@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Durable execution
     iteration_diffs TEXT,
     iteration_commits TEXT,
+    verification_passed BOOLEAN,
 
     -- Token totals (aggregated from phase_token_usage)
     total_input_tokens BIGINT DEFAULT 0,
@@ -1137,6 +1138,7 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
     resolution_notes        TEXT,
     resolved_at             TIMESTAMPTZ,
     content_embedding       BYTEA,
+    project_path            TEXT,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -1144,6 +1146,7 @@ CREATE INDEX IF NOT EXISTS idx_tk_task_run ON task_knowledge(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_tk_category ON task_knowledge(category);
 CREATE INDEX IF NOT EXISTS idx_tk_resolved ON task_knowledge(is_resolved) WHERE NOT is_resolved;
 CREATE INDEX IF NOT EXISTS idx_tk_created ON task_knowledge(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tk_project_path ON task_knowledge(project_path) WHERE project_path IS NOT NULL;
 
 -- ============================================================================
 -- Knowledge Graph Tables (workflow improvement system)
@@ -1276,3 +1279,290 @@ CREATE TABLE IF NOT EXISTS prompt_evolution (
 CREATE INDEX IF NOT EXISTS idx_pe_agent ON prompt_evolution(agent_type);
 CREATE INDEX IF NOT EXISTS idx_pe_verdict ON prompt_evolution(agent_type, canary_verdict);
 CREATE INDEX IF NOT EXISTS idx_pe_variant ON prompt_evolution(variant_id);
+
+-- Workflow Verification Phase Results
+CREATE TABLE IF NOT EXISTS workflow_verification_phase_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    all_passed BOOLEAN NOT NULL,
+    total_steps INTEGER NOT NULL,
+    passed_steps INTEGER NOT NULL,
+    failed_steps INTEGER NOT NULL,
+    skipped_steps INTEGER NOT NULL,
+    total_duration_ms BIGINT NOT NULL,
+    critical_failure BOOLEAN NOT NULL DEFAULT false,
+    result_json TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_task_run ON workflow_verification_phase_results(task_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ver_phase_unique ON workflow_verification_phase_results(task_run_id, iteration);
+
+-- Workflow AI Sessions
+CREATE TABLE IF NOT EXISTS workflow_ai_sessions (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    stage_index INTEGER,
+    claude_cli_session_id TEXT,
+    session_started_at TIMESTAMPTZ NOT NULL,
+    session_completed_at TIMESTAMPTZ,
+    output_length INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_wf_ai_sessions_task_run ON workflow_ai_sessions(task_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ai_sessions_unique
+    ON workflow_ai_sessions(task_run_id, iteration, phase, COALESCE(stage_index, -1));
+
+-- Worktrees
+CREATE TABLE IF NOT EXISTS worktrees (
+    id TEXT PRIMARY KEY,
+    worktree_path TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    source_branch TEXT NOT NULL,
+    source_commit TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    task_run_id TEXT,
+    workflow_name TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status);
+CREATE INDEX IF NOT EXISTS idx_worktrees_task_run ON worktrees(task_run_id);
+
+-- Workflow Constraint Results
+CREATE TABLE IF NOT EXISTS workflow_constraint_results (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    constraint_id TEXT NOT NULL,
+    constraint_name TEXT NOT NULL,
+    passed BOOLEAN NOT NULL,
+    severity TEXT NOT NULL,
+    violations_json TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_wf_constraint_task_run ON workflow_constraint_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wf_constraint_iteration ON workflow_constraint_results(iteration);
+
+-- Sessions (orchestration session tracking)
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    session_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'starting',
+    current_phase INTEGER NOT NULL DEFAULT 0,
+    total_phases INTEGER NOT NULL DEFAULT 0,
+    completed BOOLEAN NOT NULL DEFAULT false,
+    restart_permitted BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    error_message TEXT,
+    custom_data TEXT DEFAULT '{}',
+    activity_log TEXT DEFAULT '[]',
+    run_id TEXT,
+    workflow_name TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_workflow_name ON sessions(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_sessions_run_id ON sessions(run_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
+
+-- Session Events
+CREATE TABLE IF NOT EXISTS session_events (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_session_id ON session_events(session_id);
+
+-- Task Run Mobile State
+CREATE TABLE IF NOT EXISTS task_run_mobile_state (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_id TEXT,
+    device_type TEXT,
+    device_model TEXT,
+    app_package TEXT,
+    app_activity TEXT,
+    app_state TEXT,
+    metro_connected BOOLEAN DEFAULT false,
+    bundle_status TEXT,
+    last_reload_type TEXT,
+    last_reload_time TEXT,
+    screenshot_path TEXT,
+    logcat_path TEXT,
+    has_errors BOOLEAN DEFAULT false,
+    error_summary TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_mobile_state_task_run ON task_run_mobile_state(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_mobile_state_timestamp ON task_run_mobile_state(timestamp);
+
+-- Task Run Mobile Logs
+CREATE TABLE IF NOT EXISTS task_run_mobile_logs (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    mobile_state_id BIGINT,
+    log_source TEXT NOT NULL,
+    log_level TEXT,
+    log_tag TEXT,
+    message TEXT NOT NULL,
+    raw_line TEXT,
+    data TEXT,
+    error_type TEXT,
+    error_code TEXT,
+    stack_trace TEXT,
+    file_path TEXT,
+    line_number INTEGER,
+    column_number INTEGER,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_timestamp TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_task_run ON task_run_mobile_logs(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_source ON task_run_mobile_logs(log_source);
+
+-- Prompts
+CREATE TABLE IF NOT EXISTS prompts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'general',
+    content TEXT NOT NULL,
+    variables TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_prompts_name ON prompts(name);
+
+-- Verification Tests
+CREATE TABLE IF NOT EXISTS verification_tests (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    workflow_id TEXT,
+    test_type TEXT NOT NULL DEFAULT 'command',
+    command TEXT,
+    expected_exit_code INTEGER DEFAULT 0,
+    expected_output TEXT,
+    timeout_seconds INTEGER DEFAULT 60,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    tags TEXT DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_verification_tests_workflow ON verification_tests(workflow_id);
+
+-- Task Hooks
+CREATE TABLE IF NOT EXISTS task_hooks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    hook_type TEXT NOT NULL,
+    trigger_event TEXT NOT NULL,
+    command TEXT NOT NULL,
+    working_directory TEXT,
+    timeout_seconds INTEGER DEFAULT 30,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    workflow_filter TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_task_hooks_trigger ON task_hooks(trigger_event);
+
+-- Scheduled Tasks
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    schedule TEXT NOT NULL,
+    workflow_id TEXT,
+    workflow_name TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    last_run_at TIMESTAMPTZ,
+    next_run_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled ON scheduled_tasks(enabled);
+
+-- Active Workflows (checkpoint storage)
+CREATE TABLE IF NOT EXISTS active_workflows (
+    id              BIGSERIAL PRIMARY KEY,
+    workflow_name   TEXT NOT NULL UNIQUE,
+    checkpoint_data TEXT NOT NULL,
+    run_id          TEXT NOT NULL,
+    phase_field     TEXT NOT NULL DEFAULT 'current_phase',
+    completion_value INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    completed       BOOLEAN NOT NULL DEFAULT false
+);
+
+-- Orchestrator Flows
+CREATE TABLE IF NOT EXISTS orchestrator_flows (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    steps           TEXT NOT NULL DEFAULT '[]',
+    start_step      TEXT,
+    timeout_secs    INTEGER,
+    inputs          TEXT,
+    outputs         TEXT,
+    tags            TEXT DEFAULT '[]',
+    version         TEXT NOT NULL DEFAULT '1.0.0',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orch_flows_name ON orchestrator_flows(name);
+
+-- Flow Executions
+CREATE TABLE IF NOT EXISTS flow_executions (
+    instance_id     TEXT PRIMARY KEY,
+    flow_id         TEXT NOT NULL,
+    current_step    TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    context         TEXT,
+    history         TEXT,
+    error           TEXT,
+    started_at      TEXT NOT NULL,
+    completed_at    TEXT,
+    FOREIGN KEY (flow_id) REFERENCES orchestrator_flows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_flow_exec_flow ON flow_executions(flow_id);
+CREATE INDEX IF NOT EXISTS idx_flow_exec_status ON flow_executions(status);
+
+-- Flow Versions
+CREATE TABLE IF NOT EXISTS flow_versions (
+    id              TEXT PRIMARY KEY,
+    flow_id         TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    definition      TEXT NOT NULL,
+    message         TEXT,
+    created_by      TEXT,
+    created_at      TEXT NOT NULL,
+    FOREIGN KEY (flow_id) REFERENCES orchestrator_flows(id) ON DELETE CASCADE,
+    UNIQUE(flow_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_id ON flow_versions(flow_id);
+CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_version ON flow_versions(flow_id, version);
+
+-- Orchestrator Checkpoints
+CREATE TABLE IF NOT EXISTS orchestrator_checkpoints (
+    id              TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    iteration       INTEGER NOT NULL DEFAULT 0,
+    trigger         TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT '{}',
+    name            TEXT,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task ON orchestrator_checkpoints(task_id);
+CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task_iter ON orchestrator_checkpoints(task_id, iteration);

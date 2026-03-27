@@ -401,6 +401,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
             exec_id,
             wf_name,
             url_lock,
+            deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 controller
                     .run(

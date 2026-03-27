@@ -54,6 +54,7 @@ pub fn build_config(execution_id: &str, workflow_name: &str) -> LoopConfig {
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,

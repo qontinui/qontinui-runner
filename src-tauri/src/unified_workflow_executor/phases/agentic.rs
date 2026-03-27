@@ -661,6 +661,7 @@ impl AgenticExecutor {
                 config.max_context_tokens,
                 config.cross_workflow_learning,
                 config.project_path.as_deref(),
+                self.app_state.pg_db.as_ref(),
             ) {
                 Some(ctx) => {
                     let label = if iteration == 1 {
@@ -804,11 +805,11 @@ impl AgenticExecutor {
         // Check if there's an interrupted session we can resume via `--resume`.
         // If so, reuse its CLI session ID; otherwise generate a fresh one.
         let parent_task_id = get_parent_task_id(&config.execution_id);
-        let (cli_session_id, is_resume) = match self.checkpoint_db.get_workflow_ai_session(
-            &parent_task_id,
-            iteration as i32,
-            "agentic",
-        ) {
+        let (cli_session_id, is_resume) = match if let Some(pg) = &self.app_state.pg_db {
+            pg.get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic").await
+        } else {
+            self.checkpoint_db.get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic")
+        } {
             Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
                 info!(
                     "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
@@ -832,6 +833,14 @@ impl AgenticExecutor {
         });
 
         // Record the AI session in the database for restart recovery
+        if let Some(pg) = &self.app_state.pg_db {
+            if let Err(e) = pg.create_workflow_ai_session(
+                &parent_task_id, iteration as i32, "agentic",
+                config.stage_index.map(|i| i as i32), &cli_session_id,
+            ).await {
+                warn!("PG create_workflow_ai_session failed: {}", e);
+            }
+        }
         if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
             &parent_task_id,
             iteration as i32,
@@ -905,6 +914,14 @@ impl AgenticExecutor {
                 is_resume: false,
             });
             // Update the DB record with the new session ID
+            if let Some(pg) = &self.app_state.pg_db {
+                if let Err(e) = pg.create_workflow_ai_session(
+                    &parent_task_id, iteration as i32, "agentic",
+                    config.stage_index.map(|i| i as i32), &fresh_cli_id,
+                ).await {
+                    warn!("PG create fallback workflow AI session failed: {}", e);
+                }
+            }
             if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
                 &parent_task_id,
                 iteration as i32,
@@ -1024,6 +1041,14 @@ impl AgenticExecutor {
                 AgenticOutcome::Skipped => "completed",
             };
             let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
+            if let Some(pg) = &self.app_state.pg_db {
+                if let Err(e) = pg.complete_workflow_ai_session(
+                    &parent_task_id, iteration as i32, "agentic",
+                    config.stage_index.map(|i| i as i32), session_status, output_len,
+                ).await {
+                    warn!("PG complete_workflow_ai_session failed: {}", e);
+                }
+            }
             if let Err(e) = self.checkpoint_db.complete_workflow_ai_session(
                 &parent_task_id,
                 iteration as i32,

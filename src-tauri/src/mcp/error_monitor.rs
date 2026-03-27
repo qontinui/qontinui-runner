@@ -50,6 +50,26 @@ pub async fn get_error_monitor_errors(
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(100);
 
+    if let Some(pg) = &state.app_state.pg_db {
+        let pg_errors = pg
+            .get_unresolved_errors(task_run_id.as_deref(), limit)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to get errors: {}", e))),
+                )
+            })?;
+
+        // Deserialize JSON values into typed StoredErrorEvent structs
+        let errors: Vec<crate::error_monitor::StoredErrorEvent> = pg_errors
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect();
+
+        return Ok(Json(ApiResponse::success(errors)));
+    }
+
     let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -82,6 +102,31 @@ pub async fn get_error_monitor_summary(
 > {
     let task_run_id = query.get("task_run_id").cloned();
 
+    if let Some(pg) = &state.app_state.pg_db {
+        let pg_summary = pg
+            .get_error_summary(task_run_id.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to get summary: {}", e))),
+                )
+            })?;
+
+        let summary: crate::error_monitor::ErrorSummary =
+            serde_json::from_value(pg_summary).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!(
+                        "Failed to deserialize PG summary: {}",
+                        e
+                    ))),
+                )
+            })?;
+
+        return Ok(Json(ApiResponse::success(summary)));
+    }
+
     let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -107,6 +152,20 @@ pub async fn get_error_debug_context(
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
     let task_run_id = query.get("task_run_id").cloned();
+
+    // Try PG first — returns a simplified list of unresolved errors as debug context.
+    // Falls back to SQLite curator which builds a richer DebugContext from multiple queries.
+    if let Some(pg) = &state.app_state.pg_db {
+        match pg.get_error_debug_context(task_run_id.as_deref()).await {
+            Ok(ctx) => {
+                let formatted = serde_json::to_string_pretty(&ctx).unwrap_or_default();
+                return Ok(Json(ApiResponse::success(formatted)));
+            }
+            Err(e) => {
+                tracing::warn!("PG debug context failed, falling back to SQLite: {}", e);
+            }
+        }
+    }
 
     let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
         (
@@ -135,6 +194,20 @@ pub async fn resolve_error_monitor_error(
     Path(id): Path<i64>,
     Json(request): Json<ResolveErrorRequest>,
 ) -> Json<ApiResponse<()>> {
+    if let Some(pg) = &state.app_state.pg_db {
+        let result = if let Some(ref task_run_id) = request.resolved_by_task_run_id {
+            pg.mark_resolved_by_task(id, task_run_id, request.resolution_notes.as_deref())
+                .await
+        } else {
+            pg.update_error_status(id, "resolved", request.resolution_notes.as_deref())
+                .await
+        };
+        return match result {
+            Ok(()) => Json(ApiResponse::success(())),
+            Err(e) => Json(api_error(format!("Failed to resolve error: {}", e))),
+        };
+    }
+
     match state.app_state.checkpoint_db.connection() {
         Ok(conn) => {
             let result = if let Some(ref task_run_id) = request.resolved_by_task_run_id {
@@ -166,6 +239,13 @@ pub async fn acknowledge_error_monitor_error(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
+    if let Some(pg) = &state.app_state.pg_db {
+        return match pg.update_error_status(id, "acknowledged", None).await {
+            Ok(()) => Json(ApiResponse::success(())),
+            Err(e) => Json(api_error(format!("Failed to acknowledge error: {}", e))),
+        };
+    }
+
     match state.app_state.checkpoint_db.connection() {
         Ok(conn) => {
             let result = crate::error_monitor::ErrorEventStorage::update_status(
@@ -191,6 +271,8 @@ pub async fn generate_fix_workflow(
     Json<ApiResponse<crate::error_monitor::GeneratedWorkflow>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    // NOTE: Workflow generation uses the curator and generator which are deeply SQLite-integrated.
+    // No PG equivalent exists for the full error-fix pipeline. Falls through to SQLite always.
     let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

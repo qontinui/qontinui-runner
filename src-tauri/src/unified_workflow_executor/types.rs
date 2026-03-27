@@ -110,6 +110,10 @@ pub struct IterationResult {
     pub agentic_phase_ran: bool,
     /// Whether the agentic phase succeeded (if it ran)
     pub agentic_phase_success: Option<bool>,
+    /// JSON-serialized blame attribution report (if blame analysis was performed).
+    /// Contains BlameReport with per-step attributions, oscillating files, and revert patterns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blame_json: Option<String>,
 }
 
 /// Final result of the entire verification-agentic loop.
@@ -337,6 +341,10 @@ pub struct LoopConfig {
     /// Only applies when the workflow ends due to critical failure, max iterations,
     /// or unfixable errors. Default: None (no rollback).
     pub rollback_policy: RollbackPolicy,
+    /// Escalation policy for stuck loops.
+    /// Controls warnings, rethink prompts, and time limits when the loop
+    /// fails to make progress.
+    pub escalation_policy: super::blame::EscalationPolicy,
     /// Accumulated iteration diffs (runtime state, not persisted in config).
     /// Populated during loop execution for cross-iteration context injection.
     pub iteration_diffs: Vec<IterationDiff>,
@@ -420,6 +428,7 @@ impl LoopConfig {
             rollback_policy: RollbackPolicy::from_str(
                 workflow.rollback_policy.as_deref().unwrap_or("none"),
             ),
+            escalation_policy: super::blame::EscalationPolicy::default(),
             iteration_diffs: Vec::new(),
             // strict_cwd is true if either the workflow or global setting enables it
             strict_cwd: workflow.strict_cwd || crate::settings::get_path_settings().strict_mode,

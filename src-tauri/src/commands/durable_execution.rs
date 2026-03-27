@@ -135,7 +135,11 @@ pub async fn get_iteration_diffs(
     app_state: State<'_, Arc<AppState>>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::IterationDiff>, String> {
-    app_state.checkpoint_db.get_iteration_diffs(&execution_id)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_iteration_diffs(&execution_id).await
+    } else {
+        app_state.checkpoint_db.get_iteration_diffs(&execution_id)
+    }
 }
 
 /// Get the commit checkpoints for a workflow execution.
@@ -147,5 +151,9 @@ pub async fn get_iteration_commits(
     app_state: State<'_, Arc<AppState>>,
     execution_id: String,
 ) -> Result<Vec<crate::unified_workflow_executor::types::IterationCommit>, String> {
-    app_state.checkpoint_db.get_iteration_commits(&execution_id)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_iteration_commits(&execution_id).await
+    } else {
+        app_state.checkpoint_db.get_iteration_commits(&execution_id)
+    }
 }

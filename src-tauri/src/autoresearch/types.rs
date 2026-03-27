@@ -279,6 +279,10 @@ pub enum MutationStrategy {
     RandomPerturbation,
     /// Consult an LLM after every N experiments to decide what to try next.
     AiGuided,
+    /// Q-learning router: selects WorkflowArchitecture based on learned
+    /// task-feature→architecture Q-values. Falls back to grid search when
+    /// insufficient data exists for the current task state.
+    QLearning,
 }
 
 /// Configuration for AI-guided mutation.

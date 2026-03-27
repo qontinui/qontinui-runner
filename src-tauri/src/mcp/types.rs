@@ -67,6 +67,8 @@ pub struct ApiState {
     pub ui_bridge_semaphore: Arc<tokio::sync::Semaphore>,
     /// Last frontend pong timestamp (epoch ms)
     pub ui_bridge_last_pong: Arc<std::sync::atomic::AtomicU64>,
+    /// Readiness gate — notified on first pong. Requests wait on this during startup.
+    pub ui_bridge_ready: Arc<tokio::sync::Notify>,
     /// Pending dedup channels for read-only UI Bridge requests
     pub ui_bridge_dedup: Arc<
         tokio::sync::Mutex<
@@ -76,6 +78,8 @@ pub struct ApiState {
             >,
         >,
     >,
+    /// Last known console error count (updated by console-errors handler and health probes)
+    pub ui_bridge_console_error_count: Arc<std::sync::atomic::AtomicU64>,
     /// Render log entries for diagnostics (in-memory)
     pub ui_bridge_render_log: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     /// Web extraction state tracking

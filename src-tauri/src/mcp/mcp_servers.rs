@@ -13,7 +13,12 @@ use crate::mcp_client::McpServerConfig;
 pub async fn list_mcp_servers_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<McpServerConfig>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.list_mcp_servers() {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.list_mcp_servers().await
+    } else {
+        state.app_state.checkpoint_db.list_mcp_servers()
+    };
+    match result {
         Ok(servers) => Ok(Json(ApiResponse::success(servers))),
         Err(e) => {
             error!("Failed to list MCP servers: {}", e);
@@ -30,7 +35,12 @@ pub async fn get_mcp_server_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerConfig>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.get_mcp_server(&id) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_mcp_server(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_mcp_server(&id)
+    };
+    match result {
         Ok(Some(server)) => Ok(Json(ApiResponse::success(server))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,

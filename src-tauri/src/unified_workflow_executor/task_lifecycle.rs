@@ -16,6 +16,11 @@ impl LoopController {
     /// Mark a task as completed, sync to backend, promote workflow, store convergence snapshot,
     /// parse meta-optimizer recommendations, and check chain triggers.
     pub(crate) async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
+        if let Some(pg) = &self.app_state.pg_db {
+            if let Err(e) = pg.complete_task_run(execution_id).await {
+                warn!("PG complete_task_run failed: {}", e);
+            }
+        }
         if let Err(e) = self.checkpoint_db.complete_task_run(execution_id) {
             error!("Failed to mark task {} as completed: {}", execution_id, e);
         } else {
@@ -26,10 +31,17 @@ impl LoopController {
 
             // Sync completion to web backend (best-effort, non-blocking)
             let db = self.checkpoint_db.clone();
+            let pg = self.app_state.pg_db.clone();
             let eid = execution_id.to_string();
             tokio::spawn(async move {
                 let sync_service = crate::commands::task_sync::AITaskSyncService::new();
-                if let Ok(Some(task)) = db.get_task_run(&eid) {
+                let task = if let Some(ref pg) = pg {
+                    pg.get_task_run(&eid).await.ok().flatten()
+                        .or_else(|| db.get_task_run(&eid).ok().flatten())
+                } else {
+                    db.get_task_run(&eid).ok().flatten()
+                };
+                if let Some(task) = task {
                     if let Err(e) = sync_service.sync_task_completed(&task).await {
                         warn!("Failed to sync task completion to backend: {}", e);
                     }
@@ -87,12 +99,23 @@ impl LoopController {
             // Parse meta-optimizer recommendations from completed output
             {
                 let db = self.checkpoint_db.clone();
+                let pg = self.app_state.pg_db.clone();
                 let eid = execution_id.to_string();
                 tokio::spawn(async move {
                     // Check if this task run is a meta-optimizer run
-                    let task_run = match db.get_task_run(&eid) {
-                        Ok(Some(tr)) => tr,
-                        _ => return,
+                    let task_run = if let Some(ref pg) = pg {
+                        match pg.get_task_run(&eid).await {
+                            Ok(Some(tr)) => tr,
+                            _ => match db.get_task_run(&eid) {
+                                Ok(Some(tr)) => tr,
+                                _ => return,
+                            },
+                        }
+                    } else {
+                        match db.get_task_run(&eid) {
+                            Ok(Some(tr)) => tr,
+                            _ => return,
+                        }
                     };
                     if !task_run.is_meta_optimizer {
                         return;
@@ -183,6 +206,11 @@ impl LoopController {
         reason: &str,
         workflow_id: Option<&str>,
     ) {
+        if let Some(pg) = &self.app_state.pg_db {
+            if let Err(e) = pg.fail_task_run(execution_id, reason).await {
+                warn!("PG fail_task_run failed: {}", e);
+            }
+        }
         if let Err(e) = self.checkpoint_db.fail_task_run(execution_id, reason) {
             error!("Failed to mark task {} as failed: {}", execution_id, e);
         } else {
@@ -198,10 +226,17 @@ impl LoopController {
 
             // Sync failure to web backend (best-effort, non-blocking)
             let db = self.checkpoint_db.clone();
+            let pg = self.app_state.pg_db.clone();
             let eid = execution_id.to_string();
             tokio::spawn(async move {
                 let sync_service = crate::commands::task_sync::AITaskSyncService::new();
-                if let Ok(Some(task)) = db.get_task_run(&eid) {
+                let task = if let Some(ref pg) = pg {
+                    pg.get_task_run(&eid).await.ok().flatten()
+                        .or_else(|| db.get_task_run(&eid).ok().flatten())
+                } else {
+                    db.get_task_run(&eid).ok().flatten()
+                };
+                if let Some(task) = task {
                     if let Err(e) = sync_service.sync_task_completed(&task).await {
                         warn!("Failed to sync task failure to backend: {}", e);
                     }
@@ -360,6 +395,7 @@ impl LoopController {
         completion_automation_steps: &mut Vec<ExecutionStepConfig>,
         completion_prompt_steps: &mut Vec<ExecutionStepConfig>,
         checkpoint_db: &Arc<crate::database::CheckpointDb>,
+        pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
     ) {
         if let Some(project_path) = config.project_path.clone() {
             let repo_path = std::path::Path::new(&project_path);
@@ -393,6 +429,19 @@ impl LoopController {
                         created_at: now.clone(),
                         updated_at: now,
                     };
+                    if let Some(pg) = pg_db {
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            let pg = pg.clone();
+                            let record_clone = record.clone();
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handle.block_on(async move {
+                                    if let Err(e) = pg.insert_worktree(&record_clone).await {
+                                        warn!("PG insert_worktree failed: {}", e);
+                                    }
+                                })
+                            }));
+                        }
+                    }
                     if let Err(e) = checkpoint_db.insert_worktree(&record) {
                         warn!("WORKTREE: Failed to track worktree in database: {}", e);
                     }
@@ -455,9 +504,12 @@ async fn auto_capture_observations(
     pg: &crate::database::pg::PgDb,
     execution_id: &str,
 ) {
-    let task_run = match db.get_task_run(execution_id) {
-        Ok(Some(tr)) => tr,
-        _ => return,
+    let task_run = match pg.get_task_run(execution_id).await.ok().flatten() {
+        Some(tr) => tr,
+        None => match db.get_task_run(execution_id) {
+            Ok(Some(tr)) => tr,
+            _ => return,
+        },
     };
 
     let workflow_name = task_run.workflow_name.as_deref().unwrap_or(&task_run.task_name);

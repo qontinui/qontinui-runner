@@ -191,10 +191,12 @@ async fn create_or_update_panel(
         id
     } else {
         // Try to find the currently running task run
-        match state.app_state.checkpoint_db.get_running_task_runs(None) {
-            Ok(runs) if !runs.is_empty() => runs[0].id.clone(),
-            _ => "unknown".to_string(),
-        }
+        let runs = if let Some(pg) = &state.app_state.pg_db {
+            pg.get_running_task_runs(None).await.unwrap_or_default()
+        } else {
+            state.app_state.checkpoint_db.get_running_task_runs(None).unwrap_or_default()
+        };
+        if !runs.is_empty() { runs[0].id.clone() } else { "unknown".to_string() }
     };
 
     let now = chrono::Utc::now().to_rfc3339();

@@ -74,10 +74,14 @@ pub fn optimize_database(
 /// * `Ok(CommandResponse)` - Success with database statistics
 /// * `Err(String)` - Error message if statistics cannot be retrieved
 #[tauri::command]
-pub fn get_database_stats(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_database_stats(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting database statistics");
 
-    let stats: DatabaseStats = state.checkpoint_db.get_database_stats()?;
+    let stats: DatabaseStats = if let Some(pg) = &state.pg_db {
+        pg.get_database_stats().await?
+    } else {
+        state.checkpoint_db.get_database_stats()?
+    };
 
     let message = format!(
         "Database size: {:.2} MB, {} tables, {} total rows",
@@ -111,13 +115,17 @@ pub fn get_database_stats(state: State<Arc<AppState>>) -> Result<CommandResponse
 /// * `Ok(CommandResponse)` - Success with query plan
 /// * `Err(String)` - Error message if query plan cannot be generated
 #[tauri::command]
-pub fn explain_query_plan(
+pub async fn explain_query_plan(
     query: String,
-    state: State<Arc<AppState>>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Running EXPLAIN QUERY PLAN for query: {}", query);
 
-    let plan = state.checkpoint_db.explain_query_plan(&query)?;
+    let plan = if let Some(pg) = &state.pg_db {
+        pg.explain_query_plan(&query).await?
+    } else {
+        state.checkpoint_db.explain_query_plan(&query)?
+    };
 
     Ok(CommandResponse {
         success: true,

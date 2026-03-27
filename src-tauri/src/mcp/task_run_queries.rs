@@ -208,11 +208,12 @@ pub async fn get_task_run_checkpoints(
 
     let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
 
-    let (checkpoints, next_cursor) = state
-        .app_state
-        .checkpoint_db
-        .get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (checkpoints, next_cursor) = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit).await
+    } else {
+        state.app_state.checkpoint_db.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -1669,4 +1670,82 @@ pub async fn get_trace_correlation(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(result))
+}
+
+/// Get blame attributions for a task run.
+///
+/// Returns all blame reports from each iteration, plus aggregate statistics.
+/// Data comes from iteration_results stored in the task run's result_data.
+///
+/// `GET /task-runs/{id}/blame`
+pub async fn get_task_run_blame(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get the task run
+    let task = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Parse result_data to extract iteration_results with blame_json
+    let mut blame_reports: Vec<serde_json::Value> = Vec::new();
+    let mut total_attributions = 0u32;
+    let mut total_oscillating = 0u32;
+    let mut total_reverts = 0u32;
+
+    if let Some(ref result_data) = task.result_data {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(result_data) {
+            if let Some(iterations) = data.get("iteration_results").and_then(|v| v.as_array()) {
+                for iter_result in iterations {
+                    if let Some(blame_json) = iter_result.get("blame_json").and_then(|v| v.as_str())
+                    {
+                        if let Ok(report) = serde_json::from_str::<serde_json::Value>(blame_json) {
+                            let iteration = iter_result
+                                .get("iteration")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+
+                            let attr_count = report
+                                .get("attributions")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            let osc_count = report
+                                .get("oscillating_files")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            let rev_count = report
+                                .get("revert_patterns")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+
+                            total_attributions += attr_count as u32;
+                            total_oscillating += osc_count as u32;
+                            total_reverts += rev_count as u32;
+
+                            blame_reports.push(serde_json::json!({
+                                "iteration": iteration,
+                                "report": report,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "task_name": task.task_name,
+        "total_iterations_with_blame": blame_reports.len(),
+        "total_attributions": total_attributions,
+        "total_oscillating_files": total_oscillating,
+        "total_revert_patterns": total_reverts,
+        "blame_reports": blame_reports,
+    })))
 }

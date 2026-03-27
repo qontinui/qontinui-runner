@@ -426,6 +426,7 @@ impl PgDb {
     }
 
     /// Toggle favorite status. Returns the new is_favorite value.
+    /// Alias: `toggle_unified_workflow_favorite` delegates here.
     pub async fn toggle_favorite(&self, id: &str) -> Result<bool, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
         let new_val = qontinui_db::queries::workflows::toggle_favorite()
@@ -478,5 +479,29 @@ impl PgDb {
             .map_err(|e| format!("PG list_slash_command_sources: {}", e))?;
 
         Ok(rows.into_iter().map(|r| (r.id, r.name, r.source_file_path)).collect())
+    }
+
+    /// Toggle the is_favorite flag on a unified workflow (alias for toggle_favorite).
+    pub async fn toggle_unified_workflow_favorite(&self, id: &str) -> Result<bool, String> {
+        self.toggle_favorite(id).await
+    }
+
+    /// Get workflow execution stats by workflow name.
+    pub async fn get_workflow_stats(&self, workflow_name: &str) -> Result<(u32, u32, u32, Option<String>, Option<String>, Option<i64>), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = qontinui_db::queries::workflows::get_workflow_stats()
+            .bind(&conn, &workflow_name)
+            .one()
+            .await
+            .map_err(|e| format!("PG get_workflow_stats: {}", e))?;
+
+        Ok((
+            row.total_runs as u32,
+            row.success_count as u32,
+            row.failure_count as u32,
+            if row.last_run_at.timestamp() == 0 { None } else { Some(row.last_run_at.to_rfc3339()) },
+            non_empty(row.last_run_status),
+            if row.avg_duration_ms == 0.0 { None } else { Some(row.avg_duration_ms as i64) },
+        ))
     }
 }

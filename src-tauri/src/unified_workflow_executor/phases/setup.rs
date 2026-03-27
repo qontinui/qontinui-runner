@@ -352,6 +352,11 @@ impl SetupExecutor {
                                     "\n--- AI Setup Output ({}) ---\n{}\n",
                                     step_name, output
                                 );
+                                if let Some(pg) = &self.app_state.pg_db {
+                                    if let Err(e) = pg.append_task_output_ex(execution_id, &formatted, false, false).await {
+                                        warn!("PG append_task_output_ex failed: {}", e);
+                                    }
+                                }
                                 if let Err(e) = self.checkpoint_db.append_task_output_ex(
                                     execution_id,
                                     &formatted,

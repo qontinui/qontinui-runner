@@ -13,6 +13,15 @@ use crate::database::{CreateTaskRunInput, TaskRun};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext};
 use crate::mcp::types::{ApiResponse, ApiState};
 use crate::safe_lock::safe_lock_or_recover;
+
+/// PG-primary get_task_run helper. Falls back to SQLite when PG unavailable.
+async fn pg_get_task_run(state: &Arc<ApiState>, id: &str) -> Result<Option<TaskRun>, String> {
+    if let Some(pg) = &state.app_state.pg_db {
+        pg.get_task_run(id).await
+    } else {
+        state.app_state.checkpoint_db.get_task_run(id)
+    }
+}
 use crate::summary_generator;
 use tauri::Manager;
 
@@ -658,6 +667,7 @@ pub async fn resume_task_run(
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
@@ -687,6 +697,7 @@ pub async fn resume_task_run(
         execution_id_for_guard,
         task_name.clone(),
         url_lock,
+        state.app_state.pg_db.clone(),
         async move {
             let mut controller =
                 LoopController::new(app_state, config_storage, app_handle, pid_tracker)
@@ -729,10 +740,7 @@ pub async fn get_task_run_events(
     axum::extract::Query(query): axum::extract::Query<TaskRunEventsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task exists
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
+    pg_get_task_run(&state, &id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -776,20 +784,18 @@ pub async fn get_task_run_checkpoints(
     axum::extract::Query(query): axum::extract::Query<CheckpointsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task exists
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
+    pg_get_task_run(&state, &id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
 
-    let (checkpoints, next_cursor) = state
-        .app_state
-        .checkpoint_db
-        .get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (checkpoints, next_cursor) = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit).await
+    } else {
+        state.app_state.checkpoint_db.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -1796,10 +1802,7 @@ pub async fn get_task_run_screenshots(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task exists
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
+    pg_get_task_run(&state, &id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1960,10 +1963,7 @@ pub async fn send_message_to_session(
     );
 
     // Verify task run exists
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
+    pg_get_task_run(&state, &id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1999,12 +1999,13 @@ pub async fn send_message_to_session(
     }));
 
     // Persist user message to output_log for recap/summary generation
-    if let Err(e) = state.app_state.checkpoint_db.append_task_output_ex(
-        &id,
-        &format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", req.message),
-        false,
-        false,
-    ) {
+    let msg = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", req.message);
+    let append_err = if let Some(pg) = &state.app_state.pg_db {
+        pg.append_task_output_ex(&id, &msg, false, false).await.err()
+    } else {
+        state.app_state.checkpoint_db.append_task_output_ex(&id, &msg, false, false).err().map(|e| e.to_string())
+    };
+    if let Some(e) = append_err {
         warn!("Failed to persist user message to output_log: {}", e);
     }
 
@@ -2088,10 +2089,7 @@ pub async fn get_session_state(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task run exists
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_run(&id)
+    pg_get_task_run(&state, &id).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -2633,22 +2631,16 @@ pub async fn get_approval_gates(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(task_run_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let id = task_run_id.clone();
-    let gates = tokio::task::spawn_blocking(move || db.get_approval_gates_for_task_run(&id))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Task failed: {}", e),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
-            )
-        })?;
+    let gates = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_approval_gates_for_task_run(&task_run_id).await
+    } else {
+        let db = state.app_state.checkpoint_db.clone();
+        let id = task_run_id.clone();
+        tokio::task::spawn_blocking(move || db.get_approval_gates_for_task_run(&id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
 
     Ok(Json(serde_json::json!(gates)))
 }
@@ -2706,6 +2698,7 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/task-runs/{id}/awas-steps", get(get_task_run_awas_steps))
         .route("/task-runs/{id}/knowledge", get(get_task_run_knowledge))
+        .route("/task-runs/{id}/blame", get(get_task_run_blame))
         .route(
             "/task-runs/{id}/steps/{checkpoint_id}/progress",
             get(get_step_progress_markers),

@@ -306,12 +306,12 @@ impl KnowledgeGraph {
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         let sql = if workflow_name.is_some() {
-            r#"SELECT f.id, f.title, f.category, f.severity, f.status, f.created_at
+            r#"SELECT f.id, f.title, f.category, f.severity, f.status, f.detected_at
                FROM task_run_findings f
                INNER JOIN task_runs tr ON tr.id = f.task_run_id
                WHERE tr.workflow_name = ?1"#
         } else {
-            r#"SELECT f.id, f.title, f.category, f.severity, f.status, f.created_at
+            r#"SELECT f.id, f.title, f.category, f.severity, f.status, f.detected_at
                FROM task_run_findings f
                INNER JOIN task_runs tr ON tr.id = f.task_run_id
                WHERE tr.workflow_name IS NOT NULL"#
@@ -1896,7 +1896,7 @@ impl KnowledgeGraph {
         {
             let mut stmt = conn
                 .prepare(
-                    r#"SELECT id, title, category, severity, status, created_at
+                    r#"SELECT id, title, category, severity, status, detected_at
                        FROM task_run_findings WHERE task_run_id = ?1"#,
                 )
                 .map_err(|e| format!("Failed to prepare ingest findings query: {}", e))?;
@@ -2706,10 +2706,16 @@ mod tests {
             CREATE TABLE step_provenance (
                 id INTEGER PRIMARY KEY,
                 workflow_id TEXT NOT NULL,
+                workflow_version_id TEXT,
                 step_name TEXT NOT NULL,
+                step_index INTEGER NOT NULL DEFAULT 0,
                 phase TEXT NOT NULL DEFAULT 'setup',
                 generating_agent TEXT NOT NULL DEFAULT 'unknown',
-                ui_bridge_event_ids TEXT
+                generation_iteration INTEGER,
+                original_step_json TEXT,
+                final_step_json TEXT,
+                ui_bridge_event_ids TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE TABLE causal_events (

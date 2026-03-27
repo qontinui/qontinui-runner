@@ -157,11 +157,16 @@ pub async fn get_saved_requests_for_orchestration(
 ) -> Result<CommandResponse, String> {
     info!("Getting saved API requests for orchestration");
 
-    match state.checkpoint_db.list_saved_api_requests() {
-        Ok(requests) => Ok(CommandResponse {
+    let requests_result: Result<serde_json::Value, String> = if let Some(pg) = &state.pg_db {
+        pg.list_saved_api_requests().await.map(|v| serde_json::to_value(&v).unwrap_or_default())
+    } else {
+        state.checkpoint_db.list_saved_api_requests().map(|v| serde_json::to_value(&v).unwrap_or_default())
+    };
+    match requests_result {
+        Ok(requests_json) => Ok(CommandResponse {
             success: true,
-            message: Some(format!("Found {} saved requests", requests.len())),
-            data: Some(serde_json::to_value(&requests).unwrap_or_default()),
+            message: Some(format!("Found {} saved requests", requests_json.as_array().map(|a| a.len()).unwrap_or(0))),
+            data: Some(requests_json),
         }),
         Err(e) => {
             error!("Failed to list saved requests: {}", e);

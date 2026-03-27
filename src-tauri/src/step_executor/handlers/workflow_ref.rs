@@ -174,6 +174,12 @@ impl StepHandler for WorkflowRefHandler {
             .with_auto_continue(true)
             .with_workflow_type("unified");
 
+        // PG-primary: write to PostgreSQL first
+        if let Some(pg) = &context.app_state.pg_db {
+            if let Err(e) = pg.create_task_run(&input).await {
+                warn!("PG create_task_run for workflow_ref failed: {}", e);
+            }
+        }
         if let Err(e) = context.app_state.checkpoint_db.create_task_run(&input) {
             warn!("Failed to create task_run for workflow_ref: {}", e);
         }
@@ -231,6 +237,7 @@ impl StepHandler for WorkflowRefHandler {
             agentic_verification_config: None,
             multi_agent_pipeline_config: None,
             rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+            escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
             iteration_diffs: Vec::new(),
             active_canary: None,
             is_canary_run: false,
@@ -274,6 +281,10 @@ impl StepHandler for WorkflowRefHandler {
             Ok(workflow_result) => {
                 if workflow_result.success {
                     info!("workflow_ref '{}' completed successfully", workflow.name);
+                    // PG-primary
+                    if let Some(pg) = &context.app_state.pg_db {
+                        let _ = pg.complete_task_run(&execution_id).await;
+                    }
                     let _ = context
                         .app_state
                         .checkpoint_db
@@ -289,6 +300,10 @@ impl StepHandler for WorkflowRefHandler {
                 } else {
                     let error_msg = format!("workflow_ref '{}' failed", workflow.name);
                     warn!("{}", error_msg);
+                    // PG-primary
+                    if let Some(pg) = &context.app_state.pg_db {
+                        let _ = pg.fail_task_run(&execution_id, &error_msg).await;
+                    }
                     let _ = context
                         .app_state
                         .checkpoint_db
@@ -312,6 +327,10 @@ impl StepHandler for WorkflowRefHandler {
                     workflow.name, timeout_seconds
                 );
                 warn!("{}", error_msg);
+                // PG-primary
+                if let Some(pg) = &context.app_state.pg_db {
+                    let _ = pg.fail_task_run(&execution_id, &error_msg).await;
+                }
                 let _ = context
                     .app_state
                     .checkpoint_db

@@ -151,6 +151,7 @@ impl ResumePoint {
 pub struct ResumeManager {
     checkpoint_db: Arc<CheckpointDb>,
     checkpoint_mgr: CheckpointManager,
+    pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
 }
 
 impl std::fmt::Debug for ResumeManager {
@@ -169,7 +170,14 @@ impl ResumeManager {
         Self {
             checkpoint_db,
             checkpoint_mgr,
+            pg_db: None,
         }
+    }
+
+    /// Set the optional PG database for PG-primary reads.
+    pub fn with_pg_db(mut self, pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>) -> Self {
+        self.pg_db = pg_db;
+        self
     }
 
     /// Determine the resume point for a given execution.
@@ -390,7 +398,22 @@ impl ResumeManager {
     /// It's less accurate but provides backward compatibility.
     fn legacy_resume_point(&self, execution_id: &str) -> Result<ResumePoint, String> {
         // Check if there's a task run with sessions_count > 0
-        let task_run = self.checkpoint_db.get_task_run(execution_id)?;
+        // PG-primary: try PG first, fall back to SQLite
+        let task_run = if let Some(ref pg) = self.pg_db {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pg = pg.clone();
+                let id = execution_id.to_string();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.block_on(async move { pg.get_task_run(&id).await })
+                }))
+                .unwrap_or_else(|_| Err("block_on panicked".to_string()))
+                .or_else(|_| self.checkpoint_db.get_task_run(execution_id))?
+            } else {
+                self.checkpoint_db.get_task_run(execution_id)?
+            }
+        } else {
+            self.checkpoint_db.get_task_run(execution_id)?
+        };
 
         match task_run {
             Some(task) => {

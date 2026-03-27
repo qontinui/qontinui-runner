@@ -608,15 +608,21 @@ impl LoopController {
                 );
 
                 // Emit verdict to task output
+                let verifier_output = format!(
+                    "\n--- Verification Agent (iteration {}) ---\nStatus: {}\nConfidence: {:.0}%\nObservations: {}\n",
+                    iteration,
+                    verdict.status,
+                    verdict.confidence * 100.0,
+                    verdict.observations,
+                );
+                if let Some(pg) = &self.app_state.pg_db {
+                    if let Err(e) = pg.append_task_output_ex(&config.execution_id, &verifier_output, false, false).await {
+                        warn!("PG append_task_output_ex failed: {}", e);
+                    }
+                }
                 if let Err(e) = self.checkpoint_db.append_task_output_ex(
                     &config.execution_id,
-                    &format!(
-                        "\n--- Verification Agent (iteration {}) ---\nStatus: {}\nConfidence: {:.0}%\nObservations: {}\n",
-                        iteration,
-                        verdict.status,
-                        verdict.confidence * 100.0,
-                        verdict.observations,
-                    ),
+                    &verifier_output,
                     false,
                     false,
                 ) {
@@ -999,6 +1005,11 @@ impl LoopController {
             config.provider_override = original_provider_override.clone();
 
             // Increment session count in DB
+            if let Some(pg) = &self.app_state.pg_db {
+                if let Err(e) = pg.append_task_output_ex(&config.execution_id, "", true, false).await {
+                    warn!("PG append_task_output_ex (session increment) failed: {}", e);
+                }
+            }
             if let Err(e) = self.checkpoint_db.append_task_output_ex(
                 &config.execution_id,
                 "",

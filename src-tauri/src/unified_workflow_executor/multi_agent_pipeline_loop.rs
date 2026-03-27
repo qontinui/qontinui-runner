@@ -162,6 +162,7 @@ struct SubtreeOutput {
 #[derive(Clone)]
 struct PipelineShared {
     checkpoint_db: Arc<crate::database::CheckpointDb>,
+    pg_db: Option<Arc<crate::database::pg::PgDb>>,
     agentic_executor: Arc<super::phases::AgenticExecutor>,
     verification_executor: Arc<super::phases::VerificationExecutor>,
 }
@@ -170,6 +171,7 @@ impl PipelineShared {
     fn from_controller(ctrl: &LoopController) -> Self {
         Self {
             checkpoint_db: Arc::clone(&ctrl.checkpoint_db),
+            pg_db: ctrl.app_state.pg_db.clone(),
             agentic_executor: Arc::clone(&ctrl.agentic_executor),
             verification_executor: Arc::clone(&ctrl.verification_executor),
         }
@@ -178,7 +180,23 @@ impl PipelineShared {
     /// Mirror of `LoopController::is_task_stopped` — only needs `checkpoint_db`.
     fn is_task_stopped(&self, execution_id: &str) -> bool {
         let task_id_to_check = super::types::get_parent_task_id(execution_id);
-        match self.checkpoint_db.get_task_run(&task_id_to_check) {
+        // PG-primary: try PG first, fall back to SQLite
+        let task_result = if let Some(ref pg) = self.pg_db {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pg = pg.clone();
+                let id = task_id_to_check.clone();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.block_on(async move { pg.get_task_run(&id).await })
+                }))
+                .unwrap_or_else(|_| Err("block_on panicked".to_string()))
+                .or_else(|_| self.checkpoint_db.get_task_run(&task_id_to_check))
+            } else {
+                self.checkpoint_db.get_task_run(&task_id_to_check)
+            }
+        } else {
+            self.checkpoint_db.get_task_run(&task_id_to_check)
+        };
+        match task_result {
             Ok(Some(task)) => {
                 if task.status == "stopped" {
                     info!(
@@ -494,20 +512,38 @@ impl LoopController {
         let mut active_prompt_variants: std::collections::HashMap<String, String> = {
             let mut variants = std::collections::HashMap::new();
             for agent_type in &["spec_analyst", "locator", "implementer", "verifier"] {
-                if let Ok(Some(variant)) = crate::meta_optimizer::prompt_registry::get_active_prompt(
-                    &self.checkpoint_db,
-                    agent_type,
-                ) {
+                // Use PG prompt registry when available, fall back to SQLite
+                let variant_opt = if let Some(ref pg) = self.app_state.pg_db {
+                    pg.get_active_prompt(agent_type).await.ok().flatten()
+                } else {
+                    crate::meta_optimizer::prompt_registry::get_active_prompt(
+                        &self.checkpoint_db,
+                        agent_type,
+                    )
+                    .ok()
+                    .flatten()
+                };
+                if let Some(variant) = variant_opt {
                     debug!(
                         "MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
                         variant.variant_name, variant.version, agent_type
                     );
-                    // Route through canary A/B split if an active canary exists
-                    let resolved = crate::meta_optimizer::canary::resolve_prompt_with_canary(
-                        &self.checkpoint_db,
-                        agent_type,
-                        &variant.prompt_content,
-                    );
+                    // Route through canary A/B split if an active canary exists.
+                    // Use PG canary resolution when available, fall back to SQLite.
+                    let resolved = if let Some(ref pg) = self.app_state.pg_db {
+                        crate::meta_optimizer::canary::resolve_prompt_with_canary_pg(
+                            pg,
+                            agent_type,
+                            &variant.prompt_content,
+                        )
+                        .await
+                    } else {
+                        crate::meta_optimizer::canary::resolve_prompt_with_canary(
+                            &self.checkpoint_db,
+                            agent_type,
+                            &variant.prompt_content,
+                        )
+                    };
                     if let Some(ref cid) = resolved.canary_id {
                         info!(
                             "MULTI-AGENT-PIPELINE: Canary {} active for {}, using {} version",

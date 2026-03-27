@@ -59,7 +59,12 @@ pub async fn get_shell_command_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ShellCommand>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.get_shell_command(&id) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_shell_command(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_shell_command(&id)
+    };
+    match result {
         Ok(Some(command)) => Ok(Json(ApiResponse::success(command))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -81,7 +86,12 @@ pub async fn create_shell_command_handler(
     Json(input): Json<CreateShellCommandInput>,
 ) -> Result<Json<ApiResponse<ShellCommand>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Creating shell command: {}", input.name);
-    match state.app_state.checkpoint_db.create_shell_command(&input) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.create_shell_command(&input).await
+    } else {
+        state.app_state.checkpoint_db.create_shell_command(&input)
+    };
+    match result {
         Ok(command) => {
             info!("Created shell command: {} ({})", command.name, command.id);
             Ok(Json(ApiResponse::success(command)))
@@ -132,7 +142,12 @@ pub async fn delete_shell_command_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Deleting shell command: {}", id);
-    match state.app_state.checkpoint_db.delete_shell_command(&id) {
+    let del_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.delete_shell_command(&id).await
+    } else {
+        state.app_state.checkpoint_db.delete_shell_command(&id)
+    };
+    match del_result {
         Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
             "deleted": true,
             "id": id

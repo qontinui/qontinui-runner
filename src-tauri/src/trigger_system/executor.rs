@@ -179,6 +179,7 @@ pub fn execute_triggered_workflow(
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
@@ -199,6 +200,7 @@ pub fn execute_triggered_workflow(
         execution_id.clone(),
         wf_name,
         url_lock,
+        deps.app_state.pg_db.clone(),
         Box::pin(async move {
             let mut controller = crate::unified_workflow_executor::LoopController::new(
                 app_state,

@@ -24,7 +24,13 @@ pub async fn list_saved_api_requests(
     Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state.app_state.checkpoint_db.list_saved_api_requests() {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.list_saved_api_requests().await
+            .map(|v| serde_json::from_value::<Vec<crate::saved_api_requests::SavedApiRequest>>(serde_json::Value::Array(v)).unwrap_or_default())
+    } else {
+        state.app_state.checkpoint_db.list_saved_api_requests()
+    };
+    match result {
         Ok(requests) => Ok(Json(ApiResponse::success(requests))),
         Err(e) => {
             error!("Failed to list saved API requests: {}", e);
@@ -47,7 +53,13 @@ pub async fn get_saved_api_request(
     Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state.app_state.checkpoint_db.get_saved_api_request(&id) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_saved_api_request(&id).await
+            .map(|opt| opt.and_then(|v| serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(v).ok()))
+    } else {
+        state.app_state.checkpoint_db.get_saved_api_request(&id)
+    };
+    match result {
         Ok(Some(request)) => Ok(Json(ApiResponse::success(request))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -145,7 +157,12 @@ pub async fn delete_saved_api_request(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Deleting saved API request: {}", id);
-    match state.app_state.checkpoint_db.delete_saved_api_request(&id) {
+    let del_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.delete_saved_api_request(&id).await
+    } else {
+        state.app_state.checkpoint_db.delete_saved_api_request(&id)
+    };
+    match del_result {
         Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
             "deleted": true,
             "id": id
@@ -218,7 +235,12 @@ pub async fn get_saved_api_request_categories(
 pub async fn get_saved_api_request_tags(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.get_saved_api_request_tags() {
+    let tags_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_saved_api_request_tags().await
+    } else {
+        state.app_state.checkpoint_db.get_saved_api_request_tags()
+    };
+    match tags_result {
         Ok(tags) => Ok(Json(ApiResponse::success(tags))),
         Err(e) => {
             error!("Failed to get saved API request tags: {}", e);

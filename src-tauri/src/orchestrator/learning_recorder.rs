@@ -163,9 +163,12 @@ pub fn infer_domain_tags(
 
 /// Compute a complexity tier from step counts, iteration count, and duration.
 ///
+/// 5 tiers matching the Q-learning state space:
+/// - "trivial": single-step, no iterations, very fast
 /// - "simple": few steps, low iterations, fast
 /// - "moderate": medium complexity
 /// - "complex": many steps, high iterations, or long duration
+/// - "highly_complex": extreme step counts, many iterations, very long duration
 pub fn compute_complexity_tier(
     step_count: Option<i64>,
     iterations: u32,
@@ -175,11 +178,13 @@ pub fn compute_complexity_tier(
     let steps = step_count.unwrap_or(0);
     let agentic = agentic_step_count.unwrap_or(0);
 
-    // Heuristic: score based on multiple factors
+    // Heuristic: score based on multiple factors (0-11 range)
     let mut score: u32 = 0;
 
-    // Step count contribution
-    if steps > 15 {
+    // Step count contribution (0-4)
+    if steps > 30 {
+        score += 4;
+    } else if steps > 15 {
         score += 3;
     } else if steps > 8 {
         score += 2;
@@ -187,33 +192,39 @@ pub fn compute_complexity_tier(
         score += 1;
     }
 
-    // Agentic step count contribution (more agentic = more complex)
-    if agentic > 5 {
+    // Agentic step count contribution (0-3)
+    if agentic > 10 {
+        score += 3;
+    } else if agentic > 5 {
         score += 2;
     } else if agentic > 2 {
         score += 1;
     }
 
-    // Iteration contribution
+    // Iteration contribution (0-2)
     if iterations > 5 {
         score += 2;
     } else if iterations > 2 {
         score += 1;
     }
 
-    // Duration contribution
+    // Duration contribution (0-2)
     if duration_secs > 600.0 {
         score += 2;
     } else if duration_secs > 120.0 {
         score += 1;
     }
 
-    if score >= 5 {
+    if score >= 8 {
+        "highly_complex".to_string()
+    } else if score >= 5 {
         "complex".to_string()
     } else if score >= 2 {
         "moderate".to_string()
-    } else {
+    } else if score >= 1 {
         "simple".to_string()
+    } else {
+        "trivial".to_string()
     }
 }
 
@@ -522,9 +533,169 @@ pub fn record_workflow_learning(
         );
     }
 
+    // Update Q-routing table with this outcome (non-fatal on failure)
+    if let Err(e) = update_q_routing_table(conn, outcome) {
+        tracing::warn!(
+            "Failed to update Q-routing table for task {}: {}",
+            outcome.task_run_id,
+            e
+        );
+    }
+
     debug!(
         "Recorded learning for task {}: outcome={}, patterns={:?}",
         outcome.task_run_id, outcome_id, pattern_ids
+    );
+
+    Ok(())
+}
+
+/// Update the Q-routing table after a workflow outcome.
+///
+/// Extracts TaskState from the outcome's tags, computes reward from the
+/// composite agentic score, and performs a Q-value update for the
+/// (state, architecture) pair.
+fn update_q_routing_table(
+    conn: &Connection,
+    outcome: &WorkflowOutcome,
+) -> Result<(), String> {
+    use crate::autoresearch::q_router::{QRouter, TaskState};
+
+    // Need architecture, tags, and composite score to do a Q-update
+    let architecture = match outcome.workflow_architecture.as_deref() {
+        Some(arch) if !arch.is_empty() => arch,
+        _ => return Ok(()), // No architecture recorded — skip
+    };
+
+    // Infer tags (same logic used in record_learning_outcome)
+    let technology_tags = infer_technology_tags(&outcome.files_modified);
+    let technology_tags_json =
+        serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+    let domain_tags = infer_domain_tags(
+        &outcome.files_modified,
+        &outcome.workflow_name,
+        &outcome.category,
+        outcome.has_ui_bridge,
+    );
+    let domain_tags_json = serde_json::to_string(&domain_tags).unwrap_or_else(|_| "[]".into());
+    let complexity_tier = compute_complexity_tier(
+        outcome.step_count,
+        outcome.iterations,
+        outcome.duration_secs,
+        outcome.agentic_step_count,
+    );
+
+    let task_state = TaskState::from_outcome_tags(&technology_tags_json, &domain_tags_json, &complexity_tier);
+
+    // Load the composite agentic score from the DB (just persisted by score_and_persist_agentic_metrics)
+    let composite_score: f64 = conn
+        .query_row(
+            "SELECT COALESCE(composite_agentic_score, 0.0) FROM learning_outcomes WHERE task_id = ?1",
+            params![outcome.task_run_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    if composite_score < 0.0 {
+        return Ok(()); // Invalid score — skip
+    }
+    // Note: composite_score == 0.0 (failures) intentionally updates Q-table
+    // so that architectures that fail are penalized.
+
+    let reward = QRouter::compute_reward(composite_score, outcome.total_cost_usd);
+    let state_key = task_state.to_key();
+
+    // Load current Q-entry from SQLite
+    let (current_q, current_visits): (f64, u32) = conn
+        .query_row(
+            "SELECT q_value, visit_count FROM q_routing_table WHERE state_key = ?1 AND action = ?2",
+            params![state_key, architecture],
+            |row| Ok((row.get(0)?, row.get::<_, i32>(1)? as u32)),
+        )
+        .unwrap_or((0.0, 0));
+
+    // Q-update: Q(s,a) ← Q(s,a) + α * (reward - Q(s,a))
+    let alpha = 0.1;
+    let new_q = current_q + alpha * (reward - current_q);
+    let new_visits = current_visits + 1;
+    let now = Utc::now().to_rfc3339();
+
+    conn.execute(
+        r#"INSERT INTO q_routing_table (state_key, action, q_value, visit_count, last_updated)
+           VALUES (?1, ?2, ?3, ?4, ?5)
+           ON CONFLICT(state_key, action) DO UPDATE SET
+               q_value = ?3,
+               visit_count = ?4,
+               last_updated = ?5"#,
+        params![state_key, architecture, new_q, new_visits as i32, now],
+    )
+    .map_err(|e| format!("Failed to upsert Q-routing entry: {}", e))?;
+
+    info!(
+        "Q-routing update: state={}, arch={}, reward={:.3}, Q={:.3}→{:.3}, visits={}",
+        task_state, architecture, reward, current_q, new_q, new_visits
+    );
+
+    Ok(())
+}
+
+/// Update the Q-routing table in PostgreSQL (PG-first strategy).
+///
+/// Computes the Q-value update against PG's current state. This is the
+/// authoritative write path — SQLite is updated separately as a fallback.
+/// Supports multi-instance deployments where multiple runners share PG.
+pub async fn update_q_routing_table_pg(
+    pg: &crate::database::pg::PgDb,
+    outcome: &WorkflowOutcome,
+    composite_score: f64,
+) -> Result<(), String> {
+    use crate::autoresearch::q_router::{QRouter, TaskState};
+
+    let architecture = match outcome.workflow_architecture.as_deref() {
+        Some(arch) if !arch.is_empty() => arch,
+        _ => return Ok(()),
+    };
+
+    if composite_score < 0.0 {
+        return Ok(());
+    }
+
+    let technology_tags = infer_technology_tags(&outcome.files_modified);
+    let technology_tags_json = serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+    let domain_tags = infer_domain_tags(
+        &outcome.files_modified,
+        &outcome.workflow_name,
+        &outcome.category,
+        outcome.has_ui_bridge,
+    );
+    let domain_tags_json = serde_json::to_string(&domain_tags).unwrap_or_else(|_| "[]".into());
+    let complexity_tier = compute_complexity_tier(
+        outcome.step_count,
+        outcome.iterations,
+        outcome.duration_secs,
+        outcome.agentic_step_count,
+    );
+
+    let task_state = TaskState::from_outcome_tags(&technology_tags_json, &domain_tags_json, &complexity_tier);
+    let state_key = task_state.to_key();
+
+    // Load current Q-entry from PG
+    let entries = pg.get_q_entries_for_state(&state_key).await.unwrap_or_default();
+    let (current_q, current_visits) = entries.iter()
+        .find(|(a, _, _)| a == architecture)
+        .map(|(_, q, v)| (*q, *v))
+        .unwrap_or((0.0, 0));
+
+    let reward = QRouter::compute_reward(composite_score, outcome.total_cost_usd);
+    let alpha = 0.1;
+    let new_q = current_q + alpha * (reward - current_q);
+    let new_visits = current_visits + 1;
+
+    pg.upsert_q_entry(&state_key, architecture, new_q, new_visits).await?;
+
+    info!(
+        "PG Q-routing update: state={}, arch={}, reward={:.3}, Q={:.3}→{:.3}, visits={}",
+        task_state, architecture, reward, current_q, new_q, new_visits
     );
 
     Ok(())

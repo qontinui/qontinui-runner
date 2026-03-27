@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use tracing::warn;
 
+use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 use crate::step_event_builder::StepEventBuilder;
 use crate::step_metadata::{StepDetails, StepMetadata};
@@ -55,6 +56,8 @@ pub struct StepEventLogger {
     tracker: TrackerHandle,
     /// Database for persisting events
     checkpoint_db: Arc<CheckpointDb>,
+    /// PostgreSQL database (PG-primary, SQLite fallback)
+    pg_db: Option<Arc<PgDb>>,
     /// Workflow name for event context
     workflow_name: String,
 }
@@ -64,6 +67,7 @@ impl std::fmt::Debug for StepEventLogger {
         f.debug_struct("StepEventLogger")
             .field("tracker", &self.tracker)
             .field("checkpoint_db", &"<CheckpointDb>")
+            .field("pg_db", &self.pg_db.as_ref().map(|_| "<PgDb>"))
             .field("workflow_name", &self.workflow_name)
             .finish()
     }
@@ -77,6 +81,7 @@ impl StepEventLogger {
     /// only parent IDs exist in task_runs (required by foreign key constraint).
     pub fn new(
         checkpoint_db: Arc<CheckpointDb>,
+        pg_db: Option<Arc<PgDb>>,
         execution_id: impl Into<String>,
         workflow_name: impl Into<String>,
     ) -> Self {
@@ -87,6 +92,7 @@ impl StepEventLogger {
         Self {
             tracker: TrackerHandle::new(parent_id),
             checkpoint_db,
+            pg_db,
             workflow_name: workflow_name.into(),
         }
     }
@@ -107,6 +113,7 @@ impl StepEventLogger {
         Self {
             tracker: TrackerHandle::new("noop"),
             checkpoint_db: Arc::new(db),
+            pg_db: None,
             workflow_name: String::new(),
         }
     }
@@ -150,6 +157,16 @@ impl StepEventLogger {
 
         let event = builder.build_start();
 
+        // PG-primary: fire-and-forget async write to PostgreSQL
+        if let Some(pg) = &self.pg_db {
+            let pg = pg.clone();
+            let event_clone = event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                    tracing::warn!("PG step start event write failed: {}", e);
+                }
+            });
+        }
         if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
             warn!("Failed to log step start event: {}", e);
             return Err(LogError::DatabaseError(e.to_string()));
@@ -192,6 +209,16 @@ impl StepEventLogger {
 
         let event = builder.build_complete(duration_ms);
 
+        // PG-primary: fire-and-forget async write to PostgreSQL
+        if let Some(pg) = &self.pg_db {
+            let pg = pg.clone();
+            let event_clone = event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                    tracing::warn!("PG step complete event write failed: {}", e);
+                }
+            });
+        }
         if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
             warn!("Failed to log step complete event: {}", e);
             return Err(LogError::DatabaseError(e.to_string()));
@@ -235,6 +262,16 @@ impl StepEventLogger {
 
         let event = builder.build_error(duration_ms, error);
 
+        // PG-primary: fire-and-forget async write to PostgreSQL
+        if let Some(pg) = &self.pg_db {
+            let pg = pg.clone();
+            let event_clone = event.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.create_task_run_event(&event_clone).await {
+                    tracing::warn!("PG step error event write failed: {}", e);
+                }
+            });
+        }
         if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
             warn!("Failed to log step error event: {}", e);
             return Err(LogError::DatabaseError(e.to_string()));

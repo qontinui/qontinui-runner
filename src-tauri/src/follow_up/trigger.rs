@@ -326,6 +326,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
         exec_id,
         wf_name,
         url_lock,
+        deps.app_state.pg_db.clone(),
         Box::pin(async move {
             controller
                 .run(

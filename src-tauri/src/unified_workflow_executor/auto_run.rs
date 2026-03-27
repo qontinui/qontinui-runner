@@ -159,6 +159,7 @@ pub fn launch_generated_workflow(
         agentic_verification_config: None,
         multi_agent_pipeline_config: None,
         rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+        escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
         iteration_diffs: Vec::new(),
         active_canary: None,
         is_canary_run: false,
@@ -169,6 +170,7 @@ pub fn launch_generated_workflow(
     let wf_name = workflow.name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let checkpoint_db = deps.app_state.checkpoint_db.clone();
+    let pg_db = deps.app_state.pg_db.clone();
     let app_state = deps.app_state;
     let config_storage = deps.config_storage;
     let app_handle = deps.app_handle;
@@ -179,6 +181,7 @@ pub fn launch_generated_workflow(
         execution_id.clone(),
         wf_name,
         url_lock,
+        pg_db,
         Box::pin(async move {
             let mut controller = super::LoopController::new(
                 app_state,

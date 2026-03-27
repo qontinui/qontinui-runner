@@ -166,11 +166,16 @@ pub async fn list_checks_handler(
     Query(query): Query<ListChecksQuery>,
 ) -> Result<Json<ApiResponse<Vec<Check>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let enabled_only = query.enabled_only.unwrap_or(false);
-    match state.app_state.checkpoint_db.list_checks(
-        enabled_only,
-        query.check_type.as_deref(),
-        query.tool.as_deref(),
-    ) {
+    let list_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.list_checks().await
+    } else {
+        state.app_state.checkpoint_db.list_checks(
+            enabled_only,
+            query.check_type.as_deref(),
+            query.tool.as_deref(),
+        )
+    };
+    match list_result {
         Ok(checks) => Ok(Json(ApiResponse::success(checks))),
         Err(e) => {
             error!("Failed to list checks: {}", e);
@@ -187,7 +192,12 @@ pub async fn get_check_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Check>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.get_check(&id) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_check(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_check(&id)
+    };
+    match result {
         Ok(Some(check)) => Ok(Json(ApiResponse::success(check))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -209,7 +219,12 @@ pub async fn create_check_handler(
     Json(input): Json<CreateCheckInput>,
 ) -> Result<Json<ApiResponse<Check>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Creating check: {}", input.name);
-    match state.app_state.checkpoint_db.create_check(&input) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.create_check(&input).await
+    } else {
+        state.app_state.checkpoint_db.create_check(&input)
+    };
+    match result {
         Ok(check) => {
             info!("Created check: {} ({})", check.name, check.id);
             Ok(Json(ApiResponse::success(check)))
@@ -231,7 +246,12 @@ pub async fn update_check_handler(
     Json(input): Json<UpdateCheckInput>,
 ) -> Result<Json<ApiResponse<Check>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Updating check: {}", id);
-    match state.app_state.checkpoint_db.update_check(&id, &input) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.update_check(&id, &input).await
+    } else {
+        state.app_state.checkpoint_db.update_check(&id, &input)
+    };
+    match result {
         Ok(check) => {
             info!("Updated check: {} ({})", check.name, check.id);
             Ok(Json(ApiResponse::success(check)))
@@ -256,7 +276,12 @@ pub async fn delete_check_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Deleting check: {}", id);
-    match state.app_state.checkpoint_db.delete_check(&id) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.delete_check(&id).await
+    } else {
+        state.app_state.checkpoint_db.delete_check(&id)
+    };
+    match result {
         Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
             "deleted": true,
             "id": id
@@ -313,7 +338,12 @@ pub async fn get_check_group_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<CheckGroup>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.get_check_group(&id) {
+    let cg_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_check_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_check_group(&id)
+    };
+    match cg_result {
         Ok(Some(group)) => Ok(Json(ApiResponse::success(group))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -335,7 +365,12 @@ pub async fn create_check_group_handler(
     Json(input): Json<CreateCheckGroupInput>,
 ) -> Result<Json<ApiResponse<CheckGroup>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Creating check group: {}", input.name);
-    match state.app_state.checkpoint_db.create_check_group(&input) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.create_check_group(&input).await
+    } else {
+        state.app_state.checkpoint_db.create_check_group(&input)
+    };
+    match result {
         Ok(group) => {
             info!("Created check group: {} ({})", group.name, group.id);
             Ok(Json(ApiResponse::success(group)))
@@ -386,7 +421,12 @@ pub async fn delete_check_group_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Deleting check group: {}", id);
-    match state.app_state.checkpoint_db.delete_check_group(&id) {
+    let del_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.delete_check_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.delete_check_group(&id)
+    };
+    match del_result {
         Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
             "deleted": true,
             "id": id
@@ -433,7 +473,12 @@ pub async fn run_check_handler(
     info!("HTTP: Running check: {}", id);
 
     // Get the check from database
-    let check = match state.app_state.checkpoint_db.get_check(&id) {
+    let check_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_check(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_check(&id)
+    };
+    let check = match check_result {
         Ok(Some(c)) => c,
         Ok(None) => {
             return Err((
@@ -536,7 +581,12 @@ pub async fn get_checks_in_group_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<Check>>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Verify group exists
-    match state.app_state.checkpoint_db.get_check_group(&id) {
+    let cg_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_check_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_check_group(&id)
+    };
+    match cg_result {
         Ok(None) => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -553,7 +603,12 @@ pub async fn get_checks_in_group_handler(
         Ok(Some(_)) => {}
     }
 
-    match state.app_state.checkpoint_db.get_checks_in_group(&id) {
+    let cig_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_checks_in_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_checks_in_group(&id)
+    };
+    match cig_result {
         Ok(checks) => Ok(Json(ApiResponse::success(checks))),
         Err(e) => {
             error!("Failed to get checks in group {}: {}", id, e);
@@ -584,7 +639,12 @@ pub async fn set_checks_in_group_handler(
     );
 
     // Verify group exists
-    match state.app_state.checkpoint_db.get_check_group(&id) {
+    let cg_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_check_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_check_group(&id)
+    };
+    match cg_result {
         Ok(None) => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -631,7 +691,12 @@ pub async fn run_check_group_handler(
     info!("HTTP: Running check group: {}", id);
 
     // Get the group
-    let group = match state.app_state.checkpoint_db.get_check_group(&id) {
+    let grp_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_check_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_check_group(&id)
+    };
+    let group = match grp_result {
         Ok(Some(g)) => g,
         Ok(None) => {
             return Err((
@@ -649,7 +714,12 @@ pub async fn run_check_group_handler(
     };
 
     // Get checks in group
-    let checks = match state.app_state.checkpoint_db.get_checks_in_group(&id) {
+    let checks_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_checks_in_group(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_checks_in_group(&id)
+    };
+    let checks = match checks_result {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to get checks in group: {}", e);

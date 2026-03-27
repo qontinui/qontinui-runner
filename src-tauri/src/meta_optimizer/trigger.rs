@@ -614,6 +614,7 @@ fn launch_optimizer_internal(
             exec_id,
             wf_name,
             url_lock,
+            app_state.pg_db.clone(),
             Box::pin(async move {
                 controller
                     .run(

@@ -653,7 +653,12 @@ pub async fn export_unified_workflow(
 > {
     info!("Exporting unified workflow: {}", id);
 
-    match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+    let export_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_unified_workflow(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_unified_workflow(&id)
+    };
+    match export_result {
         Ok(Some(workflow)) => {
             let export = crate::unified_workflows::WorkflowExport {
                 manifest: crate::unified_workflows::WorkflowExportManifest {
@@ -1095,6 +1100,7 @@ pub async fn generate_unified_workflow_async_handler(
             execution_id_for_guard,
             workflow_name,
             url_lock,
+            state.app_state.pg_db.clone(),
             async move {
                 let mut controller =
                     LoopController::new(app_state, config_storage, app_handle, pid_tracker)
@@ -1224,7 +1230,12 @@ pub async fn run_unified_workflow(
     info!("Running unified workflow: {}", id);
 
     // Fetch the workflow
-    let mut workflow = match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+    let wf_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_unified_workflow(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_unified_workflow(&id)
+    };
+    let mut workflow = match wf_result {
         Ok(Some(w)) => w,
         Ok(None) => {
             return Err((
@@ -1513,6 +1524,7 @@ pub async fn run_unified_workflow(
             execution_id_for_guard,
             workflow_name_for_guard,
             url_lock,
+            app_state.pg_db.clone(),
             async move {
                 let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
                     .state::<Arc<crate::claude_session::SessionManager>>()
@@ -1612,6 +1624,7 @@ pub async fn run_unified_workflow(
         execution_id_for_guard,
         workflow_name_for_guard,
         url_lock,
+        app_state.pg_db.clone(),
         async move {
             let executor = crate::step_executor::StepExecutor::with_app_handle(
                 app_state.clone(),
@@ -1640,7 +1653,12 @@ pub async fn run_unified_workflow(
             );
 
             if result.success {
-                if let Err(e) = app_state.checkpoint_db.complete_task_run(&execution_id) {
+                let complete_err = if let Some(pg) = &app_state.pg_db {
+                    pg.complete_task_run(&execution_id).await.err()
+                } else {
+                    app_state.checkpoint_db.complete_task_run(&execution_id).err()
+                };
+                if let Some(e) = complete_err {
                     warn!(
                         "Failed to mark task_run {} as completed: {}",
                         execution_id, e
@@ -1968,6 +1986,7 @@ pub async fn execute_inline_workflow(
             project_path: crate::mcp::shared::current_project_path(),
             acceptance_criteria: workflow.acceptance_criteria.clone(),
             rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+            escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
             iteration_diffs: Vec::new(),
             active_canary: None,
             is_canary_run: false,
@@ -2034,6 +2053,7 @@ pub async fn execute_inline_workflow(
             execution_id_for_guard,
             workflow_name_for_guard,
             None,
+            app_state.pg_db.clone(),
             async move {
                 let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
                     .state::<Arc<crate::claude_session::SessionManager>>()
@@ -2180,7 +2200,12 @@ pub async fn get_unified_workflow_stats(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<WorkflowStats>>, (StatusCode, Json<ApiResponse<()>>)> {
     // First verify the workflow exists
-    let workflow = match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+    let wf_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_unified_workflow(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_unified_workflow(&id)
+    };
+    let workflow = match wf_result {
         Ok(Some(w)) => w,
         Ok(None) => {
             return Err((
@@ -2198,6 +2223,25 @@ pub async fn get_unified_workflow_stats(
     };
 
     // Query stats from task_runs table by workflow_name
+    if let Some(pg) = &state.app_state.pg_db {
+        match pg.get_workflow_stats(&workflow.name).await {
+            Ok((total, success, failure, last_at, last_status, avg_dur)) => {
+                return Ok(Json(ApiResponse::success(WorkflowStats {
+                    total_runs: total,
+                    success_count: success,
+                    failure_count: failure,
+                    last_run_at: last_at,
+                    last_run_status: last_status,
+                    avg_duration_ms: avg_dur,
+                })));
+            }
+            Err(e) => {
+                error!("PG workflow stats error: {}", e);
+                // Fall through to SQLite
+            }
+        }
+    }
+
     let conn = match state.app_state.checkpoint_db.connection() {
         Ok(c) => c,
         Err(e) => {
@@ -2235,7 +2279,6 @@ pub async fn get_unified_workflow_stats(
                 failure_count: row.get::<_, i64>(2)? as u32,
                 last_run_at: row.get(3)?,
                 last_run_status: row.get(4)?,
-                // AVG() returns a float, so we need to convert it to i64
                 avg_duration_ms: row.get::<_, Option<f64>>(5)?.map(|f| f as i64),
             })
         },
@@ -2309,7 +2352,12 @@ pub async fn run_composed_workflow(
     // Fetch all workflows and validate they exist
     let mut workflows: Vec<crate::unified_workflows::UnifiedWorkflow> = Vec::new();
     for id in &request.workflow_ids {
-        match state.app_state.checkpoint_db.get_unified_workflow(id) {
+        let wf_result = if let Some(pg) = &state.app_state.pg_db {
+            pg.get_unified_workflow(id).await
+        } else {
+            state.app_state.checkpoint_db.get_unified_workflow(id)
+        };
+        match wf_result {
             Ok(Some(w)) => workflows.push(w),
             Ok(None) => {
                 return Err((
@@ -2389,7 +2437,12 @@ pub async fn run_composed_workflow(
         .with_workflow_name(workflow_names.join(", "))
         .with_auto_continue(true)
         .with_workflow_type("unified");
-    if let Err(e) = state.app_state.checkpoint_db.create_task_run(&input) {
+    let cr_err = if let Some(pg) = &state.app_state.pg_db {
+        pg.create_task_run(&input).await.err()
+    } else {
+        state.app_state.checkpoint_db.create_task_run(&input).err()
+    };
+    if let Some(e) = cr_err {
         warn!("Failed to create task_run for composed workflow: {}", e);
     }
 
@@ -2412,6 +2465,7 @@ pub async fn run_composed_workflow(
         execution_id_for_guard,
         sequence_name_for_guard,
         url_lock_for_composed,
+        state.app_state.pg_db.clone(),
         async move {
             info!(
                 "Starting composed workflow execution: {} stages",
@@ -2473,6 +2527,7 @@ pub async fn run_composed_workflow(
                 project_path: crate::mcp::shared::current_project_path(),
                 acceptance_criteria: None,
                 rollback_policy: crate::unified_workflow_executor::RollbackPolicy::None,
+                escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
                 iteration_diffs: Vec::new(),
                 active_canary: None,
                 is_canary_run: false,

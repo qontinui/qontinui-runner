@@ -253,10 +253,13 @@ impl QueryRoot {
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let runs = if let Some(pg) = &state.app_state.pg_db {
-            pg.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
-                .await.map_err(|e| Error::new(e))?
-        } else {
+        let runs = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port)).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for task_runs, falling back to SQLite: {}", e),
+                }
+            }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || {
                 db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
@@ -276,9 +279,13 @@ impl QueryRoot {
         id: String,
     ) -> Result<Option<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let run = if let Some(pg) = &state.app_state.pg_db {
-            pg.get_task_run(&id).await.map_err(|e| Error::new(e))?
-        } else {
+        let run = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.get_task_run(&id).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for task_run, falling back to SQLite: {}", e),
+                }
+            }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.get_task_run(&id))
                 .await
@@ -299,13 +306,21 @@ impl QueryRoot {
         #[graphql(default = 10000)] limit: i32,
     ) -> Result<super::types::GqlTaskRunOutput> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
-        let id_clone = id.clone();
 
-        let full_output = tokio::task::spawn_blocking(move || db.get_full_task_output(&id_clone))
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?;
+        let full_output = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.get_task_output(&id).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for task_run_output, falling back to SQLite: {}", e),
+                }
+            }
+            let db = state.app_state.checkpoint_db.clone();
+            let id_clone = id.clone();
+            tokio::task::spawn_blocking(move || db.get_full_task_output(&id_clone))
+                .await
+                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+                .map_err(|e| Error::new(e))?
+        };
 
         let total_length = full_output.len() as i32;
         let offset = offset.max(0) as usize;
@@ -377,9 +392,13 @@ impl QueryRoot {
     ) -> Result<Vec<super::types::GqlWorkflowSummary>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let workflows = if let Some(pg) = &state.app_state.pg_db {
-            pg.list_unified_workflows().await.map_err(|e| Error::new(e))?
-        } else {
+        let workflows = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.list_unified_workflows().await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for workflows, falling back to SQLite: {}", e),
+                }
+            }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.list_unified_workflows())
                 .await
@@ -417,9 +436,13 @@ impl QueryRoot {
     ) -> Result<Option<super::types::GqlWorkflow>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let workflow = if let Some(pg) = &state.app_state.pg_db {
-            pg.get_unified_workflow(&id).await.map_err(|e| Error::new(e))?
-        } else {
+        let workflow = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.get_unified_workflow(&id).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for workflow, falling back to SQLite: {}", e),
+                }
+            }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.get_unified_workflow(&id))
                 .await

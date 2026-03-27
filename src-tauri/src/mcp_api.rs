@@ -100,16 +100,23 @@ async fn health(
     };
     let circuit_breaker_state = state.ui_bridge_circuit_breaker.get_state().await;
 
+    let status = if last_pong > 0 { "ok" } else { "starting" };
+    let console_errors = state
+        .ui_bridge_console_error_count
+        .load(Ordering::Relaxed);
+
     Json(serde_json::json!({
         "success": true,
         "data": {
-            "status": "ok",
+            "status": status,
+            "ready": last_pong > 0,
             "responsive": responsive,
             "lastHeartbeat": last_pong,
             "heartbeatAgeMs": pong_age_ms,
             "uptimeSeconds": uptime_secs,
             "pendingRequests": pending_count,
             "circuitBreaker": format!("{:?}", circuit_breaker_state),
+            "consoleErrorCount": console_errors,
         },
         "uiBridge": {
             "appId": "qontinui-runner",
@@ -174,7 +181,9 @@ pub fn create_router(
         ui_bridge_circuit_breaker: Arc::new(crate::mcp::ui_bridge::UiBridgeCircuitBreaker::new()),
         ui_bridge_semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
         ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ui_bridge_ready: Arc::new(tokio::sync::Notify::new()),
         ui_bridge_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        ui_bridge_console_error_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ui_bridge_render_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
         started_at: std::time::Instant::now(),
@@ -222,6 +231,7 @@ pub fn create_router(
     // Set up UI Bridge pong listener for frontend liveness tracking
     {
         let last_pong = api_state.ui_bridge_last_pong.clone();
+        let ready = api_state.ui_bridge_ready.clone();
         let handle = app_handle.clone();
 
         use tauri::Listener;
@@ -232,6 +242,8 @@ pub fn create_router(
                 .unwrap()
                 .as_millis() as u64;
             last_pong.store(now, std::sync::atomic::Ordering::Relaxed);
+            // Unblock any requests waiting for frontend readiness
+            ready.notify_waiters();
         });
     }
 
@@ -455,6 +467,8 @@ pub fn create_router(
         .merge(crate::mcp::generator_eval::routes())
         .merge(crate::mcp::hooks::routes())
         .merge(crate::mcp::inngest::routes())
+        .merge(crate::mcp::api_spec_verify::routes())
+        .merge(crate::mcp::headless_browser::routes())
         .merge(crate::mcp::interaction_recording::routes())
         .merge(crate::mcp::log_sources::routes())
         .merge(crate::mcp::macros::routes())

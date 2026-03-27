@@ -5,21 +5,45 @@
 
 use std::sync::Arc;
 use tauri::State;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::commands::AppState;
 use crate::database::types::*;
+use crate::recording::content_filter::ContentFilter;
 
-/// Insert a new activity timeline entry (with automatic deduplication).
+/// Shared content filter instance (lazy-initialized).
+fn get_content_filter() -> &'static ContentFilter {
+    use std::sync::OnceLock;
+    static FILTER: OnceLock<ContentFilter> = OnceLock::new();
+    FILTER.get_or_init(ContentFilter::new)
+}
+
+/// Insert a new activity timeline entry (with PII scrubbing and deduplication).
+///
+/// Content is automatically filtered: PII is scrubbed and sensitive app windows
+/// are skipped entirely (returns -1 without storing).
 #[tauri::command]
 pub async fn insert_activity_entry(
-    input: ActivityTimelineInput,
+    mut input: ActivityTimelineInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<i64, String> {
     let pg = state
         .pg_db
         .as_ref()
         .ok_or_else(|| "PostgreSQL database not available".to_string())?;
+
+    // Content filtering: skip sensitive windows, scrub PII
+    let filter = get_content_filter();
+    let app = input.app_name.as_deref().unwrap_or("");
+    let title = input.window_title.as_deref().unwrap_or("");
+
+    if filter.should_skip(app, title) {
+        debug!("Activity timeline: skipping sensitive window '{}'", title);
+        return Ok(-1);
+    }
+
+    let result = filter.scrub(&input.text_content);
+    input.text_content = result.text;
 
     pg.insert_activity_entry(&input).await
 }

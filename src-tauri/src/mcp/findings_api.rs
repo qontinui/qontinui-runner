@@ -82,16 +82,18 @@ pub async fn update_finding_status_handler(
         )
     })?;
 
-    state
-        .app_state
-        .checkpoint_db
-        .update_finding_status(&finding_id, &status, req.resolution.as_deref(), None)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to update finding status: {}", e))),
-            )
-        })?;
+    // PG-primary, SQLite fallback
+    let update_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.update_finding_status(&finding_id, status.as_str(), req.resolution.as_deref(), None).await
+    } else {
+        state.app_state.checkpoint_db.update_finding_status(&finding_id, &status, req.resolution.as_deref(), None)
+    };
+    update_result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to update finding status: {}", e))),
+        )
+    })?;
 
     info!(
         "HTTP: Updated finding {} to status {}",
@@ -114,21 +116,23 @@ pub async fn resolve_finding_handler(
     Path(finding_id): Path<String>,
     Json(req): Json<ResolveFindingRequest>,
 ) -> Result<Json<ApiResponse<FindingMutationResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    state
-        .app_state
-        .checkpoint_db
-        .update_finding_status(
+    // PG-primary, SQLite fallback
+    let resolve_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.update_finding_status(&finding_id, "resolved", Some(&req.resolution), None).await
+    } else {
+        state.app_state.checkpoint_db.update_finding_status(
             &finding_id,
             &FindingStatus::Resolved,
             Some(&req.resolution),
             None,
         )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to resolve finding: {}", e))),
-            )
-        })?;
+    };
+    resolve_result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to resolve finding: {}", e))),
+        )
+    })?;
 
     info!("HTTP: Resolved finding {}", finding_id);
 
@@ -195,15 +199,20 @@ pub async fn clear_all_findings_handler(
 
     let mut cleared_count = 0;
 
-    // Resolve each non-terminal finding
+    // Resolve each non-terminal finding (PG-primary, SQLite fallback)
     for finding in &findings {
         if !finding.status.is_terminal() {
-            if let Err(e) = state.app_state.checkpoint_db.update_finding_status(
-                &finding.id,
-                &FindingStatus::Resolved,
-                Some("Cleared by user"),
-                None,
-            ) {
+            let clear_result = if let Some(pg) = &state.app_state.pg_db {
+                pg.update_finding_status(&finding.id, "resolved", Some("Cleared by user"), None).await
+            } else {
+                state.app_state.checkpoint_db.update_finding_status(
+                    &finding.id,
+                    &FindingStatus::Resolved,
+                    Some("Cleared by user"),
+                    None,
+                )
+            };
+            if let Err(e) = clear_result {
                 info!("HTTP: Failed to clear finding {}: {}", finding.id, e);
                 continue;
             }

@@ -298,19 +298,21 @@ pub async fn create_ai_session(
     );
 
     // 1. Create task run record in DB
-    let db = app_state.checkpoint_db.clone();
-    let id_clone = task_run_id.clone();
-    let name_clone = name.clone();
-    let create_result = tokio::task::spawn_blocking(move || {
-        db.create_task_run(
-            &CreateTaskRunInput::new(id_clone, name_clone)
-                .with_prompt("AI session")
-                .with_workflow_type("chat"),
-        )
-    })
-    .await;
+    let input = CreateTaskRunInput::new(task_run_id.clone(), name.clone())
+        .with_prompt("AI session")
+        .with_workflow_type("chat");
+    let create_ok = if let Some(pg) = &app_state.pg_db {
+        pg.create_task_run(&input).await.is_ok()
+    } else {
+        let db = app_state.checkpoint_db.clone();
+        let input_clone = input;
+        tokio::task::spawn_blocking(move || db.create_task_run(&input_clone))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+    };
 
-    if create_result.is_err() || create_result.as_ref().unwrap().is_err() {
+    if !create_ok {
         return Ok(CommandResponse {
             success: false,
             message: Some("Failed to create task run record".to_string()),
@@ -411,10 +413,14 @@ pub async fn close_ai_session(
     }
 
     // Update DB status
-    let db = app_state.checkpoint_db.clone();
-    let id_clone = task_run_id.clone();
-    let _ =
-        tokio::task::spawn_blocking(move || db.update_task_run_status(&id_clone, "stopped")).await;
+    if let Some(pg) = &app_state.pg_db {
+        let _ = pg.update_task_run_status(&task_run_id, "stopped").await;
+    } else {
+        let db = app_state.checkpoint_db.clone();
+        let id_clone = task_run_id.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || db.update_task_run_status(&id_clone, "stopped")).await;
+    }
 
     // Emit closed state
     emit_session_state(
@@ -447,14 +453,20 @@ pub async fn rename_ai_session(
         task_run_id, name
     );
 
-    let db = app_state.checkpoint_db.clone();
-    let id_clone = task_run_id.clone();
-    let name_clone = name.clone();
-    let result =
-        tokio::task::spawn_blocking(move || db.update_task_run_name(&id_clone, &name_clone)).await;
+    let result: Result<(), String> = if let Some(pg) = &app_state.pg_db {
+        pg.update_task_name(&task_run_id, &name).await
+    } else {
+        let db = app_state.checkpoint_db.clone();
+        let id_clone = task_run_id.clone();
+        let name_clone = name.clone();
+        match tokio::task::spawn_blocking(move || db.update_task_run_name(&id_clone, &name_clone)).await {
+            Ok(r) => r,
+            Err(e) => Err(e.to_string()),
+        }
+    };
 
     match result {
-        Ok(Ok(())) => Ok(CommandResponse {
+        Ok(()) => Ok(CommandResponse {
             success: true,
             message: Some("Session renamed".to_string()),
             data: Some(serde_json::json!({

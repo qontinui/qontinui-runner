@@ -141,6 +141,12 @@ pub(crate) struct LoopContext {
     pub pre_agentic_health: Option<super::health_monitor::HealthBaseline>,
     pub agentic_phase_start: Option<Instant>,
     pub reflection_was_forced: bool,
+
+    // Blame attribution from the current iteration (set in BuildFailureContext, consumed in PostAgentic)
+    pub blame_json: Option<String>,
+
+    // Wall-clock start time for escalation time limit checks.
+    pub loop_start_time: Instant,
 }
 
 impl LoopContext {
@@ -212,6 +218,8 @@ impl LoopContext {
             pre_agentic_health: None,
             agentic_phase_start: None,
             reflection_was_forced: false,
+            blame_json: None,
+            loop_start_time: Instant::now(),
         }
     }
 
@@ -374,6 +382,8 @@ mod tests {
             pre_agentic_health: None,
             agentic_phase_start: None,
             reflection_was_forced: false,
+            blame_json: None,
+            loop_start_time: Instant::now(),
         }
     }
 
@@ -516,6 +526,7 @@ mod tests {
             failure_context: String::new(),
             agentic_phase_ran: true,
             agentic_phase_success: Some(true),
+            blame_json: None,
         });
         ctx.iteration_results.push(IterationResult {
             iteration: 2,
@@ -526,6 +537,7 @@ mod tests {
             failure_context: String::new(),
             agentic_phase_ran: true,
             agentic_phase_success: Some(true),
+            blame_json: None,
         });
         ctx.iteration_results.push(IterationResult {
             iteration: 3,
@@ -536,6 +548,7 @@ mod tests {
             failure_context: String::new(),
             agentic_phase_ran: false,
             agentic_phase_success: None,
+            blame_json: None,
         });
 
         let result = CompletionReason::VerificationPassed.into_loop_result(&ctx);

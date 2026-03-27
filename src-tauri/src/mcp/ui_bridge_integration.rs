@@ -2138,6 +2138,449 @@ async fn handle_cache_architecture_spec(
 }
 
 // ============================================================================
+// ============================================================================
+// Page Discovery & Source Reading (AI-powered preparation)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct PageComponent {
+    route: String,
+    component_path: String,
+    component_name: String,
+    has_registrations: bool,
+    has_spec: bool,
+    has_tutorial: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoverPagesRequest {
+    project_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoverPagesResult {
+    pages: Vec<PageComponent>,
+    framework: Framework,
+}
+
+/// Walk a project and find all page/route components.
+async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, String> {
+    let project = PathBuf::from(project_path);
+    if !project.exists() {
+        return Err(format!("Project path does not exist: {}", project_path));
+    }
+
+    let analysis = analyze_project(project_path).await?;
+    let mut pages = Vec::new();
+
+    match analysis.framework {
+        Framework::NextJs => {
+            // App Router: app/**/page.tsx
+            discover_nextjs_pages(&project, &mut pages).await;
+        }
+        Framework::React => {
+            // CRA/Vite: src/pages/**/*.tsx or src/app/**/*.tsx
+            discover_react_pages(&project, &mut pages).await;
+        }
+        _ => {
+            // Generic: scan for common page patterns
+            discover_generic_pages(&project, &mut pages).await;
+        }
+    }
+
+    // Deduplicate pages by component_path
+    pages.sort_by(|a, b| a.component_path.cmp(&b.component_path));
+    pages.dedup_by(|a, b| a.component_path == b.component_path);
+
+    // Check existing artifacts for each page
+    for page in &mut pages {
+        let page_dir = project.join(&page.component_path).parent().map(|p| p.to_path_buf());
+        let page_stem = std::path::Path::new(&page.component_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("page");
+
+        // Check for useUIElement/useUIComponent in the file
+        if let Ok(content) = tokio::fs::read_to_string(project.join(&page.component_path)).await {
+            page.has_registrations =
+                content.contains("useUIElement") || content.contains("useUIComponent");
+        }
+
+        // Check for .spec.uibridge.json nearby or in specs/
+        let spec_name = format!("{}.spec.uibridge.json", page.route.trim_start_matches('/').replace('/', "-"));
+        if let Some(ref dir) = page_dir {
+            page.has_spec = dir.join(&spec_name).exists();
+        }
+        if !page.has_spec {
+            // Also check project-level specs directory
+            page.has_spec = project.join("src/specs").join(&spec_name).exists()
+                || project.join("specs").join(&spec_name).exists();
+        }
+
+        // Check for tutorial data file
+        let tutorial_name = format!("{}.ts", page.route.trim_start_matches('/').replace('/', "-"));
+        page.has_tutorial = project
+            .join("src/components/tutorial/data")
+            .join(&tutorial_name)
+            .exists();
+    }
+
+    Ok(DiscoverPagesResult {
+        pages,
+        framework: analysis.framework,
+    })
+}
+
+/// Discover pages in a Next.js App Router project.
+async fn discover_nextjs_pages(project: &PathBuf, pages: &mut Vec<PageComponent>) {
+    let app_dir = if project.join("src/app").exists() {
+        project.join("src/app")
+    } else if project.join("app").exists() {
+        project.join("app")
+    } else {
+        return;
+    };
+
+    walk_for_pages(&app_dir, project, pages, &["page.tsx", "page.jsx", "page.ts"]).await;
+
+    // Also check pages/ directory (Pages Router)
+    let pages_dir = if project.join("src/pages").exists() {
+        Some(project.join("src/pages"))
+    } else if project.join("pages").exists() {
+        Some(project.join("pages"))
+    } else {
+        None
+    };
+
+    if let Some(dir) = pages_dir {
+        walk_for_pages(&dir, project, pages, &["index.tsx", "index.jsx"]).await;
+    }
+}
+
+/// Discover pages in a React (CRA/Vite) project.
+async fn discover_react_pages(project: &PathBuf, pages: &mut Vec<PageComponent>) {
+    for dir_name in &["src/pages", "src/app", "src/views", "src/routes"] {
+        let dir = project.join(dir_name);
+        if dir.exists() {
+            walk_for_pages(
+                &dir,
+                project,
+                pages,
+                &["index.tsx", "index.jsx", "page.tsx", "page.jsx"],
+            )
+            .await;
+        }
+    }
+}
+
+/// Discover pages generically (scan common patterns).
+async fn discover_generic_pages(project: &PathBuf, pages: &mut Vec<PageComponent>) {
+    discover_react_pages(project, pages).await;
+    // Also check Next.js patterns
+    discover_nextjs_pages(project, pages).await;
+}
+
+/// Recursively walk a directory for page files.
+async fn walk_for_pages(
+    dir: &PathBuf,
+    project_root: &PathBuf,
+    pages: &mut Vec<PageComponent>,
+    page_filenames: &[&str],
+) {
+    let mut stack = vec![dir.clone()];
+
+    while let Some(current) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&current).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Skip node_modules, .next, etc.
+            if file_name.starts_with('.') || file_name == "node_modules" || file_name == ".next" {
+                continue;
+            }
+
+            if path.is_dir() {
+                stack.push(path);
+            } else if page_filenames.iter().any(|f| file_name == *f) {
+                let rel_path = path
+                    .strip_prefix(project_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+
+                // Derive route from path
+                let route = derive_route_from_path(&rel_path);
+                let component_name = derive_component_name(&rel_path);
+
+                pages.push(PageComponent {
+                    route,
+                    component_path: rel_path,
+                    component_name,
+                    has_registrations: false,
+                    has_spec: false,
+                    has_tutorial: false,
+                });
+            }
+        }
+    }
+}
+
+/// Derive a route path from a file path (e.g., "src/app/dashboard/page.tsx" -> "/dashboard").
+fn derive_route_from_path(rel_path: &str) -> String {
+    let path = rel_path
+        .replace('\\', "/")
+        .trim_start_matches("src/")
+        .trim_start_matches("app/")
+        .trim_start_matches("pages/")
+        .to_string();
+
+    let route = path
+        .trim_end_matches("/page.tsx")
+        .trim_end_matches("/page.jsx")
+        .trim_end_matches("/page.ts")
+        .trim_end_matches("/index.tsx")
+        .trim_end_matches("/index.jsx")
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".jsx");
+
+    if route.is_empty() || route == "." {
+        "/".to_string()
+    } else {
+        format!("/{}", route)
+    }
+}
+
+/// Derive a component name from a file path.
+fn derive_component_name(rel_path: &str) -> String {
+    let normalized = rel_path.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    // Use the directory name for page.tsx/index.tsx, or file stem otherwise
+    if parts.len() >= 2 {
+        let dir = parts[parts.len() - 2];
+        let mut chars = dir.chars();
+        match chars.next() {
+            Some(c) => format!("{}{}Page", c.to_uppercase(), chars.as_str()),
+            None => "Page".to_string(),
+        }
+    } else {
+        "Page".to_string()
+    }
+}
+
+// ---- Read Page Source ----
+
+#[derive(Debug, Deserialize)]
+struct ReadPageSourceRequest {
+    project_path: String,
+    component_path: String,
+    #[serde(default = "default_max_depth")]
+    max_depth: u32,
+}
+
+fn default_max_depth() -> u32 {
+    2
+}
+
+#[derive(Debug, Serialize)]
+struct ImportedFile {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadPageSourceResult {
+    main_source: String,
+    imported_sources: Vec<ImportedFile>,
+    total_lines: usize,
+}
+
+/// Read a page component and its imported child components.
+async fn read_page_source(
+    project_path: &str,
+    component_path: &str,
+    max_depth: u32,
+) -> Result<ReadPageSourceResult, String> {
+    let project = PathBuf::from(project_path);
+    let main_path = project.join(component_path);
+
+    let main_source = tokio::fs::read_to_string(&main_path)
+        .await
+        .map_err(|e| format!("Failed to read {}: {}", component_path, e))?;
+
+    let mut imported_sources = Vec::new();
+    let mut total_size = main_source.len();
+    const MAX_TOTAL_SIZE: usize = 50_000; // 50KB cap
+
+    if max_depth > 0 {
+        // Extract relative imports
+        let imports = extract_local_imports(&main_source);
+        let component_dir = main_path.parent().unwrap_or(&project);
+
+        for import_path in imports {
+            if total_size >= MAX_TOTAL_SIZE {
+                break;
+            }
+
+            // Resolve the import to an actual file
+            if let Some(resolved) = resolve_import(component_dir, &project, &import_path).await {
+                if let Ok(content) = tokio::fs::read_to_string(&resolved).await {
+                    let rel = resolved
+                        .strip_prefix(&project)
+                        .unwrap_or(&resolved)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+
+                    total_size += content.len();
+                    imported_sources.push(ImportedFile {
+                        path: rel,
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    let total_lines = main_source.lines().count()
+        + imported_sources.iter().map(|f| f.content.lines().count()).sum::<usize>();
+
+    Ok(ReadPageSourceResult {
+        main_source,
+        imported_sources,
+        total_lines,
+    })
+}
+
+/// Extract local relative import paths from TypeScript/JavaScript source.
+fn extract_local_imports(source: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    // Match: import ... from './path' or import ... from '../path' or from '@/path'
+    let re = regex::Regex::new(r#"from\s+['"](\./[^'"]+|\.{2}/[^'"]+|@/[^'"]+)['"]"#).unwrap();
+    for cap in re.captures_iter(source) {
+        if let Some(path) = cap.get(1) {
+            let p = path.as_str().to_string();
+            // Skip node_modules-style imports and css/json
+            if !p.ends_with(".css")
+                && !p.ends_with(".json")
+                && !p.ends_with(".svg")
+                && !p.ends_with(".png")
+            {
+                imports.push(p);
+            }
+        }
+    }
+    imports
+}
+
+/// Resolve TypeScript path aliases from tsconfig.json.
+/// Returns the filesystem base directory for a given alias prefix (e.g., "@/" → "src/").
+fn resolve_ts_alias(project_root: &PathBuf, alias_prefix: &str) -> Option<PathBuf> {
+    // Try tsconfig.json, then tsconfig.app.json
+    for config_name in &["tsconfig.json", "tsconfig.app.json"] {
+        let config_path = project_root.join(config_name);
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            // Strip JSON comments (// and /* */) for parsing
+            let stripped: String = content
+                .lines()
+                .map(|line| {
+                    if let Some(pos) = line.find("//") {
+                        &line[..pos]
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stripped) {
+                if let Some(paths) = parsed
+                    .get("compilerOptions")
+                    .and_then(|co| co.get("paths"))
+                    .and_then(|p| p.as_object())
+                {
+                    // Look for alias matching the prefix (e.g., "@/*" for "@/")
+                    let alias_pattern = format!("{}*", alias_prefix);
+                    if let Some(targets) = paths.get(&alias_pattern).and_then(|v| v.as_array()) {
+                        if let Some(first) = targets.first().and_then(|v| v.as_str()) {
+                            // Strip trailing /* to get the directory
+                            let dir = first.trim_end_matches("/*").trim_end_matches('*');
+                            return Some(project_root.join(dir));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve an import path to an actual file on disk.
+async fn resolve_import(
+    from_dir: &std::path::Path,
+    project_root: &PathBuf,
+    import_path: &str,
+) -> Option<PathBuf> {
+    let base = if import_path.starts_with("@/") {
+        // TypeScript path alias — resolve from tsconfig.json paths, fallback to src/
+        let alias_base = resolve_ts_alias(project_root, "@/")
+            .unwrap_or_else(|| project_root.join("src"));
+        alias_base.join(&import_path[2..])
+    } else if import_path.starts_with("~/") {
+        // Some projects use ~/ as an alias
+        let alias_base = resolve_ts_alias(project_root, "~/")
+            .unwrap_or_else(|| project_root.join("src"));
+        alias_base.join(&import_path[2..])
+    } else {
+        from_dir.join(import_path)
+    };
+
+    // Try extensions in order
+    for ext in &[".tsx", ".ts", ".jsx", ".js", "/index.tsx", "/index.ts"] {
+        let candidate = PathBuf::from(format!("{}{}", base.display(), ext));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Try the path as-is (if it already has an extension)
+    if base.exists() && base.is_file() {
+        return Some(base);
+    }
+
+    None
+}
+
+// ---- HTTP Handlers ----
+
+async fn handle_discover_pages(
+    State(_state): State<Arc<ApiState>>,
+    Json(req): Json<DiscoverPagesRequest>,
+) -> Json<ApiResponse<DiscoverPagesResult>> {
+    match discover_pages(&req.project_path).await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err(e) => Json(ApiResponse::error(e)),
+    }
+}
+
+async fn handle_read_page_source(
+    State(_state): State<Arc<ApiState>>,
+    Json(req): Json<ReadPageSourceRequest>,
+) -> Json<ApiResponse<ReadPageSourceResult>> {
+    match read_page_source(&req.project_path, &req.component_path, req.max_depth).await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err(e) => Json(ApiResponse::error(e)),
+    }
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
@@ -2168,6 +2611,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/integration/{id}",
             delete(handle_delete_integration),
+        )
+        // AI-powered page preparation
+        .route(
+            "/ui-bridge/integration/discover-pages",
+            post(handle_discover_pages),
+        )
+        .route(
+            "/ui-bridge/integration/read-page-source",
+            post(handle_read_page_source),
         )
 }
 

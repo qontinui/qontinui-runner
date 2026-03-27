@@ -556,6 +556,29 @@ pub async fn ui_bridge_request_sync(
     // 1. Check circuit breaker
     state.ui_bridge_circuit_breaker.check().await?;
 
+    // 1.5. Wait for frontend readiness if no pong has ever been received.
+    // This prevents the race condition where requests arrive before React's
+    // event listeners are set up after a supervisor-triggered restart.
+    {
+        let pong_check = state
+            .ui_bridge_last_pong
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if pong_check == 0 {
+            tracing::info!("UI Bridge: Waiting for frontend readiness (no pong received yet)");
+            let ready_timeout = std::time::Duration::from_secs(10);
+            if tokio::time::timeout(ready_timeout, state.ui_bridge_ready.notified())
+                .await
+                .is_err()
+            {
+                return Err(
+                    "UI Bridge: Frontend did not become ready within 10s. Is the WebView running?"
+                        .to_string(),
+                );
+            }
+            tracing::info!("UI Bridge: Frontend is now ready");
+        }
+    }
+
     // 2. Check frontend liveness (warn if stale, but don't fail — let IPC timeout handle it)
     let last_pong = state
         .ui_bridge_last_pong
@@ -1285,7 +1308,16 @@ pub async fn ui_bridge_get_console_errors_handler(
     });
 
     match ui_bridge_request_sync(&state, "get_console_errors", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(data) => {
+            // Update the console error count for the health endpoint
+            if let Some(errors) = data.get("errors").and_then(|e| e.as_array()) {
+                state.ui_bridge_console_error_count.store(
+                    errors.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
@@ -1300,7 +1332,10 @@ pub async fn ui_bridge_clear_console_errors_handler(
     info!("UI Bridge API: Clearing console errors");
 
     match ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(data) => {
+            state.ui_bridge_console_error_count.store(0, std::sync::atomic::Ordering::Relaxed);
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
@@ -1780,6 +1815,66 @@ pub struct PageEvaluateRequest {
     pub expression: String,
 }
 
+/// Request to evaluate multiple JS expressions in one round-trip.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchEvaluateRequest {
+    pub expressions: Vec<BatchExpression>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchExpression {
+    pub id: String,
+    pub expression: String,
+}
+
+/// Request for a structured UI assertion.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuredAssertRequest {
+    /// CSS selector or text to search for
+    pub query: String,
+    /// How to search: "css" (CSS selector), "text" (text content match), "textContains" (substring)
+    #[serde(default = "default_query_type")]
+    pub query_type: String,
+    /// What to assert: "exists", "notExists", "count", "hasText", "hasClass", "isVisible", "hasAttribute"
+    pub assertion: String,
+    /// Expected value (for count, hasText, hasClass, hasAttribute assertions)
+    #[serde(default)]
+    pub expected: Option<serde_json::Value>,
+    /// Attribute name (for hasAttribute assertion)
+    #[serde(default)]
+    pub attribute: Option<String>,
+}
+
+fn default_query_type() -> String {
+    "css".to_string()
+}
+
+/// Result of a structured assertion.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssertResult {
+    pub passed: bool,
+    pub assertion: String,
+    pub query: String,
+    pub actual: serde_json::Value,
+    pub expected: serde_json::Value,
+    pub message: String,
+}
+
+/// Result of a single batch expression evaluation.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchExpressionResult {
+    pub id: String,
+    pub success: bool,
+    pub value: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Refresh the page.
 pub async fn ui_bridge_page_refresh_handler(
     State(state): State<Arc<ApiState>>,
@@ -1931,6 +2026,10 @@ pub async fn ui_bridge_query_selector_handler(
 }
 
 /// Evaluate a JavaScript expression in the webview.
+///
+/// First attempts the IPC path (through the SDK event handlers).
+/// If IPC fails (SDK not responding, timeout), falls back to direct
+/// WebView evaluation via Tauri's window.eval() + a response callback.
 pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageEvaluateRequest>,
@@ -1942,11 +2041,467 @@ pub async fn ui_bridge_page_evaluate_handler(
 
     let payload = serde_json::json!({ "expression": request.expression });
 
+    // Try IPC path first (fastest, uses SDK event handlers)
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(ipc_err) => {
+            // IPC failed — try direct WebView evaluation as fallback
+            debug!("UI Bridge: IPC evaluate failed ({}), trying direct WebView eval", ipc_err);
+
+            match direct_webview_evaluate_with_result(&state, &request.expression).await {
+                Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
+                    "result": { "value": result },
+                    "source": "direct_eval"
+                })))),
+                Err(direct_err) => {
+                    error!("UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}", ipc_err, direct_err);
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!(
+                        "IPC: {}. Direct eval: {}", ipc_err, direct_err
+                    )))))
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate JS in the WebView using the IPC response channel as a callback.
+///
+/// This wraps the expression in a function that sends the result back via
+/// POST to the IPC response endpoint, bypassing the Tauri event system.
+/// Used as a fallback when the SDK's event handlers aren't responding.
+async fn direct_webview_evaluate_with_result(
+    state: &Arc<ApiState>,
+    expression: &str,
+) -> Result<String, String> {
+    use tauri::Manager;
+
+    let window = state
+        .app_handle
+        .get_webview_window("main")
+        .ok_or_else(|| "WebView window 'main' not found".to_string())?;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+
+    // Register the pending request
+    {
+        let mut pending = state.ui_bridge_pending.lock().await;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    // Build JS that evaluates the expression and POSTs the result back
+    // via the IPC response HTTP endpoint
+    let callback_js = format!(
+        r#"(async function() {{
+            var reqId = "{}";
+            try {{
+                var result = (function() {{ return {}; }})();
+                var value = (result === undefined) ? null : result;
+                await fetch("http://127.0.0.1:" + location.port + "/ui-bridge/ipc-response", {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{
+                        requestId: reqId,
+                        type: "page_evaluate",
+                        success: true,
+                        data: {{ result: {{ value: (typeof value === "string") ? value : JSON.stringify(value) }} }}
+                    }})
+                }});
+            }} catch(e) {{
+                await fetch("http://127.0.0.1:" + location.port + "/ui-bridge/ipc-response", {{
+                    method: "POST",
+                    headers: {{ "Content-Type": "application/json" }},
+                    body: JSON.stringify({{
+                        requestId: reqId,
+                        type: "page_evaluate",
+                        success: false,
+                        error: e.message
+                    }})
+                }}).catch(function() {{}});
+            }}
+        }})()"#,
+        request_id, expression
+    );
+
+    window.eval(&callback_js).map_err(|e| format!("WebView eval dispatch failed: {}", e))?;
+
+    // Wait for the response with a timeout
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(data)) => {
+            if let Some(result) = data.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
+                Ok(result.to_string())
+            } else if let Some(err) = data.get("error").and_then(|e| e.as_str()) {
+                Err(format!("JS error: {}", err))
+            } else {
+                Ok(serde_json::to_string(&data).unwrap_or_default())
+            }
+        }
+        Ok(Err(_)) => Err("Response channel dropped".to_string()),
+        Err(_) => {
+            // Clean up pending request
+            let mut pending = state.ui_bridge_pending.lock().await;
+            pending.remove(&request_id);
+            Err("Direct eval timed out after 10s".to_string())
+        }
+    }
+}
+
+// ============================================================================
+// Direct WebView Evaluate (bypasses IPC, works without SDK)
+// ============================================================================
+
+/// Evaluate a JS expression directly in the Tauri WebView using window.eval().
+///
+/// This bypasses the IPC event system entirely, so it works even when the
+/// UI Bridge SDK hasn't initialized. The expression is wrapped in a try/catch
+/// to prevent evaluation errors from crashing the WebView connection.
+///
+/// Returns the stringified result. For structured data, the expression should
+/// return JSON.stringify(...).
+async fn direct_webview_evaluate(
+    app_handle: &tauri::AppHandle,
+    expression: &str,
+) -> Result<String, String> {
+    use tauri::Manager;
+
+    let window = app_handle
+        .get_webview_window("main")
+        .ok_or_else(|| "WebView window 'main' not found".to_string())?;
+
+    // Wrap in try/catch with timeout guard to prevent crashes
+    let safe_js = format!(
+        r#"(function() {{
+            try {{
+                var __result = (function() {{ return {}; }})();
+                if (__result === undefined) return "undefined";
+                if (__result === null) return "null";
+                return String(__result);
+            }} catch(e) {{
+                return "ERROR:" + e.message;
+            }}
+        }})()"#,
+        expression
+    );
+
+    // Tauri's eval() is fire-and-forget (returns Ok(()) on success).
+    // To get a return value, we use a callback pattern via a Tauri event.
+    // However, for simplicity and reliability, we use the IPC response channel
+    // if available, or fall back to a polling approach.
+    //
+    // The most robust approach: use the existing page_evaluate IPC path first,
+    // and only fall back to direct eval for side-effect-only operations.
+    //
+    // For the new endpoints, we'll use a hybrid: construct the full JS inline
+    // and use IPC to get the result back, but with error wrapping.
+
+    // Use the existing IPC path but with our safe-wrapped expression
+    window.eval(&safe_js).map_err(|e| format!("WebView eval failed: {}", e))?;
+
+    // Since eval() is fire-and-forget in Tauri v2, we can't get a return value
+    // directly. Instead, we'll use the IPC request_sync path with our wrapped expression.
+    Ok("eval_dispatched".to_string())
+}
+
+/// Evaluate a JS expression via IPC with automatic error wrapping.
+/// This is the safe version of page_evaluate that wraps expressions in try/catch
+/// so errors return as JSON instead of crashing the connection.
+async fn safe_evaluate(
+    state: &Arc<ApiState>,
+    expression: &str,
+) -> Result<serde_json::Value, String> {
+    // Wrap the expression in try/catch for safety
+    let safe_expr = format!(
+        r#"(() => {{ try {{ return JSON.stringify({{ success: true, value: (function() {{ {} }})() }}); }} catch(e) {{ return JSON.stringify({{ success: false, error: e.message, stack: e.stack }}); }} }})()"#,
+        expression
+    );
+
+    let payload = serde_json::json!({ "expression": safe_expr });
+
+    match ui_bridge_request_sync(state, "page_evaluate", payload).await {
+        Ok(data) => {
+            // Try to parse the inner result
+            if let Some(result) = data.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result) {
+                    if parsed.get("success") == Some(&serde_json::Value::Bool(false)) {
+                        let error_msg = parsed.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
+                        return Err(format!("JavaScript evaluation error: {}", error_msg));
+                    }
+                    return Ok(parsed);
+                }
+            }
+            Ok(data)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ============================================================================
+// Safe Page Evaluate (Task 20: error capture)
+// ============================================================================
+
+/// POST /ui-bridge/control/page/evaluate-safe
+///
+/// Like page/evaluate but wraps the expression in try/catch so evaluation
+/// errors return as JSON responses instead of crashing the HTTP connection.
+pub async fn ui_bridge_page_evaluate_safe_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<PageEvaluateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: Safe evaluate ({}...)",
+        &request.expression[..request.expression.len().min(80)]
+    );
+
+    match safe_evaluate(&state, &format!("return {}", request.expression)).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => {
-            error!("UI Bridge API: {}", e);
+            // Return the error as a structured response, not an HTTP error
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "success": false,
+                "error": e,
+            }))))
+        }
+    }
+}
+
+// ============================================================================
+// Batch Evaluate (Task 19: multiple expressions in one round-trip)
+// ============================================================================
+
+/// POST /ui-bridge/control/page/evaluate-batch
+///
+/// Evaluate multiple JS expressions in a single IPC round-trip.
+/// Each expression runs sequentially in the same JS context, preventing
+/// re-render races that occur with sequential HTTP evaluate calls.
+pub async fn ui_bridge_page_evaluate_batch_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<BatchEvaluateRequest>,
+) -> Result<Json<ApiResponse<Vec<BatchExpressionResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: Batch evaluate ({} expressions)",
+        request.expressions.len()
+    );
+
+    if request.expressions.is_empty() {
+        return Ok(Json(ApiResponse::success(vec![])));
+    }
+
+    if request.expressions.len() > 50 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("Maximum 50 expressions per batch".to_string())),
+        ));
+    }
+
+    // Build a single JS expression that evaluates all sub-expressions
+    // and returns an array of results
+    let mut js_parts = Vec::new();
+    for (i, expr) in request.expressions.iter().enumerate() {
+        js_parts.push(format!(
+            r#"(() => {{ try {{ var v = (function() {{ return {}; }})(); return {{ id: "{}", success: true, value: v === undefined ? null : v }}; }} catch(e) {{ return {{ id: "{}", success: false, error: e.message }}; }} }})()"#,
+            expr.expression,
+            expr.id.replace('"', r#"\""#),
+            expr.id.replace('"', r#"\""#),
+        ));
+    }
+
+    let combined = format!("return JSON.stringify([{}])", js_parts.join(","));
+    let payload = serde_json::json!({ "expression": format!("(() => {{ {} }})()", combined) });
+
+    match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
+        Ok(data) => {
+            // Parse the combined result array
+            let result_str = data
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("[]");
+
+            let results: Vec<BatchExpressionResult> =
+                serde_json::from_str(result_str).unwrap_or_else(|_| {
+                    request
+                        .expressions
+                        .iter()
+                        .map(|e| BatchExpressionResult {
+                            id: e.id.clone(),
+                            success: false,
+                            value: serde_json::Value::Null,
+                            error: Some("Failed to parse batch result".to_string()),
+                        })
+                        .collect()
+                });
+
+            Ok(Json(ApiResponse::success(results)))
+        }
+        Err(e) => {
+            error!("UI Bridge API: Batch evaluate failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Structured Assert (Task 18: declarative assertions)
+// ============================================================================
+
+/// POST /ui-bridge/control/assert
+///
+/// Evaluate a structured UI assertion without writing JavaScript.
+/// Supports CSS selectors and text search with common assertion types.
+/// Returns a structured pass/fail result.
+pub async fn ui_bridge_structured_assert_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StructuredAssertRequest>,
+) -> Result<Json<ApiResponse<AssertResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: Structured assert ({} {} on '{}')",
+        request.assertion, request.query_type, request.query
+    );
+
+    // Build the JS expression for this assertion
+    let query_js = match request.query_type.as_str() {
+        "css" => format!(
+            "document.querySelectorAll('{}')",
+            request.query.replace('\'', "\\'")
+        ),
+        "text" => format!(
+            r#"Array.from(document.querySelectorAll('*')).filter(el => el.childNodes.length <= 3 && el.textContent.trim() === '{}')"#,
+            request.query.replace('\'', "\\'")
+        ),
+        "textContains" => format!(
+            r#"Array.from(document.querySelectorAll('*')).filter(el => el.childNodes.length <= 3 && el.textContent.includes('{}'))"#,
+            request.query.replace('\'', "\\'")
+        ),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "Invalid query_type '{}'. Use: css, text, textContains",
+                    request.query_type
+                ))),
+            ));
+        }
+    };
+
+    let assertion_js = match request.assertion.as_str() {
+        "exists" => format!(
+            r#"return JSON.stringify({{ found: ({}).length, passed: ({}).length > 0 }})"#,
+            query_js, query_js
+        ),
+        "notExists" => format!(
+            r#"return JSON.stringify({{ found: ({}).length, passed: ({}).length === 0 }})"#,
+            query_js, query_js
+        ),
+        "count" => {
+            let expected = request.expected.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
+            format!(
+                r#"return JSON.stringify({{ found: ({}).length, passed: ({}).length === {}, expected: {} }})"#,
+                query_js, query_js, expected, expected
+            )
+        }
+        "isVisible" => {
+            format!(
+                r#"var els = {}; var visible = Array.from(els).filter(function(el) {{ var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).display !== 'none'; }}); return JSON.stringify({{ found: els.length, visible: visible.length, passed: visible.length > 0 }})"#,
+                query_js
+            )
+        }
+        "hasText" => {
+            let expected_text = request
+                .expected
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                r#"(() => {{ var els = {}; var texts = Array.from(els).map(el => el.textContent.trim()); var found = texts.some(t => t.includes('{}')); return JSON.stringify({{ found: els.length, texts: texts.slice(0, 3), passed: found }}); }})()"#,
+                query_js,
+                expected_text.replace('\'', "\\'")
+            )
+        }
+        "hasClass" => {
+            let expected_class = request
+                .expected
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                r#"(() => {{ var els = {}; var found = Array.from(els).some(el => el.classList.contains('{}')); var classes = Array.from(els).slice(0, 3).map(el => Array.from(el.classList).join(' ')); return JSON.stringify({{ found: els.length, classes: classes, passed: found }}); }})()"#,
+                query_js,
+                expected_class.replace('\'', "\\'")
+            )
+        }
+        "hasAttribute" => {
+            let attr = request.attribute.as_deref().unwrap_or("title");
+            let expected_val = request.expected.as_ref().and_then(|v| v.as_str());
+            let check = if let Some(val) = expected_val {
+                format!(
+                    "el.getAttribute('{}') === '{}'",
+                    attr.replace('\'', "\\'"),
+                    val.replace('\'', "\\'")
+                )
+            } else {
+                format!("el.hasAttribute('{}')", attr.replace('\'', "\\'"))
+            };
+            format!(
+                r#"(() => {{ var els = {}; var found = Array.from(els).some(el => {}); return JSON.stringify({{ found: els.length, passed: found }}); }})()"#,
+                query_js, check
+            )
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "Invalid assertion '{}'. Use: exists, notExists, count, isVisible, hasText, hasClass, hasAttribute",
+                    request.assertion
+                ))),
+            ));
+        }
+    };
+
+    // Use the safe evaluate path
+    let full_expr = format!("(() => {{ {} }})()", assertion_js);
+    let payload = serde_json::json!({ "expression": full_expr });
+
+    match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
+        Ok(data) => {
+            let result_str = data
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(result_str).unwrap_or(serde_json::json!({"passed": false}));
+
+            let passed = parsed.get("passed").and_then(|p| p.as_bool()).unwrap_or(false);
+
+            let result = AssertResult {
+                passed,
+                assertion: request.assertion.clone(),
+                query: request.query.clone(),
+                actual: parsed.clone(),
+                expected: request.expected.clone().unwrap_or(serde_json::Value::Null),
+                message: if passed {
+                    format!("Assertion '{}' passed for '{}'", request.assertion, request.query)
+                } else {
+                    format!(
+                        "Assertion '{}' failed for '{}': {:?}",
+                        request.assertion, request.query, parsed
+                    )
+                },
+            };
+
+            Ok(Json(ApiResponse::success(result)))
+        }
+        Err(e) => {
+            let result = AssertResult {
+                passed: false,
+                assertion: request.assertion,
+                query: request.query,
+                actual: serde_json::Value::Null,
+                expected: request.expected.unwrap_or(serde_json::Value::Null),
+                message: format!("Evaluation failed: {}", e),
+            };
+            Ok(Json(ApiResponse::success(result)))
         }
     }
 }
@@ -5079,6 +5634,8 @@ pub async fn ui_bridge_pong_handler(
     state
         .ui_bridge_last_pong
         .store(now, std::sync::atomic::Ordering::Relaxed);
+    // Unblock any requests waiting for frontend readiness
+    state.ui_bridge_ready.notify_waiters();
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "pong": true }),
     )))
@@ -6419,6 +6976,18 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/evaluate",
             post(ui_bridge_page_evaluate_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/evaluate-safe",
+            post(ui_bridge_page_evaluate_safe_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/evaluate-batch",
+            post(ui_bridge_page_evaluate_batch_handler),
+        )
+        .route(
+            "/ui-bridge/control/assert",
+            post(ui_bridge_structured_assert_handler),
         )
         // Design Review
         .route(

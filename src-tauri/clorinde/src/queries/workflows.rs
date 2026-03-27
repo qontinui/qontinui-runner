@@ -1236,6 +1236,44 @@ impl<'a> From<ListSlashCommandSourcesBorrowed<'a>> for ListSlashCommandSources {
         }
     }
 }
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetWorkflowStats {
+    pub total_runs: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub last_run_at: chrono::DateTime<chrono::FixedOffset>,
+    pub last_run_status: String,
+    pub avg_duration_ms: f64,
+}
+pub struct GetWorkflowStatsBorrowed<'a> {
+    pub total_runs: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    pub last_run_at: chrono::DateTime<chrono::FixedOffset>,
+    pub last_run_status: &'a str,
+    pub avg_duration_ms: f64,
+}
+impl<'a> From<GetWorkflowStatsBorrowed<'a>> for GetWorkflowStats {
+    fn from(
+        GetWorkflowStatsBorrowed {
+            total_runs,
+            success_count,
+            failure_count,
+            last_run_at,
+            last_run_status,
+            avg_duration_ms,
+        }: GetWorkflowStatsBorrowed<'a>,
+    ) -> Self {
+        Self {
+            total_runs,
+            success_count,
+            failure_count,
+            last_run_at,
+            last_run_status: last_run_status.into(),
+            avg_duration_ms,
+        }
+    }
+}
 use crate::client::async_::GenericClient;
 use futures::{self, StreamExt, TryStreamExt};
 pub struct ListUnifiedWorkflowsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
@@ -1724,6 +1762,73 @@ where
         mapper: fn(ListSlashCommandSourcesBorrowed) -> R,
     ) -> ListSlashCommandSourcesQuery<'c, 'a, 's, C, R, N> {
         ListSlashCommandSourcesQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetWorkflowStatsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(&tokio_postgres::Row) -> Result<GetWorkflowStatsBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetWorkflowStatsBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetWorkflowStatsQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetWorkflowStatsBorrowed) -> R,
+    ) -> GetWorkflowStatsQuery<'c, 'a, 's, C, R, N> {
+        GetWorkflowStatsQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -3037,6 +3142,47 @@ impl<
             &params.source_file_path,
             &params.source_content_hash,
         )
+    }
+}
+pub struct GetWorkflowStatsStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_workflow_stats() -> GetWorkflowStatsStmt {
+    GetWorkflowStatsStmt(
+        "SELECT COUNT(*)::bigint as total_runs, COUNT(*) FILTER (WHERE status = 'complete')::bigint as success_count, COUNT(*) FILTER (WHERE status = 'failed')::bigint as failure_count, MAX(created_at) as last_run_at, (SELECT status FROM task_runs WHERE workflow_name = $1 ORDER BY created_at DESC LIMIT 1) as last_run_status, AVG(CASE WHEN completed_at IS NOT NULL THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000 END)::double precision as avg_duration_ms FROM task_runs WHERE workflow_name = $1",
+        None,
+    )
+}
+impl GetWorkflowStatsStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        workflow_name: &'a T1,
+    ) -> GetWorkflowStatsQuery<'c, 'a, 's, C, GetWorkflowStats, 1> {
+        GetWorkflowStatsQuery {
+            client,
+            params: [workflow_name],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetWorkflowStatsBorrowed, tokio_postgres::Error> {
+                Ok(GetWorkflowStatsBorrowed {
+                    total_runs: row.try_get(0)?,
+                    success_count: row.try_get(1)?,
+                    failure_count: row.try_get(2)?,
+                    last_run_at: row.try_get(3)?,
+                    last_run_status: row.try_get(4)?,
+                    avg_duration_ms: row.try_get(5)?,
+                })
+            },
+            mapper: |it| GetWorkflowStats::from(it),
+        }
     }
 }
 pub struct UpdateSlashCommandContentStmt(&'static str, Option<tokio_postgres::Statement>);

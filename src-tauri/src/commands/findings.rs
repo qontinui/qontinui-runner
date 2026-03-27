@@ -17,7 +17,11 @@ pub async fn get_task_findings(
     task_run_id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Finding>, String> {
-    app_state.checkpoint_db.get_findings_for_task(&task_run_id)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_findings_for_task(&task_run_id).await
+    } else {
+        app_state.checkpoint_db.get_findings_for_task(&task_run_id)
+    }
 }
 
 /// Get findings by status for a task run.
@@ -41,7 +45,11 @@ pub async fn get_finding_by_id(
     finding_id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Option<Finding>, String> {
-    app_state.checkpoint_db.get_finding(&finding_id)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_finding(&finding_id).await
+    } else {
+        app_state.checkpoint_db.get_finding(&finding_id)
+    }
 }
 
 /// Update finding status.
@@ -56,12 +64,21 @@ pub async fn update_finding(
     let status =
         FindingStatus::from_str(&status).ok_or_else(|| format!("Invalid status: {}", status))?;
 
-    app_state.checkpoint_db.update_finding_status(
-        &finding_id,
-        &status,
-        resolution.as_deref(),
-        session_num,
-    )?;
+    if let Some(pg) = &app_state.pg_db {
+        pg.update_finding_status(
+            &finding_id,
+            status.as_str(),
+            resolution.as_deref(),
+            session_num,
+        ).await?;
+    } else {
+        app_state.checkpoint_db.update_finding_status(
+            &finding_id,
+            &status,
+            resolution.as_deref(),
+            session_num,
+        )?;
+    }
 
     info!(
         "Updated finding {} to status {}",
@@ -79,12 +96,21 @@ pub async fn resolve_finding(
     session_num: Option<u32>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    app_state.checkpoint_db.update_finding_status(
-        &finding_id,
-        &FindingStatus::Resolved,
-        Some(&resolution),
-        session_num,
-    )?;
+    if let Some(pg) = &app_state.pg_db {
+        pg.update_finding_status(
+            &finding_id,
+            "resolved",
+            Some(&resolution),
+            session_num,
+        ).await?;
+    } else {
+        app_state.checkpoint_db.update_finding_status(
+            &finding_id,
+            &FindingStatus::Resolved,
+            Some(&resolution),
+            session_num,
+        )?;
+    }
 
     info!("Resolved finding {}", finding_id);
     Ok(())
@@ -111,7 +137,11 @@ pub async fn get_findings_summary(
     task_run_id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<FindingSummary, String> {
-    app_state.checkpoint_db.get_finding_summary(&task_run_id)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_finding_summary(&task_run_id).await
+    } else {
+        app_state.checkpoint_db.get_finding_summary(&task_run_id)
+    }
 }
 
 /// List knowledge entries for a task run with optional category filter.
@@ -121,7 +151,11 @@ pub async fn list_task_knowledge_cmd(
     category: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<StoredTaskKnowledge>, String> {
-    app_state
-        .checkpoint_db
-        .list_task_knowledge(&task_run_id, category.as_deref(), false)
+    if let Some(pg) = &app_state.pg_db {
+        pg.list_task_knowledge(&task_run_id, category.as_deref(), false).await
+    } else {
+        app_state
+            .checkpoint_db
+            .list_task_knowledge(&task_run_id, category.as_deref(), false)
+    }
 }

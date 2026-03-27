@@ -480,6 +480,11 @@ impl CompletionExecutor {
                                     "\n--- AI Completion Output ({}) ---\n{}\n",
                                     step_name, output
                                 );
+                                if let Some(pg) = &self.app_state.pg_db {
+                                    if let Err(e) = pg.append_task_output_ex(execution_id, &formatted, false, false).await {
+                                        warn!("PG append_task_output_ex failed: {}", e);
+                                    }
+                                }
                                 if let Err(e) = self.checkpoint_db.append_task_output_ex(
                                     execution_id,
                                     &formatted,
@@ -887,7 +892,26 @@ impl CompletionExecutor {
         }
 
         // Fetch and include accumulated output_log (from agentic phases)
-        match self.checkpoint_db.get_full_task_output(execution_id) {
+        // PG-primary: try PG first (different method name), fall back to SQLite
+        let output_result: Result<String, String> = if let Some(pg) = &self.app_state.pg_db {
+            // Note: must use tokio::runtime::Handle since build_prior_phase_context is sync
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pg = pg.clone();
+                let id = execution_id.to_string();
+                let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.block_on(async move { pg.get_task_output(&id).await })
+                }));
+                match pg_res {
+                    Ok(Ok(output)) => Ok(output),
+                    _ => self.checkpoint_db.get_full_task_output(execution_id),
+                }
+            } else {
+                self.checkpoint_db.get_full_task_output(execution_id)
+            }
+        } else {
+            self.checkpoint_db.get_full_task_output(execution_id)
+        };
+        match output_result {
             Ok(output) if !output.is_empty() => {
                 let cleaned = crate::summary_generator::strip_output_markers(&output);
                 // Truncate to last 50k chars to avoid overwhelming the AI
@@ -913,8 +937,25 @@ impl CompletionExecutor {
             }
         }
 
-        // Fetch and include findings
-        match self.checkpoint_db.get_findings_for_task(execution_id) {
+        // Fetch and include findings (PG-primary, SQLite fallback)
+        let findings_result = if let Some(pg) = &self.app_state.pg_db {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pg = pg.clone();
+                let id = execution_id.to_string();
+                let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.block_on(async move { pg.get_findings_for_task(&id).await })
+                }));
+                match pg_res {
+                    Ok(r) => r,
+                    _ => self.checkpoint_db.get_findings_for_task(execution_id),
+                }
+            } else {
+                self.checkpoint_db.get_findings_for_task(execution_id)
+            }
+        } else {
+            self.checkpoint_db.get_findings_for_task(execution_id)
+        };
+        match findings_result {
             Ok(findings) if !findings.is_empty() => {
                 let findings_section =
                     crate::summary_generator::format_findings_for_summary(&findings);

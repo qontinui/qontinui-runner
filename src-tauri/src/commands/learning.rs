@@ -28,10 +28,18 @@ pub struct LearningDashboardData {
 
 /// Get the learning summary statistics.
 #[tauri::command]
-pub fn get_learning_summary(state: State<'_, Arc<AppState>>) -> Result<LearningSummary, String> {
+pub async fn get_learning_summary(state: State<'_, Arc<AppState>>) -> Result<LearningSummary, String> {
     // Get outcomes from database
-    let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
-    let patterns = state.checkpoint_db.get_learning_patterns()?;
+    let outcomes = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes(Some(500)).await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes(Some(500))?
+    };
+    let patterns = if let Some(pg) = &state.pg_db {
+        pg.get_learning_patterns().await?
+    } else {
+        state.checkpoint_db.get_learning_patterns()?
+    };
 
     // Calculate summary from outcomes
     let total = outcomes.len();
@@ -72,8 +80,12 @@ pub fn get_learning_summary(state: State<'_, Arc<AppState>>) -> Result<LearningS
 
 /// Get all identified patterns from the database.
 #[tauri::command]
-pub fn get_learning_patterns(state: State<'_, Arc<AppState>>) -> Result<Vec<Pattern>, String> {
-    let patterns_json = state.checkpoint_db.get_learning_patterns()?;
+pub async fn get_learning_patterns(state: State<'_, Arc<AppState>>) -> Result<Vec<Pattern>, String> {
+    let patterns_json = if let Some(pg) = &state.pg_db {
+        pg.get_learning_patterns().await?
+    } else {
+        state.checkpoint_db.get_learning_patterns()?
+    };
 
     let patterns: Vec<Pattern> = patterns_json
         .into_iter()
@@ -131,9 +143,13 @@ pub fn get_learning_patterns(state: State<'_, Arc<AppState>>) -> Result<Vec<Patt
 
 /// Get all generated insights (uses in-memory analysis).
 #[tauri::command]
-pub fn get_learning_insights(state: State<'_, Arc<AppState>>) -> Result<Vec<Insight>, String> {
+pub async fn get_learning_insights(state: State<'_, Arc<AppState>>) -> Result<Vec<Insight>, String> {
     // Load outcomes from database into the learning system
-    let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
+    let outcomes = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes(Some(500)).await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes(Some(500))?
+    };
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
     // Rebuild system from database outcomes
@@ -150,20 +166,26 @@ pub fn get_learning_insights(state: State<'_, Arc<AppState>>) -> Result<Vec<Insi
 
 /// Run full pattern analysis and return results.
 #[tauri::command]
-pub fn analyze_learning_data(state: State<'_, Arc<AppState>>) -> Result<AnalysisResult, String> {
+pub async fn analyze_learning_data(state: State<'_, Arc<AppState>>) -> Result<AnalysisResult, String> {
     // Load outcomes from database
-    let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
-    let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
+    let outcomes = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes(Some(500)).await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes(Some(500))?
+    };
+    let result = {
+        let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
-    // Rebuild system from database outcomes
-    *system = LearningSystem::new();
-    for outcome_json in outcomes {
-        if let Ok(outcome) = serde_json::from_value::<TaskOutcome>(outcome_json.clone()) {
-            system.record_outcome(outcome);
+        // Rebuild system from database outcomes
+        *system = LearningSystem::new();
+        for outcome_json in outcomes {
+            if let Ok(outcome) = serde_json::from_value::<TaskOutcome>(outcome_json.clone()) {
+                system.record_outcome(outcome);
+            }
         }
-    }
 
-    let result = system.analyze_patterns();
+        system.analyze_patterns()
+    }; // MutexGuard dropped here before any .await
 
     // Save patterns to database for persistence
     for pattern in &result.patterns {
@@ -184,14 +206,26 @@ pub fn analyze_learning_data(state: State<'_, Arc<AppState>>) -> Result<Analysis
             "observed_in": pattern.observed_in,
             "success_rate": pattern.success_rate,
         });
-        let _ = state.checkpoint_db.save_learning_pattern(
-            &pattern.id,
-            pattern_type,
-            &pattern.description,
-            pattern.confidence,
-            pattern.occurrences,
-            Some(&context),
-        );
+        if let Some(pg) = &state.pg_db {
+            let context_str = context.to_string();
+            let _ = pg.save_learning_pattern(
+                &pattern.id,
+                pattern_type,
+                &pattern.description,
+                pattern.confidence,
+                pattern.occurrences as i32,
+                Some(context_str.as_str()),
+            ).await;
+        } else {
+            let _ = state.checkpoint_db.save_learning_pattern(
+                &pattern.id,
+                pattern_type,
+                &pattern.description,
+                pattern.confidence,
+                pattern.occurrences,
+                Some(&context),
+            );
+        }
     }
 
     Ok(result)
@@ -210,11 +244,15 @@ pub fn get_feedback_for_context(context: String) -> Result<Vec<Feedback>, String
 
 /// Get all learning dashboard data in one call.
 #[tauri::command]
-pub fn get_learning_dashboard_data(
+pub async fn get_learning_dashboard_data(
     state: State<'_, Arc<AppState>>,
 ) -> Result<LearningDashboardData, String> {
     // Load outcomes from database
-    let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
+    let outcomes = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes(Some(500)).await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes(Some(500))?
+    };
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
 
     // Rebuild system from database outcomes
@@ -307,8 +345,12 @@ pub fn record_task_outcome(
 
 /// Get the best performing strategy.
 #[tauri::command]
-pub fn get_best_strategy(state: State<'_, Arc<AppState>>) -> Result<Option<(String, f64)>, String> {
-    let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
+pub async fn get_best_strategy(state: State<'_, Arc<AppState>>) -> Result<Option<(String, f64)>, String> {
+    let outcomes = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes(Some(500)).await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes(Some(500))?
+    };
 
     let mut strategy_stats: std::collections::HashMap<String, (u32, u32)> =
         std::collections::HashMap::new();
@@ -333,9 +375,17 @@ pub fn get_best_strategy(state: State<'_, Arc<AppState>>) -> Result<Option<(Stri
 
 /// Export learning data as JSON for backup.
 #[tauri::command]
-pub fn export_learning_data(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let outcomes = state.checkpoint_db.get_learning_outcomes(None)?;
-    let patterns = state.checkpoint_db.get_learning_patterns()?;
+pub async fn export_learning_data(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let outcomes = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes(None).await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes(None)?
+    };
+    let patterns = if let Some(pg) = &state.pg_db {
+        pg.get_learning_patterns().await?
+    } else {
+        state.checkpoint_db.get_learning_patterns()?
+    };
 
     let export = serde_json::json!({
         "outcomes": outcomes,
@@ -448,21 +498,31 @@ pub struct PaginatedResult<T> {
 
 /// Get learning outcomes with optional filtering.
 #[tauri::command]
-pub fn get_learning_outcomes_filtered(
+pub async fn get_learning_outcomes_filtered(
     state: State<'_, Arc<AppState>>,
     filter: LearningOutcomeFilter,
 ) -> Result<Vec<serde_json::Value>, String> {
-    state.checkpoint_db.get_learning_outcomes_filtered(
-        filter.status.as_deref(),
-        filter.strategy.as_deref(),
-        filter.since.as_deref(),
-        filter.limit,
-    )
+    if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes_filtered(
+            filter.status.as_deref(),
+            filter.strategy.as_deref(),
+            filter.since.as_deref(),
+            filter.limit,
+        )
+        .await
+    } else {
+        state.checkpoint_db.get_learning_outcomes_filtered(
+            filter.status.as_deref(),
+            filter.strategy.as_deref(),
+            filter.since.as_deref(),
+            filter.limit,
+        )
+    }
 }
 
 /// Get learning outcomes with pagination.
 #[tauri::command]
-pub fn get_learning_outcomes_paginated(
+pub async fn get_learning_outcomes_paginated(
     state: State<'_, Arc<AppState>>,
     offset: i64,
     limit: i64,
@@ -470,7 +530,11 @@ pub fn get_learning_outcomes_paginated(
     let items = state
         .checkpoint_db
         .get_learning_outcomes_paginated(offset, limit)?;
-    let total = state.checkpoint_db.get_learning_outcomes_count()?;
+    let total = if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes_count().await?
+    } else {
+        state.checkpoint_db.get_learning_outcomes_count()?
+    };
     Ok(PaginatedResult {
         items,
         total,
@@ -493,8 +557,12 @@ pub fn get_learning_stats_by_date_range(
 
 /// Get total count of learning outcomes.
 #[tauri::command]
-pub fn get_learning_outcomes_count(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
-    state.checkpoint_db.get_learning_outcomes_count()
+pub async fn get_learning_outcomes_count(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
+    if let Some(pg) = &state.pg_db {
+        pg.get_learning_outcomes_count().await
+    } else {
+        state.checkpoint_db.get_learning_outcomes_count()
+    }
 }
 
 // ============================================================================
@@ -517,10 +585,14 @@ pub fn get_recent_tasks_with_outcomes(
 /// Get the current running task (if any).
 /// Returns the most recently updated running task.
 #[tauri::command]
-pub fn get_current_running_task(
+pub async fn get_current_running_task(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let running_tasks = state.checkpoint_db.get_running_task_runs(None)?;
+    let running_tasks = if let Some(pg) = &state.pg_db {
+        pg.get_running_task_runs(None).await?
+    } else {
+        state.checkpoint_db.get_running_task_runs(None)?
+    };
 
     // Return the first (most recently updated) running task with basic info
     if let Some(task) = running_tasks.first() {
@@ -551,8 +623,12 @@ pub fn get_most_recent_task_with_checkpoints(
 
 /// Get learning statistics summary for dashboard display.
 #[tauri::command]
-pub fn get_learning_stats_summary(
+pub async fn get_learning_stats_summary(
     state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    state.checkpoint_db.get_learning_stats_summary()
+    if let Some(pg) = &state.pg_db {
+        pg.get_learning_stats_summary().await
+    } else {
+        state.checkpoint_db.get_learning_stats_summary()
+    }
 }

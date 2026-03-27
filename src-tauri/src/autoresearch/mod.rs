@@ -35,4 +35,5 @@ pub mod engine;
 pub mod metrics;
 pub mod model_profiles;
 pub mod mutations;
+pub mod q_router;
 pub mod types;

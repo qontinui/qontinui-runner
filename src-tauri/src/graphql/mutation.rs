@@ -238,11 +238,15 @@ impl MutationRoot {
             .load(std::sync::atomic::Ordering::Relaxed);
         db_input.runner_port = Some(port);
 
-        let run = state
-            .app_state
-            .checkpoint_db
-            .create_task_run(&db_input)
-            .map_err(|e| Error::new(e))?;
+        let run = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.create_task_run(&db_input).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for create_task_run, falling back to SQLite: {}", e),
+                }
+            }
+            state.app_state.checkpoint_db.create_task_run(&db_input).map_err(|e| Error::new(e))?
+        };
 
         Ok(GqlTaskRun::from_db(run))
     }
@@ -255,12 +259,16 @@ impl MutationRoot {
     ) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let task_run = state
-            .app_state
-            .checkpoint_db
-            .get_task_run(&id)
-            .map_err(|e| Error::new(e))?
-            .ok_or_else(|| Error::new(format!("Task run not found: {}", id)))?;
+        let task_run = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.get_task_run(&id).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for get_task_run, falling back to SQLite: {}", e),
+                }
+            }
+            state.app_state.checkpoint_db.get_task_run(&id).map_err(|e| Error::new(e))?
+        }
+        .ok_or_else(|| Error::new(format!("Task run not found: {}", id)))?;
 
         if task_run.status != "running" {
             return Err(Error::new(format!(
@@ -281,16 +289,32 @@ impl MutationRoot {
         };
         for pid in &pids_to_kill {
             info!("GraphQL: Killing AI process PID {} for task {}", pid, id);
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .output();
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+            }
         }
 
-        state
-            .app_state
-            .checkpoint_db
-            .stop_task_run(&id)
-            .map_err(|e| Error::new(e))?;
+        {
+            let mut stopped = false;
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.stop_task_run(&id, "User stopped").await {
+                    Ok(_) => stopped = true,
+                    Err(e) => tracing::warn!("PG failed for stop_task_run, falling back to SQLite: {}", e),
+                }
+            }
+            if !stopped {
+                state.app_state.checkpoint_db.stop_task_run(&id).map_err(|e| Error::new(e))?;
+            }
+        }
 
         // Release URL locks
         state.app_state.url_lock_manager.release_all(&id).await;
@@ -356,18 +380,25 @@ impl MutationRoot {
         input: super::types::UpdateFindingStatusInput,
     ) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
 
         let domain_status = gql_status_to_domain(input.status);
         let resolution = input.resolution;
         let finding_id = input.finding_id;
 
-        tokio::task::spawn_blocking(move || {
-            db.update_finding_status(&finding_id, &domain_status, resolution.as_deref(), None)
-        })
-        .await
-        .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-        .map_err(|e| Error::new(e))?;
+        // PG-primary, SQLite fallback
+        if let Some(pg) = &state.app_state.pg_db {
+            pg.update_finding_status(&finding_id, domain_status.as_str(), resolution.as_deref(), None)
+                .await
+                .map_err(|e| Error::new(e))?;
+        } else {
+            let db = state.app_state.checkpoint_db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.update_finding_status(&finding_id, &domain_status, resolution.as_deref(), None)
+            })
+            .await
+            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+            .map_err(|e| Error::new(e))?;
+        }
 
         Ok(true)
     }
@@ -408,9 +439,13 @@ impl MutationRoot {
     ) -> Result<GqlTaskRun> {
         let state = ctx.data::<Arc<ApiState>>()?;
         // Fetch workflow to get its name
-        let workflow = if let Some(pg) = &state.app_state.pg_db {
-            pg.get_unified_workflow(&workflow_id).await.map_err(|e| Error::new(e))?
-        } else {
+        let workflow = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.get_unified_workflow(&workflow_id).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for get_unified_workflow, falling back to SQLite: {}", e),
+                }
+            }
             let db = state.app_state.checkpoint_db.clone();
             let wf_id = workflow_id.clone();
             tokio::task::spawn_blocking(move || db.get_unified_workflow(&wf_id))
@@ -438,11 +473,15 @@ impl MutationRoot {
             input = input.with_prompt(p);
         }
 
-        let run = state
-            .app_state
-            .checkpoint_db
-            .create_task_run(&input)
-            .map_err(|e| Error::new(e))?;
+        let run = 'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.create_task_run(&input).await {
+                    Ok(r) => break 'pg r,
+                    Err(e) => tracing::warn!("PG failed for create_task_run in run_workflow, falling back to SQLite: {}", e),
+                }
+            }
+            state.app_state.checkpoint_db.create_task_run(&input).map_err(|e| Error::new(e))?
+        };
 
         // Broadcast task creation (not "running" — actual execution is
         // triggered via POST /unified-workflows/{id}/run)
@@ -460,9 +499,13 @@ impl MutationRoot {
         id: String,
     ) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        if let Some(pg) = &state.app_state.pg_db {
-            pg.delete_unified_workflow(&id).await.map_err(|e| Error::new(e))
-        } else {
+        'pg: {
+            if let Some(pg) = &state.app_state.pg_db {
+                match pg.delete_unified_workflow(&id).await {
+                    Ok(r) => break 'pg Ok(r),
+                    Err(e) => tracing::warn!("PG failed for delete_workflow, falling back to SQLite: {}", e),
+                }
+            }
             let db = state.app_state.checkpoint_db.clone();
             tokio::task::spawn_blocking(move || db.delete_unified_workflow(&id))
                 .await

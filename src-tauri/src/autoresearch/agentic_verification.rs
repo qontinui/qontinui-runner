@@ -378,6 +378,7 @@ impl AgenticVerificationResult {
                     } else {
                         None
                     },
+                    blame_json: None,
                 })
                 .collect(),
             total_tokens: self.total_tokens,
@@ -1171,6 +1172,7 @@ impl MultiAgentPipelineResult {
                                 .join("; "),
                             agentic_phase_ran: true,
                             agentic_phase_success: Some(lr.passed),
+                            blame_json: None,
                         }
                     })
                 })

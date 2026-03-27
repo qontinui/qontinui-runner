@@ -136,14 +136,18 @@ pub struct ImportPreview {
 
 /// Get a summary of all exportable data counts.
 #[tauri::command]
-pub fn get_export_summary(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+pub async fn get_export_summary(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     info!("Getting export summary");
-    state.checkpoint_db.get_export_summary()
+    if let Some(pg) = &state.pg_db {
+        pg.get_export_summary().await
+    } else {
+        state.checkpoint_db.get_export_summary()
+    }
 }
 
 /// Export all user data to a JSON structure.
 #[tauri::command]
-pub fn export_all_data(
+pub async fn export_all_data(
     state: State<'_, Arc<AppState>>,
     options: Option<ExportOptions>,
 ) -> Result<ComprehensiveExport, String> {
@@ -153,79 +157,131 @@ pub fn export_all_data(
     let summary = state.checkpoint_db.get_export_summary()?;
 
     let flows = if opts.flows {
-        state.checkpoint_db.export_all_flows()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_flows().await?
+        } else {
+            state.checkpoint_db.export_all_flows()?
+        }
     } else {
         vec![]
     };
 
     let flow_executions = if opts.flow_executions {
-        state.checkpoint_db.export_all_flow_executions()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_flow_executions().await?
+        } else {
+            state.checkpoint_db.export_all_flow_executions()?
+        }
     } else {
         vec![]
     };
 
     let checkpoints = if opts.checkpoints {
-        state.checkpoint_db.export_all_orchestrator_checkpoints()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_orchestrator_checkpoints().await?
+        } else {
+            state.checkpoint_db.export_all_orchestrator_checkpoints()?
+        }
     } else {
         vec![]
     };
 
     let learning_outcomes = if opts.learning_outcomes {
-        state.checkpoint_db.get_learning_outcomes(None)?
+        if let Some(pg) = &state.pg_db {
+            pg.get_learning_outcomes(None).await?
+        } else {
+            state.checkpoint_db.get_learning_outcomes(None)?
+        }
     } else {
         vec![]
     };
 
     let learning_patterns = if opts.learning_patterns {
-        state.checkpoint_db.get_learning_patterns()?
+        if let Some(pg) = &state.pg_db {
+            pg.get_learning_patterns().await?
+        } else {
+            state.checkpoint_db.get_learning_patterns()?
+        }
     } else {
         vec![]
     };
 
     let settings = if opts.settings {
-        state.checkpoint_db.export_all_settings()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_settings().await?
+        } else {
+            state.checkpoint_db.export_all_settings()?
+        }
     } else {
         vec![]
     };
 
     let prompts = if opts.prompts {
-        state.checkpoint_db.export_all_prompts()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_prompts().await?
+        } else {
+            state.checkpoint_db.export_all_prompts()?
+        }
     } else {
         vec![]
     };
 
     let unified_workflows = if opts.unified_workflows {
-        state.checkpoint_db.export_all_unified_workflows()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_unified_workflows().await?
+        } else {
+            state.checkpoint_db.export_all_unified_workflows()?
+        }
     } else {
         vec![]
     };
 
     let verification_tests = if opts.verification_tests {
-        state.checkpoint_db.export_all_verification_tests()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_verification_tests().await?
+        } else {
+            state.checkpoint_db.export_all_verification_tests()?
+        }
     } else {
         vec![]
     };
 
     let task_hooks = if opts.task_hooks {
-        state.checkpoint_db.export_all_task_hooks()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_task_hooks().await?
+        } else {
+            state.checkpoint_db.export_all_task_hooks()?
+        }
     } else {
         vec![]
     };
 
     let scheduled_tasks = if opts.scheduled_tasks {
-        state.checkpoint_db.export_all_scheduled_tasks()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_scheduled_tasks().await?
+        } else {
+            state.checkpoint_db.export_all_scheduled_tasks()?
+        }
     } else {
         vec![]
     };
 
     let saved_api_requests = if opts.saved_api_requests {
-        state.checkpoint_db.export_all_saved_api_requests()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_saved_api_requests().await?
+        } else {
+            state.checkpoint_db.export_all_saved_api_requests()?
+        }
     } else {
         vec![]
     };
 
     let configs = if opts.configs {
-        state.checkpoint_db.export_all_configs()?
+        if let Some(pg) = &state.pg_db {
+            pg.export_all_configs().await?
+        } else {
+            state.checkpoint_db.export_all_configs()?
+        }
     } else {
         vec![]
     };

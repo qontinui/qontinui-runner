@@ -60,6 +60,7 @@ pub mod agentic_output;
 mod agentic_verification_loop;
 pub mod approval;
 pub(crate) mod auto_run;
+pub mod blame;
 mod canvas_panels;
 pub mod compensation;
 pub mod conditional_routing;
@@ -233,6 +234,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     execution_id: String,
     workflow_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
+    pg_db: Option<Arc<crate::database::pg::PgDb>>,
     fut: F,
 ) where
     F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
@@ -291,7 +293,12 @@ pub fn spawn_workflow_with_panic_guard<F>(
 
                 // Mark the task as failed so Continue button appears
                 let error_message = format!("Workflow panicked: {}", panic_msg);
-                if let Err(e) = checkpoint_db.fail_task_run(&execution_id, &error_message) {
+                let fail_err = if let Some(ref pg) = pg_db {
+                    pg.fail_task_run(&execution_id, &error_message).await.err()
+                } else {
+                    checkpoint_db.fail_task_run(&execution_id, &error_message).err()
+                };
+                if let Some(e) = fail_err {
                     error!(
                         "Failed to mark panicked workflow {} as failed: {}",
                         execution_id, e
@@ -322,6 +329,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     execution_id: String,
     sequence_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
+    pg_db: Option<Arc<crate::database::pg::PgDb>>,
     fut: F,
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -375,7 +383,12 @@ pub fn spawn_sequence_with_panic_guard<F>(
 
                 // Mark the task as failed so Continue button appears
                 let error_message = format!("Workflow sequence panicked: {}", panic_msg);
-                if let Err(e) = checkpoint_db.fail_task_run(&execution_id, &error_message) {
+                let fail_err = if let Some(ref pg) = pg_db {
+                    pg.fail_task_run(&execution_id, &error_message).await.err()
+                } else {
+                    checkpoint_db.fail_task_run(&execution_id, &error_message).err()
+                };
+                if let Some(e) = fail_err {
                     error!(
                         "Failed to mark panicked sequence {} as failed: {}",
                         execution_id, e

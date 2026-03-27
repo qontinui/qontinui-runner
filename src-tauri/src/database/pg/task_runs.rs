@@ -366,4 +366,182 @@ impl PgDb {
             .map_err(|e| format!("PG update_task_result_data: {}", e))?;
         Ok(())
     }
+
+    /// Extended output append with optional session increment and completion check.
+    /// PG version uses simple string concatenation (no chunking) + session increment.
+    pub async fn append_task_output_ex(
+        &self,
+        id: &str,
+        output: &str,
+        increment_session: bool,
+        _check_completion_marker: bool,
+    ) -> Result<bool, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Append output
+        qontinui_db::queries::task_runs::append_task_output()
+            .bind(&conn, &output, &id)
+            .await
+            .map_err(|e| format!("PG append_task_output: {}", e))?;
+
+        // Increment session count if requested
+        if increment_session {
+            qontinui_db::queries::task_runs::increment_sessions_count()
+                .bind(&conn, &id)
+                .await
+                .map_err(|e| format!("PG increment_sessions: {}", e))?;
+        }
+
+        // Completion marker check — for PG, return false (let unified workflow loop handle completion)
+        Ok(false)
+    }
+
+    /// Set the verification_passed flag on a task run.
+    pub async fn set_verification_passed(&self, id: &str, passed: bool) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET verification_passed = $1 WHERE id = $2",
+            &[&passed, &id],
+        )
+        .await
+        .map_err(|e| format!("PG set_verification_passed: {}", e))?;
+        Ok(())
+    }
+
+    /// Get iteration commits for a task run (stored as JSON array in iteration_commits column).
+    pub async fn get_iteration_commits(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::unified_workflow_executor::IterationCommit>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT iteration_commits FROM task_runs WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_iteration_commits: {}", e))?;
+
+        match row.and_then(|r| r.get::<_, Option<String>>(0)) {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| format!("Failed to parse iteration commits: {}", e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Get the full output log (alias for get_task_output on PG where output is not chunked).
+    pub async fn get_full_task_output(&self, id: &str) -> Result<String, String> {
+        self.get_task_output(id).await
+    }
+
+    /// Update runtime context for a task run.
+    pub async fn update_task_run_runtime_context(
+        &self,
+        id: &str,
+        runtime_context_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET runtime_context_json = $1, updated_at = NOW() WHERE id = $2",
+            &[&runtime_context_json, &id],
+        )
+        .await
+        .map_err(|e| format!("PG update_task_run_runtime_context: {}", e))?;
+        Ok(())
+    }
+
+    /// Get the most recent task run that has orchestrator checkpoints.
+    pub async fn get_most_recent_task_with_checkpoints(&self) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT DISTINCT t.id
+                FROM task_runs t
+                INNER JOIN orchestrator_checkpoints c ON t.id = c.task_id
+                ORDER BY t.id DESC
+                LIMIT 1"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_most_recent_task_with_checkpoints: {}", e))?;
+
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Get all iteration diffs for a task run (JSON column).
+    pub async fn get_iteration_diffs(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::unified_workflow_executor::IterationDiff>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT iteration_diffs FROM task_runs WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_iteration_diffs: {}", e))?;
+
+        match row.and_then(|r| r.get::<_, Option<String>>(0)) {
+            Some(s) => serde_json::from_str(&s)
+                .map_err(|e| format!("Failed to parse iteration diffs: {}", e)),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Get currently running task runs.
+    pub async fn get_running_task_runs(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let port: Option<i32> = runner_port.map(|p| p as i32);
+
+        let rows = qontinui_db::queries::task_runs::get_running_task_runs()
+            .bind(&conn, &port)
+            .all()
+            .await
+            .map_err(|e| format!("PG get_running_task_runs: {}", e))?;
+
+        Ok(rows.into_iter().map(|r| {
+            TaskRun {
+                id: r.id,
+                task_name: r.task_name,
+                prompt: non_empty(r.prompt),
+                task_type: if r.task_type.is_empty() { "task".to_string() } else { r.task_type },
+                status: r.status,
+                sessions_count: r.sessions_count as u32,
+                max_sessions: if r.max_sessions == 0 { None } else { Some(r.max_sessions as u32) },
+                output_log: String::new(),
+                error_message: non_empty(r.error_message),
+                auto_continue: r.auto_continue,
+                execution_steps_json: None,
+                log_sources_json: None,
+                config_id: non_empty(r.config_id),
+                workflow_name: non_empty(r.workflow_name),
+                workflow_id: non_empty(r.workflow_id),
+                summary: None,
+                ai_summary: None,
+                goal_achieved: None,
+                remaining_work: None,
+                summary_generated_at: None,
+                transition_history_json: None,
+                workflow_type: non_empty(r.workflow_type),
+                workspace_id: non_empty(r.workspace_id),
+                triggered_by: non_empty(r.triggered_by),
+                parent_task_run_id: non_empty(r.parent_task_run_id),
+                root_task_run_id: non_empty(r.root_task_run_id),
+                depth: r.depth as u32,
+                bridge_id: non_empty(r.bridge_id),
+                result_data: None,
+                is_reflection: r.is_reflection,
+                reflection_source_task_run_id: non_empty(r.reflection_source_task_run_id),
+                is_follow_up: r.is_follow_up,
+                follow_up_source_task_run_id: non_empty(r.follow_up_source_task_run_id),
+                is_fixer: r.is_fixer,
+                fixer_source_task_run_id: non_empty(r.fixer_source_task_run_id),
+                is_meta_optimizer: r.is_meta_optimizer,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                completed_at: if r.completed_at.timestamp() == 0 { None } else { Some(r.completed_at.to_rfc3339()) },
+            }
+        }).collect())
+    }
 }

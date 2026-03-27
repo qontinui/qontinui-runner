@@ -381,10 +381,29 @@ pub fn list_verification_tests(
 
 /// Get a single verification test by ID
 #[tauri::command]
-pub fn get_verification_test(id: String, state: State<'_, Arc<AppState>>) -> CommandResponse {
-    let db = &state.checkpoint_db;
+pub async fn get_verification_test(id: String, state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+    if let Some(pg) = &state.pg_db {
+        match pg.get_verification_test(&id).await {
+            Ok(Some(test)) => return Ok(CommandResponse {
+                success: true,
+                message: Some("Test found".to_string()),
+                data: Some(serde_json::to_value(test).unwrap_or_default()),
+            }),
+            Ok(None) => return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Test not found: {}", id)),
+                data: None,
+            }),
+            Err(e) => return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Failed to get test: {}", e)),
+                data: None,
+            }),
+        }
+    }
 
-    match db.get_verification_test(&id) {
+    let db = &state.checkpoint_db;
+    Ok(match db.get_verification_test(&id) {
         Ok(Some(test)) => CommandResponse {
             success: true,
             message: Some("Test found".to_string()),
@@ -400,7 +419,7 @@ pub fn get_verification_test(id: String, state: State<'_, Arc<AppState>>) -> Com
             message: Some(format!("Failed to get test: {}", e)),
             data: None,
         },
-    }
+    })
 }
 
 /// Create a new verification test

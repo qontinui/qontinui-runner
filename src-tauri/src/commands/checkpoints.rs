@@ -11,7 +11,11 @@ pub async fn checkpoint_get(
     app_state: State<'_, Arc<AppState>>,
     workflow_name: String,
 ) -> Result<Option<CheckpointData>, String> {
-    app_state.checkpoint_db.get_checkpoint(&workflow_name)
+    if let Some(pg) = &app_state.pg_db {
+        pg.get_checkpoint(&workflow_name).await
+    } else {
+        app_state.checkpoint_db.get_checkpoint(&workflow_name)
+    }
 }
 
 /// Save or update a checkpoint.
@@ -20,7 +24,11 @@ pub async fn checkpoint_save(
     app_state: State<'_, Arc<AppState>>,
     data: CheckpointData,
 ) -> Result<CommandResponse, String> {
-    app_state.checkpoint_db.save_checkpoint(&data)?;
+    if let Some(pg) = &app_state.pg_db {
+        pg.save_checkpoint(&data).await?;
+    } else {
+        app_state.checkpoint_db.save_checkpoint(&data)?;
+    }
     Ok(CommandResponse {
         success: true,
         message: Some("Checkpoint saved".to_string()),
@@ -34,7 +42,11 @@ pub async fn checkpoint_delete(
     app_state: State<'_, Arc<AppState>>,
     workflow_name: String,
 ) -> Result<CommandResponse, String> {
-    let deleted = app_state.checkpoint_db.delete_checkpoint(&workflow_name)?;
+    let deleted = if let Some(pg) = &app_state.pg_db {
+        pg.delete_checkpoint(&workflow_name).await?
+    } else {
+        app_state.checkpoint_db.delete_checkpoint(&workflow_name)?
+    };
     Ok(CommandResponse {
         success: deleted,
         message: Some(if deleted {
@@ -51,7 +63,11 @@ pub async fn checkpoint_delete(
 pub async fn checkpoint_list_active(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<CheckpointData>, String> {
-    app_state.checkpoint_db.list_active_checkpoints()
+    if let Some(pg) = &app_state.pg_db {
+        pg.list_active_checkpoints().await
+    } else {
+        app_state.checkpoint_db.list_active_checkpoints()
+    }
 }
 
 /// Check checkpoint status for cross-session continuation.
@@ -90,13 +106,17 @@ pub async fn session_create(
     workflow_name: Option<String>,
     run_id: Option<String>,
 ) -> Result<CommandResponse, String> {
-    app_state.checkpoint_db.create_session(
-        &id,
-        &session_type,
-        &name,
-        workflow_name.as_deref(),
-        run_id.as_deref(),
-    )?;
+    if let Some(pg) = &app_state.pg_db {
+        pg.create_session(&id, &session_type, &name, workflow_name.as_deref(), run_id.as_deref()).await?;
+    } else {
+        app_state.checkpoint_db.create_session(
+            &id,
+            &session_type,
+            &name,
+            workflow_name.as_deref(),
+            run_id.as_deref(),
+        )?;
+    }
     Ok(CommandResponse {
         success: true,
         message: Some("Session created".to_string()),
@@ -113,12 +133,16 @@ pub async fn session_update_status(
     current_phase: Option<u32>,
     error_message: Option<String>,
 ) -> Result<CommandResponse, String> {
-    app_state.checkpoint_db.update_session_status(
-        &session_id,
-        &status,
-        current_phase,
-        error_message.as_deref(),
-    )?;
+    if let Some(pg) = &app_state.pg_db {
+        pg.update_session_status(&session_id, &status, current_phase, error_message.as_deref()).await?;
+    } else {
+        app_state.checkpoint_db.update_session_status(
+            &session_id,
+            &status,
+            current_phase,
+            error_message.as_deref(),
+        )?;
+    }
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Session status updated to {}", status)),

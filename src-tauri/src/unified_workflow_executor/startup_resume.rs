@@ -328,6 +328,7 @@ pub async fn resume_interrupted_workflows(
                         task_id.clone(),
                         task_name.clone(),
                         url_lock,
+                        app_state.pg_db.clone(),
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
                                 app_handle_for_spawn
@@ -424,6 +425,7 @@ pub async fn resume_interrupted_workflows(
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                                 rollback_policy:
                                     crate::unified_workflow_executor::RollbackPolicy::None,
+                                escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
                                 iteration_diffs: Vec::new(),
                                 active_canary: None,
                                 is_canary_run: false,
@@ -542,11 +544,13 @@ pub async fn resume_interrupted_workflows(
                     );
 
                     let url_lock2 = Some(app_state.url_lock_manager.clone());
+                    let pg_db_for_spawn = app_state.pg_db.clone();
                     super::spawn_workflow_with_panic_guard(
                         checkpoint_db_for_guard,
                         task_id.clone(),
                         task_name.clone(),
                         url_lock2,
+                        pg_db_for_spawn,
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
                                 app_handle_for_spawn
@@ -637,6 +641,7 @@ pub async fn resume_interrupted_workflows(
                                 acceptance_criteria: workflow.acceptance_criteria.clone(),
                                 rollback_policy:
                                     crate::unified_workflow_executor::RollbackPolicy::None,
+                                escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
                                 iteration_diffs: Vec::new(),
                                 active_canary: None,
                                 is_canary_run: false,

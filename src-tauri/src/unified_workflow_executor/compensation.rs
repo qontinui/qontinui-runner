@@ -663,6 +663,7 @@ mod tests {
             failure_context: String::new(),
             agentic_phase_ran: true,
             agentic_phase_success: Some(true),
+            blame_json: None,
         }
     }
 }

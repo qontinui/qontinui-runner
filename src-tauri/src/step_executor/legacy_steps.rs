@@ -421,8 +421,14 @@ impl StepExecutor {
             None => {
                 // If no direct command, check for shell_command_id
                 if let Some(id) = &step.shell_command_id {
-                    match self.app_state.checkpoint_db.get_shell_command(id) {
-                        Ok(Some(cmd)) => cmd.command,
+                    // PG-primary, SQLite fallback
+                    let shell_cmd_result = if let Some(pg) = &self.app_state.pg_db {
+                        pg.get_shell_command(id).await.map(|opt| opt.map(|c| c.command))
+                    } else {
+                        self.app_state.checkpoint_db.get_shell_command(id).map(|opt| opt.map(|c| c.command))
+                    };
+                    match shell_cmd_result {
+                        Ok(Some(cmd)) => cmd,
                         Ok(None) => {
                             return (
                                 false,

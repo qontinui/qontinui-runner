@@ -196,6 +196,20 @@ ON CONFLICT(id) DO UPDATE SET
     updated_at = NOW()
 RETURNING id;
 
+--! get_workflow_stats
+SELECT
+    COUNT(*)::bigint as total_runs,
+    COUNT(*) FILTER (WHERE status = 'complete')::bigint as success_count,
+    COUNT(*) FILTER (WHERE status = 'failed')::bigint as failure_count,
+    MAX(created_at) as last_run_at,
+    (SELECT status FROM task_runs WHERE workflow_name = :workflow_name
+     ORDER BY created_at DESC LIMIT 1) as last_run_status,
+    AVG(CASE WHEN completed_at IS NOT NULL
+        THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000
+        END)::double precision as avg_duration_ms
+FROM task_runs
+WHERE workflow_name = :workflow_name;
+
 --! update_slash_command_content (source_content_hash?)
 UPDATE unified_workflows SET
     agentic_steps = :agentic_steps,

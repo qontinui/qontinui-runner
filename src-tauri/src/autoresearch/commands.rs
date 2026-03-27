@@ -19,12 +19,14 @@ pub async fn start_autoresearch(
     config_json: String,
     engine: State<'_, SharedResearchEngine>,
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<String, String> {
     let config: super::types::ResearchConfig = serde_json::from_str(&config_json)
         .map_err(|e| format!("Invalid research config: {}", e))?;
 
+    let pg_db = app_state.pg_db.clone();
     let mut eng = engine.lock().await;
-    eng.start(config, db.inner().clone()).await
+    eng.start(config, db.inner().clone(), pg_db).await
 }
 
 /// Stop the currently running autoresearch campaign.
@@ -187,6 +189,7 @@ pub async fn rerun_autoresearch_campaign(
     campaign_id: String,
     engine: State<'_, SharedResearchEngine>,
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<String, String> {
     // Load the original campaign's config
     let config_json: String = db.with_conn({
@@ -206,8 +209,9 @@ pub async fn rerun_autoresearch_campaign(
 
     config.name = format!("{} (rerun)", config.name);
 
+    let pg_db = app_state.pg_db.clone();
     let mut eng = engine.lock().await;
-    eng.start(config, db.inner().clone()).await
+    eng.start(config, db.inner().clone(), pg_db).await
 }
 
 /// Comparison between two campaigns.
@@ -377,6 +381,192 @@ pub async fn list_unified_workflows(
             name: w.name,
         })
         .collect())
+}
+
+// =============================================================================
+// Q-routing observability (for QRoutingTab)
+// =============================================================================
+
+/// Load Q-table rows, preferring PG over SQLite.
+/// If PG is connected and query succeeds, use PG results (even if empty).
+/// Only fall back to SQLite on PG error or when PG is not configured.
+async fn load_q_rows_pg_first(
+    db: &CheckpointDb,
+    app_state: &crate::commands::AppState,
+) -> Vec<(String, String, f64, u32)> {
+    if let Some(ref pg) = app_state.pg_db {
+        if let Ok(rows) = pg.get_all_q_entries().await {
+            return rows;
+        }
+    }
+    load_q_table(db).unwrap_or_default()
+}
+
+/// Load overrides, preferring PG over SQLite.
+async fn load_overrides_pg_first(
+    db: &CheckpointDb,
+    app_state: &crate::commands::AppState,
+) -> Vec<(String, String)> {
+    if let Some(ref pg) = app_state.pg_db {
+        if let Ok(overrides) = pg.get_all_q_overrides().await {
+            return overrides;
+        }
+    }
+    load_q_overrides(db).unwrap_or_default()
+}
+
+/// Get the full Q-routing table as JSON. Prefers PG.
+#[tauri::command]
+pub async fn get_q_routing_table(
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<Vec<super::q_router::QTableRow>, String> {
+    let mut q_router = super::q_router::QRouter::new();
+    let rows = load_q_rows_pg_first(&db, &app_state).await;
+    q_router.load_from_rows(rows);
+    Ok(q_router.table_snapshot())
+}
+
+/// Get the greedy Q-routing policy (best architecture per state). Prefers PG.
+#[tauri::command]
+pub async fn get_q_routing_policy(
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<Vec<super::q_router::PolicyEntry>, String> {
+    let mut q_router = super::q_router::QRouter::new();
+    let rows = load_q_rows_pg_first(&db, &app_state).await;
+    q_router.load_from_rows(rows);
+    Ok(q_router.policy_snapshot())
+}
+
+/// Get Q-routing convergence stats. Prefers PG.
+#[tauri::command]
+pub async fn get_q_routing_stats(
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<super::q_router::QRoutingStats, String> {
+    let mut q_router = super::q_router::QRouter::new();
+    let rows = load_q_rows_pg_first(&db, &app_state).await;
+    q_router.load_from_rows(rows);
+    Ok(q_router.stats())
+}
+
+/// Get all Q-routing overrides. Prefers PG.
+#[tauri::command]
+pub async fn get_q_routing_overrides(
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<Vec<super::q_router::OverrideEntry>, String> {
+    let mut q_router = super::q_router::QRouter::new();
+    let overrides = load_overrides_pg_first(&db, &app_state).await;
+    q_router.load_overrides(overrides);
+    Ok(q_router.overrides_snapshot())
+}
+
+/// Set a manual override: lock a state to a specific architecture.
+/// Writes to both SQLite and PG (PG-first).
+#[tauri::command]
+pub async fn set_q_routing_override(
+    state_key: String,
+    forced_action: String,
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<(), String> {
+    // Validate state_key parses
+    super::q_router::TaskState::from_key(&state_key)
+        .ok_or_else(|| format!("Invalid state_key: {}", state_key))?;
+
+    // Validate architecture
+    if !["traditional", "agentic_verification", "multi_agent_pipeline"].contains(&forced_action.as_str()) {
+        return Err(format!("Invalid architecture: {}", forced_action));
+    }
+
+    // PG-first
+    if let Some(ref pg) = app_state.pg_db {
+        pg.upsert_q_override(&state_key, &forced_action).await?;
+    }
+
+    // SQLite fallback
+    let now = chrono::Utc::now().to_rfc3339();
+    db.with_conn(|conn| {
+        conn.execute(
+            r#"INSERT INTO q_routing_overrides (state_key, forced_action, created_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(state_key) DO UPDATE SET
+                   forced_action = ?2,
+                   created_at = ?3"#,
+            rusqlite::params![state_key, forced_action, now],
+        )
+        .map_err(|e| format!("Failed to set override: {}", e))?;
+        Ok(())
+    })
+}
+
+/// Remove a manual override for a state.
+/// Removes from both PG and SQLite.
+#[tauri::command]
+pub async fn remove_q_routing_override(
+    state_key: String,
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<bool, String> {
+    // PG-first
+    if let Some(ref pg) = app_state.pg_db {
+        if let Err(e) = pg.delete_q_override(&state_key).await {
+            tracing::warn!("Failed to delete PG override for {}: {}", state_key, e);
+        }
+    }
+
+    // SQLite
+    db.with_conn(|conn| {
+        let deleted = conn
+            .execute(
+                "DELETE FROM q_routing_overrides WHERE state_key = ?1",
+                rusqlite::params![state_key],
+            )
+            .map_err(|e| format!("Failed to remove override: {}", e))?;
+        Ok(deleted > 0)
+    })
+}
+
+// SQLite helpers delegated to q_router module
+fn load_q_overrides(db: &CheckpointDb) -> Result<Vec<(String, String)>, String> {
+    super::q_router::load_overrides_sqlite(db)
+}
+
+fn load_q_table(db: &CheckpointDb) -> Result<Vec<(String, String, f64, u32)>, String> {
+    super::q_router::load_q_table_sqlite(db)
+}
+
+/// Reset the Q-routing table (clears all learned Q-values).
+/// Clears both PG and SQLite. Overrides are preserved.
+#[tauri::command]
+pub async fn reset_q_routing_table(
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
+) -> Result<serde_json::Value, String> {
+    let mut deleted_pg: u64 = 0;
+
+    // PG-first
+    if let Some(ref pg) = app_state.pg_db {
+        deleted_pg = pg.clear_q_table().await.unwrap_or(0);
+    }
+
+    // SQLite
+    let deleted_sqlite = db.with_conn(|conn| {
+        conn.execute("DELETE FROM q_routing_table", rusqlite::params![])
+            .map_err(|e| format!("Failed to clear SQLite Q-table: {}", e))
+    })? as u64;
+
+    tracing::info!(
+        "Q-routing table reset: {} PG rows, {} SQLite rows deleted",
+        deleted_pg, deleted_sqlite
+    );
+
+    Ok(serde_json::json!({
+        "deleted_pg": deleted_pg,
+        "deleted_sqlite": deleted_sqlite,
+    }))
 }
 
 // =============================================================================

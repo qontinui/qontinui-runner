@@ -1,7 +1,7 @@
 //! Main autoresearch engine — the async experiment loop.
 
 use super::metrics;
-use super::mutations::{AiGuidedMutator, RandomPerturbator, SequentialMutator};
+use super::mutations::{AiGuidedMutator, QLearningMutator, RandomPerturbator, SequentialMutator};
 use super::types::*;
 use crate::orchestration_loop::remote_client::RunnerClient;
 use std::path::PathBuf;
@@ -60,6 +60,7 @@ impl ResearchEngine {
         &mut self,
         config: ResearchConfig,
         db: Arc<crate::database::CheckpointDb>,
+        pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
     ) -> Result<String, String> {
         // Check if already running
         {
@@ -112,7 +113,7 @@ impl ResearchEngine {
         let state_clone = self.state.clone();
         let campaign_id_clone = campaign_id.clone();
         tokio::spawn(async move {
-            run_campaign_loop(config, campaign_id_clone, state_clone, stop_rx, db).await;
+            run_campaign_loop(config, campaign_id_clone, state_clone, stop_rx, db, pg_db).await;
         });
 
         info!("Started autoresearch campaign: {}", campaign_id);
@@ -158,10 +159,16 @@ enum Mutator {
     Sequential(SequentialMutator),
     Random(Box<RandomPerturbator>),
     AiGuided(Box<AiGuidedMutator>),
+    QLearning(Box<QLearningMutator>),
 }
 
 impl Mutator {
-    fn from_strategy(strategy: &MutationStrategy, ai_config: &AiGuidanceConfig) -> Self {
+    fn from_strategy(
+        strategy: &MutationStrategy,
+        ai_config: &AiGuidanceConfig,
+        db: &crate::database::CheckpointDb,
+        pg_q_rows: Option<Vec<(String, String, f64, u32)>>,
+    ) -> Self {
         match strategy {
             MutationStrategy::Sequential => Mutator::Sequential(SequentialMutator::new()),
             MutationStrategy::RandomPerturbation => {
@@ -171,6 +178,26 @@ impl Mutator {
                 ai_config.batch_size,
                 ai_config.model.clone(),
             ))),
+            MutationStrategy::QLearning => {
+                let mut q_router = super::q_router::QRouter::new();
+                // Prefer PG Q-table (more entries from multi-instance), fall back to SQLite
+                let rows = pg_q_rows.or_else(|| load_q_table_from_db(db).ok());
+                if let Some(rows) = rows {
+                    q_router.load_from_rows(rows);
+                    info!(
+                        "Q-learning mutator loaded {} Q-table entries",
+                        q_router.stats().total_state_action_pairs
+                    );
+                }
+                // Load manual overrides from SQLite
+                if let Ok(overrides) = load_q_overrides_from_db(db) {
+                    if !overrides.is_empty() {
+                        info!("Q-learning mutator loaded {} overrides", overrides.len());
+                        q_router.load_overrides(overrides);
+                    }
+                }
+                Mutator::QLearning(Box::new(QLearningMutator::new(q_router)))
+            }
         }
     }
 
@@ -184,6 +211,7 @@ impl Mutator {
             Mutator::Sequential(m) => m.next_experiment(control, dimensions, history),
             Mutator::Random(m) => m.next_experiment(control, dimensions, history),
             Mutator::AiGuided(m) => m.next_experiment(control, dimensions, history),
+            Mutator::QLearning(m) => m.next_experiment(control, dimensions, history),
         }
     }
 
@@ -196,6 +224,19 @@ impl Mutator {
     }
 }
 
+// SQLite helpers delegated to q_router module
+fn load_q_table_from_db(
+    db: &crate::database::CheckpointDb,
+) -> Result<Vec<(String, String, f64, u32)>, String> {
+    super::q_router::load_q_table_sqlite(db)
+}
+
+fn load_q_overrides_from_db(
+    db: &crate::database::CheckpointDb,
+) -> Result<Vec<(String, String)>, String> {
+    super::q_router::load_overrides_sqlite(db)
+}
+
 /// The main experiment loop (runs in a spawned task).
 async fn run_campaign_loop(
     mut config: ResearchConfig,
@@ -203,9 +244,24 @@ async fn run_campaign_loop(
     state: Arc<Mutex<ResearchState>>,
     stop_rx: watch::Receiver<bool>,
     db: Arc<crate::database::CheckpointDb>,
+    pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
 ) {
     let runner = RunnerClient::new(config.target_runner_port);
-    let mut mutator = Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance);
+
+    // Load Q-table from PG-first if available, fallback to SQLite
+    let pg_q_rows = if let Some(ref pg) = pg_db {
+        match pg.get_all_q_entries().await {
+            Ok(rows) if !rows.is_empty() => {
+                info!("Loaded {} Q-table entries from PG", rows.len());
+                Some(rows)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let mut mutator = Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &db, pg_q_rows);
     let mut experiment_number: u32 = 0;
 
     // Start config file watcher if configured
@@ -249,8 +305,14 @@ async fn run_campaign_loop(
                     != std::mem::discriminant(&new_config.mutation_strategy)
                 {
                     config.mutation_strategy = new_config.mutation_strategy;
+                    // Reload PG Q-data on strategy change
+                    let reload_pg_rows = if let Some(ref pg) = pg_db {
+                        pg.get_all_q_entries().await.ok().filter(|r| !r.is_empty())
+                    } else {
+                        None
+                    };
                     mutator =
-                        Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance);
+                        Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &db, reload_pg_rows);
                     info!("Mutation strategy changed — resetting mutator");
                 }
                 // Invalidate cached control

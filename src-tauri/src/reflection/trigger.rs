@@ -729,6 +729,7 @@ pub fn launch_reflection(
         exec_id,
         wf_name,
         url_lock,
+        deps.app_state.pg_db.clone(),
         Box::pin(async move {
             controller
                 .run(
@@ -1109,6 +1110,7 @@ pub fn launch_project_reflection(
         exec_id,
         wf_name,
         url_lock,
+        deps.app_state.pg_db.clone(),
         Box::pin(async move {
             controller
                 .run(
@@ -1471,6 +1473,7 @@ pub fn launch_ui_bridge_reflection(
         exec_id,
         wf_name,
         url_lock,
+        deps.app_state.pg_db.clone(),
         Box::pin(async move {
             controller
                 .run(

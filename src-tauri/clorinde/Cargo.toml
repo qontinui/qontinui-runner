@@ -28,6 +28,10 @@ version = "0.6.10"
 version = "0.2.12"
 features = ["derive"]
 
+[dependencies.rust_decimal]
+version = "1.40.0"
+features = ["db-postgres"]
+
 [dependencies.serde]
 version = "1.0.228"
 features = ["derive"]

@@ -157,7 +157,12 @@ pub async fn list_skills(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<SkillDefinition>>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Load user skills from database
-    let user_skills = match state.app_state.checkpoint_db.list_user_skills() {
+    let user_skills_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.list_user_skills().await
+    } else {
+        state.app_state.checkpoint_db.list_user_skills()
+    };
+    let user_skills = match user_skills_result {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("Failed to list user skills: {}", e);
@@ -185,7 +190,12 @@ pub async fn get_skill(
     }
 
     // Check user skills in database
-    match state.app_state.checkpoint_db.get_user_skill(&id) {
+    let skill_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_user_skill(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_user_skill(&id)
+    };
+    match skill_result {
         Ok(Some(skill)) => Ok(Json(ApiResponse::success(skill))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -203,7 +213,12 @@ pub async fn create_skill(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateSkillRequest>,
 ) -> Result<Json<ApiResponse<SkillDefinition>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.create_user_skill(&request) {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.create_user_skill(&request).await
+    } else {
+        state.app_state.checkpoint_db.create_user_skill(&request)
+    };
+    match result {
         Ok(skill) => Ok(Json(ApiResponse::success(skill))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -226,11 +241,12 @@ pub async fn update_skill(
         ));
     }
 
-    match state
-        .app_state
-        .checkpoint_db
-        .update_user_skill(&id, &request)
-    {
+    let result = if let Some(pg) = &state.app_state.pg_db {
+        pg.update_user_skill(&id, &request).await
+    } else {
+        state.app_state.checkpoint_db.update_user_skill(&id, &request)
+    };
+    match result {
         Ok(skill) => Ok(Json(ApiResponse::success(skill))),
         Err(e) => Err((
             StatusCode::NOT_FOUND,
@@ -252,7 +268,12 @@ pub async fn delete_skill(
         ));
     }
 
-    match state.app_state.checkpoint_db.delete_user_skill(&id) {
+    let del_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.delete_user_skill(&id).await
+    } else {
+        state.app_state.checkpoint_db.delete_user_skill(&id)
+    };
+    match del_result {
         Ok(true) => Ok(Json(ApiResponse::success(()))),
         Ok(false) => Err((
             StatusCode::NOT_FOUND,
@@ -272,11 +293,11 @@ pub async fn search_skills(
 ) -> Result<Json<ApiResponse<Vec<SkillDefinition>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
 
-    let user_skills = state
-        .app_state
-        .checkpoint_db
-        .list_user_skills()
-        .unwrap_or_default();
+    let user_skills = if let Some(pg) = &state.app_state.pg_db {
+        pg.list_user_skills().await.unwrap_or_default()
+    } else {
+        state.app_state.checkpoint_db.list_user_skills().unwrap_or_default()
+    };
 
     let mut registry = crate::skills::SkillRegistry::new();
     registry.set_user_skills(user_skills);
@@ -292,11 +313,11 @@ pub async fn instantiate_skill(
     Json(request): Json<InstantiateSkillRequest>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Load user skills for registry
-    let user_skills = state
-        .app_state
-        .checkpoint_db
-        .list_user_skills()
-        .unwrap_or_default();
+    let user_skills = if let Some(pg) = &state.app_state.pg_db {
+        pg.list_user_skills().await.unwrap_or_default()
+    } else {
+        state.app_state.checkpoint_db.list_user_skills().unwrap_or_default()
+    };
 
     let mut registry = crate::skills::SkillRegistry::new();
     registry.set_user_skills(user_skills);
@@ -322,11 +343,12 @@ pub async fn export_skills(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExportSkillsRequest>,
 ) -> Result<Json<ApiResponse<crate::skills::SkillExport>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let mut skills = match state
-        .app_state
-        .checkpoint_db
-        .export_user_skills(&request.skill_ids)
-    {
+    let export_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.export_user_skills(&request.skill_ids).await
+    } else {
+        state.app_state.checkpoint_db.export_user_skills(&request.skill_ids)
+    };
+    let mut skills = match export_result {
         Ok(s) => s,
         Err(e) => {
             return Err((
@@ -387,11 +409,12 @@ pub async fn import_skills(
         }
     }
 
-    match state
-        .app_state
-        .checkpoint_db
-        .import_skills(&request.skills, &request.conflict_mode)
-    {
+    let import_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.import_skills(&request.skills, &request.conflict_mode).await
+    } else {
+        state.app_state.checkpoint_db.import_skills(&request.skills, &request.conflict_mode)
+    };
+    match import_result {
         Ok(mut result) => {
             result.warnings.extend(checksum_warnings);
             Ok(Json(ApiResponse::success(result)))
@@ -419,11 +442,12 @@ pub async fn approve_skill(
         ));
     }
 
-    match state
-        .app_state
-        .checkpoint_db
-        .update_skill_approval(&id, &req.status)
-    {
+    let approval_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.update_skill_approval(&id, &req.status).await
+    } else {
+        state.app_state.checkpoint_db.update_skill_approval(&id, &req.status)
+    };
+    match approval_result {
         Ok(_) => Ok(Json(ApiResponse::success(serde_json::json!({
             "id": id,
             "approval_status": req.status
@@ -444,11 +468,12 @@ pub async fn fork_skill(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<ForkSkillRequest>,
 ) -> Result<Json<ApiResponse<SkillDefinition>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state
-        .app_state
-        .checkpoint_db
-        .fork_skill(&id, req.new_name.as_deref())
-    {
+    let fork_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.fork_skill(&id, req.new_name.as_deref()).await
+    } else {
+        state.app_state.checkpoint_db.fork_skill(&id, req.new_name.as_deref())
+    };
+    match fork_result {
         Ok(new_skill) => Ok(Json(ApiResponse::success(new_skill))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -462,7 +487,12 @@ pub async fn increment_usage(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.increment_skill_usage(&id) {
+    let inc_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.increment_skill_usage(&id).await
+    } else {
+        state.app_state.checkpoint_db.increment_skill_usage(&id)
+    };
+    match inc_result {
         Ok(count) => Ok(Json(ApiResponse::success(serde_json::json!({
             "id": id,
             "usage_count": count
@@ -484,11 +514,12 @@ pub async fn sync_push(
     Json(req): Json<SyncPushRequest>,
 ) -> Result<Json<ApiResponse<SyncPushResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Export skills from local DB
-    let mut skills = match state
-        .app_state
-        .checkpoint_db
-        .export_user_skills(&req.skill_ids)
-    {
+    let push_export_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.export_user_skills(&req.skill_ids).await
+    } else {
+        state.app_state.checkpoint_db.export_user_skills(&req.skill_ids)
+    };
+    let mut skills = match push_export_result {
         Ok(s) => s,
         Err(e) => {
             return Err((
@@ -677,8 +708,13 @@ pub async fn sync_pull(
         })));
     }
 
-    // Import into local DB
-    match state.app_state.checkpoint_db.import_skills(&skills, "skip") {
+    // Import into local DB (PG-primary, SQLite fallback)
+    let import_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.import_skills(&skills, "skip").await
+    } else {
+        state.app_state.checkpoint_db.import_skills(&skills, "skip")
+    };
+    match import_result {
         Ok(result) => {
             let mut all_errors = parse_errors;
             all_errors.extend(result.errors);
@@ -749,7 +785,12 @@ pub async fn bump_version(
     }
 
     // Get the current skill
-    let skill = match state.app_state.checkpoint_db.get_user_skill(&id) {
+    let skill_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.get_user_skill(&id).await
+    } else {
+        state.app_state.checkpoint_db.get_user_skill(&id)
+    };
+    let skill = match skill_result {
         Ok(Some(s)) => s,
         Ok(None) => {
             return Err((
@@ -774,11 +815,12 @@ pub async fn bump_version(
     let checksum = crate::skills::compute_skill_checksum(&updated);
 
     // Update in DB
-    match state
-        .app_state
-        .checkpoint_db
-        .update_skill_version(&id, &new_version, &checksum)
-    {
+    let version_result = if let Some(pg) = &state.app_state.pg_db {
+        pg.update_skill_version(&id, &new_version, &checksum).await
+    } else {
+        state.app_state.checkpoint_db.update_skill_version(&id, &new_version, &checksum)
+    };
+    match version_result {
         Ok(_) => Ok(Json(ApiResponse::success(serde_json::json!({
             "id": id,
             "previous_version": current_version,

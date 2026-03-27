@@ -29,6 +29,12 @@ pub mod ui_bridge;
 pub mod watchers;
 pub mod workflow_state;
 pub mod workflows;
+pub mod ai_sessions;
+pub mod checkpoints;
+pub mod flows;
+pub mod worktrees;
+pub mod export;
+pub mod data_migration;
 
 use tracing::{info, warn};
 
@@ -306,6 +312,133 @@ impl PgDb {
             "CREATE INDEX IF NOT EXISTS idx_error_events_last_seen ON error_events(last_seen_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_error_events_source_name ON error_events(log_source_name)",
             "CREATE INDEX IF NOT EXISTS idx_error_events_trace_id ON error_events(trace_id)",
+            // Workflow Verification Phase Results
+            "CREATE TABLE IF NOT EXISTS workflow_verification_phase_results (
+                id              TEXT PRIMARY KEY,
+                task_run_id     TEXT NOT NULL,
+                iteration       INTEGER NOT NULL,
+                all_passed      BOOLEAN NOT NULL,
+                total_steps     INTEGER NOT NULL,
+                passed_steps    INTEGER NOT NULL,
+                failed_steps    INTEGER NOT NULL,
+                skipped_steps   INTEGER NOT NULL,
+                total_duration_ms BIGINT NOT NULL,
+                critical_failure BOOLEAN NOT NULL DEFAULT false,
+                result_json     TEXT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ver_phase_unique ON workflow_verification_phase_results(task_run_id, iteration)",
+            // Workflow AI Sessions
+            "CREATE TABLE IF NOT EXISTS workflow_ai_sessions (
+                id                      BIGSERIAL PRIMARY KEY,
+                task_run_id             TEXT NOT NULL,
+                iteration               INTEGER NOT NULL,
+                phase                   TEXT NOT NULL,
+                stage_index             INTEGER,
+                claude_cli_session_id   TEXT,
+                session_started_at      TIMESTAMPTZ NOT NULL,
+                session_completed_at    TIMESTAMPTZ,
+                output_length           INTEGER NOT NULL DEFAULT 0,
+                status                  TEXT NOT NULL DEFAULT 'running'
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ai_sessions_unique ON workflow_ai_sessions(task_run_id, iteration, phase, COALESCE(stage_index, -1))",
+            "CREATE INDEX IF NOT EXISTS idx_wf_ai_sessions_task_run ON workflow_ai_sessions(task_run_id)",
+            // Worktrees
+            "CREATE TABLE IF NOT EXISTS worktrees (
+                id              TEXT PRIMARY KEY,
+                worktree_path   TEXT NOT NULL,
+                branch_name     TEXT NOT NULL,
+                source_branch   TEXT NOT NULL,
+                source_commit   TEXT NOT NULL,
+                repo_path       TEXT NOT NULL,
+                task_run_id     TEXT,
+                workflow_name   TEXT,
+                status          TEXT NOT NULL DEFAULT 'active',
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_worktrees_status ON worktrees(status)",
+            "CREATE INDEX IF NOT EXISTS idx_worktrees_task_run ON worktrees(task_run_id)",
+            // Workflow Constraint Results
+            "CREATE TABLE IF NOT EXISTS workflow_constraint_results (
+                id              BIGSERIAL PRIMARY KEY,
+                task_run_id     TEXT NOT NULL,
+                iteration       INTEGER NOT NULL,
+                constraint_id   TEXT NOT NULL,
+                constraint_name TEXT NOT NULL,
+                passed          BOOLEAN NOT NULL,
+                severity        TEXT NOT NULL,
+                violations_json TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_wf_constraint_task_run ON workflow_constraint_results(task_run_id)",
+            // Active Workflows (checkpoint storage)
+            "CREATE TABLE IF NOT EXISTS active_workflows (
+                id              BIGSERIAL PRIMARY KEY,
+                workflow_name   TEXT NOT NULL UNIQUE,
+                checkpoint_data TEXT NOT NULL,
+                run_id          TEXT NOT NULL,
+                phase_field     TEXT NOT NULL DEFAULT 'current_phase',
+                completion_value INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                completed       BOOLEAN NOT NULL DEFAULT false
+            )",
+            // Orchestrator Flows
+            "CREATE TABLE IF NOT EXISTS orchestrator_flows (
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                description     TEXT,
+                steps           TEXT NOT NULL DEFAULT '[]',
+                start_step      TEXT,
+                timeout_secs    INTEGER,
+                inputs          TEXT,
+                outputs         TEXT,
+                tags            TEXT DEFAULT '[]',
+                version         TEXT NOT NULL DEFAULT '1.0.0',
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_orch_flows_name ON orchestrator_flows(name)",
+            // Flow Executions
+            "CREATE TABLE IF NOT EXISTS flow_executions (
+                instance_id     TEXT PRIMARY KEY,
+                flow_id         TEXT NOT NULL,
+                current_step    TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                context         TEXT,
+                history         TEXT,
+                error           TEXT,
+                started_at      TEXT NOT NULL,
+                completed_at    TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_flow_exec_flow ON flow_executions(flow_id)",
+            "CREATE INDEX IF NOT EXISTS idx_flow_exec_status ON flow_executions(status)",
+            // Flow Versions
+            "CREATE TABLE IF NOT EXISTS flow_versions (
+                id              TEXT PRIMARY KEY,
+                flow_id         TEXT NOT NULL,
+                version         INTEGER NOT NULL,
+                definition      TEXT NOT NULL,
+                message         TEXT,
+                created_by      TEXT,
+                created_at      TEXT NOT NULL,
+                UNIQUE(flow_id, version)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_id ON flow_versions(flow_id)",
+            "CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_version ON flow_versions(flow_id, version)",
+            // Orchestrator Checkpoints
+            "CREATE TABLE IF NOT EXISTS orchestrator_checkpoints (
+                id              TEXT PRIMARY KEY,
+                task_id         TEXT NOT NULL,
+                iteration       INTEGER NOT NULL DEFAULT 0,
+                trigger         TEXT NOT NULL,
+                state           TEXT NOT NULL DEFAULT '{}',
+                name            TEXT,
+                created_at      TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task ON orchestrator_checkpoints(task_id)",
+            "CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task_iter ON orchestrator_checkpoints(task_id, iteration)",
         ];
 
         for sql in &ddl {

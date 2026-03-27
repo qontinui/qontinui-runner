@@ -529,17 +529,42 @@ pub fn detect_regression(
     execution_id: &str,
     current_iteration: u32,
     current_result: &crate::step_executor::VerificationPhaseResult,
+    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
 ) -> Option<String> {
     if current_iteration <= 1 {
         return None;
     }
 
-    // Retrieve previous iteration result
-    let prev_result =
-        match checkpoint_db.get_verification_phase_result(execution_id, current_iteration - 1) {
-            Ok(Some(val)) => val,
-            _ => return None,
+    // Retrieve previous iteration result (PG-primary with SQLite fallback)
+    let prev_result = {
+        let prev_iter = current_iteration - 1;
+        let pg_result = if let Some(pg) = pg_db {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let pg = pg.clone();
+                let id = execution_id.to_string();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle.block_on(async move { pg.get_verification_phase_result(&id, prev_iter).await })
+                }))
+                .ok()
+                .and_then(|r| r.ok())
+            } else {
+                None
+            }
+        } else {
+            None
         };
+        match pg_result {
+            Some(v) => v,
+            None => match checkpoint_db.get_verification_phase_result(execution_id, prev_iter) {
+                Ok(Some(val)) => Some(val),
+                _ => None,
+            },
+        }
+    };
+    let prev_result = match prev_result {
+        Some(val) => val,
+        None => return None,
+    };
 
     // Extract previous step results
     let prev_step_results = prev_result.get("step_results").and_then(|v| v.as_array())?;
@@ -639,12 +664,28 @@ pub fn build_resume_agentic_context(
     checkpoint_db: &Arc<CheckpointDb>,
     execution_id: &str,
     iteration: u32,
+    pg_db: Option<&std::sync::Arc<crate::database::pg::PgDb>>,
 ) -> String {
     // Strategy 1: Try loading the full verification phase result.
     // The result may be stored under the execution_id or a child ID.
-    if let Ok(Some(result_json)) =
-        checkpoint_db.get_verification_phase_result(execution_id, iteration)
-    {
+    // PG-primary with SQLite fallback
+    let phase_result = if let Some(pg) = pg_db {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = pg.clone();
+            let id = execution_id.to_string();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_verification_phase_result(&id, iteration).await })
+            }))
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_else(|| checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten())
+        } else {
+            checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten()
+        }
+    } else {
+        checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten()
+    };
+    if let Some(result_json) = phase_result {
         // Try to deserialize into VerificationPhaseResult and use build_failure_context()
         if let Ok(result) =
             serde_json::from_value::<crate::step_executor::VerificationPhaseResult>(result_json)
