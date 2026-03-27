@@ -1642,3 +1642,1388 @@ CREATE TABLE IF NOT EXISTS development_intelligence (
 );
 CREATE INDEX IF NOT EXISTS idx_di_project ON development_intelligence(project_path, analysis_type);
 CREATE INDEX IF NOT EXISTS idx_di_created ON development_intelligence(created_at);
+
+-- Cached App Specs (discovered application specifications)
+CREATE TABLE IF NOT EXISTS cached_app_specs (
+    id TEXT PRIMARY KEY,
+    app_url TEXT NOT NULL,
+    app_name TEXT NOT NULL,
+    spec_id TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    page_url TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cached_specs_app ON cached_app_specs(app_url);
+
+-- Canvas Panels (task run visualization panels)
+CREATE TABLE IF NOT EXISTS canvas_panels (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    component TEXT NOT NULL,
+    title TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    priority INTEGER DEFAULT 50,
+    size TEXT DEFAULT 'normal',
+    group_name TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_panels_task_run_id ON canvas_panels(task_run_id);
+
+-- Process Sessions (managed process lifecycle tracking)
+CREATE TABLE IF NOT EXISTS process_sessions (
+    id TEXT PRIMARY KEY,
+    process_config_id TEXT NOT NULL,
+    process_name TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    stopped_at TEXT,
+    exit_code INTEGER,
+    state TEXT NOT NULL DEFAULT 'running',
+    error_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_process_sessions_config_id ON process_sessions(process_config_id);
+CREATE INDEX IF NOT EXISTS idx_process_sessions_started_at ON process_sessions(started_at);
+
+-- Process Session Output (stdout/stderr lines from managed processes)
+CREATE TABLE IF NOT EXISTS process_session_output (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    line TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES process_sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_process_session_output_session ON process_session_output(session_id);
+
+-- State Machine Configs (state machine definitions for UI automation)
+CREATE TABLE IF NOT EXISTS state_machine_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT 'default',
+    description TEXT,
+    render_count INTEGER NOT NULL DEFAULT 0,
+    element_count INTEGER NOT NULL DEFAULT 0,
+    include_html_ids BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- State Machine States (individual states within a state machine config)
+CREATE TABLE IF NOT EXISTS state_machine_states (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    state_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    element_ids TEXT NOT NULL DEFAULT '[]',
+    render_ids TEXT NOT NULL DEFAULT '[]',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.9,
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    extra_metadata TEXT NOT NULL DEFAULT '{}',
+    domain_knowledge TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sm_states_config_id ON state_machine_states(config_id);
+
+-- State Machine Transitions (transitions between states)
+CREATE TABLE IF NOT EXISTS state_machine_transitions (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    transition_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    from_states TEXT NOT NULL DEFAULT '[]',
+    activate_states TEXT NOT NULL DEFAULT '[]',
+    exit_states TEXT NOT NULL DEFAULT '[]',
+    actions TEXT NOT NULL DEFAULT '[]',
+    path_cost DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    stays_visible BOOLEAN NOT NULL DEFAULT FALSE,
+    extra_metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sm_transitions_config_id ON state_machine_transitions(config_id);
+
+-- UI Bridge Integrations (projects with source integration)
+CREATE TABLE IF NOT EXISTS ui_bridge_integrations (
+    id TEXT PRIMARY KEY,
+    project_path TEXT NOT NULL,
+    label TEXT,
+    framework TEXT,
+    integration_type TEXT NOT NULL,
+    sdk_version TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    target_url TEXT,
+    last_health_check INTEGER,
+    element_count INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_status ON ui_bridge_integrations(status);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_type ON ui_bridge_integrations(integration_type);
+
+-- UI Bridge State Groups (atomic state collections)
+CREATE TABLE IF NOT EXISTS ui_bridge_state_groups (
+    id BIGSERIAL PRIMARY KEY,
+    group_id TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    states TEXT,
+    metadata TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_state_groups_group_id ON ui_bridge_state_groups(group_id);
+
+-- UI Bridge States (registered UI states for navigation)
+CREATE TABLE IF NOT EXISTS ui_bridge_states (
+    id BIGSERIAL PRIMARY KEY,
+    state_id TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    elements TEXT,
+    blocking INTEGER DEFAULT 0,
+    blocks TEXT,
+    group_id TEXT,
+    path_cost DOUBLE PRECISION DEFAULT 1.0,
+    is_active INTEGER DEFAULT 0,
+    active_when TEXT,
+    metadata TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_states_state_id ON ui_bridge_states(state_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_states_group ON ui_bridge_states(group_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_states_active ON ui_bridge_states(is_active);
+
+-- State Machine Capture Screenshots (full-page screenshots for state view)
+CREATE TABLE IF NOT EXISTS sm_capture_screenshots (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    capture_index INTEGER NOT NULL,
+    screenshot_webp BYTEA NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    element_bounds_json TEXT NOT NULL DEFAULT '{}',
+    fingerprint_hashes_json TEXT NOT NULL DEFAULT '[]',
+    captured_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sm_screenshots_config ON sm_capture_screenshots(config_id);
+
+-- State Machine Element Thumbnails (per-element cropped thumbnails)
+CREATE TABLE IF NOT EXISTS sm_element_thumbnails (
+    config_id TEXT NOT NULL REFERENCES state_machine_configs(id) ON DELETE CASCADE,
+    fingerprint_hash TEXT NOT NULL,
+    thumbnail_base64 TEXT NOT NULL,
+    PRIMARY KEY (config_id, fingerprint_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_sm_thumbnails_config ON sm_element_thumbnails(config_id);
+
+-- Log Sources (application log files to monitor for errors)
+CREATE TABLE IF NOT EXISTS log_sources (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    path TEXT NOT NULL,
+    path_type TEXT DEFAULT 'file',
+    format TEXT DEFAULT 'plaintext',
+    parser TEXT DEFAULT 'generic',
+    timestamp_pattern TEXT,
+    timezone TEXT DEFAULT 'local',
+    error_patterns TEXT,
+    warning_patterns TEXT,
+    ignore_patterns TEXT,
+    enabled BOOLEAN DEFAULT true,
+    poll_interval_ms INTEGER DEFAULT 5000,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_log_sources_name ON log_sources(name);
+CREATE INDEX IF NOT EXISTS idx_log_sources_enabled ON log_sources(enabled);
+
+-- Recordings (browser interaction recording sessions)
+CREATE TABLE IF NOT EXISTS recordings (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    base_url TEXT NOT NULL,
+    action_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'recording',
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    browser_info TEXT,
+    tab_id INTEGER,
+    tags TEXT DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
+CREATE INDEX IF NOT EXISTS idx_recordings_created_at ON recordings(created_at);
+CREATE INDEX IF NOT EXISTS idx_recordings_base_url ON recordings(base_url);
+
+-- Recording Actions (individual captured user interactions)
+CREATE TABLE IF NOT EXISTS recording_actions (
+    id TEXT PRIMARY KEY,
+    recording_id TEXT NOT NULL,
+    sequence_number INTEGER NOT NULL,
+    action_type TEXT NOT NULL,
+    url TEXT NOT NULL,
+    page_title TEXT,
+    target_json TEXT NOT NULL,
+    action_data_json TEXT,
+    screenshot_path TEXT,
+    timestamp TEXT NOT NULL,
+    duration_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_recording_actions_recording_id ON recording_actions(recording_id);
+CREATE INDEX IF NOT EXISTS idx_recording_actions_sequence ON recording_actions(recording_id, sequence_number);
+CREATE INDEX IF NOT EXISTS idx_recording_actions_action_type ON recording_actions(action_type);
+
+-- Recording Exports (generated scripts from recordings)
+CREATE TABLE IF NOT EXISTS recording_exports (
+    id TEXT PRIMARY KEY,
+    recording_id TEXT NOT NULL,
+    export_format TEXT NOT NULL,
+    script_content TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    options_json TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_recording_exports_recording_id ON recording_exports(recording_id);
+CREATE INDEX IF NOT EXISTS idx_recording_exports_format ON recording_exports(export_format);
+
+-- Context Summaries (compressed iteration context for long-running workflows)
+CREATE TABLE IF NOT EXISTS context_summaries (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    iterations_summarized TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    key_findings TEXT,
+    successful_fixes TEXT,
+    root_causes TEXT,
+    original_token_count INTEGER,
+    summary_token_count INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Convergence Snapshots (workflow convergence tracking over time)
+CREATE TABLE IF NOT EXISTS convergence_snapshots (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    project_path TEXT,
+    scope TEXT NOT NULL DEFAULT 'workflow',
+    convergence_score DOUBLE PRECISION NOT NULL,
+    consecutive_clean_runs INTEGER NOT NULL,
+    novelty_score DOUBLE PRECISION NOT NULL,
+    effective_fix_rate DOUBLE PRECISION NOT NULL,
+    change_velocity DOUBLE PRECISION NOT NULL,
+    total_fixes INTEGER NOT NULL,
+    effective_fixes INTEGER NOT NULL,
+    snapshot_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_convergence_workflow ON convergence_snapshots(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_convergence_project ON convergence_snapshots(project_path);
+CREATE INDEX IF NOT EXISTS idx_convergence_scope ON convergence_snapshots(scope);
+
+-- Scheduler Settings (singleton scheduler configuration)
+CREATE TABLE IF NOT EXISTS scheduler_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    max_concurrent INTEGER NOT NULL DEFAULT 1,
+    default_auto_fix_on_failure BOOLEAN NOT NULL DEFAULT false,
+    timezone TEXT
+);
+
+-- =============================================================================
+-- Generation Rules
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS generation_rules (
+    id TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    section TEXT NOT NULL,
+    rule_number INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    condition TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    provenance TEXT NOT NULL DEFAULT 'seed',
+    source_fix_id TEXT,
+    confidence DOUBLE PRECISION DEFAULT 1.0,
+    auto_generated_at TEXT,
+    evidence_count INTEGER DEFAULT 0,
+    severity TEXT NOT NULL DEFAULT 'normal',
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    examples_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_agent_section ON generation_rules(agent, section, rule_number);
+CREATE INDEX IF NOT EXISTS idx_generation_rules_severity ON generation_rules(severity);
+
+-- =============================================================================
+-- Generation Pipeline Artifacts
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    description TEXT NOT NULL,
+    category TEXT,
+    created_at TEXT NOT NULL,
+    investigation_duration_ms INTEGER,
+    investigation_enriched_description TEXT,
+    discovery_duration_ms INTEGER,
+    builder_duration_ms INTEGER,
+    autofix_duration_ms INTEGER,
+    verification_duration_ms INTEGER,
+    hardener_duration_ms INTEGER,
+    total_duration_ms INTEGER,
+    discovery_calls TEXT,
+    builder_raw_output TEXT,
+    builder_parsed_json TEXT,
+    autofix_diff TEXT,
+    verification_iterations TEXT,
+    fixer_snapshots TEXT,
+    hardening_summary TEXT,
+    hardened_json TEXT,
+    final_json TEXT,
+    validation_errors TEXT,
+    specification_duration_ms INTEGER,
+    specification_criteria TEXT,
+    specification_prompt TEXT,
+    builder_prompt TEXT,
+    verification_prompts TEXT,
+    hardener_prompt TEXT,
+    revision_duration_ms INTEGER DEFAULT NULL,
+    quality_report TEXT DEFAULT NULL,
+    revision_cycles INTEGER DEFAULT NULL,
+    confidence_score DOUBLE PRECISION DEFAULT NULL,
+    success BOOLEAN NOT NULL DEFAULT true,
+    error_message TEXT,
+    model_used TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_workflow ON generation_pipeline_artifacts(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_created ON generation_pipeline_artifacts(created_at);
+
+-- =============================================================================
+-- Generator Benchmarks
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS generator_benchmarks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT,
+    tags TEXT,
+    expected_structure TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT true
+);
+
+-- =============================================================================
+-- Generator Benchmark Results
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS generator_benchmark_results (
+    id TEXT PRIMARY KEY,
+    benchmark_id TEXT NOT NULL REFERENCES generator_benchmarks(id),
+    artifact_id TEXT REFERENCES generation_pipeline_artifacts(id),
+    run_at TEXT NOT NULL,
+    model_used TEXT,
+    structure_score DOUBLE PRECISION,
+    content_score DOUBLE PRECISION,
+    step_type_score DOUBLE PRECISION,
+    overall_score DOUBLE PRECISION,
+    score_breakdown TEXT,
+    generated_json TEXT,
+    duration_ms INTEGER,
+    passed BOOLEAN NOT NULL DEFAULT false,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_benchmark ON generator_benchmark_results(benchmark_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_results_run_at ON generator_benchmark_results(run_at);
+
+-- =============================================================================
+-- Golden Datasets
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS golden_datasets (
+    id TEXT PRIMARY KEY,
+    agent_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    entries_json TEXT NOT NULL DEFAULT '[]',
+    entry_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_golden_agent ON golden_datasets(agent_type);
+
+-- =============================================================================
+-- Eval Specs
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS eval_specs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    target_agent TEXT,
+    spec_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- =============================================================================
+-- Eval Results
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS eval_results (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    recommendation_id TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    p_value DOUBLE PRECISION,
+    trials_run INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eval_results_spec ON eval_results(spec_id);
+CREATE INDEX IF NOT EXISTS idx_eval_results_rec ON eval_results(recommendation_id);
+
+-- =============================================================================
+-- Pipeline Agent Traces
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    agent_type TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    input_snapshot TEXT NOT NULL DEFAULT '{}',
+    output_snapshot TEXT NOT NULL DEFAULT '{}',
+    config_json TEXT NOT NULL DEFAULT '{}',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    downstream_success BOOLEAN,
+    output_quality_score DOUBLE PRECISION,
+    parent_span_id TEXT,
+    span_type TEXT DEFAULT 'agent',
+    guardrail_results_json TEXT,
+    handoff_context_json TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_agent_type ON pipeline_agent_traces(agent_type);
+CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_run_id ON pipeline_agent_traces(run_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_traces_parent_span ON pipeline_agent_traces(parent_span_id);
+CREATE INDEX IF NOT EXISTS idx_pipeline_traces_span_type ON pipeline_agent_traces(span_type);
+
+-- =============================================================================
+-- Meta-Optimizer Runs
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS meta_optimizer_runs (
+    id TEXT PRIMARY KEY,
+    optimizer_type TEXT NOT NULL,
+    trigger_type TEXT NOT NULL DEFAULT 'threshold',
+    runs_analyzed INTEGER NOT NULL DEFAULT 0,
+    recommendations_produced INTEGER NOT NULL DEFAULT 0,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_runs_type ON meta_optimizer_runs(optimizer_type);
+
+-- =============================================================================
+-- Meta-Optimizer Snapshots
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS meta_optimizer_snapshots (
+    id TEXT PRIMARY KEY,
+    snapshot_type TEXT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    breakdown_json TEXT DEFAULT '{}',
+    recommendation_id TEXT,
+    runs_included INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_type ON meta_optimizer_snapshots(snapshot_type);
+CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_rec ON meta_optimizer_snapshots(recommendation_id);
+
+-- =============================================================================
+-- Reflection Fixes
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS reflection_fixes (
+    id TEXT PRIMARY KEY,
+    source_task_run_id TEXT NOT NULL,
+    reflection_task_run_id TEXT NOT NULL,
+    source_finding_id TEXT,
+    source_knowledge_id TEXT,
+    fix_type TEXT NOT NULL,
+    fix_description TEXT NOT NULL,
+    file_changed TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    confidence TEXT NOT NULL DEFAULT 'medium',
+    content_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'applied',
+    effectiveness TEXT,
+    effectiveness_evidence TEXT,
+    applied_at TEXT NOT NULL,
+    evaluated_at TEXT,
+    created_at TEXT NOT NULL,
+    source_agent TEXT,
+    reasoning TEXT,
+    alternatives_considered TEXT,
+    reflection_scope TEXT DEFAULT 'workflow',
+    project_path TEXT,
+    target_component TEXT,
+    reuse_count INTEGER DEFAULT 0,
+    applicability_context TEXT,
+    fix_description_embedding BYTEA,
+    FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (reflection_task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_finding_id) REFERENCES task_run_findings(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_knowledge_id) REFERENCES task_knowledge(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source ON reflection_fixes(source_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_reflection ON reflection_fixes(reflection_task_run_id);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_content_hash ON reflection_fixes(content_hash);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_status ON reflection_fixes(status);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_effectiveness ON reflection_fixes(effectiveness);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_applied_at ON reflection_fixes(applied_at);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_source_agent ON reflection_fixes(source_agent);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_project ON reflection_fixes(project_path);
+CREATE INDEX IF NOT EXISTS idx_reflection_fixes_scope ON reflection_fixes(reflection_scope);
+
+-- =============================================================================
+-- Fix Applications
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS fix_applications (
+    id TEXT PRIMARY KEY,
+    fix_id TEXT NOT NULL,
+    task_run_id TEXT NOT NULL,
+    error_signature_hash TEXT,
+    outcome TEXT DEFAULT 'pending',
+    applied_at TEXT NOT NULL,
+    evaluated_at TEXT,
+    FOREIGN KEY (fix_id) REFERENCES reflection_fixes(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_fix_applications_fix ON fix_applications(fix_id);
+CREATE INDEX IF NOT EXISTS idx_fix_applications_task ON fix_applications(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_fix_applications_sig ON fix_applications(error_signature_hash);
+
+-- =============================================================================
+-- Rule Applications
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS rule_applications (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    agent TEXT NOT NULL,
+    section TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    FOREIGN KEY (rule_id) REFERENCES generation_rules(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_apps_rule ON rule_applications(rule_id);
+CREATE INDEX IF NOT EXISTS idx_rule_apps_workflow ON rule_applications(workflow_id);
+
+-- =============================================================================
+-- Workflow Generation Feedback
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS workflow_generation_feedback (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    task_run_id TEXT,
+    feedback_type TEXT NOT NULL,
+    edited_field TEXT,
+    old_value TEXT,
+    new_value TEXT,
+    delete_reason TEXT,
+    rating INTEGER,
+    rating_comment TEXT,
+    workflow_category TEXT,
+    workflow_description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_wgf_workflow_id ON workflow_generation_feedback(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_wgf_task_run_id ON workflow_generation_feedback(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wgf_feedback_type ON workflow_generation_feedback(feedback_type);
+CREATE INDEX IF NOT EXISTS idx_wgf_created_at ON workflow_generation_feedback(created_at);
+
+-- =============================================================================
+-- Known Issues
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS known_issues (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'other',
+    scope_type TEXT NOT NULL DEFAULT 'global',
+    scope_value TEXT,
+    scope_tags TEXT DEFAULT '[]',
+    detection_method TEXT NOT NULL DEFAULT 'ai_judgment',
+    detection_config TEXT DEFAULT '{}',
+    pattern_template_id TEXT,
+    reproduction_context TEXT,
+    trigger_conditions TEXT DEFAULT '[]',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'active',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    provenance TEXT NOT NULL DEFAULT 'manual',
+    source_finding_ids TEXT DEFAULT '[]',
+    source_task_run_id TEXT,
+    verification_hint TEXT,
+    verification_step_template TEXT,
+    times_detected INTEGER DEFAULT 1,
+    times_checked INTEGER DEFAULT 0,
+    last_detected_at TEXT,
+    last_checked_at TEXT,
+    resolved_at TEXT,
+    description_embedding BYTEA,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (source_task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+    -- pattern_template_id is a soft FK to issue_pattern_templates(id)
+);
+CREATE INDEX IF NOT EXISTS idx_known_issues_category ON known_issues(category);
+CREATE INDEX IF NOT EXISTS idx_known_issues_scope_type ON known_issues(scope_type);
+CREATE INDEX IF NOT EXISTS idx_known_issues_status ON known_issues(status);
+CREATE INDEX IF NOT EXISTS idx_known_issues_severity ON known_issues(severity);
+CREATE INDEX IF NOT EXISTS idx_known_issues_scope_value ON known_issues(scope_value);
+CREATE INDEX IF NOT EXISTS idx_known_issues_scope_compound ON known_issues(scope_type, scope_value, status);
+
+-- =============================================================================
+-- Issue Pattern Templates
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS issue_pattern_templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    category TEXT NOT NULL,
+    detection_type TEXT NOT NULL,
+    step_template TEXT,
+    ai_prompt_template TEXT,
+    parameters TEXT NOT NULL DEFAULT '[]',
+    built_in BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ipt_category ON issue_pattern_templates(category);
+CREATE INDEX IF NOT EXISTS idx_ipt_status ON issue_pattern_templates(status);
+
+-- =============================================================================
+-- Pending Discoveries
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS pending_discoveries (
+    id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_attempt TEXT,
+    attempt_count INTEGER DEFAULT 0,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_discoveries_created_at ON pending_discoveries(created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_discoveries_attempt_count ON pending_discoveries(attempt_count);
+
+-- =============================================================================
+-- Step Type Knowledge
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS step_type_knowledge (
+    id TEXT PRIMARY KEY,
+    step_type TEXT NOT NULL,
+    layer TEXT NOT NULL DEFAULT 'universal',
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    provenance TEXT NOT NULL DEFAULT 'seed',
+    source_fix_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stk_step_type ON step_type_knowledge(step_type);
+CREATE INDEX IF NOT EXISTS idx_stk_layer ON step_type_knowledge(layer);
+CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, layer, status);
+
+-- =============================================================================
+-- Task Knowledge Summaries
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS task_knowledge_summaries (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    covered_iterations TEXT NOT NULL,
+    item_count INTEGER NOT NULL,
+    original_tokens INTEGER,
+    compressed_tokens INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_summaries_task_run_id ON task_knowledge_summaries(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_summaries_category ON task_knowledge_summaries(category);
+
+-- =============================================================================
+-- Batch 3: Remaining missing tables (18 of 19; workflow_generation_feedback already exists)
+-- =============================================================================
+
+-- Schema Version tracking
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+
+-- GUI Lock (singleton row)
+CREATE TABLE IF NOT EXISTS gui_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    holder_session_id TEXT,
+    acquired_at TEXT,
+    FOREIGN KEY (holder_session_id) REFERENCES sessions(id) ON DELETE SET NULL
+);
+
+-- AI Workflows (legacy workflow definitions)
+CREATE TABLE IF NOT EXISTS ai_workflows (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    config TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Executions (workflow execution records)
+CREATE TABLE IF NOT EXISTS executions (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT,
+    config_path TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    status TEXT NOT NULL,
+    success BOOLEAN,
+    result_data TEXT,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_executions_started_at ON executions(started_at);
+CREATE INDEX IF NOT EXISTS idx_executions_workflow_name ON executions(workflow_name);
+
+-- Config Statistics (aggregated statistics per config)
+CREATE TABLE IF NOT EXISTS config_statistics (
+    id TEXT PRIMARY KEY,
+    config_id TEXT NOT NULL UNIQUE,
+    config_hash TEXT,
+    total_runs INTEGER DEFAULT 0,
+    successful_runs INTEGER DEFAULT 0,
+    failed_runs INTEGER DEFAULT 0,
+    timeout_runs INTEGER DEFAULT 0,
+    avg_duration_ms INTEGER,
+    recent_success_rate DOUBLE PRECISION,
+    recent_avg_duration_ms INTEGER,
+    transition_stats TEXT,
+    template_stats TEXT,
+    state_stats TEXT,
+    error_patterns TEXT,
+    flaky_transitions TEXT,
+    flaky_templates TEXT,
+    first_run_at TEXT,
+    last_run_at TEXT,
+    last_updated_at TEXT,
+    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_config_statistics_config_id ON config_statistics(config_id);
+
+-- Causal Events (cause-effect relationship graph)
+CREATE TABLE IF NOT EXISTS causal_events (
+    id TEXT PRIMARY KEY,
+    cause_event_type TEXT NOT NULL,
+    cause_event_id TEXT NOT NULL,
+    effect_event_type TEXT NOT NULL,
+    effect_event_id TEXT NOT NULL,
+    relationship TEXT NOT NULL,
+    confidence TEXT NOT NULL DEFAULT 'high',
+    source TEXT NOT NULL DEFAULT 'automated',
+    task_run_id TEXT,
+    workflow_name TEXT,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_causal_cause ON causal_events(cause_event_type, cause_event_id);
+CREATE INDEX IF NOT EXISTS idx_causal_effect ON causal_events(effect_event_type, effect_event_id);
+CREATE INDEX IF NOT EXISTS idx_causal_workflow ON causal_events(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_causal_task_run ON causal_events(task_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_causal_dedup ON causal_events(cause_event_type, cause_event_id, effect_event_type, effect_event_id);
+
+-- Architecture Components (component-level aggregated data)
+CREATE TABLE IF NOT EXISTS architecture_components (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    component_path TEXT NOT NULL,
+    component_type TEXT NOT NULL DEFAULT 'file',
+    fix_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    causal_involvement_count INTEGER NOT NULL DEFAULT 0,
+    effective_fix_count INTEGER NOT NULL DEFAULT 0,
+    ineffective_fix_count INTEGER NOT NULL DEFAULT 0,
+    health_score DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    change_velocity DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    last_activity_at TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(workflow_name, component_path)
+);
+CREATE INDEX IF NOT EXISTS idx_arch_comp_workflow ON architecture_components(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_arch_comp_health ON architecture_components(health_score);
+
+-- Component Relationships (inter-component dependency graph)
+CREATE TABLE IF NOT EXISTS component_relationships (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    source_component TEXT NOT NULL,
+    target_component TEXT NOT NULL,
+    relationship_type TEXT NOT NULL,
+    strength INTEGER NOT NULL DEFAULT 1,
+    last_seen_at TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(workflow_name, source_component, target_component, relationship_type)
+);
+CREATE INDEX IF NOT EXISTS idx_comp_rel_workflow ON component_relationships(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_comp_rel_source ON component_relationships(source_component);
+
+-- Component Health Snapshots (temporal health trends)
+CREATE TABLE IF NOT EXISTS component_health_snapshots (
+    id TEXT PRIMARY KEY,
+    workflow_name TEXT NOT NULL,
+    component_path TEXT NOT NULL,
+    health_score DOUBLE PRECISION NOT NULL,
+    fix_count INTEGER NOT NULL DEFAULT 0,
+    effective_fix_count INTEGER NOT NULL DEFAULT 0,
+    change_velocity DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    snapshot_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_comp_health_snap_wf ON component_health_snapshots(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_comp_health_snap_comp ON component_health_snapshots(workflow_name, component_path);
+CREATE INDEX IF NOT EXISTS idx_comp_health_snap_at ON component_health_snapshots(snapshot_at);
+
+-- Autoresearch Campaigns (A/B testing campaigns)
+CREATE TABLE IF NOT EXISTS autoresearch_campaigns (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    current_control_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    experiment_count INTEGER NOT NULL DEFAULT 0,
+    accepted_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+-- Autoresearch Experiments (individual A/B experiments)
+CREATE TABLE IF NOT EXISTS autoresearch_experiments (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES autoresearch_campaigns(id) ON DELETE CASCADE,
+    experiment_number INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    trials_json TEXT NOT NULL,
+    aggregate_json TEXT NOT NULL,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    p_value DOUBLE PRECISION,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_campaign ON autoresearch_experiments(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_number ON autoresearch_experiments(campaign_id, experiment_number);
+
+-- Agentic Metric Baselines (learned baselines per workflow)
+CREATE TABLE IF NOT EXISTS agentic_metric_baselines (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT,
+    metric_type TEXT NOT NULL,
+    baseline_value TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baselines_unique ON agentic_metric_baselines(workflow_id, metric_type);
+
+-- Spec Compliance Results (spec assertion tracking)
+CREATE TABLE IF NOT EXISTS spec_compliance_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    spec_id TEXT,
+    iteration INTEGER NOT NULL,
+    overall_score DOUBLE PRECISION NOT NULL,
+    raw_pass_rate DOUBLE PRECISION NOT NULL,
+    critical_passed INTEGER NOT NULL DEFAULT 0,
+    critical_total INTEGER NOT NULL DEFAULT 0,
+    warning_passed INTEGER NOT NULL DEFAULT 0,
+    warning_total INTEGER NOT NULL DEFAULT 0,
+    info_passed INTEGER NOT NULL DEFAULT 0,
+    info_total INTEGER NOT NULL DEFAULT 0,
+    assertions_passed INTEGER NOT NULL,
+    assertions_total INTEGER NOT NULL,
+    group_scores_json TEXT NOT NULL DEFAULT '[]',
+    assertion_details_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spec_compliance_task ON spec_compliance_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_spec_compliance_score ON spec_compliance_results(overall_score);
+CREATE INDEX IF NOT EXISTS idx_spec_compliance_spec ON spec_compliance_results(spec_id);
+
+-- Spec Accuracy Results (spec quality analysis)
+CREATE TABLE IF NOT EXISTS spec_accuracy_results (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    analysis_type TEXT NOT NULL,
+    score DOUBLE PRECISION NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spec_accuracy_spec ON spec_accuracy_results(spec_id);
+CREATE INDEX IF NOT EXISTS idx_spec_accuracy_type ON spec_accuracy_results(analysis_type);
+
+-- Artifacts (UI Bridge IPC artifact persistence)
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    source_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    environment_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    passed INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_passed ON artifacts(passed);
+
+-- Robustness Reports (prompt robustness evaluation)
+CREATE TABLE IF NOT EXISTS robustness_reports (
+    id TEXT PRIMARY KEY,
+    prompt_variant_id TEXT,
+    recommendation_id TEXT,
+    total_tests INTEGER NOT NULL,
+    passed INTEGER NOT NULL,
+    failed INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_robustness_variant ON robustness_reports(prompt_variant_id);
+
+-- Decomposition Plans (task decomposition tracking)
+CREATE TABLE IF NOT EXISTS decomposition_plans (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    original_goal TEXT NOT NULL,
+    goal_summary TEXT,
+    subtask_count INTEGER NOT NULL,
+    plan_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TEXT
+);
+
+-- Decomposition Subtasks (individual subtasks within a plan)
+CREATE TABLE IF NOT EXISTS decomposition_subtasks (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    subtask_index INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    depends_on TEXT,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    output_summary TEXT,
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (plan_id) REFERENCES decomposition_plans(id) ON DELETE CASCADE
+);
+
+-- =============================================================================
+-- Batch: 19 missing tables migrated from SQLite schema
+-- =============================================================================
+
+-- API Credentials (metadata only, secrets in secure storage)
+CREATE TABLE IF NOT EXISTS api_credentials (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    credential_type TEXT NOT NULL,
+    storage_type TEXT NOT NULL DEFAULT 'secure',
+    token_endpoint TEXT,
+    client_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_credentials_name ON api_credentials(name);
+CREATE INDEX IF NOT EXISTS idx_api_credentials_type ON api_credentials(credential_type);
+
+-- API Request Logs (persisted for history, supplements JSONL for DB queries)
+CREATE TABLE IF NOT EXISTS api_request_logs (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT,
+    step_id TEXT NOT NULL,
+    step_name TEXT,
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    resolved_url TEXT NOT NULL,
+    status_code INTEGER NOT NULL,
+    response_time_ms INTEGER NOT NULL,
+    response_body_type TEXT NOT NULL,
+    response_file_path TEXT,
+    response_size_bytes INTEGER,
+    success BOOLEAN NOT NULL,
+    assertion_failures INTEGER DEFAULT 0,
+    extractions_json TEXT,
+    assertions_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_api_request_logs_task_run_id ON api_request_logs(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_api_request_logs_created_at ON api_request_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_api_request_logs_step_id ON api_request_logs(step_id);
+
+-- Model Profiles (per-model capability/cost metadata)
+CREATE TABLE IF NOT EXISTS model_profiles (
+    id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL UNIQUE,
+    profile_json TEXT NOT NULL,
+    trial_count INTEGER DEFAULT 0,
+    last_updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_model_profiles_model ON model_profiles(model_id);
+
+-- Check Results (execution results for individual checks)
+CREATE TABLE IF NOT EXISTS check_results (
+    id TEXT PRIMARY KEY,
+    check_id TEXT NOT NULL,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    output TEXT,
+    error_message TEXT,
+    issues_found INTEGER DEFAULT 0,
+    issues_fixed INTEGER DEFAULT 0,
+    files_checked INTEGER DEFAULT 0,
+    structured_output TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_check_results_check_id ON check_results(check_id);
+CREATE INDEX IF NOT EXISTS idx_check_results_task_run_id ON check_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_check_results_status ON check_results(status);
+CREATE INDEX IF NOT EXISTS idx_check_results_created_at ON check_results(created_at);
+
+-- Shell Command Results (execution results for shell commands)
+CREATE TABLE IF NOT EXISTS shell_command_results (
+    id TEXT PRIMARY KEY,
+    shell_command_id TEXT NOT NULL,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    exit_code INTEGER,
+    stdout TEXT,
+    stderr TEXT,
+    duration_ms INTEGER,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (shell_command_id) REFERENCES shell_commands(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_shell_command_id ON shell_command_results(shell_command_id);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_task_run_id ON shell_command_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_status ON shell_command_results(status);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_created_at ON shell_command_results(created_at);
+
+-- Test Associations (link tests to configs/workflows)
+CREATE TABLE IF NOT EXISTS test_associations (
+    id TEXT PRIMARY KEY,
+    test_id TEXT NOT NULL,
+    config_id TEXT,
+    workflow_name TEXT,
+    trigger_point TEXT NOT NULL,
+    action_id TEXT,
+    execution_order INTEGER DEFAULT 0,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (test_id) REFERENCES verification_tests(id) ON DELETE CASCADE,
+    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_test_associations_test_id ON test_associations(test_id);
+CREATE INDEX IF NOT EXISTS idx_test_associations_config_id ON test_associations(config_id);
+
+-- Test Results (execution results for verification tests)
+CREATE TABLE IF NOT EXISTS test_results (
+    id TEXT PRIMARY KEY,
+    test_id TEXT NOT NULL,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    output TEXT,
+    error_message TEXT,
+    structured_output TEXT,
+    assertions_passed INTEGER DEFAULT 0,
+    assertions_failed INTEGER DEFAULT 0,
+    screenshots TEXT DEFAULT '[]',
+    visual_evidence TEXT,
+    ai_analysis TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (test_id) REFERENCES verification_tests(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_test_results_test_id ON test_results(test_id);
+CREATE INDEX IF NOT EXISTS idx_test_results_task_run_id ON test_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_test_results_status ON test_results(status);
+
+-- Verification Plans (orchestrator architecture, created by Planning Agent)
+CREATE TABLE IF NOT EXISTS verification_plans (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    plan_json TEXT NOT NULL,
+    goal_summary TEXT NOT NULL,
+    criteria_count INTEGER NOT NULL DEFAULT 0,
+    has_ai_criteria BOOLEAN NOT NULL DEFAULT false,
+    replan_reason TEXT,
+    previous_version_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (previous_version_id) REFERENCES verification_plans(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verification_plans_task_run_id ON verification_plans(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_verification_plans_version ON verification_plans(version);
+CREATE INDEX IF NOT EXISTS idx_verification_plans_created_at ON verification_plans(created_at);
+
+-- Orchestrator Verification Results (per-criterion results per iteration)
+CREATE TABLE IF NOT EXISTS orchestrator_verification_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    criterion_id TEXT NOT NULL,
+    criterion_type TEXT NOT NULL,
+    passed BOOLEAN NOT NULL,
+    is_critical BOOLEAN NOT NULL DEFAULT true,
+    confidence TEXT,
+    observations TEXT DEFAULT '[]',
+    issues TEXT DEFAULT '[]',
+    suggestions TEXT DEFAULT '[]',
+    raw_output TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (plan_id) REFERENCES verification_plans(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_task_run_id ON orchestrator_verification_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_plan_id ON orchestrator_verification_results(plan_id);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_iteration ON orchestrator_verification_results(iteration);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_passed ON orchestrator_verification_results(passed);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_criterion_id ON orchestrator_verification_results(criterion_id);
+
+-- Orchestration Loop Configs (saved loop configuration presets)
+CREATE TABLE IF NOT EXISTS orchestration_loop_configs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    is_favorite BOOLEAN DEFAULT false,
+    config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ol_configs_favorite ON orchestration_loop_configs(is_favorite);
+CREATE INDEX IF NOT EXISTS idx_ol_configs_updated ON orchestration_loop_configs(updated_at);
+
+-- Comparison Runs (A/B workflow comparison experiments)
+CREATE TABLE IF NOT EXISTS comparison_runs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    variation_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    entries_json TEXT NOT NULL DEFAULT '[]',
+    report TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_workflow ON comparison_runs(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_comparison_runs_status ON comparison_runs(status);
+
+-- Task Run Automation (workflow automation execution details)
+CREATE TABLE IF NOT EXISTS task_run_automation (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    workflow_name TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_ms INTEGER,
+    automation_status TEXT NOT NULL DEFAULT 'running',
+    success BOOLEAN,
+    error_type TEXT,
+    error_message TEXT,
+    actions_summary TEXT,
+    states_visited TEXT,
+    transitions_executed TEXT,
+    template_matches TEXT,
+    anomalies TEXT,
+    iteration_number INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_run_automation_task_run_id ON task_run_automation(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_automation_started_at ON task_run_automation(started_at);
+CREATE INDEX IF NOT EXISTS idx_task_run_automation_status ON task_run_automation(automation_status);
+
+-- Task Run MCP Calls (MCP tool invocations within task runs)
+CREATE TABLE IF NOT EXISTS task_run_mcp_calls (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    step_name TEXT,
+    server_id TEXT NOT NULL,
+    server_name TEXT,
+    tool_name TEXT NOT NULL,
+    arguments TEXT,
+    resolved_arguments TEXT,
+    response TEXT,
+    response_type TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    extractions TEXT,
+    assertions TEXT,
+    success BOOLEAN NOT NULL,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (server_id) REFERENCES mcp_servers(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_task_run_id ON task_run_mcp_calls(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_server_id ON task_run_mcp_calls(server_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_step_id ON task_run_mcp_calls(step_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_created_at ON task_run_mcp_calls(created_at);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_success ON task_run_mcp_calls(success);
+
+-- Task Run Output Chunks (streaming output segments for task runs)
+CREATE TABLE IF NOT EXISTS task_run_output_chunks (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    chunk_sequence INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_task_run ON task_run_output_chunks(task_run_id, chunk_sequence);
+
+-- Trigger History (event log for workflow triggers)
+CREATE TABLE IF NOT EXISTS trigger_history (
+    id TEXT PRIMARY KEY,
+    trigger_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data TEXT DEFAULT '{}',
+    action TEXT NOT NULL,
+    task_run_id TEXT,
+    error_message TEXT,
+    triggered_at TEXT NOT NULL
+    -- trigger_id is a soft FK to workflow_triggers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_trigger_history_trigger_id ON trigger_history(trigger_id);
+CREATE INDEX IF NOT EXISTS idx_trigger_history_triggered_at ON trigger_history(triggered_at);
+
+-- Scheduler History (execution log for scheduled tasks)
+CREATE TABLE IF NOT EXISTS scheduler_history (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    session_id TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    success BOOLEAN NOT NULL DEFAULT false,
+    error_message TEXT,
+    triggered_auto_fix BOOLEAN NOT NULL DEFAULT false,
+    auto_fix_session_id TEXT,
+    FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_history_task_id ON scheduler_history(task_id);
+CREATE INDEX IF NOT EXISTS idx_scheduler_history_started_at ON scheduler_history(started_at);
+CREATE INDEX IF NOT EXISTS idx_scheduler_history_status ON scheduler_history(status);
+
+-- Workflow Triggers (event-driven workflow execution)
+CREATE TABLE IF NOT EXISTS workflow_triggers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    trigger_type TEXT NOT NULL,
+    trigger_config TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_overrides TEXT,
+    conditions TEXT DEFAULT '[]',
+    debounce_ms INTEGER DEFAULT 1000,
+    cooldown_seconds INTEGER DEFAULT 60,
+    max_concurrent INTEGER DEFAULT 1,
+    retry_count INTEGER DEFAULT 0,
+    retry_delay_seconds INTEGER DEFAULT 30,
+    enabled BOOLEAN DEFAULT true,
+    last_triggered_at TEXT,
+    last_execution_id TEXT,
+    trigger_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (workflow_id) REFERENCES unified_workflows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_triggers_type ON workflow_triggers(trigger_type);
+CREATE INDEX IF NOT EXISTS idx_workflow_triggers_enabled ON workflow_triggers(enabled);
+
+-- Workflow Variables (session-scoped variables for API request substitution)
+CREATE TABLE IF NOT EXISTS workflow_variables (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    variable_name TEXT NOT NULL,
+    variable_value TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_step_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    UNIQUE(task_run_id, variable_name)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_variables_task_run_id ON workflow_variables(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_variables_name ON workflow_variables(variable_name);
+
+-- Spec Versions (version history for spec documents)
+CREATE TABLE IF NOT EXISTS spec_versions (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    spec_json TEXT NOT NULL,
+    change_summary TEXT,
+    change_type TEXT NOT NULL DEFAULT 'manual',
+    parent_version_id TEXT,
+    assertion_count INTEGER NOT NULL,
+    group_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_spec_versions_spec ON spec_versions(spec_id);
+CREATE INDEX IF NOT EXISTS idx_spec_versions_hash ON spec_versions(content_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_spec_versions_num ON spec_versions(spec_id, version_number);
+
+-- UI Bridge Transitions
+CREATE TABLE IF NOT EXISTS ui_bridge_transitions (
+    id BIGSERIAL PRIMARY KEY,
+    transition_id TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    from_states TEXT NOT NULL,
+    activate_states TEXT NOT NULL,
+    exit_states TEXT,
+    activate_groups TEXT,
+    exit_groups TEXT,
+    actions TEXT,
+    path_cost DOUBLE PRECISION DEFAULT 1.0,
+    stays_visible BOOLEAN DEFAULT false,
+    metadata TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ubt_transition_id ON ui_bridge_transitions(transition_id);
