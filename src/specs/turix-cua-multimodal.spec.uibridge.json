@@ -72,15 +72,15 @@
       "assertions": [
         {
           "id": "presence-provider-radio-group",
-          "description": "The page shows a provider selection control with four options: Claude CLI, Claude API, Gemini CLI, and Gemini API. Each option has a label and a radio button or equivalent selector",
+          "description": "The page shows a provider selection control with four options: Claude Code CLI, Claude API, Gemini CLI, and Gemini API. Each option has a label and a radio button or equivalent selector",
           "category": "element-presence",
           "severity": "critical",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "Claude CLI"
+              "textContent": "Claude Code CLI"
             },
-            "label": "Claude CLI provider option"
+            "label": "Claude Code CLI provider option"
           },
           "assertionType": "exists",
           "source": "manual",
