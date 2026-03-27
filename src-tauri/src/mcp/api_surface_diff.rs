@@ -7,7 +7,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::info;
 
-use super::api_surface::ApiSurface;
+use super::api_surface::{
+    ApiConnection, ApiSurface, McpRoute, OrphanedEndpoint, PgMethod, TauriCommand,
+};
 use crate::mcp::types::{ApiResponse, ApiState};
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -15,16 +17,16 @@ use crate::mcp::types::{ApiResponse, ApiState};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiSurfaceDiff {
-    pub added_commands: Vec<String>,
+    pub added_commands: Vec<TauriCommand>,
     pub removed_commands: Vec<String>,
-    pub added_routes: Vec<String>,
+    pub added_routes: Vec<McpRoute>,
     pub removed_routes: Vec<String>,
-    pub added_pg_methods: Vec<String>,
+    pub added_pg_methods: Vec<PgMethod>,
     pub removed_pg_methods: Vec<String>,
-    pub new_orphans: Vec<String>,
+    pub new_orphans: Vec<OrphanedEndpoint>,
     pub resolved_orphans: Vec<String>,
-    pub new_connections: usize,
-    pub broken_connections: usize,
+    pub new_connections: Vec<ApiConnection>,
+    pub broken_connections: Vec<ApiConnection>,
     pub summary: String,
 }
 
@@ -59,23 +61,22 @@ async fn handle_diff(
     State(state): State<Arc<ApiState>>,
     Json(input): Json<DiffRequest>,
 ) -> Result<Json<ApiResponse<ApiSurfaceDiff>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
-    // Load the most recent snapshot from PG
     let pg = &state.app_state.pg_db;
     let previous = load_latest_snapshot(pg).await;
 
     let diff = match previous {
         Some(prev) => compute_diff(&prev, &input.current),
         None => ApiSurfaceDiff {
-            added_commands: input.current.tauri_commands.iter().map(|c| c.name.clone()).collect(),
+            added_commands: input.current.tauri_commands.clone(),
             removed_commands: Vec::new(),
-            added_routes: input.current.mcp_routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect(),
+            added_routes: input.current.mcp_routes.clone(),
             removed_routes: Vec::new(),
-            added_pg_methods: input.current.pg_methods.iter().map(|m| m.name.clone()).collect(),
+            added_pg_methods: input.current.pg_methods.clone(),
             removed_pg_methods: Vec::new(),
-            new_orphans: input.current.orphans.iter().map(|o| o.name.clone()).collect(),
+            new_orphans: input.current.orphans.clone(),
             resolved_orphans: Vec::new(),
-            new_connections: input.current.connections.len(),
-            broken_connections: 0,
+            new_connections: input.current.connections.clone(),
+            broken_connections: Vec::new(),
             summary: "First scan — no previous snapshot to compare against".into(),
         },
     };
@@ -115,7 +116,17 @@ async fn handle_save_snapshot(
         + surface.clorinde_queries.len()) as i32;
     let orphan_count = surface.orphans.len() as i32;
 
-    let scan_json = serde_json::to_string(&surface).unwrap_or_default();
+    let scan_json = serde_json::to_string(&surface).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Serialize scan: {}", e)),
+                error_detail: None,
+            }),
+        )
+    })?;
     let summary = format!(
         "{} commands, {} routes, {} PgDb, {} queries, {} tables, {} orphans",
         surface.summary.total_tauri_commands,
@@ -237,37 +248,72 @@ async fn load_latest_snapshot(pg: &crate::database::pg::PgDb) -> Option<ApiSurfa
     serde_json::from_str(&json).ok()
 }
 
+/// Compute a rich diff between two API surface scans using proper set operations.
 fn compute_diff(previous: &ApiSurface, current: &ApiSurface) -> ApiSurfaceDiff {
-    let prev_cmds: HashSet<&str> = previous.tauri_commands.iter().map(|c| c.name.as_str()).collect();
-    let curr_cmds: HashSet<&str> = current.tauri_commands.iter().map(|c| c.name.as_str()).collect();
+    // Command diff
+    let prev_cmd_names: HashSet<&str> = previous.tauri_commands.iter().map(|c| c.name.as_str()).collect();
+    let curr_cmd_names: HashSet<&str> = current.tauri_commands.iter().map(|c| c.name.as_str()).collect();
+    let added_commands: Vec<TauriCommand> = current.tauri_commands.iter()
+        .filter(|c| !prev_cmd_names.contains(c.name.as_str()))
+        .cloned()
+        .collect();
+    let removed_commands: Vec<String> = prev_cmd_names.difference(&curr_cmd_names).map(|s| s.to_string()).collect();
 
-    let prev_routes: HashSet<String> = previous.mcp_routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
-    let curr_routes: HashSet<String> = current.mcp_routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
+    // Route diff
+    let prev_route_keys: HashSet<String> = previous.mcp_routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
+    let curr_route_keys: HashSet<String> = current.mcp_routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
+    let added_routes: Vec<McpRoute> = current.mcp_routes.iter()
+        .filter(|r| !prev_route_keys.contains(&format!("{} {}", r.method, r.path)))
+        .cloned()
+        .collect();
+    let removed_routes: Vec<String> = prev_route_keys.difference(&curr_route_keys).cloned().collect();
 
-    let prev_pg: HashSet<&str> = previous.pg_methods.iter().map(|m| m.name.as_str()).collect();
-    let curr_pg: HashSet<&str> = current.pg_methods.iter().map(|m| m.name.as_str()).collect();
+    // PgDb method diff
+    let prev_pg_names: HashSet<&str> = previous.pg_methods.iter().map(|m| m.name.as_str()).collect();
+    let curr_pg_names: HashSet<&str> = current.pg_methods.iter().map(|m| m.name.as_str()).collect();
+    let added_pg_methods: Vec<PgMethod> = current.pg_methods.iter()
+        .filter(|m| !prev_pg_names.contains(m.name.as_str()))
+        .cloned()
+        .collect();
+    let removed_pg_methods: Vec<String> = prev_pg_names.difference(&curr_pg_names).map(|s| s.to_string()).collect();
 
-    let prev_orphans: HashSet<&str> = previous.orphans.iter().map(|o| o.name.as_str()).collect();
-    let curr_orphans: HashSet<&str> = current.orphans.iter().map(|o| o.name.as_str()).collect();
+    // Orphan diff
+    let prev_orphan_names: HashSet<&str> = previous.orphans.iter().map(|o| o.name.as_str()).collect();
+    let curr_orphan_names: HashSet<&str> = current.orphans.iter().map(|o| o.name.as_str()).collect();
+    let new_orphans: Vec<OrphanedEndpoint> = current.orphans.iter()
+        .filter(|o| !prev_orphan_names.contains(o.name.as_str()))
+        .cloned()
+        .collect();
+    let resolved_orphans: Vec<String> = prev_orphan_names.difference(&curr_orphan_names).map(|s| s.to_string()).collect();
 
-    let added_commands: Vec<String> = curr_cmds.difference(&prev_cmds).map(|s| s.to_string()).collect();
-    let removed_commands: Vec<String> = prev_cmds.difference(&curr_cmds).map(|s| s.to_string()).collect();
-    let added_routes: Vec<String> = curr_routes.difference(&prev_routes).cloned().collect();
-    let removed_routes: Vec<String> = prev_routes.difference(&curr_routes).cloned().collect();
-    let added_pg: Vec<String> = curr_pg.difference(&prev_pg).map(|s| s.to_string()).collect();
-    let removed_pg: Vec<String> = prev_pg.difference(&curr_pg).map(|s| s.to_string()).collect();
-    let new_orphans: Vec<String> = curr_orphans.difference(&prev_orphans).map(|s| s.to_string()).collect();
-    let resolved_orphans: Vec<String> = prev_orphans.difference(&curr_orphans).map(|s| s.to_string()).collect();
+    // Connection diff — proper set operations using (from_type:from_name → to_type:to_name) as key
+    let conn_key = |c: &ApiConnection| -> String {
+        format!("{}:{}->{}:{}", c.from_type, c.from_name, c.to_type, c.to_name)
+    };
+    let prev_conn_keys: HashSet<String> = previous.connections.iter().map(conn_key).collect();
+    let curr_conn_keys: HashSet<String> = current.connections.iter().map(conn_key).collect();
+    let new_connections: Vec<ApiConnection> = current.connections.iter()
+        .filter(|c| !prev_conn_keys.contains(&conn_key(c)))
+        .cloned()
+        .collect();
+    let broken_connections: Vec<ApiConnection> = previous.connections.iter()
+        .filter(|c| !curr_conn_keys.contains(&conn_key(c)))
+        .cloned()
+        .collect();
 
-    let conn_diff = current.connections.len() as i64 - previous.connections.len() as i64;
-
+    // Build summary
     let mut parts = Vec::new();
     if !added_commands.is_empty() { parts.push(format!("+{} commands", added_commands.len())); }
     if !removed_commands.is_empty() { parts.push(format!("-{} commands", removed_commands.len())); }
     if !added_routes.is_empty() { parts.push(format!("+{} routes", added_routes.len())); }
     if !removed_routes.is_empty() { parts.push(format!("-{} routes", removed_routes.len())); }
+    if !added_pg_methods.is_empty() { parts.push(format!("+{} PgDb methods", added_pg_methods.len())); }
+    if !removed_pg_methods.is_empty() { parts.push(format!("-{} PgDb methods", removed_pg_methods.len())); }
     if !new_orphans.is_empty() { parts.push(format!("+{} orphans", new_orphans.len())); }
     if !resolved_orphans.is_empty() { parts.push(format!("-{} orphans resolved", resolved_orphans.len())); }
+    if !new_connections.is_empty() { parts.push(format!("+{} connections", new_connections.len())); }
+    if !broken_connections.is_empty() { parts.push(format!("-{} connections broken", broken_connections.len())); }
+
     let summary = if parts.is_empty() {
         "No changes since last scan".to_string()
     } else {
@@ -279,12 +325,12 @@ fn compute_diff(previous: &ApiSurface, current: &ApiSurface) -> ApiSurfaceDiff {
         removed_commands,
         added_routes,
         removed_routes,
-        added_pg_methods: added_pg,
-        removed_pg_methods: removed_pg,
+        added_pg_methods,
+        removed_pg_methods,
         new_orphans,
         resolved_orphans,
-        new_connections: if conn_diff > 0 { conn_diff as usize } else { 0 },
-        broken_connections: if conn_diff < 0 { (-conn_diff) as usize } else { 0 },
+        new_connections,
+        broken_connections,
         summary,
     }
 }

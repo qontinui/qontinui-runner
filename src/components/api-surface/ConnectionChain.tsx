@@ -138,6 +138,13 @@ function findNodeInfo(surface: ApiSurface, type: string, name: string): ChainLin
     const event = surface.pythonEvents.find((e) => e.value === name);
     return { type, name, file: event?.file, line: event?.line };
   }
+  if (type === "ui_bridge_route") {
+    const route = surface.uiBridgeRoutes.find((r) => r.path === name);
+    return { type, name, file: route?.file, line: route?.line, detail: route ? `${route.method} ${route.path}` : undefined };
+  }
+  if (type === "frontend") {
+    return { type, name, file: name };
+  }
   return { type, name };
 }
 
@@ -185,10 +192,11 @@ function walkDownstream(
     }
   }
 
-  // For clorinde queries, add the DB table as terminal
+  // For clorinde queries, add the DB table as terminal (if not already visited)
   if (type === "clorinde_query") {
     const query = surface.clorindeQueries.find((q) => q.name === name);
-    if (query?.table) {
+    if (query?.table && !visited.has(`db_table:${query.table}`)) {
+      visited.add(`db_table:${query.table}`);
       const table = surface.dbTables.find((t) => t.name === query.table);
       if (table) {
         links.push({

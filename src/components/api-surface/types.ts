@@ -105,16 +105,16 @@ export interface ScanSummary {
 }
 
 export interface ApiSurfaceDiff {
-  addedCommands: string[];
+  addedCommands: TauriCommand[];
   removedCommands: string[];
-  addedRoutes: string[];
+  addedRoutes: McpRoute[];
   removedRoutes: string[];
-  addedPgMethods: string[];
+  addedPgMethods: PgMethod[];
   removedPgMethods: string[];
-  newOrphans: string[];
+  newOrphans: OrphanedEndpoint[];
   resolvedOrphans: string[];
-  newConnections: number;
-  brokenConnections: number;
+  newConnections: ApiConnection[];
+  brokenConnections: ApiConnection[];
   summary: string;
 }
 

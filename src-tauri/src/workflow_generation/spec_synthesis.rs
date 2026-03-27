@@ -770,11 +770,126 @@ fn score_spec_match(spec_json: &Value, description: &str) -> f32 {
     score.min(1.0)
 }
 
+/// Classify whether acceptance criteria should update page specs.
+///
+/// Returns:
+/// - `SpecTarget::Page` — criteria relate to a UI page (has ui_bridge methods or ui categories)
+/// - `SpecTarget::Backend` — backend/infra work with no UI association
+/// - `SpecTarget::Skip` — tooling/ops prompt that should not update specs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecTarget {
+    /// Criteria relate to a UI page — match against existing page specs.
+    Page,
+    /// Backend/infra work — use catch-all spec if no page matches.
+    Backend,
+    /// Tooling/ops — do not update any specs.
+    Skip,
+}
+
+/// Detect whether a prompt is a tooling/ops operation that should not update specs.
+fn is_ops_prompt(description: &str) -> bool {
+    let d = description.to_lowercase();
+    let ops_patterns = [
+        "git pull", "git push", "git commit", "git rebase", "git merge",
+        "git checkout", "git stash", "git reset", "git cherry-pick",
+        "create a pr", "create a pull request", "open a pr",
+        "push the branch", "pull latest", "rebase onto",
+        "npm publish", "cargo publish", "deploy to",
+        "run the migration", "database backup",
+    ];
+    ops_patterns.iter().any(|p| d.contains(p))
+}
+
+/// Classify acceptance criteria to determine where they should be stored.
+pub fn classify_spec_target(criteria: &AcceptanceCriteria, description: &str) -> SpecTarget {
+    if is_ops_prompt(description) {
+        return SpecTarget::Skip;
+    }
+
+    let has_ui_bridge = criteria
+        .criteria
+        .iter()
+        .any(|c| c.method == VerificationMethod::UiBridge);
+
+    let has_ui_category = criteria.criteria.iter().any(|c| {
+        matches!(
+            c.category.as_str(),
+            "ui-content" | "ui" | "visual" | "style" | "design" | "layout" | "navigation"
+        )
+    });
+
+    if has_ui_bridge || has_ui_category {
+        SpecTarget::Page
+    } else {
+        SpecTarget::Backend
+    }
+}
+
+/// Write a group to a specific spec file, replacing any existing group with the same ID.
+fn write_group_to_spec_file(
+    path: &std::path::Path,
+    group: &Value,
+    group_id: &str,
+    criteria_count: usize,
+) -> Result<(), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+    let mut spec_json: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+
+    // Replace existing group if present
+    if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
+        let had_group = groups.len();
+        groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
+        if groups.len() < had_group {
+            debug!(
+                "Spec {:?} had existing group '{}', replacing",
+                path.file_name(),
+                group_id
+            );
+        }
+    }
+
+    // Append the new group
+    if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
+        groups.push(group.clone());
+    } else {
+        spec_json["groups"] = json!([group.clone()]);
+    }
+
+    // Update metadata.updatedAt
+    if let Some(metadata) = spec_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        metadata.insert(
+            "updatedAt".to_string(),
+            json!(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+
+    let updated_content = serde_json::to_string_pretty(&spec_json)
+        .map_err(|e| format!("Failed to serialize {}: {}", path.display(), e))?;
+
+    std::fs::write(path, updated_content)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+
+    info!(
+        "Updated spec {:?} with {} acceptance criteria",
+        path.file_name(),
+        criteria_count,
+    );
+
+    Ok(())
+}
+
 /// Update page spec files by appending acceptance criteria as a new SpecGroup.
 ///
 /// Scans spec files in the given directories, scores each against the workflow
 /// description, and appends the criteria as a new group to matching specs
 /// (score >= `match_threshold`).
+///
+/// For backend/infra criteria that match no page spec, falls back to a
+/// catch-all `workflow-criteria.spec.uibridge.json` file. Tooling/ops
+/// prompts are skipped entirely.
 pub fn update_page_specs_from_criteria(
     criteria: &AcceptanceCriteria,
     description: &str,
@@ -793,9 +908,17 @@ pub fn update_page_specs_from_criteria(
         return result;
     }
 
+    // Classify the prompt to decide routing
+    let target = classify_spec_target(criteria, description);
+    if target == SpecTarget::Skip {
+        info!("Ops/tooling prompt detected, skipping spec update");
+        return result;
+    }
+
     let new_group = criteria_to_spec_group(criteria);
     let group_id = "wf-acceptance-criteria";
 
+    // Try to match against existing page specs
     for spec_dir in spec_dirs {
         let entries = match std::fs::read_dir(spec_dir) {
             Ok(e) => e,
@@ -816,6 +939,11 @@ pub fn update_page_specs_from_criteria(
                 continue;
             }
 
+            // Skip the catch-all file during page matching
+            if file_name == "workflow-criteria.spec.uibridge.json" {
+                continue;
+            }
+
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -828,7 +956,7 @@ pub fn update_page_specs_from_criteria(
                 }
             };
 
-            let mut spec_json: Value = match serde_json::from_str(&content) {
+            let spec_json: Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
                 Err(e) => {
                     result.errors.push(format!(
@@ -846,227 +974,55 @@ pub fn update_page_specs_from_criteria(
                 continue;
             }
 
-            // Replace existing group if present (criteria may have changed between runs)
-            if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
-                let had_group = groups.len();
-                groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
-                if groups.len() < had_group {
-                    debug!(
-                        "Spec {} had existing group '{}', replacing with updated criteria",
-                        file_name, group_id
-                    );
+            match write_group_to_spec_file(&path, &new_group, group_id, criteria.criteria.len()) {
+                Ok(()) => {
+                    result.specs_updated += 1;
+                    result.updated_paths.push(path.display().to_string());
+                }
+                Err(e) => {
+                    result.errors.push(e);
                 }
             }
+        }
+    }
 
-            // Append the new group
-            if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
-                groups.push(new_group.clone());
-            } else {
-                // Create groups array if missing
-                spec_json["groups"] = json!([new_group.clone()]);
-            }
-
-            // Update metadata.updatedAt
-            if let Some(metadata) = spec_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                metadata.insert(
-                    "updatedAt".to_string(),
-                    json!(chrono::Utc::now().to_rfc3339()),
-                );
-            }
-
-            // Write back
-            match serde_json::to_string_pretty(&spec_json) {
-                Ok(updated_content) => match std::fs::write(&path, updated_content) {
+    // If no page spec matched, fall back to the catch-all spec file.
+    // This handles backend/infra criteria that don't map to any UI page.
+    // The file workflow-criteria.spec.uibridge.json is pre-created in the repo
+    // and included in the spec registry so it appears in the Specs page UI.
+    if result.specs_updated == 0 {
+        let mut found_catchall = false;
+        for spec_dir in spec_dirs {
+            let catchall_path = spec_dir.join("workflow-criteria.spec.uibridge.json");
+            if catchall_path.exists() {
+                match write_group_to_spec_file(
+                    &catchall_path,
+                    &new_group,
+                    group_id,
+                    criteria.criteria.len(),
+                ) {
                     Ok(()) => {
                         result.specs_updated += 1;
-                        result.updated_paths.push(path.display().to_string());
-                        info!(
-                            "Updated page spec {} with {} acceptance criteria (score={:.2})",
-                            file_name,
-                            criteria.criteria.len(),
-                            score,
-                        );
+                        result
+                            .updated_paths
+                            .push(catchall_path.display().to_string());
                     }
                     Err(e) => {
-                        result.errors.push(format!(
-                            "Failed to write {}: {}",
-                            path.display(),
-                            e
-                        ));
+                        result.errors.push(e);
                     }
-                },
-                Err(e) => {
-                    result.errors.push(format!(
-                        "Failed to serialize {}: {}",
-                        path.display(),
-                        e
-                    ));
                 }
+                found_catchall = true;
+                break;
             }
+        }
+        if !found_catchall {
+            debug!("No catch-all spec file (workflow-criteria.spec.uibridge.json) found in spec directories");
         }
     }
 
     let duration_ms = start.elapsed().as_millis();
     info!(
         "Page spec update: {} updated, {} errors in {}ms",
-        result.specs_updated,
-        result.errors.len(),
-        duration_ms,
-    );
-
-    result
-}
-
-// ============================================================================
-// Database-backed Spec Update (for remote/target instances)
-// ============================================================================
-
-/// Update cached specs in the database for a target runner instance.
-///
-/// When a protected instance generates a workflow targeting another instance,
-/// the acceptance criteria should be written to the cached_app_specs table
-/// (keyed by the target's app_url) so they persist through target restarts
-/// and are available during workflow discovery.
-pub fn update_cached_specs_from_criteria(
-    conn: &rusqlite::Connection,
-    criteria: &AcceptanceCriteria,
-    description: &str,
-    target_app_url: &str,
-) -> PageSpecUpdateResult {
-    let start = Instant::now();
-    let mut result = PageSpecUpdateResult {
-        specs_updated: 0,
-        updated_paths: Vec::new(),
-        errors: Vec::new(),
-    };
-
-    if criteria.criteria.is_empty() {
-        debug!("No acceptance criteria to append to cached specs");
-        return result;
-    }
-
-    let new_group = criteria_to_spec_group(criteria);
-    let group_id = "wf-acceptance-criteria";
-
-    // Fetch existing cached specs for the target instance
-    let mut stmt = match conn.prepare(
-        "SELECT id, spec_id, spec_json, page_url FROM cached_app_specs WHERE app_url = ?1",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            result
-                .errors
-                .push(format!("Failed to query cached specs: {}", e));
-            return result;
-        }
-    };
-
-    let rows: Vec<(String, String, String, Option<String>)> = match stmt.query_map(
-        rusqlite::params![target_app_url],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        },
-    ) {
-        Ok(iter) => iter.flatten().collect(),
-        Err(e) => {
-            result
-                .errors
-                .push(format!("Failed to fetch cached specs: {}", e));
-            return result;
-        }
-    };
-
-    if rows.is_empty() {
-        debug!(
-            "No cached specs found for target instance {}",
-            target_app_url
-        );
-        return result;
-    }
-
-    for (row_id, spec_id, spec_json_str, _page_url) in &rows {
-        let mut spec_json: Value = match serde_json::from_str(spec_json_str) {
-            Ok(v) => v,
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Failed to parse cached spec {}: {}", spec_id, e));
-                continue;
-            }
-        };
-
-        let score = score_spec_match(&spec_json, description);
-        if score < 0.3 {
-            continue;
-        }
-
-        // Replace existing group if present
-        if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
-            groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
-        }
-
-        // Append new group
-        if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
-            groups.push(new_group.clone());
-        } else {
-            spec_json["groups"] = json!([new_group.clone()]);
-        }
-
-        // Update metadata.updatedAt
-        if let Some(metadata) = spec_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            metadata.insert(
-                "updatedAt".to_string(),
-                json!(chrono::Utc::now().to_rfc3339()),
-            );
-        }
-
-        // Write back to database
-        let updated_json_str = match serde_json::to_string(&spec_json) {
-            Ok(s) => s,
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Failed to serialize spec {}: {}", spec_id, e));
-                continue;
-            }
-        };
-
-        let now = chrono::Utc::now().to_rfc3339();
-        match conn.execute(
-            "UPDATE cached_app_specs SET spec_json = ?1, discovered_at = ?2 WHERE id = ?3",
-            rusqlite::params![updated_json_str, now, row_id],
-        ) {
-            Ok(_) => {
-                result.specs_updated += 1;
-                result.updated_paths.push(format!(
-                    "cached:{}:{}",
-                    target_app_url, spec_id
-                ));
-                info!(
-                    "Updated cached spec {} for target {} with {} acceptance criteria (score={:.2})",
-                    spec_id,
-                    target_app_url,
-                    criteria.criteria.len(),
-                    score,
-                );
-            }
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Failed to update cached spec {}: {}", spec_id, e));
-            }
-        }
-    }
-
-    let duration_ms = start.elapsed().as_millis();
-    info!(
-        "Cached spec update for {}: {} updated, {} errors in {}ms",
-        target_app_url,
         result.specs_updated,
         result.errors.len(),
         duration_ms,
@@ -1652,5 +1608,149 @@ mod tests {
         );
 
         assert_eq!(result.specs_updated, 0);
+    }
+
+    // ── Classification Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_classify_ops_prompt_skips() {
+        let criteria = AcceptanceCriteria {
+            goal_summary: "Push changes".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "push-ok".to_string(),
+                description: "Git push succeeds".to_string(),
+                method: VerificationMethod::Command,
+                priority: CriterionPriority::Critical,
+                verification_hint: "git push".to_string(),
+                category: "behavior".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        assert_eq!(
+            classify_spec_target(&criteria, "git push the branch and create a PR"),
+            SpecTarget::Skip
+        );
+    }
+
+    #[test]
+    fn test_classify_ui_criteria_targets_page() {
+        let criteria = AcceptanceCriteria {
+            goal_summary: "Toggle renders".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "toggle-visible".to_string(),
+                description: "Toggle is visible".to_string(),
+                method: VerificationMethod::UiBridge,
+                priority: CriterionPriority::Critical,
+                verification_hint: "Assert exists".to_string(),
+                category: "ui-content".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        assert_eq!(
+            classify_spec_target(&criteria, "Fix the dark mode toggle"),
+            SpecTarget::Page
+        );
+    }
+
+    #[test]
+    fn test_classify_backend_criteria() {
+        let criteria = AcceptanceCriteria {
+            goal_summary: "WAL checkpoint works".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "wal-timeout".to_string(),
+                description: "WAL checkpoint completes within 5s".to_string(),
+                method: VerificationMethod::Command,
+                priority: CriterionPriority::Critical,
+                verification_hint: "Run checkpoint test".to_string(),
+                category: "data-integrity".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        assert_eq!(
+            classify_spec_target(&criteria, "Fix SQLite WAL checkpoint timeout"),
+            SpecTarget::Backend
+        );
+    }
+
+    #[test]
+    fn test_ops_skip_prevents_spec_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("settings.spec.uibridge.json");
+        let spec_content = json!({
+            "version": "1.0.0",
+            "description": "Settings page",
+            "metadata": { "pageUrl": "/settings", "tags": ["settings"] },
+            "groups": []
+        });
+        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+
+        let criteria = AcceptanceCriteria {
+            goal_summary: "Push succeeds".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "push-ok".to_string(),
+                description: "Push succeeds".to_string(),
+                method: VerificationMethod::Command,
+                priority: CriterionPriority::Critical,
+                verification_hint: "git push".to_string(),
+                category: "behavior".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "git push the branch to remote",
+            &[dir.path()],
+            0.2,
+        );
+
+        assert_eq!(result.specs_updated, 0);
+    }
+
+    #[test]
+    fn test_backend_criteria_uses_catchall() {
+        let dir = tempfile::tempdir().unwrap();
+        let catchall_path = dir.path().join("workflow-criteria.spec.uibridge.json");
+
+        // Pre-create the catch-all file (as it would exist in the repo)
+        let catchall_spec = json!({
+            "version": "1.0.0",
+            "description": "Catch-all spec for workflow acceptance criteria",
+            "metadata": { "pageUrl": "/workflows", "tags": ["catch-all"] },
+            "groups": []
+        });
+        std::fs::write(&catchall_path, serde_json::to_string_pretty(&catchall_spec).unwrap())
+            .unwrap();
+
+        let criteria = AcceptanceCriteria {
+            goal_summary: "WAL checkpoint works".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "wal-ok".to_string(),
+                description: "WAL checkpoint completes".to_string(),
+                method: VerificationMethod::Command,
+                priority: CriterionPriority::Critical,
+                verification_hint: "run test".to_string(),
+                category: "data-integrity".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "Fix SQLite WAL checkpoint timeout",
+            &[dir.path()],
+            0.3,
+        );
+
+        assert_eq!(result.specs_updated, 1);
+
+        let catchall: Value =
+            serde_json::from_str(&std::fs::read_to_string(&catchall_path).unwrap()).unwrap();
+        let groups = catchall["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["id"].as_str().unwrap(), "wf-acceptance-criteria");
     }
 }

@@ -150,9 +150,7 @@ pub struct GenerateWorkflowRequest {
     pub tool_tags: Option<Vec<String>>,
 
     /// Target runner port for workflows that manage a different instance.
-    /// When set, acceptance criteria are written to the cached_app_specs database
-    /// (keyed by target URL) instead of the local src/specs/ files.
-    /// Protected instances use this to push specs to the instance they're testing.
+    /// Used by the orchestration loop to target a specific runner for execution.
     #[serde(default)]
     pub target_runner_port: Option<u16>,
 }
@@ -771,81 +769,41 @@ pub fn generate_workflow(
                 write_back_verification_templates(c, &relevant_issues, &spec_result.criteria);
             }
 
-            // Append acceptance criteria to matching page specs so that
+            // Append acceptance criteria to matching page spec files so that
             // prompt-driven goals become part of the persistent spec definitions.
-            //
-            // Two paths:
-            // - target_runner_port set → workflow targets a remote instance;
-            //   write to the cached_app_specs DB table keyed by the target URL
-            //   so criteria survive target restarts and are discoverable.
-            // - target_runner_port unset → targeting self; write to local spec files.
+            // All runner instances (including protected ones) share the same
+            // src/specs/ directory, so local file writes reach every instance.
             {
-                let self_port: u16 = std::env::var("QONTINUI_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(9876);
-                let target_port = effective_request.target_runner_port;
-                let is_remote = target_port.map(|p| p != self_port).unwrap_or(false);
-
-                let spec_update = if is_remote {
-                    let target_url = format!(
-                        "http://localhost:{}",
-                        target_port.unwrap()
-                    );
-                    if let Some(c) = conn {
-                        super::spec_synthesis::update_cached_specs_from_criteria(
-                            c,
-                            &spec_result.criteria,
-                            &effective_request.description,
-                            &target_url,
-                        )
-                    } else {
-                        warn!("Cannot update cached specs for target instance: no DB connection");
-                        super::spec_synthesis::PageSpecUpdateResult {
-                            specs_updated: 0,
-                            updated_paths: Vec::new(),
-                            errors: vec!["No DB connection".to_string()],
-                        }
-                    }
-                } else {
-                    // Targeting self — update local spec files
-                    let runner_specs_dir = std::path::Path::new("src/specs");
-                    let runner_specs_alt = std::path::Path::new("../src/specs");
-                    let mut spec_dirs: Vec<&std::path::Path> = Vec::new();
-                    if runner_specs_dir.exists() {
-                        spec_dirs.push(runner_specs_dir);
-                    }
-                    if runner_specs_alt.exists() {
-                        spec_dirs.push(runner_specs_alt);
-                    }
-                    if spec_dirs.is_empty() {
-                        debug!("No spec directories found for page spec update (checked src/specs and ../src/specs)");
-                        super::spec_synthesis::PageSpecUpdateResult {
-                            specs_updated: 0,
-                            updated_paths: Vec::new(),
-                            errors: Vec::new(),
-                        }
-                    } else {
-                        super::spec_synthesis::update_page_specs_from_criteria(
-                            &spec_result.criteria,
-                            &effective_request.description,
-                            &spec_dirs,
-                            0.3,
-                        )
-                    }
-                };
-
-                if spec_update.specs_updated > 0 {
-                    info!(
-                        "Appended acceptance criteria to {} spec(s): {:?}",
-                        spec_update.specs_updated, spec_update.updated_paths
-                    );
+                let runner_specs_dir = std::path::Path::new("src/specs");
+                let runner_specs_alt = std::path::Path::new("../src/specs");
+                let mut spec_dirs: Vec<&std::path::Path> = Vec::new();
+                if runner_specs_dir.exists() {
+                    spec_dirs.push(runner_specs_dir);
                 }
-                if !spec_update.errors.is_empty() {
-                    warn!(
-                        "Spec update errors: {:?}",
-                        spec_update.errors
+                if runner_specs_alt.exists() {
+                    spec_dirs.push(runner_specs_alt);
+                }
+                if spec_dirs.is_empty() {
+                    debug!("No spec directories found for page spec update (checked src/specs and ../src/specs)");
+                } else {
+                    let spec_update = super::spec_synthesis::update_page_specs_from_criteria(
+                        &spec_result.criteria,
+                        &effective_request.description,
+                        &spec_dirs,
+                        0.3,
                     );
+                    if spec_update.specs_updated > 0 {
+                        info!(
+                            "Appended acceptance criteria to {} page spec(s): {:?}",
+                            spec_update.specs_updated, spec_update.updated_paths
+                        );
+                    }
+                    if !spec_update.errors.is_empty() {
+                        warn!(
+                            "Page spec update errors: {:?}",
+                            spec_update.errors
+                        );
+                    }
                 }
             }
 

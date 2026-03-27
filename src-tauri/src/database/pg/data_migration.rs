@@ -74,6 +74,27 @@ impl PgDb {
 
         info!("Starting SQLite → PG data migration...");
 
+        // Verify PG connectivity
+        match conn.query_one("SELECT current_setting('search_path')", &[]).await {
+            Ok(row) => {
+                let sp: String = row.get(0);
+                info!("Migration PG search_path: {}", sp);
+            }
+            Err(e) => warn!("Migration PG search_path check failed: {}", e),
+        }
+
+        // Count existing PG tables
+        match conn.query_one(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'runner'",
+            &[],
+        ).await {
+            Ok(row) => {
+                let count: i64 = row.get(0);
+                info!("Migration: PG has {} tables in runner schema", count);
+            }
+            Err(e) => warn!("Migration: table count check failed: {}", e),
+        }
+
         // =====================================================================
         // Tier 1: Tables with no foreign key dependencies
         // =====================================================================
@@ -147,7 +168,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -192,7 +213,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -243,7 +264,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -301,7 +322,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -361,7 +382,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -428,7 +449,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -498,7 +519,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -554,7 +575,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -633,7 +654,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -687,7 +708,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -774,7 +795,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -928,7 +949,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -991,7 +1012,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1172,7 +1193,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1233,7 +1254,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1289,7 +1310,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1375,7 +1396,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1433,7 +1454,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1498,7 +1519,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1551,7 +1572,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1607,7 +1628,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1671,7 +1692,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1737,7 +1758,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }
@@ -1786,7 +1807,7 @@ impl PgDb {
             Ok(c) => c,
             Err(e) => { stats.errors.push(format!("{}: pool error: {}", table, e)); return; }
         };
-        if pg_table_has_data(&conn, table).await.unwrap_or(true) {
+        if pg_table_has_data(&conn, table).await.unwrap_or(false) {
             stats.tables_skipped += 1;
             return;
         }

@@ -172,7 +172,6 @@ export function useAppNavigation(): UseAppNavigationReturn {
       setSidebarCollapsed(true);
     } else if (!shouldAutoCollapse && autoCollapsedRef.current) {
       autoCollapsedRef.current = false;
-      // eslint-disable-next-line react-hooks/set-state-in-effect -- restore sidebar after auto-collapse
       setSidebarCollapsed(false);
     }
   }, [activeTab, terminalSessionCount, sidebarCollapsed]);

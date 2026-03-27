@@ -235,6 +235,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Uses RUNNER_DATABASE_URL env var, or defaults to the local docker-compose PostgreSQL.
     // Uses a dedicated tokio runtime for the one-shot async connection — cannot use
     // tauri::async_runtime::block_on here because the Tauri runtime hasn't started yet.
+    // Initialize PG and run one-time data migration in the same tokio runtime.
+    // Critical: PG pool connections are tied to their creating runtime.
     let pg_db: Arc<crate::database::pg::PgDb> = {
         let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
             "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
@@ -243,6 +245,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
+
         match rt.block_on(crate::database::pg::PgDb::new(&pg_url)) {
             Ok(pg) => {
                 info!("PostgreSQL connected successfully");
@@ -254,34 +257,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-
-    // One-time full data migration from SQLite to PostgreSQL (idempotent, non-fatal)
-    {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build() {
-            Ok(rt) => rt,
-            Err(e) => {
-                warn!("Failed to create tokio runtime for data migration: {}", e);
-                // Skip migration, continue startup
-                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            }
-        };
-        match rt.block_on(pg_db.migrate_all_from_sqlite(&checkpoint_db)) {
-            Ok(stats) => {
-                if stats.rows_migrated > 0 {
-                    info!(
-                        "SQLite→PG migration complete: {} tables, {} rows migrated",
-                        stats.tables_migrated, stats.rows_migrated
-                    );
-                }
-                if !stats.errors.is_empty() {
-                    warn!("SQLite→PG migration had {} errors: {:?}", stats.errors.len(), &stats.errors[..stats.errors.len().min(5)]);
-                }
-            }
-            Err(e) => warn!("SQLite→PG data migration failed (non-fatal): {}", e),
-        }
-    }
 
     // Connect the SQLite span layer to the database pool
     if let Some(ref sqlite_layer) = logging_result.sqlite_span_layer {
@@ -1427,6 +1402,40 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
+
+            // One-time SQLite→PG data migration (runs in its own thread+runtime)
+            {
+                let app_state = app.state::<Arc<crate::commands::AppState>>();
+                let sqlite = app_state.checkpoint_db.clone();
+                let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
+                    "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
+                });
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Migration runtime");
+                    rt.block_on(async move {
+                        let pg = match crate::database::pg::PgDb::new(&pg_url).await {
+                            Ok(pg) => pg,
+                            Err(e) => { warn!("Migration PG connect failed: {}", e); return; }
+                        };
+                        info!("SQLite→PG migration: SQLite DB at {:?}", sqlite.path());
+                        match pg.migrate_all_from_sqlite(&sqlite).await {
+                        Ok(stats) => {
+                            info!(
+                                "SQLite→PG migration: {} tables migrated, {} skipped, {} rows, {} errors",
+                                stats.tables_migrated, stats.tables_skipped, stats.rows_migrated, stats.errors.len()
+                            );
+                            for (i, e) in stats.errors.iter().enumerate().take(10) {
+                                warn!("SQLite→PG migration error {}: {}", i + 1, e);
+                            }
+                        }
+                        Err(e) => warn!("SQLite→PG data migration failed: {}", e),
+                    }
+                    }); // block_on
+                }); // thread::spawn
+            }
 
             // Clear runner log files from previous session
             executor::FileLogger::clear_logs();

@@ -142,7 +142,6 @@ export function DashboardPage({
         const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/workflow-state`);
         if (response.ok) {
           const data = await response.json();
-          // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching
           setIsPaused(data.is_paused === true);
         }
       } catch {

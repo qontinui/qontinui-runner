@@ -9,7 +9,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { X, ChevronRight, ChevronLeft, Loader2, Play } from "lucide-react";
+import { X, ChevronRight, ChevronLeft, Loader2 } from "lucide-react";
 import type {
   ProductTour,
   ProductTourStep,

@@ -162,7 +162,22 @@ async fn handle_scan(
 
     info!("API Surface scan starting — project_root={}", project_root.display());
 
-    let surface = scan_codebase(&project_root, &src_tauri, &src_frontend, &python_bridge, start).await;
+    // Run the file-system scan on a blocking thread to avoid holding the async executor
+    let surface = tokio::task::spawn_blocking(move || {
+        scan_codebase(&project_root, &src_tauri, &src_frontend, &python_bridge, start)
+    })
+    .await
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some(format!("Scan task failed: {}", e)),
+                error_detail: None,
+            }),
+        )
+    })?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -210,7 +225,7 @@ fn find_project_root() -> Option<PathBuf> {
 
 // ─── Core scanner ────────────────────────────────────────────────────────────
 
-async fn scan_codebase(
+fn scan_codebase(
     project_root: &Path,
     src_tauri: &Path,
     src_frontend: &Path,
