@@ -929,7 +929,7 @@ pub async fn ui_bridge_execute_action_handler(
 
         // Spawn blocking DB write — fire-and-forget, never blocks the response
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = db.with_conn(|conn| {
+            match db.with_conn(|conn| {
                 crate::database::ui_bridge_ops::insert_ui_bridge_event(
                     conn,
                     Some(tr_id),
@@ -947,7 +947,8 @@ pub async fn ui_bridge_execute_action_handler(
                     None,
                 )
             }) {
-                warn!("Failed to persist UI Bridge event: {}", e);
+                Ok(row_id) => info!("UI Bridge event persisted: element={}, row_id={}", element_id, row_id),
+                Err(e) => warn!("UI Bridge event persist failed: {}", e),
             }
         });
     }
