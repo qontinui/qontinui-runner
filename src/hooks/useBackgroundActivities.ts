@@ -69,6 +69,7 @@ export function useBackgroundActivities({
   // Sync extraction with props if they indicate extracting (fallback)
   useEffect(() => {
     if (isExtracting && !extractionState.isExtracting) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing extraction state from props
       setExtractionState({
         isExtracting: true,
         currentUrl: extractionUrl,

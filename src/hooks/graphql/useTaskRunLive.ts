@@ -74,6 +74,7 @@ export function useTaskRunLive(
   useEffect(() => {
     if (taskRunId !== prevTaskIdRef.current) {
       prevTaskIdRef.current = taskRunId;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- resetting state on task ID change
       setEvents([]);
       setOutputOffset(0);
     }
@@ -115,6 +116,7 @@ export function useTaskRunLive(
   useEffect(() => {
     const event = progressData?.taskRunProgress;
     if (event) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- accumulating events from subscription
       setEvents((prev) => {
         const next = [...prev, event];
         return next.length > 500 ? next.slice(-500) : next;

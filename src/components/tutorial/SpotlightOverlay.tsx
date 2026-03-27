@@ -103,6 +103,7 @@ export function SpotlightOverlay({
 
   // Set up resize observer and event listeners
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- DOM measurement on mount
     updateWindowSize();
     updateRect();
 
@@ -126,6 +127,7 @@ export function SpotlightOverlay({
 
   // Update rect when selector changes
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- DOM measurement on selector change
     updateRect();
   }, [targetSelector, updateRect]);
 

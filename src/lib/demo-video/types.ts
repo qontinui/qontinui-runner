@@ -25,6 +25,8 @@ export interface DemoStep {
     elementId: string;
     type: "spotlight" | "pulse" | "border";
   };
+  /** AI-suggested visual that could enhance this step (image generation prompt). */
+  visualSuggestion?: string;
 }
 
 export type DemoAction =
@@ -35,7 +37,26 @@ export type DemoAction =
   | { type: "scroll"; direction: "up" | "down"; amount: number }
   | { type: "wait"; ms: number }
   | { type: "waitForElement"; selector: string; timeout: number }
-  | { type: "waitForIdle"; timeout: number };
+  | { type: "waitForIdle"; timeout: number }
+  | { type: "visual"; filePath: string; durationMs: number; caption?: string };
+
+// =============================================================================
+// Visual Overlay Events
+// =============================================================================
+
+/** Custom event name dispatched to show/hide the fullscreen visual overlay. */
+export const DEMO_VISUAL_OVERLAY_EVENT = "demo-visual-overlay";
+
+export interface DemoVisualOverlayDetail {
+  /** "show" to display, "hide" to dismiss */
+  action: "show" | "hide";
+  /** Absolute path to image or video file */
+  filePath?: string;
+  /** Optional caption rendered below the visual */
+  caption?: string;
+  /** Auto-dismiss after this many ms (overlay stays until "hide" if omitted) */
+  durationMs?: number;
+}
 
 // =============================================================================
 // Recording Configuration

@@ -6,7 +6,7 @@
  * with Tauri storage integration.
  */
 
-import { useEffect, useRef, useCallback, useMemo } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { RenderLogManager, type RenderLogEntry } from "ui-bridge";
 import { TauriRenderLogStorage } from "./TauriRenderLogStorage";
 
@@ -70,7 +70,7 @@ export function useRenderLogManager(
   // Create storage and manager once
   const storageRef = useRef<TauriRenderLogStorage | null>(null);
   const managerRef = useRef<RenderLogManager | null>(null);
-  const isRunningRef = useRef(false);
+  const [isRunning, setIsRunning] = useState(false);
   const lastTabRef = useRef<string | undefined>(undefined);
 
   // Initialize storage and manager
@@ -97,7 +97,8 @@ export function useRenderLogManager(
 
     // Start the manager
     managerRef.current.start();
-    isRunningRef.current = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- lifecycle sync
+    setIsRunning(true);
 
     console.debug("[useRenderLogManager] Started render log manager");
 
@@ -105,7 +106,7 @@ export function useRenderLogManager(
       managerRef.current?.stop();
       managerRef.current = null;
       storageRef.current = null;
-      isRunningRef.current = false;
+      setIsRunning(false);
       console.debug("[useRenderLogManager] Stopped render log manager");
     };
   }, [
@@ -184,8 +185,8 @@ export function useRenderLogManager(
       clear,
       getEntries,
       getCount,
-      isRunning: isRunningRef.current,
+      isRunning,
     }),
-    [captureSnapshot, clear, getEntries, getCount],
+    [captureSnapshot, clear, getEntries, getCount, isRunning],
   );
 }

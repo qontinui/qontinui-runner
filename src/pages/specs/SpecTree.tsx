@@ -2,6 +2,7 @@
  * SpecTree — Left sidebar showing hierarchical spec navigation
  */
 
+import React from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -58,6 +59,14 @@ function getTypeIcon(type: SpecTreeNode["type"]) {
 // Tree Node Component
 // ============================================================================
 
+/**
+ * Renders the icon for a spec tree node type.
+ * Extracted to module scope to avoid defining a component inside TreeNode.
+ */
+function TypeIcon({ type, className }: { type: SpecTreeNode["type"]; className?: string }) {
+  return React.createElement(getTypeIcon(type), { className });
+}
+
 interface TreeNodeProps {
   node: SpecTreeNode;
   depth: number;
@@ -80,7 +89,6 @@ function TreeNode({
   selection,
 }: TreeNodeProps) {
   const hasChildren = node.children && node.children.length > 0;
-  const Icon = getTypeIcon(node.type);
   const isGroup = node.type === "group";
   const isUnspecced = node.unspecced === true;
 
@@ -108,7 +116,7 @@ function TreeNode({
         )}
 
         {!isGroup && (
-          <Icon className={`w-3 h-3 shrink-0 ${isUnspecced ? "opacity-30" : "opacity-60"}`} />
+          <TypeIcon type={node.type} className={`w-3 h-3 shrink-0 ${isUnspecced ? "opacity-30" : "opacity-60"}`} />
         )}
 
         <span className="truncate flex-1">{node.label}</span>

@@ -4,7 +4,7 @@
  * Global scheduler settings configuration.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useMemo } from "react";
 import { Save, Loader2, Play, Pause } from "lucide-react";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import type {
@@ -29,28 +29,23 @@ export function SchedulerSettings({
   const [maxConcurrent, setMaxConcurrent] = useState(settings.max_concurrent);
   const [defaultAutoFix, setDefaultAutoFix] = useState(settings.default_auto_fix_on_failure);
   const [timezone, setTimezone] = useState(settings.timezone || "");
-  const [hasChanges, setHasChanges] = useState(false);
-
-  // Track changes
-  useEffect(() => {
-    const changed =
-      enabled !== settings.enabled ||
-      maxConcurrent !== settings.max_concurrent ||
-      defaultAutoFix !== settings.default_auto_fix_on_failure ||
-      timezone !== (settings.timezone || "");
-    setHasChanges(changed);
-  }, [enabled, maxConcurrent, defaultAutoFix, timezone, settings]);
+  // Track changes (derived from current form state vs props)
+  const hasChanges = useMemo(() =>
+    enabled !== settings.enabled ||
+    maxConcurrent !== settings.max_concurrent ||
+    defaultAutoFix !== settings.default_auto_fix_on_failure ||
+    timezone !== (settings.timezone || ""),
+    [enabled, maxConcurrent, defaultAutoFix, timezone, settings],
+  );
 
   const handleSave = async () => {
-    const success = await onUpdateSettings({
+    await onUpdateSettings({
       enabled,
       max_concurrent: maxConcurrent,
       default_auto_fix_on_failure: defaultAutoFix,
       timezone: timezone || undefined,
     });
-    if (success) {
-      setHasChanges(false);
-    }
+    // hasChanges resets automatically when parent updates the settings prop
   };
 
   return (

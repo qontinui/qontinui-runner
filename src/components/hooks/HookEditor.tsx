@@ -50,6 +50,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
 
   // Initialize form when hook changes
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect -- sync form state from prop */
     if (hook) {
       setName(hook.name);
       setDescription(hook.description || "");
@@ -73,6 +74,7 @@ export function HookEditor({ hook, onSave, onCancel, loading }: HookEditorProps)
       setConditions(defaults.conditions);
     }
     setErrors({});
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [hook]);
 
   // Validate form

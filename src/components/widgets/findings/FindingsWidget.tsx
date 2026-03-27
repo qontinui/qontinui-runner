@@ -5,6 +5,7 @@
  * Shows severity summary, category breakdown, and scrollable list of findings.
  */
 
+import React from "react";
 import {
   AlertTriangle,
   Bug,
@@ -83,15 +84,22 @@ function SeverityBadge({ severity, count }: { severity: FindingSeverity; count: 
 }
 
 /**
+ * Renders the icon for a finding category.
+ * Extracted to module scope to avoid defining a component inside CategoryBadge/FindingItem.
+ */
+function CategoryIcon({ category, className }: { category: FindingCategory; className?: string }) {
+  return React.createElement(getCategoryIcon(category), { className });
+}
+
+/**
  * Category badge component.
  */
 function CategoryBadge({ category }: { category: FindingCategory }) {
   const config = getCategoryConfig(category);
-  const IconComponent = getCategoryIcon(category);
 
   return (
     <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-muted/50 text-xs text-muted-foreground">
-      <IconComponent className="w-3 h-3" />
+      <CategoryIcon category={category} className="w-3 h-3" />
       <span>{config.label}</span>
     </div>
   );
@@ -111,7 +119,6 @@ function StatusIndicator({ status }: { status: Finding["status"] }) {
  */
 function FindingItem({ finding }: { finding: Finding }) {
   const severityConfig = getSeverityConfig(finding.severity);
-  const IconComponent = getCategoryIcon(finding.category);
 
   return (
     <div
@@ -127,7 +134,7 @@ function FindingItem({ finding }: { finding: Finding }) {
           severityConfig.bgColor,
         )}
       >
-        <IconComponent className={cn("w-4 h-4", severityConfig.color)} />
+        <CategoryIcon category={finding.category} className={cn("w-4 h-4", severityConfig.color)} />
       </div>
 
       {/* Content */}

@@ -98,6 +98,7 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
 
     // If there's a running run that wasn't in previous list, auto-select it
     if (runningRun && !prevRunIdsRef.current.has(runningRun.id)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- auto-select newly detected running run
       setSelectedRunIdState(runningRun.id);
       // Also persist to instanceStorage
       try {
@@ -140,6 +141,7 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
   // Auto-select most recent if no selection and runs available
   useEffect(() => {
     if (!selectedRunId && recentRuns.length > 0 && !isLoadingRuns) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- auto-select when no selection exists
       setSelectedRunIdState(recentRuns[0].id);
     }
   }, [recentRuns, isLoadingRuns, selectedRunId]);
@@ -150,6 +152,7 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
       const runExists = recentRuns.some((run) => run.id === selectedRunId);
       if (!runExists) {
         // Selected run no longer exists, select most recent
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- validating selection against external data
         setSelectedRunId(recentRuns[0].id);
       }
     }

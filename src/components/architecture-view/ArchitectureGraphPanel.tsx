@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useRef, memo } from "react";
+import { useEffect, useMemo, useCallback, useRef, memo } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -16,6 +16,7 @@ import {
 import dagre from "dagre";
 import "@xyflow/react/dist/style.css";
 import type { ComponentNode, ComponentEdge } from "@/types/architecture";
+import { copyMermaidToClipboard } from "@/lib/development-intelligence/mermaid-export";
 
 // =============================================================================
 // Health color mapping
@@ -171,17 +172,19 @@ export function ArchitectureGraphPanel({ nodes: rawNodes, edges: rawEdges, onNod
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  // Sync when data changes (workflow switch, rebuild, refresh) — computed during render
+  // Sync when data changes (workflow switch, rebuild, refresh)
   const prevInitialNodesRef = useRef(initialNodes);
   const prevInitialEdgesRef = useRef(initialEdges);
-  if (prevInitialNodesRef.current !== initialNodes) {
-    prevInitialNodesRef.current = initialNodes;
-    setNodes(initialNodes);
-  }
-  if (prevInitialEdgesRef.current !== initialEdges) {
-    prevInitialEdgesRef.current = initialEdges;
-    setEdges(initialEdges);
-  }
+  useEffect(() => {
+    if (prevInitialNodesRef.current !== initialNodes) {
+      prevInitialNodesRef.current = initialNodes;
+      setNodes(initialNodes);
+    }
+    if (prevInitialEdgesRef.current !== initialEdges) {
+      prevInitialEdgesRef.current = initialEdges;
+      setEdges(initialEdges);
+    }
+  }, [initialNodes, initialEdges, setNodes, setEdges]);
 
   const handleNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
@@ -211,6 +214,16 @@ export function ArchitectureGraphPanel({ nodes: rawNodes, edges: rawEdges, onNod
         />
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#374151" />
       </ReactFlow>
+
+      {/* Export button */}
+      <button
+        onClick={() => copyMermaidToClipboard(nodes, edges, { direction: "TB", title: "Component Architecture" })}
+        className="absolute top-2 right-2 z-10 flex items-center gap-1 px-2 py-1 text-[10px] bg-card/90 border border-border/50 rounded-md hover:bg-muted/80 transition-colors text-muted-foreground"
+        title="Copy as Mermaid markdown"
+      >
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/></svg>
+        Mermaid
+      </button>
 
       {/* Legend */}
       <div className="absolute bottom-12 left-2 bg-card/90 border border-border/50 rounded-lg p-2 space-y-1 z-10 text-[10px]">

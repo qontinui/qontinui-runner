@@ -5,6 +5,8 @@ pub mod agentic_metrics;
 pub mod approval_gates;
 pub mod canary;
 pub mod checks;
+pub mod decisions;
+pub mod error_monitor;
 pub mod findings;
 pub mod graph_ops;
 pub mod learning;

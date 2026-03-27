@@ -5,7 +5,7 @@
  * Format: Graph > State: Login Form > Fingerprint: fp_abc123
  */
 
-import { memo } from "react";
+import { memo, useState } from "react";
 import { ChevronRight, Share2, Layers, GitBranch, Fingerprint, X } from "lucide-react";
 import type { NavigationHistory, NavigationItem, NavigationItemType } from "./navigation";
 import { truncateLabel } from "./navigation";
@@ -111,6 +111,8 @@ function NavigationBreadcrumbComponent({
   onClear,
   currentSelection,
 }: NavigationBreadcrumbProps) {
+  const [now] = useState(() => Date.now());
+
   // Combine history items with current selection if not already in history
   const displayItems = [...history.items];
 
@@ -125,7 +127,7 @@ function NavigationBreadcrumbComponent({
         type: currentSelection.type,
         id: currentSelection.id,
         label: currentSelection.label,
-        timestamp: Date.now(),
+        timestamp: now,
       });
     }
   }

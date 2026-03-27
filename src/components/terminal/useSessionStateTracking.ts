@@ -28,7 +28,9 @@ export function useSessionStateTracking(
 ): UseSessionStateTrackingReturn {
   const { tabs, processOutput, getBufferLines } = params;
   const getBufferLinesRef = useRef(getBufferLines);
-  getBufferLinesRef.current = getBufferLines;
+  useEffect(() => {
+    getBufferLinesRef.current = getBufferLines;
+  }, [getBufferLines]);
 
   // ── State ─────────────────────────────────────────────────────────────────
 
@@ -53,13 +55,17 @@ export function useSessionStateTracking(
 
   // Activity sparkline: ring buffer of output byte counts per 2s interval per tab
   const activityBuffersRef = useRef<Record<string, number[]>>({});
+  // State snapshot of activity buffers, updated on the 2s tick interval
+  const [activityDataSnapshot, setActivityDataSnapshot] = useState<Record<string, number[]>>({});
 
   // ── Idle / stale detection interval (2s) ──────────────────────────────────
 
   // Use a ref for tabs so the interval doesn't need to be recreated on every
   // tab change. The interval reads the latest value via the ref.
   const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -109,6 +115,7 @@ export function useSessionStateTracking(
   useEffect(() => {
     const tabIdSet = new Set(tabs.map((t) => t.id));
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- cleanup state for removed tabs
     setSessionStates((prev) => {
       const deadKeys = Object.keys(prev).filter((id) => !tabIdSet.has(id));
       if (deadKeys.length === 0) return prev;
@@ -176,6 +183,8 @@ export function useSessionStateTracking(
         // Push current accumulator and reset; keep last 30 points
         buffers[tabId] = [...(buffers[tabId] ?? []), 0].slice(-30);
       }
+      // Update the state snapshot so consumers re-render with latest data
+      setActivityDataSnapshot({ ...buffers });
     }, 2000);
     return () => clearInterval(interval);
   }, []);
@@ -265,7 +274,7 @@ export function useSessionStateTracking(
     stateDurations,
     stateTimeAccum,
     stateEntryTimeRef,
-    activityData: activityBuffersRef.current,
+    activityData: activityDataSnapshot,
     prevSessionStatesRef,
     handleExit,
     handleOutput,

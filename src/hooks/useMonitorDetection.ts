@@ -104,6 +104,7 @@ export function useMonitorDetection(
   useEffect(() => {
     if (detectOnMount) {
       log.debug("Detecting monitors on mount");
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- async monitor detection on mount
       detectSystemMonitors();
     }
   }, [detectOnMount, detectSystemMonitors]);

@@ -136,6 +136,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
 
   // Load categories on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching on mount
     loadCategories();
   }, [loadCategories]);
 

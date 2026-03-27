@@ -126,6 +126,7 @@ export function useAiConversationData(): AiConversationData {
     // Initial fetch - defensive coding for undefined
     try {
       const logs = logManager.getAiOutputLogs?.() ?? [];
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- initial data fetch on mount
       setAllEntries(logs);
     } catch (e) {
       console.error("useAiConversationData: Error fetching logs:", e);
@@ -160,6 +161,13 @@ export function useAiConversationData(): AiConversationData {
     }
   }, [allEntries, currentTaskRunId]);
 
+  // Track current time for "is thinking" computation; refresh when entries change
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync time snapshot when entries update
+    setNow(Date.now());
+  }, [entries]);
+
   // Compute derived state
   const data = useMemo((): AiConversationData => {
     try {
@@ -172,7 +180,6 @@ export function useAiConversationData(): AiConversationData {
 
       // Determine if AI is thinking based on recent activity
       // If the last entry was recent and from "response", AI might still be processing
-      const now = Date.now();
       const lastTimestamp = lastEntry?.timestamp ?? 0;
       const timeSinceLastMessage = now - lastTimestamp;
       const isThinking =
@@ -192,7 +199,7 @@ export function useAiConversationData(): AiConversationData {
       console.error("useAiConversationData: Error computing data:", e);
       return EMPTY_DATA;
     }
-  }, [entries]);
+  }, [entries, now]);
 
   return data;
 }

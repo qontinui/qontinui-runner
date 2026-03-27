@@ -261,6 +261,22 @@ interface ConfigureViewProps {
   resolveIcon: (iconId: string) => React.ComponentType<{ className?: string }>;
 }
 
+/**
+ * Renders a resolved skill icon.
+ * Extracted to module scope to avoid defining a component inside ConfigureView/SkillRow.
+ */
+function ResolvedSkillIcon({
+  iconId,
+  className,
+  resolveIcon,
+}: {
+  iconId: string;
+  className?: string;
+  resolveIcon: (iconId: string) => React.ComponentType<{ className?: string }>;
+}) {
+  return React.createElement(resolveIcon(iconId), { className });
+}
+
 function ConfigureView({
   selectedSkill,
   paramValues,
@@ -273,7 +289,6 @@ function ConfigureView({
   if (!selectedSkill) return null;
 
   const iconData = getSkillCategoryIconData(selectedSkill.category);
-  const Icon = resolveIcon(selectedSkill.icon);
 
   return (
     <>
@@ -287,7 +302,7 @@ function ConfigureView({
           <ChevronRight className="w-4 h-4 rotate-180" />
         </button>
         <div className={`p-2 rounded ${iconData.bgClass}`}>
-          <Icon className={`w-5 h-5 ${iconData.textClass}`} />
+          <ResolvedSkillIcon iconId={selectedSkill.icon} className={`w-5 h-5 ${iconData.textClass}`} resolveIcon={resolveIcon} />
         </div>
         <div className="flex-1 min-w-0">
           <h3 className="text-sm font-medium text-zinc-200">{selectedSkill.name}</h3>
@@ -371,7 +386,6 @@ function SkillRow({
   resolveIcon: (iconId: string) => React.ComponentType<{ className?: string }>;
 }) {
   const iconData = getSkillCategoryIconData(skill.category);
-  const Icon = resolveIcon(skill.icon);
 
   return (
     <button
@@ -379,7 +393,7 @@ function SkillRow({
       onClick={onClick}
     >
       <div className={`shrink-0 p-1.5 rounded ${iconData.bgClass}`}>
-        <Icon className={`w-4 h-4 ${iconData.textClass}`} />
+        <ResolvedSkillIcon iconId={skill.icon} className={`w-4 h-4 ${iconData.textClass}`} resolveIcon={resolveIcon} />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">

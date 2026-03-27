@@ -299,9 +299,13 @@ export function useTerminalInitialization({
 
   // Save scrollback buffers to disk when the window is about to close
   const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
   const zoneLayoutRef = useRef(zoneLayout);
-  zoneLayoutRef.current = zoneLayout;
+  useEffect(() => {
+    zoneLayoutRef.current = zoneLayout;
+  }, [zoneLayout]);
 
   const handleWindowClose = useCallback(async () => {
     const currentTabs = tabsRef.current;

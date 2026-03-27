@@ -169,7 +169,7 @@ export function TerminalPage({
     lastOutputLines: stateTracking.lastOutputLines,
     terminalRefs: terminalRefs.current,
     stateEntryTimeRef: stateTracking.stateEntryTimeRef,
-    stateTimeAccum: stateTracking.stateTimeAccum,
+    stateTimeAccumRef: stateTracking.stateTimeAccum,
     setFocusedZone: zoneLayout.setFocusedZone,
     handleRestartInZone,
     addHistoryEvent,

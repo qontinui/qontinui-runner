@@ -127,6 +127,7 @@ export function ConvergenceWidget() {
     let unlisten: UnlistenFn | null = null;
 
     // Reset metrics when task run changes
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription callback
     setMetrics([]);
 
     const setup = async () => {

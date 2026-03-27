@@ -30,6 +30,7 @@ export function CanvasWidget({
   // Auto-expand all panels when new ones arrive
   useEffect(() => {
     if (data.panels.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync expanded state with incoming panels
       setExpandedIds((prev) => {
         const next = new Set(prev);
         for (const panel of data.panels) {

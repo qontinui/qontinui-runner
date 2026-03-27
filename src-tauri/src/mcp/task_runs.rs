@@ -2316,6 +2316,7 @@ pub async fn generate_workflow_from_session(
         discover_ui_bridge_specs: None,
         simple_mode: None,
         tool_tags: None,
+        target_runner_port: None,
     };
 
     let doctor_handle = state.doctor_handle.clone();

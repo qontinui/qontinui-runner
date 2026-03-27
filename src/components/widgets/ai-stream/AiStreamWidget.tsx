@@ -33,6 +33,7 @@ export function AiStreamWidget() {
     let unlisten: UnlistenFn | null = null;
 
     // Reset output when task run changes
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription callback
     setOutput("");
 
     const setup = async () => {

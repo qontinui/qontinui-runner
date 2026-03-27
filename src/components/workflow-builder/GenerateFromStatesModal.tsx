@@ -42,6 +42,7 @@ export function GenerateFromStatesModal({
   // Check for available config when modal opens
   useEffect(() => {
     if (isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching
       setIsCheckingConfig(true);
       Promise.all([checkConfigAvailable(), getStateCount()])
         .then(([available, count]) => {

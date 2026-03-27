@@ -40,10 +40,16 @@ import { useTutorial, useTutorialProgress } from "../contexts/TutorialContext";
 import { TutorialCard } from "./tutorial/TutorialCard";
 import { TutorialTrigger } from "./tutorial";
 import { tutorials, getFeaturedTutorials } from "./tutorial/data";
-import { Star } from "lucide-react";
+import { Star, MapPin } from "lucide-react";
+import type { ProductTour, TourAudience } from "@/types/product-tour";
+import { PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
+import { TourCard } from "./product-tour/TourCard";
+import { TourPlayer } from "./product-tour/TourPlayer";
+import { exportTour } from "@/lib/product-tour/tour-exporter";
 
 type HelpSubPage =
   | "tutorials"
+  | "product-tours"
   | "shortcuts"
   | "getting-started"
   | "documentation"
@@ -704,6 +710,109 @@ function TutorialsPage() {
   );
 }
 
+// =============================================================================
+// Product Tours Page
+// =============================================================================
+
+const AUDIENCE_LABELS: Record<TourAudience, string> = {
+  "new-user": "Getting Started",
+  "power-user": "Power Features",
+  evaluator: "Product Overview",
+};
+
+function ProductToursPage() {
+  const [tours] = useState<ProductTour[]>(
+    () => instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []),
+  );
+  const [activeTour, setActiveTour] = useState<ProductTour | null>(null);
+
+  const handleExport = (tour: ProductTour, format: "html" | "json" | "markdown") => {
+    const exports = exportTour(tour);
+    const formatMap = {
+      html: { content: exports.html, mime: "text/html", ext: "html" },
+      json: { content: exports.json, mime: "application/json", ext: "json" },
+      markdown: { content: exports.markdown, mime: "text/markdown", ext: "md" },
+    };
+    const { content, mime, ext } = formatMap[format];
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${tour.id}.${ext}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const toursByAudience = (aud: TourAudience) => tours.filter((t) => t.targetAudience === aud);
+
+  if (tours.length === 0) {
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-primary/10 rounded-lg">
+            <MapPin className="w-5 h-5 text-primary" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold">Product Tours</h2>
+            <p className="text-sm text-muted-foreground">
+              Interactive tours that demonstrate features automatically
+            </p>
+          </div>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          No tours generated yet. Go to <strong>Build &gt; Product Tours</strong> to generate tours from page specs.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center gap-3">
+        <div className="p-2 bg-primary/10 rounded-lg">
+          <MapPin className="w-5 h-5 text-primary" />
+        </div>
+        <div>
+          <h2 className="text-lg font-semibold">Product Tours</h2>
+          <p className="text-sm text-muted-foreground">
+            Interactive tours that demonstrate features automatically
+          </p>
+        </div>
+      </div>
+
+      {(["new-user", "power-user", "evaluator"] as TourAudience[]).map((aud) => {
+        const audienceTours = toursByAudience(aud);
+        if (audienceTours.length === 0) return null;
+        return (
+          <div key={aud} className="space-y-3">
+            <h3 className="text-sm font-medium text-muted-foreground">
+              {AUDIENCE_LABELS[aud]}
+            </h3>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {audienceTours.map((tour) => (
+                <TourCard
+                  key={tour.id}
+                  tour={tour}
+                  onLaunch={setActiveTour}
+                  onExport={handleExport}
+                />
+              ))}
+            </div>
+          </div>
+        );
+      })}
+
+      {activeTour && (
+        <TourPlayer
+          tour={activeTour}
+          onClose={() => setActiveTour(null)}
+          onComplete={() => setActiveTour(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 interface VersionInfo {
   current_version: string;
 }
@@ -862,6 +971,7 @@ export function HelpTab() {
 
   const subPages = [
     { id: "tutorials" as const, label: "Tutorials", icon: GraduationCap },
+    { id: "product-tours" as const, label: "Product Tours", icon: MapPin },
     { id: "shortcuts" as const, label: "Shortcuts", icon: Keyboard },
     { id: "getting-started" as const, label: "Getting Started", icon: Rocket },
     { id: "documentation" as const, label: "Documentation", icon: BookOpen },
@@ -926,6 +1036,10 @@ export function HelpTab() {
       <div className="flex-1 overflow-y-auto p-6">
         <Tabs.Content value="tutorials" className="outline-hidden">
           <TutorialsPage />
+        </Tabs.Content>
+
+        <Tabs.Content value="product-tours" className="outline-hidden">
+          <ProductToursPage />
         </Tabs.Content>
 
         <Tabs.Content value="shortcuts" className="outline-hidden">

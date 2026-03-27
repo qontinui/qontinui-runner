@@ -12,6 +12,7 @@ import { RenderLogWrapper, UIBridgeHooks } from "./lib/ui-bridge";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { ContextualTutorial } from "./components/tutorial";
+import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
 
 import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
@@ -474,6 +475,7 @@ function AppWithTutorials() {
     <TutorialProvider onNavigate={navigate}>
       <AppContent />
       <ContextualTutorial />
+      <DemoVisualOverlay />
     </TutorialProvider>
   );
 }

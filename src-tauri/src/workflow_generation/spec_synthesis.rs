@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-use super::specification::{AcceptanceCriteria, AcceptanceCriterion, VerificationMethod};
+use super::specification::{
+    AcceptanceCriteria, AcceptanceCriterion, CriterionPriority, VerificationMethod,
+};
 
 // ============================================================================
 // Types
@@ -577,6 +579,503 @@ pub fn coverage_report(workflow_json: &Value, criteria: &AcceptanceCriteria) -> 
 }
 
 // ============================================================================
+// Page Spec Update — Append acceptance criteria to matching page specs
+// ============================================================================
+
+/// Result of updating page specs with acceptance criteria.
+#[derive(Debug, Clone)]
+pub struct PageSpecUpdateResult {
+    /// Number of spec files that were updated.
+    pub specs_updated: usize,
+    /// Spec file paths that were updated.
+    pub updated_paths: Vec<String>,
+    /// Errors encountered during update.
+    pub errors: Vec<String>,
+}
+
+/// Convert an acceptance criterion's priority to a spec assertion severity.
+fn priority_to_severity(priority: &CriterionPriority) -> &'static str {
+    match priority {
+        CriterionPriority::Critical => "critical",
+        CriterionPriority::Important => "warning",
+        CriterionPriority::Optional => "info",
+    }
+}
+
+/// Convert an acceptance criterion's category to the closest SpecCategory.
+fn criterion_category_to_spec_category(category: &str) -> &'static str {
+    match category {
+        "compilation" | "build" => "element-presence",
+        "ui-content" | "ui" | "visual" => "element-presence",
+        "behavior" | "interaction" | "workflow" => "behavior",
+        "style" | "design" | "theme" => "design",
+        "data-integrity" | "data" | "api" => "semantic",
+        "navigation" | "routing" => "navigation",
+        "accessibility" | "a11y" => "accessibility",
+        "form-validation" | "validation" => "form-validation",
+        _ => "semantic",
+    }
+}
+
+/// Convert an acceptance criterion's method to an assertionType string.
+fn method_to_assertion_type(method: &VerificationMethod) -> &'static str {
+    match method {
+        VerificationMethod::UiBridge => "exists",
+        VerificationMethod::Command => "behavior",
+        VerificationMethod::Test => "behavior",
+        VerificationMethod::Manual => "semantic",
+    }
+}
+
+/// Build a SpecAssertion JSON value from an acceptance criterion.
+fn criterion_to_spec_assertion(criterion: &AcceptanceCriterion) -> Value {
+    let spec_category = criterion_category_to_spec_category(&criterion.category);
+    let assertion_type = method_to_assertion_type(&criterion.method);
+    let severity = priority_to_severity(&criterion.priority);
+
+    let mut assertion = json!({
+        "id": format!("wf-{}", criterion.id),
+        "description": criterion.description,
+        "category": spec_category,
+        "severity": severity,
+        "assertionType": assertion_type,
+        "source": "ai-generated",
+        "reviewed": false,
+        "enabled": true,
+        "precondition": criterion.verification_hint,
+    });
+
+    // Build target based on method
+    match criterion.method {
+        VerificationMethod::UiBridge => {
+            assertion["target"] = json!({
+                "type": "search",
+                "criteria": {
+                    "textContent": criterion.description
+                },
+                "label": criterion.description
+            });
+        }
+        _ => {
+            assertion["target"] = json!({
+                "type": "search",
+                "criteria": {},
+                "label": criterion.description
+            });
+        }
+    }
+
+    assertion
+}
+
+/// Build a SpecGroup JSON value from acceptance criteria.
+fn criteria_to_spec_group(criteria: &AcceptanceCriteria) -> Value {
+    let assertions: Vec<Value> = criteria
+        .criteria
+        .iter()
+        .map(criterion_to_spec_assertion)
+        .collect();
+
+    json!({
+        "id": "wf-acceptance-criteria",
+        "name": "Workflow Acceptance Criteria",
+        "description": criteria.goal_summary,
+        "category": "semantic",
+        "assertions": assertions,
+        "source": "ai-generated",
+        "tags": ["workflow-generated", "acceptance-criteria"]
+    })
+}
+
+/// Score how well a spec file matches the workflow description.
+///
+/// Returns a score from 0.0 to 1.0. Higher means a better match.
+fn score_spec_match(spec_json: &Value, description: &str) -> f32 {
+    let description_lower = description.to_lowercase();
+    let mut score: f32 = 0.0;
+
+    // Check pageUrl match
+    if let Some(page_url) = spec_json
+        .get("metadata")
+        .and_then(|m| m.get("pageUrl"))
+        .and_then(|v| v.as_str())
+    {
+        let url_parts: Vec<&str> = page_url
+            .split('/')
+            .filter(|p| p.len() > 3) // skip short generic segments like "app", "api", "new"
+            .collect();
+        for part in &url_parts {
+            if description_lower.contains(&part.to_lowercase()) {
+                score += 0.3;
+            }
+        }
+    }
+
+    // Check spec description overlap
+    if let Some(spec_desc) = spec_json.get("description").and_then(|v| v.as_str()) {
+        let spec_words: Vec<&str> = spec_desc
+            .split_whitespace()
+            .filter(|w| w.len() > 4)
+            .collect();
+        let desc_words: Vec<&str> = description_lower
+            .split_whitespace()
+            .filter(|w| w.len() > 4)
+            .collect();
+
+        if !spec_words.is_empty() && !desc_words.is_empty() {
+            let mut matching = 0;
+            for sw in &spec_words {
+                let sw_lower = sw.to_lowercase();
+                for dw in &desc_words {
+                    if sw_lower == **dw || sw_lower.contains(*dw) || dw.contains(sw_lower.as_str())
+                    {
+                        matching += 1;
+                        break;
+                    }
+                }
+            }
+            let overlap = matching as f32 / spec_words.len().max(desc_words.len()) as f32;
+            score += overlap * 0.4;
+        }
+    }
+
+    // Check component name match
+    if let Some(component) = spec_json
+        .get("metadata")
+        .and_then(|m| m.get("component"))
+        .and_then(|v| v.as_str())
+    {
+        if description_lower.contains(&component.to_lowercase()) {
+            score += 0.3;
+        }
+    }
+
+    // Check tags overlap (capped at 0.3 to prevent tag-heavy specs from dominating)
+    if let Some(tags) = spec_json
+        .get("metadata")
+        .and_then(|m| m.get("tags"))
+        .and_then(|v| v.as_array())
+    {
+        let mut tag_score: f32 = 0.0;
+        for tag in tags {
+            if let Some(tag_str) = tag.as_str() {
+                if description_lower.contains(&tag_str.to_lowercase()) {
+                    tag_score += 0.15;
+                }
+            }
+        }
+        score += tag_score.min(0.3);
+    }
+
+    score.min(1.0)
+}
+
+/// Update page spec files by appending acceptance criteria as a new SpecGroup.
+///
+/// Scans spec files in the given directories, scores each against the workflow
+/// description, and appends the criteria as a new group to matching specs
+/// (score >= `match_threshold`).
+pub fn update_page_specs_from_criteria(
+    criteria: &AcceptanceCriteria,
+    description: &str,
+    spec_dirs: &[&std::path::Path],
+    match_threshold: f32,
+) -> PageSpecUpdateResult {
+    let start = Instant::now();
+    let mut result = PageSpecUpdateResult {
+        specs_updated: 0,
+        updated_paths: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    if criteria.criteria.is_empty() {
+        debug!("No acceptance criteria to append to page specs");
+        return result;
+    }
+
+    let new_group = criteria_to_spec_group(criteria);
+    let group_id = "wf-acceptance-criteria";
+
+    for spec_dir in spec_dirs {
+        let entries = match std::fs::read_dir(spec_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("Cannot read spec dir {:?}: {}", spec_dir, e);
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if !file_name.ends_with(".spec.uibridge.json") {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    result.errors.push(format!(
+                        "Failed to read {}: {}",
+                        path.display(),
+                        e
+                    ));
+                    continue;
+                }
+            };
+
+            let mut spec_json: Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    result.errors.push(format!(
+                        "Failed to parse {}: {}",
+                        path.display(),
+                        e
+                    ));
+                    continue;
+                }
+            };
+
+            let score = score_spec_match(&spec_json, description);
+
+            if score < match_threshold {
+                continue;
+            }
+
+            // Replace existing group if present (criteria may have changed between runs)
+            if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
+                let had_group = groups.len();
+                groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
+                if groups.len() < had_group {
+                    debug!(
+                        "Spec {} had existing group '{}', replacing with updated criteria",
+                        file_name, group_id
+                    );
+                }
+            }
+
+            // Append the new group
+            if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
+                groups.push(new_group.clone());
+            } else {
+                // Create groups array if missing
+                spec_json["groups"] = json!([new_group.clone()]);
+            }
+
+            // Update metadata.updatedAt
+            if let Some(metadata) = spec_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                metadata.insert(
+                    "updatedAt".to_string(),
+                    json!(chrono::Utc::now().to_rfc3339()),
+                );
+            }
+
+            // Write back
+            match serde_json::to_string_pretty(&spec_json) {
+                Ok(updated_content) => match std::fs::write(&path, updated_content) {
+                    Ok(()) => {
+                        result.specs_updated += 1;
+                        result.updated_paths.push(path.display().to_string());
+                        info!(
+                            "Updated page spec {} with {} acceptance criteria (score={:.2})",
+                            file_name,
+                            criteria.criteria.len(),
+                            score,
+                        );
+                    }
+                    Err(e) => {
+                        result.errors.push(format!(
+                            "Failed to write {}: {}",
+                            path.display(),
+                            e
+                        ));
+                    }
+                },
+                Err(e) => {
+                    result.errors.push(format!(
+                        "Failed to serialize {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis();
+    info!(
+        "Page spec update: {} updated, {} errors in {}ms",
+        result.specs_updated,
+        result.errors.len(),
+        duration_ms,
+    );
+
+    result
+}
+
+// ============================================================================
+// Database-backed Spec Update (for remote/target instances)
+// ============================================================================
+
+/// Update cached specs in the database for a target runner instance.
+///
+/// When a protected instance generates a workflow targeting another instance,
+/// the acceptance criteria should be written to the cached_app_specs table
+/// (keyed by the target's app_url) so they persist through target restarts
+/// and are available during workflow discovery.
+pub fn update_cached_specs_from_criteria(
+    conn: &rusqlite::Connection,
+    criteria: &AcceptanceCriteria,
+    description: &str,
+    target_app_url: &str,
+) -> PageSpecUpdateResult {
+    let start = Instant::now();
+    let mut result = PageSpecUpdateResult {
+        specs_updated: 0,
+        updated_paths: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    if criteria.criteria.is_empty() {
+        debug!("No acceptance criteria to append to cached specs");
+        return result;
+    }
+
+    let new_group = criteria_to_spec_group(criteria);
+    let group_id = "wf-acceptance-criteria";
+
+    // Fetch existing cached specs for the target instance
+    let mut stmt = match conn.prepare(
+        "SELECT id, spec_id, spec_json, page_url FROM cached_app_specs WHERE app_url = ?1",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to query cached specs: {}", e));
+            return result;
+        }
+    };
+
+    let rows: Vec<(String, String, String, Option<String>)> = match stmt.query_map(
+        rusqlite::params![target_app_url],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        },
+    ) {
+        Ok(iter) => iter.flatten().collect(),
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to fetch cached specs: {}", e));
+            return result;
+        }
+    };
+
+    if rows.is_empty() {
+        debug!(
+            "No cached specs found for target instance {}",
+            target_app_url
+        );
+        return result;
+    }
+
+    for (row_id, spec_id, spec_json_str, _page_url) in &rows {
+        let mut spec_json: Value = match serde_json::from_str(spec_json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("Failed to parse cached spec {}: {}", spec_id, e));
+                continue;
+            }
+        };
+
+        let score = score_spec_match(&spec_json, description);
+        if score < 0.3 {
+            continue;
+        }
+
+        // Replace existing group if present
+        if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
+            groups.retain(|g| g.get("id").and_then(|v| v.as_str()) != Some(group_id));
+        }
+
+        // Append new group
+        if let Some(groups) = spec_json.get_mut("groups").and_then(|g| g.as_array_mut()) {
+            groups.push(new_group.clone());
+        } else {
+            spec_json["groups"] = json!([new_group.clone()]);
+        }
+
+        // Update metadata.updatedAt
+        if let Some(metadata) = spec_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            metadata.insert(
+                "updatedAt".to_string(),
+                json!(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+
+        // Write back to database
+        let updated_json_str = match serde_json::to_string(&spec_json) {
+            Ok(s) => s,
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("Failed to serialize spec {}: {}", spec_id, e));
+                continue;
+            }
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        match conn.execute(
+            "UPDATE cached_app_specs SET spec_json = ?1, discovered_at = ?2 WHERE id = ?3",
+            rusqlite::params![updated_json_str, now, row_id],
+        ) {
+            Ok(_) => {
+                result.specs_updated += 1;
+                result.updated_paths.push(format!(
+                    "cached:{}:{}",
+                    target_app_url, spec_id
+                ));
+                info!(
+                    "Updated cached spec {} for target {} with {} acceptance criteria (score={:.2})",
+                    spec_id,
+                    target_app_url,
+                    criteria.criteria.len(),
+                    score,
+                );
+            }
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("Failed to update cached spec {}: {}", spec_id, e));
+            }
+        }
+    }
+
+    let duration_ms = start.elapsed().as_millis();
+    info!(
+        "Cached spec update for {}: {} updated, {} errors in {}ms",
+        target_app_url,
+        result.specs_updated,
+        result.errors.len(),
+        duration_ms,
+    );
+
+    result
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -897,5 +1396,261 @@ mod tests {
         );
         assert_eq!(detect_test_runner("cargo rust"), TestRunner::Cargo);
         assert_eq!(detect_test_runner("unknown project"), TestRunner::Generic);
+    }
+
+    // ── Page Spec Update Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_criterion_to_spec_assertion_structure() {
+        let criterion = AcceptanceCriterion {
+            id: "toggle-renders".to_string(),
+            description: "Dark mode toggle is visible".to_string(),
+            method: VerificationMethod::UiBridge,
+            priority: CriterionPriority::Critical,
+            verification_hint: "Assert element 'toggle-dark-mode' exists".to_string(),
+            category: "ui-content".to_string(),
+        };
+
+        let assertion = criterion_to_spec_assertion(&criterion);
+        assert_eq!(assertion["id"].as_str().unwrap(), "wf-toggle-renders");
+        assert_eq!(
+            assertion["description"].as_str().unwrap(),
+            "Dark mode toggle is visible"
+        );
+        assert_eq!(assertion["severity"].as_str().unwrap(), "critical");
+        assert_eq!(assertion["assertionType"].as_str().unwrap(), "exists");
+        assert_eq!(assertion["source"].as_str().unwrap(), "ai-generated");
+        assert_eq!(assertion["reviewed"].as_bool().unwrap(), false);
+        assert_eq!(assertion["enabled"].as_bool().unwrap(), true);
+        assert!(assertion.get("target").is_some());
+    }
+
+    #[test]
+    fn test_criteria_to_spec_group() {
+        let criteria = sample_criteria();
+        let group = criteria_to_spec_group(&criteria);
+
+        assert_eq!(group["id"].as_str().unwrap(), "wf-acceptance-criteria");
+        assert_eq!(
+            group["name"].as_str().unwrap(),
+            "Workflow Acceptance Criteria"
+        );
+        assert_eq!(
+            group["description"].as_str().unwrap(),
+            "Dark mode toggle works correctly"
+        );
+        assert_eq!(group["assertions"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_priority_to_severity_mapping() {
+        assert_eq!(priority_to_severity(&CriterionPriority::Critical), "critical");
+        assert_eq!(priority_to_severity(&CriterionPriority::Important), "warning");
+        assert_eq!(priority_to_severity(&CriterionPriority::Optional), "info");
+    }
+
+    #[test]
+    fn test_score_spec_match_by_page_url() {
+        let spec = json!({
+            "description": "Settings page",
+            "metadata": {
+                "pageUrl": "/settings/dark-mode",
+                "component": "DarkModeSettings"
+            }
+        });
+
+        // Description mentions "settings" which is a URL part
+        let score = score_spec_match(&spec, "Fix the dark-mode toggle on settings page");
+        assert!(score > 0.3, "Expected score > 0.3, got {}", score);
+
+        // Unrelated description
+        let score = score_spec_match(&spec, "Update the database migration script");
+        assert!(score < 0.3, "Expected score < 0.3, got {}", score);
+    }
+
+    #[test]
+    fn test_score_spec_match_by_component() {
+        let spec = json!({
+            "description": "Workflow builder page",
+            "metadata": {
+                "pageUrl": "/build/workflows",
+                "component": "WorkflowBuilder"
+            }
+        });
+
+        let score = score_spec_match(&spec, "Fix the WorkflowBuilder save button");
+        assert!(score > 0.2, "Expected score > 0.2, got {}", score);
+    }
+
+    #[test]
+    fn test_update_page_specs_writes_to_matching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("settings.spec.uibridge.json");
+
+        let spec_content = json!({
+            "version": "1.0.0",
+            "description": "Settings page with dark mode toggle",
+            "metadata": {
+                "pageUrl": "/settings",
+                "component": "SettingsPage",
+                "tags": ["dark-mode", "settings"]
+            },
+            "groups": [
+                {
+                    "id": "existing-group",
+                    "name": "Existing",
+                    "description": "Existing tests",
+                    "category": "element-presence",
+                    "assertions": [],
+                    "source": "manual"
+                }
+            ]
+        });
+        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+
+        let criteria = AcceptanceCriteria {
+            goal_summary: "Dark mode settings toggle works".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "toggle-visible".to_string(),
+                description: "Toggle is visible on settings page".to_string(),
+                method: VerificationMethod::UiBridge,
+                priority: CriterionPriority::Critical,
+                verification_hint: "Check toggle exists".to_string(),
+                category: "ui-content".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "Fix the dark-mode toggle on settings page",
+            &[dir.path()],
+            0.2,
+        );
+
+        assert_eq!(result.specs_updated, 1);
+        assert!(result.errors.is_empty());
+
+        // Verify the file was updated
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+        let groups = updated["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1]["id"].as_str().unwrap(), "wf-acceptance-criteria");
+        assert_eq!(groups[1]["assertions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_update_page_specs_replaces_existing_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("settings.spec.uibridge.json");
+
+        let spec_content = json!({
+            "version": "1.0.0",
+            "description": "Settings page",
+            "metadata": { "pageUrl": "/settings", "tags": ["settings"] },
+            "groups": [
+                {
+                    "id": "wf-acceptance-criteria",
+                    "name": "Already exists",
+                    "description": "Previous criteria",
+                    "category": "semantic",
+                    "assertions": [{"id": "old-assertion"}],
+                    "source": "ai-generated"
+                }
+            ]
+        });
+        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+
+        let criteria = AcceptanceCriteria {
+            goal_summary: "New goal".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "new-check".to_string(),
+                description: "New check".to_string(),
+                method: VerificationMethod::Command,
+                priority: CriterionPriority::Critical,
+                verification_hint: "run it".to_string(),
+                category: "compilation".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "Update the settings page",
+            &[dir.path()],
+            0.2,
+        );
+
+        // Should replace the old group, not skip
+        assert_eq!(result.specs_updated, 1);
+
+        // Verify the file has the new criteria, not the old
+        let updated: Value =
+            serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+        let groups = updated["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["description"].as_str().unwrap(), "New goal");
+        assert_eq!(groups[0]["assertions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            groups[0]["assertions"][0]["id"].as_str().unwrap(),
+            "wf-new-check"
+        );
+    }
+
+    #[test]
+    fn test_update_page_specs_skips_low_scoring() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec_path = dir.path().join("dashboard.spec.uibridge.json");
+
+        let spec_content = json!({
+            "version": "1.0.0",
+            "description": "Dashboard overview page",
+            "metadata": { "pageUrl": "/dashboard", "component": "Dashboard" },
+            "groups": []
+        });
+        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+
+        let criteria = AcceptanceCriteria {
+            goal_summary: "Fix auth".to_string(),
+            criteria: vec![AcceptanceCriterion {
+                id: "auth-check".to_string(),
+                description: "Auth check passes".to_string(),
+                method: VerificationMethod::Command,
+                priority: CriterionPriority::Critical,
+                verification_hint: "run auth test".to_string(),
+                category: "behavior".to_string(),
+            }],
+            assumptions: vec![],
+        };
+
+        // "Fix authentication backend" has nothing to do with "dashboard"
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "Fix authentication backend service",
+            &[dir.path()],
+            0.3,
+        );
+
+        assert_eq!(result.specs_updated, 0);
+    }
+
+    #[test]
+    fn test_update_page_specs_empty_criteria() {
+        let dir = tempfile::tempdir().unwrap();
+        let criteria = AcceptanceCriteria {
+            goal_summary: "".to_string(),
+            criteria: vec![],
+            assumptions: vec![],
+        };
+
+        let result = update_page_specs_from_criteria(
+            &criteria,
+            "some description",
+            &[dir.path()],
+            0.3,
+        );
+
+        assert_eq!(result.specs_updated, 0);
     }
 }

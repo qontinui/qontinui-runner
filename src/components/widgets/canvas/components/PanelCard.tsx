@@ -5,7 +5,7 @@
  * Extracted from CanvasWidget for reuse in both active dashboard and run recap.
  */
 
-import { useState, useCallback } from "react";
+import React, { useState, useCallback } from "react";
 import { ChevronRight, Copy, Check, Maximize2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui";
@@ -25,10 +25,12 @@ interface PanelCardProps {
  * Lazy-rendered panel content. Only mounts when the panel is expanded.
  */
 function PanelContent({ panel, readOnly }: { panel: CanvasPanel; readOnly?: boolean }) {
-  const Component = CanvasComponentRegistry.get(panel.component);
-  return (
-    <Component data={panel.data} size={panel.size} panelId={panel.panel_id} readOnly={readOnly} />
-  );
+  return React.createElement(CanvasComponentRegistry.get(panel.component), {
+    data: panel.data,
+    size: panel.size,
+    panelId: panel.panel_id,
+    readOnly,
+  });
 }
 
 /**

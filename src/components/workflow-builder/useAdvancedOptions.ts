@@ -58,6 +58,7 @@ export function useAdvancedOptions(aiSettings: Record<string, unknown> | null) {
     if (!aiSettings) return;
     const settings = aiSettings as Record<string, unknown>;
     if (!provider && typeof settings.provider === "string") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize from loaded settings
       setProvider(settings.provider);
     }
     if (!model) {

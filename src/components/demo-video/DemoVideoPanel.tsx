@@ -17,9 +17,14 @@ import {
   Sparkles,
   RefreshCw,
   CheckSquare,
+  MapPin,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIComponent } from "ui-bridge";
+import type { ProductTour } from "@/types/product-tour";
+import { PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
+import { instanceStorage } from "@/lib/instance-storage";
+import { TourPlayer } from "@/components/product-tour/TourPlayer";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import type {
   DemoScript,
@@ -157,6 +162,7 @@ export function DemoVideoPanel() {
   });
 
   const [specs, setSpecs] = useState<DiscoveredSpecEntry[]>([]);
+  const [activeTour, setActiveTour] = useState<ProductTour | null>(null);
   const [selectedSpecIds, setSelectedSpecIds] = useState<Set<string>>(new Set());
   const [config, setConfig] = useState<DemoRecordingConfig>(DEFAULT_RECORDING_CONFIG);
   const [state, setState] = useState<DemoGenerationState>(INITIAL_GENERATION_STATE);
@@ -532,11 +538,37 @@ export function DemoVideoPanel() {
                     {entry.narration.markdown}
                   </pre>
                 </details>
+
+                {/* Cross-link to matching product tour */}
+                {(() => {
+                  const savedTours = instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []);
+                  const matchingTour = savedTours.find((t) =>
+                    t.pages.some((p) => entry.script.targetPage.includes(p) || p.includes(entry.script.targetPage))
+                  );
+                  if (!matchingTour) return null;
+                  return (
+                    <button
+                      onClick={() => setActiveTour(matchingTour)}
+                      className="flex items-center gap-1.5 text-xs text-primary hover:underline mt-1"
+                    >
+                      <MapPin className="h-3 w-3" />
+                      Start interactive tour for this page
+                    </button>
+                  );
+                })()}
               </div>
             ))}
           </div>
         )}
       </div>
+
+      {activeTour && (
+        <TourPlayer
+          tour={activeTour}
+          onClose={() => setActiveTour(null)}
+          onComplete={() => setActiveTour(null)}
+        />
+      )}
     </div>
   );
 }

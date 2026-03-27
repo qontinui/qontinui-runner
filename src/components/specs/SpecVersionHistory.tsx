@@ -48,6 +48,7 @@ export function SpecVersionHistory({ specId }: SpecVersionHistoryProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching
     setLoading(true);
     invoke<VersionEntry[]>("get_spec_compliance_history", { specId })
       .then((results) => {

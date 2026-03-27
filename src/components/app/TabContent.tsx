@@ -86,6 +86,11 @@ const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser
 const ActivityTimelinePanel = lazy(() => import("../activity-timeline/ActivityTimelinePanel").then(m => ({ default: m.ActivityTimelinePanel })));
 const WatcherManagementPanel = lazy(() => import("../activity-timeline/WatcherManagementPanel").then(m => ({ default: m.WatcherManagementPanel })));
 const DemoVideoPanel = lazy(() => import("../demo-video/DemoVideoPanel").then(m => ({ default: m.DemoVideoPanel })));
+const DevelopmentIntelligencePage = lazy(() => import("../development-intelligence/DevelopmentIntelligencePage").then(m => ({ default: m.DevelopmentIntelligencePage })));
+const TourCatalog = lazy(() => import("../product-tour/TourCatalog").then(m => ({ default: m.TourCatalog })));
+const SessionRecapPage = lazy(() => import("../session-recap/SessionRecapPage").then(m => ({ default: m.SessionRecapPage })));
+const ApiSurfacePage = lazy(() => import("../api-surface/ApiSurfacePage").then(m => ({ default: m.ApiSurfacePage })));
+const DecisionTrailPage = lazy(() => import("../decision-trail/DecisionTrailPage").then(m => ({ default: m.DecisionTrailPage })));
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({ id, name, description }: { id: string; name: string; description: string }) {
@@ -802,10 +807,30 @@ export function TabContent({
         </div>
       );
 
+    case "decision-trail":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="decision-trail" name="Decision Trail" description="Architectural decision history and concept summaries" />
+          <Suspense fallback={<LazyFallback />}>
+            <DecisionTrailPage />
+          </Suspense>
+        </div>
+      );
+
     case "event-history":
       return (
         <div className="h-full overflow-hidden">
           <EventHistoryPage />
+        </div>
+      );
+
+    case "development-intelligence":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="development-intelligence" name="Dev Intelligence" description="Coverage gap analysis, complexity scoring, and dead feature detection" />
+          <Suspense fallback={<LazyFallback />}>
+            <DevelopmentIntelligencePage />
+          </Suspense>
         </div>
       );
 
@@ -815,6 +840,36 @@ export function TabContent({
           <PageRegistration id="demo-video" name="Demo Videos" description="Generate demo videos from UI Bridge page specs" />
           <Suspense fallback={<LazyFallback />}>
             <DemoVideoPanel />
+          </Suspense>
+        </div>
+      );
+
+    case "product-tours":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="product-tours" name="Product Tours" description="Generate and manage interactive product tours" />
+          <Suspense fallback={<LazyFallback />}>
+            <TourCatalog />
+          </Suspense>
+        </div>
+      );
+
+    case "session-recap":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="session-recap" name="Session Recap" description="Semantic timeline of what was built during a development session — files, types, endpoints, dependencies" />
+          <Suspense fallback={<LazyFallback />}>
+            <SessionRecapPage />
+          </Suspense>
+        </div>
+      );
+
+    case "api-surface":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="api-surface" name="API Surface Map" description="Interactive map of every endpoint, command, query, and their connections — shows orphaned endpoints" />
+          <Suspense fallback={<LazyFallback />}>
+            <ApiSurfacePage />
           </Suspense>
         </div>
       );

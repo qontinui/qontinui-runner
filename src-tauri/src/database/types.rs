@@ -2109,6 +2109,204 @@ pub struct ObservationTypeStat {
 }
 
 // ============================================================================
+// Decision Trail (architectural decision history)
+// ============================================================================
+
+/// Full decision record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Decision {
+    pub id: String,
+    pub timestamp: String,
+    pub scale: String,
+    pub category: String,
+    pub status: String,
+    pub title: String,
+    pub summary: String,
+    pub rationale: String,
+    pub alternatives_json: String,
+    pub tradeoffs_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspiration_json: Option<String>,
+    pub related_decisions_json: String,
+    pub affected_files_json: String,
+    pub affected_endpoints_json: String,
+    pub affected_tables_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    pub tags_json: String,
+    pub is_deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Truncated decision preview for list views.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionPreview {
+    pub id: String,
+    pub timestamp: String,
+    pub scale: String,
+    pub category: String,
+    pub status: String,
+    pub title: String,
+    pub summary_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<String>,
+    pub tags_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Decision search result with relevance rank.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecisionSearchResult {
+    pub id: String,
+    pub timestamp: String,
+    pub scale: String,
+    pub category: String,
+    pub status: String,
+    pub title: String,
+    pub summary_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triggered_by: Option<String>,
+    pub tags_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f32>,
+}
+
+/// Input for creating a new decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDecisionInput {
+    pub scale: String,
+    pub category: String,
+    pub title: String,
+    pub summary: String,
+    pub rationale: String,
+    #[serde(default)]
+    pub alternatives_json: Option<String>,
+    #[serde(default)]
+    pub tradeoffs_json: Option<String>,
+    pub triggered_by: Option<String>,
+    pub inspiration_json: Option<String>,
+    #[serde(default)]
+    pub related_decisions_json: Option<String>,
+    #[serde(default)]
+    pub affected_files_json: Option<String>,
+    #[serde(default)]
+    pub affected_endpoints_json: Option<String>,
+    #[serde(default)]
+    pub affected_tables_json: Option<String>,
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub tags_json: Option<String>,
+}
+
+/// Input for updating an existing decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateDecisionInput {
+    #[serde(default)]
+    pub id: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub rationale: Option<String>,
+    pub alternatives_json: Option<String>,
+    pub tradeoffs_json: Option<String>,
+    pub triggered_by: Option<String>,
+    pub inspiration_json: Option<String>,
+    pub related_decisions_json: Option<String>,
+    pub affected_files_json: Option<String>,
+    pub affected_endpoints_json: Option<String>,
+    pub affected_tables_json: Option<String>,
+    pub tags_json: Option<String>,
+}
+
+/// Full concept summary record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConceptSummaryRecord {
+    pub id: String,
+    pub name: String,
+    pub tagline: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspiration_json: Option<String>,
+    pub benefits_json: String,
+    pub components_json: String,
+    pub related_decisions_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics_json: Option<String>,
+    pub is_deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Truncated concept summary preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConceptSummaryPreview {
+    pub id: String,
+    pub name: String,
+    pub tagline: String,
+    pub description_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspiration_json: Option<String>,
+    pub benefits_json: String,
+    pub components_json: String,
+    pub related_decisions_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input for creating a concept summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateConceptSummaryInput {
+    pub name: String,
+    pub tagline: String,
+    pub description: String,
+    pub inspiration_json: Option<String>,
+    #[serde(default)]
+    pub benefits_json: Option<String>,
+    #[serde(default)]
+    pub components_json: Option<String>,
+    #[serde(default)]
+    pub related_decisions_json: Option<String>,
+    pub metrics_json: Option<String>,
+}
+
+/// Input for updating a concept summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateConceptSummaryInput {
+    #[serde(default)]
+    pub id: String,
+    pub name: Option<String>,
+    pub tagline: Option<String>,
+    pub description: Option<String>,
+    pub inspiration_json: Option<String>,
+    pub benefits_json: Option<String>,
+    pub components_json: Option<String>,
+    pub related_decisions_json: Option<String>,
+    pub metrics_json: Option<String>,
+}
+
+// ============================================================================
 // Activity Timeline (screenpipe-inspired capture history)
 // ============================================================================
 

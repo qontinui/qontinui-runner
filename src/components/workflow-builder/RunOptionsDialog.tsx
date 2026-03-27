@@ -62,6 +62,7 @@ export function RunOptionsDialog({
 
   useEffect(() => {
     if (open) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset state on dialog open
       setSelected(new Set([(defaultArchitecture as WorkflowArchitecture) || "traditional"]));
       setUseWorktree(false);
       setIsLaunching(false);

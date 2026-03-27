@@ -46,6 +46,7 @@ export const FlameChart: React.FC<FlameChartProps> = ({
   const [focusStack, setFocusStack] = useState<FlameNode[]>([]);
   const [hoveredSpan, setHoveredSpan] = useState<{ span: TraceSpan; x: number; y: number } | null>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 400 });
+  const [isDragging, setIsDragging] = useState(false);
   const dragRef = useRef<{ startX: number; startPanX: number } | null>(null);
 
   // Build flame data
@@ -235,12 +236,14 @@ export const FlameChart: React.FC<FlameChartProps> = ({
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       dragRef.current = { startX: e.clientX, startPanX: view.panX };
+      setIsDragging(true);
     },
     [view.panX],
   );
 
   const handleMouseUp = useCallback(() => {
     dragRef.current = null;
+    setIsDragging(false);
   }, []);
 
   const handleClick = useCallback(
@@ -348,7 +351,7 @@ export const FlameChart: React.FC<FlameChartProps> = ({
       <div ref={containerRef} className="flex-1 relative overflow-hidden" style={{ minHeight: height - 48 }}>
         <canvas
           ref={canvasRef}
-          style={{ width: canvasSize.width, height: canvasSize.height, cursor: dragRef.current ? "grabbing" : "default" }}
+          style={{ width: canvasSize.width, height: canvasSize.height, cursor: isDragging ? "grabbing" : "default" }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}

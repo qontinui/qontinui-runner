@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { LayoutDashboard, GitBranch, Cpu, Search, Bot, Loader2, Boxes } from "lucide-react";
 import type { SdkArchitectureGraph } from "@/types/architecture";
 import { DeveloperOverviewPanel } from "./DeveloperOverviewPanel";
@@ -32,6 +32,28 @@ export function DeveloperArchitecturePanel({
 }: Props) {
   const [activeView, setActiveView] = useState<ViewId>("overview");
   const [selectedProjectIndex, setSelectedProjectIndex] = useState(0);
+
+  // Load spec page IDs for coverage overlay badges
+  const [specPageIds, setSpecPageIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch("http://localhost:9876/specs");
+        const json = await resp.json();
+        if (!cancelled && json.data) {
+          const ids = new Set<string>();
+          for (const spec of json.data) {
+            if (spec.metadata?.pageId) ids.add(spec.metadata.pageId);
+          }
+          setSpecPageIds(ids);
+        }
+      } catch {
+        // Specs endpoint may not be available
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const clampedIndex = useMemo(
     () => Math.min(selectedProjectIndex, Math.max(0, specs.length - 1)),
@@ -109,7 +131,7 @@ export function DeveloperArchitecturePanel({
       {/* Active view */}
       <div className="flex-1 min-h-0 overflow-auto">
         {activeView === "overview" && <DeveloperOverviewPanel project={project} />}
-        {activeView === "dependencies" && <DeveloperDependencyGraph project={project} />}
+        {activeView === "dependencies" && <DeveloperDependencyGraph project={project} specPageIds={specPageIds} />}
         {activeView === "tech-map" && <DeveloperTechMap project={project} />}
         {activeView === "explorer" && <DeveloperExplorerPanel project={project} />}
         {activeView === "agentic" && <DeveloperAgenticPanel project={project} />}

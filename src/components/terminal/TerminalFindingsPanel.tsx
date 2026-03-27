@@ -52,6 +52,7 @@ export function TerminalFindingsPanel({
 
   // Auto-select first finding when findings change or selected is removed
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect -- auto-select on list change */
     if (displayedFindings.length === 0) {
       setSelectedId(null);
       return;
@@ -60,6 +61,7 @@ export function TerminalFindingsPanel({
     if (!stillExists) {
       setSelectedId(displayedFindings[0].id);
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [displayedFindings, selectedId]);
 
   const selected = displayedFindings.find((f) => f.id === selectedId) ?? null;

@@ -54,6 +54,10 @@ import {
 import { generateNarration } from "@/lib/demo-video/narration-generator";
 import type { DemoScript } from "@/lib/demo-video/types";
 import { DEFAULT_RECORDING_CONFIG } from "@/lib/demo-video/types";
+import { generateTour } from "@/lib/product-tour/tour-generator";
+import type { ProductTour } from "@/types/product-tour";
+import { PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import {
   buildRegistrationPrompt,
@@ -269,6 +273,7 @@ export function HookGenerationPanel({
     generateSpecs: true,
     generateTutorials: false,
     generateDemoVideos: false,
+    generateProductTours: false,
   });
   const currentPageRef = useRef<{
     page: PageComponent;
@@ -277,7 +282,9 @@ export function HookGenerationPanel({
   } | null>(null);
   // Collected demo video scripts for batch recording after all pages are done
   const demoVideoScriptsRef = useRef<DemoScript[]>([]);
-  // Last generated spec JSON per page (used by demo script planner)
+  // Collected product tours for batch saving after all pages are done
+  const productToursRef = useRef<ProductTour[]>([]);
+  // Last generated spec JSON per page (used by demo script planner and tour generator)
   const lastSpecJsonRef = useRef<string>("");
 
   // Track how many AI messages we've already processed to avoid duplicate extraction
@@ -516,8 +523,8 @@ export function HookGenerationPanel({
           "",
         );
         session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
-      } else if (opts.generateDemoVideos) {
-        // Skip to demo script planning
+      } else if (opts.generateDemoVideos || opts.generateProductTours) {
+        // Skip to demo script / product tour planning
         chainToDemoScript(cur?.page.route ?? "", controller.signal);
       } else {
         // Advance to next page
@@ -555,7 +562,7 @@ export function HookGenerationPanel({
           jsonBlock || "",
         );
         session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
-      } else if (opts.generateDemoVideos) {
+      } else if (opts.generateDemoVideos || opts.generateProductTours) {
         chainToDemoScript(cur?.page.route ?? "", controller.signal);
       } else {
         advanceToNextPage(controller.signal);
@@ -570,7 +577,7 @@ export function HookGenerationPanel({
         prev.map((s) => (s.state === "active" ? { ...s, state: "done" } : s)),
       );
       const opts = pageOptionsRef.current;
-      if (opts.generateDemoVideos) {
+      if (opts.generateDemoVideos || opts.generateProductTours) {
         const cur = currentPageRef.current;
         chainToDemoScript(cur?.page.route ?? "", controller.signal);
       } else {
@@ -586,33 +593,49 @@ export function HookGenerationPanel({
       advanceToNextPage(controller.signal);
     }
 
-    // Helper: chain to demo script planning (non-AI — calls the planner API directly)
+    // Helper: chain to demo script + product tour planning (non-AI — calls planner APIs directly)
     function chainToDemoScript(route: string, signal: AbortSignal) {
       pendingStepRef.current = "page-demo-script";
+      const opts = pageOptionsRef.current;
+      const parts = [opts.generateDemoVideos && "Demo", opts.generateProductTours && "Tour"].filter(Boolean);
       setStepStatuses((prev) => [
         ...prev,
-        { state: "active", label: `Demo Script: ${route}` },
+        { state: "active", label: `${parts.join(" + ")}: ${route}` },
       ]);
 
       (async () => {
-        try {
-          // Parse the last generated spec JSON into a SpecConfig
-          let specConfig: SpecConfig | null = null;
-          if (lastSpecJsonRef.current) {
+        // Parse the last generated spec JSON into a SpecConfig
+        let specConfig: SpecConfig | null = null;
+        if (lastSpecJsonRef.current) {
+          try {
+            specConfig = JSON.parse(lastSpecJsonRef.current) as SpecConfig;
+          } catch {
+            // Spec JSON couldn't be parsed
+          }
+        }
+
+        if (specConfig) {
+          const elements = await fetchRegisteredElements();
+
+          // Demo video script
+          if (opts.generateDemoVideos) {
             try {
-              specConfig = JSON.parse(lastSpecJsonRef.current) as SpecConfig;
-            } catch {
-              // Spec JSON couldn't be parsed — skip this page's demo script
+              const script = await planDemoScript(specConfig, elements);
+              demoVideoScriptsRef.current.push(script);
+            } catch (err) {
+              console.warn("Demo script planning failed for", route, err);
             }
           }
 
-          if (specConfig) {
-            const elements = await fetchRegisteredElements();
-            const script = await planDemoScript(specConfig, elements);
-            demoVideoScriptsRef.current.push(script);
+          // Product tour
+          if (opts.generateProductTours) {
+            try {
+              const tour = await generateTour(specConfig, elements, "new-user");
+              productToursRef.current.push(tour);
+            } catch (err) {
+              console.warn("Product tour generation failed for", route, err);
+            }
           }
-        } catch (err) {
-          console.warn("Demo script planning failed for", route, err);
         }
 
         setStepStatuses((prev) =>
@@ -633,6 +656,16 @@ export function HookGenerationPanel({
         pendingStepRef.current = null;
         currentPageRef.current = null;
 
+        // Save product tours if any were generated
+        const tours = productToursRef.current;
+        if (tours.length > 0) {
+          const existing = instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []);
+          const newIds = new Set(tours.map((t) => t.id));
+          const merged = [...existing.filter((t) => !newIds.has(t.id)), ...tours];
+          instanceStorage.setJSON(PRODUCT_TOURS_STORAGE_KEY, merged);
+          productToursRef.current = [];
+        }
+
         // If demo videos were planned, start batch recording
         const scripts = demoVideoScriptsRef.current;
         if (scripts.length > 0 && pageOptionsRef.current.generateDemoVideos) {
@@ -646,7 +679,6 @@ export function HookGenerationPanel({
               try {
                 const result = await executeScript(script, DEFAULT_RECORDING_CONFIG);
                 const narr = generateNarration(script, result);
-                // Save narration files alongside generated code files
                 setGeneratedFiles((prev) => [
                   ...prev,
                   { filePath: `${script.targetPage.replace(/^\//, "").replace(/\//g, "-") || "demo"}-narration.srt`, content: narr.srt },
@@ -786,8 +818,8 @@ export function HookGenerationPanel({
         await session.sendMessage(
           `Generate a tutorial for ${page.route}.\n\n` + tutPrompt,
         );
-      } else if (opts.generateDemoVideos) {
-        // Only demo videos selected — chain directly to demo script planning
+      } else if (opts.generateDemoVideos || opts.generateProductTours) {
+        // Only demo videos / product tours selected — chain directly
         chainToDemoScript(page.route, signal);
       }
     }
@@ -959,12 +991,14 @@ export function HookGenerationPanel({
           options.generateSpecs && "spec",
           options.generateTutorials && "tutorial",
           options.generateDemoVideos && "demo",
+          options.generateProductTours && "tour",
         ]
           .filter(Boolean)
           .join("+")})`,
       }));
       setStepStatuses(steps);
       demoVideoScriptsRef.current = [];
+      productToursRef.current = [];
       lastSpecJsonRef.current = "";
 
       // Close existing session

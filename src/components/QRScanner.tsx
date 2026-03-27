@@ -187,7 +187,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
 
       {/* Video Preview */}
       <div className="relative bg-black rounded-lg overflow-hidden" style={{ minHeight: "400px" }}>
-        <div id={scannerIdRef.current} className="w-full"></div>
+        <div id="qr-reader" className="w-full"></div>
 
         {/* Scanning Overlay */}
         {scanning && !scanSuccess && !error && (

@@ -1047,6 +1047,7 @@ function AutoApprovePopover({
 
   // Sync text when patterns change externally
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync from external prop
     if (!open) setText(patterns.join("\n"));
   }, [patterns, open]);
 

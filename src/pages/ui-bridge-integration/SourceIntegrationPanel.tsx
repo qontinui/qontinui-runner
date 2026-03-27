@@ -197,6 +197,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         generateSpecs: true,
         generateTutorials: false, // Off by default to keep it faster
         generateDemoVideos: false,
+        generateProductTours: false,
       };
 
       window.dispatchEvent(

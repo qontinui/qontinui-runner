@@ -7,7 +7,7 @@
  * Provides a high-level overview of workflow execution progress.
  */
 
-import { useState, useRef, useCallback, useMemo } from "react";
+import React, { useState, useCallback, useEffect, useMemo } from "react";
 import {
   Terminal,
   CheckCircle,
@@ -252,6 +252,14 @@ function StepDetailPanel({ step }: { step: TimelineStep }) {
 }
 
 /**
+ * Renders the icon for a given step type.
+ * Extracted to module scope to avoid defining a component inside StepRow.
+ */
+function StepTypeIcon({ type, className }: { type: StepType; className?: string }) {
+  return React.createElement(getStepIcon(type), { className });
+}
+
+/**
  * Individual step row component.
  * Shows step progress bar for running steps or completed steps with progress data.
  * Expandable for terminal steps (success/failed) to show detail panel.
@@ -267,7 +275,6 @@ function StepRow({
   isExpanded: boolean;
   onToggle: (stepId: string) => void;
 }) {
-  const Icon = getStepIcon(step.type);
   const accentColor = getStepAccentColor(step.type);
   const colors = getAccentColors(accentColor as Parameters<typeof getAccentColors>[0]);
   const errorColors = getStatusColors("error");
@@ -327,7 +334,7 @@ function StepRow({
             colors.border,
           )}
         >
-          <Icon className="h-2.5 w-2.5 mr-1" />
+          <StepTypeIcon type={step.type} className="h-2.5 w-2.5 mr-1" />
           {step.type}
         </Badge>
 
@@ -762,8 +769,19 @@ export function ExecutionTimelineWidget({
   // User-explicit iteration expand/collapse overrides (key -> expanded boolean)
   const [userIterationToggles, setUserIterationToggles] = useState<Map<string, boolean>>(new Map());
 
-  // Track the previous iteration counts to detect new iterations
-  const prevIterationCounts = useRef<Map<string, number>>(new Map());
+  // Track the previous iteration counts to detect new iterations (state so useMemo stays pure)
+  const [prevIterationCounts, setPrevIterationCounts] = useState<Map<string, number>>(new Map());
+
+  // Build current iteration counts from phaseGroups (pure derivation for useMemo + useEffect)
+  const currentIterationCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const group of phaseGroups) {
+      if (!group.hasIterations || group.iterationGroups.length === 0) continue;
+      const groupId = `${group.stageIndex}:${group.phase}`;
+      counts.set(groupId, group.iterationGroups.length);
+    }
+    return counts;
+  }, [phaseGroups]);
 
   // Compute expanded iterations during render by merging auto-defaults with user overrides.
   // Auto-default: expand the latest iteration in each phase.
@@ -775,12 +793,10 @@ export function ExecutionTimelineWidget({
       if (!group.hasIterations || group.iterationGroups.length === 0) continue;
 
       const groupId = `${group.stageIndex}:${group.phase}`;
-      const prevCount = prevIterationCounts.current.get(groupId) ?? 0;
+      const prevCount = prevIterationCounts.get(groupId) ?? 0;
       const currentCount = group.iterationGroups.length;
       const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
       const isNewIteration = currentCount > prevCount;
-
-      prevIterationCounts.current.set(groupId, currentCount);
 
       if (isNewIteration) {
         // New iteration detected: expand only the latest, ignore user overrides for this phase
@@ -806,7 +822,12 @@ export function ExecutionTimelineWidget({
     }
 
     return result;
-  }, [phaseGroups, userIterationToggles]);
+  }, [phaseGroups, userIterationToggles, prevIterationCounts]);
+
+  // Sync previous iteration counts after render so the next render can detect new iterations
+  useEffect(() => {
+    setPrevIterationCounts(currentIterationCounts);
+  }, [currentIterationCounts]);
 
   const handleIterationToggle = useCallback((key: string, expanded: boolean) => {
     setUserIterationToggles((prev) => {

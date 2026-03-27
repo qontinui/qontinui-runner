@@ -822,7 +822,9 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
 
   // Keep a ref to navState so effects can read it without depending on it
   const navStateRef = useRef(navState);
-  navStateRef.current = navState;
+  useEffect(() => {
+    navStateRef.current = navState;
+  }, [navState]);
 
   // Persist state changes
   useEffect(() => {

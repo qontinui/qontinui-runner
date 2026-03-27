@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 
 // ── Layout Definitions ─────────────────────────────────────────────────────
@@ -164,13 +164,13 @@ function persistState(state: PersistedState) {
 // ── Hook ───────────────────────────────────────────────────────────────────
 
 export function useZoneLayout(tabIds: string[]) {
-  const persisted = useRef(loadPersistedState());
+  const [persistedState] = useState(() => loadPersistedState());
 
-  const [layoutId, setLayoutIdState] = useState<string>(persisted.current?.layoutId ?? "single");
+  const [layoutId, setLayoutIdState] = useState<string>(persistedState?.layoutId ?? "single");
   const [assignments, setAssignments] = useState<ZoneAssignments>(
-    persisted.current?.assignments ?? {},
+    persistedState?.assignments ?? {},
   );
-  const [focusedZone, setFocusedZone] = useState<number>(persisted.current?.focusedZone ?? 0);
+  const [focusedZone, setFocusedZone] = useState<number>(persistedState?.focusedZone ?? 0);
   /** Zone index that is temporarily maximized (null = normal grid) */
   const [maximizedZone, setMaximizedZone] = useState<number | null>(null);
 
@@ -183,6 +183,7 @@ export function useZoneLayout(tabIds: string[]) {
 
   // Auto-assign tabs to empty zones when tabs change
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync assignments when tab list changes
     setAssignments((prev) => {
       // Check if any removals or additions are needed before cloning
       const hasDeadAssignments = Object.values(prev).some((tabId) => !tabIds.includes(tabId));

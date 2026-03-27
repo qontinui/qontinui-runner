@@ -102,7 +102,7 @@ export function RunCostBreakdown({ runId }: RunCostBreakdownProps) {
   const sortedModels = useMemo(() => {
     if (!data?.per_model) return [];
     return [...data.per_model].sort((a, b) => b.cost_usd - a.cost_usd);
-  }, [data?.per_model]);
+  }, [data]);
 
   // Loading
   if (loading) {

@@ -55,14 +55,17 @@ export function PhaseDistributionPanel({ data, size }: CanvasPanelComponentProps
   const center = ringSize / 2;
   const fontSize = isCompact ? "text-[10px]" : "text-xs";
 
-  // Build SVG arc segments
-  let cumulativeOffset = 0;
+  // Build SVG arc segments — precompute cumulative offsets to avoid mutable variables
+  const cumulativeOffsets = segments.reduce<number[]>(
+    (acc, seg, idx) => [...acc, (acc[idx - 1] ?? 0) + seg.percentage / 100],
+    [],
+  );
   const arcs = segments.map((seg, idx) => {
+    const cumulativeOffset = idx === 0 ? 0 : cumulativeOffsets[idx - 1];
     const pct = seg.percentage / 100;
     const dashLength = circumference * pct;
     const dashGap = circumference - dashLength;
     const offset = -circumference * cumulativeOffset + circumference * 0.25; // start at top
-    cumulativeOffset += pct;
 
     return {
       dashArray: `${dashLength} ${dashGap}`,

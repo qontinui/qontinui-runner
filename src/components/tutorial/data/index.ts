@@ -22,6 +22,7 @@ import { traceAnalysisTutorial } from "./trace-analysis";
 import { activityTimelineTutorial } from "./activity-timeline";
 import { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
 import { proceduralSkillsTutorial } from "./procedural-skills";
+import { qLearningRouterTutorial } from "./q-learning-router";
 
 /**
  * All available tutorials
@@ -45,6 +46,7 @@ export const tutorials: Tutorial[] = [
   activityTimelineTutorial, // Featured - Screenpipe-inspired capture history & watchers
   metaPromptOptimizerTutorial, // Featured - LLM-based prompt rewriting with canary A/B testing
   proceduralSkillsTutorial, // Featured - Hermes-agent-inspired self-improving procedural memory
+  qLearningRouterTutorial, // Featured - Q-learning architecture routing for autoresearch
 ];
 
 /**
@@ -125,3 +127,4 @@ export { blameAttributionTutorial } from "./blame-attribution";
 export { multimodalVisionTutorial } from "./multimodal-vision";
 export { traceAnalysisTutorial } from "./trace-analysis";
 export { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
+export { qLearningRouterTutorial } from "./q-learning-router";

@@ -90,6 +90,7 @@ export function ExecutionStatsCard({
   // Update elapsed time every second while running
   useEffect(() => {
     if (!isRunning || !startTime) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync display when run stops
       setElapsedDisplay(formatElapsedTime(startTime));
       return;
     }

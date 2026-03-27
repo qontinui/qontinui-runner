@@ -113,6 +113,7 @@ export function AddStepDropdown({
   // Reset state when dropdown closes
   useEffect(() => {
     if (!isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset side-effect on close
       setShowLibrary(false);
     }
   }, [isOpen]);

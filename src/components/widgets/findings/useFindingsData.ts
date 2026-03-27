@@ -156,6 +156,7 @@ export function useFindingsData(): FindingsData {
 
   // Initial fetch and polling
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching
     fetchFindings();
 
     const interval = setInterval(fetchFindings, POLL_INTERVAL_MS);

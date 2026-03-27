@@ -46,6 +46,7 @@ export function PageSelectionPanel({
     generateSpecs: true,
     generateTutorials: false,
     generateDemoVideos: false,
+    generateProductTours: false,
   });
 
   const discoverPages = useCallback(async () => {
@@ -297,6 +298,20 @@ export function PageSelectionPanel({
               />
               Demo Videos
             </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={options.generateProductTours}
+                onChange={(e) =>
+                  setOptions({
+                    ...options,
+                    generateProductTours: e.target.checked,
+                  })
+                }
+                className="rounded"
+              />
+              Product Tours
+            </label>
           </div>
 
           {/* Generate button */}
@@ -308,7 +323,8 @@ export function PageSelectionPanel({
               (!options.generateRegistrations &&
                 !options.generateSpecs &&
                 !options.generateTutorials &&
-                !options.generateDemoVideos)
+                !options.generateDemoVideos &&
+                !options.generateProductTours)
             }
             className="flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50"
           >

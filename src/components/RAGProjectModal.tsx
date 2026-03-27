@@ -34,6 +34,7 @@ export function RAGProjectModal({ isOpen, onClose, onLog }: RAGProjectModalProps
   // Reset loading state when modal closes
   useEffect(() => {
     if (!isOpen) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset transient state on modal close
       setLoading(false);
     }
   }, [isOpen]);

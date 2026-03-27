@@ -12,7 +12,7 @@
  * Layout uses dagre with left-to-right ranking.
  */
 
-import { memo, useMemo, useState, useCallback, useRef } from "react";
+import { memo, useMemo, useState, useCallback, useRef, useEffect } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -34,6 +34,7 @@ import type {
   SdkArchitectureNode,
   SdkArchitectureEdge,
 } from "@/types/architecture";
+import { copyMermaidToClipboard } from "@/lib/development-intelligence/mermaid-export";
 
 // =============================================================================
 // Priority color system
@@ -102,7 +103,25 @@ function StatusDot({ status }: { status?: string }) {
 interface FeatureNodeData {
   feature: SdkArchitectureNode;
   dimmed: boolean;
+  hasSpec?: boolean;
   [key: string]: unknown;
+}
+
+/** Spec coverage badge: green checkmark if spec exists, red X if not */
+function SpecBadge({ hasSpec }: { hasSpec?: boolean }) {
+  if (hasSpec === undefined) return null;
+  return (
+    <span
+      className="shrink-0 text-[9px] font-bold rounded-full w-3.5 h-3.5 flex items-center justify-center"
+      style={{
+        background: hasSpec ? "rgba(34,197,94,0.3)" : "rgba(239,68,68,0.3)",
+        color: hasSpec ? "#22c55e" : "#ef4444",
+      }}
+      title={hasSpec ? "Has page spec" : "No page spec"}
+    >
+      {hasSpec ? "✓" : "✗"}
+    </span>
+  );
 }
 
 const FeatureNode = memo(({ data }: { data: FeatureNodeData }) => {
@@ -124,6 +143,7 @@ const FeatureNode = memo(({ data }: { data: FeatureNodeData }) => {
         <div className="flex items-center gap-1.5 mb-1">
           <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: colors.dot }} />
           <span className="text-xs font-semibold text-white truncate flex-1">{feature.label}</span>
+          <SpecBadge hasSpec={data.hasSpec} />
           <StatusDot status={feature.status} />
         </div>
         {feature.priority && (
@@ -148,6 +168,7 @@ const NODE_H = 60;
 function layoutGraph(
   features: SdkArchitectureNode[],
   edges: SdkArchitectureEdge[],
+  specPageIds?: Set<string>,
 ): { nodes: Node[]; edges: Edge[] } {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
@@ -180,7 +201,11 @@ function layoutGraph(
       id: f.id,
       type: "featureNode",
       position: { x: (pos?.x ?? 0) - NODE_W / 2, y: (pos?.y ?? 0) - NODE_H / 2 },
-      data: { feature: f, dimmed: false } satisfies FeatureNodeData,
+      data: {
+        feature: f,
+        dimmed: false,
+        hasSpec: specPageIds ? specPageIds.has(f.label.toLowerCase().replace(/\s+/g, "-")) || specPageIds.has(f.id.replace("feature:", "")) : undefined,
+      } satisfies FeatureNodeData,
     };
   });
 
@@ -393,9 +418,11 @@ function DetailSidebar({ feature, depsOut, depsIn, onClose }: DetailSidebarProps
 
 interface Props {
   project: SdkArchitectureGraph;
+  /** Set of page IDs that have spec files — used for spec coverage overlay badges */
+  specPageIds?: Set<string>;
 }
 
-export function DeveloperDependencyGraph({ project }: Props) {
+export function DeveloperDependencyGraph({ project, specPageIds }: Props) {
   const features = useMemo(
     () => project.nodes.filter((n) => n.type === "feature"),
     [project.nodes],
@@ -423,6 +450,7 @@ export function DeveloperDependencyGraph({ project }: Props) {
       features={features}
       allNodes={project.nodes}
       edges={project.edges}
+      specPageIds={specPageIds}
     />
   );
 }
@@ -432,17 +460,19 @@ function DeveloperDependencyGraphFlow({
   features,
   allNodes,
   edges: rawEdges,
+  specPageIds,
 }: {
   features: SdkArchitectureNode[];
   allNodes: SdkArchitectureNode[];
   edges: SdkArchitectureEdge[];
+  specPageIds?: Set<string>;
 }) {
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<SdkArchitectureNode | null>(null);
 
   const { nodes: initialNodes, edges: initialEdges } = useMemo(
-    () => layoutGraph(features, rawEdges),
-    [features, rawEdges],
+    () => layoutGraph(features, rawEdges, specPageIds),
+    [features, rawEdges, specPageIds],
   );
 
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
@@ -451,14 +481,16 @@ function DeveloperDependencyGraphFlow({
   // Sync when data changes
   const prevInitialNodesRef = useRef(initialNodes);
   const prevInitialEdgesRef = useRef(initialEdges);
-  if (prevInitialNodesRef.current !== initialNodes) {
-    prevInitialNodesRef.current = initialNodes;
-    setNodes(initialNodes);
-  }
-  if (prevInitialEdgesRef.current !== initialEdges) {
-    prevInitialEdgesRef.current = initialEdges;
-    setEdges(initialEdges);
-  }
+  useEffect(() => {
+    if (prevInitialNodesRef.current !== initialNodes) {
+      prevInitialNodesRef.current = initialNodes;
+      setNodes(initialNodes);
+    }
+    if (prevInitialEdgesRef.current !== initialEdges) {
+      prevInitialEdgesRef.current = initialEdges;
+      setEdges(initialEdges);
+    }
+  }, [initialNodes, initialEdges, setNodes, setEdges]);
 
   // Build a lookup map: node id -> SdkArchitectureNode
   // Use a ref to stabilize the lookup so handleNodeClick doesn't cause ReactFlow re-renders
@@ -471,7 +503,9 @@ function DeveloperDependencyGraphFlow({
   }, [allNodes]);
 
   const nodeByIdRef = useRef(nodeById);
-  nodeByIdRef.current = nodeById;
+  useEffect(() => {
+    nodeByIdRef.current = nodeById;
+  }, [nodeById]);
 
   // Apply hover dimming
   const displayNodes = useMemo(() => {
@@ -572,6 +606,16 @@ function DeveloperDependencyGraphFlow({
           <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#374151" />
         </ReactFlow>
 
+        {/* Export button */}
+        <button
+          onClick={() => copyMermaidToClipboard(displayNodes, displayEdges, { direction: "LR", title: "Feature Dependency Graph" })}
+          className="absolute top-2 right-2 z-10 flex items-center gap-1 px-2 py-1 text-[10px] bg-card/90 border border-border/50 rounded-md hover:bg-muted/80 transition-colors text-muted-foreground"
+          title="Copy as Mermaid markdown"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 010 1.5h-1.5a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-1.5a.75.75 0 011.5 0v1.5A1.75 1.75 0 019.25 16h-7.5A1.75 1.75 0 010 14.25v-7.5z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0114.25 11h-7.5A1.75 1.75 0 015 9.25v-7.5zm1.75-.25a.25.25 0 00-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 00.25-.25v-7.5a.25.25 0 00-.25-.25h-7.5z"/></svg>
+          Mermaid
+        </button>
+
         {/* Legend */}
         <div className="absolute bottom-12 left-2 bg-card/90 border border-border/50 rounded-lg p-2.5 space-y-1.5 z-10">
           <div className="text-[10px] font-semibold text-zinc-400 mb-1">Priority</div>
@@ -607,6 +651,22 @@ function DeveloperDependencyGraphFlow({
             <div className="w-4 h-0 border-t-2 border-dotted border-[#71717a]" />
             <span className="text-zinc-400">Uses</span>
           </div>
+
+          {specPageIds && specPageIds.size > 0 && (
+            <>
+              <div className="text-[10px] font-semibold text-zinc-400 mt-2 mb-1 pt-1 border-t border-border/30">
+                Spec Coverage
+              </div>
+              <div className="flex items-center gap-1.5 text-[10px]">
+                <span className="w-3.5 h-3.5 rounded-full flex items-center justify-center text-[9px] font-bold" style={{ background: "rgba(34,197,94,0.3)", color: "#22c55e" }}>✓</span>
+                <span className="text-zinc-400">Has spec</span>
+              </div>
+              <div className="flex items-center gap-1.5 text-[10px]">
+                <span className="w-3.5 h-3.5 rounded-full flex items-center justify-center text-[9px] font-bold" style={{ background: "rgba(239,68,68,0.3)", color: "#ef4444" }}>✗</span>
+                <span className="text-zinc-400">No spec</span>
+              </div>
+            </>
+          )}
         </div>
       </div>
 

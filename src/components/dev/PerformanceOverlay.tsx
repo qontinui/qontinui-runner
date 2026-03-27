@@ -369,6 +369,7 @@ export function PerformanceOverlay({
     const networkMonitor = getNetworkMonitor();
 
     // Initial fetch
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription + polling for real-time metrics
     setMetrics(monitor.getMetrics());
     setNetworkStats(networkMonitor.getStats());
 

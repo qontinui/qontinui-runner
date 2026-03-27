@@ -11,8 +11,9 @@ import type {
   DemoRecordingConfig,
   DemoExecutionResult,
   StepTimestamp,
+  DemoVisualOverlayDetail,
 } from "./types";
-import { DEFAULT_RECORDING_CONFIG } from "./types";
+import { DEFAULT_RECORDING_CONFIG, DEMO_VISUAL_OVERLAY_EVENT } from "./types";
 import { getApiBase } from "@/lib/runner-api";
 
 // =============================================================================
@@ -93,6 +94,27 @@ async function executeAction(action: DemoAction): Promise<void> {
         }
         await sleep(500);
       }
+      break;
+    }
+
+    case "visual": {
+      // Show a pre-generated image/video as a fullscreen overlay
+      const showDetail: DemoVisualOverlayDetail = {
+        action: "show",
+        filePath: action.filePath,
+        caption: action.caption,
+        durationMs: action.durationMs,
+      };
+      window.dispatchEvent(
+        new CustomEvent(DEMO_VISUAL_OVERLAY_EVENT, { detail: showDetail }),
+      );
+      // Hold for the specified duration while the overlay is visible on screen
+      await sleep(action.durationMs);
+      // Dismiss the overlay
+      const hideDetail: DemoVisualOverlayDetail = { action: "hide" };
+      window.dispatchEvent(
+        new CustomEvent(DEMO_VISUAL_OVERLAY_EVENT, { detail: hideDetail }),
+      );
       break;
     }
   }

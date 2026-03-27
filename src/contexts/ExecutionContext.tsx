@@ -226,6 +226,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
       } else {
         log.debug("Saved workflow not found in loaded config:", pendingWorkflowId);
       }
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clearing pending state after async config load
       setPendingWorkflowId(null);
     }
   }, [pendingWorkflowId, workflows, setSelectedWorkflow]);
@@ -246,6 +247,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
           availableMonitors,
         );
       }
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- clearing pending state after async monitor detection
       setPendingMonitorIndices(null);
     }
   }, [pendingMonitorIndices, availableMonitors, setSelectedMonitors]);
@@ -253,6 +255,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   // Increment config load count when config is loaded (for initial states override reset)
   useEffect(() => {
     if (configLoaded) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- tracking config load events
       setConfigLoadCount((prev) => prev + 1);
       log.debug("Config loaded, incrementing config load count");
     }
@@ -261,6 +264,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   // Fetch resolved initial states when workflow changes
   useEffect(() => {
     if (!selectedWorkflow || !configLoaded) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching reset
       setResolvedInitialStates({
         stateIds: [],
         source: "defaults",

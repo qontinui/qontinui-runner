@@ -29,6 +29,10 @@ function actionLabel(action: DemoAction): string {
       return `Wait for element`;
     case "waitForIdle":
       return `Wait for idle`;
+    case "visual": {
+      const name = action.filePath === "PLACEHOLDER" ? "needs asset" : action.filePath.split(/[/\\]/).pop();
+      return `Visual: ${name}${action.caption ? ` — "${action.caption}"` : ""}`;
+    }
   }
 }
 
@@ -44,6 +48,8 @@ function actionColor(type: DemoAction["type"]): string {
       return "bg-purple-500/20 text-purple-400 border-purple-500/30";
     case "scroll":
       return "bg-cyan-500/20 text-cyan-400 border-cyan-500/30";
+    case "visual":
+      return "bg-pink-500/20 text-pink-400 border-pink-500/30";
     default:
       return "bg-gray-500/20 text-gray-400 border-gray-500/30";
   }
@@ -112,6 +118,12 @@ function StepCard({
             <ActionBadge key={i} action={action} />
           ))}
         </div>
+
+        {step.visualSuggestion && (
+          <div className="mt-1 text-xs text-pink-400/80 bg-pink-500/5 border border-pink-500/10 rounded px-2 py-1.5 italic">
+            Visual idea: {step.visualSuggestion}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -78,6 +78,7 @@ export function OrchestrationLoopBanner() {
 
   // Fetch full status via Tauri on mount
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching via Tauri invoke
     fetchStatus();
   }, [fetchStatus]);
 
@@ -90,6 +91,7 @@ export function OrchestrationLoopBanner() {
     const key = `${sub.running}:${sub.phase}:${sub.currentIteration}`;
     if (key !== lastPhaseRef.current) {
       lastPhaseRef.current = key;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription-triggered refetch
       fetchStatus();
     }
   }, [subData, fetchStatus]);

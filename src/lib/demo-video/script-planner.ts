@@ -88,6 +88,17 @@ INSTRUCTIONS:
 - Include waitForIdle actions after navigation and major state changes
 - Default pauseAfterMs to 2000 unless a step needs more or less visual breathing room
 
+VISUAL SUGGESTIONS:
+For steps where an abstract concept would benefit from a generated visual (architecture diagrams, data flow, before/after comparisons), add a "visualSuggestion" field with a detailed image generation prompt. These are suggestions — a human will pre-generate the images and wire them in. Good candidates:
+- Intro steps: a hero illustration of the concept the page addresses
+- Architecture explanations: diagrams showing data flow or system topology
+- Transition moments: "before vs after" comparisons
+Do NOT add visualSuggestion to every step — only where a visual genuinely helps explain something that screen recording alone cannot convey.
+
+You may also include a "visual" action type for steps that should display a pre-generated image/video overlay:
+  { "type": "visual", "filePath": "PLACEHOLDER", "durationMs": 5000, "caption": "Optional caption" }
+Use "PLACEHOLDER" for filePath — the user will replace it with a real path to a pre-generated asset. Only include visual actions when you also provide a visualSuggestion for what that image should depict.
+
 OUTPUT FORMAT (strict JSON, no markdown fencing):
 {
   "title": "Page Name Demo",
@@ -102,7 +113,8 @@ OUTPUT FORMAT (strict JSON, no markdown fencing):
         { "type": "navigate", "target": "${pageUrl}" },
         { "type": "waitForIdle", "timeout": 5000 }
       ],
-      "pauseAfterMs": 2000
+      "pauseAfterMs": 2000,
+      "visualSuggestion": "A clean hero illustration showing a searchable timeline with colorful event cards flowing left to right, representing captured automation history"
     },
     {
       "id": "step-2",

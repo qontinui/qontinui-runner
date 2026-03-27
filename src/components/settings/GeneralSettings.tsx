@@ -28,11 +28,6 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   });
   const [includeSummaryStep, setIncludeSummaryStep] = useState<boolean>(true);
 
-  useEffect(() => {
-    loadAppSettings();
-    loadIncludeSummaryStep();
-  }, []);
-
   const loadAppSettings = async () => {
     try {
       const result = await invoke<TauriResult<AutoLoadConfigData>>("get_auto_load_last_config");
@@ -45,6 +40,25 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
       console.error("Failed to load app settings:", err);
     }
   };
+
+  const loadIncludeSummaryStep = async () => {
+    try {
+      const result = await invoke<TauriResult<IncludeSummaryStepData>>(
+        "get_include_summary_step_by_default",
+      );
+      if (result && result.success && result.data) {
+        setIncludeSummaryStep(result.data.enabled);
+      }
+    } catch (err) {
+      console.error("Failed to load include summary step setting:", err);
+    }
+  };
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async init from Tauri backend
+    loadAppSettings();
+    loadIncludeSummaryStep();
+  }, []);
 
   const handleToggleAutoLoad = async () => {
     const newValue = !appSettings.auto_load_last_config;
@@ -73,19 +87,6 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         ...prev,
         auto_load_last_config: !newValue,
       }));
-    }
-  };
-
-  const loadIncludeSummaryStep = async () => {
-    try {
-      const result = await invoke<TauriResult<IncludeSummaryStepData>>(
-        "get_include_summary_step_by_default",
-      );
-      if (result && result.success && result.data) {
-        setIncludeSummaryStep(result.data.enabled);
-      }
-    } catch (err) {
-      console.error("Failed to load include summary step setting:", err);
     }
   };
 

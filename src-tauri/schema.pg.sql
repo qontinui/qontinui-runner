@@ -1062,7 +1062,7 @@ CREATE TABLE IF NOT EXISTS error_events (
     status TEXT DEFAULT 'new',
 
     -- Debug agent integration
-    finding_id TEXT REFERENCES task_run_findings(id) ON DELETE SET NULL,
+    finding_id TEXT,  -- Soft FK to task_run_findings(id)
     resolved_by_task_run_id TEXT,
     resolved_by_fix_id TEXT,
     resolution_notes TEXT,
@@ -1566,3 +1566,79 @@ CREATE TABLE IF NOT EXISTS orchestrator_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task ON orchestrator_checkpoints(task_id);
 CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task_iter ON orchestrator_checkpoints(task_id, iteration);
+
+-- API Surface Snapshots — stores scan results for diff comparison
+CREATE TABLE IF NOT EXISTS api_surface_snapshots (
+    id              BIGSERIAL PRIMARY KEY,
+    scan_json       TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    total_endpoints INTEGER NOT NULL,
+    orphan_count    INTEGER NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_api_surface_snapshots_created ON api_surface_snapshots(created_at DESC);
+
+-- Decision Trail (architectural decision history)
+CREATE TABLE IF NOT EXISTS decisions (
+    id              TEXT PRIMARY KEY,
+    timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    scale           TEXT NOT NULL,                          -- 'tactical' | 'strategic'
+    category        TEXT NOT NULL,                          -- 'architecture' | 'technology' | 'design' | 'integration' | 'performance' | 'security' | 'ux' | 'data-model'
+    status          TEXT NOT NULL DEFAULT 'active',         -- 'active' | 'superseded' | 'reversed'
+    title           TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    rationale       TEXT NOT NULL,
+    alternatives_json       TEXT NOT NULL DEFAULT '[]',
+    tradeoffs_json          TEXT NOT NULL DEFAULT '[]',
+    triggered_by            TEXT,
+    inspiration_json        TEXT,
+    related_decisions_json  TEXT NOT NULL DEFAULT '[]',
+    affected_files_json     TEXT NOT NULL DEFAULT '[]',
+    affected_endpoints_json TEXT NOT NULL DEFAULT '[]',
+    affected_tables_json    TEXT NOT NULL DEFAULT '[]',
+    created_by              TEXT,
+    superseded_by           TEXT,
+    tags_json               TEXT NOT NULL DEFAULT '[]',
+    is_deleted              BOOLEAN NOT NULL DEFAULT false,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dec_timestamp ON decisions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_dec_category ON decisions(category);
+CREATE INDEX IF NOT EXISTS idx_dec_scale ON decisions(scale);
+CREATE INDEX IF NOT EXISTS idx_dec_status ON decisions(status) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_dec_fts ON decisions
+    USING GIN (to_tsvector('english', title || ' ' || summary || ' ' || rationale))
+    WHERE NOT is_deleted;
+
+-- Concept Summaries (high-level feature narratives)
+CREATE TABLE IF NOT EXISTS concept_summaries (
+    id                      TEXT PRIMARY KEY,
+    name                    TEXT NOT NULL,
+    tagline                 TEXT NOT NULL,
+    description             TEXT NOT NULL,
+    inspiration_json        TEXT,
+    benefits_json           TEXT NOT NULL DEFAULT '[]',
+    components_json         TEXT NOT NULL DEFAULT '[]',
+    related_decisions_json  TEXT NOT NULL DEFAULT '[]',
+    metrics_json            TEXT,
+    is_deleted              BOOLEAN NOT NULL DEFAULT false,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cs_fts ON concept_summaries
+    USING GIN (to_tsvector('english', name || ' ' || tagline || ' ' || description))
+    WHERE NOT is_deleted;
+
+-- Development Intelligence (coverage, complexity, and feature health trend tracking)
+CREATE TABLE IF NOT EXISTS development_intelligence (
+    id BIGSERIAL PRIMARY KEY,
+    project_path TEXT NOT NULL,
+    analysis_type TEXT NOT NULL,  -- 'coverage' | 'complexity' | 'health'
+    page_route TEXT NOT NULL,
+    score DOUBLE PRECISION,
+    details_json TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_di_project ON development_intelligence(project_path, analysis_type);
+CREATE INDEX IF NOT EXISTS idx_di_created ON development_intelligence(created_at);

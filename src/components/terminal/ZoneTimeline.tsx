@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { X } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
@@ -45,13 +45,14 @@ export function ZoneTimeline({
   eventHistory,
   onClose,
 }: ZoneTimelineProps) {
+  const [now] = useState(() => Date.now());
+
   // Build per-zone timeline data from eventHistory
   const { zoneRows, timeRange } = useMemo(() => {
     if (eventHistory.length === 0) {
       return { zoneRows: [], timeRange: { start: 0, end: 0 } };
     }
 
-    const now = Date.now();
     const firstTime = eventHistory[0].time;
     const totalDuration = now - firstTime;
     const range = { start: firstTime, end: now };
@@ -141,7 +142,7 @@ export function ZoneTimeline({
     }
 
     return { zoneRows: rows, timeRange: range };
-  }, [eventHistory, assignments, tabs]);
+  }, [eventHistory, assignments, tabs, now]);
 
   // Format time labels for the axis
   const formatAxisTime = (ts: number): string => {

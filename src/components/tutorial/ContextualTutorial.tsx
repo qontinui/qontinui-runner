@@ -312,6 +312,7 @@ export function ContextualTutorial() {
   useEffect(() => {
     // Detect when we move to next step after being in waiting state
     if (prevStepIndexRef.current !== currentStepIndex && wasWaitingRef.current) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- animation trigger on step transition
       setShowSuccess(true);
       // Clear success animation after it plays
       const timer = setTimeout(() => {
@@ -331,6 +332,7 @@ export function ContextualTutorial() {
   useEffect(() => {
     const targetSelector = currentStep?.targetElement?.selector;
     if (!targetSelector) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- DOM observation
       setTargetElementExists(false);
       return;
     }

@@ -5,7 +5,7 @@
  * Used by the tutorial system to detect when elements appear, change, or become visible.
  */
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 
 interface DOMObserverConfig {
   /** CSS selector or data-tutorial-id to watch for */
@@ -103,6 +103,7 @@ export function useDOMObserver({
     switch (type) {
       case "appear": {
         if (existingElement) {
+          // eslint-disable-next-line react-hooks/set-state-in-effect -- DOM observation callback
           handleMatch(existingElement);
           return;
         }
@@ -240,10 +241,7 @@ export function useDOMObserverMultiple(configs: DOMObserverConfig[]): {
   anyMatched: boolean;
   resetAll: () => void;
 } {
-  const [results, setResults] = useState<Map<string, UseDOMObserverReturn>>(new Map());
-
-  // Create observers for each config
-  useEffect(() => {
+  const results = useMemo(() => {
     const observerResults = new Map<string, UseDOMObserverReturn>();
 
     configs.forEach((config) => {
@@ -255,7 +253,7 @@ export function useDOMObserverMultiple(configs: DOMObserverConfig[]): {
       });
     });
 
-    setResults(observerResults);
+    return observerResults;
   }, [configs]);
 
   const allMatched = Array.from(results.values()).every((r) => r.matched);

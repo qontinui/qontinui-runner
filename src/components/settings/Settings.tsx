@@ -122,6 +122,7 @@ export function Settings({
   // Sync with defaultTab prop when it changes (from navigation)
   useEffect(() => {
     if (defaultTab && (VALID_TABS as readonly string[]).includes(defaultTab)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync state from navigation prop
       setActiveTab(defaultTab as SettingsTab);
     }
   }, [defaultTab]);

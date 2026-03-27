@@ -214,6 +214,7 @@ export function TutorialTooltip({
 
   // Update position on mount and when dependencies change
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- DOM measurement for positioning
     updatePosition();
 
     window.addEventListener("resize", updatePosition);

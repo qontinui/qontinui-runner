@@ -54,9 +54,11 @@ export function PlanViewer({ filePath, visible }: PlanViewerProps) {
       }
     };
 
+    /* eslint-disable react-hooks/set-state-in-effect -- file loading with watcher */
     setLoading(true);
     setError(null);
     setContent(null);
+    /* eslint-enable react-hooks/set-state-in-effect */
     loadFileGuarded();
 
     watch(

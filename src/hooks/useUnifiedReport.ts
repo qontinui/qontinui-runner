@@ -184,6 +184,7 @@ export function useUnifiedReport(options: UseUnifiedReportOptions = {}): UseUnif
       allItems = allItems.filter((item) => item.status === "needs_input");
     }
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reading from external findings tracker
     setItems(allItems);
     setSession(sessionManager.getCurrentSession());
   }, [refreshCounter, statusFilter, severityFilter, actionableOnly, needsInputOnly]);

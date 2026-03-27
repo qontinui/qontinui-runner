@@ -126,6 +126,7 @@ export function useDashboardLayout(
     if (currentTaskId !== prevTaskIdRef.current) {
       prevTaskIdRef.current = currentTaskId;
       if (initialTaskInfo) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- syncing layout state when taskId changes
         resetLayoutForTask(initialTaskInfo);
       }
     }

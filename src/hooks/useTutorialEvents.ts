@@ -332,6 +332,7 @@ export function useTutorialEvents({
   // Set up event listeners when step changes
   useEffect(() => {
     // Clean up previous listeners
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- event listener setup for tutorial step transitions
     cleanup();
 
     // Skip if not active or no step

@@ -105,6 +105,7 @@ export function useZoneLabelsAndTags(
       prevLayoutIdRef2.current = layoutId;
       prevAssignmentsRef.current = assignments;
 
+      /* eslint-disable react-hooks/set-state-in-effect -- layout change migration */
       setZoneLabels(instanceStorage.getJSON<Record<number, string>>(`zone-labels-${layoutId}`, {}));
 
       // Restore pins: merge stored pins with migrated tab-based pins
@@ -120,6 +121,7 @@ export function useZoneLabelsAndTags(
       setPinnedZones(newPins);
 
       setZoneNotes(instanceStorage.getJSON<Record<number, string>>(`zone-notes-${layoutId}`, {}));
+      /* eslint-enable react-hooks/set-state-in-effect */
     } else {
       // Keep assignments ref in sync for non-layout-change updates (e.g., tab swaps)
       prevAssignmentsRef.current = assignments;

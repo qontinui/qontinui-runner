@@ -13,8 +13,9 @@ export function useFocusHistory(
   const focusHistoryIndexRef = useRef(-1);
   const isNavigatingHistoryRef = useRef(false);
 
-  // Track zone changes that aren't caused by history navigation
-  const [, setTick] = useState(0);
+  // State-tracked navigation bounds so render can derive canGoBack/canGoForward
+  // without reading ref.current during render.
+  const [navState, setNavState] = useState({ index: -1, length: 0 });
 
   useEffect(() => {
     if (isNavigatingHistoryRef.current) {
@@ -34,7 +35,7 @@ export function useFocusHistory(
       focusHistoryRef.current = focusHistoryRef.current.slice(-20);
     }
     focusHistoryIndexRef.current = focusHistoryRef.current.length - 1;
-    setTick((t) => t + 1);
+    setNavState({ index: focusHistoryIndexRef.current, length: focusHistoryRef.current.length });
   }, [focusedZone]);
 
   const goBack = useCallback(() => {
@@ -42,7 +43,7 @@ export function useFocusHistory(
       focusHistoryIndexRef.current -= 1;
       isNavigatingHistoryRef.current = true;
       setFocusedZone(focusHistoryRef.current[focusHistoryIndexRef.current]);
-      setTick((t) => t + 1);
+      setNavState({ index: focusHistoryIndexRef.current, length: focusHistoryRef.current.length });
     }
   }, [setFocusedZone]);
 
@@ -51,12 +52,12 @@ export function useFocusHistory(
       focusHistoryIndexRef.current += 1;
       isNavigatingHistoryRef.current = true;
       setFocusedZone(focusHistoryRef.current[focusHistoryIndexRef.current]);
-      setTick((t) => t + 1);
+      setNavState({ index: focusHistoryIndexRef.current, length: focusHistoryRef.current.length });
     }
   }, [setFocusedZone]);
 
-  const canGoBack = focusHistoryIndexRef.current > 0;
-  const canGoForward = focusHistoryIndexRef.current < focusHistoryRef.current.length - 1;
+  const canGoBack = navState.index > 0;
+  const canGoForward = navState.index < navState.length - 1;
 
   return { goBack, goForward, canGoBack, canGoForward };
 }

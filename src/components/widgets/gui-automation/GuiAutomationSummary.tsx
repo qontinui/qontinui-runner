@@ -64,6 +64,7 @@ function ScreenshotThumbnail({ screenshot }: { screenshot: ScreenshotInfo | unde
     if (screenshot?.path) {
       try {
         const src = convertFileSrc(screenshot.path);
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- sync derived from prop change
         setImageSrc(src);
         setImageError(false);
       } catch {

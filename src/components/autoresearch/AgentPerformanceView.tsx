@@ -302,9 +302,11 @@ export function AgentPerformanceView({ selectedAgent, live, historicalResults }:
 
   useEffect(() => {
     if (historicalResults) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync prop to local state
       setResults(historicalResults);
       return;
     }
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching with polling
     fetchResults();
     if (live) {
       const id = setInterval(fetchResults, 5000);

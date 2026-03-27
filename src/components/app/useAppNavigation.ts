@@ -60,6 +60,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
     if (isApiReady && getApiPort() !== 9876) {
       const stored = instanceStorage.getItem("qontinui-main-active-tab");
       const correct = migrateTabId(stored);
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- re-sync tab after API becomes ready
       setActiveTab(correct);
     }
   }, [isApiReady]);
@@ -167,9 +168,11 @@ export function useAppNavigation(): UseAppNavigationReturn {
 
     if (shouldAutoCollapse && !sidebarCollapsed) {
       autoCollapsedRef.current = true;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- auto-collapse sidebar for terminal multi-session
       setSidebarCollapsed(true);
     } else if (!shouldAutoCollapse && autoCollapsedRef.current) {
       autoCollapsedRef.current = false;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- restore sidebar after auto-collapse
       setSidebarCollapsed(false);
     }
   }, [activeTab, terminalSessionCount, sidebarCollapsed]);

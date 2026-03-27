@@ -99,6 +99,7 @@ export function ElementTreeView({
 
   // Clear lazy thumbnails when screenshot changes
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset side-effect on prop change
     setLazyThumbnails(new Map());
   }, [screenshotData]);
 
@@ -484,6 +485,7 @@ function SelectedElementDetails({
   // Generate larger preview for detail pane when element changes
   useEffect(() => {
     if (!element || !screenshotData) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- async image generation
       setDetailPreview(null);
       return;
     }

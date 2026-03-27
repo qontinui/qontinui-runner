@@ -317,6 +317,7 @@ export function ContextSelector({
   // Run auto-detection when enabled or when task context changes
   useEffect(() => {
     if (selection.autoDetect && !autoDetectState.evaluated && !autoDetectState.loading) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- triggers async auto-detection which updates state
       runAutoDetection();
     }
   }, [selection.autoDetect, autoDetectState.evaluated, autoDetectState.loading, runAutoDetection]);
@@ -326,6 +327,7 @@ export function ContextSelector({
   const recentErrorsKey = recentErrors.join(",");
   useEffect(() => {
     if (selection.autoDetect) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- invalidate cache to trigger re-evaluation
       setAutoDetectState((prev) => ({ ...prev, evaluated: false }));
     }
   }, [selection.autoDetect, taskPrompt, actionTypesKey, recentErrorsKey]);

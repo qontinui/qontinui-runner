@@ -25,7 +25,7 @@
  * ```
  */
 
-import { useEffect, useCallback, useRef } from "react";
+import { useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { useUIBridge } from "ui-bridge";
 import type { StyleGuideConfig } from "ui-bridge";
@@ -71,10 +71,12 @@ export function useUIBridgeEventHandler(): void {
     typeof import("ui-bridge").CompositeIdleDetector
   > | null>(null);
 
-  // Keep bridge ref updated synchronously during render to avoid stale closures.
-  // Using useEffect would leave a gap between rerender and effect execution
-  // where IPC events could arrive and use the stale bridge reference.
-  bridgeRef.current = bridge;
+  // Keep bridge ref updated via useLayoutEffect to minimize the gap between
+  // rerender and ref update. IPC events arriving in the gap will use the
+  // previous bridge reference, which is acceptable.
+  useLayoutEffect(() => {
+    bridgeRef.current = bridge;
+  }, [bridge]);
 
   /**
    * Send a response back to the Rust backend

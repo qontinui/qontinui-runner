@@ -243,17 +243,30 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
-        let pg = rt.block_on(crate::database::pg::PgDb::new(&pg_url))
-            .expect("PostgreSQL connection required — ensure docker-compose PG is running");
-        Arc::new(pg)
+        match rt.block_on(crate::database::pg::PgDb::new(&pg_url)) {
+            Ok(pg) => {
+                info!("PostgreSQL connected successfully");
+                Arc::new(pg)
+            }
+            Err(e) => {
+                error!("PostgreSQL connection failed: {}. Ensure docker-compose PG is running.", e);
+                panic!("PostgreSQL connection required — {}", e);
+            }
+        }
     };
 
-    // One-time full data migration from SQLite to PostgreSQL (idempotent)
+    // One-time full data migration from SQLite to PostgreSQL (idempotent, non-fatal)
     {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for data migration");
+            .build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!("Failed to create tokio runtime for data migration: {}", e);
+                // Skip migration, continue startup
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            }
+        };
         match rt.block_on(pg_db.migrate_all_from_sqlite(&checkpoint_db)) {
             Ok(stats) => {
                 if stats.rows_migrated > 0 {

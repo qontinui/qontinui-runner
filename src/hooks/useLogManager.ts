@@ -99,6 +99,7 @@ export function useLogManager(): UseLogManagerResult {
   // Subscribe to log changes
   useEffect(() => {
     // Initial fetch
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription to external log manager
     setLogs(logManager.getGeneralLogs());
     setImageLogs(logManager.getImageLogs());
     setAiOutputLogs(logManager.getAiOutputLogs());

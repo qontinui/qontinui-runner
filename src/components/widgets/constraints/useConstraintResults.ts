@@ -24,6 +24,7 @@ export function useConstraintResults(): ConstraintResultsData {
     let unlisten: UnlistenFn | null = null;
 
     // Reset iterations when task run changes
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription callback
     setIterations([]);
 
     const setup = async () => {

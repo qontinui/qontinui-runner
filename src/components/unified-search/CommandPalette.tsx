@@ -49,6 +49,7 @@ export function CommandPalette() {
 
   // Reset query when closing
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset side-effect on close
     if (!open) setQuery("");
   }, [open]);
 

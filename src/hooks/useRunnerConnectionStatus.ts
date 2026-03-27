@@ -30,6 +30,15 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
   const { data, error: subError } = useHealthStream(5000);
   const [fallbackStatus, setFallbackStatus] = useState<ConnectionStatus | null>(null);
 
+  // Track current time for subscription status; refresh when data changes
+  const [lastDataTime, setLastDataTime] = useState(() => Date.now());
+  useEffect(() => {
+    if (data?.uiBridgeHealthStream) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync time snapshot when subscription data arrives
+      setLastDataTime(Date.now());
+    }
+  }, [data]);
+
   // Derive subscription status (all hooks called unconditionally above)
   const subscriptionStatus = useMemo<ConnectionStatus | null>(() => {
     if (!data?.uiBridgeHealthStream) return null;
@@ -37,9 +46,9 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
     return {
       isConnected: health.responsive,
       latencyMs: parseInt(health.heartbeatAgeMs, 10) || null,
-      lastCheckedAt: Date.now(),
+      lastCheckedAt: lastDataTime,
     };
-  }, [data]);
+  }, [data, lastDataTime]);
 
   const hasSubscriptionData = !!subscriptionStatus;
 
@@ -71,6 +80,7 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
   // Only start fallback polling if subscription has no data yet
   useEffect(() => {
     if (hasSubscriptionData) return; // Subscription is working, skip polling
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- health polling fallback
     checkHealth();
     const interval = setInterval(checkHealth, HEALTH_POLL_INTERVAL);
     return () => clearInterval(interval);

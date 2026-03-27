@@ -69,9 +69,11 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
   const onCompleteRef = useRef(onComplete);
   const onErrorRef = useRef(onError);
   const onProgressRef = useRef(onProgress);
-  onCompleteRef.current = onComplete;
-  onErrorRef.current = onError;
-  onProgressRef.current = onProgress;
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+    onErrorRef.current = onError;
+    onProgressRef.current = onProgress;
+  }, [onComplete, onError, onProgress]);
 
   // GraphQL subscription for real-time task progress (replaces frequent polling).
   // The subscription streams events for the active task; polling is kept as a

@@ -168,6 +168,7 @@ export interface PageGenerationOptions {
   generateSpecs: boolean;
   generateTutorials: boolean;
   generateDemoVideos: boolean;
+  generateProductTours: boolean;
 }
 
 // --- API Response wrapper ---

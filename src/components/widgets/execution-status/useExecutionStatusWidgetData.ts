@@ -109,6 +109,7 @@ export function useExecutionStatusWidgetData(): ExecutionStatusWidgetData {
 
   useEffect(() => {
     if (!taskRunId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching
       setSessionBudget({ sessionsUsed: 0, maxSessions: null });
       return;
     }

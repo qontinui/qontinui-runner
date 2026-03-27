@@ -132,6 +132,7 @@ export function DashboardPage({
   useEffect(() => {
     const taskId = state.taskInfo?.taskId;
     if (!taskId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on task change
       setIsPaused(false);
       return;
     }
@@ -141,6 +142,7 @@ export function DashboardPage({
         const response = await tracedFetch(`${getApiBase()}/task-runs/${taskId}/workflow-state`);
         if (response.ok) {
           const data = await response.json();
+          // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching
           setIsPaused(data.is_paused === true);
         }
       } catch {
@@ -183,7 +185,8 @@ export function DashboardPage({
     prevIsRunningRef.current = state.isRunning;
 
     if (wasRunning && !state.isRunning) {
-      // Workflow just finished
+      // Workflow just finished — batch state updates for completion overlay
+      /* eslint-disable react-hooks/set-state-in-effect -- state machine transition detection */
       const finalStatus =
         state.status === "completed" || state.status === "failed" ? state.status : "completed";
       setCompletionStatus(finalStatus);
@@ -198,6 +201,7 @@ export function DashboardPage({
       }
 
       setShowCompletion(true);
+      /* eslint-enable react-hooks/set-state-in-effect */
     }
   }, [state.isRunning, state.status, state.layout.activities]);
 

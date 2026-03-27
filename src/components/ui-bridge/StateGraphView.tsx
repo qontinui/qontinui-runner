@@ -359,18 +359,20 @@ export function StateGraphView({
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  // Sync nodes/edges when discovery result changes (derived state, no useEffect)
+  // Sync nodes/edges when discovery result changes
   const prevInitialNodesRef = useRef(initialNodes);
   const prevInitialEdgesRef = useRef(initialEdges);
-  if (
-    prevInitialNodesRef.current !== initialNodes ||
-    prevInitialEdgesRef.current !== initialEdges
-  ) {
-    prevInitialNodesRef.current = initialNodes;
-    prevInitialEdgesRef.current = initialEdges;
-    setNodes(initialNodes);
-    setEdges(initialEdges);
-  }
+  useEffect(() => {
+    if (
+      prevInitialNodesRef.current !== initialNodes ||
+      prevInitialEdgesRef.current !== initialEdges
+    ) {
+      prevInitialNodesRef.current = initialNodes;
+      prevInitialEdgesRef.current = initialEdges;
+      setNodes(initialNodes);
+      setEdges(initialEdges);
+    }
+  }, [initialNodes, initialEdges, setNodes, setEdges]);
 
   // Update nodes when selection changes
   useEffect(() => {

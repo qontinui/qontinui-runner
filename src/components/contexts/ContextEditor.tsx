@@ -88,22 +88,6 @@ export function ContextEditor({
   const [showPreview, setShowPreview] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  // Initialize form when context changes
-  useEffect(() => {
-    if (context) {
-      setName(context.name);
-      setCategory(context.category || "");
-      setSelectedTags(context.tags || []);
-      setContent(context.content);
-      setTaskMentions(context.autoInclude?.taskMentions || []);
-      setActionTypes(context.autoInclude?.actionTypes || []);
-      setErrorPatterns(context.autoInclude?.errorPatterns || []);
-      setFilePatterns(context.autoInclude?.filePatterns || []);
-    } else {
-      resetForm();
-    }
-  }, [context]);
-
   const resetForm = () => {
     setName("");
     setCategory("");
@@ -120,6 +104,23 @@ export function ContextEditor({
     setFilePatternInput("");
     setErrors({});
   };
+
+  // Initialize form when context changes
+  useEffect(() => {
+    if (context) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync form fields from prop
+      setName(context.name);
+      setCategory(context.category || "");
+      setSelectedTags(context.tags || []);
+      setContent(context.content);
+      setTaskMentions(context.autoInclude?.taskMentions || []);
+      setActionTypes(context.autoInclude?.actionTypes || []);
+      setErrorPatterns(context.autoInclude?.errorPatterns || []);
+      setFilePatterns(context.autoInclude?.filePatterns || []);
+    } else {
+      resetForm();
+    }
+  }, [context]);
 
   const validate = (): boolean => {
     const newErrors: Record<string, string> = {};

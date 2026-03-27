@@ -84,6 +84,7 @@ export function PromptTemplateEditor({
   // Initialize editor content based on scope
   useEffect(() => {
     if (activeScope === "workflow") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync editor with scope change
       setEditorContent(workflowTemplate || getGlobalPromptTemplate());
     } else {
       setEditorContent(getGlobalPromptTemplate());

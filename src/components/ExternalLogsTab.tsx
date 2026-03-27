@@ -96,6 +96,7 @@ export function ExternalLogsTab({
   // Select first source by default when sources change
   useEffect(() => {
     if (safeSources.length > 0 && !selectedSourceId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- initialize default selection once sources arrive
       setSelectedSourceId(safeSources[0].sourceId);
     }
   }, [safeSources, selectedSourceId]);

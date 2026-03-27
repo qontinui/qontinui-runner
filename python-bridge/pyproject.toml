@@ -24,7 +24,6 @@ black = "^24.10"
 ruff = "^0.14"
 mypy = "^1.14"
 pylint = "^3.3"
-isort = "^6.0"
 flake8 = "^7.3"
 pre-commit = "^4.4"
 types-requests = "^2.31"
@@ -32,10 +31,6 @@ types-requests = "^2.31"
 [tool.black]
 line-length = 100
 target-version = ['py311', 'py312']
-
-[tool.isort]
-profile = "black"
-line_length = 100
 
 [tool.mypy]
 python_version = "3.12"
@@ -50,7 +45,7 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "C90", "N", "UP", "B", "A", "C4", "ICN", "PIE", "SIM"]
+select = ["E", "F", "W", "I", "C90", "N", "UP", "B", "A", "C4", "ICN", "PIE", "SIM"]
 ignore = ["E501", "C901", "T201", "SIM102", "N806"]
 
 [tool.pylint]

@@ -778,14 +778,16 @@ function AgentHierarchyGraph({
   // Sync when data changes
   const prevInitialNodesRef = useRef(initialNodes);
   const prevInitialEdgesRef = useRef(initialEdges);
-  if (prevInitialNodesRef.current !== initialNodes) {
-    prevInitialNodesRef.current = initialNodes;
-    setNodes(initialNodes);
-  }
-  if (prevInitialEdgesRef.current !== initialEdges) {
-    prevInitialEdgesRef.current = initialEdges;
-    setEdges(initialEdges);
-  }
+  useEffect(() => {
+    if (prevInitialNodesRef.current !== initialNodes) {
+      prevInitialNodesRef.current = initialNodes;
+      setNodes(initialNodes);
+    }
+    if (prevInitialEdgesRef.current !== initialEdges) {
+      prevInitialEdgesRef.current = initialEdges;
+      setEdges(initialEdges);
+    }
+  }, [initialNodes, initialEdges, setNodes, setEdges]);
 
   // Agent lookup map
   // Use a ref to stabilize the lookup so handleNodeClick doesn't cause ReactFlow re-renders
@@ -796,7 +798,9 @@ function AgentHierarchyGraph({
   }, [agents]);
 
   const agentByIdRef = useRef(agentById);
-  agentByIdRef.current = agentById;
+  useEffect(() => {
+    agentByIdRef.current = agentById;
+  }, [agentById]);
 
   // Hover dimming
   const displayNodes = useMemo(() => {

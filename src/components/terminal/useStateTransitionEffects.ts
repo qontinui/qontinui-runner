@@ -11,7 +11,7 @@ export interface UseStateTransitionEffectsParams {
   lastOutputLines: Record<string, string[]>;
   terminalRefs: Map<string, React.RefObject<{ writeToTerminal: (data: string) => void } | null>>;
   stateEntryTimeRef: React.MutableRefObject<Record<string, number>>;
-  stateTimeAccum: React.MutableRefObject<Record<SessionState, number>>;
+  stateTimeAccumRef: React.MutableRefObject<Record<SessionState, number>>;
   setFocusedZone: (z: number) => void;
   handleRestartInZone: (zoneIdx: number) => void;
   addHistoryEvent: (type: string, session: string, zone?: number, color?: string) => void;
@@ -50,7 +50,7 @@ export function useStateTransitionEffects(
     lastOutputLines,
     terminalRefs,
     stateEntryTimeRef,
-    stateTimeAccum,
+    stateTimeAccumRef,
     setFocusedZone,
     handleRestartInZone,
     addHistoryEvent,
@@ -65,14 +65,16 @@ export function useStateTransitionEffects(
   const [autoApprovePatterns, setAutoApprovePatternsState] = useState<string[]>(() =>
     instanceStorage.getJSON<string[]>("zone-auto-approve-patterns", []),
   );
-  const autoApproveCountRef = useRef(0);
+  const [autoApproveCount, setAutoApproveCount] = useState(0);
 
   const [autoRestart, setAutoRestart] = useState(
     () => instanceStorage.getItem("zone-auto-restart") === "true",
   );
-  const autoRestartCountRef = useRef(0);
+  const [autoRestartCount, setAutoRestartCount] = useState(0);
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
-  handleRestartInZoneRef.current = handleRestartInZone;
+  useEffect(() => {
+    handleRestartInZoneRef.current = handleRestartInZone;
+  });
 
   const [pendingRestarts, setPendingRestarts] = useState<Record<number, number>>({});
   const pendingRestartTimersRef = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
@@ -147,6 +149,7 @@ export function useStateTransitionEffects(
 
   useEffect(() => {
     if (needsInputCount > prevNeedsInputCountRef.current) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset dismissal when new input needed
       setBatchBarDismissed(false);
     }
     prevNeedsInputCountRef.current = needsInputCount;
@@ -168,7 +171,7 @@ export function useStateTransitionEffects(
         const prevState = prev[tabId];
         if (prevState && stateEntryTimeRef.current[tabId]) {
           const elapsed = now - stateEntryTimeRef.current[tabId];
-          stateTimeAccum.current[prevState] += elapsed;
+          stateTimeAccumRef.current[prevState] += elapsed;
         }
         stateEntryTimeRef.current[tabId] = now;
 
@@ -196,11 +199,12 @@ export function useStateTransitionEffects(
               const capturedZoneNum = zoneNum;
               const capturedTitle = completedTab.title ?? tabId;
               const restartAt = Date.now() + 2000;
+              // eslint-disable-next-line react-hooks/set-state-in-effect -- schedule pending restart countdown
               setPendingRestarts((prev) => ({ ...prev, [capturedZoneNum]: restartAt }));
 
               const timer = setTimeout(() => {
                 handleRestartInZoneRef.current(capturedZoneNum);
-                autoRestartCountRef.current++;
+                setAutoRestartCount((c) => c + 1);
                 addHistoryEvent("Auto-restarted", capturedTitle, capturedZoneNum, "#7dcfff");
                 setPendingRestarts((prev) => {
                   const next = { ...prev };
@@ -252,7 +256,7 @@ export function useStateTransitionEffects(
         if (matched) {
           const ref = terminalRefs.get(tabId);
           ref?.current?.writeToTerminal("y\r");
-          autoApproveCountRef.current++;
+          setAutoApproveCount((c) => c + 1);
           const tab = tabs.find((t) => t.id === tabId);
           addHistoryEvent("Auto-approved", tab?.title ?? tabId, undefined, "#9ece6a");
         }
@@ -349,7 +353,7 @@ export function useStateTransitionEffects(
     terminalRefs,
     setFocusedZone,
     stateEntryTimeRef,
-    stateTimeAccum,
+    stateTimeAccumRef,
     prevSessionStatesRef,
   ]);
 
@@ -359,7 +363,7 @@ export function useStateTransitionEffects(
     setUnseenNeedsInput,
     autoApprovePatterns,
     setAutoApprovePatterns,
-    autoApproveCount: autoApproveCountRef.current,
+    autoApproveCount,
     autoFocusNeedsInput,
     toggleAutoFocus,
     soundEnabled,
@@ -368,7 +372,7 @@ export function useStateTransitionEffects(
     setDesktopNotify,
     autoRestart,
     setAutoRestart,
-    autoRestartCount: autoRestartCountRef.current,
+    autoRestartCount,
     pendingRestarts,
     cancelPendingRestart,
     batchBarDismissed,

@@ -35,6 +35,7 @@ pub mod flows;
 pub mod worktrees;
 pub mod export;
 pub mod data_migration;
+pub mod decision_trail;
 
 use tracing::{info, warn};
 
@@ -439,6 +440,52 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task ON orchestrator_checkpoints(task_id)",
             "CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task_iter ON orchestrator_checkpoints(task_id, iteration)",
+            // Decision Trail
+            "CREATE TABLE IF NOT EXISTS decisions (
+                id              TEXT PRIMARY KEY,
+                timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                scale           TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'active',
+                title           TEXT NOT NULL,
+                summary         TEXT NOT NULL,
+                rationale       TEXT NOT NULL,
+                alternatives_json       TEXT NOT NULL DEFAULT '[]',
+                tradeoffs_json          TEXT NOT NULL DEFAULT '[]',
+                triggered_by            TEXT,
+                inspiration_json        TEXT,
+                related_decisions_json  TEXT NOT NULL DEFAULT '[]',
+                affected_files_json     TEXT NOT NULL DEFAULT '[]',
+                affected_endpoints_json TEXT NOT NULL DEFAULT '[]',
+                affected_tables_json    TEXT NOT NULL DEFAULT '[]',
+                created_by              TEXT,
+                superseded_by           TEXT,
+                tags_json               TEXT NOT NULL DEFAULT '[]',
+                is_deleted              BOOLEAN NOT NULL DEFAULT false,
+                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_dec_timestamp ON decisions(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_dec_category ON decisions(category)",
+            "CREATE INDEX IF NOT EXISTS idx_dec_scale ON decisions(scale)",
+            "CREATE INDEX IF NOT EXISTS idx_dec_status ON decisions(status) WHERE status = 'active'",
+            "CREATE INDEX IF NOT EXISTS idx_dec_fts ON decisions USING GIN (to_tsvector('english', title || ' ' || summary || ' ' || rationale)) WHERE NOT is_deleted",
+            // Concept Summaries
+            "CREATE TABLE IF NOT EXISTS concept_summaries (
+                id                      TEXT PRIMARY KEY,
+                name                    TEXT NOT NULL,
+                tagline                 TEXT NOT NULL,
+                description             TEXT NOT NULL,
+                inspiration_json        TEXT,
+                benefits_json           TEXT NOT NULL DEFAULT '[]',
+                components_json         TEXT NOT NULL DEFAULT '[]',
+                related_decisions_json  TEXT NOT NULL DEFAULT '[]',
+                metrics_json            TEXT,
+                is_deleted              BOOLEAN NOT NULL DEFAULT false,
+                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_cs_fts ON concept_summaries USING GIN (to_tsvector('english', name || ' ' || tagline || ' ' || description)) WHERE NOT is_deleted",
         ];
 
         for sql in &ddl {
@@ -447,7 +494,7 @@ impl PgDb {
             }
         }
 
-        info!("All managed PG tables ensured (activity_timeline, watchers, agentic_metric_scores, prompt_registry, canary_rollouts, canary_run_records, prompt_template_canaries, error_events)");
+        info!("All managed PG tables ensured (activity_timeline, watchers, agentic_metric_scores, prompt_registry, canary_rollouts, canary_run_records, prompt_template_canaries, error_events, decisions, concept_summaries)");
     }
 
     /// Get a reference to the connection pool.

@@ -155,6 +155,7 @@ export function AutoresearchDashboard() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching with polling
     fetchData();
     const id = setInterval(fetchData, 3000);
     return () => clearInterval(id);

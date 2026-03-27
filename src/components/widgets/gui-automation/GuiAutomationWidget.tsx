@@ -129,6 +129,7 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
   // Reset to latest screenshot when new ones arrive
   useEffect(() => {
     if (screenshotCount > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset side-effect on new screenshots
       setCurrentIndex(0); // Most recent is first (sorted by modified desc)
     }
   }, [screenshotCount]);
@@ -139,6 +140,7 @@ function ScreenshotView({ screenshots }: { screenshots?: ScreenshotInfo[] }) {
     if (currentScreenshot?.path) {
       try {
         const src = convertFileSrc(currentScreenshot.path);
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- sync derived from prop change
         setImageSrc(src);
         setImageError(false);
       } catch {
@@ -265,8 +267,9 @@ function getActionTypeColorClass(actionType: string): string {
  * Single action row in the stream.
  */
 function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean }) {
+  const [now] = useState(() => Date.now());
   const relativeTime = action.timestamp
-    ? `+${((Date.now() - action.timestamp) / 1000).toFixed(1)}s`
+    ? `+${((now - action.timestamp) / 1000).toFixed(1)}s`
     : "0.0s";
 
   const colorClass = getActionTypeColorClass(action.action_type);

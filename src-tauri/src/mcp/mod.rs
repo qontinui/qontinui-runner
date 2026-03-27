@@ -14,6 +14,8 @@
 
 pub mod action_plan_cache;
 pub mod ai_generation;
+pub mod api_surface;
+pub mod api_surface_diff;
 pub mod ai_session;
 pub mod api_requests;
 pub mod app_discovery;
@@ -34,6 +36,8 @@ pub mod comparison_api;
 pub mod configs;
 pub mod constraints_api;
 pub mod contexts;
+pub mod decision_trail_api;
+pub mod development_intelligence;
 pub mod dom_capture;
 pub mod error_monitor;
 pub mod extraction;
@@ -73,6 +77,7 @@ pub mod reflection_api;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+pub mod session_recap;
 pub mod server;
 pub mod settings;
 pub mod shared;

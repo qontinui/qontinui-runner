@@ -42,6 +42,7 @@ export function SummarizationBadge({ running }: SummarizationBadgeProps) {
 
   useEffect(() => {
     if (!running) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset state on stop
       setInfo(null);
       return;
     }

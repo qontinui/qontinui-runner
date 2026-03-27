@@ -257,15 +257,24 @@ export function useDashboardState(options: UseDashboardStateOptions = {}): UseDa
   // Update wasActive when execution starts
   useEffect(() => {
     if (executionActive) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- track execution lifecycle
       setWasActive(true);
     }
   }, [executionActive]);
 
   // Reset wasActive when workflow changes (new execution context)
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on workflow change
     setWasActive(false);
     setIsPaused(false);
   }, [selectedWorkflow]);
+
+  // Track current time for elapsed time calculation; refresh when viewData changes
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync time snapshot when viewData updates
+    setNow(Date.now());
+  }, [viewData]);
 
   // Calculate execution state
   const executionState: ExecutionState = useMemo(() => {
@@ -319,7 +328,7 @@ export function useDashboardState(options: UseDashboardStateOptions = {}): UseDa
 
     // Calculate elapsed time
     const elapsedTime = viewData?.workflow_start_time
-      ? Math.floor(Date.now() / 1000 - viewData.workflow_start_time)
+      ? Math.floor(now / 1000 - viewData.workflow_start_time)
       : 0;
 
     // Build screenshots result
@@ -341,7 +350,7 @@ export function useDashboardState(options: UseDashboardStateOptions = {}): UseDa
         playwright: [], // Would need Tauri command to list playwright screenshots
       },
     };
-  }, [executionActive, isPaused, wasActive, workflows, selectedWorkflow, viewData, imageLogs]);
+  }, [executionActive, isPaused, wasActive, workflows, selectedWorkflow, viewData, imageLogs, now]);
 
   // Transform actions to dashboard format
   const actions: ActionItem[] = useMemo(() => {

@@ -283,6 +283,7 @@ export function UserInputPanel({
     });
 
     // Initialize with current findings
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- subscription initialization
     setLiveFindings(findingsTracker.getFindingsNeedingInput());
 
     return unsubscribe;

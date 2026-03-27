@@ -47,6 +47,7 @@ const CollapsiblePanel = ({
   // Sync with controlled prop
   useEffect(() => {
     if (controlledCollapsed !== undefined) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- sync controlled prop to internal state
       setIsCollapsed(controlledCollapsed);
     }
   }, [controlledCollapsed]);

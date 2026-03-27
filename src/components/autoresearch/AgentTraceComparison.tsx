@@ -164,6 +164,7 @@ export function AgentTraceComparison({ selectedAgent }: Props) {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- data fetching with polling
     fetchResults();
     const id = setInterval(fetchResults, 5000);
     return () => clearInterval(id);

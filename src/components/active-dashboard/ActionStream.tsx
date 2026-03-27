@@ -6,7 +6,7 @@
  * Uses virtual scrolling for large action lists (100+ items) to maintain performance.
  */
 
-import { useCallback, useEffect, type CSSProperties } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { CheckCircle2, XCircle, Loader2, ChevronRight } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Badge, ScrollArea, FixedVirtualList } from "../ui";
@@ -60,8 +60,9 @@ function StatusIcon({ status }: { status: ActionStatus }) {
 }
 
 function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean }) {
+  const [now] = useState(() => Date.now());
   const relativeTime = action.timestamp
-    ? `+${((Date.now() - action.timestamp) / 1000).toFixed(1)}s`
+    ? `+${((now - action.timestamp) / 1000).toFixed(1)}s`
     : "0.0s";
 
   const pendingColors = getStatusColors("pending");

@@ -6,7 +6,7 @@
  * parsing errors from crashing the recap view.
  */
 
-import { useState } from "react";
+import React, { useState } from "react";
 import { ChevronDown, ChevronRight, Play, Zap, Bot, TestTube, Activity } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { formatDuration } from "@/lib/formatting";
@@ -53,11 +53,18 @@ interface StepItemProps {
   onAiStepClick?: () => void;
 }
 
+/**
+ * Renders the icon for a given step type at module scope to avoid
+ * defining a component inside StepItem's render body.
+ */
+function StepTypeIcon({ stepType, className }: { stepType: string; className?: string }) {
+  return React.createElement(getStepIcon(stepType), { className });
+}
+
 export function StepItem({ step, depth = 0, onAiStepClick }: StepItemProps) {
   const [expanded, setExpanded] = useState(step.status === "failed");
   const hasChildren = step.children && step.children.length > 0;
   const isClickable = hasChildren || !!onAiStepClick;
-  const Icon = getStepIcon(step.step_type);
 
   const handleClick = () => {
     if (onAiStepClick) {
@@ -94,7 +101,7 @@ export function StepItem({ step, depth = 0, onAiStepClick }: StepItemProps) {
 
         {/* Step type icon */}
         <div className="p-1.5 rounded bg-muted/50">
-          <Icon className="w-3 h-3 text-muted-foreground" />
+          <StepTypeIcon stepType={step.step_type} className="w-3 h-3 text-muted-foreground" />
         </div>
 
         {/* Content */}

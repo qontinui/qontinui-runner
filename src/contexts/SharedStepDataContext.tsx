@@ -186,6 +186,7 @@ export function useSharedStepData(filter?: { stepType?: string }): {
   lastFetchedAt: number | null;
 } {
   const { data, isLoading, error, lastFetchedAt } = useSharedStepDataContext();
+  const stepType = filter?.stepType;
 
   return useMemo(() => {
     if (!data || !data.success) {
@@ -203,8 +204,8 @@ export function useSharedStepData(filter?: { stepType?: string }): {
     }
 
     // Apply client-side filter if provided
-    const executions = filter?.stepType
-      ? data.executions.filter((exec) => exec.step_type === filter.stepType)
+    const executions = stepType
+      ? data.executions.filter((exec) => exec.step_type === stepType)
       : data.executions;
 
     const startTime = detectStartTime(executions);
@@ -221,7 +222,7 @@ export function useSharedStepData(filter?: { stepType?: string }): {
       taskRunId: data.task_run_id,
       lastFetchedAt,
     };
-  }, [data, isLoading, error, lastFetchedAt, filter?.stepType]);
+  }, [data, isLoading, error, lastFetchedAt, stepType]);
 }
 
 /**

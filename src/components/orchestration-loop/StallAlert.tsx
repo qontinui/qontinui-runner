@@ -99,8 +99,10 @@ export function StallAlert({ running }: StallAlertProps) {
 
   useEffect(() => {
     if (!running) {
+      /* eslint-disable react-hooks/set-state-in-effect -- reset state on stop */
       setStall(null);
       setDismissed(false);
+      /* eslint-enable react-hooks/set-state-in-effect */
       return;
     }
 
