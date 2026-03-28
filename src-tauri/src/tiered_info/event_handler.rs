@@ -110,6 +110,7 @@ impl RunRecordingHandler {
         *self.project_id.lock().await = project_id;
 
         // Load expected durations from statistics
+        // PG: complex dynamic SQL
         let conn = match self.db.connection() {
             Ok(c) => c,
             Err(e) => {

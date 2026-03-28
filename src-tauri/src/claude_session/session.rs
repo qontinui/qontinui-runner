@@ -449,6 +449,7 @@ impl ClaudeSession {
                     );
 
                     if let Some(ref db) = db {
+                        // PG: complex dynamic SQL
                         let conn = match db.connection() {
                             Ok(c) => c,
                             Err(e) => {

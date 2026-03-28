@@ -330,6 +330,70 @@ impl PgDb {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
+    /// Text search across task_knowledge content and category.
+    /// Splits the query into keywords and matches rows where content contains ALL keywords.
+    /// Returns lightweight results ordered by recency.
+    pub async fn search_task_knowledge(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String, String, String)>, String> {
+        // (id, category, content, confidence, created_at)
+        let keywords: Vec<&str> = query
+            .split_whitespace()
+            .map(|s| s.trim())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+
+        // Build LIKE conditions for each keyword
+        let conditions: Vec<String> = (0..keywords.len())
+            .map(|i| format!("(LOWER(content) LIKE ${} OR LOWER(category) LIKE ${})", i + 1, i + 1))
+            .collect();
+        let where_clause = conditions.join(" AND ");
+        let limit_idx = keywords.len() + 1;
+
+        let sql = format!(
+            r#"SELECT id, category, content, confidence, created_at::text
+               FROM task_knowledge
+               WHERE {}
+               ORDER BY created_at DESC
+               LIMIT ${}"#,
+            where_clause, limit_idx
+        );
+
+        let like_patterns: Vec<String> = keywords.iter().map(|k| format!("%{}%", k.to_lowercase())).collect();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        for pattern in &like_patterns {
+            params.push(pattern);
+        }
+        let limit_val = limit;
+        params.push(&limit_val);
+
+        let rows = conn
+            .query(&sql, &params)
+            .await
+            .map_err(|e| format!("PG search_task_knowledge: {e}"))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, String>(3),
+                    r.get::<_, String>(4),
+                )
+            })
+            .collect())
+    }
+
     /// Helper: convert a PG row to StoredTaskKnowledge.
     fn row_to_stored_knowledge(row: &tokio_postgres::Row) -> crate::database::types::StoredTaskKnowledge {
         let related_files_str: Option<String> = row.get(8);
@@ -351,5 +415,43 @@ impl PgDb {
             resolved_at: row.get(12),
             created_at: row.get(13),
         }
+    }
+
+    /// Get task knowledge entries filtered by multiple categories.
+    pub async fn get_task_knowledge_by_categories(
+        &self,
+        task_run_id: &str,
+        categories: &[&str],
+        limit: i64,
+    ) -> Result<Vec<(String, String)>, String> {
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+
+        // Build IN clause dynamically
+        let placeholders: Vec<String> = categories
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 2))
+            .collect();
+        let sql = format!(
+            "SELECT category, content FROM task_knowledge \
+             WHERE task_run_id = $1 AND category IN ({}) \
+             ORDER BY created_at DESC LIMIT {}",
+            placeholders.join(", "),
+            limit
+        );
+
+        let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            std::iter::once(Box::new(task_run_id.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>)
+                .chain(categories.iter().map(|c| Box::new(c.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>))
+                .collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG get_task_knowledge_by_categories: {e}"))?;
+
+        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect())
     }
 }

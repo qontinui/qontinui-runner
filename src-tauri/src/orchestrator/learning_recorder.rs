@@ -847,6 +847,7 @@ pub fn spawn_llm_judge_if_eligible(
             };
 
         // Persist the LLM-judged scores
+        // PG: complex dynamic SQL
         if let Err(e) = db.with_conn(|conn| {
             let now = chrono::Utc::now().to_rfc3339();
             for score in &results {
@@ -926,6 +927,7 @@ fn gather_llm_judge_input(
     db: &crate::database::CheckpointDb,
     task_run_id: &str,
 ) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let (prompt, execution_steps, summary, goal_achieved, status): (
             Option<String>,
@@ -999,6 +1001,7 @@ pub fn spawn_rag_judge_if_eligible(
 ) {
     tokio::spawn(async move {
         // Check if this run has retrieval events
+        // PG: complex dynamic SQL
         let (retrieval_events, task_prompt) = match db.with_conn(|conn| {
             let events = crate::meta_optimizer::agentic_metrics::rag_judge::load_retrieval_events(
                 conn,
@@ -1035,6 +1038,7 @@ pub fn spawn_rag_judge_if_eligible(
         };
 
         // Persist RAG scores and recompute composite
+        // PG: complex dynamic SQL
         if let Err(e) = db.with_conn(|conn| {
             let now = chrono::Utc::now().to_rfc3339();
             for score in &results {

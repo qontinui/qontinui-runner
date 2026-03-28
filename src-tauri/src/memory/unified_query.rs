@@ -255,6 +255,46 @@ async fn retrieve_timeline(pg: &PgDb, query: &str, limit: i64) -> Vec<MemoryResu
     }
 }
 
+/// Keyword search on PostgreSQL task_knowledge (content + category).
+async fn retrieve_knowledge(pg: &PgDb, query: &str, limit: i64) -> Vec<MemoryResult> {
+    match pg.search_task_knowledge(query, limit).await {
+        Ok(rows) => {
+            let total = rows.len().max(1) as f64;
+            rows.into_iter()
+                .enumerate()
+                .map(|(i, (id, category, content, confidence, created_at))| {
+                    // Position-based score with confidence boost
+                    let base_score = 1.0 - (i as f64 / total);
+                    let conf_mult = match confidence.as_str() {
+                        "high" => 1.2,
+                        "low" => 0.8,
+                        _ => 1.0,
+                    };
+                    let score = (base_score * conf_mult).min(1.0);
+                    let ts = chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc));
+                    MemoryResult {
+                        id,
+                        source: MemorySource::TaskKnowledge,
+                        title: format!("{} knowledge", category),
+                        snippet: truncate_str(&content, 500),
+                        source_score: score,
+                        fused_score: 0.0,
+                        timestamp: ts,
+                        memory_type: category,
+                        found_by: vec![RetrievalStrategy::CategoryMatch],
+                    }
+                })
+                .collect()
+        }
+        Err(e) => {
+            warn!("Unified memory: PG knowledge retrieval failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// LIKE search on SQLite tables (findings, fixes, errors, rules, workflows, ui_elements).
 /// Wraps the existing `unified_search` function.
 fn retrieve_sqlite(
@@ -262,6 +302,7 @@ fn retrieve_sqlite(
     query: &str,
     limit: usize,
 ) -> Vec<MemoryResult> {
+    // PG: complex dynamic SQL
     match db.with_conn(|conn| {
         crate::reflection::unified_search::unified_search(conn, query, limit)
     }) {
@@ -431,6 +472,7 @@ pub async fn query_memory(
     // Determine which sources to query
     let want_observations = source_enabled(sources, MemorySource::Observation);
     let want_timeline = source_enabled(sources, MemorySource::ActivityTimeline);
+    let want_knowledge = source_enabled(sources, MemorySource::TaskKnowledge);
     let want_sqlite = source_enabled(sources, MemorySource::Finding)
         || source_enabled(sources, MemorySource::Fix)
         || source_enabled(sources, MemorySource::Error)
@@ -444,6 +486,7 @@ pub async fn query_memory(
     // PG queries are async; SQLite and graph are sync so we spawn_blocking.
     let obs_query = query.to_string();
     let timeline_query = query.to_string();
+    let knowledge_query = query.to_string();
     let sqlite_query = query.to_string();
     let graph_query = query.to_string();
 
@@ -458,6 +501,14 @@ pub async fn query_memory(
     let timeline_fut = async {
         if want_timeline {
             retrieve_timeline(pg, &timeline_query, per_source_limit).await
+        } else {
+            Vec::new()
+        }
+    };
+
+    let knowledge_fut = async {
+        if want_knowledge {
+            retrieve_knowledge(pg, &knowledge_query, per_source_limit).await
         } else {
             Vec::new()
         }
@@ -490,10 +541,11 @@ pub async fn query_memory(
         Vec::new()
     };
 
-    let (obs, timeline, sqlite) = tokio::join!(obs_fut, timeline_fut, sqlite_fut);
+    let (obs, timeline, knowledge, sqlite) =
+        tokio::join!(obs_fut, timeline_fut, knowledge_fut, sqlite_fut);
 
-    // Collect all result sets for fusion
-    let result_sets = vec![obs, timeline, sqlite, graph_results];
+    // Collect all result sets for fusion (5 sources)
+    let result_sets = vec![obs, timeline, knowledge, sqlite, graph_results];
 
     // Fuse with RRF (k=60 is standard)
     let mut fused = reciprocal_rank_fusion(result_sets, 60.0);

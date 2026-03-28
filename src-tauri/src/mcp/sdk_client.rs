@@ -473,16 +473,11 @@ pub async fn connect_sdk_app(
 /// Push element reliability data to a connected SDK app for CTR confidence seeding.
 /// Fire-and-forget: errors are logged but never fail the caller.
 async fn push_ctr_reliability_to_sdk(state: &Arc<ApiState>) {
-    let db = state.app_state.checkpoint_db.clone();
     let sdk_conn = state.sdk_connection.clone();
 
     // Fetch all elements with interaction history from our DB
-    let reliability_data = match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::database::ui_bridge_ops::get_flaky_elements(conn, 3, 1.0))
-    })
-    .await
-    {
-        Ok(Ok(data)) if !data.is_empty() => data,
+    let reliability_data = match state.app_state.pg_db.get_flaky_elements(3, 1.0).await {
+        Ok(data) if !data.is_empty() => data,
         _ => return, // No data or error — silently skip
     };
 
@@ -951,29 +946,26 @@ async fn handle_element_action(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let success = result.1;
         let error_msg = result.2.clone();
-        let db = state.app_state.checkpoint_db.clone();
+        let pg_db = state.app_state.pg_db.clone();
         let element_id = id.clone();
         let action_for_db = action_name.clone();
 
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = db.with_conn(|conn| {
-                crate::database::ui_bridge_ops::insert_ui_bridge_event(
-                    conn,
-                    Some(tr_id),
-                    seq,
-                    "action_executed",
-                    Some(&element_id),
-                    None,
-                    None,
-                    Some(&action_for_db),
-                    None,
-                    None,
-                    Some(duration_ms),
-                    success,
-                    error_msg.as_deref(),
-                    None,
-                )
-            }) {
+        tokio::spawn(async move {
+            if let Err(e) = pg_db.insert_ui_bridge_event(
+                Some(tr_id),
+                seq,
+                "action_executed",
+                Some(&element_id),
+                None,
+                None,
+                Some(&action_for_db),
+                None,
+                None,
+                Some(duration_ms),
+                success,
+                error_msg.as_deref(),
+                None,
+            ).await {
                 tracing::warn!("Failed to persist SDK UI Bridge event: {}", e);
             }
         });

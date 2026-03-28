@@ -105,19 +105,13 @@ impl LoopController {
                         return;
                     }
 
-                    // Look up the optimizer_run record by task_run_id
-                    let (optimizer_run_id, optimizer_type) = match db.with_conn({
-                        let eid = eid.clone();
-                        move |conn| {
-                            conn.query_row(
-                                "SELECT id, optimizer_type FROM meta_optimizer_runs WHERE task_run_id = ?1",
-                                rusqlite::params![eid],
-                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                            )
-                            .map_err(|e| format!("Failed to find optimizer run for task {}: {}", eid, e))
+                    // Look up the optimizer_run record by task_run_id (PG)
+                    let (optimizer_run_id, optimizer_type) = match pg.get_optimizer_run_by_task_run_id(&eid).await {
+                        Ok(Some((id, ot))) => (id, ot),
+                        Ok(None) => {
+                            warn!("Could not find optimizer run for meta-optimizer task {}", eid);
+                            return;
                         }
-                    }) {
-                        Ok((id, ot)) => (id, ot),
                         Err(e) => {
                             warn!("Could not find optimizer run for meta-optimizer task {}: {}", eid, e);
                             return;
@@ -280,46 +274,36 @@ impl LoopController {
             execution_id
         );
 
-        match self.checkpoint_db.connection() {
-            Ok(conn) => {
-                let mut resolved_count = 0;
-                let mut failed_count = 0;
+        // PG: mark_resolved_by_task
+        let mut resolved_count = 0;
+        let mut failed_count = 0;
 
-                for error_id in error_ids {
-                    let resolution_note = format!(
-                        "Auto-resolved by successful completion of workflow task {}",
-                        execution_id
-                    );
+        for error_id in error_ids {
+            let resolution_note = format!(
+                "Auto-resolved by successful completion of workflow task {}",
+                execution_id
+            );
 
-                    match crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
-                        &conn,
-                        *error_id,
-                        execution_id,
-                        Some(&resolution_note),
-                    ) {
-                        Ok(_) => {
-                            resolved_count += 1;
-                        }
-                        Err(e) => {
-                            failed_count += 1;
-                            warn!("Failed to resolve error {}: {}", error_id, e);
-                        }
-                    }
+            match self.app_state.pg_db.mark_resolved_by_task(
+                *error_id,
+                execution_id,
+                Some(&resolution_note),
+            ).await {
+                Ok(_) => {
+                    resolved_count += 1;
                 }
-
-                if resolved_count > 0 {
-                    info!(
-                        "Successfully resolved {} errors (failed: {}) for workflow {}",
-                        resolved_count, failed_count, execution_id
-                    );
+                Err(e) => {
+                    failed_count += 1;
+                    warn!("Failed to resolve error {}: {}", error_id, e);
                 }
             }
-            Err(e) => {
-                error!(
-                    "Failed to get database connection for error resolution: {}",
-                    e
-                );
-            }
+        }
+
+        if resolved_count > 0 {
+            info!(
+                "Successfully resolved {} errors (failed: {}) for workflow {}",
+                resolved_count, failed_count, execution_id
+            );
         }
     }
 
@@ -330,32 +314,22 @@ impl LoopController {
     /// so those get their specific notes first; already-resolved errors won't be
     /// double-processed by the WHERE clause.
     pub(crate) async fn resolve_workflow_scoped_errors(&self, execution_id: &str) {
-        match self.checkpoint_db.connection() {
-            Ok(conn) => {
-                match crate::error_monitor::ErrorEventStorage::resolve_errors_by_task_run(
-                    &conn,
-                    execution_id,
-                    execution_id,
-                ) {
-                    Ok(count) if count > 0 => {
-                        info!(
-                            "Auto-resolved {} workflow-scoped errors for task {}",
-                            count, execution_id
-                        );
-                    }
-                    Ok(_) => {} // No errors to resolve
-                    Err(e) => {
-                        warn!(
-                            "Failed to auto-resolve workflow-scoped errors for {}: {}",
-                            execution_id, e
-                        );
-                    }
-                }
+        // PG: resolve_errors_by_task_run
+        match self.app_state.pg_db.resolve_errors_by_task_run(
+            execution_id,
+            execution_id,
+        ).await {
+            Ok(count) if count > 0 => {
+                info!(
+                    "Auto-resolved {} workflow-scoped errors for task {}",
+                    count, execution_id
+                );
             }
+            Ok(_) => {} // No errors to resolve
             Err(e) => {
-                error!(
-                    "Failed to get database connection for workflow-scoped error resolution: {}",
-                    e
+                warn!(
+                    "Failed to auto-resolve workflow-scoped errors for {}: {}",
+                    execution_id, e
                 );
             }
         }
@@ -531,25 +505,14 @@ async fn auto_capture_observations(
         }
     }
 
-    // Extract findings from task knowledge (if available)
-    let findings = db
-        .with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT category, content FROM task_knowledge \
-                     WHERE task_run_id = ?1 AND category IN ('Finding', 'RootCause', 'Solution') \
-                     ORDER BY created_at DESC LIMIT 10",
-                )
-                .map_err(|e| format!("{}", e))?;
-            let rows: Vec<(String, String)> = stmt
-                .query_map(rusqlite::params![execution_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| format!("{}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
-        })
+    // Extract findings from task knowledge (PG)
+    let findings = pg
+        .get_task_knowledge_by_categories(
+            execution_id,
+            &["Finding", "RootCause", "Solution"],
+            10,
+        )
+        .await
         .unwrap_or_default();
 
     if !findings.is_empty() {

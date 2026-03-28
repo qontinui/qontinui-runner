@@ -232,3 +232,28 @@ pub fn build_validation_comparison(
         timeout_seconds: 600,
     }))
 }
+
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Convert a comparison to a recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn comparison_to_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    comparison_id: &str,
+) -> Result<Option<String>, String> {
+    let result = comparison_to_recommendation(db, comparison_id)?;
+    if let Some(ref rec_id) = result {
+        if let Ok(recs) = super::recommendations::list_recommendations(db, Some("comparison"), Some("pending")) {
+            if let Some(r) = recs.iter().find(|r| &r.id == rec_id) {
+                let pg = pg_db.clone();
+                let r = r.clone();
+                let ch = super::recommendations::compute_content_hash(&r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), r.recommended_value.as_deref());
+                tokio::spawn(async move {
+                    let _ = pg.create_recommendation(&r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(), r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch).await;
+                });
+            }
+        }
+    }
+    Ok(result)
+}

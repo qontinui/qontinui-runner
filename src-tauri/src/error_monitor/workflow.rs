@@ -508,6 +508,7 @@ pub async fn generate_error_fix_workflow(
     let config = config.unwrap_or_default();
 
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let generator = ErrorFixWorkflowGenerator::with_config(config);
         generator.generate(&conn)
@@ -525,6 +526,7 @@ pub async fn generate_single_error_fix_workflow(
     let db = db.inner().clone();
 
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let generator = ErrorFixWorkflowGenerator::new();
         generator.generate_for_single_error(&conn, error_id)
@@ -542,6 +544,7 @@ pub async fn check_fixable_errors(
     let db = db.inner().clone();
 
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
 
         let query = ErrorQuery {

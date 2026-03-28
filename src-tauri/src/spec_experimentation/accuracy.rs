@@ -554,6 +554,7 @@ pub fn store_accuracy_result(
     let now = chrono::Utc::now().to_rfc3339();
     let id_clone = id.clone();
 
+    // PG: complex dynamic SQL
     db.with_conn({
         let id = id.clone();
         let spec_id = spec_id.to_string();
@@ -583,6 +584,7 @@ pub fn get_accuracy_results(
     let spec_id = spec_id.map(|s| s.to_string());
     let analysis_type = analysis_type.map(|s| s.to_string());
 
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let mut conditions = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();

@@ -147,9 +147,9 @@ fn try_init_otel(
     use opentelemetry_sdk::trace::{self as sdktrace, Sampler};
     use opentelemetry_sdk::Resource;
 
-    // Build the OTLP span exporter (gRPC via tonic)
+    // Build the OTLP span exporter (HTTP via reqwest)
     let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
+        .with_http()
         .with_endpoint(&config.endpoint)
         .build()?;
 

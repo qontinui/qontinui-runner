@@ -611,6 +611,29 @@ fn compute_confidence(run_count: i64, min_samples: i64, max_samples: i64) -> f64
     }
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Generate cost recommendations with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn generate_cost_recommendations_with_pg(
+    db: &crate::database::CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    existing_recommendations: &[Recommendation],
+) -> Vec<Recommendation> {
+    let recs = generate_cost_recommendations(db, existing_recommendations);
+    if !recs.is_empty() {
+        let pg = pg_db.clone();
+        let recs_clone: Vec<Recommendation> = recs.clone();
+        tokio::spawn(async move {
+            for r in &recs_clone {
+                let ch = super::recommendations::compute_content_hash(&r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), r.recommended_value.as_deref());
+                let _ = pg.create_recommendation(&r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(), r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch).await;
+            }
+        });
+    }
+    recs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

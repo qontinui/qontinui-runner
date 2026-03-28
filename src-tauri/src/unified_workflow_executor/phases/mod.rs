@@ -596,6 +596,7 @@ fn build_compressed_iteration_history(
     if budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
             // Try relevance-scored knowledge first (v99 cognitive system model)
+            // PG: complex dynamic SQL
             let scored_knowledge = checkpoint_db.with_conn(|conn| {
                 crate::reflection::prediction::score_knowledge_relevance(conn, wf_name, 10)
             });
@@ -744,6 +745,7 @@ fn build_compressed_iteration_history(
                     }
                     // Use the finding's actual signature_hash for fix prediction lookup
                     let sig = &finding.signature_hash;
+                    // PG: complex dynamic SQL
                     if let Ok(Some(predicted)) = checkpoint_db.with_conn(|conn| {
                         crate::reflection::prediction::predict_fix_for_error(conn, sig)
                     }) {
@@ -756,16 +758,13 @@ fn build_compressed_iteration_history(
                             ));
                             prediction_count += 1;
 
-                            // Record that this fix was shown to the AI (outcome="shown" won't increment reuse_count)
-                            let _ = checkpoint_db.with_conn(|conn| {
-                                crate::reflection::prediction::record_fix_application(
-                                    conn,
-                                    &predicted.fix_id,
-                                    execution_id,
-                                    Some(sig),
-                                    "shown",
-                                )
-                            });
+                            // Record that this fix was shown to the AI (PG: save_fix_application)
+                            let _ = pg_block!(pg_db, pg_db.save_fix_application(
+                                &predicted.fix_id,
+                                execution_id,
+                                Some(sig),
+                                "shown",
+                            ));
                         }
                     }
                 }
@@ -791,6 +790,7 @@ fn build_compressed_iteration_history(
     // Priority: LOW -- only when causal data exists, max 500 tokens
     if budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
+            // PG: complex dynamic SQL
             let causal_events = checkpoint_db.with_conn(|conn| {
                 crate::reflection::causal::get_causal_events_for_workflow(conn, wf_name, 10)
             });
@@ -857,6 +857,7 @@ fn build_compressed_iteration_history(
                         min_similarity: 0.3,
                     };
                     checkpoint_db
+                        // PG: complex dynamic SQL
                         .with_conn(|conn| {
                             crate::database::hybrid_search::hybrid_search_universal_fixes(
                                 conn,
@@ -885,6 +886,7 @@ fn build_compressed_iteration_history(
                             None,
                             |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
                         );
+                    // PG: complex dynamic SQL
                     let _ = checkpoint_db.with_conn(|conn| {
                         crate::meta_optimizer::agentic_metrics::rag_judge::persist_retrieval_event(
                             conn,
@@ -906,8 +908,8 @@ fn build_compressed_iteration_history(
             }
             _ => {
                 // SQL-only fallback: get universal fixes by reuse_count
-                checkpoint_db
-                    .with_conn(|conn| crate::reflection::storage::get_universal_fixes(conn, 5))
+                // PG: get_universal_fixes
+                pg_block!(pg_db, pg_db.get_universal_fixes(5))
                     .ok()
                     .unwrap_or_default()
                     .into_iter()
@@ -1232,6 +1234,7 @@ fn build_impact_context(
 
     for file_path in changed_files.iter().take(5) {
         let impact = checkpoint_db
+            // PG: complex dynamic SQL
             .with_conn(|conn| {
                 crate::reflection::architecture::get_impact_analysis(conn, workflow_name, file_path)
             })

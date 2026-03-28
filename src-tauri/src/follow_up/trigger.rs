@@ -57,6 +57,7 @@ pub fn should_launch_follow_up(
 ) -> Result<bool, String> {
     let source_id = source_task_run_id.to_string();
 
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         // Guard 0: Check if a follow-up workflow is already running
         let has_running: bool = conn
@@ -249,6 +250,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
 
     // Get source task run details
     let source_id = source_task_run_id.clone();
+    // PG: complex dynamic SQL
     let workflow_name = db.with_conn(|conn| {
         conn.query_row(
             "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",

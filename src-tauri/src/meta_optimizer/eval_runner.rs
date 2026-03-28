@@ -503,6 +503,27 @@ pub fn evaluate_test_case_with_io(
         .collect()
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Validate a recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn validate_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<EvalResult, String> {
+    let result = validate_recommendation(db, recommendation_id)?;
+    let pg = pg_db.clone();
+    let r = result.clone();
+    let rj = serde_json::to_string(&r).unwrap_or_default();
+    let pv = r.comparison.as_ref().and_then(|c| c.p_value);
+    let tr = r.trials_run as i64;
+    tokio::spawn(async move {
+        let _ = pg.save_eval_result(&r.id, &r.spec_id, r.recommendation_id.as_deref(), &r.status, &rj, pv, tr).await;
+    });
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -621,6 +621,7 @@ fn parse_architecture(s: &str) -> Option<WorkflowArchitecture> {
 pub fn load_q_table_sqlite(
     db: &crate::database::CheckpointDb,
 ) -> Result<Vec<(String, String, f64, u32)>, String> {
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let mut stmt = conn
             .prepare("SELECT state_key, action, q_value, visit_count FROM q_routing_table ORDER BY state_key, action")
@@ -648,6 +649,7 @@ pub fn load_q_table_sqlite(
 pub fn load_overrides_sqlite(
     db: &crate::database::CheckpointDb,
 ) -> Result<Vec<(String, String)>, String> {
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let mut stmt = conn
             .prepare("SELECT state_key, forced_action FROM q_routing_overrides ORDER BY state_key")

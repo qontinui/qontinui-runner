@@ -69,6 +69,7 @@ pub async fn get_autoresearch_campaign_history(
     filter: Option<String>,
     db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<Vec<CampaignSummary>, String> {
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match &filter {
             Some(f) => (
@@ -118,6 +119,7 @@ pub async fn get_autoresearch_campaign_experiments(
     campaign_id: String,
     db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<Vec<(u32, ExperimentResult)>, String> {
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
@@ -192,6 +194,7 @@ pub async fn rerun_autoresearch_campaign(
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<String, String> {
     // Load the original campaign's config
+    // PG: complex dynamic SQL
     let config_json: String = db.with_conn({
         let campaign_id = campaign_id.clone();
         move |conn| {
@@ -235,6 +238,7 @@ pub async fn compare_autoresearch_campaigns(
         (CampaignSummary, Vec<(u32, super::types::ExperimentResult)>),
         String,
     > {
+        // PG: complex dynamic SQL
         let summary = db.with_conn({
             let id = id.clone();
             move |conn| {
@@ -259,6 +263,7 @@ pub async fn compare_autoresearch_campaigns(
         })?;
 
         // Load experiments for pass rate calculation
+        // PG: complex dynamic SQL
         let experiments = db.with_conn({
             let id = id.clone();
             move |conn| {
@@ -482,6 +487,7 @@ pub async fn set_q_routing_override(
 
     // SQLite fallback
     let now = chrono::Utc::now().to_rfc3339();
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         conn.execute(
             r#"INSERT INTO q_routing_overrides (state_key, forced_action, created_at)
@@ -510,6 +516,7 @@ pub async fn remove_q_routing_override(
     }
 
     // SQLite
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let deleted = conn
             .execute(
@@ -543,6 +550,7 @@ pub async fn reset_q_routing_table(
     deleted_pg = app_state.pg_db.clear_q_table().await.unwrap_or(0);
 
     // SQLite
+    // PG: complex dynamic SQL
     let deleted_sqlite = db.with_conn(|conn| {
         conn.execute("DELETE FROM q_routing_table", rusqlite::params![])
             .map_err(|e| format!("Failed to clear SQLite Q-table: {}", e))

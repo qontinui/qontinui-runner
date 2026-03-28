@@ -1923,6 +1923,7 @@ impl LoopController {
             let pg_db_for_q = self.app_state.pg_db.clone();
             tokio::spawn(async move {
                 // Record learning outcome + agentic metrics + SQLite Q-update
+                // PG: complex dynamic SQL
                 let sqlite_ok = db.with_conn(|conn| {
                     crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome)
                 });
@@ -1934,13 +1935,11 @@ impl LoopController {
                 // PG Q-routing update — only if SQLite recording succeeded
                 // (composite_agentic_score is read back from SQLite)
                 if sqlite_ok.is_ok() {
-                    let composite_score = db.with_conn(|conn| {
-                        conn.query_row(
-                            "SELECT COALESCE(composite_agentic_score, 0.0) FROM learning_outcomes WHERE task_id = ?1",
-                            rusqlite::params![outcome.task_run_id],
-                            |row| row.get::<_, f64>(0),
-                        ).map_err(|e| format!("Failed to read composite score: {}", e))
-                    }).unwrap_or(0.0);
+                    // PG: get_composite_agentic_score
+                    let composite_score = pg_db_for_q
+                        .get_composite_agentic_score(&outcome.task_run_id)
+                        .await
+                        .unwrap_or(0.0);
 
                     if let Err(e) = crate::orchestrator::learning_recorder::update_q_routing_table_pg(
                         &pg_db_for_q, &outcome, composite_score,
@@ -2191,6 +2190,7 @@ impl LoopController {
             let cra_workflow_name = config.workflow_name.clone();
             let cra_pg_db = self.app_state.pg_db.clone();
             tokio::spawn(async move {
+                // PG: complex dynamic SQL
                 if let Err(e) = cra_db.with_conn(|conn| {
                     // Look up the source workflow name from the reflection_source_task_run_id
                     let source_wf_name: String = conn

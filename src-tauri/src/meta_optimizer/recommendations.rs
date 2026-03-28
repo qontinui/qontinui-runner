@@ -940,6 +940,114 @@ pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
     }
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Create a recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn create_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    optimizer_type: &str,
+    recommendation_type: &str,
+    target_agent: Option<&str>,
+    title: &str,
+    description: &str,
+    current_value: Option<&str>,
+    recommended_value: Option<&str>,
+    evidence: Option<&str>,
+    confidence: f64,
+    optimizer_run_id: Option<&str>,
+) -> Result<Recommendation, String> {
+    let rec = create_recommendation(
+        db, optimizer_type, recommendation_type, target_agent, title,
+        description, current_value, recommended_value, evidence, confidence, optimizer_run_id,
+    )?;
+    let pg = pg_db.clone();
+    let r = rec.clone();
+    let ch = compute_content_hash(optimizer_type, recommendation_type, target_agent, recommended_value);
+    tokio::spawn(async move {
+        let _ = pg.create_recommendation(
+            &r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(),
+            &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(),
+            r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch,
+        ).await;
+    });
+    Ok(rec)
+}
+
+/// Apply a recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn apply_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    apply_recommendation(db, recommendation_id)?;
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    tokio::spawn(async move { let _ = pg.update_recommendation_status(&rid, "applied").await; });
+    Ok(())
+}
+
+/// Reject a recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn reject_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    reject_recommendation(db, recommendation_id)?;
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    tokio::spawn(async move { let _ = pg.update_recommendation_status(&rid, "rejected").await; });
+    Ok(())
+}
+
+/// Rollback a recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn rollback_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    rollback_recommendation(db, recommendation_id)?;
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    tokio::spawn(async move { let _ = pg.update_recommendation_status(&rid, "rolled_back").await; });
+    Ok(())
+}
+
+/// Dedup pending recommendations with PG dual-write.
+#[allow(dead_code)]
+pub fn dedup_pending_recommendations_with_pg(
+    db: &CheckpointDb,
+    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> usize {
+    dedup_pending_recommendations(db)
+}
+
+/// Auto-reject stale recommendations with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn auto_reject_stale_recommendations_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> usize {
+    let count = auto_reject_stale_recommendations(db);
+    if count > 0 {
+        let pg = pg_db.clone();
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        tokio::spawn(async move {
+            if let Ok(conn) = pg.pool().get().await {
+                let _ = conn.execute(
+                    "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE status = 'pending' AND created_at < $1",
+                    &[&cutoff],
+                ).await;
+            }
+        });
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1376,3 +1376,78 @@ pub fn record_canary_outcome(
         );
     }
 }
+
+// ── Additional PG dual-write wrappers ───────────────────────────────────
+
+/// Update canary traffic percentage with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn update_canary_percentage_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+    new_percentage: i64,
+) -> Result<(), String> {
+    update_canary_percentage(db, canary_id, new_percentage)?;
+    let pg = pg_db.clone();
+    let cid = canary_id.to_string();
+    tokio::spawn(async move { let _ = pg.update_canary_percentage(&cid, new_percentage).await; });
+    Ok(())
+}
+
+/// Roll back a canary with evaluation metrics and PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn rollback_canary_with_eval_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+    eval: Option<&CanaryEvaluation>,
+) -> Result<(), String> {
+    rollback_canary_with_eval(db, canary_id, eval)?;
+    let pg = pg_db.clone();
+    let cid = canary_id.to_string();
+    tokio::spawn(async move { let _ = pg.rollback_canary(&cid).await; });
+    Ok(())
+}
+
+/// Auto-rollback stale canaries with PG dual-write.
+#[allow(dead_code)]
+pub fn auto_rollback_stale_canaries_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> usize {
+    let canaries = match get_active_canaries(db) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let mut rolled_back = 0;
+    for canary in &canaries {
+        let started = if canary.start_date.is_empty() { &canary.created_at } else { &canary.start_date };
+        if started.as_str() >= cutoff.as_str() { continue; }
+        info!("Auto-rolling-back stale canary {} (active since {}, {} canary runs)", canary.id, started, canary.canary_run_count);
+        if let Err(e) = rollback_canary_with_pg(db, pg_db, &canary.id) {
+            warn!("Failed to auto-rollback stale canary {}: {}", canary.id, e);
+        } else {
+            rolled_back += 1;
+        }
+    }
+    if rolled_back > 0 { info!("Auto-rolled-back {} stale canary rollout(s) (active >30 days)", rolled_back); }
+    rolled_back
+}
+
+/// Record canary outcome with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn record_canary_outcome_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+    used_candidate: bool,
+    success: bool,
+    cost_usd: f64,
+    latency_ms: f64,
+    tokens: i64,
+) {
+    if let Err(e) = record_prompt_canary_run_with_pg(db, pg_db, canary_id, used_candidate, success, cost_usd, latency_ms, tokens) {
+        warn!("Failed to record canary outcome for {}: {}", canary_id, e);
+    }
+}

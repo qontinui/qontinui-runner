@@ -554,6 +554,35 @@ pub fn has_baseline_drifted(
     .unwrap_or(false)
 }
 
+/// Record evolution with full parameters and PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn record_evolution_full_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    parent_variant_id: Option<&str>,
+    variant_id: &str,
+    recommendation_id: Option<&str>,
+    critique: Option<&str>,
+    changes_summary: Option<&str>,
+    score_before: Option<f64>,
+    baseline_prompt_hash: Option<&str>,
+) -> Result<String, String> {
+    let id = record_evolution_full(db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before, baseline_prompt_hash)?;
+    let pg = pg_db.clone();
+    let id_clone = id.clone();
+    let at = agent_type.to_string();
+    let pvid = parent_variant_id.map(|s| s.to_string());
+    let vid = variant_id.to_string();
+    let rid = recommendation_id.map(|s| s.to_string());
+    let cr = critique.map(|s| s.to_string());
+    let cs = changes_summary.map(|s| s.to_string());
+    tokio::spawn(async move {
+        let _ = pg.record_prompt_evolution(&id_clone, &at, pvid.as_deref(), &vid, rid.as_deref(), cr.as_deref(), cs.as_deref(), score_before).await;
+    });
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

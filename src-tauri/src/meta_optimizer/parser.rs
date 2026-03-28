@@ -1270,6 +1270,48 @@ fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
     }
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Save parsed recommendations with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn save_parsed_recommendations_with_pg(
+    db: &crate::database::CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    optimizer_type: &str,
+    optimizer_run_id: Option<&str>,
+    output: &str,
+) -> Result<usize, String> {
+    let count = save_parsed_recommendations(db, optimizer_type, optimizer_run_id, output)?;
+    if count > 0 {
+        if let Ok(recs) = super::recommendations::list_recommendations(db, Some(optimizer_type), Some("pending")) {
+            let pg = pg_db.clone();
+            tokio::spawn(async move {
+                for r in &recs {
+                    let ch = super::recommendations::compute_content_hash(&r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), r.recommended_value.as_deref());
+                    let _ = pg.create_recommendation(&r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(), r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch).await;
+                }
+            });
+        }
+    }
+    Ok(count)
+}
+
+/// Auto-apply high-confidence recommendations with PG dual-write.
+#[allow(dead_code)]
+pub fn auto_apply_high_confidence_with_pg(
+    db: &crate::database::CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    optimizer_run_id: Option<&str>,
+) {
+    auto_apply_high_confidence(db, optimizer_run_id);
+    let pg = pg_db.clone();
+    if let Ok(applied) = super::recommendations::list_recommendations(db, None, Some("applied")) {
+        tokio::spawn(async move {
+            for r in &applied { let _ = pg.update_recommendation_status(&r.id, "applied").await; }
+        });
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

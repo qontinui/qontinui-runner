@@ -436,4 +436,19 @@ impl PgDb {
             }
         }))
     }
+
+    /// Get composite agentic score for a task run.
+    pub async fn get_composite_agentic_score(&self, task_id: &str) -> Result<f64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                "SELECT COALESCE(composite_agentic_score, 0.0) FROM learning_outcomes WHERE task_id = $1",
+                &[&task_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_composite_agentic_score: {}", e))?;
+
+        Ok(row.map(|r| r.get::<_, f64>(0)).unwrap_or(0.0))
+    }
 }

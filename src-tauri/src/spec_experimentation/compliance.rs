@@ -81,6 +81,7 @@ pub fn extract_compliance(
     let trid = task_run_id.to_string();
 
     // 1. Get the latest iteration's result_json
+        // PG: complex dynamic SQL
     let (iteration, result_json, spec_id): (i64, String, Option<String>) = db.with_conn({
         let trid = trid.clone();
         move |conn| {
@@ -241,6 +242,7 @@ pub fn extract_compliance(
     let assertion_details_json =
         serde_json::to_string(&all_details).unwrap_or_else(|_| "[]".into());
 
+    // PG: complex dynamic SQL
     db.with_conn({
         let id = id.clone();
         let trid = trid.clone();
@@ -297,6 +299,7 @@ pub fn get_compliance_for_run(
     task_run_id: &str,
 ) -> Result<Option<SpecComplianceResult>, String> {
     let trid = task_run_id.to_string();
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let row = conn.query_row(
             r#"SELECT id, task_run_id, spec_id, iteration,
@@ -353,6 +356,7 @@ pub fn get_compliance_history(
     let spec_id = spec_id.map(|s| s.to_string());
     let limit = limit.unwrap_or(50);
 
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
             if let Some(ref sid) = spec_id {
@@ -433,6 +437,7 @@ pub fn get_compliance_history(
 
 /// Get a summary of compliance across all specs: latest score, trend, run count.
 pub fn get_compliance_summary(db: &CheckpointDb) -> Result<Vec<SpecComplianceSummary>, String> {
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         // Get distinct spec_ids with their latest scores and run counts
         let mut stmt = conn
@@ -483,6 +488,7 @@ pub fn get_compliance_summary(db: &CheckpointDb) -> Result<Vec<SpecComplianceSum
 /// Get average spec compliance score over a period (used by snapshots).
 pub fn get_avg_compliance_since(db: &CheckpointDb, since: &str) -> Result<Option<f64>, String> {
     let since = since.to_string();
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let result: Result<f64, _> = conn.query_row(
             "SELECT AVG(overall_score) FROM spec_compliance_results WHERE created_at > ?1",
@@ -613,6 +619,7 @@ pub fn detect_broken_assertions(
 ) -> Result<Vec<BrokenAssertion>, String> {
     let spec_id = spec_id.to_string();
 
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let mut stmt = conn
             .prepare(
@@ -696,6 +703,7 @@ pub struct SpecAttentionItem {
 
 /// Get specs that need attention: broken assertions, stale, or never run.
 pub fn get_specs_needing_attention(db: &CheckpointDb) -> Result<Vec<SpecAttentionItem>, String> {
+    // PG: complex dynamic SQL
     let spec_ids: Vec<(String, f64)> = db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
@@ -759,6 +767,7 @@ pub fn get_specs_needing_attention(db: &CheckpointDb) -> Result<Vec<SpecAttentio
         }
     }
 
+    // PG: complex dynamic SQL
     let stale_specs: Vec<(String, i64)> = db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
@@ -821,6 +830,7 @@ pub fn get_specs_needing_attention(db: &CheckpointDb) -> Result<Vec<SpecAttentio
         });
     }
 
+    // PG: complex dynamic SQL
     let never_run: Vec<String> = db.with_conn(|conn| {
         let mut stmt = conn
             .prepare(
@@ -873,6 +883,7 @@ pub fn auto_extract_spec_compliance(db: &CheckpointDb, task_run_id: &str) {
 
     // Check if this is a spec-generated workflow
     let is_spec = db
+        // PG: complex dynamic SQL
         .with_conn({
             let trid = trid.clone();
             move |conn| {

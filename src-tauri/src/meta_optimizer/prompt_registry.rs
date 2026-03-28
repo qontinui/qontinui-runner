@@ -266,6 +266,38 @@ pub fn update_performance_metrics(
     })
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Create a prompt variant with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn create_variant_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, variant_name: &str, prompt_content: &str, source_recommendation_id: Option<&str>) -> Result<PromptVariant, String> {
+    let variant = create_variant(db, agent_type, variant_name, prompt_content, source_recommendation_id)?;
+    let pg = pg_db.clone();
+    let at = agent_type.to_string(); let vn = variant_name.to_string(); let pc = prompt_content.to_string(); let sri = source_recommendation_id.map(|s| s.to_string());
+    tokio::spawn(async move { let _ = pg.create_prompt_variant(&at, &vn, &pc, sri.as_deref()).await; });
+    Ok(variant)
+}
+
+/// Activate a prompt variant with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn activate_variant_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, variant_id: &str) -> Result<(), String> {
+    activate_variant(db, variant_id)?;
+    let pg = pg_db.clone();
+    let vid = variant_id.to_string();
+    tokio::spawn(async move { let _ = pg.activate_variant(&vid).await; });
+    Ok(())
+}
+
+/// Update performance metrics with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn update_performance_metrics_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, variant_id: &str, metrics_json: &str) -> Result<(), String> {
+    update_performance_metrics(db, variant_id, metrics_json)?;
+    let pg = pg_db.clone();
+    let vid = variant_id.to_string(); let mj = metrics_json.to_string();
+    tokio::spawn(async move { let _ = pg.update_performance_metrics(&vid, &mj).await; });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

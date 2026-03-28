@@ -600,6 +600,7 @@ impl StepExecutor {
 
             // Link any findings detected during this step's execution window
             if let Some(ref task_run_id) = self.task_run_id {
+                // PG: complex dynamic SQL
                 if let Ok(conn) = self.app_state.checkpoint_db.connection() {
                     match crate::database::graph_ops::link_findings_to_steps_by_timestamp(
                         &conn,

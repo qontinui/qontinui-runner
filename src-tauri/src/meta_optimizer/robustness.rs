@@ -474,6 +474,32 @@ pub fn run_robustness_test(
     Ok(report)
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Save a robustness report with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn save_robustness_report_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, report: &RobustnessReport) -> Result<(), String> {
+    save_robustness_report(db, report)?;
+    let pg = pg_db.clone();
+    let id = report.id.clone(); let vid = report.prompt_variant_id.clone(); let rid = report.recommendation_id.clone();
+    let total = report.total_tests as i64; let passed = report.passed as i64; let failed = report.failed as i64;
+    let rj = serde_json::to_string(report).unwrap_or_default();
+    tokio::spawn(async move { let _ = pg.save_robustness_report(&id, vid.as_deref(), rid.as_deref(), total, passed, failed, &rj).await; });
+    Ok(())
+}
+
+/// Run a full robustness test with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn run_robustness_test_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>) -> Result<RobustnessReport, String> {
+    let report = run_robustness_test(db, agent_type, prompt_variant_id, recommendation_id)?;
+    let pg = pg_db.clone();
+    let id = report.id.clone(); let vid = report.prompt_variant_id.clone(); let rid = report.recommendation_id.clone();
+    let total = report.total_tests as i64; let passed = report.passed as i64; let failed = report.failed as i64;
+    let rj = serde_json::to_string(&report).unwrap_or_default();
+    tokio::spawn(async move { let _ = pg.save_robustness_report(&id, vid.as_deref(), rid.as_deref(), total, passed, failed, &rj).await; });
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

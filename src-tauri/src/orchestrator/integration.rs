@@ -777,6 +777,7 @@ impl Orchestrator {
             return None;
         }
 
+        // PG: complex dynamic SQL
         match self.db.connection() {
             Ok(conn) => {
                 let config = CuratorConfig {
@@ -837,6 +838,7 @@ impl Orchestrator {
             state.task_run_id
         );
 
+        // PG: complex dynamic SQL
         match self.db.connection() {
             Ok(conn) => {
                 let mut resolved_count = 0;

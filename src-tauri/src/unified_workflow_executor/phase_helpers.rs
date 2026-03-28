@@ -1099,6 +1099,7 @@ pub(super) fn store_parsed_findings(
     task_run_id: &str,
     findings: &[ParsedFinding],
 ) {
+    // PG: complex dynamic SQL
     let conn = match db.connection() {
         Ok(c) => c,
         Err(e) => {

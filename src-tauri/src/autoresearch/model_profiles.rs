@@ -71,6 +71,7 @@ pub fn build_model_profile(
     let model = model_id.to_string();
     let period_start = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         // Get runs that used this model (via phase_token_usage) and their outcomes
         let result = conn.query_row(
@@ -149,6 +150,7 @@ pub fn build_all_profiles(db: &CheckpointDb, days: i64) -> Result<Vec<ModelProfi
     let period_start = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
     // Get distinct models
+    // PG: complex dynamic SQL
     let models: Vec<String> = db.with_conn(move |conn| {
         let mut stmt = conn
             .prepare(
@@ -248,6 +250,7 @@ pub fn save_model_profile(db: &CheckpointDb, profile: &ModelProfile) -> Result<(
     let trial_count = profile.trial_count as i64;
     let last_updated = profile.last_updated.clone();
 
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         conn.execute(
             r#"INSERT INTO model_profiles (id, model_id, profile_json, trial_count, last_updated)
@@ -270,6 +273,7 @@ pub fn save_model_profile(db: &CheckpointDb, profile: &ModelProfile) -> Result<(
 
 /// Load all saved model profiles.
 pub fn list_model_profiles(db: &CheckpointDb) -> Result<Vec<ModelProfile>, String> {
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         let mut stmt = conn
             .prepare("SELECT profile_json FROM model_profiles ORDER BY trial_count DESC")

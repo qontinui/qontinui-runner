@@ -225,6 +225,39 @@ pub fn build_from_history(
     Ok(dataset)
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Save a golden dataset with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn save_golden_dataset_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
+    save_golden_dataset(db, dataset)?;
+    let pg = pg_db.clone();
+    let id = dataset.id.clone(); let at = dataset.agent_type.clone(); let name = dataset.name.clone();
+    let ej = serde_json::to_string(&dataset.entries).unwrap_or_default(); let ec = dataset.entries.len() as i64;
+    tokio::spawn(async move { let _ = pg.save_golden_dataset(&id, &at, &name, &ej, ec).await; });
+    Ok(())
+}
+
+/// Delete a golden dataset with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn delete_golden_dataset_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset_id: &str) -> Result<(), String> {
+    delete_golden_dataset(db, dataset_id)?;
+    let pg = pg_db.clone(); let did = dataset_id.to_string();
+    tokio::spawn(async move { let _ = pg.delete_golden_dataset(&did).await; });
+    Ok(())
+}
+
+/// Build a golden dataset from history with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn build_from_history_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, max_entries: usize) -> Result<GoldenDataset, String> {
+    let dataset = build_from_history(db, agent_type, max_entries)?;
+    let pg = pg_db.clone();
+    let id = dataset.id.clone(); let at = dataset.agent_type.clone(); let name = dataset.name.clone();
+    let ej = serde_json::to_string(&dataset.entries).unwrap_or_default(); let ec = dataset.entries.len() as i64;
+    tokio::spawn(async move { let _ = pg.save_golden_dataset(&id, &at, &name, &ej, ec).await; });
+    Ok(dataset)
+}
+
 /// Simple string hash for deduplication (not cryptographic).
 fn md5_hash(s: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;

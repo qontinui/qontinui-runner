@@ -639,6 +639,54 @@ fn launch_optimizer_internal(
     Ok(task_run_id)
 }
 
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Check and launch optimizers with PG dual-write on maintenance operations.
+#[allow(dead_code)]
+pub fn check_and_launch_optimizers_with_pg(
+    deps: MetaOptimizerDeps,
+    source_task_run_id: String,
+) -> Result<Vec<String>, String> {
+    let mut launched = Vec::new();
+    let db = &deps.app_state.checkpoint_db;
+    let pg_db = &deps.app_state.pg_db;
+
+    for optimizer_type in OptimizerType::all() {
+        match should_launch_optimizer(db, *optimizer_type, &source_task_run_id) {
+            Ok(true) => {
+                if *optimizer_type == OptimizerType::MetaPrompt && !should_launch_meta_prompt_optimizer(db) {
+                    debug!("Skipping MetaPrompt — additional guards not met");
+                    continue;
+                }
+                match launch_optimizer(&deps, *optimizer_type) {
+                    Ok(id) => launched.push(id),
+                    Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
+                }
+            }
+            Ok(false) => {}
+            Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
+        }
+    }
+    if let Err(e) = super::snapshots::capture_periodic_with_pg(db, pg_db, super::types::WorkflowCategory::Main) {
+        warn!("Failed to capture periodic snapshot: {}", e);
+    }
+    crate::spec_experimentation::compliance::auto_extract_spec_compliance(db, &source_task_run_id);
+    super::recommendations::dedup_pending_recommendations_with_pg(db, pg_db);
+    super::recommendations::auto_reject_stale_recommendations_with_pg(db, pg_db);
+    super::canary::auto_rollback_stale_canaries_with_pg(db, pg_db);
+    super::parser::auto_apply_high_confidence_with_pg(db, pg_db, None);
+    auto_evaluate_outcomes(db);
+    auto_evaluate_canaries(db, Some(&deps.app_handle));
+    run_cost_analysis(db);
+    if let Err(e) = db.with_conn(|conn| {
+        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn).map(|_| ())
+    }) {
+        debug!("Baseline recomputation skipped: {}", e);
+    }
+    super::recommendations::auto_evaluate_with_agentic_scores(db);
+    Ok(launched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

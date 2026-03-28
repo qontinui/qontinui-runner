@@ -780,6 +780,7 @@ fn run_claude_session_inline(
                 // Store in database if connection is available
                 if let Some(ref db) = db {
                     // Get a connection from the pool for this operation
+                    // PG: complex dynamic SQL
                     let conn = match db.connection() {
                         Ok(c) => c,
                         Err(e) => {
@@ -1127,6 +1128,7 @@ fn run_claude_session_inline(
                 );
 
                 if let Some(ref db) = db {
+                    // PG: complex dynamic SQL
                     let conn = match db.connection() {
                         Ok(c) => c,
                         Err(e) => {
@@ -1424,6 +1426,7 @@ fn run_claude_session_inline(
                     let reflection_task_run_id = sc.context.task_run_id.clone();
                     // Look up source_task_run_id from DB
                     let db = CheckpointDb::new().ok()?;
+                    // PG: complex dynamic SQL
                     let conn = db.connection().ok()?;
                     let source_id: Option<String> = conn
                         .query_row(
@@ -1475,6 +1478,7 @@ fn run_claude_session_inline(
                     );
 
                     if let Some(ref db) = db {
+                        // PG: complex dynamic SQL
                         let conn = match db.connection() {
                             Ok(c) => c,
                             Err(e) => {
@@ -1705,6 +1709,7 @@ fn run_claude_session_inline(
 
         if !causal_links.is_empty() {
             if let Ok(db) = CheckpointDb::new() {
+                // PG: complex dynamic SQL
                 if let Ok(conn) = db.connection() {
                     let rfx_ctx = reflection_fix_ctx.as_ref();
                     let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());

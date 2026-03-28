@@ -155,6 +155,7 @@ pub fn snapshot_spec_version(
         created_at: now.clone(),
     };
 
+    // PG: complex dynamic SQL
     db.with_conn({
         let id = id.clone();
         let spec_id = spec_id_owned.clone();
@@ -205,6 +206,7 @@ pub fn snapshot_spec_version(
 /// Get the latest version of a spec.
 pub fn get_latest_version(db: &CheckpointDb, spec_id: &str) -> Result<Option<SpecVersion>, String> {
     let sid = spec_id.to_string();
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let result = conn.query_row(
             r#"SELECT id, spec_id, version_number, content_hash, spec_json,
@@ -233,6 +235,7 @@ pub fn get_version_history(
 ) -> Result<Vec<SpecVersion>, String> {
     let sid = spec_id.to_string();
     let limit = limit.unwrap_or(50);
+    // PG: complex dynamic SQL
     db.with_conn(move |conn| {
         let mut stmt = conn
             .prepare(
@@ -434,6 +437,7 @@ pub fn diff_spec_versions(
     to_version: i64,
 ) -> Result<SpecDiff, String> {
     let sid = spec_id.to_string();
+    // PG: complex dynamic SQL
     let (old_json, new_json) = db.with_conn(move |conn| {
         let old: String = conn
             .query_row(

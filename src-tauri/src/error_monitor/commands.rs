@@ -33,6 +33,7 @@ pub async fn query_error_events(
     );
     let db = db.inner().clone();
     let result = tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::query(&conn, &query)
     })
@@ -53,10 +54,20 @@ pub async fn query_error_events(
 #[tauri::command]
 pub async fn get_error_event(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     id: i64,
 ) -> Result<Option<StoredErrorEvent>, String> {
+    // Try PG first
+    if let Ok(Some(pg_event)) = app_state.pg_db.get_error_event_by_id(id).await {
+        if let Ok(event) = serde_json::from_value(pg_event) {
+            return Ok(Some(event));
+        }
+    }
+
+    // Fallback to SQLite
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::get_by_id(&conn, id)
     })
@@ -96,6 +107,7 @@ pub async fn get_unresolved_errors(
     // Fallback to SQLite
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::get_unresolved(&conn, task_run_id.as_deref(), limit)
     })
@@ -127,6 +139,7 @@ pub async fn update_error_status(
 
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::update_status(&conn, id, status_enum, resolution_notes.as_deref())
     })
@@ -151,6 +164,7 @@ pub async fn acknowledge_error(
 
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::update_status(&conn, id, ErrorStatus::Acknowledged, None)
     })
@@ -184,6 +198,7 @@ pub async fn resolve_error(
 
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         if let Some(ref task_run_id) = resolved_by_task_run_id {
             ErrorEventStorage::mark_resolved_by_task(
@@ -224,6 +239,7 @@ pub async fn ignore_error(
 
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::update_status(&conn, id, ErrorStatus::Ignored, reason.as_deref())
     })
@@ -235,11 +251,21 @@ pub async fn ignore_error(
 #[tauri::command]
 pub async fn link_error_to_finding(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     error_id: i64,
     finding_id: i64,
 ) -> Result<(), String> {
+    // Fire-and-forget PG dual-write
+    let pg = app_state.pg_db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pg.link_error_to_finding(error_id, finding_id).await {
+            tracing::warn!("PG link_error_to_finding failed: {}", e);
+        }
+    });
+
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::link_to_finding(&conn, error_id, finding_id)
     })
@@ -268,6 +294,7 @@ pub async fn get_error_summary(
     // Fallback to SQLite
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::get_summary(&conn, task_run_id.as_deref())
     })
@@ -285,6 +312,7 @@ pub async fn search_errors(
     let db = db.inner().clone();
     let limit = limit.unwrap_or(50);
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         ErrorEventStorage::search(&conn, &query, limit)
     })
@@ -309,6 +337,7 @@ pub async fn has_actionable_errors(
     // Fallback to SQLite
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let summary = ErrorEventStorage::get_summary(&conn, task_run_id.as_deref())?;
         Ok(summary.has_actionable_errors)
@@ -329,6 +358,7 @@ pub async fn get_recent_errors(
     let limit = limit.unwrap_or(10);
 
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let captured_after = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
 
@@ -357,6 +387,7 @@ pub async fn acknowledge_all_errors(
 ) -> Result<u32, String> {
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
 
         // Get all new errors
@@ -403,6 +434,7 @@ pub async fn get_debug_context(
     };
 
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let curator = DebugContextCurator::with_config(config);
         curator.build_context(&conn, task_run_id.as_deref())
@@ -420,6 +452,7 @@ pub async fn get_debug_context_for_ai(
     let db = db.inner().clone();
 
     tokio::task::spawn_blocking(move || {
+        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let curator = DebugContextCurator::new();
         let context = curator.build_context(&conn, task_run_id.as_deref())?;

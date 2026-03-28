@@ -453,3 +453,53 @@ pub fn generate_default_spec(db: &CheckpointDb, target_agent: &str) -> Result<Ev
         thresholds: EvalThresholds::default(),
     })
 }
+
+// ── PG dual-write wrappers ─────────────────────────────────────────────
+
+/// Save an eval spec with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn save_eval_spec_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, spec: &EvalSpec) -> Result<(), String> {
+    save_eval_spec(db, spec)?;
+    let pg = pg_db.clone();
+    let id = spec.id.clone();
+    let name = spec.name.clone();
+    let ta = spec.target_agent.clone().unwrap_or_default();
+    let sj = serde_json::to_string(spec).unwrap_or_default();
+    tokio::spawn(async move { let _ = pg.save_eval_spec(&id, &name, &ta, &sj).await; });
+    Ok(())
+}
+
+/// Delete an eval spec with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn delete_eval_spec_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, spec_id: &str) -> Result<(), String> {
+    delete_eval_spec(db, spec_id)?;
+    let pg = pg_db.clone();
+    let sid = spec_id.to_string();
+    tokio::spawn(async move { let _ = pg.delete_eval_spec(&sid).await; });
+    Ok(())
+}
+
+/// Save an eval result with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn save_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, result: &EvalResult) -> Result<(), String> {
+    save_eval_result(db, result)?;
+    let pg = pg_db.clone();
+    let r = result.clone();
+    let rj = serde_json::to_string(&r).unwrap_or_default();
+    let pv = r.comparison.as_ref().and_then(|c| c.p_value);
+    let tr = r.trials_run as i64;
+    tokio::spawn(async move { let _ = pg.save_eval_result(&r.id, &r.spec_id, r.recommendation_id.as_deref(), &r.status, &rj, pv, tr).await; });
+    Ok(())
+}
+
+/// Attach eval result to recommendation with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn attach_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, recommendation_id: &str, eval_result_id: &str, eval_status: &str) -> Result<(), String> {
+    attach_eval_result(db, recommendation_id, eval_result_id, eval_status)?;
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    let erid = eval_result_id.to_string();
+    let es = eval_status.to_string();
+    tokio::spawn(async move { let _ = pg.attach_eval_result(&rid, &erid, &es).await; });
+    Ok(())
+}

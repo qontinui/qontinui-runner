@@ -371,6 +371,22 @@ pub fn update_outcome(
     })
 }
 
+/// Update outcome with PG dual-write (fire-and-forget).
+#[allow(dead_code)]
+pub fn update_outcome_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+    outcome_json: &str,
+) -> Result<(), String> {
+    update_outcome(db, recommendation_id, outcome_json)?;
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    let json = outcome_json.to_string();
+    tokio::spawn(async move { let _ = pg.update_recommendation_outcome(&rid, &json).await; });
+    Ok(())
+}
+
 // ── Core snapshot capture ──────────────────────────────────────────────
 
 /// Capture a performance snapshot from learning_outcomes + phase_token_usage.

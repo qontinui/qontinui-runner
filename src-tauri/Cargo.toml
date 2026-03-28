@@ -52,11 +52,11 @@ base64 = "0.22"
 bollard = "0.18"
 opentelemetry = { version = "0.27", features = ["trace"] }
 opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["tonic", "http-proto", "http-json"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "http-json", "reqwest-client"] }
 tracing-opentelemetry = "0.28"
 axum = { version = "0.8", features = ["ws"] }
-async-graphql = { version = "7", features = ["chrono", "uuid", "tracing"] }
-async-graphql-axum = "7"
+async-graphql = { version = "8.0.0-rc.4", features = ["chrono", "uuid", "tracing"] }
+async-graphql-axum = "8.0.0-rc.4"
 futures = "0.3"
 futures-util = "0.3"
 async-stream = "0.3"

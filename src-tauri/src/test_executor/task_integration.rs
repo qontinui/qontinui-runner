@@ -275,6 +275,7 @@ fn insert_test_failure_finding(
     description: &str,
     test_name: &str,
 ) -> Result<String, String> {
+    // PG: complex dynamic SQL
     let conn = db.connection().map_err(|e| format!("DB error: {}", e))?;
 
     let finding_id = uuid::Uuid::new_v4().to_string();

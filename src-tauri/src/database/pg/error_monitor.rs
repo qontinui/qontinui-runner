@@ -244,6 +244,93 @@ impl PgDb {
         self.get_unresolved_errors(task_run_id, 50).await
     }
 
+    /// Bulk-resolve all unresolved errors scoped to a specific task run.
+    pub async fn resolve_errors_by_task_run(
+        &self,
+        task_run_id: &str,
+        resolved_by_task_run_id: &str,
+    ) -> Result<u64, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let count = conn
+            .execute(
+                r#"
+                UPDATE error_events SET
+                    status = 'resolved',
+                    resolved_by_task_run_id = $1,
+                    resolution_notes = 'Auto-resolved: workflow completed successfully',
+                    resolved_at = NOW()
+                WHERE task_run_id = $2
+                  AND status IN ('new', 'acknowledged', 'in_progress')
+                "#,
+                &[&resolved_by_task_run_id, &task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG resolve_errors_by_task_run: {}", e))?;
+
+        Ok(count)
+    }
+
+    /// Get a single error event by its ID.
+    pub async fn get_error_event_by_id(
+        &self,
+        id: i64,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"
+                SELECT e.id, e.log_source_id, e.log_source_name, e.task_run_id, e.workflow_step_id,
+                       e.log_timestamp::TEXT, e.captured_at::TEXT, e.severity, e.error_type, e.error_code,
+                       e.message, e.stack_trace, e.context_lines, e.raw_entry,
+                       e.file_path, e.line_number, e.column_number, e.function_name,
+                       e.signature_hash, e.occurrence_count, e.first_seen_at::TEXT, e.last_seen_at::TEXT,
+                       e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
+                       e.acknowledged_at::TEXT, e.resolved_at::TEXT, tr.workflow_name, e.trace_id
+                FROM error_events e
+                LEFT JOIN task_runs tr ON e.task_run_id = tr.id
+                WHERE e.id = $1
+                "#,
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_error_event_by_id: {}", e))?;
+
+        Ok(row.map(|r| Self::error_row_to_json(&r)))
+    }
+
+    /// Link an error event to a finding.
+    pub async fn link_error_to_finding(
+        &self,
+        error_id: i64,
+        finding_id: i64,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let finding_id_str = finding_id.to_string();
+        conn.execute(
+            "UPDATE error_events SET finding_id = $1, status = 'promoted' WHERE id = $2",
+            &[&finding_id_str, &error_id],
+        )
+        .await
+        .map_err(|e| format!("PG link_error_to_finding: {}", e))?;
+
+        Ok(())
+    }
+
     // ========================================================================
     // Internal helpers
     // ========================================================================

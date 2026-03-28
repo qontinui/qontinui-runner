@@ -229,6 +229,7 @@ impl LoopController {
         // Auto-detect recurring findings → known issues
         let auto_detected_ids: Vec<String> = self
             .checkpoint_db
+            // PG: complex dynamic SQL
             .with_conn(|conn| {
                 match crate::known_issues::auto_detect::check_and_promote_recurring_findings(
                     conn,
@@ -632,6 +633,7 @@ impl LoopController {
                     if let Some(issue_id) = step_id.strip_prefix("regression-") {
                         let issue_id = issue_id.to_string();
                         let success = step_result.success;
+                        // PG: complex dynamic SQL
                         if let Err(e) = db.with_conn(|conn| {
                             crate::known_issues::storage::increment_checked(conn, &issue_id)?;
                             if !success {
@@ -1327,6 +1329,7 @@ impl LoopController {
 
                 // Record blame as causal events for cross-run learning.
                 // Uses SQLite (checkpoint_db) since causal_events table is local.
+                // PG: complex dynamic SQL
                 if let Ok(conn) = self.checkpoint_db.connection() {
                     super::blame::record_blame_as_causal_events(
                         &conn,

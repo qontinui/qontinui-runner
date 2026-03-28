@@ -191,6 +191,75 @@ impl PgDb {
         Ok(rows.iter().map(row_to_rule).collect())
     }
 
+    /// Update an existing generation rule.
+    pub async fn update_rule(
+        &self,
+        id: &str,
+        input: &UpdateRuleInput,
+    ) -> Result<GenerationRule, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut sets = vec!["updated_at = $1".to_string()];
+        let mut param_values: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        param_values.push(Box::new(now));
+        let mut param_idx = 2u32;
+
+        if let Some(ref title) = input.title {
+            sets.push(format!("title = ${}", param_idx));
+            param_values.push(Box::new(title.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref content) = input.content {
+            sets.push(format!("content = ${}", param_idx));
+            param_values.push(Box::new(content.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref condition) = input.condition {
+            sets.push(format!("condition = ${}", param_idx));
+            param_values.push(Box::new(condition.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref status) = input.status {
+            sets.push(format!("status = ${}", param_idx));
+            param_values.push(Box::new(status.clone()));
+            param_idx += 1;
+        }
+        if let Some(rule_number) = input.rule_number {
+            sets.push(format!("rule_number = ${}", param_idx));
+            param_values.push(Box::new(rule_number));
+            param_idx += 1;
+        }
+        if let Some(ref severity) = input.severity {
+            sets.push(format!("severity = ${}", param_idx));
+            param_values.push(Box::new(severity.clone()));
+            param_idx += 1;
+        }
+        if let Some(ref examples_json) = input.examples_json {
+            sets.push(format!("examples_json = ${}", param_idx));
+            param_values.push(Box::new(examples_json.clone()));
+            param_idx += 1;
+        }
+
+        let sql = format!(
+            "UPDATE generation_rules SET {} WHERE id = ${}",
+            sets.join(", "),
+            param_idx
+        );
+        param_values.push(Box::new(id.to_string()));
+
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            param_values.iter().map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        conn.execute(&sql, &params)
+            .await
+            .map_err(|e| format!("PG update_rule: {}", e))?;
+
+        self.get_rule_by_id(id)
+            .await?
+            .ok_or_else(|| format!("Rule {} not found after update", id))
+    }
+
     /// Delete a generation rule by ID.
     pub async fn delete_rule(&self, id: &str) -> Result<bool, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;

@@ -47,6 +47,7 @@ pub fn should_launch_reflection(
 ) -> Result<bool, String> {
     let source_id = source_task_run_id.to_string();
 
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         // Guard 0: Check if a reflection for the SAME workflow is already running.
         // Only block if the running reflection's source shares the same workflow_name
@@ -624,6 +625,7 @@ pub fn analyze_convergence_status(
 /// workflow programmatically, and spawns it via LoopController.
 ///
 /// This is a synchronous function that spawns the workflow asynchronously.
+// PG: complex dynamic SQL
 /// All database operations use `with_conn` (sync) and the workflow is launched
 /// via `spawn_workflow_with_panic_guard` (fire-and-forget).
 pub fn launch_reflection(
@@ -639,6 +641,7 @@ pub fn launch_reflection(
 
     // Get source task run details
     let source_id = source_task_run_id.clone();
+    // PG: complex dynamic SQL
     let workflow_name = db.with_conn(|conn| {
         conn.query_row(
             "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
@@ -767,6 +770,7 @@ pub fn should_launch_project_reflection(
 ) -> Result<bool, String> {
     let source_id = source_task_run_id.to_string();
 
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         // Guard 0: Block if a project reflection for the SAME workflow is already running
         let has_running: bool = conn
@@ -981,6 +985,7 @@ pub fn launch_project_reflection(
 
     // Get source task run details
     let source_id = source_task_run_id.clone();
+    // PG: complex dynamic SQL
     let (workflow_name, project_path) = db.with_conn(|conn| {
         let wf_name: String = conn
             .query_row(
@@ -1148,6 +1153,7 @@ pub fn should_launch_ui_bridge_reflection(
 ) -> Result<bool, String> {
     let source_id = source_task_run_id.to_string();
 
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         // Guard 0: Block if a UI Bridge reflection for the SAME workflow is already running
         let has_running: bool = conn
@@ -1390,6 +1396,7 @@ pub fn launch_ui_bridge_reflection(
 
     // Get source task run details
     let source_id = source_task_run_id.clone();
+    // PG: complex dynamic SQL
     let workflow_name = db.with_conn(|conn| {
         conn.query_row(
             "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",

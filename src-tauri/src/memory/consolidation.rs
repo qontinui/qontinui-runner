@@ -79,7 +79,11 @@ pub struct ConsolidationResult {
 }
 
 /// Statistics from a single consolidation run.
+///
+/// Note: `rename_all = "camelCase"` is required — the MemoryHealthPanel.tsx frontend
+/// expects camelCase field names (e.g. `modelsCreated`, not `models_created`).
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConsolidationStats {
     pub observations_scanned: i32,
     pub groups_found: i32,

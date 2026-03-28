@@ -49,6 +49,7 @@ pub fn should_launch_fixer_excluding(
     let source_id = source_task_run_id.to_string();
     let exclude_id = exclude_fixer_id.map(|s| s.to_string());
 
+    // PG: complex dynamic SQL
     db.with_conn(|conn| {
         // Guard 0: Check if a fixer workflow is already running (exclude self if provided)
         let has_running: bool = if let Some(ref eid) = exclude_id {
@@ -233,6 +234,7 @@ pub async fn wait_for_children_complete(
         }
 
         let source_id = source_task_run_id.to_string();
+        // PG: complex dynamic SQL
         let still_running = db.with_conn(|conn| {
             let count: i64 = conn
                 .query_row(
@@ -282,6 +284,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
 
     // Get source task run details
     let source_id = source_task_run_id.clone();
+    // PG: complex dynamic SQL
     let workflow_name = db.with_conn(|conn| {
         conn.query_row(
             "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",

@@ -431,6 +431,7 @@ impl ErrorMonitorService {
         let db = self.db.clone();
         let sources_for_db = sources.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
+            // PG: complex dynamic SQL
             let conn = db.connection()?;
             // Clear existing sources and re-insert from settings
             conn.execute("DELETE FROM log_sources", [])
@@ -462,6 +463,7 @@ impl ErrorMonitorService {
         let db = self.db.clone();
         let source_clone = source.clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
+            // PG: complex dynamic SQL
             let conn = db.connection()?;
             LogSourceStorage::insert(&conn, &source_clone)
         })
@@ -511,6 +513,7 @@ impl ErrorMonitorService {
         let db = self.db.clone();
         let name_owned = name.to_string();
         if let Err(e) = tokio::task::spawn_blocking(move || {
+            // PG: complex dynamic SQL
             let conn = db.connection()?;
             LogSourceStorage::delete_by_name(&conn, &name_owned)
         })

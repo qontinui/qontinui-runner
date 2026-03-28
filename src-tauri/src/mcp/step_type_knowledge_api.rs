@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::workflow_generation::step_type_knowledge::{
-    self, InsertKnowledgeInput, ListKnowledgeQuery, StepTypeKnowledge, UpdateKnowledgeInput,
+    InsertKnowledgeInput, ListKnowledgeQuery, StepTypeKnowledge, UpdateKnowledgeInput,
 };
 
 /// GET /step-type-knowledge
@@ -25,8 +25,9 @@ pub async fn list_knowledge_handler(
 ) -> Result<Json<ApiResponse<Vec<StepTypeKnowledge>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let entries = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| step_type_knowledge::list_knowledge(conn, &query))
+        .pg_db
+        .list_step_type_knowledge(&query)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,8 +50,9 @@ pub async fn get_knowledge_handler(
 ) -> Result<Json<ApiResponse<StepTypeKnowledge>>, (StatusCode, Json<ApiResponse<()>>)> {
     let entry = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| step_type_knowledge::get_knowledge(conn, &id))
+        .pg_db
+        .get_step_type_knowledge(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -79,8 +81,9 @@ pub async fn create_knowledge_handler(
 ) -> Result<Json<ApiResponse<StepTypeKnowledge>>, (StatusCode, Json<ApiResponse<()>>)> {
     let entry = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| step_type_knowledge::insert_knowledge(conn, &input))
+        .pg_db
+        .insert_step_type_knowledge(&input)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -109,8 +112,9 @@ pub async fn update_knowledge_handler(
 ) -> Result<Json<ApiResponse<StepTypeKnowledge>>, (StatusCode, Json<ApiResponse<()>>)> {
     let entry = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| step_type_knowledge::update_knowledge(conn, &id, &input))
+        .pg_db
+        .update_step_type_knowledge(&id, &input)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -135,8 +139,9 @@ pub async fn delete_knowledge_handler(
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
     let deleted = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| step_type_knowledge::delete_knowledge(conn, &id))
+        .pg_db
+        .delete_step_type_knowledge(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
