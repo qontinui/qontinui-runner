@@ -51,7 +51,11 @@ pub mod canvas;
 pub mod orchestration_loop;
 pub mod scheduler;
 pub mod recordings;
+pub mod spec_experimentation;
 pub mod step_type_knowledge;
+pub mod hooks;
+pub mod comparison;
+pub mod tiered_info;
 
 use tracing::{info, warn};
 

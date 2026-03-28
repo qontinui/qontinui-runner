@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use rusqlite::params;
 use tauri::State;
 
 use crate::commands::AppState;
@@ -77,15 +76,10 @@ pub async fn start_comparison(
     let ejs = entries_json.clone();
     let now_c = now.clone();
 
-    app_state.checkpoint_db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO comparison_runs (id, workflow_id, variation_type, status, entries_json, created_at) \
-             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
-            params![cid, wid, vtype, ejs, now_c],
-        )
-        .map_err(|e| format!("Failed to create comparison: {}", e))?;
-        Ok(())
-    })?;
+    app_state
+        .pg_db
+        .insert_comparison(&cid, &wid, &vtype, &ejs)
+        .await?;
 
     // Launch runs via local HTTP API in background
     let db = app_state.checkpoint_db.clone();
@@ -136,7 +130,7 @@ pub async fn start_comparison(
         let _ = db.with_conn(|conn| {
             conn.execute(
                 "UPDATE comparison_runs SET entries_json = ?1, status = ?2 WHERE id = ?3",
-                params![ejs, new_status, comp_id],
+                rusqlite::params![ejs, new_status, comp_id],
             )
             .map_err(|e| format!("{}", e))?;
             Ok(())
@@ -154,39 +148,20 @@ pub async fn get_comparison_status(
 ) -> Result<serde_json::Value, String> {
     let db = &app_state.checkpoint_db;
 
-    let row = db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, workflow_id, variation_type, status, entries_json, report, created_at, completed_at \
-                 FROM comparison_runs WHERE id = ?1",
-            )
-            .map_err(|e| format!("Prepare failed: {}", e))?;
+    let cmp_json = app_state
+        .pg_db
+        .get_comparison(&comparison_id)
+        .await?
+        .ok_or_else(|| format!("Comparison not found: {}", comparison_id))?;
 
-        stmt.query_row(params![comparison_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ))
-        })
-        .map_err(|e| format!("Comparison not found: {}", e))
-    })?;
-
-    let (
-        id,
-        workflow_id,
-        variation_type,
-        status,
-        entries_json_str,
-        report,
-        created_at,
-        completed_at,
-    ) = row;
+    let id = cmp_json["id"].as_str().unwrap_or("").to_string();
+    let workflow_id = cmp_json["workflow_id"].as_str().unwrap_or("").to_string();
+    let variation_type = cmp_json["variation_type"].as_str().unwrap_or("").to_string();
+    let status = cmp_json["status"].as_str().unwrap_or("").to_string();
+    let entries_json_str = cmp_json["entries_json"].as_str().unwrap_or("[]").to_string();
+    let report: Option<String> = cmp_json["report"].as_str().map(|s| s.to_string());
+    let created_at = cmp_json["created_at"].as_str().unwrap_or("").to_string();
+    let completed_at: Option<String> = cmp_json["completed_at"].as_str().map(|s| s.to_string());
 
     let mut entries: Vec<ComparisonEntryJson> =
         serde_json::from_str(&entries_json_str).unwrap_or_default();
@@ -236,16 +211,11 @@ pub async fn get_comparison_status(
 
     // Auto-complete if all done
     let final_status = if all_done && status == "running" {
-        let now = chrono::Utc::now().to_rfc3339();
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE comparison_runs SET status = 'completed', completed_at = ?1, entries_json = ?2 WHERE id = ?3",
-                params![now, entries_str, id],
-            )
-            .map_err(|e| format!("{}", e))?;
-            Ok(())
-        });
+        let _ = app_state
+            .pg_db
+            .complete_comparison(&id, &entries_str)
+            .await;
         "completed".to_string()
     } else {
         status
@@ -268,49 +238,7 @@ pub async fn get_comparison_status(
 pub async fn list_comparisons(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let db = &app_state.checkpoint_db;
-
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, workflow_id, variation_type, status, entries_json, report, created_at, completed_at \
-                 FROM comparison_runs ORDER BY created_at DESC LIMIT 50",
-            )
-            .map_err(|e| format!("Prepare failed: {}", e))?;
-
-        let results = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            })
-            .map_err(|e| format!("Query failed: {}", e))?
-            .filter_map(|r| r.ok())
-            .map(|(id, workflow_id, variation_type, status, entries_json_str, report, created_at, completed_at)| {
-                let entries: Vec<ComparisonEntryJson> =
-                    serde_json::from_str(&entries_json_str).unwrap_or_default();
-                serde_json::json!({
-                    "id": id,
-                    "workflow_id": workflow_id,
-                    "variation_type": variation_type,
-                    "status": status,
-                    "entries": entries,
-                    "report": report,
-                    "created_at": created_at,
-                    "completed_at": completed_at,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok(results)
-    })
+    app_state.pg_db.list_comparisons().await
 }
 
 fn calculate_duration(created_at: &str, completed_at: Option<&str>) -> u64 {

@@ -9,7 +9,6 @@
 
 use crate::commands::{AppState, CommandResponse};
 use crate::orchestrator::hooks::{Hook, HookAction, HookCondition, HookContext, HookTrigger};
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
@@ -398,64 +397,26 @@ fn hook_to_response(
 pub async fn get_all_hooks(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting all hooks");
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT id, name, description, trigger, action_type, action_config,
-                   enabled, execution_order, continue_on_failure, conditions,
-                   task_run_id, created_at, updated_at
-            FROM task_hooks
-            WHERE task_run_id IS NULL
-            ORDER BY execution_order ASC, created_at ASC
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let hooks_iter = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,          // id
-                row.get::<_, String>(1)?,          // name
-                row.get::<_, Option<String>>(2)?,  // description
-                row.get::<_, String>(3)?,          // trigger
-                row.get::<_, String>(4)?,          // action_type
-                row.get::<_, String>(5)?,          // action_config
-                row.get::<_, bool>(6)?,            // enabled
-                row.get::<_, i32>(7)?,             // execution_order
-                row.get::<_, bool>(8)?,            // continue_on_failure
-                row.get::<_, String>(9)?,          // conditions
-                row.get::<_, Option<String>>(10)?, // task_run_id
-                row.get::<_, String>(11)?,         // created_at
-                row.get::<_, String>(12)?,         // updated_at
-            ))
-        })
-        .map_err(|e| format!("Failed to query hooks: {}", e))?;
+    let pg_hooks = state.pg_db.list_hooks().await?;
 
     let mut hooks: Vec<HookResponse> = Vec::new();
 
-    for hook_result in hooks_iter {
-        let (
-            id,
-            name,
-            description,
-            trigger_str,
-            action_type,
-            action_config_str,
-            enabled,
-            execution_order,
-            continue_on_failure,
-            conditions_str,
-            task_run_id,
-            created_at,
-            updated_at,
-        ) = hook_result.map_err(|e| format!("Failed to read hook row: {}", e))?;
+    for hook_json in pg_hooks {
+        let id = hook_json["id"].as_str().unwrap_or("").to_string();
+        let name = hook_json["name"].as_str().unwrap_or("").to_string();
+        let description = hook_json["description"].as_str().map(|s| s.to_string());
+        let trigger_str = hook_json["trigger"].as_str().unwrap_or("");
+        let action_type = hook_json["action_type"].as_str().unwrap_or("").to_string();
+        let action_config_str = hook_json["action_config"].as_str().unwrap_or("{}");
+        let enabled = hook_json["enabled"].as_bool().unwrap_or(true);
+        let execution_order = hook_json["execution_order"].as_i64().unwrap_or(0) as i32;
+        let continue_on_failure = hook_json["continue_on_failure"].as_bool().unwrap_or(true);
+        let conditions_str = hook_json["conditions"].as_str().unwrap_or("[]");
+        let task_run_id = hook_json["task_run_id"].as_str().map(|s| s.to_string());
+        let created_at = hook_json["created_at"].as_str().unwrap_or("").to_string();
+        let updated_at = hook_json["updated_at"].as_str().unwrap_or("").to_string();
 
-        let trigger = match parse_trigger(&trigger_str) {
+        let trigger = match parse_trigger(trigger_str) {
             Ok(t) => t,
             Err(e) => {
                 error!("Invalid trigger for hook {}: {}", id, e);
@@ -463,7 +424,7 @@ pub async fn get_all_hooks(state: State<'_, Arc<AppState>>) -> Result<CommandRes
             }
         };
 
-        let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
+        let action_config: serde_json::Value = serde_json::from_str(action_config_str)
             .map_err(|e| format!("Failed to parse action config: {}", e))?;
 
         let action = match parse_action(&action_type, action_config.clone()) {
@@ -475,7 +436,7 @@ pub async fn get_all_hooks(state: State<'_, Arc<AppState>>) -> Result<CommandRes
         };
 
         let conditions: Vec<HookCondition> =
-            serde_json::from_str(&conditions_str).unwrap_or_default();
+            serde_json::from_str(conditions_str).unwrap_or_default();
 
         hooks.push(hook_to_response(
             id,
@@ -518,64 +479,31 @@ pub async fn get_hook(
 ) -> Result<CommandResponse, String> {
     info!("Getting hook: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    match state.pg_db.get_hook(&id).await? {
+        Some(hook_json) => {
+            let hid = hook_json["id"].as_str().unwrap_or("").to_string();
+            let name = hook_json["name"].as_str().unwrap_or("").to_string();
+            let description = hook_json["description"].as_str().map(|s| s.to_string());
+            let trigger_str = hook_json["trigger"].as_str().unwrap_or("");
+            let action_type = hook_json["action_type"].as_str().unwrap_or("").to_string();
+            let action_config_str = hook_json["action_config"].as_str().unwrap_or("{}");
+            let enabled = hook_json["enabled"].as_bool().unwrap_or(true);
+            let execution_order = hook_json["execution_order"].as_i64().unwrap_or(0) as i32;
+            let continue_on_failure = hook_json["continue_on_failure"].as_bool().unwrap_or(true);
+            let conditions_str = hook_json["conditions"].as_str().unwrap_or("[]");
+            let task_run_id = hook_json["task_run_id"].as_str().map(|s| s.to_string());
+            let created_at = hook_json["created_at"].as_str().unwrap_or("").to_string();
+            let updated_at = hook_json["updated_at"].as_str().unwrap_or("").to_string();
 
-    let result = conn.query_row(
-        r#"
-        SELECT id, name, description, trigger, action_type, action_config,
-               enabled, execution_order, continue_on_failure, conditions,
-               task_run_id, created_at, updated_at
-        FROM task_hooks
-        WHERE id = ?1
-        "#,
-        params![id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, bool>(6)?,
-                row.get::<_, i32>(7)?,
-                row.get::<_, bool>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
-            ))
-        },
-    );
-
-    match result {
-        Ok((
-            id,
-            name,
-            description,
-            trigger_str,
-            action_type,
-            action_config_str,
-            enabled,
-            execution_order,
-            continue_on_failure,
-            conditions_str,
-            task_run_id,
-            created_at,
-            updated_at,
-        )) => {
-            let trigger = parse_trigger(&trigger_str)?;
-            let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
+            let trigger = parse_trigger(trigger_str)?;
+            let action_config: serde_json::Value = serde_json::from_str(action_config_str)
                 .map_err(|e| format!("Failed to parse action config: {}", e))?;
             let action = parse_action(&action_type, action_config)?;
             let conditions: Vec<HookCondition> =
-                serde_json::from_str(&conditions_str).unwrap_or_default();
+                serde_json::from_str(conditions_str).unwrap_or_default();
 
             let hook = hook_to_response(
-                id,
+                hid,
                 name,
                 description,
                 trigger,
@@ -598,12 +526,11 @@ pub async fn get_hook(
                 ),
             })
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(CommandResponse {
+        None => Ok(CommandResponse {
             success: true,
             message: Some("Hook not found".to_string()),
             data: Some(serde_json::Value::Null),
         }),
-        Err(e) => Err(format!("Failed to query hook: {}", e)),
     }
 }
 
@@ -628,13 +555,7 @@ pub async fn create_hook(
     // Validate action
     let _ = parse_action(&request.action_type, request.action_config.clone())?;
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
     let id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
 
     let action_config_str = serde_json::to_string(&request.action_config)
         .map_err(|e| format!("Failed to serialize action config: {}", e))?;
@@ -642,33 +563,22 @@ pub async fn create_hook(
     let conditions_str = serde_json::to_string(&request.conditions)
         .map_err(|e| format!("Failed to serialize conditions: {}", e))?;
 
-    conn.execute(
-        r#"
-        INSERT INTO task_hooks (
-            id, name, description, trigger, action_type, action_config,
-            enabled, execution_order, continue_on_failure, conditions,
-            task_run_id, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-        "#,
-        params![
-            id,
-            request.name,
-            request.description,
-            request.trigger,
-            request.action_type,
-            action_config_str,
+    state
+        .pg_db
+        .create_hook(
+            &id,
+            &request.name,
+            request.description.as_deref(),
+            &request.trigger,
+            &request.action_type,
+            &action_config_str,
             request.enabled,
             request.execution_order,
             request.continue_on_failure,
-            conditions_str,
-            request.task_run_id,
-            now,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to create hook: {}", e))?;
-
-    drop(conn); // Release connection before calling get_hook
+            &conditions_str,
+            request.task_run_id.as_deref(),
+        )
+        .await?;
 
     // Fetch the created hook
     get_hook(id, state).await
@@ -691,71 +601,35 @@ pub async fn update_hook(
 ) -> Result<CommandResponse, String> {
     info!("Updating hook: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Get current hook values
-    let current = conn.query_row(
-        "SELECT name, description, trigger, action_type, action_config, enabled, execution_order, continue_on_failure, conditions FROM task_hooks WHERE id = ?1",
-        params![id],
-        |row| Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, bool>(5)?,
-            row.get::<_, i32>(6)?,
-            row.get::<_, bool>(7)?,
-            row.get::<_, String>(8)?,
-        ))
-    );
-
-    let (
-        current_name,
-        current_description,
-        current_trigger,
-        current_action_type,
-        current_action_config,
-        current_enabled,
-        current_execution_order,
-        current_continue_on_failure,
-        current_conditions,
-    ) = match current {
-        Ok(v) => v,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
+    // Get current hook values from PG
+    let current = match state.pg_db.get_hook(&id).await? {
+        Some(v) => v,
+        None => {
             return Ok(CommandResponse {
                 success: false,
                 message: Some("Hook not found".to_string()),
                 data: None,
             });
         }
-        Err(e) => return Err(format!("Failed to query hook: {}", e)),
     };
 
     // Apply updates
-    let name = request.name.unwrap_or(current_name);
-    let description = request.description.unwrap_or(current_description);
-    let trigger = request.trigger.unwrap_or(current_trigger);
-    let action_type = request.action_type.unwrap_or(current_action_type);
+    let name = request.name.unwrap_or_else(|| current["name"].as_str().unwrap_or("").to_string());
+    let description = request.description.unwrap_or_else(|| current["description"].as_str().map(|s| s.to_string()));
+    let trigger = request.trigger.unwrap_or_else(|| current["trigger"].as_str().unwrap_or("").to_string());
+    let action_type = request.action_type.unwrap_or_else(|| current["action_type"].as_str().unwrap_or("").to_string());
     let action_config_str = match request.action_config {
         Some(config) => serde_json::to_string(&config)
             .map_err(|e| format!("Failed to serialize action config: {}", e))?,
-        None => current_action_config,
+        None => current["action_config"].as_str().unwrap_or("{}").to_string(),
     };
-    let enabled = request.enabled.unwrap_or(current_enabled);
-    let execution_order = request.execution_order.unwrap_or(current_execution_order);
-    let continue_on_failure = request
-        .continue_on_failure
-        .unwrap_or(current_continue_on_failure);
+    let enabled = request.enabled.unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(true));
+    let execution_order = request.execution_order.unwrap_or_else(|| current["execution_order"].as_i64().unwrap_or(0) as i32);
+    let continue_on_failure = request.continue_on_failure.unwrap_or_else(|| current["continue_on_failure"].as_bool().unwrap_or(true));
     let conditions_str = match request.conditions {
         Some(conditions) => serde_json::to_string(&conditions)
             .map_err(|e| format!("Failed to serialize conditions: {}", e))?,
-        None => current_conditions,
+        None => current["conditions"].as_str().unwrap_or("[]").to_string(),
     };
 
     // Validate trigger
@@ -766,38 +640,21 @@ pub async fn update_hook(
         .map_err(|e| format!("Failed to parse action config: {}", e))?;
     let _ = parse_action(&action_type, action_config)?;
 
-    conn.execute(
-        r#"
-        UPDATE task_hooks SET
-            name = ?1,
-            description = ?2,
-            trigger = ?3,
-            action_type = ?4,
-            action_config = ?5,
-            enabled = ?6,
-            execution_order = ?7,
-            continue_on_failure = ?8,
-            conditions = ?9,
-            updated_at = ?10
-        WHERE id = ?11
-        "#,
-        params![
-            name,
-            description,
-            trigger,
-            action_type,
-            action_config_str,
+    state
+        .pg_db
+        .update_hook(
+            &id,
+            &name,
+            description.as_deref(),
+            &trigger,
+            &action_type,
+            &action_config_str,
             enabled,
             execution_order,
             continue_on_failure,
-            conditions_str,
-            now,
-            id,
-        ],
-    )
-    .map_err(|e| format!("Failed to update hook: {}", e))?;
-
-    drop(conn);
+            &conditions_str,
+        )
+        .await?;
 
     // Fetch the updated hook
     get_hook(id, state).await
@@ -818,16 +675,9 @@ pub async fn delete_hook(
 ) -> Result<CommandResponse, String> {
     info!("Deleting hook: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    let deleted = state.pg_db.delete_hook(&id).await?;
 
-    let affected = conn
-        .execute("DELETE FROM task_hooks WHERE id = ?1", params![id])
-        .map_err(|e| format!("Failed to delete hook: {}", e))?;
-
-    if affected == 0 {
+    if !deleted {
         return Ok(CommandResponse {
             success: false,
             message: Some("Hook not found".to_string()),
@@ -859,21 +709,9 @@ pub async fn set_hook_enabled(
 ) -> Result<CommandResponse, String> {
     info!("Setting hook {} enabled={}", id, enabled);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    let updated = state.pg_db.set_hook_enabled(&id, enabled).await?;
 
-    let now = chrono::Utc::now().to_rfc3339();
-
-    let affected = conn
-        .execute(
-            "UPDATE task_hooks SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
-            params![enabled, now, id],
-        )
-        .map_err(|e| format!("Failed to update hook: {}", e))?;
-
-    if affected == 0 {
+    if !updated {
         return Ok(CommandResponse {
             success: false,
             message: Some("Hook not found".to_string()),
@@ -909,20 +747,7 @@ pub async fn reorder_hooks(
 ) -> Result<CommandResponse, String> {
     info!("Reordering {} hooks", request.hook_ids.len());
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    let now = chrono::Utc::now().to_rfc3339();
-
-    for (index, hook_id) in request.hook_ids.iter().enumerate() {
-        conn.execute(
-            "UPDATE task_hooks SET execution_order = ?1, updated_at = ?2 WHERE id = ?3",
-            params![index as i32, now, hook_id],
-        )
-        .map_err(|e| format!("Failed to update hook order: {}", e))?;
-    }
+    state.pg_db.reorder_hooks(&request.hook_ids).await?;
 
     Ok(CommandResponse {
         success: true,
@@ -946,29 +771,20 @@ pub async fn test_hook(
 ) -> Result<CommandResponse, String> {
     info!("Testing hook: {}", request.hook_id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    // Get the hook
-    let result = conn.query_row(
-        "SELECT action_type, action_config FROM task_hooks WHERE id = ?1",
-        params![request.hook_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    );
-
-    let (action_type, action_config_str) = match result {
-        Ok(v) => v,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
+    // Get the hook from PG
+    let hook_json = match state.pg_db.get_hook(&request.hook_id).await? {
+        Some(v) => v,
+        None => {
             return Ok(CommandResponse {
                 success: false,
                 message: Some("Hook not found".to_string()),
                 data: None,
             });
         }
-        Err(e) => return Err(format!("Failed to query hook: {}", e)),
     };
+
+    let action_type = hook_json["action_type"].as_str().unwrap_or("").to_string();
+    let action_config_str = hook_json["action_config"].as_str().unwrap_or("{}").to_string();
 
     let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
         .map_err(|e| format!("Failed to parse action config: {}", e))?;

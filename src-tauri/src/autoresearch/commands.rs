@@ -68,49 +68,27 @@ pub async fn get_autoresearch_results_tsv(
 pub async fn get_autoresearch_campaign_history(
     filter: Option<String>,
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<CampaignSummary>, String> {
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match &filter {
-            Some(f) => (
-                "SELECT id, name, status, experiment_count, accepted_count, config_json, created_at \
-                 FROM autoresearch_campaigns WHERE name LIKE ?1 ORDER BY created_at DESC"
-                    .to_string(),
-                vec![Box::new(format!("%{}%", f)) as Box<dyn rusqlite::types::ToSql>],
-            ),
-            None => (
-                "SELECT id, name, status, experiment_count, accepted_count, config_json, created_at \
-                 FROM autoresearch_campaigns ORDER BY created_at DESC"
-                    .to_string(),
-                vec![],
-            ),
-        };
+    let rows = app_state
+        .pg_db
+        .get_autoresearch_campaigns(filter.as_deref())
+        .await?;
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-        let rows = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(CampaignSummary {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    status: row.get(2)?,
-                    experiment_count: row.get(3)?,
-                    accepted_count: row.get(4)?,
-                    config_json: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query campaigns: {}", e))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
-        }
-        Ok(results)
-    })
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, status, experiment_count, accepted_count, config_json, created_at)| {
+            CampaignSummary {
+                id,
+                name,
+                status,
+                experiment_count,
+                accepted_count,
+                config_json,
+                created_at,
+            }
+        })
+        .collect())
 }
 
 /// Get all experiments for a specific campaign, returning (experiment_number, ExperimentResult).
@@ -118,67 +96,39 @@ pub async fn get_autoresearch_campaign_history(
 pub async fn get_autoresearch_campaign_experiments(
     campaign_id: String,
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<(u32, ExperimentResult)>, String> {
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                "SELECT experiment_number, config_json, trials_json, aggregate_json, accepted, reason, p_value \
-                 FROM autoresearch_experiments WHERE campaign_id = ?1 ORDER BY experiment_number ASC",
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+    let rows = app_state
+        .pg_db
+        .get_autoresearch_experiments(&campaign_id)
+        .await?;
 
-        let rows = stmt
-            .query_map([&campaign_id], |row| {
-                let experiment_number: u32 = row.get(0)?;
-                let config_json: String = row.get(1)?;
-                let trials_json: String = row.get(2)?;
-                let aggregate_json: String = row.get(3)?;
-                let accepted: bool = row.get(4)?;
-                let reason: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
-                let p_value: Option<f64> = row.get(6)?;
-                Ok((
-                    experiment_number,
-                    config_json,
-                    trials_json,
-                    aggregate_json,
-                    accepted,
-                    reason,
-                    p_value,
-                ))
-            })
-            .map_err(|e| format!("Failed to query experiments: {}", e))?;
+    let mut results = Vec::new();
+    for (num, config_json, trials_json, aggregate_json, accepted, reason, p_value) in rows {
+        let config: super::types::ExperimentConfig =
+            serde_json::from_str(&config_json)
+                .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
+        let trials: Vec<super::types::TrialResult> =
+            serde_json::from_str(&trials_json)
+                .map_err(|e| format!("Failed to parse trials JSON: {}", e))?;
+        let aggregate: super::types::AggregateMetrics =
+            serde_json::from_str(&aggregate_json)
+                .map_err(|e| format!("Failed to parse aggregate JSON: {}", e))?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            let (num, config_json, trials_json, aggregate_json, accepted, reason, p_value) =
-                row.map_err(|e| format!("Failed to read row: {}", e))?;
-
-            let config: super::types::ExperimentConfig =
-                serde_json::from_str(&config_json)
-                    .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
-            let trials: Vec<super::types::TrialResult> =
-                serde_json::from_str(&trials_json)
-                    .map_err(|e| format!("Failed to parse trials JSON: {}", e))?;
-            let aggregate: super::types::AggregateMetrics =
-                serde_json::from_str(&aggregate_json)
-                    .map_err(|e| format!("Failed to parse aggregate JSON: {}", e))?;
-
-            results.push((
-                num,
-                ExperimentResult {
-                    config,
-                    trials,
-                    aggregate,
-                    accepted,
-                    reason,
-                    p_value,
-                    ai_recommendation: None,
-                },
-            ));
-        }
-        Ok(results)
-    })
+        results.push((
+            num as u32,
+            ExperimentResult {
+                config,
+                trials,
+                aggregate,
+                accepted,
+                reason: reason.unwrap_or_default(),
+                p_value,
+                ai_recommendation: None,
+            },
+        ));
+    }
+    Ok(results)
 }
 
 // =============================================================================
@@ -193,19 +143,8 @@ pub async fn rerun_autoresearch_campaign(
     db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<String, String> {
-    // Load the original campaign's config
-    // PG: complex dynamic SQL
-    let config_json: String = db.with_conn({
-        let campaign_id = campaign_id.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT config_json FROM autoresearch_campaigns WHERE id = ?1",
-                rusqlite::params![campaign_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Campaign not found: {}", e))
-        }
-    })?;
+    // Load the original campaign's config from PG
+    let config_json: String = app_state.pg_db.get_campaign_config(&campaign_id).await?;
 
     let mut config: super::types::ResearchConfig = serde_json::from_str(&config_json)
         .map_err(|e| format!("Invalid campaign config: {}", e))?;
@@ -233,91 +172,57 @@ pub async fn compare_autoresearch_campaigns(
     campaign_id_a: String,
     campaign_id_b: String,
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<CampaignComparison, String> {
-    let load_campaign = |id: String| -> Result<
-        (CampaignSummary, Vec<(u32, super::types::ExperimentResult)>),
-        String,
-    > {
-        // PG: complex dynamic SQL
-        let summary = db.with_conn({
-            let id = id.clone();
-            move |conn| {
-                conn.query_row(
-                    "SELECT id, name, status, experiment_count, accepted_count, config_json, created_at \
-                     FROM autoresearch_campaigns WHERE id = ?1",
-                    rusqlite::params![id],
-                    |row| {
-                        Ok(CampaignSummary {
-                            id: row.get(0)?,
-                            name: row.get(1)?,
-                            status: row.get(2)?,
-                            experiment_count: row.get(3)?,
-                            accepted_count: row.get(4)?,
-                            config_json: row.get(5)?,
-                            created_at: row.get(6)?,
-                        })
-                    },
-                )
-                .map_err(|e| format!("Campaign not found: {}", e))
-            }
-        })?;
+    let pg_db = &app_state.pg_db;
 
-        // Load experiments for pass rate calculation
-        // PG: complex dynamic SQL
-        let experiments = db.with_conn({
-            let id = id.clone();
-            move |conn| {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT experiment_number, aggregate_json, accepted FROM autoresearch_experiments \
-                         WHERE campaign_id = ?1 ORDER BY experiment_number ASC",
-                    )
-                    .map_err(|e| format!("Failed to prepare query: {}", e))?;
+    // Helper: load campaign summary + experiments from PG
+    async fn load_campaign_pg(
+        pg_db: &crate::database::pg::PgDb,
+        id: &str,
+    ) -> Result<(CampaignSummary, Vec<(u32, super::types::ExperimentResult)>), String> {
+        let (sid, name, status, experiment_count, accepted_count, config_json, created_at) =
+            pg_db.get_campaign_summary_by_id(id).await?;
+        let summary = CampaignSummary {
+            id: sid,
+            name,
+            status,
+            experiment_count,
+            accepted_count,
+            config_json,
+            created_at,
+        };
 
-                let rows = stmt
-                    .query_map(rusqlite::params![id], |row| {
-                        let num: u32 = row.get(0)?;
-                        let agg_json: String = row.get(1)?;
-                        let accepted: bool = row.get(2)?;
-                        Ok((num, agg_json, accepted))
-                    })
-                    .map_err(|e| format!("Failed to query experiments: {}", e))?;
-
-                let mut results = Vec::new();
-                for row in rows {
-                    let (num, agg_json, accepted) = row.map_err(|e| format!("Row error: {}", e))?;
-                    let aggregate: super::types::AggregateMetrics = serde_json::from_str(&agg_json)
-                        .unwrap_or(super::types::AggregateMetrics {
-                            pass_rate: 0.0,
-                            mean_iterations: 0.0,
-                            mean_duration_ms: 0.0,
-                            trial_count: 0,
-                            mean_spec_compliance: None,
-                            mean_composite_agentic_score: None,
-                            mean_agentic_scores: None,
-                        });
-                    // We only need the aggregate for comparison; construct a minimal ExperimentResult
-                    let config: super::types::ExperimentConfig =
-                        serde_json::from_str("{}").unwrap_or_else(|_| serde_json::from_value(serde_json::json!({})).unwrap());
-                    results.push((num, super::types::ExperimentResult {
-                        config,
-                        trials: vec![],
-                        aggregate,
-                        accepted,
-                        reason: String::new(),
-                        p_value: None,
-                        ai_recommendation: None,
-                    }));
-                }
-                Ok(results)
-            }
-        })?;
-
+        let exp_rows = pg_db.get_experiments_for_comparison(id).await?;
+        let mut experiments = Vec::new();
+        for (num, agg_json, accepted) in exp_rows {
+            let aggregate: super::types::AggregateMetrics = serde_json::from_str(&agg_json)
+                .unwrap_or(super::types::AggregateMetrics {
+                    pass_rate: 0.0,
+                    mean_iterations: 0.0,
+                    mean_duration_ms: 0.0,
+                    trial_count: 0,
+                    mean_spec_compliance: None,
+                    mean_composite_agentic_score: None,
+                    mean_agentic_scores: None,
+                });
+            let config: super::types::ExperimentConfig =
+                serde_json::from_str("{}").unwrap_or_else(|_| serde_json::from_value(serde_json::json!({})).unwrap());
+            experiments.push((num as u32, super::types::ExperimentResult {
+                config,
+                trials: vec![],
+                aggregate,
+                accepted,
+                reason: String::new(),
+                p_value: None,
+                ai_recommendation: None,
+            }));
+        }
         Ok((summary, experiments))
-    };
+    }
 
-    let (summary_a, exps_a) = load_campaign(campaign_id_a)?;
-    let (summary_b, exps_b) = load_campaign(campaign_id_b)?;
+    let (summary_a, exps_a) = load_campaign_pg(pg_db, &campaign_id_a).await?;
+    let (summary_b, exps_b) = load_campaign_pg(pg_db, &campaign_id_b).await?;
 
     // Compute weighted average pass rate
     let compute_pass_rate = |exps: &[(u32, super::types::ExperimentResult)]| -> f64 {
@@ -485,21 +390,8 @@ pub async fn set_q_routing_override(
     // PG-first
     app_state.pg_db.upsert_q_override(&state_key, &forced_action).await?;
 
-    // SQLite fallback
-    let now = chrono::Utc::now().to_rfc3339();
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        conn.execute(
-            r#"INSERT INTO q_routing_overrides (state_key, forced_action, created_at)
-               VALUES (?1, ?2, ?3)
-               ON CONFLICT(state_key) DO UPDATE SET
-                   forced_action = ?2,
-                   created_at = ?3"#,
-            rusqlite::params![state_key, forced_action, now],
-        )
-        .map_err(|e| format!("Failed to set override: {}", e))?;
-        Ok(())
-    })
+    // PG is the primary store (upsert_q_override above); no SQLite fallback needed
+    Ok(())
 }
 
 /// Remove a manual override for a state.
@@ -515,17 +407,8 @@ pub async fn remove_q_routing_override(
         tracing::warn!("Failed to delete PG override for {}: {}", state_key, e);
     }
 
-    // SQLite
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        let deleted = conn
-            .execute(
-                "DELETE FROM q_routing_overrides WHERE state_key = ?1",
-                rusqlite::params![state_key],
-            )
-            .map_err(|e| format!("Failed to remove override: {}", e))?;
-        Ok(deleted > 0)
-    })
+    // PG is the primary store (delete_q_override above); no SQLite fallback needed
+    Ok(true)
 }
 
 // SQLite helpers delegated to q_router module
@@ -549,12 +432,8 @@ pub async fn reset_q_routing_table(
     // PG-first
     deleted_pg = app_state.pg_db.clear_q_table().await.unwrap_or(0);
 
-    // SQLite
-    // PG: complex dynamic SQL
-    let deleted_sqlite = db.with_conn(|conn| {
-        conn.execute("DELETE FROM q_routing_table", rusqlite::params![])
-            .map_err(|e| format!("Failed to clear SQLite Q-table: {}", e))
-    })? as u64;
+    // PG is the primary store; no SQLite Q-table cleanup needed
+    let deleted_sqlite: u64 = 0;
 
     tracing::info!(
         "Q-routing table reset: {} PG rows, {} SQLite rows deleted",

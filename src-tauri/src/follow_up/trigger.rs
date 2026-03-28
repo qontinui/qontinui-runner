@@ -52,128 +52,99 @@ pub struct FollowUpDeps {
 /// - The source run has insufficient output
 /// - The source output doesn't contain unfixed-issue signals
 pub fn should_launch_follow_up(
-    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
-    let source_id = source_task_run_id.to_string();
-
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        // Guard 0: Check if a follow-up workflow is already running
-        let has_running: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_follow_up = 1 AND workflow_type = 'unified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if has_running {
-            debug!("Skipping follow-up — another follow-up workflow is already running");
-            return Ok(false);
-        }
-
-        // Guard 1: Check if source task run is already a follow-up run
-        let is_follow_up: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_follow_up, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_follow_up: {}", e))?;
-
-        if is_follow_up {
-            debug!(
-                "Skipping follow-up for {} — source is already a follow-up run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 2: Check if source task run is a reflection run
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
-
-        if is_reflection {
-            debug!(
-                "Skipping follow-up for {} — source is a reflection run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 2b: Check if source task run is a fixer run
-        let is_fixer: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap_or(false);
-
-        if is_fixer {
-            debug!(
-                "Skipping follow-up for {} — source is a fixer run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 3: Check follow_up_enabled setting (default true)
-        // json_extract returns integers for JSON booleans (1/0), so use CAST to normalize
-        let follow_up_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.follow_up_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true); // Default to enabled if setting doesn't exist
-
-        if !follow_up_enabled {
-            debug!("Follow-up disabled in settings");
-            return Ok(false);
-        }
-
-        // Guard 4: Check that the source run has meaningful output to analyze
-        let has_output: bool = conn
-            .query_row(
-                r#"SELECT COALESCE(
-                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
-                    0
-                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !has_output {
-            debug!(
-                "Skipping follow-up for {} — insufficient output to analyze",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 5: Check that source output contains unfixed-issue signals
-        let has_signal = check_has_unfixed_signal(conn, &source_id)?;
-        if !has_signal {
-            debug!(
-                "Skipping follow-up for {} — no unfixed-issue signals found in output",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        Ok(true)
+    let pg = pg_db.clone();
+    let src_id = source_task_run_id.to_string();
+    tokio::task::block_in_place(move || {
+        tokio::runtime::Handle::current().block_on(async {
+            should_launch_follow_up_pg(&pg, &src_id).await
+        })
     })
+}
+
+/// PG-backed follow-up guard checks.
+async fn should_launch_follow_up_pg(
+    pg_db: &crate::database::pg::PgDb,
+    source_task_run_id: &str,
+) -> Result<bool, String> {
+    // Guard 0: Check if a follow-up workflow is already running
+    if pg_db.has_running_follow_up().await? {
+        debug!("Skipping follow-up — another follow-up workflow is already running");
+        return Ok(false);
+    }
+
+    // Guard 1-2b: Check task_run flags
+    let (is_reflection, is_fixer, is_follow_up) =
+        pg_db.get_task_run_flags(source_task_run_id).await?;
+
+    if is_follow_up {
+        debug!("Skipping follow-up for {} — source is already a follow-up run", source_task_run_id);
+        return Ok(false);
+    }
+    if is_reflection {
+        debug!("Skipping follow-up for {} — source is a reflection run", source_task_run_id);
+        return Ok(false);
+    }
+    if is_fixer {
+        debug!("Skipping follow-up for {} — source is a fixer run", source_task_run_id);
+        return Ok(false);
+    }
+
+    // Guard 3: Check follow_up_enabled setting
+    if !pg_db.get_dev_mode_setting_bool("follow_up_enabled", true).await? {
+        debug!("Follow-up disabled in settings");
+        return Ok(false);
+    }
+
+    // Guard 4: Check output threshold
+    if !pg_db.has_sufficient_output(source_task_run_id).await? {
+        debug!("Skipping follow-up for {} — insufficient output to analyze", source_task_run_id);
+        return Ok(false);
+    }
+
+    // Guard 5: Check that source output contains unfixed-issue signals
+    let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+    let chunks: Vec<String> = conn
+        .query(
+            r#"SELECT content FROM task_run_output_chunks
+               WHERE task_run_id = $1
+               ORDER BY chunk_sequence DESC
+               LIMIT 20"#,
+            &[&source_task_run_id],
+        )
+        .await
+        .map_err(|e| format!("Failed to query output chunks: {e}"))?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+
+    let output_log: String = conn
+        .query_one(
+            "SELECT COALESCE(output_log, '') FROM task_runs WHERE id = $1",
+            &[&source_task_run_id],
+        )
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or_default();
+
+    let combined = chunks.join(" ");
+    let tail_output = if !combined.is_empty() {
+        combined
+    } else {
+        output_log[output_log.len().saturating_sub(20000)..].to_string()
+    };
+
+    let lower = tail_output.to_lowercase();
+    let has_signal = UNFIXED_SIGNAL_PATTERNS.iter().any(|pattern| lower.contains(pattern));
+
+    if !has_signal {
+        debug!("Skipping follow-up for {} — no unfixed-issue signals found in output", source_task_run_id);
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 /// Scan the last ~20 output chunks for unfixed-issue signal patterns.
@@ -241,24 +212,25 @@ fn check_has_unfixed_signal(conn: &Connection, task_run_id: &str) -> Result<bool
 ///
 /// This is a synchronous function that spawns the workflow asynchronously.
 pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Result<String, String> {
-    let db = &deps.app_state.checkpoint_db;
+    let pg_db = &deps.app_state.pg_db;
 
     // Final check before launching
-    if !should_launch_follow_up(db, &source_task_run_id)? {
+    if !should_launch_follow_up(pg_db, &source_task_run_id)? {
         return Ok("skipped".to_string());
     }
 
-    // Get source task run details
-    let source_id = source_task_run_id.clone();
-    // PG: complex dynamic SQL
-    let workflow_name = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
-            rusqlite::params![source_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| format!("Failed to get source task run: {}", e))
-    })?;
+    let db = &deps.app_state.checkpoint_db;
+
+    // Get source task run details via block_in_place
+    let workflow_name = {
+        let pg = pg_db.clone();
+        let src_id = source_task_run_id.clone();
+        tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async {
+                pg.get_task_run_workflow_name(&src_id).await
+            })
+        })?
+    };
 
     // Create follow-up task run ID
     let follow_up_id = uuid::Uuid::new_v4().to_string();

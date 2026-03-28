@@ -34,190 +34,122 @@ pub struct FixerDeps {
 /// - The source task run is itself a fixer, reflection, or follow-up run
 /// - Fixer is disabled in settings
 /// - The source run has insufficient output
-pub fn should_launch_fixer(db: &CheckpointDb, source_task_run_id: &str) -> Result<bool, String> {
-    should_launch_fixer_excluding(db, source_task_run_id, None)
+pub fn should_launch_fixer(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, source_task_run_id: &str) -> Result<bool, String> {
+    should_launch_fixer_sync(pg_db, source_task_run_id, None)
+}
+
+/// Sync wrapper around async PG guard checks using tokio::task::block_in_place.
+fn should_launch_fixer_sync(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    source_task_run_id: &str,
+    exclude_fixer_id: Option<&str>,
+) -> Result<bool, String> {
+    let pg = pg_db.clone();
+    let src_id = source_task_run_id.to_string();
+    let exc_id = exclude_fixer_id.map(|s| s.to_string());
+    tokio::task::block_in_place(move || {
+        tokio::runtime::Handle::current().block_on(async {
+            should_launch_fixer_pg(&pg, &src_id, exc_id.as_deref()).await
+        })
+    })
 }
 
 /// Same as `should_launch_fixer` but excludes a specific task run ID from the
 /// "is another fixer running?" check. Used for the re-check after the fixer's
 /// own task run has been created (to avoid self-blocking).
 pub fn should_launch_fixer_excluding(
-    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     source_task_run_id: &str,
     exclude_fixer_id: Option<&str>,
 ) -> Result<bool, String> {
-    let source_id = source_task_run_id.to_string();
-    let exclude_id = exclude_fixer_id.map(|s| s.to_string());
+    should_launch_fixer_sync(pg_db, source_task_run_id, exclude_fixer_id)
+}
 
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        // Guard 0: Check if a fixer workflow is already running (exclude self if provided)
-        let has_running: bool = if let Some(ref eid) = exclude_id {
-            conn.query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_fixer = 1 AND workflow_type = 'unified' AND id != ?1",
-                rusqlite::params![eid],
-                |row| row.get(0),
+/// PG-backed fixer guard checks.
+async fn should_launch_fixer_pg(
+    pg_db: &crate::database::pg::PgDb,
+    source_task_run_id: &str,
+    exclude_fixer_id: Option<&str>,
+) -> Result<bool, String> {
+    // Guard 0: Check if a fixer workflow is already running
+    if pg_db.has_running_fixer(exclude_fixer_id).await? {
+        debug!("Skipping fixer — another fixer workflow is already running");
+        return Ok(false);
+    }
+
+    // Guard 1-3: Check task_run flags
+    let (is_reflection, is_fixer, is_follow_up) =
+        pg_db.get_task_run_flags(source_task_run_id).await?;
+
+    if is_fixer {
+        debug!("Skipping fixer for {} — source is already a fixer run", source_task_run_id);
+        return Ok(false);
+    }
+    if is_reflection {
+        debug!("Skipping fixer for {} — source is a reflection run", source_task_run_id);
+        return Ok(false);
+    }
+    if is_follow_up {
+        debug!("Skipping fixer for {} — source is a follow-up run", source_task_run_id);
+        return Ok(false);
+    }
+
+    // Guard 4: Check fixer_enabled setting
+    if !pg_db.get_dev_mode_setting_bool("fixer_enabled", true).await? {
+        debug!("Fixer disabled in settings");
+        return Ok(false);
+    }
+
+    // Guard 5: Check output threshold
+    if !pg_db.has_sufficient_output(source_task_run_id).await? {
+        debug!("Skipping fixer for {} — insufficient output to analyze", source_task_run_id);
+        return Ok(false);
+    }
+
+    // Guard 6: Check that reflection fixes exist
+    let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+    let fix_count: i64 = conn
+        .query_one(
+            "SELECT COUNT(*) FROM reflection_fixes WHERE source_task_run_id = $1",
+            &[&source_task_run_id],
+        )
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or(0);
+
+    if fix_count == 0 {
+        debug!("Skipping fixer: no reflection fixes found for source run {}", source_task_run_id);
+        return Ok(false);
+    }
+
+    // Guard 7: Skip fixer if source passed verification (fixer_on_failure_only)
+    let fixer_on_failure_only = pg_db.get_dev_mode_setting_bool("fixer_on_failure_only", true).await?;
+    if fixer_on_failure_only {
+        let verification_passed: bool = conn
+            .query_one(
+                "SELECT COALESCE(verification_passed, false) FROM task_runs WHERE id = $1",
+                &[&source_task_run_id],
             )
-            .unwrap_or(false)
-        } else {
-            conn.query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_fixer = 1 AND workflow_type = 'unified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false)
-        };
-
-        if has_running {
-            debug!("Skipping fixer — another fixer workflow is already running");
-            return Ok(false);
-        }
-
-        // Guard 1: Check if source task run is already a fixer run
-        let is_fixer: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_fixer: {}", e))?;
-
-        if is_fixer {
-            debug!(
-                "Skipping fixer for {} — source is already a fixer run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 2: Check if source task run is a reflection run
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
-
-        if is_reflection {
-            debug!(
-                "Skipping fixer for {} — source is a reflection run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 3: Check if source task run is a follow-up run
-        let is_follow_up: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_follow_up, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_follow_up: {}", e))?;
-
-        if is_follow_up {
-            debug!(
-                "Skipping fixer for {} — source is a follow-up run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 4: Check fixer_enabled setting (default true)
-        let fixer_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.fixer_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-
-        if !fixer_enabled {
-            debug!("Fixer disabled in settings");
-            return Ok(false);
-        }
-
-        // Guard 5: Check that the source run has meaningful output to analyze
-        let has_output: bool = conn
-            .query_row(
-                r#"SELECT COALESCE(
-                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
-                    0
-                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
+            .await
+            .map(|r| r.get(0))
             .unwrap_or(false);
 
-        if !has_output {
-            debug!(
-                "Skipping fixer for {} — insufficient output to analyze",
-                source_id
-            );
+        if verification_passed {
+            info!("Skipping fixer — parent workflow passed successfully (source: {})", source_task_run_id);
             return Ok(false);
         }
+    }
 
-        // Guard 6: Check that reflection fixes exist for the source run
-        let fix_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM reflection_fixes WHERE source_task_run_id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if fix_count == 0 {
-            debug!(
-                "Skipping fixer: no reflection fixes found for source run {}",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 7: Skip fixer if the source run passed verification (fixer_on_failure_only)
-        let fixer_on_failure_only: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.fixer_on_failure_only') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-
-        if fixer_on_failure_only {
-            let verification_passed: bool = conn
-                .query_row(
-                    "SELECT COALESCE(verification_passed, 0) FROM task_runs WHERE id = ?1",
-                    rusqlite::params![source_id],
-                    |row| row.get::<_, i32>(0).map(|v| v != 0),
-                )
-                .unwrap_or(false);
-
-            if verification_passed {
-                info!(
-                    "Skipping fixer — parent workflow passed successfully (source: {})",
-                    source_id
-                );
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    })
+    Ok(true)
 }
+
 
 /// Wait for all child task runs (reflections, follow-ups) of the given source
 /// to reach a terminal state. Polls every 5 seconds with a 10-minute timeout.
 ///
 /// Returns Ok(true) if all children completed, Ok(false) if timed out.
 pub async fn wait_for_children_complete(
-    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
     let max_wait = std::time::Duration::from_secs(600); // 10 minutes
@@ -233,22 +165,7 @@ pub async fn wait_for_children_complete(
             return Ok(false);
         }
 
-        let source_id = source_task_run_id.to_string();
-        // PG: complex dynamic SQL
-        let still_running = db.with_conn(|conn| {
-            let count: i64 = conn
-                .query_row(
-                    r#"SELECT COUNT(*) FROM task_runs
-                       WHERE parent_task_run_id = ?1
-                         AND status IN ('running', 'pending')
-                         AND id != ?1
-                         AND COALESCE(is_fixer, 0) = 0"#,
-                    rusqlite::params![source_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            Ok(count)
-        })?;
+        let still_running = pg_db.count_running_children(source_task_run_id).await?;
 
         if still_running == 0 {
             debug!(
@@ -275,24 +192,23 @@ pub async fn wait_for_children_complete(
 ///
 /// Returns the fixer task run ID or "skipped".
 pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<String, String> {
-    let db = &deps.app_state.checkpoint_db;
+    let pg_db = &deps.app_state.pg_db;
 
-    // Synchronous guard check before committing to spawn
-    if !should_launch_fixer(db, &source_task_run_id)? {
+    // Guard check before committing to spawn
+    if !should_launch_fixer(pg_db, &source_task_run_id)? {
         return Ok("skipped".to_string());
     }
 
-    // Get source task run details
-    let source_id = source_task_run_id.clone();
-    // PG: complex dynamic SQL
-    let workflow_name = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
-            rusqlite::params![source_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| format!("Failed to get source task run: {}", e))
-    })?;
+    // Get source task run details via block_in_place
+    let workflow_name = {
+        let pg = pg_db.clone();
+        let src_id = source_task_run_id.clone();
+        tokio::task::block_in_place(move || {
+            tokio::runtime::Handle::current().block_on(async {
+                pg.get_task_run_workflow_name(&src_id).await
+            })
+        })?
+    };
 
     // Create fixer task run ID
     let fixer_id = uuid::Uuid::new_v4().to_string();
@@ -318,6 +234,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         .with_fixer_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
 
+    let db = &deps.app_state.checkpoint_db;
     db.create_task_run(&input)?;
 
     // Spawn an async task that waits for children, then runs the fixer workflow
@@ -326,6 +243,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
     let workflow_name_clone = workflow_name.clone();
     let source_id_clone = source_task_run_id.clone();
     let db_clone = deps.app_state.checkpoint_db.clone();
+    let pg_db_clone = deps.app_state.pg_db.clone();
 
     tokio::spawn(async move {
         // Wait for all children to complete before building/running the fixer
@@ -333,7 +251,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
             "Fixer waiting for children of {} to complete...",
             source_id_clone
         );
-        match wait_for_children_complete(&db_clone, &source_id_clone).await {
+        match wait_for_children_complete(&pg_db_clone, &source_id_clone).await {
             Ok(true) => {
                 info!("All children complete, proceeding with fixer");
             }
@@ -343,23 +261,23 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
                     source_id_clone
                 );
                 // Mark the fixer run as failed
-                let _ = db_clone.update_task_run_status(&fixer_id_clone, "failed");
+                let _ = pg_db_clone.update_task_run_status(&fixer_id_clone, "failed").await;
                 return;
             }
             Err(e) => {
                 warn!("Fixer error waiting for children: {}", e);
-                let _ = db_clone.update_task_run_status(&fixer_id_clone, "failed");
+                let _ = pg_db_clone.update_task_run_status(&fixer_id_clone, "failed").await;
                 return;
             }
         }
 
         // Re-check guards after waiting (state may have changed)
         // Exclude own ID to avoid self-blocking (our task run is status='running')
-        match should_launch_fixer_excluding(&db_clone, &source_id_clone, Some(&fixer_id_clone)) {
+        match should_launch_fixer_excluding(&pg_db_clone, &source_id_clone, Some(&fixer_id_clone)) {
             Ok(true) => {}
             _ => {
                 info!("Fixer guards no longer pass after waiting — skipping");
-                let _ = db_clone.update_task_run_status(&fixer_id_clone, "stopped");
+                let _ = pg_db_clone.update_task_run_status(&fixer_id_clone, "stopped").await;
                 return;
             }
         }

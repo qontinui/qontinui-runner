@@ -87,10 +87,16 @@ impl From<&PendingDiscovery> for DiscoveryPreview {
 pub async fn get_pending_discoveries_cmd(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<Vec<PendingDiscovery>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match get_pending_discoveries(&conn) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        get_pending_discoveries(&conn)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(discoveries) => Ok(DiscoveryResponse::ok(discoveries)),
         Err(e) => Ok(DiscoveryResponse::err(e)),
     }
@@ -101,32 +107,30 @@ pub async fn get_pending_discoveries_cmd(
 pub async fn get_discovery_summary(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<DiscoverySummary>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    // Get sync status
-    let status = match get_sync_status(&conn) {
-        Ok(s) => s,
-        Err(e) => return Ok(DiscoveryResponse::err(e)),
-    };
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        let status = get_sync_status(&conn)?;
+        let all = get_pending_discoveries(&conn)?;
+        let recent: Vec<DiscoveryPreview> = all.iter().take(10).map(DiscoveryPreview::from).collect();
+        Ok::<_, String>((status, recent))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
-    // Get all pending for preview
-    let all = match get_pending_discoveries(&conn) {
-        Ok(d) => d,
-        Err(e) => return Ok(DiscoveryResponse::err(e)),
-    };
-
-    // Get recent (last 10)
-    let recent: Vec<DiscoveryPreview> = all.iter().take(10).map(DiscoveryPreview::from).collect();
-
-    let summary = DiscoverySummary {
-        pending_count: status.pending_count,
-        ready_for_sync: status.ready_for_retry,
-        can_sync: status.authenticated,
-        recent,
-    };
-
-    Ok(DiscoveryResponse::ok(summary))
+    match result {
+        Ok((status, recent)) => {
+            let summary = DiscoverySummary {
+                pending_count: status.pending_count,
+                ready_for_sync: status.ready_for_retry,
+                can_sync: status.authenticated,
+                recent,
+            };
+            Ok(DiscoveryResponse::ok(summary))
+        }
+        Err(e) => Ok(DiscoveryResponse::err(e)),
+    }
 }
 
 /// Sync status response.
@@ -153,13 +157,13 @@ pub async fn sync_discoveries(
     let db = &state.checkpoint_db;
 
     // Phase 1: Extract discoveries (sync operation)
-    let to_sync = {
-        let conn = db.connection()?;
-        match extract_discoveries_for_sync(&conn) {
-            Ok(discoveries) => discoveries,
-            Err(e) => return Ok(DiscoveryResponse::err(e)),
-        }
-    };
+    let db1 = db.clone();
+    let to_sync = tokio::task::spawn_blocking(move || {
+        let conn = db1.connection()?;
+        extract_discoveries_for_sync(&conn)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
 
     if to_sync.is_empty() {
         return Ok(DiscoveryResponse::ok(SyncResultResponse {
@@ -176,14 +180,15 @@ pub async fn sync_discoveries(
     let sync_results = sync_discoveries_batch(to_sync).await;
 
     // Phase 3: Apply results to database (sync operation, fresh connection)
-    let conn = db.connection()?;
-    let result = match apply_sync_results(&conn, sync_results) {
-        Ok(r) => r,
-        Err(e) => return Ok(DiscoveryResponse::err(e)),
-    };
-
-    // Get remaining count
-    let remaining = get_pending_count(&conn).unwrap_or(0);
+    let db2 = db.clone();
+    let (result, remaining) = tokio::task::spawn_blocking(move || {
+        let conn = db2.connection()?;
+        let result = apply_sync_results(&conn, sync_results)?;
+        let remaining = get_pending_count(&conn).unwrap_or(0);
+        Ok::<_, String>((result, remaining))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
 
     let response = SyncResultResponse {
         sent: result.sent,
@@ -208,14 +213,17 @@ pub async fn clear_discovery(
 ) -> Result<DiscoveryResponse<bool>, String> {
     info!("Clearing discovery {} from queue", id);
 
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match discoveries::delete_discovery(&conn, &id) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        discoveries::delete_discovery(&conn, &id)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(deleted) => {
-            if deleted {
-                info!("Discovery {} cleared from queue", id);
-            }
             Ok(DiscoveryResponse::ok(deleted))
         }
         Err(e) => Ok(DiscoveryResponse::err(e)),
@@ -229,10 +237,16 @@ pub async fn clear_failed_discoveries(
 ) -> Result<DiscoveryResponse<u32>, String> {
     info!("Clearing failed discoveries");
 
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match discoveries::cleanup_failed_discoveries(&conn) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        discoveries::cleanup_failed_discoveries(&conn)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(count) => {
             info!("Cleared {} failed discoveries", count);
             Ok(DiscoveryResponse::ok(count))
@@ -246,10 +260,16 @@ pub async fn clear_failed_discoveries(
 pub async fn get_discovery_sync_status(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<SyncStatus>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match get_sync_status(&conn) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        get_sync_status(&conn)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(status) => Ok(DiscoveryResponse::ok(status)),
         Err(e) => Ok(DiscoveryResponse::err(e)),
     }

@@ -225,39 +225,45 @@ pub async fn get_performance_dashboard(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<PerformanceDashboardData>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
     let range = time_range
         .map(|s| TimeRange::from_str(&s))
         .unwrap_or(TimeRange::SevenDays);
 
-    // Aggregate all dashboard data
-    let summary = aggregate_summary(&conn, &config_id, &range)?;
-    let action_metrics = aggregate_action_performance(&conn, &config_id, &range)?;
-    let transition_metrics = get_transition_metrics(&conn, &config_id)?;
-    let element_metrics = get_element_metrics(&conn, &config_id)?;
-    let success_rate_trend = aggregate_success_rate_trend(&conn, &config_id, &range)?;
-    let duration_trend = aggregate_duration_trend(&conn, &config_id, &range)?;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        let summary = aggregate_summary(&conn, &config_id, &range)?;
+        let action_metrics = aggregate_action_performance(&conn, &config_id, &range)?;
+        let transition_metrics = get_transition_metrics(&conn, &config_id)?;
+        let element_metrics = get_element_metrics(&conn, &config_id)?;
+        let success_rate_trend = aggregate_success_rate_trend(&conn, &config_id, &range)?;
+        let duration_trend = aggregate_duration_trend(&conn, &config_id, &range)?;
 
-    let dashboard = PerformanceDashboardData {
-        summary,
-        action_metrics,
-        transition_metrics,
-        element_metrics,
-        success_rate_trend,
-        duration_trend,
-    };
+        Ok::<_, String>(PerformanceDashboardData {
+            summary,
+            action_metrics,
+            transition_metrics,
+            element_metrics,
+            success_rate_trend,
+            duration_trend,
+        })
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
-    debug!(
-        "Performance dashboard for config {}: {} actions, {} transitions, {} elements",
-        config_id,
-        dashboard.action_metrics.len(),
-        dashboard.transition_metrics.len(),
-        dashboard.element_metrics.len()
-    );
-
-    Ok(PerformanceMetricsResponse::ok(dashboard))
+    match result {
+        Ok(dashboard) => {
+            debug!(
+                "Performance dashboard: {} actions, {} transitions, {} elements",
+                dashboard.action_metrics.len(),
+                dashboard.transition_metrics.len(),
+                dashboard.element_metrics.len()
+            );
+            Ok(PerformanceMetricsResponse::ok(dashboard))
+        }
+        Err(e) => Ok(PerformanceMetricsResponse::err(e)),
+    }
 }
 
 /// Get action performance metrics only.
@@ -267,14 +273,17 @@ pub async fn get_action_performance(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<ActionPerformanceMetrics>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
+    let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
 
-    let range = time_range
-        .map(|s| TimeRange::from_str(&s))
-        .unwrap_or(TimeRange::SevenDays);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        aggregate_action_performance(&conn, &config_id, &range)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
-    match aggregate_action_performance(&conn, &config_id, &range) {
+    match result {
         Ok(metrics) => Ok(PerformanceMetricsResponse::ok(metrics)),
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
@@ -286,10 +295,16 @@ pub async fn get_transition_reliability(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<PerformanceMetricsResponse<Vec<StateTransitionMetrics>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match get_transition_metrics(&conn, &config_id) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        get_transition_metrics(&conn, &config_id)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(metrics) => Ok(PerformanceMetricsResponse::ok(metrics)),
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
@@ -301,10 +316,16 @@ pub async fn get_element_resolution_metrics(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<PerformanceMetricsResponse<Vec<ElementResolutionMetrics>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match get_element_metrics(&conn, &config_id) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        get_element_metrics(&conn, &config_id)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(metrics) => Ok(PerformanceMetricsResponse::ok(metrics)),
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
@@ -317,14 +338,17 @@ pub async fn get_success_rate_trend(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<TimeSeriesDataPoint>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
+    let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
 
-    let range = time_range
-        .map(|s| TimeRange::from_str(&s))
-        .unwrap_or(TimeRange::SevenDays);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        aggregate_success_rate_trend(&conn, &config_id, &range)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
-    match aggregate_success_rate_trend(&conn, &config_id, &range) {
+    match result {
         Ok(trend) => Ok(PerformanceMetricsResponse::ok(trend)),
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }

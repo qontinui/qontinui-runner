@@ -1885,90 +1885,36 @@ pub struct WorkflowRunContext {
 ///
 /// Returns a list of recent task runs that can be selected for AI test generation context.
 #[tauri::command]
-pub fn list_recent_task_runs(
+pub async fn list_recent_task_runs(
     limit: Option<i32>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
+) -> Result<CommandResponse, String> {
     info!("[list_recent_task_runs] Called with limit: {:?}", limit);
     let limit = limit.unwrap_or(20);
 
-    let conn = match state.checkpoint_db.connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to get database connection: {}", e)),
-                data: None,
-            };
-        }
-    };
+    let pg_runs = state.pg_db.list_recent_task_runs_pg(limit).await?;
 
-    // Query recent task runs
-    let query = r#"
-        SELECT
-            tr.id,
-            tr.task_name,
-            tr.workflow_name,
-            tr.status,
-            tr.created_at,
-            tr.completed_at,
-            tr.goal_achieved,
-            CASE
-                WHEN tr.completed_at IS NOT NULL
-                THEN CAST((julianday(tr.completed_at) - julianday(tr.created_at)) * 86400000 AS INTEGER)
-                ELSE NULL
-            END as duration_ms
-        FROM task_runs tr
-        ORDER BY tr.created_at DESC
-        LIMIT ?1
-    "#;
-    let mut stmt = match conn.prepare(query) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to prepare query: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    let runs: Result<Vec<TaskRunSummary>, _> = stmt
-        .query_map([limit], |row| {
-            Ok(TaskRunSummary {
-                id: row.get(0)?,
-                task_name: row.get(1)?,
-                workflow_name: row.get(2)?,
-                status: row.get(3)?,
-                created_at: row.get(4)?,
-                completed_at: row.get(5)?,
-                goal_achieved: row.get(6)?,
-                duration_ms: row.get(7)?,
-            })
+    let runs: Vec<TaskRunSummary> = pg_runs
+        .into_iter()
+        .map(|row| TaskRunSummary {
+            id: row["id"].as_str().unwrap_or("").to_string(),
+            task_name: row["task_name"].as_str().unwrap_or("").to_string(),
+            workflow_name: row["workflow_name"].as_str().map(|s| s.to_string()),
+            status: row["status"].as_str().unwrap_or("").to_string(),
+            created_at: row["created_at"].as_str().unwrap_or("").to_string(),
+            completed_at: row["completed_at"].as_str().map(|s| s.to_string()),
+            goal_achieved: row["goal_achieved"].as_bool(),
+            duration_ms: row["duration_ms"].as_i64(),
         })
-        .and_then(|rows| rows.collect());
+        .collect();
 
-    match runs {
-        Ok(runs) => {
-            info!("[list_recent_task_runs] Found {} task runs", runs.len());
-            if !runs.is_empty() {
-                info!("[list_recent_task_runs] First run: {:?}", runs[0].task_name);
-            }
-            CommandResponse {
-                success: true,
-                message: Some(format!("Found {} recent task runs", runs.len())),
-                data: Some(serde_json::to_value(&runs).unwrap_or_default()),
-            }
-        }
-        Err(e) => {
-            info!("[list_recent_task_runs] Query failed: {}", e);
-            CommandResponse {
-                success: false,
-                message: Some(format!("Failed to query task runs: {}", e)),
-                data: None,
-            }
-        }
-    }
+    info!("[list_recent_task_runs] Found {} task runs", runs.len());
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Found {} recent task runs", runs.len())),
+        data: Some(serde_json::to_value(&runs).unwrap_or_default()),
+    })
 }
 
 /// Get full workflow run context for AI test generation.
@@ -1976,11 +1922,27 @@ pub fn list_recent_task_runs(
 /// Returns comprehensive context about a workflow run including automation results,
 /// screenshots, API requests, events, and AI findings.
 #[tauri::command]
-pub fn get_workflow_run_context(
+pub async fn get_workflow_run_context(
     task_run_id: String,
     state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = state.checkpoint_db.clone();
+    let tid = task_run_id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        get_workflow_run_context_inner(tid, &db)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    Ok(result)
+}
+
+fn get_workflow_run_context_inner(
+    task_run_id: String,
+    db: &std::sync::Arc<crate::database::CheckpointDb>,
 ) -> CommandResponse {
-    let conn = match state.checkpoint_db.connection() {
+    let conn = match db.connection() {
         Ok(conn) => conn,
         Err(e) => {
             return CommandResponse {

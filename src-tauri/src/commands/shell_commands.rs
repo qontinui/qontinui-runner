@@ -292,98 +292,34 @@ pub async fn list_shell_commands(
         enabled_only, category
     );
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    let pg_cmds = state
+        .pg_db
+        .list_shell_commands_filtered(enabled_only.unwrap_or(false), category.as_deref())
+        .await?;
 
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    // Build query based on filters
-    let mut query = String::from(
-        r#"
-        SELECT id, name, description, command, working_directory,
-               timeout_seconds, fail_on_error, category, tags,
-               enabled, created_at, updated_at
-        FROM shell_commands
-        WHERE 1=1
-        "#,
-    );
-
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-    if enabled_only.unwrap_or(false) {
-        query.push_str(" AND enabled = 1");
-    }
-
-    if let Some(ref cat) = category {
-        query.push_str(" AND category = ?");
-        params_vec.push(Box::new(cat.clone()));
-    }
-
-    query.push_str(" ORDER BY name ASC");
-
-    let mut stmt = conn
-        .prepare(&query)
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-
-    let commands_iter = stmt
-        .query_map(params_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // id
-                row.get::<_, String>(1)?,         // name
-                row.get::<_, Option<String>>(2)?, // description
-                row.get::<_, String>(3)?,         // command
-                row.get::<_, Option<String>>(4)?, // working_directory
-                row.get::<_, i32>(5)?,            // timeout_seconds
-                row.get::<_, bool>(6)?,           // fail_on_error
-                row.get::<_, Option<String>>(7)?, // category
-                row.get::<_, String>(8)?,         // tags
-                row.get::<_, bool>(9)?,           // enabled
-                row.get::<_, String>(10)?,        // created_at
-                row.get::<_, String>(11)?,        // updated_at
-            ))
+    let commands: Vec<ShellCommand> = pg_cmds
+        .iter()
+        .map(|row| {
+            let tags: Vec<String> = row["tags"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            ShellCommand {
+                id: row["id"].as_str().unwrap_or("").to_string(),
+                name: row["name"].as_str().unwrap_or("").to_string(),
+                description: row["description"].as_str().map(|s| s.to_string()),
+                command: row["command"].as_str().unwrap_or("").to_string(),
+                working_directory: row["working_directory"].as_str().map(|s| s.to_string()),
+                timeout_seconds: row["timeout_seconds"].as_i64().unwrap_or(0) as i32,
+                fail_on_error: row["fail_on_error"].as_bool().unwrap_or(true),
+                category: row["category"].as_str().map(|s| s.to_string()),
+                tags,
+                enabled: row["enabled"].as_bool().unwrap_or(true),
+                created_at: row["created_at"].as_str().unwrap_or("").to_string(),
+                updated_at: row["updated_at"].as_str().unwrap_or("").to_string(),
+            }
         })
-        .map_err(|e| format!("Failed to query shell commands: {}", e))?;
-
-    let mut commands: Vec<ShellCommand> = Vec::new();
-
-    for cmd_result in commands_iter {
-        let (
-            id,
-            name,
-            description,
-            command,
-            working_directory,
-            timeout_seconds,
-            fail_on_error,
-            category,
-            tags_str,
-            enabled,
-            created_at,
-            updated_at,
-        ) = cmd_result.map_err(|e| format!("Failed to read shell command row: {}", e))?;
-
-        let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
-
-        commands.push(ShellCommand {
-            id,
-            name,
-            description,
-            command,
-            working_directory,
-            timeout_seconds,
-            fail_on_error,
-            category,
-            tags,
-            enabled,
-            created_at,
-            updated_at,
-        });
-    }
+        .collect();
 
     Ok(CommandResponse {
         success: true,
@@ -412,112 +348,52 @@ pub async fn update_shell_command(
 ) -> Result<CommandResponse, String> {
     info!("Updating shell command: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    let now = Utc::now().to_rfc3339();
-
-    // Get current values
-    let current = conn.query_row(
-        r#"
-        SELECT name, description, command, working_directory,
-               timeout_seconds, fail_on_error, category, tags, enabled
-        FROM shell_commands
-        WHERE id = ?1
-        "#,
-        params![id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // name
-                row.get::<_, Option<String>>(1)?, // description
-                row.get::<_, String>(2)?,         // command
-                row.get::<_, Option<String>>(3)?, // working_directory
-                row.get::<_, i32>(4)?,            // timeout_seconds
-                row.get::<_, bool>(5)?,           // fail_on_error
-                row.get::<_, Option<String>>(6)?, // category
-                row.get::<_, String>(7)?,         // tags
-                row.get::<_, bool>(8)?,           // enabled
-            ))
-        },
-    );
-
-    let (
-        current_name,
-        current_description,
-        current_command,
-        current_working_directory,
-        current_timeout_seconds,
-        current_fail_on_error,
-        current_category,
-        current_tags_str,
-        current_enabled,
-    ) = match current {
-        Ok(v) => v,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
+    // Get current values from PG
+    let current = match state.pg_db.get_shell_command(&id).await? {
+        Some(v) => v,
+        None => {
             return Ok(CommandResponse {
                 success: false,
                 message: Some(format!("Shell command not found: {}", id)),
                 data: None,
             });
         }
-        Err(e) => return Err(format!("Failed to query shell command: {}", e)),
     };
 
     // Apply updates
-    let name = input.name.unwrap_or(current_name);
-    let description = input.description.or(current_description);
-    let command = input.command.unwrap_or(current_command);
-    let working_directory = input.working_directory.or(current_working_directory);
-    let timeout_seconds = input.timeout_seconds.unwrap_or(current_timeout_seconds);
-    let fail_on_error = input.fail_on_error.unwrap_or(current_fail_on_error);
-    let category = input.category.or(current_category);
+    let name = input.name.unwrap_or_else(|| current.name.clone());
+    let description = input.description.or_else(|| current.description.clone());
+    let command = input.command.unwrap_or_else(|| current.command.clone());
+    let working_directory = input.working_directory.or_else(|| current.working_directory.clone());
+    let timeout_seconds = input.timeout_seconds.unwrap_or(current.timeout_seconds);
+    let fail_on_error = input.fail_on_error.unwrap_or(current.fail_on_error);
+    let category = input.category.or_else(|| Some(current.category.clone()));
     let tags_str = match input.tags {
         Some(tags) => {
             serde_json::to_string(&tags).map_err(|e| format!("Failed to serialize tags: {}", e))?
         }
-        None => current_tags_str,
+        None => serde_json::to_string(&current.tags).unwrap_or_else(|_| "[]".to_string()),
     };
-    let enabled = input.enabled.unwrap_or(current_enabled);
+    let enabled = input.enabled.unwrap_or(current.enabled);
 
-    conn.execute(
-        r#"
-        UPDATE shell_commands SET
-            name = ?1,
-            description = ?2,
-            command = ?3,
-            working_directory = ?4,
-            timeout_seconds = ?5,
-            fail_on_error = ?6,
-            category = ?7,
-            tags = ?8,
-            enabled = ?9,
-            updated_at = ?10
-        WHERE id = ?11
-        "#,
-        params![
-            name,
-            description,
-            command,
-            working_directory,
+    state
+        .pg_db
+        .update_shell_command_full(
+            &id,
+            &name,
+            description.as_deref(),
+            &command,
+            working_directory.as_deref(),
             timeout_seconds,
             fail_on_error,
-            category,
-            tags_str,
+            category.as_deref(),
+            &tags_str,
             enabled,
-            now,
-            id,
-        ],
-    )
-    .map_err(|e| format!("Failed to update shell command: {}", e))?;
+        )
+        .await?;
 
     info!("Updated shell command: {}", id);
 
-    drop(conn);
     get_shell_command(id, state).await
 }
 
@@ -817,34 +693,7 @@ pub async fn get_shell_command_categories(
 ) -> Result<CommandResponse, String> {
     info!("Getting shell command categories");
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT DISTINCT category
-            FROM shell_commands
-            WHERE category IS NOT NULL AND category != ''
-            ORDER BY category ASC
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let categories_iter = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("Failed to query categories: {}", e))?;
-
-    let mut categories: Vec<String> = Vec::new();
-
-    for cat_result in categories_iter {
-        categories.push(cat_result.map_err(|e| format!("Failed to read category: {}", e))?);
-    }
+    let categories = state.pg_db.get_shell_command_categories().await?;
 
     Ok(CommandResponse {
         success: true,
@@ -873,24 +722,9 @@ pub async fn set_shell_command_enabled(
 ) -> Result<CommandResponse, String> {
     info!("Setting shell command {} enabled={}", id, enabled);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    let updated = state.pg_db.set_shell_command_enabled(&id, enabled).await?;
 
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    let now = Utc::now().to_rfc3339();
-
-    let affected = conn
-        .execute(
-            "UPDATE shell_commands SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
-            params![enabled, now, id],
-        )
-        .map_err(|e| format!("Failed to update shell command: {}", e))?;
-
-    if affected == 0 {
+    if !updated {
         return Ok(CommandResponse {
             success: false,
             message: Some(format!("Shell command not found: {}", id)),

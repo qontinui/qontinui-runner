@@ -13,7 +13,7 @@ use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::memory::unified_query::{self, MemoryResult, MemorySource, UnifiedMemoryQuery};
-use crate::reflection::graph_engine::KnowledgeGraph;
+use super::graph_api::get_or_build_graph;
 
 // ============================================================================
 // Request/Response types
@@ -105,20 +105,12 @@ async fn query_handler(
         .map_or(true, |s| s.contains(&MemorySource::GraphNode));
 
     let graph = if want_graph {
-        let db_for_graph = db.clone();
-        match tokio::task::spawn_blocking(move || {
-            db_for_graph.with_conn(|conn| {
-                KnowledgeGraph::build_from_db(conn, None).map_err(|e| format!("{e}"))
-            })
-        }).await {
-            Ok(Ok(g)) => Some(g),
-            _ => None,
-        }
+        get_or_build_graph(&state, None).await.ok()
     } else {
         None
     };
 
-    match unified_query::query_memory(&params, pg, db, graph.as_ref()).await {
+    match unified_query::query_memory(&params, pg, db, graph.as_deref()).await {
         Ok(results) => {
             let total = results.len();
             Ok(Json(ApiResponse::success(QueryMemoryResponse {

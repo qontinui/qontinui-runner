@@ -298,6 +298,60 @@ pub fn update_performance_metrics_with_pg(db: &CheckpointDb, pg_db: &std::sync::
     Ok(())
 }
 
+// ── PG-primary read wrappers ─────────────────────────────────────────────
+
+/// Get the active prompt with PG-primary read.
+#[allow(dead_code)]
+pub fn get_active_prompt_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+) -> Result<Option<PromptVariant>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        if let Ok(result) = handle.block_on(pg.get_active_prompt(&at)) {
+            return Ok(result);
+        }
+    }
+    get_active_prompt(db, agent_type)
+}
+
+/// List all prompt variants with PG-primary read.
+#[allow(dead_code)]
+pub fn list_variants_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: Option<&str>,
+) -> Result<Vec<PromptVariant>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.map(|s| s.to_string());
+        if let Ok(result) = handle.block_on(pg.list_variants(at.as_deref())) {
+            return Ok(result);
+        }
+    }
+    list_variants(db, agent_type)
+}
+
+/// Get a prompt variant by version with PG-primary read.
+#[allow(dead_code)]
+pub fn get_prompt_by_version_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    version: i32,
+) -> Result<Option<PromptVariant>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        if let Ok(result) = handle.block_on(pg.get_prompt_by_version(&at, version)) {
+            return Ok(result);
+        }
+    }
+    get_prompt_by_version(db, agent_type, version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

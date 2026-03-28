@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 use crate::error_monitor::{CuratorConfig, DebugContextCurator};
 use crate::execution_context::AiSessionContext;
@@ -666,6 +667,8 @@ pub struct Orchestrator {
     hook_executor: HookExecutor,
     /// Doctor health monitor handle for tracking AI processes.
     doctor_handle: Option<DoctorHandle>,
+    /// Optional PostgreSQL database for unified memory queries.
+    pg_db: Option<Arc<PgDb>>,
 }
 
 impl Orchestrator {
@@ -688,6 +691,7 @@ impl Orchestrator {
             session_ctx: None,
             hook_executor: HookExecutor::empty(),
             doctor_handle,
+            pg_db: None,
         }
     }
 
@@ -712,7 +716,14 @@ impl Orchestrator {
             session_ctx,
             hook_executor: HookExecutor::empty(),
             doctor_handle,
+            pg_db: None,
         }
+    }
+
+    /// Set the PostgreSQL database for unified memory queries.
+    pub fn with_pg_db(mut self, pg_db: Arc<PgDb>) -> Self {
+        self.pg_db = Some(pg_db);
+        self
     }
 
     /// Add hooks to the orchestrator.
@@ -1612,6 +1623,26 @@ impl Orchestrator {
         // This provides context about application errors that may be related to the task
         if let Some(error_context) = self.get_error_monitor_context(Some(&state.task_run_id)) {
             prompt = format!("{}\n{}", error_context, prompt);
+        }
+
+        // Inject unified memory context (cross-run learnings, knowledge graph, PG memories)
+        // when PgDb is available on this orchestrator instance.
+        if let Some(ref pg) = self.pg_db {
+            let mem = super::memory::MemorySystem::new();
+            let pg = Arc::clone(pg);
+            let db = Arc::clone(&self.db);
+            let task_desc = base_prompt.to_string();
+            let mem_ctx = tokio::runtime::Handle::current().block_on(async {
+                mem.build_context_unified(20, &task_desc, &pg, db).await
+            });
+            if !mem_ctx.trim().is_empty() {
+                info!(
+                    "Injected unified memory context ({} chars) for task {}",
+                    mem_ctx.len(),
+                    state.task_run_id
+                );
+                prompt = format!("{}\n\n{}", prompt, mem_ctx);
+            }
         }
 
         // Inject relevant procedural skills (hermes-agent-inspired progressive disclosure).

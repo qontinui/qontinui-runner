@@ -189,6 +189,7 @@ pub fn create_router(
         started_at: std::time::Instant::now(),
         instance_manager,
         ui_bridge_event_sequence: std::sync::atomic::AtomicI64::new(0),
+        knowledge_graph_cache: Arc::new(tokio::sync::RwLock::new(None)),
     });
 
     // Set up UI Bridge response listener

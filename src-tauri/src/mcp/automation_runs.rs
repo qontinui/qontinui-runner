@@ -27,23 +27,12 @@ pub async fn list_automation_runs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ListAutomationRunsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let conn = state
-        .app_state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let limit = query.limit.unwrap_or(20);
+    let config_id = query.config_id.clone();
 
-    // If config_id is provided, filter by it. Otherwise get all recent runs.
-    let runs = if let Some(config_id) = &query.config_id {
-        tiered_info::get_all_recent_runs(&conn, config_id, limit)
-    } else {
-        // Get runs across all configs - use a broader query
-        get_all_recent_runs(&conn, limit)
-    };
-
-    match runs {
+    // PG-first: use the tiered_info PG module
+    let pg_db = &state.app_state.pg_db;
+    match pg_db.get_recent_runs(config_id.as_deref(), limit).await {
         Ok(runs) => Ok(Json(serde_json::json!({
             "success": true,
             "data": runs
@@ -130,37 +119,16 @@ pub async fn get_automation_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use rusqlite::{params, OptionalExtension};
-
-    let conn = state
-        .app_state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let result: Result<Option<RunDetails>, String> = conn
-        .query_row(
-            r#"
-            SELECT
-                tra.id, tr.config_id, tra.workflow_name, tra.started_at, tra.ended_at, tra.duration_ms,
-                tra.automation_status, tra.success, tra.error_type, tra.error_message,
-                tra.actions_summary, tra.states_visited, tra.transitions_executed,
-                tra.template_matches, tra.anomalies
-            FROM task_run_automation tra
-            INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-            WHERE tra.id = ?1
-            "#,
-            params![id],
-            row_to_run_details_from_automation,
-        )
-        .optional()
-        .map_err(|e| format!("Failed to get automation run: {}", e));
-
-    match result {
-        Ok(Some(run)) => Ok(Json(serde_json::json!({
-            "success": true,
-            "data": run
-        }))),
+    // PG-first: use task_run_automation_by_id
+    let pg_db = &state.app_state.pg_db;
+    match pg_db.get_task_run_automation_by_id(&id).await {
+        Ok(Some(automation)) => {
+            // Convert to RunDetails-like JSON
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "data": automation
+            })))
+        }
         Ok(None) => Ok(Json(serde_json::json!({
             "success": false,
             "error": format!("Run not found: {}", id)

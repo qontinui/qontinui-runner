@@ -8,7 +8,6 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -208,24 +207,17 @@ pub async fn start_comparison(
     let entries_json_str = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
 
     // Insert into database
-    let cid = comparison_id.clone();
-    let wid = req.workflow_id.clone();
-    let vtype = req.variation_type.clone();
-    let now_clone = now.clone();
-    let ejs = entries_json_str.clone();
-
     state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO comparison_runs (id, workflow_id, variation_type, status, entries_json, created_at) \
-                 VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
-                params![cid, wid, vtype, ejs, now_clone],
-            )
-            .map_err(|e| format!("Failed to create comparison run: {}", e))?;
-            Ok(())
-        })
+        .pg_db
+        .create_comparison_run(
+            &comparison_id,
+            &req.workflow_id,
+            &req.variation_type,
+            &entries_json_str,
+            &now,
+        )
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -234,7 +226,7 @@ pub async fn start_comparison(
         })?;
 
     // Spawn background task to launch all the workflow runs
-    let db = state.app_state.checkpoint_db.clone();
+    let pg_db = state.app_state.pg_db.clone();
     let api_port = state
         .app_state
         .api_port
@@ -243,7 +235,7 @@ pub async fn start_comparison(
     let comp_id = comparison_id.clone();
 
     tokio::spawn(async move {
-        launch_comparison_entries(db, api_port, &workflow_id, &comp_id, entries).await;
+        launch_comparison_entries(pg_db, api_port, &workflow_id, &comp_id, entries).await;
     });
 
     Ok(Json(ApiResponse::success(StartComparisonResponse {
@@ -254,7 +246,7 @@ pub async fn start_comparison(
 
 /// Background task: launches each entry's workflow run via local HTTP API.
 async fn launch_comparison_entries(
-    db: Arc<crate::database::CheckpointDb>,
+    pg_db: Arc<crate::database::pg::PgDb>,
     api_port: u16,
     workflow_id: &str,
     comparison_id: &str,
@@ -314,14 +306,9 @@ async fn launch_comparison_entries(
     let all_failed = entries.iter().all(|e| e.status == "failed");
     let new_status = if all_failed { "failed" } else { "running" };
 
-    let _ = db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE comparison_runs SET entries_json = ?1, status = ?2 WHERE id = ?3",
-            params![entries_json, new_status, comparison_id],
-        )
-        .map_err(|e| format!("Failed to update comparison entries: {}", e))?;
-        Ok(())
-    });
+    let _ = pg_db
+        .update_comparison_run_entries(comparison_id, &entries_json, new_status)
+        .await;
 }
 
 /// GET /comparison/:id — get comparison run with live entry statuses.
@@ -329,59 +316,34 @@ pub async fn get_comparison(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ComparisonRunView>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
+    let pg = &state.app_state.pg_db;
 
-    let row = db
-        .with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, workflow_id, variation_type, status, entries_json, report, created_at, completed_at \
-                     FROM comparison_runs WHERE id = ?1",
-                )
-                .map_err(|e| format!("Prepare failed: {}", e))?;
+    let row = pg
+        .get_comparison_run(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error(format!("Comparison run not found: {}", id)))))?;
 
-            let result = stmt
-                .query_row(params![id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })
-                .map_err(|e| format!("Comparison run not found: {}", e))?;
-            Ok(result)
-        })
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(api_error(e))))?;
-
-    let (
-        id,
-        workflow_id,
-        variation_type,
-        status,
-        entries_json_str,
-        report,
-        created_at,
-        completed_at,
-    ) = row;
+    let id = row.id;
+    let workflow_id = row.workflow_id;
+    let variation_type = row.variation_type;
+    let status = row.status;
+    let report = row.report;
+    let created_at = row.created_at;
+    let completed_at = row.completed_at;
 
     let mut entries: Vec<ComparisonEntryJson> =
-        serde_json::from_str(&entries_json_str).unwrap_or_default();
+        serde_json::from_str(&row.entries_json).unwrap_or_default();
 
     // Enrich entries with live task_run status
     let mut all_done = true;
     let mut any_running = false;
     for entry in entries.iter_mut() {
         if let Some(ref trid) = entry.task_run_id {
-            if let Ok(Some(task_run)) = db.get_task_run(trid) {
+            if let Ok(Some(task_run)) = state.app_state.pg_db.get_task_run(trid).await {
                 match task_run.status.as_str() {
                     "complete" => {
                         entry.status = "completed".to_string();
-                        // Extract metrics from task_run
                         entry.result = Some(ComparisonEntryResultJson {
                             success: true,
                             iterations: task_run.sessions_count,
@@ -416,29 +378,12 @@ pub async fn get_comparison(
 
     // Update comparison status if all entries are done
     let final_status = if all_done && status == "running" {
-        let new_status = "completed";
-        let now = chrono::Utc::now().to_rfc3339();
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE comparison_runs SET status = ?1, completed_at = ?2, entries_json = ?3 WHERE id = ?4",
-                params![new_status, now, entries_str, id],
-            )
-            .map_err(|e| format!("{}", e))?;
-            Ok(())
-        });
-        new_status.to_string()
+        let _ = pg.complete_comparison_run(&id, &entries_str).await;
+        "completed".to_string()
     } else if any_running {
-        // Also persist the updated entries_json with live statuses
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE comparison_runs SET entries_json = ?1 WHERE id = ?2",
-                params![entries_str, id],
-            )
-            .map_err(|e| format!("{}", e))?;
-            Ok(())
-        });
+        let _ = pg.update_comparison_run_entries(&id, &entries_str, &status).await;
         status
     } else {
         status
@@ -460,51 +405,11 @@ pub async fn get_comparison(
 pub async fn list_comparisons(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<ComparisonRunView>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
-
-    let rows = db
-        .with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, workflow_id, variation_type, status, entries_json, report, created_at, completed_at \
-                     FROM comparison_runs ORDER BY created_at DESC LIMIT 50",
-                )
-                .map_err(|e| format!("Prepare failed: {}", e))?;
-
-            let results = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                })
-                .map_err(|e| format!("Query failed: {}", e))?
-                .filter_map(|r| r.ok())
-                .map(
-                    |(id, workflow_id, variation_type, status, entries_json_str, report, created_at, completed_at)| {
-                        let entries: Vec<ComparisonEntryJson> =
-                            serde_json::from_str(&entries_json_str).unwrap_or_default();
-                        ComparisonRunView {
-                            id,
-                            workflow_id,
-                            variation_type,
-                            status,
-                            entries,
-                            report,
-                            created_at,
-                            completed_at,
-                        }
-                    },
-                )
-                .collect::<Vec<_>>();
-            Ok(results)
-        })
+    let rows = state
+        .app_state
+        .pg_db
+        .list_comparison_runs(50i64)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -512,7 +417,25 @@ pub async fn list_comparisons(
             )
         })?;
 
-    Ok(Json(ApiResponse::success(rows)))
+    let views = rows
+        .into_iter()
+        .map(|r| {
+            let entries: Vec<ComparisonEntryJson> =
+                serde_json::from_str(&r.entries_json).unwrap_or_default();
+            ComparisonRunView {
+                id: r.id,
+                workflow_id: r.workflow_id,
+                variation_type: r.variation_type,
+                status: r.status,
+                entries,
+                report: r.report,
+                created_at: r.created_at,
+                completed_at: r.completed_at,
+            }
+        })
+        .collect();
+
+    Ok(Json(ApiResponse::success(views)))
 }
 
 // ---------------------------------------------------------------------------

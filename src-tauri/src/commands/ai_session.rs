@@ -672,19 +672,22 @@ pub async fn generate_workflow_from_session(
     let artifact_task_run_id = task_run_id.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
-        let gen_result = db2.with_conn(|conn| {
-            let (response, mut artifact) = crate::workflow_generation::generate_workflow(
-                request,
-                doctor_handle.as_ref(),
-                Some(conn),
-                None,
-            );
-            // Save pipeline artifact for generator evaluation
-            artifact.task_run_id = Some(artifact_task_run_id.clone());
-            if let Err(e) = db2.save_pipeline_artifact(&artifact) {
-                tracing::warn!("Failed to save pipeline artifact: {}", e);
+        let gen_result = db2.with_conn({
+            let db2_inner = db2.clone();
+            move |conn| {
+                let (response, mut artifact) = crate::workflow_generation::generate_workflow(
+                    request,
+                    doctor_handle.as_ref(),
+                    Some(conn),
+                    None,
+                );
+                // Save pipeline artifact for generator evaluation
+                artifact.task_run_id = Some(artifact_task_run_id.clone());
+                if let Err(e) = db2_inner.save_pipeline_artifact(&artifact) {
+                    tracing::warn!("Failed to save pipeline artifact: {}", e);
+                }
+                Ok(response)
             }
-            Ok(response)
         });
         match gen_result {
             Ok(response) => response,

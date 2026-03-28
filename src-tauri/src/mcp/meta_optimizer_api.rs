@@ -722,189 +722,34 @@ pub async fn get_learning_outcomes_handler(
 
     match tier {
         ContextTier::L0 => {
-            let status_c = status.clone();
-            let wa_c = workflow_architecture.clone();
             let summaries = state
                 .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT status,
-                                  COUNT(*) as run_count,
-                                  COALESCE(AVG(duration_secs), 0.0) as avg_duration_secs,
-                                  COALESCE(AVG(iterations), 0.0) as avg_iterations
-                           FROM learning_outcomes
-                           WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref s) = status_c {
-                        sql.push_str(&format!(" AND status = ?{}", idx));
-                        param_values.push(Box::new(s.clone()));
-                        idx += 1;
-                    }
-                    if let Some(ref wa) = wa_c {
-                        sql.push_str(&format!(" AND workflow_architecture = ?{}", idx));
-                        param_values.push(Box::new(wa.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(" GROUP BY status ORDER BY run_count DESC");
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<LearningOutcomeSummaryL0> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(LearningOutcomeSummaryL0 {
-                                status: row.get(0)?,
-                                run_count: row.get(1)?,
-                                avg_duration_secs: row.get(2)?,
-                                avg_iterations: row.get(3)?,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+                .pg_db
+                .get_learning_outcomes_l0(status.as_deref(), workflow_architecture.as_deref())
+                .await
                 .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(summaries).unwrap_or_default(),
             )))
         }
         ContextTier::L1 => {
-            let status_c = status.clone();
-            let wa_c = workflow_architecture.clone();
             let details = state
                 .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, task_id, status, duration_secs, iterations,
-                                  workflow_architecture, error_type, created_at
-                           FROM learning_outcomes
-                           WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref s) = status_c {
-                        sql.push_str(&format!(" AND status = ?{}", idx));
-                        param_values.push(Box::new(s.clone()));
-                        idx += 1;
-                    }
-                    if let Some(ref wa) = wa_c {
-                        sql.push_str(&format!(" AND workflow_architecture = ?{}", idx));
-                        param_values.push(Box::new(wa.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<LearningOutcomeDetailL1> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(LearningOutcomeDetailL1 {
-                                id: row.get(0)?,
-                                task_id: row.get(1)?,
-                                status: row.get(2)?,
-                                duration_secs: row.get(3)?,
-                                iterations: row.get(4)?,
-                                workflow_architecture: row.get(5)?,
-                                error_type: row.get(6)?,
-                                created_at: row.get(7)?,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+                .pg_db
+                .get_learning_outcomes_l1(status.as_deref(), workflow_architecture.as_deref(), limit)
+                .await
                 .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(details).unwrap_or_default(),
             )))
         }
         ContextTier::L2 => {
-            // Full records (existing behavior)
             let outcomes = state
                 .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
-                                  tools_used, files_modified, error_type, error_message,
-                                  workflow_architecture, created_at, step_count,
-                                  verification_step_count, agentic_step_count, has_ui_bridge,
-                                  technology_tags, domain_tags, complexity_tier
-                           FROM learning_outcomes
-                           WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut param_idx = 1u32;
-
-                    if let Some(ref s) = status {
-                        param_idx += 1;
-                        sql.push_str(&format!(" AND status = ?{}", param_idx));
-                        param_values.push(Box::new(s.clone()));
-                    }
-                    if let Some(ref wa) = workflow_architecture {
-                        param_idx += 1;
-                        sql.push_str(&format!(" AND workflow_architecture = ?{}", param_idx));
-                        param_values.push(Box::new(wa.clone()));
-                    }
-
-                    sql.push_str(" ORDER BY created_at DESC LIMIT ?1");
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Failed to prepare learning_outcomes query: {}", e))?;
-
-                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    all_params.push(Box::new(limit as i64));
-                    all_params.extend(param_values);
-
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        all_params.iter().map(|p| p.as_ref()).collect();
-
-                    let results: Vec<serde_json::Value> = stmt
-                        .query_map(param_refs.as_slice(), |row| {
-                            Ok(serde_json::json!({
-                                "id": row.get::<_, String>(0).unwrap_or_default(),
-                                "task_id": row.get::<_, String>(1).unwrap_or_default(),
-                                "status": row.get::<_, String>(2).unwrap_or_default(),
-                                "duration_secs": row.get::<_, Option<f64>>(3).unwrap_or(None),
-                                "iterations": row.get::<_, Option<i64>>(4).unwrap_or(None),
-                                "strategy": row.get::<_, Option<String>>(5).unwrap_or(None),
-                                "tools_used": row.get::<_, Option<String>>(6).unwrap_or(None),
-                                "files_modified": row.get::<_, Option<String>>(7).unwrap_or(None),
-                                "error_type": row.get::<_, Option<String>>(8).unwrap_or(None),
-                                "error_message": row.get::<_, Option<String>>(9).unwrap_or(None),
-                                "workflow_architecture": row.get::<_, Option<String>>(10).unwrap_or(None),
-                                "created_at": row.get::<_, String>(11).unwrap_or_default(),
-                                "step_count": row.get::<_, Option<i64>>(12).unwrap_or(None),
-                                "verification_step_count": row.get::<_, Option<i64>>(13).unwrap_or(None),
-                                "agentic_step_count": row.get::<_, Option<i64>>(14).unwrap_or(None),
-                                "has_ui_bridge": row.get::<_, Option<i32>>(15).unwrap_or(None).map(|v| v != 0),
-                                "technology_tags": row.get::<_, Option<String>>(16).unwrap_or(None).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                                "domain_tags": row.get::<_, Option<String>>(17).unwrap_or(None).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                                "complexity_tier": row.get::<_, Option<String>>(18).unwrap_or(None),
-                            }))
-                        })
-                        .map_err(|e| format!("Failed to query learning_outcomes: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    Ok(results)
-                })
+                .pg_db
+                .get_learning_outcomes_l2(status.as_deref(), workflow_architecture.as_deref(), limit)
+                .await
                 .unwrap_or_default();
-
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(outcomes).unwrap_or_default(),
             )))
@@ -938,161 +783,25 @@ pub async fn get_generation_feedback_handler(
 
     match tier {
         ContextTier::L0 => {
-            let ft_c = feedback_type.clone();
-            let summaries = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT feedback_type,
-                                  COUNT(*) as total_count,
-                                  AVG(rating) as avg_rating
-                           FROM workflow_generation_feedback
-                           WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref ft) = ft_c {
-                        sql.push_str(&format!(" AND feedback_type = ?{}", idx));
-                        param_values.push(Box::new(ft.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(" GROUP BY feedback_type ORDER BY total_count DESC");
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<GenerationFeedbackSummaryL0> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(GenerationFeedbackSummaryL0 {
-                                feedback_type: row.get(0)?,
-                                total_count: row.get(1)?,
-                                avg_rating: row.get(2)?,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+            let summaries = state.app_state.pg_db
+                .get_generation_feedback_l0(feedback_type.as_deref())
+                .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(summaries).unwrap_or_default(),
-            )))
+            Ok(Json(ApiResponse::success(serde_json::to_value(summaries).unwrap_or_default())))
         }
         ContextTier::L1 => {
-            let ft_c = feedback_type.clone();
-            let details = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, feedback_type, edited_field, rating,
-                                  workflow_category, created_at
-                           FROM workflow_generation_feedback
-                           WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref ft) = ft_c {
-                        sql.push_str(&format!(" AND feedback_type = ?{}", idx));
-                        param_values.push(Box::new(ft.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<GenerationFeedbackDetailL1> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(GenerationFeedbackDetailL1 {
-                                id: row.get(0)?,
-                                feedback_type: row.get(1)?,
-                                edited_field: row.get(2)?,
-                                rating: row.get(3)?,
-                                workflow_category: row.get(4)?,
-                                created_at: row.get(5)?,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+            let details = state.app_state.pg_db
+                .get_generation_feedback_l1(feedback_type.as_deref(), limit)
+                .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(details).unwrap_or_default(),
-            )))
+            Ok(Json(ApiResponse::success(serde_json::to_value(details).unwrap_or_default())))
         }
         ContextTier::L2 => {
-            // Full records (existing behavior)
-            let feedback = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, workflow_id, task_run_id, feedback_type, edited_field,
-                                  old_value, new_value, delete_reason, rating, rating_comment,
-                                  workflow_category, workflow_description, created_at
-                           FROM workflow_generation_feedback
-                           WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-                    if let Some(ref ft) = feedback_type {
-                        sql.push_str(" AND feedback_type = ?2");
-                        param_values.push(Box::new(ft.clone()));
-                    }
-
-                    sql.push_str(" ORDER BY created_at DESC LIMIT ?1");
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Failed to prepare generation_feedback query: {}", e))?;
-
-                    let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    all_params.push(Box::new(limit as i64));
-                    all_params.extend(param_values);
-
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        all_params.iter().map(|p| p.as_ref()).collect();
-
-                    let results: Vec<serde_json::Value> = stmt
-                        .query_map(param_refs.as_slice(), |row| {
-                            Ok(serde_json::json!({
-                                "id": row.get::<_, String>(0).unwrap_or_default(),
-                                "workflow_id": row.get::<_, String>(1).unwrap_or_default(),
-                                "task_run_id": row.get::<_, Option<String>>(2).unwrap_or(None),
-                                "feedback_type": row.get::<_, String>(3).unwrap_or_default(),
-                                "edited_field": row.get::<_, Option<String>>(4).unwrap_or(None),
-                                "old_value": row.get::<_, Option<String>>(5).unwrap_or(None),
-                                "new_value": row.get::<_, Option<String>>(6).unwrap_or(None),
-                                "delete_reason": row.get::<_, Option<String>>(7).unwrap_or(None),
-                                "rating": row.get::<_, Option<i64>>(8).unwrap_or(None),
-                                "rating_comment": row.get::<_, Option<String>>(9).unwrap_or(None),
-                                "workflow_category": row.get::<_, Option<String>>(10).unwrap_or(None),
-                                "workflow_description": row.get::<_, Option<String>>(11).unwrap_or(None),
-                                "created_at": row.get::<_, String>(12).unwrap_or_default(),
-                            }))
-                        })
-                        .map_err(|e| format!("Failed to query generation_feedback: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    Ok(results)
-                })
+            let feedback = state.app_state.pg_db
+                .get_generation_feedback_l2(feedback_type.as_deref(), limit)
+                .await
                 .unwrap_or_default();
-
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(feedback).unwrap_or_default(),
-            )))
+            Ok(Json(ApiResponse::success(serde_json::to_value(feedback).unwrap_or_default())))
         }
     }
 }
@@ -1230,170 +939,25 @@ pub async fn get_reflection_fixes_handler(
 
     match tier {
         ContextTier::L0 => {
-            let summaries = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT fix_type,
-                                  COUNT(*) as total_count,
-                                  SUM(CASE WHEN effectiveness = 'effective' THEN 1 ELSE 0 END) as effective_count
-                           FROM reflection_fixes WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref agent) = source_agent {
-                        sql.push_str(&format!(" AND source_agent = ?{}", idx));
-                        param_values.push(Box::new(agent.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(" GROUP BY fix_type ORDER BY total_count DESC");
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<ReflectionFixSummaryL0> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(ReflectionFixSummaryL0 {
-                                fix_type: row.get(0)?,
-                                total_count: row.get(1)?,
-                                effective_count: row.get(2)?,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+            let summaries = state.app_state.pg_db
+                .get_reflection_fixes_l0(source_agent.as_deref())
+                .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(summaries).unwrap_or_default(),
-            )))
+            Ok(Json(ApiResponse::success(serde_json::to_value(summaries).unwrap_or_default())))
         }
         ContextTier::L1 => {
-            let details = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, fix_type, fix_description, confidence,
-                                  effectiveness, source_agent, created_at
-                           FROM reflection_fixes WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref agent) = source_agent {
-                        sql.push_str(&format!(" AND source_agent = ?{}", idx));
-                        param_values.push(Box::new(agent.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<ReflectionFixDetailL1> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(ReflectionFixDetailL1 {
-                                id: row.get(0)?,
-                                fix_type: row.get(1)?,
-                                fix_description: row.get(2)?,
-                                confidence: row.get(3)?,
-                                effectiveness: row.get(4)?,
-                                source_agent: row.get(5)?,
-                                created_at: row.get(6)?,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+            let details = state.app_state.pg_db
+                .get_reflection_fixes_l1(source_agent.as_deref(), limit)
+                .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(details).unwrap_or_default(),
-            )))
+            Ok(Json(ApiResponse::success(serde_json::to_value(details).unwrap_or_default())))
         }
         ContextTier::L2 => {
-            // Full records (existing behavior)
-            let fixes = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, source_task_run_id, reflection_task_run_id,
-                                  source_finding_id, source_knowledge_id,
-                                  fix_type, fix_description, file_changed,
-                                  old_value, new_value, confidence, status,
-                                  effectiveness, effectiveness_evidence,
-                                  applied_at, evaluated_at, created_at,
-                                  content_hash, source_agent, reflection_scope,
-                                  project_path, target_component, reuse_count,
-                                  reasoning, alternatives_considered,
-                                  applicability_context
-                           FROM reflection_fixes WHERE 1=1"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    let mut idx = 1;
-
-                    if let Some(ref agent) = source_agent {
-                        sql.push_str(&format!(" AND source_agent = ?{}", idx));
-                        param_values.push(Box::new(agent.clone()));
-                        idx += 1;
-                    }
-                    let _ = idx;
-
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-                    let rows: Vec<serde_json::Value> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok(serde_json::json!({
-                                "id": row.get::<_, String>(0)?,
-                                "source_task_run_id": row.get::<_, String>(1)?,
-                                "reflection_task_run_id": row.get::<_, String>(2)?,
-                                "source_finding_id": row.get::<_, Option<String>>(3)?,
-                                "source_knowledge_id": row.get::<_, Option<String>>(4)?,
-                                "fix_type": row.get::<_, String>(5)?,
-                                "fix_description": row.get::<_, String>(6)?,
-                                "file_changed": row.get::<_, Option<String>>(7)?,
-                                "old_value": row.get::<_, Option<String>>(8)?,
-                                "new_value": row.get::<_, Option<String>>(9)?,
-                                "confidence": row.get::<_, String>(10)?,
-                                "status": row.get::<_, String>(11)?,
-                                "effectiveness": row.get::<_, Option<String>>(12)?,
-                                "effectiveness_evidence": row.get::<_, Option<String>>(13)?,
-                                "applied_at": row.get::<_, String>(14)?,
-                                "evaluated_at": row.get::<_, Option<String>>(15)?,
-                                "created_at": row.get::<_, String>(16)?,
-                                "content_hash": row.get::<_, Option<String>>(17)?,
-                                "source_agent": row.get::<_, Option<String>>(18)?,
-                                "reflection_scope": row.get::<_, Option<String>>(19)?,
-                                "project_path": row.get::<_, Option<String>>(20)?,
-                                "target_component": row.get::<_, Option<String>>(21)?,
-                                "reuse_count": row.get::<_, Option<i64>>(22)?,
-                                "reasoning": row.get::<_, Option<String>>(23)?,
-                                "alternatives_considered": row.get::<_, Option<String>>(24)?,
-                                "applicability_context": row.get::<_, Option<String>>(25)?,
-                            }))
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Ok(rows)
-                })
+            let fixes = state.app_state.pg_db
+                .get_reflection_fixes_l2(source_agent.as_deref(), limit)
+                .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(
-                serde_json::to_value(fixes).unwrap_or_default(),
-            )))
+            Ok(Json(ApiResponse::success(serde_json::to_value(fixes).unwrap_or_default())))
         }
     }
 }
@@ -1935,44 +1499,33 @@ pub async fn get_canaries_handler(
             })?;
 
     // Enrich with recommendation metadata
-    let enriched: Vec<serde_json::Value> = canaries
-        .iter()
-        .map(|c| {
-            let rec_info = state.app_state.checkpoint_db.with_conn({
-                let rec_id = c.recommendation_id.clone();
-                move |conn| {
-                    Ok(conn.query_row(
-                        "SELECT title, target_agent, recommendation_type FROM meta_optimizer_recommendations WHERE id = ?1",
-                        params![rec_id],
-                        |row| Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        )),
-                    ).ok())
-                }
-            }).ok().flatten();
+    let mut enriched: Vec<serde_json::Value> = Vec::new();
+    for c in &canaries {
+        let rec_info = state.app_state.pg_db
+            .get_recommendation_metadata(&c.recommendation_id)
+            .await
+            .ok()
+            .flatten();
 
-            let (title, agent, rec_type) = rec_info.unwrap_or((None, None, None));
+        let (title, agent, rec_type) = rec_info.unwrap_or((None, None, None));
 
-            serde_json::json!({
-                "id": c.id,
-                "recommendation_id": c.recommendation_id,
-                "percentage": c.percentage,
-                "status": c.status,
-                "start_date": c.start_date,
-                "end_date": c.end_date,
-                "baseline_run_count": c.baseline_run_count,
-                "canary_run_count": c.canary_run_count,
-                "baseline_metrics_json": c.baseline_metrics_json,
-                "canary_metrics_json": c.canary_metrics_json,
-                "created_at": c.created_at,
-                "recommendation_title": title,
-                "target_agent": agent,
-                "recommendation_type": rec_type,
-            })
-        })
-        .collect();
+        enriched.push(serde_json::json!({
+            "id": c.id,
+            "recommendation_id": c.recommendation_id,
+            "percentage": c.percentage,
+            "status": c.status,
+            "start_date": c.start_date,
+            "end_date": c.end_date,
+            "baseline_run_count": c.baseline_run_count,
+            "canary_run_count": c.canary_run_count,
+            "baseline_metrics_json": c.baseline_metrics_json,
+            "canary_metrics_json": c.canary_metrics_json,
+            "created_at": c.created_at,
+            "recommendation_title": title,
+            "target_agent": agent,
+            "recommendation_type": rec_type,
+        }));
+    }
 
     Ok(Json(ApiResponse::success(
         serde_json::to_value(enriched).unwrap_or_default(),

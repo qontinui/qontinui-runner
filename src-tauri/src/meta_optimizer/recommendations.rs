@@ -1048,6 +1048,79 @@ pub fn auto_reject_stale_recommendations_with_pg(
     count
 }
 
+// ── PG-primary read wrappers ─────────────────────────────────────────────
+
+/// Check content duplicate with PG-primary read.
+#[allow(dead_code)]
+pub fn is_content_duplicate_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    content_hash: &str,
+) -> bool {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let ch = content_hash.to_string();
+        if let Ok(result) = handle.block_on(pg.is_content_duplicate(&ch)) {
+            return result;
+        }
+    }
+    is_content_duplicate(db, content_hash)
+}
+
+/// List recommendations with PG-primary read.
+#[allow(dead_code)]
+pub fn list_recommendations_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    optimizer_type: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<Recommendation>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let ot = optimizer_type.map(|s| s.to_string());
+        let st = status.map(|s| s.to_string());
+        if let Ok(result) = handle.block_on(pg.list_recommendations(ot.as_deref(), st.as_deref())) {
+            return Ok(result);
+        }
+    }
+    list_recommendations(db, optimizer_type, status)
+}
+
+/// List optimizer runs with PG-primary read.
+#[allow(dead_code)]
+pub fn list_optimizer_runs_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> Result<Vec<MetaOptimizerRun>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        if let Ok(result) = handle.block_on(pg.list_optimizer_runs()) {
+            return Ok(result);
+        }
+    }
+    list_optimizer_runs(db)
+}
+
+/// Auto-evaluate applied recommendations with agentic scores, with PG dual-write.
+#[allow(dead_code)]
+pub fn auto_evaluate_with_agentic_scores_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) {
+    auto_evaluate_with_agentic_scores(db);
+    // PG dual-write: sync any updated outcome_after_apply values
+    if let Ok(recs) = list_recommendations(db, None, Some("applied")) {
+        let pg = pg_db.clone();
+        tokio::spawn(async move {
+            for r in &recs {
+                if let Some(ref outcome) = r.outcome_after_apply {
+                    let _ = pg.update_recommendation_outcome(&r.id, outcome).await;
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

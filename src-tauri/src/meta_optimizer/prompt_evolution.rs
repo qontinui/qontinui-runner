@@ -554,6 +554,150 @@ pub fn has_baseline_drifted(
     .unwrap_or(false)
 }
 
+/// Get evolution history with PG-primary read (falls back to SQLite).
+#[allow(dead_code)]
+pub fn get_evolution_history_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: Option<&str>,
+    limit: usize,
+) -> Result<Vec<PromptEvolutionEntry>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.map(|s| s.to_string());
+        if let Ok(result) = handle.block_on(pg.get_evolution_history(at.as_deref(), limit as i64)) {
+            return Ok(result);
+        }
+    }
+    get_evolution_history(db, agent_type, limit)
+}
+
+/// Check whether there is an active evolution with PG-primary read.
+#[allow(dead_code)]
+pub fn has_active_evolution_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+) -> bool {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        if let Ok(result) = handle.block_on(pg.has_active_evolution(&at)) {
+            return result;
+        }
+    }
+    has_active_evolution(db, agent_type)
+}
+
+/// Get the most recent rejected evolution entry with PG-primary read.
+#[allow(dead_code)]
+pub fn get_latest_rejected_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+) -> Result<Option<PromptEvolutionEntry>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        if let Ok(result) = handle.block_on(pg.get_latest_rejected_evolution(&at)) {
+            return Ok(result);
+        }
+    }
+    get_latest_rejected(db, agent_type)
+}
+
+/// Check cooldown with PG-primary read.
+#[allow(dead_code)]
+pub fn is_in_cooldown_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    cooldown_hours: i64,
+) -> bool {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cooldown_hours)).to_rfc3339();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        let c = cutoff.clone();
+        if let Ok(result) = handle.block_on(pg.is_in_evolution_cooldown(&at, &c)) {
+            return result;
+        }
+    }
+    is_in_cooldown(db, agent_type, cooldown_hours)
+}
+
+/// Count consecutive rejections with PG-primary read.
+#[allow(dead_code)]
+pub fn count_consecutive_rejections_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+) -> i32 {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        if let Ok(result) = handle.block_on(pg.count_consecutive_rejections(&at)) {
+            return result;
+        }
+    }
+    count_consecutive_rejections(db, agent_type)
+}
+
+/// Get rejected prompt contents with PG-primary read.
+#[allow(dead_code)]
+pub fn get_rejected_prompt_contents_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        if let Ok(result) = handle.block_on(pg.get_rejected_prompt_contents(&at)) {
+            return Ok(result);
+        }
+    }
+    get_rejected_prompt_contents(db, agent_type)
+}
+
+/// Check baseline drift with PG-primary read.
+#[allow(dead_code)]
+pub fn has_baseline_drifted_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    current_prompt_hash: &str,
+) -> bool {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.to_string();
+        let ch = current_prompt_hash.to_string();
+        if let Ok(result) = handle.block_on(pg.has_baseline_drifted(&at, &ch)) {
+            return result;
+        }
+    }
+    has_baseline_drifted(db, agent_type, current_prompt_hash)
+}
+
+/// Update verdict by variant with PG dual-write (variant-based).
+#[allow(dead_code)]
+pub fn update_verdict_by_variant_direct_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    variant_id: &str,
+    verdict: &str,
+    score_after: Option<f64>,
+) -> Result<(), String> {
+    update_verdict_by_variant(db, variant_id, verdict, score_after)?;
+    let pg = pg_db.clone();
+    let vid = variant_id.to_string();
+    let v = verdict.to_string();
+    tokio::spawn(async move {
+        let _ = pg.update_evolution_verdict_by_variant(&vid, &v, score_after).await;
+    });
+    Ok(())
+}
+
 /// Record evolution with full parameters and PG dual-write (fire-and-forget).
 #[allow(dead_code)]
 pub fn record_evolution_full_with_pg(

@@ -328,18 +328,21 @@ pub async fn generate_workflow_standalone(
     let db2 = db.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
-        let gen_result = db.with_conn(|conn| {
-            let (response, artifact) = crate::workflow_generation::generate_workflow(
-                request,
-                doctor_handle.as_ref(),
-                Some(conn),
-                None,
-            );
-            // Save pipeline artifact (no task_run_id for standalone generation)
-            if let Err(e) = db.save_pipeline_artifact(&artifact) {
-                tracing::warn!("Failed to save pipeline artifact: {}", e);
+        let gen_result = db.with_conn({
+            let db_inner = db.clone();
+            move |conn| {
+                let (response, artifact) = crate::workflow_generation::generate_workflow(
+                    request,
+                    doctor_handle.as_ref(),
+                    Some(conn),
+                    None,
+                );
+                // Save pipeline artifact (no task_run_id for standalone generation)
+                if let Err(e) = db_inner.save_pipeline_artifact(&artifact) {
+                    tracing::warn!("Failed to save pipeline artifact: {}", e);
+                }
+                Ok(response)
             }
-            Ok(response)
         });
         match gen_result {
             Ok(response) => response,

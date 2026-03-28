@@ -504,4 +504,21 @@ impl PgDb {
             if row.avg_duration_ms == 0.0 { None } else { Some(row.avg_duration_ms as i64) },
         ))
     }
+
+    /// Update example_status for a workflow.
+    pub async fn update_example_status(
+        &self,
+        workflow_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE unified_workflows SET example_status = $1 WHERE id = $2",
+            &[&status, &workflow_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_example_status: {}", e))?;
+        tracing::info!("Updated workflow '{}' example_status to '{}'", workflow_id, status);
+        Ok(())
+    }
 }

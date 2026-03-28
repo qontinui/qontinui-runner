@@ -88,18 +88,15 @@ pub async fn list_fixes_handler(
         ));
     }
 
-    // NOTE: PG get_fixes_by_workflow_name lacks effectiveness filter; stays on SQLite
     let fixes = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            storage::get_fixes_by_workflow_name(
-                conn,
-                workflow_name,
-                query.status.as_deref(),
-                query.effectiveness.as_deref(),
-            )
-        })
+        .pg_db
+        .get_fixes_by_workflow_name_filtered(
+            workflow_name,
+            query.status.as_deref(),
+            query.effectiveness.as_deref(),
+        )
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -268,8 +265,9 @@ pub async fn effectiveness_report_handler(
 ) -> Result<Json<ApiResponse<EffectivenessReport>>, (StatusCode, Json<ApiResponse<()>>)> {
     let report = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::get_effectiveness_report(conn, &query.workflow_name))
+        .pg_db
+        .get_effectiveness_report(&query.workflow_name)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -297,8 +295,9 @@ pub async fn reflection_history_handler(
 ) -> Result<Json<ApiResponse<Vec<ReflectionRunSummary>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let history = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::get_reflection_history(conn, &query.workflow_name))
+        .pg_db
+        .get_reflection_history(&query.workflow_name)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -162,29 +162,26 @@ pub async fn generate_fix_workflow(
     Json<ApiResponse<crate::error_monitor::GeneratedWorkflow>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // NOTE: Workflow generation uses the curator and generator which are deeply SQLite-integrated.
-    // No PG equivalent exists for the full error-fix pipeline. Falls through to SQLite always.
-    let conn = state.app_state.checkpoint_db.connection().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Database error: {}", e))),
-        )
-    })?;
+    // Workflow generation uses the curator and generator which are deeply SQLite-integrated.
+    // Run on a blocking thread to avoid blocking the async runtime.
+    let db = state.app_state.checkpoint_db.clone();
+    let task_run_id = request.task_run_id;
+    let max_iterations = request.max_iterations.unwrap_or(10);
 
-    let config = crate::error_monitor::ErrorFixWorkflowConfig {
-        task_run_id: request.task_run_id,
-        max_iterations: request.max_iterations.unwrap_or(10),
-        ..Default::default()
-    };
-    let generator = crate::error_monitor::ErrorFixWorkflowGenerator::with_config(config);
-    let workflow = generator.generate(&conn).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to generate workflow: {}", e))),
-        )
-    })?;
-
-    Ok(Json(ApiResponse::success(workflow)))
+    match tokio::task::spawn_blocking(move || {
+        let conn = db.connection().map_err(|e| format!("Database error: {}", e))?;
+        let config = crate::error_monitor::ErrorFixWorkflowConfig {
+            task_run_id,
+            max_iterations,
+            ..Default::default()
+        };
+        let generator = crate::error_monitor::ErrorFixWorkflowGenerator::with_config(config);
+        generator.generate(&conn).map_err(|e| format!("Failed to generate workflow: {}", e))
+    }).await {
+        Ok(Ok(workflow)) => Ok(Json(ApiResponse::success(workflow))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    }
 }
 
 /// Create routes for this module.

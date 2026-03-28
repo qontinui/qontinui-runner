@@ -503,3 +503,66 @@ pub fn attach_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crat
     tokio::spawn(async move { let _ = pg.attach_eval_result(&rid, &erid, &es).await; });
     Ok(())
 }
+
+// ── PG-primary read wrappers ─────────────────────────────────────────────
+
+/// List eval specs with PG-primary read.
+#[allow(dead_code)]
+pub fn list_eval_specs_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    target_agent: Option<&str>,
+) -> Result<Vec<EvalSpec>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let ta = target_agent.map(|s| s.to_string());
+        if let Ok(jsons) = handle.block_on(pg.list_eval_specs(ta.as_deref())) {
+            let specs: Vec<EvalSpec> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+            if !specs.is_empty() {
+                return Ok(specs);
+            }
+        }
+    }
+    list_eval_specs(db, target_agent)
+}
+
+/// Get a single eval spec with PG-primary read.
+#[allow(dead_code)]
+pub fn get_eval_spec_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    spec_id: &str,
+) -> Result<Option<EvalSpec>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let sid = spec_id.to_string();
+        if let Ok(Some(json)) = handle.block_on(pg.get_eval_spec(&sid)) {
+            if let Ok(spec) = serde_json::from_str::<EvalSpec>(&json) {
+                return Ok(Some(spec));
+            }
+        }
+    }
+    get_eval_spec(db, spec_id)
+}
+
+/// List eval results with PG-primary read.
+#[allow(dead_code)]
+pub fn list_eval_results_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    spec_id: Option<&str>,
+    recommendation_id: Option<&str>,
+) -> Result<Vec<EvalResult>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let s = spec_id.map(|s| s.to_string());
+        let r = recommendation_id.map(|s| s.to_string());
+        if let Ok(jsons) = handle.block_on(pg.list_eval_results(s.as_deref(), r.as_deref())) {
+            let results: Vec<EvalResult> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+            if !results.is_empty() {
+                return Ok(results);
+            }
+        }
+    }
+    list_eval_results(db, spec_id, recommendation_id)
+}

@@ -844,3 +844,143 @@ pub fn get_progress_summary(
         applied_recommendations_count,
     })
 }
+
+// ── PG-primary read wrappers ───────────────────────────────────────────
+
+/// Get the latest baseline snapshot with PG-primary read.
+#[allow(dead_code)]
+pub fn get_latest_baseline_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    category: WorkflowCategory,
+) -> Result<Option<MetaOptimizerSnapshot>, String> {
+    let snap_type = format!("baseline{}", category.snapshot_suffix());
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let st = snap_type.clone();
+        if let Ok(result) = handle.block_on(pg.get_latest_baseline_snapshot(&st)) {
+            return Ok(result);
+        }
+    }
+    get_latest_baseline(db, category)
+}
+
+/// List snapshots with PG-primary read.
+#[allow(dead_code)]
+pub fn list_snapshots_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    snapshot_type: Option<&str>,
+) -> Result<Vec<MetaOptimizerSnapshot>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let st = snapshot_type.map(|s| s.to_string());
+        if let Ok(result) = handle.block_on(pg.list_snapshots(st.as_deref())) {
+            return Ok(result);
+        }
+    }
+    list_snapshots(db, snapshot_type)
+}
+
+/// Get a full progress summary with PG-primary read for snapshot components.
+#[allow(dead_code)]
+pub fn get_progress_summary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    category: WorkflowCategory,
+) -> Result<ProgressSummary, String> {
+    let baseline_snap = get_latest_baseline_with_pg(db, pg_db, category)?;
+
+    let periodic_type = format!("periodic{}", category.snapshot_suffix());
+    let current_snap: Option<MetaOptimizerSnapshot> = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let pt = periodic_type.clone();
+        handle.block_on(pg.get_latest_baseline_snapshot(&pt)).unwrap_or(None)
+    } else {
+        None
+    }.or_else(|| {
+        db.with_conn(move |conn| {
+            let result = conn.query_row(
+                r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
+                          breakdown_json, recommendation_id, runs_included, created_at
+                   FROM meta_optimizer_snapshots WHERE snapshot_type = ?1
+                   ORDER BY created_at DESC LIMIT 1"#,
+                rusqlite::params![periodic_type],
+                |row| {
+                    Ok(MetaOptimizerSnapshot {
+                        id: row.get(0)?, snapshot_type: row.get(1)?, period_start: row.get(2)?,
+                        period_end: row.get(3)?, metrics_json: row.get(4)?, breakdown_json: row.get(5)?,
+                        recommendation_id: row.get(6)?, runs_included: row.get(7)?, created_at: row.get(8)?,
+                    })
+                },
+            );
+            match result {
+                Ok(snap) => Ok(Some(snap)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(format!("Failed to query periodic snapshot: {}", e)),
+            }
+        }).unwrap_or(None)
+    });
+
+    let baseline_metrics = baseline_snap
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<SnapshotMetrics>(&s.metrics_json).ok());
+    let current_metrics = current_snap
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<SnapshotMetrics>(&s.metrics_json).ok());
+
+    let delta = match (&baseline_metrics, &current_metrics) {
+        (Some(b), Some(c)) => Some(MetricsDelta {
+            success_rate_delta: c.success_rate - b.success_rate,
+            duration_delta: c.avg_duration_secs - b.avg_duration_secs,
+            iterations_delta: c.avg_iterations - b.avg_iterations,
+            cost_delta: c.avg_cost_cents - b.avg_cost_cents,
+        }),
+        _ => None,
+    };
+
+    let snapshots = list_snapshots_with_pg(db, pg_db, None)?;
+
+    let applied_recommendations_count: i64 = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        handle.block_on(pg.count_applied_recommendations()).unwrap_or_else(|_| {
+            db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
+                    [], |row| row.get(0),
+                ).map_err(|e| format!("{}", e))
+            }).unwrap_or(0)
+        })
+    } else {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
+                [], |row| row.get(0),
+            ).map_err(|e| format!("{}", e))
+        }).unwrap_or(0)
+    };
+
+    Ok(ProgressSummary {
+        baseline: baseline_metrics,
+        current: current_metrics,
+        delta,
+        snapshots,
+        applied_recommendations_count,
+    })
+}
+
+/// Evaluate recommendation outcome with PG dual-write for persisted outcome.
+#[allow(dead_code)]
+pub fn evaluate_recommendation_outcome_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<RecommendationOutcome, String> {
+    let outcome = evaluate_recommendation_outcome(db, recommendation_id)?;
+    // Fire-and-forget PG write for the outcome
+    let outcome_json = serde_json::to_string(&outcome).unwrap_or_default();
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    tokio::spawn(async move { let _ = pg.update_recommendation_outcome(&rid, &outcome_json).await; });
+    Ok(outcome)
+}

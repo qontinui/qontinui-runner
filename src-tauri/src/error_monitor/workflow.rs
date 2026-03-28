@@ -499,6 +499,8 @@ impl Default for ErrorFixWorkflowGenerator {
 }
 
 /// Tauri command to generate an error fix workflow.
+///
+/// Note: The generator uses SQLite connection internally for complex curator queries.
 #[tauri::command]
 pub async fn generate_error_fix_workflow(
     db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
@@ -508,7 +510,6 @@ pub async fn generate_error_fix_workflow(
     let config = config.unwrap_or_default();
 
     tokio::task::spawn_blocking(move || {
-        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let generator = ErrorFixWorkflowGenerator::with_config(config);
         generator.generate(&conn)
@@ -518,6 +519,8 @@ pub async fn generate_error_fix_workflow(
 }
 
 /// Tauri command to generate a workflow to fix a single error.
+///
+/// Note: The generator uses SQLite connection internally for complex curator queries.
 #[tauri::command]
 pub async fn generate_single_error_fix_workflow(
     db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
@@ -526,7 +529,6 @@ pub async fn generate_single_error_fix_workflow(
     let db = db.inner().clone();
 
     tokio::task::spawn_blocking(move || {
-        // PG: complex dynamic SQL
         let conn = db.connection()?;
         let generator = ErrorFixWorkflowGenerator::new();
         generator.generate_for_single_error(&conn, error_id)
@@ -538,62 +540,59 @@ pub async fn generate_single_error_fix_workflow(
 /// Check if there are fixable errors and return a summary.
 #[tauri::command]
 pub async fn check_fixable_errors(
-    db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
+    app_state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
     task_run_id: Option<String>,
 ) -> Result<FixableErrorsSummary, String> {
-    let db = db.inner().clone();
+    let statuses = ["new", "acknowledged", "in_progress", "promoted"];
 
-    tokio::task::spawn_blocking(move || {
-        // PG: complex dynamic SQL
-        let conn = db.connection()?;
+    let pg_rows = app_state
+        .pg_db
+        .query_error_events(
+            task_run_id.as_deref(),
+            Some(&statuses),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
 
-        let query = ErrorQuery {
-            task_run_id,
-            status: Some(vec![
-                ErrorStatus::New,
-                ErrorStatus::Acknowledged,
-                ErrorStatus::InProgress,
-                ErrorStatus::Promoted,
-            ]),
-            ..Default::default()
-        };
+    let errors: Vec<crate::error_monitor::types::StoredErrorEvent> = pg_rows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
 
-        let errors = ErrorEventStorage::query(&conn, &query)?;
+    let critical_count = errors
+        .iter()
+        .filter(|e| e.severity == crate::error_monitor::types::ErrorSeverity::Critical)
+        .count();
 
-        let critical_count = errors
-            .iter()
-            .filter(|e| e.severity == crate::error_monitor::types::ErrorSeverity::Critical)
-            .count();
+    let error_count = errors
+        .iter()
+        .filter(|e| e.severity == crate::error_monitor::types::ErrorSeverity::Error)
+        .count();
 
-        let error_count = errors
-            .iter()
-            .filter(|e| e.severity == crate::error_monitor::types::ErrorSeverity::Error)
-            .count();
+    let warning_count = errors
+        .iter()
+        .filter(|e| e.severity == crate::error_monitor::types::ErrorSeverity::Warning)
+        .count();
 
-        let warning_count = errors
-            .iter()
-            .filter(|e| e.severity == crate::error_monitor::types::ErrorSeverity::Warning)
-            .count();
-
-        Ok(FixableErrorsSummary {
-            total: errors.len() as u32,
-            critical_count: critical_count as u32,
-            error_count: error_count as u32,
-            warning_count: warning_count as u32,
-            can_generate_workflow: !errors.is_empty(),
-            recommended_action: if critical_count > 0 {
-                "Immediate fix recommended - critical errors present".to_string()
-            } else if error_count > 0 {
-                "Fix recommended - errors present".to_string()
-            } else if warning_count > 0 {
-                "Optional fix - only warnings present".to_string()
-            } else {
-                "No action needed".to_string()
-            },
-        })
+    Ok(FixableErrorsSummary {
+        total: errors.len() as u32,
+        critical_count: critical_count as u32,
+        error_count: error_count as u32,
+        warning_count: warning_count as u32,
+        can_generate_workflow: !errors.is_empty(),
+        recommended_action: if critical_count > 0 {
+            "Immediate fix recommended - critical errors present".to_string()
+        } else if error_count > 0 {
+            "Fix recommended - errors present".to_string()
+        } else if warning_count > 0 {
+            "Optional fix - only warnings present".to_string()
+        } else {
+            "No action needed".to_string()
+        },
     })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Summary of fixable errors.

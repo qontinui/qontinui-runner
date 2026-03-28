@@ -1434,8 +1434,11 @@ fn record_flow_learning(
     let verification_passed = outcome.verification_passed;
     let was_stopped = outcome.was_stopped;
     tokio::spawn(async move {
-        if let Err(e) =
-            db_arc.with_conn(|conn| learning_recorder::record_workflow_learning(conn, &outcome))
+        let db_inner = db_arc.clone();
+        let record_result = tokio::task::spawn_blocking(move || {
+            db_inner.with_conn(|conn| learning_recorder::record_workflow_learning(conn, &outcome))
+        }).await;
+        if let Err(e) = record_result.unwrap_or_else(|e| Err(format!("Task join error: {}", e)))
         {
             warn!("Failed to record flow learning outcome: {}", e);
             return;

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::database::{cross_run_ops, graph_ops};
-use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
 use crate::memory::unified_query::{self, MemorySource, UnifiedMemoryQuery};
 use crate::reflection::{
     cross_run_learning, fuzzy_matching, graph_engine::KnowledgeGraph,
@@ -65,6 +65,59 @@ async fn fetch_observations_for_graph(
         .collect();
 
     (previews, full)
+}
+
+// ============================================================================
+// Cached graph helper
+// ============================================================================
+
+/// TTL for the cached knowledge graph (seconds).
+const GRAPH_TTL_SECS: u64 = 60;
+
+/// Get or build the knowledge graph, using a cached version if fresh enough.
+///
+/// Only full (non-workflow-scoped) graphs are cached. Workflow-scoped graphs
+/// are always built fresh because they differ per workflow name.
+///
+/// Returns an `Arc<KnowledgeGraph>` so callers can share without cloning.
+pub(crate) async fn get_or_build_graph(
+    state: &ApiState,
+    workflow_name: Option<&str>,
+) -> Result<Arc<KnowledgeGraph>, String> {
+    // Only use cache for full graphs (no workflow scope)
+    if workflow_name.is_none() {
+        let cache = state.knowledge_graph_cache.read().await;
+        if let Some(cached) = cache.as_ref() {
+            if cached.built_at.elapsed().as_secs() < GRAPH_TTL_SECS {
+                return Ok(Arc::clone(&cached.graph));
+            }
+        }
+    }
+
+    // Build fresh graph
+    let db = state.app_state.checkpoint_db.clone();
+    let wf = workflow_name.map(|s| s.to_string());
+    let graph = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            KnowledgeGraph::build_from_db(conn, wf.as_deref())
+                .map_err(|e| format!("{e}"))
+        })
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))??;
+
+    let graph = Arc::new(graph);
+
+    // Update cache only for full graphs
+    if workflow_name.is_none() {
+        let mut cache = state.knowledge_graph_cache.write().await;
+        *cache = Some(CachedKnowledgeGraph {
+            graph: Arc::clone(&graph),
+            built_at: std::time::Instant::now(),
+        });
+    }
+
+    Ok(graph)
 }
 
 // ============================================================================
@@ -201,27 +254,65 @@ async fn summary_handler(
     )
     .await;
 
-    let summary = state
-        .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            let mut graph =
-                KnowledgeGraph::build_from_db(conn, workflow_name.as_deref())?;
-            // Enrich with PG observations
-            if !obs_previews.is_empty() {
-                graph.load_observations_from_pg(&obs_previews);
-                graph.link_observations(&obs_full);
-            }
-            Ok(graph.summary())
+    let has_observations = !obs_previews.is_empty();
+
+    // If there are PG observations to enrich, we need a mutable graph — build
+    // fresh, enrich, produce the summary, and update the cache with the enriched
+    // version so other handlers benefit.
+    // If no observations, use the cached graph directly.
+    if has_observations || workflow_name.is_some() {
+        let db = state.app_state.checkpoint_db.clone();
+        let wf = workflow_name.clone();
+        let (summary, maybe_graph) = tokio::task::spawn_blocking(move || {
+            db.with_conn(|conn| {
+                let mut graph =
+                    KnowledgeGraph::build_from_db(conn, wf.as_deref())?;
+                if has_observations {
+                    graph.load_observations_from_pg(&obs_previews);
+                    graph.link_observations(&obs_full);
+                }
+                let summary = graph.summary();
+                // Return the graph so we can cache the enriched version
+                Ok((summary, graph))
+            })
         })
+        .await
         .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("spawn_blocking: {}", e))),
+            )
+        })?
+        .map_err(|e: String| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to build graph summary: {}", e))),
             )
         })?;
 
-    Ok(Json(ApiResponse::success(summary)))
+        // Cache the enriched graph for other handlers (only full graphs)
+        if workflow_name.is_none() {
+            let mut cache = state.knowledge_graph_cache.write().await;
+            *cache = Some(CachedKnowledgeGraph {
+                graph: Arc::new(maybe_graph),
+                built_at: std::time::Instant::now(),
+            });
+        }
+
+        Ok(Json(ApiResponse::success(summary)))
+    } else {
+        // No PG observations — use cached graph
+        let graph = get_or_build_graph(&state, workflow_name.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to build graph summary: {}", e))),
+                )
+            })?;
+
+        Ok(Json(ApiResponse::success(graph.summary())))
+    }
 }
 
 // ============================================================================
@@ -238,8 +329,9 @@ async fn search_handler(
     let limit = query.limit.unwrap_or(20);
     let results = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| unified_search::unified_search(conn, &query.q, limit))
+        .pg_db
+        .unified_search(&query.q, limit)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -320,13 +412,11 @@ async fn step_provenance_handler(
     Json<ApiResponse<Vec<graph_ops::StepProvenance>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // NOTE: No PG equivalent for get_provenance_for_workflow; stays on SQLite
     let provenance = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            graph_ops::get_provenance_for_workflow(conn, &query.workflow_id)
-        })
+        .pg_db
+        .get_provenance_for_workflow(&query.workflow_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -351,11 +441,11 @@ async fn rule_influence_handler(
     Json<ApiResponse<Vec<graph_ops::RuleInfluence>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // NOTE: No PG equivalent for get_rule_influences; stays on SQLite
     let influences = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| graph_ops::get_rule_influences(conn, &query.rule_id))
+        .pg_db
+        .get_rule_influences(&query.rule_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -380,12 +470,12 @@ async fn ineffective_rules_handler(
     Json<ApiResponse<Vec<graph_ops::IneffectiveRule>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // NOTE: No PG equivalent for get_ineffective_rules; stays on SQLite
     let threshold = query.threshold.unwrap_or(3);
     let rules = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| graph_ops::get_ineffective_rules(conn, threshold))
+        .pg_db
+        .get_ineffective_rules(threshold)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -439,11 +529,11 @@ async fn phase_stats_handler(
     Json<ApiResponse<Vec<graph_ops::PhaseStats>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // NOTE: No PG equivalent for get_phase_stats; stays on SQLite
     let stats = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| graph_ops::get_phase_stats(conn, &query.workflow_id))
+        .pg_db
+        .get_phase_stats(&query.workflow_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -609,20 +699,14 @@ async fn ui_failure_chain_handler(
     Query(query): Query<UiFailureChainQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::reflection::graph_types::GraphPath>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let db = state.app_state.checkpoint_db.clone();
     let element_id = query.element_id;
 
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let kg = crate::reflection::graph_engine::KnowledgeGraph::build_from_db(conn, None)?;
-            Ok(kg.trace_ui_failure_chain(&element_id))
-        })
-    })
-    .await
-    {
-        Ok(Ok(paths)) => Ok(Json(ApiResponse::success(paths))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match get_or_build_graph(&state, None).await {
+        Ok(graph) => {
+            let paths = graph.trace_ui_failure_chain(&element_id);
+            Ok(Json(ApiResponse::success(paths)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -642,18 +726,14 @@ async fn ui_fix_effectiveness_handler(
     Json<ApiResponse<Vec<crate::database::cross_run_ops::FixEffectivenessScore>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let db = state.app_state.checkpoint_db.clone();
-    let limit = query.limit;
+    let scores = state
+        .app_state
+        .pg_db
+        .get_fix_effectiveness_scores(query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::database::cross_run_ops::get_fix_effectiveness_scores(conn, limit))
-    })
-    .await
-    {
-        Ok(Ok(scores)) => Ok(Json(ApiResponse::success(scores))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
-    }
+    Ok(Json(ApiResponse::success(scores)))
 }
 
 // ============================================================================
@@ -663,102 +743,14 @@ async fn ui_fix_effectiveness_handler(
 async fn skill_metrics_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
+    let metrics = state
+        .app_state
+        .pg_db
+        .get_skill_metrics()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            // Counts by approval status
-            let status_counts: Vec<(String, i64)> = conn
-                .prepare(
-                    r#"SELECT COALESCE(approval_status, 'pending') as status, COUNT(*)
-                       FROM user_skills WHERE source = 'auto'
-                       GROUP BY status ORDER BY COUNT(*) DESC"#,
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default();
-
-            let mut pending = 0i64;
-            let mut approved = 0i64;
-            let mut rejected = 0i64;
-            for (status, count) in &status_counts {
-                match status.as_str() {
-                    "pending" => pending = *count,
-                    "approved" => approved = *count,
-                    "rejected" => rejected = *count,
-                    _ => {}
-                }
-            }
-
-            // Total usage across approved skills
-            let total_usage: i64 = conn
-                .query_row(
-                    r#"SELECT COALESCE(SUM(usage_count), 0) FROM user_skills
-                       WHERE source = 'auto' AND approval_status = 'approved'"#,
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            // Skill failure events count
-            let failure_events: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM task_run_events WHERE event_type = 'skill_failure'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            // Auto-disabled count (skills that were approved then reverted to pending)
-            let auto_disabled: i64 = conn
-                .query_row(
-                    r#"SELECT COUNT(DISTINCT event_subtype) FROM task_run_events
-                       WHERE event_type = 'skill_failure'"#,
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            // Top skills by usage
-            let top_skills: Vec<(String, String, i64)> = conn
-                .prepare(
-                    r#"SELECT slug, category, usage_count FROM user_skills
-                       WHERE source = 'auto' AND approval_status = 'approved'
-                       ORDER BY usage_count DESC LIMIT 5"#,
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default();
-
-            let top: Vec<serde_json::Value> = top_skills
-                .into_iter()
-                .map(|(slug, cat, usage)| {
-                    serde_json::json!({"slug": slug, "category": cat, "usage_count": usage})
-                })
-                .collect();
-
-            Ok(serde_json::json!({
-                "total_auto_skills": pending + approved + rejected,
-                "pending": pending,
-                "approved": approved,
-                "rejected": rejected,
-                "total_usage": total_usage,
-                "failure_events": failure_events,
-                "unique_skills_failed": auto_disabled,
-                "top_skills": top,
-            }))
-        })
-    })
-    .await
-    {
-        Ok(Ok(metrics)) => Ok(Json(ApiResponse::success(metrics))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
-    }
+    Ok(Json(ApiResponse::success(metrics)))
 }
 
 // ============================================================================
@@ -811,23 +803,12 @@ async fn memory_search_handler(
         .map_or(true, |s| s.contains(&MemorySource::GraphNode));
 
     let graph = if want_graph {
-        // Build graph in spawn_blocking (sync petgraph construction)
-        let db_clone = db.clone();
-        match tokio::task::spawn_blocking(move || {
-            db_clone.with_conn(|conn| {
-                KnowledgeGraph::build_from_db(conn, None).map_err(|e| format!("{e}"))
-            })
-        })
-        .await
-        {
-            Ok(Ok(g)) => Some(g),
-            _ => None,
-        }
+        get_or_build_graph(&state, None).await.ok()
     } else {
         None
     };
 
-    let results = unified_query::query_memory(&params, pg, db.clone(), graph.as_ref())
+    let results = unified_query::query_memory(&params, pg, db.clone(), graph.as_deref())
         .await
         .map_err(|e| {
             (

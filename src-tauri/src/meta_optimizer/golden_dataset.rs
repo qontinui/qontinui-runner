@@ -258,6 +258,31 @@ pub fn build_from_history_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crat
     Ok(dataset)
 }
 
+// ── PG-primary read wrappers ─────────────────────────────────────────────
+
+/// List golden datasets with PG-primary read.
+#[allow(dead_code)]
+pub fn list_golden_datasets_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: Option<&str>,
+) -> Result<Vec<GoldenDataset>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let at = agent_type.map(|s| s.to_string());
+        if let Ok(rows) = handle.block_on(pg.list_golden_datasets(at.as_deref())) {
+            let datasets: Vec<GoldenDataset> = rows.into_iter().map(|(id, agent_type, name, entries_json, created_at, updated_at)| {
+                let entries: Vec<GoldenEntry> = serde_json::from_str(&entries_json).unwrap_or_default();
+                GoldenDataset { id, agent_type, name, entries, created_at, updated_at }
+            }).collect();
+            if !datasets.is_empty() {
+                return Ok(datasets);
+            }
+        }
+    }
+    list_golden_datasets(db, agent_type)
+}
+
 /// Simple string hash for deduplication (not cryptographic).
 fn md5_hash(s: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;

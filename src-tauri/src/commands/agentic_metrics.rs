@@ -40,10 +40,15 @@ pub fn get_composite_score_trend(
 
 /// Manually trigger baseline recomputation.
 #[tauri::command]
-pub fn recompute_agentic_baselines(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
-    state.checkpoint_db.with_conn(|conn| {
-        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn)
+pub async fn recompute_agentic_baselines(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    let db = state.checkpoint_db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn)
+        })
     })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 // ============================================================================

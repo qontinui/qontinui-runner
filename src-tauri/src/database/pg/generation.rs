@@ -156,7 +156,7 @@ impl PgDb {
                       created_at, updated_at
                FROM generation_rules WHERE 1=1"#,
         );
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
 
         if let Some(ref agent) = query.agent {
             params.push(Box::new(agent.clone()));
@@ -181,7 +181,7 @@ impl PgDb {
         sql.push_str(" ORDER BY agent, section, rule_number");
 
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
 
         let rows = conn
             .query(&sql, &param_refs)

@@ -415,24 +415,29 @@ pub async fn update_unified_workflow(
                 existing.name, task_run_id
             );
 
-            // Record structured feedback
-            let feedback = crate::workflow_generation::feedback::FeedbackType::Edit {
-                field: "workflow_update".to_string(),
-                old_value: None,
-                new_value: None,
-            };
-            if let Err(e) = state.app_state.checkpoint_db.with_conn(|conn| {
-                crate::workflow_generation::feedback::record_workflow_feedback(
-                    conn,
-                    &id,
-                    Some(task_run_id),
-                    Some(&existing.category),
-                    Some(&existing.description),
-                    &feedback,
-                )
-            }) {
-                warn!("Failed to record edit feedback: {}", e);
-            }
+            // Record structured feedback via PG
+            let pg = state.app_state.pg_db.clone();
+            let wf_id = id.clone();
+            let trid = task_run_id.clone();
+            let cat = existing.category.clone();
+            let desc = existing.description.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.record_generation_feedback(
+                    &wf_id,
+                    Some(&trid),
+                    "edit",
+                    Some("workflow_update"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&cat),
+                    Some(&desc),
+                ).await {
+                    tracing::warn!("Failed to record edit feedback: {}", e);
+                }
+            });
         }
     }
 
@@ -484,21 +489,29 @@ pub async fn delete_unified_workflow(
                 existing.name, task_run_id
             );
 
-            // Record structured feedback
-            let feedback =
-                crate::workflow_generation::feedback::FeedbackType::Delete { reason: None };
-            if let Err(e) = state.app_state.checkpoint_db.with_conn(|conn| {
-                crate::workflow_generation::feedback::record_workflow_feedback(
-                    conn,
-                    &id,
-                    Some(task_run_id),
-                    Some(&existing.category),
-                    Some(&existing.description),
-                    &feedback,
-                )
-            }) {
-                warn!("Failed to record delete feedback: {}", e);
-            }
+            // Record structured feedback via PG
+            let pg = state.app_state.pg_db.clone();
+            let wf_id = id.clone();
+            let trid = task_run_id.clone();
+            let cat = existing.category.clone();
+            let desc = existing.description.clone();
+            tokio::spawn(async move {
+                if let Err(e) = pg.record_generation_feedback(
+                    &wf_id,
+                    Some(&trid),
+                    "delete",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&cat),
+                    Some(&desc),
+                ).await {
+                    tracing::warn!("Failed to record delete feedback: {}", e);
+                }
+            });
         }
     }
 
@@ -2477,13 +2490,9 @@ async fn update_example_status_handler(
 
     state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| match request.status.as_str() {
-            "active" => example_workflows::promote_workflow_to_example(conn, &id),
-            "excluded" => example_workflows::exclude_workflow_from_examples(conn, &id),
-            "pending" => example_workflows::remove_workflow_from_examples(conn, &id),
-            _ => unreachable!(),
-        })
+        .pg_db
+        .update_example_status(&id, &request.status)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

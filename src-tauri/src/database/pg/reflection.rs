@@ -372,6 +372,150 @@ impl PgDb {
         Ok(id)
     }
 
+    /// Get fixes by workflow name with optional status and effectiveness filters.
+    pub async fn get_fixes_by_workflow_name_filtered(
+        &self,
+        workflow_name: &str,
+        status_filter: Option<&str>,
+        effectiveness_filter: Option<&str>,
+    ) -> Result<Vec<ReflectionFix>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let prefixed = SELECT_ALL_COLUMNS
+            .split(',')
+            .map(|col| {
+                let col = col.trim();
+                if col.is_empty() { String::new() } else { format!("rf.{}", col) }
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut sql = format!(
+            r#"SELECT {} FROM reflection_fixes rf
+               INNER JOIN task_runs tr ON rf.source_task_run_id = tr.id
+               WHERE tr.workflow_name = $1"#,
+            prefixed
+        );
+
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        params.push(Box::new(workflow_name.to_string()));
+
+        if let Some(s) = status_filter {
+            params.push(Box::new(s.to_string()));
+            sql.push_str(&format!(" AND rf.status = ${}", params.len()));
+        }
+        if let Some(e) = effectiveness_filter {
+            if e == "unevaluated" {
+                sql.push_str(" AND rf.effectiveness IS NULL");
+            } else {
+                params.push(Box::new(e.to_string()));
+                sql.push_str(&format!(" AND rf.effectiveness = ${}", params.len()));
+            }
+        }
+        sql.push_str(" ORDER BY rf.created_at DESC");
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG get_fixes_by_workflow_name_filtered: {}", e))?;
+
+        Ok(rows.iter().map(row_to_fix).collect())
+    }
+
+    /// Get reflection history for a workflow (reflection task runs with fix counts).
+    pub async fn get_reflection_history(
+        &self,
+        workflow_name: &str,
+    ) -> Result<Vec<crate::reflection::storage::ReflectionRunSummary>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT
+                    tr.id,
+                    tr.reflection_source_task_run_id,
+                    tr.status,
+                    tr.created_at,
+                    tr.completed_at,
+                    (SELECT COUNT(*) FROM reflection_fixes rf WHERE rf.reflection_task_run_id = tr.id) as fix_count
+                FROM task_runs tr
+                WHERE tr.is_reflection = true
+                  AND tr.workflow_name LIKE '%' || $1 || '%'
+                ORDER BY tr.created_at DESC
+                "#,
+                &[&workflow_name],
+            )
+            .await
+            .map_err(|e| format!("PG get_reflection_history: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::reflection::storage::ReflectionRunSummary {
+                task_run_id: r.get(0),
+                source_task_run_id: r.get(1),
+                status: r.get(2),
+                created_at: r.get(3),
+                completed_at: r.get(4),
+                fix_count: {
+                    let c: i64 = r.get(5);
+                    c as u32
+                },
+            })
+            .collect())
+    }
+
+    /// Get effectiveness report for a workflow (computed from fixes).
+    pub async fn get_effectiveness_report(
+        &self,
+        workflow_name: &str,
+    ) -> Result<crate::reflection::types::EffectivenessReport, String> {
+        let fixes = self
+            .get_fixes_by_workflow_name_filtered(workflow_name, None, None)
+            .await?;
+        let total = fixes.len() as u32;
+
+        let mut effective = 0u32;
+        let mut ineffective = 0u32;
+        let mut regression = 0u32;
+        let mut inconclusive = 0u32;
+        let mut unevaluated = 0u32;
+
+        for fix in &fixes {
+            match fix.effectiveness.as_deref() {
+                Some("effective") => effective += 1,
+                Some("ineffective") => ineffective += 1,
+                Some("caused_regression") => regression += 1,
+                Some("inconclusive") => inconclusive += 1,
+                None => unevaluated += 1,
+                _ => unevaluated += 1,
+            }
+        }
+
+        let evaluated = effective + ineffective + regression;
+        let effectiveness_rate = if evaluated > 0 {
+            effective as f64 / evaluated as f64
+        } else {
+            0.0
+        };
+
+        Ok(crate::reflection::types::EffectivenessReport {
+            workflow_name: workflow_name.to_string(),
+            total_fixes: total,
+            effective_count: effective,
+            ineffective_count: ineffective,
+            regression_count: regression,
+            inconclusive_count: inconclusive,
+            unevaluated_count: unevaluated,
+            effectiveness_rate,
+            fixes,
+        })
+    }
+
     /// Get all applications for a given fix.
     pub async fn get_applications_for_fix(
         &self,

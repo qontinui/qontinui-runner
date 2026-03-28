@@ -16,6 +16,15 @@ use crate::commands::rag::RAGState;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
+use crate::reflection::graph_engine::KnowledgeGraph;
+
+/// Cached knowledge graph with TTL-based invalidation.
+/// The graph is wrapped in `Arc` so it can be shared without cloning the
+/// entire petgraph structure.
+pub struct CachedKnowledgeGraph {
+    pub graph: Arc<KnowledgeGraph>,
+    pub built_at: std::time::Instant,
+}
 
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
@@ -95,6 +104,9 @@ pub struct ApiState {
     pub instance_manager: Arc<crate::instance_manager::InstanceManager>,
     /// UI Bridge event sequence counter (monotonically increasing per runner lifetime)
     pub ui_bridge_event_sequence: std::sync::atomic::AtomicI64,
+    /// Cached knowledge graph with TTL-based invalidation (60s).
+    /// Avoids rebuilding the expensive petgraph on every request.
+    pub knowledge_graph_cache: Arc<tokio::sync::RwLock<Option<CachedKnowledgeGraph>>>,
 }
 
 /// Response for API endpoints

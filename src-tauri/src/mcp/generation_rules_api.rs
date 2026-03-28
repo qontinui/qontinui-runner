@@ -2,11 +2,7 @@
 //!
 //! CRUD API for the `generation_rules` table — allows runtime management
 //! of workflow generation rules without Rust recompilation.
-//!
-//! TODO: Wire to PG (pg_db.list_all_rules, get_rule_by_id, upsert_rule, update_rule, delete_rule).
-//! PG methods exist in database/pg/generation.rs but axum 0.7/0.8 Handler trait clash
-//! prevents compilation when async PG calls are used in these handlers. Fix after
-//! async-graphql-axum upgrades to axum 0.8 (eliminates dual-version conflict).
+//! Backed by PostgreSQL via `pg_db.*` methods in `database/pg/generation.rs`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -18,7 +14,7 @@ use tracing::info;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::workflow_generation::rules::{
-    self, GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
+    GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
 };
 
 /// GET /generation-rules
@@ -30,8 +26,9 @@ pub async fn list_rules_handler(
 ) -> Result<Json<ApiResponse<Vec<GenerationRule>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let rules = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| rules::list_rules(conn, &query))
+        .pg_db
+        .list_all_rules(&query)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -51,8 +48,9 @@ pub async fn get_rule_handler(
 ) -> Result<Json<ApiResponse<GenerationRule>>, (StatusCode, Json<ApiResponse<()>>)> {
     let rule = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| rules::get_rule(conn, &id))
+        .pg_db
+        .get_rule_by_id(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -78,8 +76,9 @@ pub async fn create_rule_handler(
 ) -> Result<Json<ApiResponse<GenerationRule>>, (StatusCode, Json<ApiResponse<()>>)> {
     let rule = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| rules::insert_rule(conn, &input))
+        .pg_db
+        .upsert_rule(&input)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -108,8 +107,9 @@ pub async fn update_rule_handler(
 ) -> Result<Json<ApiResponse<GenerationRule>>, (StatusCode, Json<ApiResponse<()>>)> {
     let rule = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| rules::update_rule(conn, &id, &input))
+        .pg_db
+        .update_rule(&id, &input)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -134,8 +134,9 @@ pub async fn delete_rule_handler(
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
     let deleted = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| rules::delete_rule(conn, &id))
+        .pg_db
+        .delete_rule(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

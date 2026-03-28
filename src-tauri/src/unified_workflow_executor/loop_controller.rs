@@ -2190,22 +2190,14 @@ impl LoopController {
             let cra_workflow_name = config.workflow_name.clone();
             let cra_pg_db = self.app_state.pg_db.clone();
             tokio::spawn(async move {
-                // PG: complex dynamic SQL
-                if let Err(e) = cra_db.with_conn(|conn| {
-                    // Look up the source workflow name from the reflection_source_task_run_id
-                    let source_wf_name: String = conn
-                        .query_row(
-                            r#"SELECT COALESCE(
-                                (SELECT workflow_name FROM task_runs WHERE id = (
-                                    SELECT reflection_source_task_run_id FROM task_runs WHERE id = ?1
-                                )),
-                                ?2
-                            )"#,
-                            rusqlite::params![cra_task_run_id, cra_workflow_name],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or_else(|_| cra_workflow_name.clone());
+                // Look up source workflow name from PG
+                let source_wf_name = cra_pg_db
+                    .get_source_workflow_name(&cra_task_run_id, &cra_workflow_name)
+                    .await
+                    .unwrap_or_else(|_| cra_workflow_name.clone());
 
+                // Cross-run analysis uses deeply-integrated SQLite functions
+                if let Err(e) = cra_db.with_conn(|conn| {
                     match crate::reflection::cross_run_learning::post_run_analysis_with_skills(
                         conn,
                         &source_wf_name,

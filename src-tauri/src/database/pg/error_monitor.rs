@@ -411,6 +411,201 @@ impl PgDb {
         })
     }
 
+    /// Query error events with flexible filters.
+    ///
+    /// Supports filtering by task_run_id, status list, severity list, source, captured_after, limit.
+    /// Returns JSON values matching StoredErrorEvent shape.
+    pub async fn query_error_events(
+        &self,
+        task_run_id: Option<&str>,
+        statuses: Option<&[&str]>,
+        severities: Option<&[&str]>,
+        source: Option<&str>,
+        captured_after: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Build dynamic WHERE clauses
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_idx = 1u32;
+        // We'll use a Vec of dynamic params
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+
+        if let Some(tid) = task_run_id {
+            conditions.push(format!("e.task_run_id = ${}", param_idx));
+            params.push(Box::new(tid.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(sts) = statuses {
+            if !sts.is_empty() {
+                let placeholders: Vec<String> = sts.iter().enumerate().map(|(i, _)| {
+                    let idx = param_idx + i as u32;
+                    format!("${}", idx)
+                }).collect();
+                conditions.push(format!("e.status IN ({})", placeholders.join(",")));
+                for s in sts {
+                    params.push(Box::new(s.to_string()));
+                    param_idx += 1;
+                }
+            }
+        }
+
+        if let Some(sevs) = severities {
+            if !sevs.is_empty() {
+                let placeholders: Vec<String> = sevs.iter().enumerate().map(|(i, _)| {
+                    let idx = param_idx + i as u32;
+                    format!("${}", idx)
+                }).collect();
+                conditions.push(format!("e.severity IN ({})", placeholders.join(",")));
+                for s in sevs {
+                    params.push(Box::new(s.to_string()));
+                    param_idx += 1;
+                }
+            }
+        }
+
+        if let Some(src) = source {
+            conditions.push(format!("e.log_source_name = ${}", param_idx));
+            params.push(Box::new(src.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(after) = captured_after {
+            conditions.push(format!("e.captured_at >= ${}::TIMESTAMPTZ", param_idx));
+            params.push(Box::new(after.to_string()));
+            param_idx += 1;
+        }
+
+        let limit_val = limit.unwrap_or(100) as i64;
+        let limit_param = format!("${}", param_idx);
+        params.push(Box::new(limit_val));
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            r#"
+            SELECT e.id, e.log_source_id, e.log_source_name, e.task_run_id, e.workflow_step_id,
+                   e.log_timestamp::TEXT, e.captured_at::TEXT, e.severity, e.error_type, e.error_code,
+                   e.message, e.stack_trace, e.context_lines, e.raw_entry,
+                   e.file_path, e.line_number, e.column_number, e.function_name,
+                   e.signature_hash, e.occurrence_count, e.first_seen_at::TEXT, e.last_seen_at::TEXT,
+                   e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
+                   e.acknowledged_at::TEXT, e.resolved_at::TEXT, tr.workflow_name, e.trace_id
+            FROM error_events e
+            LEFT JOIN task_runs tr ON e.task_run_id = tr.id
+            {}
+            ORDER BY
+                CASE e.severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
+                e.occurrence_count DESC,
+                e.last_seen_at DESC
+            LIMIT {}
+            "#,
+            where_clause, limit_param
+        );
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG query_error_events: {}", e))?;
+
+        Ok(rows.iter().map(|row| Self::error_row_to_json(row)).collect())
+    }
+
+    /// Search error events by message content using ILIKE.
+    pub async fn search_errors(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let pattern = format!("%{}%", query);
+        let limit_i64 = limit as i64;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT e.id, e.log_source_id, e.log_source_name, e.task_run_id, e.workflow_step_id,
+                       e.log_timestamp::TEXT, e.captured_at::TEXT, e.severity, e.error_type, e.error_code,
+                       e.message, e.stack_trace, e.context_lines, e.raw_entry,
+                       e.file_path, e.line_number, e.column_number, e.function_name,
+                       e.signature_hash, e.occurrence_count, e.first_seen_at::TEXT, e.last_seen_at::TEXT,
+                       e.status, e.finding_id, e.resolved_by_task_run_id, e.resolution_notes,
+                       e.acknowledged_at::TEXT, e.resolved_at::TEXT, tr.workflow_name, e.trace_id
+                FROM error_events e
+                LEFT JOIN task_runs tr ON e.task_run_id = tr.id
+                WHERE e.message ILIKE $1 OR e.error_type ILIKE $1
+                ORDER BY e.last_seen_at DESC
+                LIMIT $2
+                "#,
+                &[&pattern, &limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG search_errors: {}", e))?;
+
+        Ok(rows.iter().map(|row| Self::error_row_to_json(row)).collect())
+    }
+
+    /// Acknowledge all new errors, optionally scoped to a task_run_id.
+    /// Returns the count of acknowledged errors.
+    pub async fn acknowledge_all_errors(
+        &self,
+        task_run_id: Option<&str>,
+    ) -> Result<u32, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let count = if let Some(tid) = task_run_id {
+            conn.execute(
+                r#"
+                UPDATE error_events SET
+                    status = 'acknowledged',
+                    acknowledged_at = $1::TIMESTAMPTZ
+                WHERE status = 'new' AND task_run_id = $2
+                "#,
+                &[&now, &tid],
+            )
+            .await
+            .map_err(|e| format!("PG acknowledge_all_errors: {}", e))?
+        } else {
+            conn.execute(
+                r#"
+                UPDATE error_events SET
+                    status = 'acknowledged',
+                    acknowledged_at = $1::TIMESTAMPTZ
+                WHERE status = 'new'
+                "#,
+                &[&now],
+            )
+            .await
+            .map_err(|e| format!("PG acknowledge_all_errors: {}", e))?
+        };
+
+        Ok(count as u32)
+    }
+
     /// Get count breakdown for a given column in error_events.
     async fn error_count_by_column(
         &self,

@@ -668,31 +668,15 @@ pub fn get_prompt_evolution_history(
 }
 
 #[tauri::command]
-pub fn get_prompt_variant_content(
+pub async fn get_prompt_variant_content(
     app_state: State<'_, Arc<AppState>>,
     variant_id: String,
 ) -> Result<Option<String>, String> {
-    let db = &app_state.checkpoint_db;
-    // Look up prompt content by variant_id from the prompt_registry
-    db.with_conn({
-        let vid = variant_id;
-        move |conn| {
-            conn.query_row(
-                "SELECT prompt_content FROM prompt_registry WHERE id = ?1",
-                rusqlite::params![vid],
-                |row| row.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                _ => Err(format!("Failed to get variant content: {}", e)),
-            })
-        }
-    })
+    app_state.pg_db.get_prompt_variant_content(&variant_id).await
 }
 
 #[tauri::command]
-pub fn get_prompt_evolution_diff(
+pub async fn get_prompt_evolution_diff(
     app_state: State<'_, Arc<AppState>>,
     evolution_id: String,
 ) -> Result<serde_json::Value, String> {
@@ -705,40 +689,18 @@ pub fn get_prompt_evolution_diff(
         .find(|e| e.id == evolution_id)
         .ok_or_else(|| format!("Evolution entry not found: {}", evolution_id))?;
 
-    // Get the new prompt content from the variant
-    let new_content: Option<String> = db.with_conn({
-        let vid = entry.variant_id.clone();
-        move |conn| {
-            let result = conn.query_row(
-                "SELECT prompt_content FROM prompt_registry WHERE id = ?1",
-                rusqlite::params![vid],
-                |row| row.get::<_, String>(0),
-            );
-            match result {
-                Ok(content) => Ok(Some(content)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(format!("Failed to get variant content: {}", e)),
-            }
-        }
-    })?;
+    // Get the new prompt content from the variant via PG
+    let new_content = app_state
+        .pg_db
+        .get_prompt_variant_content(&entry.variant_id)
+        .await?;
 
     // Get the old prompt content (from parent variant or default)
     let old_content: String = if let Some(ref parent_id) = entry.parent_variant_id {
-        let parent_content: Option<String> = db.with_conn({
-            let pid = parent_id.clone();
-            move |conn| {
-                let result = conn.query_row(
-                    "SELECT prompt_content FROM prompt_registry WHERE id = ?1",
-                    rusqlite::params![pid],
-                    |row| row.get::<_, String>(0),
-                );
-                match result {
-                    Ok(content) => Ok(Some(content)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(e) => Err(format!("Failed to get parent content: {}", e)),
-                }
-            }
-        })?;
+        let parent_content = app_state
+            .pg_db
+            .get_prompt_variant_content(parent_id)
+            .await?;
         parent_content.unwrap_or_else(|| {
             crate::meta_optimizer::prompt_extractor::get_default_agent_prompt(&entry.agent_type)
         })

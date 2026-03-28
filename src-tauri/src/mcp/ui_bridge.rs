@@ -6582,7 +6582,8 @@ pub async fn analytics_health_score_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<crate::database::ui_bridge_ops::AutomationHealthScore>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // NOTE: No PG equivalent for compute_automation_health_score; stays on SQLite
+    // Uses SQLite-specific ui_bridge_ops analytics (no PG equivalent yet).
+    // Run on blocking thread to avoid blocking async runtime.
     let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
     match tokio::task::spawn_blocking(move || {

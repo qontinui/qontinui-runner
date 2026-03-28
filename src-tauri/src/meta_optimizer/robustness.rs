@@ -500,6 +500,30 @@ pub fn run_robustness_test_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<cra
     Ok(report)
 }
 
+// ── PG-primary read wrappers ─────────────────────────────────────────────
+
+/// List robustness reports with PG-primary read.
+#[allow(dead_code)]
+pub fn list_robustness_reports_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    prompt_variant_id: Option<&str>,
+    recommendation_id: Option<&str>,
+) -> Result<Vec<RobustnessReport>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let v = prompt_variant_id.map(|s| s.to_string());
+        let r = recommendation_id.map(|s| s.to_string());
+        if let Ok(jsons) = handle.block_on(pg.list_robustness_reports(v.as_deref(), r.as_deref())) {
+            let reports: Vec<RobustnessReport> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+            if !reports.is_empty() {
+                return Ok(reports);
+            }
+        }
+    }
+    list_robustness_reports(db, prompt_variant_id, recommendation_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

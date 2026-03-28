@@ -1451,3 +1451,166 @@ pub fn record_canary_outcome_with_pg(
         warn!("Failed to record canary outcome for {}: {}", canary_id, e);
     }
 }
+
+// ── PG-primary read wrappers ───────────────────────────────────────────
+
+/// Get all active canary rollouts with PG-primary read.
+#[allow(dead_code)]
+pub fn get_active_canaries_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> Result<Vec<CanaryRollout>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        if let Ok(result) = handle.block_on(pg.get_active_canaries()) {
+            return Ok(result);
+        }
+    }
+    get_active_canaries(db)
+}
+
+/// Get canary history with PG-primary read.
+#[allow(dead_code)]
+pub fn get_canary_history_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    limit: u32,
+) -> Result<Vec<serde_json::Value>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let lim = limit.min(100) as i64;
+        if let Ok(result) = handle.block_on(pg.get_canary_history(lim)) {
+            return Ok(result);
+        }
+    }
+    get_canary_history(db, limit)
+}
+
+/// Probabilistic check with PG-primary read: should this run use the canary config?
+#[allow(dead_code)]
+pub fn should_apply_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> bool {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let rid = recommendation_id.to_string();
+        if let Ok(result) = handle.block_on(pg.should_apply_canary(&rid)) {
+            return result;
+        }
+    }
+    should_apply_canary(db, recommendation_id)
+}
+
+/// Evaluate a canary with PG-primary read for metrics.
+#[allow(dead_code)]
+pub fn evaluate_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+) -> Result<CanaryEvaluation, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let cid = canary_id.to_string();
+        if let Ok(metrics) = handle.block_on(pg.get_canary_metrics(&cid)) {
+            // Parse metrics and evaluate locally
+            let (baseline_json, canary_json) = metrics;
+            let baseline: CanaryMetrics = serde_json::from_str(&baseline_json).unwrap_or_default();
+            let canary: CanaryMetrics = serde_json::from_str(&canary_json).unwrap_or_default();
+
+            let baseline_total = (baseline.success_count + baseline.failure_count) as u64;
+            let canary_total = (canary.success_count + canary.failure_count) as u64;
+            let baseline_sr = if baseline_total > 0 { baseline.success_count as f64 / baseline_total as f64 * 100.0 } else { 0.0 };
+            let canary_sr = if canary_total > 0 { canary.success_count as f64 / canary_total as f64 * 100.0 } else { 0.0 };
+            let delta = canary_sr - baseline_sr;
+            let min_runs_met = canary_total >= 10;
+
+            let analysis = crate::stats::proportion_analysis(
+                (canary.success_count as u64, canary_total),
+                (baseline.success_count as u64, baseline_total),
+                2,
+            );
+
+            let cost_delta_pct = if baseline_total > 0 && canary_total > 0 {
+                let b_avg = baseline.total_cost_usd / baseline_total as f64;
+                let c_avg = canary.total_cost_usd / canary_total as f64;
+                if b_avg > 0.0 { Some((c_avg - b_avg) / b_avg * 100.0) } else { None }
+            } else { None };
+            let duration_delta_pct = if baseline_total > 0 && canary_total > 0 {
+                let b_avg = baseline.total_duration_ms / baseline_total as f64;
+                let c_avg = canary.total_duration_ms / canary_total as f64;
+                if b_avg > 0.0 { Some((c_avg - b_avg) / b_avg * 100.0) } else { None }
+            } else { None };
+
+            let verdict_enum = if !min_runs_met {
+                crate::stats::Verdict::Neutral
+            } else {
+                crate::stats::compute_verdict(delta, &analysis, canary_total, &crate::stats::VerdictThresholds::canary())
+            };
+
+            return Ok(CanaryEvaluation {
+                verdict: verdict_enum.as_canary_str().to_string(),
+                baseline_success_rate: baseline_sr, canary_success_rate: canary_sr,
+                delta, min_runs_met,
+                p_value: analysis.p_value, confidence_interval: analysis.confidence_interval,
+                effect_size: analysis.effect_size, cost_delta_pct, duration_delta_pct,
+            });
+        }
+    }
+    evaluate_canary(db, canary_id)
+}
+
+/// Get prompt template canary with PG-primary read.
+#[allow(dead_code)]
+pub fn get_prompt_template_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+) -> Result<PromptTemplateCanary, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let cid = canary_id.to_string();
+        if let Ok(Some(result)) = handle.block_on(pg.get_template_canary(&cid)) {
+            return Ok(result);
+        }
+    }
+    get_prompt_template_canary(db, canary_id)
+}
+
+/// Promote a canary with PG dual-write including evolution verdict.
+#[allow(dead_code)]
+pub fn promote_canary_with_evolution_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+) -> Result<(), String> {
+    promote_canary(db, canary_id)?;
+    let pg = pg_db.clone();
+    let cid = canary_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.promote_canary(&cid).await {
+            tracing::warn!("PG promote_canary dual-write failed: {}", e);
+        }
+    });
+    Ok(())
+}
+
+/// Rollback canary with eval and PG dual-write including evolution verdict.
+#[allow(dead_code)]
+pub fn rollback_canary_with_eval_and_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+    eval: Option<&CanaryEvaluation>,
+) -> Result<(), String> {
+    rollback_canary_with_eval(db, canary_id, eval)?;
+    let pg = pg_db.clone();
+    let cid = canary_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.rollback_canary(&cid).await {
+            tracing::warn!("PG rollback_canary dual-write failed: {}", e);
+        }
+    });
+    Ok(())
+}

@@ -46,21 +46,29 @@ impl<T> TieredInfoResponse<T> {
 }
 
 /// Get config statistics (Tier 4 summary).
+///
+/// Note: Uses SQLite because config_statistics is a complex aggregation table
+/// tightly coupled to the tiered_info module's internal data model.
 #[tauri::command]
 pub async fn get_config_statistics(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<TieredInfoResponse<ConfigStatistics>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
+    let cid = config_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        tiered_info::get_config_statistics(&conn, &cid)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
 
-    match tiered_info::get_config_statistics(&conn, &config_id) {
-        Ok(Some(stats)) => Ok(TieredInfoResponse::ok(stats)),
-        Ok(None) => Ok(TieredInfoResponse::err(format!(
+    match result {
+        Some(stats) => Ok(TieredInfoResponse::ok(stats)),
+        None => Ok(TieredInfoResponse::err(format!(
             "No statistics found for config {}",
             config_id
         ))),
-        Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
 
@@ -71,12 +79,17 @@ pub async fn get_flaky_transitions(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
-
+    let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
 
-    match tiered_info::get_flaky_transitions(&conn, &config_id, threshold) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        tiered_info::get_flaky_transitions(&conn, &config_id, threshold)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(items) => Ok(TieredInfoResponse::ok(items)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -89,12 +102,17 @@ pub async fn get_flaky_templates(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
-
+    let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
 
-    match tiered_info::get_flaky_templates(&conn, &config_id, threshold) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        tiered_info::get_flaky_templates(&conn, &config_id, threshold)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(items) => Ok(TieredInfoResponse::ok(items)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -107,10 +125,16 @@ pub async fn get_debugging_context(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<DebuggingContext>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match tiered_info::get_debugging_context(&conn, &config_id, config_name) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        tiered_info::get_debugging_context(&conn, &config_id, config_name)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(context) => Ok(TieredInfoResponse::ok(context)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -123,14 +147,18 @@ pub async fn get_debugging_context_prompt(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<String>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
 
-    match tiered_info::get_debugging_context(&conn, &config_id, config_name) {
-        Ok(context) => {
-            let prompt = tiered_info::format_debugging_context_for_prompt(&context);
-            Ok(TieredInfoResponse::ok(prompt))
-        }
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        tiered_info::get_debugging_context(&conn, &config_id, config_name)
+            .map(|context| tiered_info::format_debugging_context_for_prompt(&context))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
+        Ok(prompt) => Ok(TieredInfoResponse::ok(prompt)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -195,16 +223,20 @@ pub async fn get_recent_runs(
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
-
+    let db = state.checkpoint_db.clone();
     let limit = limit.unwrap_or(10);
+    let cid = config_id.clone();
 
-    let result = if let Some(ref cid) = config_id {
-        tiered_info::get_all_recent_runs(&conn, cid, limit)
-    } else {
-        crate::mcp::automation_runs::get_all_recent_runs(&conn, limit)
-    };
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        if let Some(ref cid) = cid {
+            tiered_info::get_all_recent_runs(&conn, cid, limit)
+        } else {
+            crate::mcp::automation_runs::get_all_recent_runs(&conn, limit)
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
     match result {
         Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
@@ -219,12 +251,17 @@ pub async fn get_failed_runs(
     config_id: String,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
-
+    let db = state.checkpoint_db.clone();
     let limit = limit.unwrap_or(5);
 
-    match tiered_info::get_all_failed_runs(&conn, &config_id, limit) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        tiered_info::get_all_failed_runs(&conn, &config_id, limit)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -259,7 +296,7 @@ pub async fn record_run(
     state: State<'_, Arc<AppState>>,
     input: RecordRunInput,
 ) -> Result<TieredInfoResponse<String>, String> {
-    let db = &state.checkpoint_db;
+    let db = state.checkpoint_db.clone();
     let conn = db.connection()?;
 
     // Parse status
@@ -383,33 +420,15 @@ pub async fn cleanup_old_runs(
     config_id: String,
     keep_count: Option<u32>,
 ) -> Result<TieredInfoResponse<u32>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
-
     let keep_count = keep_count.unwrap_or(100);
 
-    // Delete old task_run_automation records for tasks linked to this config
-    let result = conn.execute(
-        r#"
-        DELETE FROM task_run_automation
-        WHERE id IN (
-            SELECT tra.id FROM task_run_automation tra
-            INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-            WHERE tr.config_id = ?1
-            ORDER BY tra.started_at DESC
-            LIMIT -1 OFFSET ?2
-        )
-        "#,
-        rusqlite::params![config_id, keep_count],
-    );
-
-    match result {
+    match state.pg_db.cleanup_old_runs(&config_id, keep_count).await {
         Ok(deleted) => {
             info!(
                 "Cleaned up {} old automation records for config {}",
                 deleted, config_id
             );
-            Ok(TieredInfoResponse::ok(deleted as u32))
+            Ok(TieredInfoResponse::ok(deleted))
         }
         Err(e) => Ok(TieredInfoResponse::err(format!(
             "Failed to cleanup old runs: {}",
@@ -437,42 +456,35 @@ pub async fn get_execution_options(
     transition_id: Option<String>,
     template_id: Option<String>,
 ) -> Result<TieredInfoResponse<ExecutionOptions>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
+    let db = state.checkpoint_db.clone();
+    let cid = config_id.clone();
+    let tid = transition_id.clone();
+    let tmpl = template_id.clone();
 
-    // Default flakiness threshold (20% - items with 20-80% success rate)
-    let threshold = 0.2;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        // Default flakiness threshold (20% - items with 20-80% success rate)
+        let threshold = 0.2;
+        let cache = FlakinessCache::load(&conn, &cid, threshold)?;
+        let options = if let Some(tid) = tid {
+            cache.get_transition_options(&tid)
+        } else if let Some(tmpl) = tmpl {
+            cache.get_template_options(&tmpl)
+        } else {
+            ExecutionOptions::default()
+        };
+        Ok::<_, String>(options)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
-    // Load flakiness cache
-    let cache = match FlakinessCache::load(&conn, &config_id, threshold) {
-        Ok(c) => c,
+    match result {
+        Ok(options) => Ok(TieredInfoResponse::ok(options)),
         Err(e) => {
             warn!("Failed to load flakiness cache: {}", e);
-            // Return default options on cache load failure
-            return Ok(TieredInfoResponse::ok(ExecutionOptions::default()));
+            Ok(TieredInfoResponse::ok(ExecutionOptions::default()))
         }
-    };
-
-    // Get execution options based on item type
-    let options = if let Some(tid) = transition_id {
-        let opts = cache.get_transition_options(&tid);
-        debug!(
-            "Execution options for transition '{}': retries={}, timeout_mult={:.1}",
-            tid, opts.retry_count, opts.timeout_multiplier
-        );
-        opts
-    } else if let Some(tmpl) = template_id {
-        let opts = cache.get_template_options(&tmpl);
-        debug!(
-            "Execution options for template '{}': retries={}, confidence={:.2}",
-            tmpl, opts.retry_count, opts.confidence_threshold
-        );
-        opts
-    } else {
-        ExecutionOptions::default()
-    };
-
-    Ok(TieredInfoResponse::ok(options))
+    }
 }
 
 /// Response containing flakiness summary for a configuration.
@@ -500,12 +512,18 @@ pub async fn get_flakiness_summary(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<FlakinessSummary>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
-
+    let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
+    let cid = config_id.clone();
 
-    match FlakinessCache::load(&conn, &config_id, threshold) {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.connection()?;
+        FlakinessCache::load(&conn, &cid, threshold)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    match result {
         Ok(cache) => {
             let summary = FlakinessSummary {
                 flaky_transition_count: cache.flaky_transition_count(),
@@ -566,65 +584,28 @@ pub async fn get_ai_session_history(
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<AiSessionRun>>, String> {
-    let db = &state.checkpoint_db;
-    let conn = db.connection()?;
     let limit = limit.unwrap_or(50);
 
-    // Build the query based on whether config_id filter is provided
-    let query = if config_id.is_some() {
-        r#"
-        SELECT id, task_name, created_at, completed_at, status, sessions_count, task_type
-        FROM task_runs
-        WHERE config_id = ?1
-        ORDER BY created_at DESC
-        LIMIT ?2
-        "#
-    } else {
-        r#"
-        SELECT id, task_name, created_at, completed_at, status, sessions_count, task_type
-        FROM task_runs
-        ORDER BY created_at DESC
-        LIMIT ?1
-        "#
-    };
+    let pg_rows = state
+        .pg_db
+        .get_ai_session_history(config_id.as_deref(), limit)
+        .await?;
 
-    let mut stmt = conn
-        .prepare(query)
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let runs: Vec<AiSessionRun> = if let Some(ref cid) = config_id {
-        stmt.query_map(rusqlite::params![cid, limit], |row| {
-            let status: String = row.get(4)?;
-            Ok(AiSessionRun {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                started_at: row.get(2)?,
-                ended_at: row.get(3)?,
-                status: map_status_to_frontend(&status),
-                loop_count: row.get(5)?,
-                task_type: row.get(6)?,
-            })
+    let runs: Vec<AiSessionRun> = pg_rows
+        .into_iter()
+        .map(|row| {
+            let status = row["status"].as_str().unwrap_or("unknown");
+            AiSessionRun {
+                id: row["id"].as_str().unwrap_or("").to_string(),
+                name: row["task_name"].as_str().unwrap_or("").to_string(),
+                started_at: row["created_at"].as_str().unwrap_or("").to_string(),
+                ended_at: row["completed_at"].as_str().map(|s| s.to_string()),
+                status: map_status_to_frontend(status),
+                loop_count: row["sessions_count"].as_i64().unwrap_or(0) as u32,
+                task_type: row["task_type"].as_str().map(|s| s.to_string()),
+            }
         })
-        .map_err(|e| format!("Failed to query task runs: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect()
-    } else {
-        stmt.query_map(rusqlite::params![limit], |row| {
-            let status: String = row.get(4)?;
-            Ok(AiSessionRun {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                started_at: row.get(2)?,
-                ended_at: row.get(3)?,
-                status: map_status_to_frontend(&status),
-                loop_count: row.get(5)?,
-                task_type: row.get(6)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query task runs: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect()
-    };
+        .collect();
 
     debug!(
         "Retrieved {} AI session runs (config_id: {:?})",

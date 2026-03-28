@@ -380,70 +380,62 @@ pub async fn get_cross_run_state_diff(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<CrossRunDiffQuery>,
 ) -> Result<Json<ApiResponse<CrossRunStateDiff>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
+    let pg_db = state.app_state.pg_db.clone();
 
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            // Get distinct states from ui_bridge_states per task run
-            let mut stmt = conn
-                .prepare(
-                    r#"SELECT DISTINCT state_id FROM ui_bridge_states ORDER BY created_at DESC"#,
-                )
-                .map_err(|e| format!("Failed to prepare cross-run diff query: {e}"))?;
+    match async {
+        let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
 
-            let all_states: Vec<String> = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| format!("Failed to query states: {e}"))?
-                .filter_map(|r| r.ok())
-                .collect();
+        // Get distinct states from ui_bridge_states
+        let all_rows = conn
+            .query(
+                r#"SELECT DISTINCT state_id FROM ui_bridge_states ORDER BY created_at DESC"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Failed to query states: {e}"))?;
 
-            // Get states from most recent exploration (via ui_bridge_events with state_id)
-            let mut recent_stmt = conn
-                .prepare(
-                    r#"SELECT DISTINCT state_id FROM ui_bridge_events
-                       WHERE state_id IS NOT NULL
-                       AND task_run_id = (
-                         SELECT task_run_id FROM ui_bridge_events
-                         WHERE state_id IS NOT NULL
-                         ORDER BY timestamp DESC LIMIT 1
-                       )"#,
-                )
-                .map_err(|e| format!("Failed to prepare recent states query: {e}"))?;
+        let all_states: Vec<String> = all_rows.iter().map(|r| r.get(0)).collect();
 
-            let recent_states: std::collections::HashSet<String> = recent_stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| format!("Failed to query recent states: {e}"))?
-                .filter_map(|r| r.ok())
-                .collect();
+        // Get states from most recent exploration (via ui_bridge_events with state_id)
+        let recent_rows = conn
+            .query(
+                r#"SELECT DISTINCT state_id FROM ui_bridge_events
+                   WHERE state_id IS NOT NULL
+                   AND task_run_id = (
+                     SELECT task_run_id FROM ui_bridge_events
+                     WHERE state_id IS NOT NULL
+                     ORDER BY timestamp DESC LIMIT 1
+                   )"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Failed to query recent states: {e}"))?;
 
-            let all_set: std::collections::HashSet<String> = all_states.into_iter().collect();
+        let recent_states: std::collections::HashSet<String> =
+            recent_rows.iter().map(|r| r.get(0)).collect();
 
-            let new_states: Vec<String> = recent_states.difference(&all_set).cloned().collect();
-            let missing_states: Vec<String> = all_set.difference(&recent_states).cloned().collect();
-            let consistent_states: Vec<String> =
-                recent_states.intersection(&all_set).cloned().collect();
+        let all_set: std::collections::HashSet<String> = all_states.into_iter().collect();
 
-            let _ = query; // workflow_name filtering is future work
+        let new_states: Vec<String> = recent_states.difference(&all_set).cloned().collect();
+        let missing_states: Vec<String> = all_set.difference(&recent_states).cloned().collect();
+        let consistent_states: Vec<String> =
+            recent_states.intersection(&all_set).cloned().collect();
 
-            Ok(CrossRunStateDiff {
-                new_states,
-                missing_states,
-                consistent_states,
-                runs_compared: 2, // latest vs all prior
-            })
+        let _ = query; // workflow_name filtering is future work
+
+        Ok::<_, String>(CrossRunStateDiff {
+            new_states,
+            missing_states,
+            consistent_states,
+            runs_compared: 2, // latest vs all prior
         })
-    })
+    }
     .await
     {
-        Ok(Ok(diff)) => Ok(Json(ApiResponse::success(diff))),
-        Ok(Err(e)) => {
+        Ok(diff) => Ok(Json(ApiResponse::success(diff))),
+        Err(e) => {
             error!("Cross-run state diff: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-        Err(e) => {
-            let msg = format!("Cross-run state diff task failed: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
         }
     }
 }

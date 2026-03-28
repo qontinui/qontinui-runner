@@ -544,6 +544,30 @@ impl AgenticExecutor {
             }
         };
 
+        // Append unified memory context (cross-run learnings, knowledge graph, PG memories).
+        // Uses MemorySystem::build_context_unified which queries PG + SQLite + graph and
+        // falls back gracefully when the unified query returns nothing.
+        let enhanced_prompt = {
+            let mem = crate::orchestrator::memory::MemorySystem::new();
+            let mem_ctx = mem
+                .build_context_unified(
+                    20,
+                    &config.base_prompt,
+                    &self.app_state.pg_db,
+                    self.checkpoint_db.clone(),
+                )
+                .await;
+            if mem_ctx.trim().is_empty() {
+                enhanced_prompt
+            } else {
+                info!(
+                    "AGENTIC-PHASE: Injecting unified memory context ({} chars)",
+                    mem_ctx.len()
+                );
+                format!("{}\n\n{}", enhanced_prompt, mem_ctx)
+            }
+        };
+
         // Append execution timing context if available (from iteration 2+ or cross-stage)
         let enhanced_prompt = if iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0) {
             match build_execution_timing_context(&self.checkpoint_db, &config.execution_id) {
