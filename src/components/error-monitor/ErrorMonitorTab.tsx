@@ -15,6 +15,7 @@ import {
   Clock,
   Eye,
   Filter,
+  ExternalLink,
   FolderOpen,
   Info,
   Play,
@@ -26,8 +27,8 @@ import {
 import { cn } from "../../lib/utils";
 import { ScrollArea } from "../ui/ScrollArea";
 import { getStatusColors } from "@/design-system";
-import { useErrorEvents, useErrorSummary } from "../../hooks/useErrorMonitor";
-import { formatErrorTime } from "../../services/error-monitor-service";
+import { useErrorEvents, useErrorSummary, useDebugContext } from "../../hooks/useErrorMonitor";
+import { errorMonitorService, formatErrorTime } from "../../services/error-monitor-service";
 import type { StoredErrorEvent, ErrorSeverity, ErrorStatus } from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
 import { BrowserErrorsPanel } from "./BrowserErrorsPanel";
@@ -244,6 +245,26 @@ function ErrorItem({
             </div>
           )}
 
+          {/* Open in Editor */}
+          {error.location?.filePath && (
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  errorMonitorService.openInEditor(
+                    error.location!.filePath,
+                    error.location!.lineNumber,
+                    error.location!.columnNumber,
+                  );
+                }}
+                className="flex items-center gap-1 px-3 py-1.5 text-xs bg-primary/20 text-primary rounded hover:bg-primary/30 transition-colors"
+              >
+                <ExternalLink className="w-3 h-3" />
+                Open in Editor
+              </button>
+            </div>
+          )}
+
           {/* Actions */}
           {error.status !== "resolved" && error.status !== "ignored" && (
             <div className="flex gap-2 pt-2">
@@ -356,6 +377,9 @@ export function ErrorMonitorTab({
   });
 
   const { summary } = useErrorSummary({ taskRunId, refreshInterval: 30000 });
+
+  const { context: debugContext } = useDebugContext({ taskRunId });
+  const patterns = debugContext?.patterns ?? [];
 
   // Filter errors by search text
   const filteredErrors = useMemo(() => {
@@ -572,6 +596,28 @@ export function ErrorMonitorTab({
 
       {/* Browser errors from UI Bridge SDK */}
       <BrowserErrorsPanel defaultCollapsed={true} />
+
+      {/* Detected patterns */}
+      {patterns.length > 0 && (
+        <div className="px-4 py-2 border-b border-border bg-muted/20">
+          <span className="text-xs font-medium text-muted-foreground">
+            Detected Patterns ({patterns.length})
+          </span>
+          <div className="mt-1 space-y-1">
+            {patterns.map((p, i) => (
+              <div key={i} className="text-xs flex items-center gap-2 text-muted-foreground">
+                <span className="px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded">
+                  {(p.patternType ?? "unknown").replace(/_/g, " ")}
+                </span>
+                <span>{p.name}</span>
+                <span className="text-muted-foreground/60">
+                  ({p.frequency ?? p.matchCount ?? 0} errors)
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Error list */}
       <ScrollArea className="flex-1">

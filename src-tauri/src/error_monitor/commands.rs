@@ -331,6 +331,32 @@ pub async fn get_debug_context_for_ai(
     .map_err(|e| format!("Task join error: {}", e))?
 }
 
+/// Open a file in the user's editor at a specific line.
+/// Tries VS Code first, then falls back to the system default.
+#[tauri::command]
+pub async fn open_error_in_editor(
+    file_path: String,
+    line_number: Option<u32>,
+    column_number: Option<u32>,
+) -> Result<(), String> {
+    let line = line_number.unwrap_or(1);
+    let col = column_number.unwrap_or(1);
+
+    // Try VS Code first (most common for developers)
+    let vscode_arg = format!("{}:{}:{}", file_path, line, col);
+    let vscode_result = std::process::Command::new("code")
+        .args(["--goto", &vscode_arg])
+        .spawn();
+
+    if vscode_result.is_ok() {
+        return Ok(());
+    }
+
+    // Fallback: try to open just the file with the default handler
+    open::that(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
+    Ok(())
+}
+
 /// Get all commands that should be registered with Tauri.
 ///
 /// Use this in your main.rs to register all error monitoring commands:
@@ -365,6 +391,7 @@ macro_rules! error_monitor_commands {
             $crate::error_monitor::commands::acknowledge_all_errors,
             $crate::error_monitor::commands::get_debug_context,
             $crate::error_monitor::commands::get_debug_context_for_ai,
+            $crate::error_monitor::commands::open_error_in_editor,
             $crate::error_monitor::workflow::generate_error_fix_workflow,
             $crate::error_monitor::workflow::generate_single_error_fix_workflow,
             $crate::error_monitor::workflow::check_fixable_errors,

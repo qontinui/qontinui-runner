@@ -6,6 +6,7 @@ use super::protocol::{ExecutorCommand, ProtocolHandler};
 use super::state::ExecutorState;
 use crate::event_system::EventEmitter;
 use serde_json::{json, Value};
+use tauri::Manager;
 use std::process::Child;
 use std::sync::Arc;
 use std::time::Duration;
@@ -189,9 +190,37 @@ impl PythonBridge {
             });
         }
 
+        // Set up error monitor integration for stderr.
+        // Create a channel so the stderr reader thread can forward lines to the
+        // error monitor's async ingestion task without blocking.
+        let error_monitor_tx = {
+            let mut tx_opt = None;
+            if let Some(app_state) = self
+                .app_handle
+                .try_state::<std::sync::Arc<crate::commands::AppState>>()
+            {
+                // Access the error monitor handle (non-blocking try_lock to avoid
+                // deadlocks during startup; if the lock is held we skip registration).
+                if let Ok(guard) = app_state.error_monitor_handle.try_lock() {
+                    if let Some(ref handle) = *guard {
+                        let (tx, rx) = tokio::sync::mpsc::channel::<String>(512);
+                        let source_label = if self.is_headless() {
+                            "python-executor-headless".to_string()
+                        } else {
+                            "python-executor".to_string()
+                        };
+                        handle.spawn_stderr_ingestion_task(source_label, rx);
+                        tx_opt = Some(tx);
+                        info!("Registered Python stderr with error monitor");
+                    }
+                }
+            }
+            tx_opt
+        };
+
         // Spawn stderr reader task using output processor
         std::thread::spawn(move || {
-            OutputProcessor::stderr_reader_task(stderr);
+            OutputProcessor::stderr_reader_task(stderr, error_monitor_tx);
         });
 
         // Spawn command sender task using protocol handler

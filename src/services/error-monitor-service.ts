@@ -191,6 +191,13 @@ export const errorMonitorService = {
   },
 
   /**
+   * Open an error's source file in the user's editor.
+   */
+  async openInEditor(filePath: string, lineNumber?: number, columnNumber?: number): Promise<void> {
+    return invoke("open_error_in_editor", { filePath, lineNumber, columnNumber });
+  },
+
+  /**
    * Check if there are fixable errors and get summary.
    */
   async checkFixableErrors(taskRunId?: string): Promise<FixableErrorsSummary> {

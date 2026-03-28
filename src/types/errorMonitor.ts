@@ -197,14 +197,29 @@ export interface ErrorSummary {
 // Debug Context Types
 // =============================================================================
 
+/** Types of error patterns */
+export type PatternType =
+  | "repeated_error_type"
+  | "same_file_location"
+  | "same_source"
+  | "similar_message"
+  | "cascading_failure"
+  | "similar_embedding";
+
 /** A pattern detected in errors */
 export interface ErrorPattern {
   /** Pattern name */
   name: string;
   /** Number of matches */
   matchCount: number;
-  /** Representative error IDs */
+  /** Error IDs that match this pattern */
+  errorIds: number[];
+  /** Frequency (how many errors match) */
+  frequency: number;
+  /** Representative error IDs (legacy alias) */
   sampleIds: number[];
+  /** Pattern type */
+  patternType: PatternType;
   /** Suggested root cause */
   suggestedCause?: string;
 }

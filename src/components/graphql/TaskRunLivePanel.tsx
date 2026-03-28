@@ -14,6 +14,7 @@
 import { useTaskRunLive, useTaskRunControls } from "@/hooks/graphql";
 import { Loader2, Square, Pause, Play, Trash2, AlertCircle, CheckCircle2, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { RunErrorSummary } from "../error-monitor/RunErrorSummary";
 
 interface TaskRunLivePanelProps {
   taskRunId: string;
@@ -180,6 +181,9 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
           {taskRun.errorMessage}
         </div>
       )}
+
+      {/* Error monitor summary for this run */}
+      <RunErrorSummary taskRunId={taskRunId} />
 
       {/* Summary */}
       {taskRun.summary && (

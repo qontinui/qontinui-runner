@@ -91,6 +91,8 @@ pub enum PatternType {
     SimilarMessage,
     /// Cascading failures (one error causing others)
     CascadingFailure,
+    /// Errors with similar embeddings (semantic similarity)
+    SimilarEmbedding,
 }
 
 /// Configuration for the debug context curator.
@@ -201,7 +203,12 @@ impl DebugContextCurator {
         warnings.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
 
         // Detect patterns
-        let patterns = self.detect_patterns(&errors);
+        let mut patterns = self.detect_patterns(&errors);
+
+        // Detect embedding-based similarity patterns
+        let error_ids: Vec<i64> = errors.iter().map(|e| e.id).collect();
+        let embedding_patterns = self.detect_embedding_patterns(conn, &error_ids);
+        patterns.extend(embedding_patterns);
 
         // Generate focus areas
         let focus_areas = self.generate_focus_areas(&critical_errors, &regular_errors, &patterns);
@@ -548,6 +555,126 @@ impl DebugContextCurator {
         // Sort patterns by frequency
         patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
         patterns
+    }
+
+    /// Detect embedding-based similarity patterns.
+    /// This requires database access to read the message_embedding column.
+    pub fn detect_embedding_patterns(
+        &self,
+        conn: &Connection,
+        error_ids: &[i64],
+    ) -> Vec<ErrorPattern> {
+        if error_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Build a parameterized IN clause
+        let placeholders: Vec<String> = (1..=error_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT id, message, message_embedding FROM error_events WHERE id IN ({}) AND message_embedding IS NOT NULL",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        // Bind parameters
+        let params: Vec<&dyn rusqlite::types::ToSql> = error_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows: Vec<(i64, String, Vec<f32>)> = match stmt.query_map(params.as_slice(), |row| {
+            let id: i64 = row.get(0)?;
+            let message: String = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            // Parse embedding: 384 f32 values, little-endian
+            let embedding: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            Ok((id, message, embedding))
+        }) {
+            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Err(_) => return Vec::new(),
+        };
+
+        if rows.len() < 2 {
+            return Vec::new();
+        }
+
+        // Precompute norms
+        let norms: Vec<f32> = rows
+            .iter()
+            .map(|(_, _, emb)| {
+                let sum_sq: f32 = emb.iter().map(|x| x * x).sum();
+                sum_sq.sqrt().max(1e-10)
+            })
+            .collect();
+
+        // Greedy clustering with cosine similarity threshold
+        let threshold: f32 = 0.85;
+        let mut assigned = vec![false; rows.len()];
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+
+        for i in 0..rows.len() {
+            if assigned[i] {
+                continue;
+            }
+            let mut cluster = vec![i];
+            assigned[i] = true;
+
+            for j in (i + 1)..rows.len() {
+                if assigned[j] {
+                    continue;
+                }
+                // Cosine similarity
+                let dot: f32 = rows[i]
+                    .2
+                    .iter()
+                    .zip(rows[j].2.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                let sim = dot / (norms[i] * norms[j]);
+                if sim >= threshold {
+                    cluster.push(j);
+                    assigned[j] = true;
+                }
+            }
+
+            if cluster.len() >= 2 {
+                clusters.push(cluster);
+            }
+        }
+
+        // Convert clusters to ErrorPattern entries
+        clusters
+            .into_iter()
+            .map(|indices| {
+                let ids: Vec<i64> = indices.iter().map(|&idx| rows[idx].0).collect();
+                let freq = ids.len() as u32;
+                // Use the first error's message as a representative label
+                let representative_msg = &rows[indices[0]].1;
+                let label = if representative_msg.len() > 60 {
+                    format!("{}...", &representative_msg[..60])
+                } else {
+                    representative_msg.clone()
+                };
+
+                ErrorPattern {
+                    name: format!("Semantically similar: \"{}\"", label),
+                    error_ids: ids,
+                    frequency: freq,
+                    pattern_type: PatternType::SimilarEmbedding,
+                    suggested_cause: Some(
+                        "These errors have similar semantic meaning and may share a root cause"
+                            .to_string(),
+                    ),
+                }
+            })
+            .collect()
     }
 
     /// Generate suggested focus areas based on errors and patterns.

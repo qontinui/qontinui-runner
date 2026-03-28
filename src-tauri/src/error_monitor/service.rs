@@ -27,7 +27,7 @@ use crate::error_monitor::pipeline::traits::{Exporter, Processor};
 use crate::error_monitor::pipeline::types::{LogRecord, SourceMeta};
 use crate::error_monitor::storage::LogSourceStorage;
 use crate::error_monitor::types::{
-    ErrorEvent, LogFormat, LogSourceConfig, ParserType, PathType, StoredErrorEvent,
+    ErrorEvent, ErrorSeverity, LogFormat, LogSourceConfig, ParserType, PathType, StoredErrorEvent,
 };
 
 /// File position tracker for incremental parsing
@@ -182,6 +182,91 @@ impl ErrorMonitorHandle {
             })
             .await
             .map_err(|e| format!("Failed to send ingest stream errors command: {}", e))
+    }
+
+    /// Register a managed process stderr stream for error monitoring.
+    ///
+    /// Spawns a background tokio task that reads lines from the provided receiver
+    /// (populated by the stderr reader thread) and ingests error/warning lines
+    /// through the error monitor pipeline.
+    ///
+    /// The caller should send stderr lines to the returned channel; the background
+    /// task will parse them and forward errors via `ingest_stream_errors`.
+    pub fn spawn_stderr_ingestion_task(
+        &self,
+        source_name: String,
+        mut line_rx: tokio::sync::mpsc::Receiver<String>,
+    ) {
+        let command_tx = self.command_tx.clone();
+        tokio::spawn(async move {
+            // Batch lines to avoid sending one-at-a-time through the command channel.
+            // Flush every 50 lines or when the channel is empty (try_recv returns Empty).
+            let mut batch: Vec<ErrorEvent> = Vec::new();
+            const BATCH_SIZE: usize = 50;
+
+            while let Some(line) = line_rx.recv().await {
+                // Only ingest lines that look like errors or warnings.
+                // The pipeline processors will do full parsing/dedup, but we
+                // pre-filter to avoid flooding the pipeline with debug/info lines.
+                let dominated = line.to_lowercase();
+                let is_error_like = dominated.contains("error")
+                    || dominated.contains("exception")
+                    || dominated.contains("traceback")
+                    || dominated.contains("critical")
+                    || dominated.contains("fatal")
+                    || dominated.contains("panic");
+                let is_warning_like = dominated.contains("warning") || dominated.contains("warn");
+
+                if !is_error_like && !is_warning_like {
+                    continue;
+                }
+
+                let severity = if is_error_like {
+                    ErrorSeverity::Error
+                } else {
+                    ErrorSeverity::Warning
+                };
+
+                batch.push(ErrorEvent {
+                    log_source_name: source_name.clone(),
+                    severity,
+                    error_type: None,
+                    error_code: None,
+                    message: line.clone(),
+                    stack_trace: None,
+                    location: None,
+                    context_lines: None,
+                    raw_entry: line,
+                    log_timestamp: None,
+                    trace_id: None,
+                });
+
+                if batch.len() >= BATCH_SIZE {
+                    let errors = std::mem::take(&mut batch);
+                    let _ = command_tx
+                        .send(ServiceCommand::IngestStreamErrors {
+                            source_name: source_name.clone(),
+                            errors,
+                        })
+                        .await;
+                }
+            }
+
+            // Flush remaining
+            if !batch.is_empty() {
+                let _ = command_tx
+                    .send(ServiceCommand::IngestStreamErrors {
+                        source_name: source_name.clone(),
+                        errors: batch,
+                    })
+                    .await;
+            }
+
+            tracing::debug!(
+                "Stderr ingestion task for '{}' ended (stream closed)",
+                source_name
+            );
+        });
     }
 
     /// Stop the error monitor service.

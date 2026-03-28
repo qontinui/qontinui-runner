@@ -42,7 +42,10 @@ import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 import { useCanaryAlerts } from "./hooks/useCanaryAlerts";
 import { useGraphDataRefresh } from "./hooks/useGraphDataRefresh";
 import { useObservationServices } from "./hooks/useObservationServices";
+import { useToast } from "./hooks/useToast";
+import { useErrorNotifications } from "./hooks/useErrorNotifications";
 
+import { ToastContainer } from "./components/ToastContainer";
 import StatusIndicator from "./components/StatusIndicator";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
@@ -159,6 +162,8 @@ function AppContent() {
   const projectLogs = useProjectLogs();
   const globalLogSources = useGlobalLogSources();
   const { alerts: canaryAlerts, dismissAlert: dismissCanaryAlert } = useCanaryAlerts();
+  const { toasts, showToast, dismissToast } = useToast();
+  useErrorNotifications(showToast);
 
   const { activities: backgroundActivities } = useBackgroundActivities({
     isExtracting: false,
@@ -460,6 +465,7 @@ function AppContent() {
             </div>
           ))}
 
+          <ToastContainer toasts={toasts} onDismiss={dismissToast} />
           <PerformanceOverlay position="bottom-right" />
           <CommandPalette />
         </div>

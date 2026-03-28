@@ -340,6 +340,17 @@ impl ErrorEventStorage {
 
             Ok(id)
         } else {
+            // Check if this error previously existed and was resolved (recurrence detection)
+            let was_previously_resolved: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM error_events WHERE signature_hash = ?1 AND status IN ('resolved', 'wont_fix')",
+                    params![signature_hash],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+
+            let initial_status = if was_previously_resolved { "recurring" } else { "new" };
+
             // Insert new error event
             conn.execute(
                 r#"
@@ -352,7 +363,7 @@ impl ErrorEventStorage {
                     status, trace_id
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, 1, datetime('now'), datetime('now'), 'new', ?18
+                    ?13, ?14, ?15, ?16, ?17, 1, datetime('now'), datetime('now'), ?18, ?19
                 )
                 "#,
                 params![
@@ -376,6 +387,7 @@ impl ErrorEventStorage {
                         .as_ref()
                         .and_then(|l| l.function_name.as_ref()),
                     signature_hash,
+                    initial_status,
                     event.trace_id,
                 ],
             )
@@ -628,7 +640,7 @@ impl ErrorEventStorage {
                     status = 'resolved',
                     resolution_notes = 'Auto-resolved: SPEC verification results are not application errors',
                     resolved_at = datetime('now')
-                WHERE status IN ('new', 'acknowledged', 'in_progress')
+                WHERE status IN ('new', 'recurring', 'acknowledged', 'in_progress')
                   AND message LIKE '%SPEC: %'
                   AND message LIKE 'action_failed%'
                 "#,
@@ -660,7 +672,7 @@ impl ErrorEventStorage {
                     resolution_notes = 'Auto-resolved: workflow completed successfully',
                     resolved_at = datetime('now')
                 WHERE task_run_id = ?2
-                  AND status IN ('new', 'acknowledged', 'in_progress')
+                  AND status IN ('new', 'recurring', 'acknowledged', 'in_progress')
                 "#,
                 params![resolved_by_task_run_id, task_run_id],
             )
@@ -681,10 +693,10 @@ impl ErrorEventStorage {
             SELECT
                 COUNT(*) as total,
                 COUNT(*) FILTER (WHERE status = 'new') as new_count,
-                COUNT(*) FILTER (WHERE status IN ('new', 'acknowledged', 'in_progress', 'promoted')) as unresolved_count,
-                COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted')) as critical_count,
-                COUNT(*) FILTER (WHERE severity = 'error' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted')) as error_count,
-                COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted')) as warning_count
+                COUNT(*) FILTER (WHERE status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')) as unresolved_count,
+                COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')) as critical_count,
+                COUNT(*) FILTER (WHERE severity = 'error' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')) as error_count,
+                COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')) as warning_count
             FROM error_events {}
             "#,
             where_clause

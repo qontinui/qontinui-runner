@@ -171,11 +171,25 @@ impl OutputProcessor {
         }
     }
 
-    /// Stderr reader task with log level parsing
-    pub fn stderr_reader_task(stderr: std::process::ChildStderr) {
+    /// Stderr reader task with log level parsing.
+    ///
+    /// If `error_monitor_tx` is provided, stderr lines are also forwarded to the
+    /// error monitor ingestion task for automatic error detection and storage.
+    pub fn stderr_reader_task(
+        stderr: std::process::ChildStderr,
+        error_monitor_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ) {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
             Self::log_python_stderr(&line);
+
+            // Forward to error monitor if channel is available.
+            // Use try_send to avoid blocking the stderr reader thread;
+            // if the channel is full, the line is dropped (acceptable since
+            // the error monitor also has periodic file-based polling).
+            if let Some(ref tx) = error_monitor_tx {
+                let _ = tx.try_send(line);
+            }
         }
         info!("Stderr reader thread ending");
     }

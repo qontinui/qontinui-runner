@@ -138,8 +138,9 @@ impl ExtractionExecutor {
         });
 
         // Spawn stderr reader task using output processor
+        // (No error monitor integration for extraction executor — it's short-lived)
         std::thread::spawn(move || {
-            OutputProcessor::stderr_reader_task(stderr);
+            OutputProcessor::stderr_reader_task(stderr, None);
         });
 
         // Spawn command sender task using protocol handler

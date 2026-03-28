@@ -13,7 +13,7 @@ use std::collections::HashMap;
 impl PgDb {
     /// Get unresolved errors, optionally filtered by task_run_id.
     ///
-    /// Returns errors with status IN ('new', 'acknowledged', 'in_progress', 'promoted'),
+    /// Returns errors with status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'),
     /// ordered by severity priority, occurrence_count DESC, last_seen_at DESC.
     pub async fn get_unresolved_errors(
         &self,
@@ -40,7 +40,7 @@ impl PgDb {
                        e.acknowledged_at::TEXT, e.resolved_at::TEXT, tr.workflow_name, e.trace_id
                 FROM error_events e
                 LEFT JOIN task_runs tr ON e.task_run_id = tr.id
-                WHERE e.status IN ('new', 'acknowledged', 'in_progress', 'promoted')
+                WHERE e.status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')
                   AND e.task_run_id = $1
                 ORDER BY
                     CASE e.severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
@@ -64,7 +64,7 @@ impl PgDb {
                        e.acknowledged_at::TEXT, e.resolved_at::TEXT, tr.workflow_name, e.trace_id
                 FROM error_events e
                 LEFT JOIN task_runs tr ON e.task_run_id = tr.id
-                WHERE e.status IN ('new', 'acknowledged', 'in_progress', 'promoted')
+                WHERE e.status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted')
                 ORDER BY
                     CASE e.severity WHEN 'critical' THEN 0 WHEN 'error' THEN 1 ELSE 2 END,
                     e.occurrence_count DESC,
@@ -98,10 +98,10 @@ impl PgDb {
                 SELECT
                     COUNT(*)::INTEGER as total,
                     COUNT(*) FILTER (WHERE status = 'new')::INTEGER as new_count,
-                    COUNT(*) FILTER (WHERE status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as unresolved_count,
-                    COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as critical_count,
-                    COUNT(*) FILTER (WHERE severity = 'error' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as error_count,
-                    COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as warning_count
+                    COUNT(*) FILTER (WHERE status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as unresolved_count,
+                    COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as critical_count,
+                    COUNT(*) FILTER (WHERE severity = 'error' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as error_count,
+                    COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as warning_count
                 FROM error_events
                 WHERE task_run_id = $1
                 "#,
@@ -115,10 +115,10 @@ impl PgDb {
                 SELECT
                     COUNT(*)::INTEGER as total,
                     COUNT(*) FILTER (WHERE status = 'new')::INTEGER as new_count,
-                    COUNT(*) FILTER (WHERE status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as unresolved_count,
-                    COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as critical_count,
-                    COUNT(*) FILTER (WHERE severity = 'error' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as error_count,
-                    COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('new', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as warning_count
+                    COUNT(*) FILTER (WHERE status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as unresolved_count,
+                    COUNT(*) FILTER (WHERE severity = 'critical' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as critical_count,
+                    COUNT(*) FILTER (WHERE severity = 'error' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as error_count,
+                    COUNT(*) FILTER (WHERE severity = 'warning' AND status IN ('new', 'recurring', 'acknowledged', 'in_progress', 'promoted'))::INTEGER as warning_count
                 FROM error_events
                 "#,
                 &[],
@@ -265,7 +265,7 @@ impl PgDb {
                     resolution_notes = 'Auto-resolved: workflow completed successfully',
                     resolved_at = NOW()
                 WHERE task_run_id = $2
-                  AND status IN ('new', 'acknowledged', 'in_progress')
+                  AND status IN ('new', 'recurring', 'acknowledged', 'in_progress')
                 "#,
                 &[&resolved_by_task_run_id, &task_run_id],
             )
