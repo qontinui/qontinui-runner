@@ -10,6 +10,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Outcome of a workflow execution for learning purposes.
+#[derive(Clone)]
 pub struct WorkflowOutcome {
     pub task_run_id: String,
     pub workflow_name: String,
@@ -815,6 +816,30 @@ pub fn spawn_llm_judge_if_eligible(
     verification_passed: bool,
     was_stopped: bool,
 ) {
+    // PG variant preferred — if pg_db available in caller, use spawn_llm_judge_if_eligible_pg
+    spawn_llm_judge_if_eligible_inner(db, None, task_run_id, iterations, verification_passed, was_stopped);
+}
+
+/// PG-aware variant of spawn_llm_judge_if_eligible.
+pub fn spawn_llm_judge_if_eligible_pg(
+    db: std::sync::Arc<crate::database::CheckpointDb>,
+    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
+    task_run_id: String,
+    iterations: u32,
+    verification_passed: bool,
+    was_stopped: bool,
+) {
+    spawn_llm_judge_if_eligible_inner(db, Some(pg_db), task_run_id, iterations, verification_passed, was_stopped);
+}
+
+fn spawn_llm_judge_if_eligible_inner(
+    db: std::sync::Arc<crate::database::CheckpointDb>,
+    pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
+    task_run_id: String,
+    iterations: u32,
+    verification_passed: bool,
+    was_stopped: bool,
+) {
     use crate::meta_optimizer::agentic_metrics::llm_judge;
 
     if !llm_judge::should_llm_judge(iterations, verification_passed, was_stopped) {
@@ -822,16 +847,41 @@ pub fn spawn_llm_judge_if_eligible(
     }
 
     tokio::spawn(async move {
-        // Gather input data from the database
-        let judge_input = match gather_llm_judge_input(&db, &task_run_id) {
-            Ok(input) => input,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to gather LLM judge input for {}: {}",
-                    task_run_id,
-                    e
-                );
-                return;
+        // Gather input data from PG if available, fallback to SQLite
+        let judge_input = if let Some(ref pg) = pg_db {
+            match gather_llm_judge_input_pg(pg, &task_run_id).await {
+                Ok(input) => input,
+                Err(_) => match tokio::task::spawn_blocking({
+                    let db = db.clone();
+                    let tid = task_run_id.clone();
+                    move || gather_llm_judge_input(&db, &tid)
+                }).await {
+                    Ok(Ok(input)) => input,
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to gather LLM judge input for {}: {}", task_run_id, e);
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("LLM judge gather panicked for {}: {}", task_run_id, e);
+                        return;
+                    }
+                },
+            }
+        } else {
+            match tokio::task::spawn_blocking({
+                let db = db.clone();
+                let tid = task_run_id.clone();
+                move || gather_llm_judge_input(&db, &tid)
+            }).await {
+                Ok(Ok(input)) => input,
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to gather LLM judge input for {}: {}", task_run_id, e);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("LLM judge gather panicked for {}: {}", task_run_id, e);
+                    return;
+                }
             }
         };
 
@@ -846,78 +896,20 @@ pub fn spawn_llm_judge_if_eligible(
                 }
             };
 
-        // Persist the LLM-judged scores
-        // PG: complex dynamic SQL
-        if let Err(e) = db.with_conn(|conn| {
-            let now = chrono::Utc::now().to_rfc3339();
-            for score in &results {
-                let id = format!("ams-{}", Uuid::new_v4());
-                conn.execute(
-                    r#"INSERT OR REPLACE INTO agentic_metric_scores
-                        (id, task_run_id, metric_type, score, confidence,
-                         rationale, is_llm_judged, model_used, created_at)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                    params![
-                        id,
-                        task_run_id,
-                        score.metric.as_str(),
-                        score.score,
-                        score.confidence,
-                        score.rationale,
-                        score.is_llm_judged as i32,
-                        score.model_used,
-                        now,
-                    ],
-                )
-                .map_err(|e| format!("Failed to insert LLM judge score: {}", e))?;
+        // Persist the LLM-judged scores via PG or spawn_blocking SQLite
+        if let Some(ref pg) = pg_db {
+            if let Err(e) = persist_judge_scores_pg(pg, &task_run_id, &results).await {
+                tracing::warn!("Failed to persist LLM judge scores for {}: {}", task_run_id, e);
             }
-
-            // Recompute composite score now that we have LLM-judged metrics
-            let all_scores: Vec<crate::meta_optimizer::agentic_metrics::MetricResult> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT metric_type, score FROM agentic_metric_scores WHERE task_run_id = ?1",
-                    )
-                    .map_err(|e| format!("Failed to query scores: {}", e))?;
-                let raw_scores: Vec<(String, f64)> = stmt
-                    .query_map(params![task_run_id], |row| {
-                        let metric_type: String = row.get(0)?;
-                        let score: f64 = row.get(1)?;
-                        Ok((metric_type, score))
-                    })
-                    .map_err(|e| format!("Failed to read scores: {}", e))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                drop(stmt);
-                raw_scores
-                    .into_iter()
-                    .filter_map(|(mt, s)| {
-                        metric_from_str(&mt).map(|m| crate::meta_optimizer::agentic_metrics::MetricResult {
-                            metric: m,
-                            score: s,
-                            confidence: 0.7,
-                            rationale: String::new(),
-                            is_llm_judged: false,
-                            model_used: None,
-                        })
-                    })
-                    .collect()
-            };
-
-            let composite = crate::meta_optimizer::agentic_metrics::composite_score(&all_scores);
-            conn.execute(
-                "UPDATE learning_outcomes SET composite_agentic_score = ?1 WHERE task_id = ?2",
-                params![composite, task_run_id],
-            )
-            .map_err(|e| format!("Failed to update composite score: {}", e))?;
-
-            info!(
-                "LLM judge completed for {}: composite updated to {:.3}",
-                task_run_id, composite
-            );
-            Ok(())
-        }) {
-            tracing::warn!("Failed to persist LLM judge scores for {}: {}", task_run_id, e);
+        } else {
+            let db2 = db.clone();
+            let tid = task_run_id.clone();
+            let results_c = results.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                persist_judge_scores_sqlite(&db2, &tid, &results_c)
+            }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string())) {
+                tracing::warn!("Failed to persist LLM judge scores for {}: {}", task_run_id, e);
+            }
         }
     });
 }
@@ -1001,22 +993,28 @@ pub fn spawn_rag_judge_if_eligible(
 ) {
     tokio::spawn(async move {
         // Check if this run has retrieval events
-        // PG: complex dynamic SQL
-        let (retrieval_events, task_prompt) = match db.with_conn(|conn| {
-            let events = crate::meta_optimizer::agentic_metrics::rag_judge::load_retrieval_events(
-                conn,
-                &task_run_id,
-            )?;
-            let prompt: String = conn
-                .query_row(
-                    "SELECT COALESCE(prompt, '') FROM task_runs WHERE id = ?1",
-                    params![task_run_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_default();
-            Ok((events, prompt))
-        }) {
-            Ok((events, prompt)) if !events.is_empty() => (events, prompt),
+        let load_result = {
+            let db_c = db.clone();
+            let tid_c = task_run_id.clone();
+            tokio::task::spawn_blocking(move || {
+                db_c.with_conn(|conn| {
+                    let events = crate::meta_optimizer::agentic_metrics::rag_judge::load_retrieval_events(
+                        conn,
+                        &tid_c,
+                    )?;
+                    let prompt: String = conn
+                        .query_row(
+                            "SELECT COALESCE(prompt, '') FROM task_runs WHERE id = ?1",
+                            params![tid_c],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_default();
+                    Ok((events, prompt))
+                })
+            }).await
+        };
+        let (retrieval_events, task_prompt) = match load_result {
+            Ok(Ok((events, prompt))) if !events.is_empty() => (events, prompt),
             _ => return, // No retrieval events or error — skip
         };
 
@@ -1038,88 +1036,162 @@ pub fn spawn_rag_judge_if_eligible(
         };
 
         // Persist RAG scores and recompute composite
-        // PG: complex dynamic SQL
-        if let Err(e) = db.with_conn(|conn| {
-            let now = chrono::Utc::now().to_rfc3339();
-            for score in &results {
-                let id = format!("ams-{}", Uuid::new_v4());
-                conn.execute(
-                    r#"INSERT OR REPLACE INTO agentic_metric_scores
-                        (id, task_run_id, metric_type, score, confidence,
-                         rationale, is_llm_judged, model_used, created_at)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                    params![
-                        id,
-                        task_run_id,
-                        score.metric.as_str(),
-                        score.score,
-                        score.confidence,
-                        score.rationale,
-                        score.is_llm_judged as i32,
-                        score.model_used,
-                        now,
-                    ],
-                )
-                .map_err(|e| format!("Failed to insert RAG score: {}", e))?;
-            }
-
-            // Recompute composite score including RAG metrics
-            let mut stmt = conn
-                .prepare(
-                    "SELECT metric_type, score FROM agentic_metric_scores WHERE task_run_id = ?1",
-                )
-                .map_err(|e| format!("Failed to query scores: {}", e))?;
-            let raw_scores: Vec<(String, f64)> = stmt
-                .query_map(params![task_run_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                })
-                .map_err(|e| format!("Failed to read scores: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-            drop(stmt);
-
-            let all_scores: Vec<crate::meta_optimizer::agentic_metrics::MetricResult> = raw_scores
-                .into_iter()
-                .filter_map(|(mt, s)| {
-                    metric_from_str(&mt).map(|m| {
-                        crate::meta_optimizer::agentic_metrics::MetricResult {
-                            metric: m,
-                            score: s,
-                            confidence: 0.7,
-                            rationale: String::new(),
-                            is_llm_judged: false,
-                            model_used: None,
-                        }
-                    })
-                })
-                .collect();
-
-            let composite = crate::meta_optimizer::agentic_metrics::composite_score(&all_scores);
-            conn.execute(
-                "UPDATE learning_outcomes SET composite_agentic_score = ?1 WHERE task_id = ?2",
-                params![composite, task_run_id],
-            )
-            .map_err(|e| format!("Failed to update composite score: {}", e))?;
-
+        let db_c = db.clone();
+        let tid_c = task_run_id.clone();
+        let results_c = results.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            persist_judge_scores_sqlite(&db_c, &tid_c, &results_c)
+        }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string())) {
+            tracing::warn!(
+                "Failed to persist RAG judge scores for {}: {}",
+                task_run_id,
+                e
+            );
+        } else {
             info!(
-                "RAG judge completed for {}: {}, composite updated to {:.3}",
+                "RAG judge completed for {}: {}",
                 task_run_id,
                 results
                     .iter()
                     .map(|r| format!("{}={:.2}", r.metric, r.score))
                     .collect::<Vec<_>>()
                     .join(", "),
-                composite,
-            );
-            Ok(())
-        }) {
-            tracing::warn!(
-                "Failed to persist RAG judge scores for {}: {}",
-                task_run_id,
-                e
             );
         }
     });
+}
+
+/// Persist judge scores to SQLite (for use in spawn_blocking).
+fn persist_judge_scores_sqlite(
+    db: &crate::database::CheckpointDb,
+    task_run_id: &str,
+    results: &[crate::meta_optimizer::agentic_metrics::MetricResult],
+) -> Result<(), String> {
+    db.with_conn(|conn| {
+        let now = chrono::Utc::now().to_rfc3339();
+        for score in results {
+            let id = format!("ams-{}", Uuid::new_v4());
+            conn.execute(
+                r#"INSERT OR REPLACE INTO agentic_metric_scores
+                    (id, task_run_id, metric_type, score, confidence,
+                     rationale, is_llm_judged, model_used, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                params![
+                    id,
+                    task_run_id,
+                    score.metric.as_str(),
+                    score.score,
+                    score.confidence,
+                    score.rationale,
+                    score.is_llm_judged as i32,
+                    score.model_used,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to insert score: {}", e))?;
+        }
+
+        // Recompute composite score
+        let mut stmt = conn
+            .prepare("SELECT metric_type, score FROM agentic_metric_scores WHERE task_run_id = ?1")
+            .map_err(|e| format!("Failed to query scores: {}", e))?;
+        let raw_scores: Vec<(String, f64)> = stmt
+            .query_map(params![task_run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|e| format!("Failed to read scores: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let all_scores: Vec<crate::meta_optimizer::agentic_metrics::MetricResult> = raw_scores
+            .into_iter()
+            .filter_map(|(mt, s)| {
+                metric_from_str(&mt).map(|m| crate::meta_optimizer::agentic_metrics::MetricResult {
+                    metric: m,
+                    score: s,
+                    confidence: 0.7,
+                    rationale: String::new(),
+                    is_llm_judged: false,
+                    model_used: None,
+                })
+            })
+            .collect();
+
+        let composite = crate::meta_optimizer::agentic_metrics::composite_score(&all_scores);
+        conn.execute(
+            "UPDATE learning_outcomes SET composite_agentic_score = ?1 WHERE task_id = ?2",
+            params![composite, task_run_id],
+        )
+        .map_err(|e| format!("Failed to update composite score: {}", e))?;
+
+        info!("Judge scores persisted for {}: composite={:.3}", task_run_id, composite);
+        Ok(())
+    })
+}
+
+/// Persist judge scores to PG.
+async fn persist_judge_scores_pg(
+    pg: &crate::database::pg::PgDb,
+    task_run_id: &str,
+    results: &[crate::meta_optimizer::agentic_metrics::MetricResult],
+) -> Result<(), String> {
+    for score in results {
+        let id = format!("ams-{}", Uuid::new_v4());
+        let now = chrono::Utc::now().to_rfc3339();
+        pg.upsert_agentic_metric_score(
+            &id,
+            task_run_id,
+            score.metric.as_str(),
+            score.score,
+            score.confidence,
+            &score.rationale,
+            score.is_llm_judged,
+            score.model_used.as_deref(),
+            &now,
+        ).await?;
+    }
+
+    // Recompute composite
+    let all_scores_raw = pg.get_all_metric_scores(task_run_id).await?;
+    let all_scores: Vec<crate::meta_optimizer::agentic_metrics::MetricResult> = all_scores_raw
+        .into_iter()
+        .filter_map(|(mt, s)| {
+            metric_from_str(&mt).map(|m| crate::meta_optimizer::agentic_metrics::MetricResult {
+                metric: m,
+                score: s,
+                confidence: 0.7,
+                rationale: String::new(),
+                is_llm_judged: false,
+                model_used: None,
+            })
+        })
+        .collect();
+    let composite = crate::meta_optimizer::agentic_metrics::composite_score(&all_scores);
+    pg.update_composite_agentic_score(task_run_id, composite).await?;
+
+    info!("Judge scores persisted (PG) for {}: composite={:.3}", task_run_id, composite);
+    Ok(())
+}
+
+/// Gather LLM judge input from PG.
+async fn gather_llm_judge_input_pg(
+    pg: &crate::database::pg::PgDb,
+    task_run_id: &str,
+) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
+    let (prompt, execution_steps, summary, goal_achieved, status) =
+        pg.get_task_run_for_judge(task_run_id).await?;
+    let execution_trace_summary = pg.get_execution_trace_summary(task_run_id).await.ok().flatten();
+
+    Ok(crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
+        task_run_id: task_run_id.to_string(),
+        task_prompt: prompt.unwrap_or_default(),
+        execution_plan: execution_steps,
+        outcome_summary: summary,
+        goal_achieved,
+        status,
+        execution_trace_summary,
+    })
 }
 
 /// Parse a metric type string back to an AgenticMetric enum.

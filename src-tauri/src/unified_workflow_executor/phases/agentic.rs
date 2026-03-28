@@ -686,7 +686,7 @@ impl AgenticExecutor {
                 config.cross_workflow_learning,
                 config.project_path.as_deref(),
                 &self.app_state.pg_db,
-            ) {
+            ).await {
                 Some(ctx) => {
                     let label = if iteration == 1 {
                         format!(

@@ -11,50 +11,50 @@ use crate::commands::AppState;
 // ── Compliance commands ───────────────────────────────────────────────
 
 #[tauri::command]
-pub fn get_spec_compliance_history(
+pub async fn get_spec_compliance_history(
     app_state: State<'_, Arc<AppState>>,
     spec_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<compliance::SpecComplianceResult>, String> {
-    compliance::get_compliance_history(&app_state.checkpoint_db, spec_id.as_deref(), limit)
+    compliance::get_compliance_history(&app_state.pg_db, spec_id.as_deref(), limit).await
 }
 
 #[tauri::command]
-pub fn get_spec_compliance_summary(
+pub async fn get_spec_compliance_summary(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<compliance::SpecComplianceSummary>, String> {
-    compliance::get_compliance_summary(&app_state.checkpoint_db)
+    compliance::get_compliance_summary(&app_state.pg_db).await
 }
 
 #[tauri::command]
-pub fn extract_spec_compliance(
+pub async fn extract_spec_compliance(
     app_state: State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<compliance::SpecComplianceResult, String> {
-    compliance::extract_compliance(&app_state.checkpoint_db, &task_run_id)
+    compliance::extract_compliance(&app_state.pg_db, &task_run_id).await
 }
 
 // -- Broken assertion & attention commands ------------------------------------
 
 #[tauri::command]
-pub fn detect_broken_spec_assertions(
+pub async fn detect_broken_spec_assertions(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
 ) -> Result<Vec<compliance::BrokenAssertion>, String> {
-    compliance::detect_broken_assertions(&app_state.checkpoint_db, &spec_id)
+    compliance::detect_broken_assertions(&app_state.pg_db, &spec_id).await
 }
 
 #[tauri::command]
-pub fn get_specs_needing_attention(
+pub async fn get_specs_needing_attention(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<compliance::SpecAttentionItem>, String> {
-    compliance::get_specs_needing_attention(&app_state.checkpoint_db)
+    compliance::get_specs_needing_attention(&app_state.pg_db).await
 }
 
 // ── Accuracy commands ─────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn analyze_spec_element_coverage(
+pub async fn analyze_spec_element_coverage(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
     spec_config: serde_json::Value,
@@ -65,18 +65,19 @@ pub fn analyze_spec_element_coverage(
     // Store the result
     let detail_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
     accuracy::store_accuracy_result(
-        &app_state.checkpoint_db,
+        &app_state.pg_db,
         &spec_id,
         "element_coverage",
         result.element_coverage,
         &detail_json,
-    )?;
+    )
+    .await?;
 
     Ok(result)
 }
 
 #[tauri::command]
-pub fn analyze_cross_page_consistency(
+pub async fn analyze_cross_page_consistency(
     app_state: State<'_, Arc<AppState>>,
     specs: Vec<(String, serde_json::Value)>,
 ) -> Result<accuracy::CrossPageConsistencyResult, String> {
@@ -86,19 +87,20 @@ pub fn analyze_cross_page_consistency(
     for spec_score in &result.per_spec_scores {
         let detail_json = serde_json::to_string(spec_score).unwrap_or_else(|_| "{}".into());
         let _ = accuracy::store_accuracy_result(
-            &app_state.checkpoint_db,
+            &app_state.pg_db,
             &spec_score.spec_id,
             "cross_page",
             spec_score.score,
             &detail_json,
-        );
+        )
+        .await;
     }
 
     Ok(result)
 }
 
 #[tauri::command]
-pub fn run_spec_mutation_test(
+pub async fn run_spec_mutation_test(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
     spec_config: serde_json::Value,
@@ -108,12 +110,13 @@ pub fn run_spec_mutation_test(
 
     let detail_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
     accuracy::store_accuracy_result(
-        &app_state.checkpoint_db,
+        &app_state.pg_db,
         &spec_id,
         "mutation",
         result.mutation_score,
         &detail_json,
-    )?;
+    )
+    .await?;
 
     Ok(result)
 }
@@ -135,22 +138,23 @@ pub fn analyze_spec_freshness(
 }
 
 #[tauri::command]
-pub fn get_spec_accuracy_results(
+pub async fn get_spec_accuracy_results(
     app_state: State<'_, Arc<AppState>>,
     spec_id: Option<String>,
     analysis_type: Option<String>,
 ) -> Result<Vec<accuracy::SpecAccuracyRecord>, String> {
     accuracy::get_accuracy_results(
-        &app_state.checkpoint_db,
+        &app_state.pg_db,
         spec_id.as_deref(),
         analysis_type.as_deref(),
     )
+    .await
 }
 
 // ── Versioning commands ───────────────────────────────────────────────
 
 #[tauri::command]
-pub fn snapshot_current_spec(
+pub async fn snapshot_current_spec(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
     spec_json: String,
@@ -158,31 +162,32 @@ pub fn snapshot_current_spec(
     change_type: Option<String>,
 ) -> Result<versioning::SpecVersion, String> {
     versioning::snapshot_spec_version(
-        &app_state.checkpoint_db,
+        &app_state.pg_db,
         &spec_id,
         &spec_json,
         change_summary.as_deref(),
         change_type.as_deref().unwrap_or("manual"),
     )
+    .await
 }
 
 #[tauri::command]
-pub fn get_spec_version_history(
+pub async fn get_spec_version_history(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
     limit: Option<i64>,
 ) -> Result<Vec<versioning::SpecVersion>, String> {
-    versioning::get_version_history(&app_state.checkpoint_db, &spec_id, limit)
+    versioning::get_version_history(&app_state.pg_db, &spec_id, limit).await
 }
 
 #[tauri::command]
-pub fn diff_spec_versions(
+pub async fn diff_spec_versions(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
     from_version: i64,
     to_version: i64,
 ) -> Result<versioning::SpecDiff, String> {
-    versioning::diff_spec_versions(&app_state.checkpoint_db, &spec_id, from_version, to_version)
+    versioning::diff_spec_versions(&app_state.pg_db, &spec_id, from_version, to_version).await
 }
 
 #[tauri::command]

@@ -779,25 +779,18 @@ fn run_claude_session_inline(
 
                 // Store in database if connection is available
                 if let Some(ref db) = db {
-                    // Get a connection from the pool for this operation
-                    // PG: complex dynamic SQL
-                    let conn = match db.connection() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("Failed to get database connection: {}", e);
-                            continue;
-                        }
-                    };
-
                     // Check if this is a resolved finding (marked via :resolved modifier)
                     let is_resolved = parsed_finding.is_resolved;
 
-                    match finding_storage::insert_finding(
-                        &conn,
-                        &ctx.task_run_id,
-                        ctx.session_num,
-                        &parsed_finding,
-                    ) {
+                    let insert_result = db.with_conn(|conn| {
+                        finding_storage::insert_finding(
+                            conn,
+                            &ctx.task_run_id,
+                            ctx.session_num,
+                            &parsed_finding,
+                        )
+                    });
+                    match insert_result {
                         Ok(finding) => {
                             // Emit appropriate event to frontend based on status
                             let event_name = if is_resolved {
@@ -1128,15 +1121,6 @@ fn run_claude_session_inline(
                 );
 
                 if let Some(ref db) = db {
-                    // PG: complex dynamic SQL
-                    let conn = match db.connection() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("Failed to get database connection: {}", e);
-                            continue;
-                        }
-                    };
-
                     let input = CreateReflectionFixInput {
                         source_task_run_id: ctx.source_task_run_id.clone(),
                         reflection_task_run_id: ctx.reflection_task_run_id.clone(),
@@ -1153,43 +1137,44 @@ fn run_claude_session_inline(
                         alternatives_considered: parsed_fix.alternatives_considered,
                     };
 
-                    match reflection_storage::insert_fix(&conn, &input) {
+                    let insert_result = db.with_conn(|conn| {
+                        let fix = reflection_storage::insert_fix(conn, &input)?;
+                        // Set reflection_scope
+                        if parsed_fix.scope.as_deref() == Some("universal") {
+                            let _ = conn.execute(
+                                "UPDATE reflection_fixes SET reflection_scope = 'universal', applicability_context = ?1 WHERE id = ?2",
+                                rusqlite::params![parsed_fix.applicability, fix.id],
+                            );
+                        } else {
+                            let is_project_fix = matches!(
+                                fix.fix_type.as_str(),
+                                "project_environment"
+                                    | "project_architecture"
+                                    | "project_test_pattern"
+                                    | "project_recurring_issue"
+                            );
+                            if is_project_fix {
+                                let _ = conn.execute(
+                                    "UPDATE reflection_fixes SET reflection_scope = 'project', project_path = ?1 WHERE id = ?2",
+                                    rusqlite::params![ctx.project_path, fix.id],
+                                );
+                            }
+                        }
+                        // Link error_events
+                        if let Some(ref finding_id) = fix.source_finding_id {
+                            let _ = conn.execute(
+                                r#"UPDATE error_events SET resolved_by_fix_id = ?1
+                                   WHERE signature_hash = (
+                                       SELECT signature_hash FROM task_run_findings WHERE id = ?2
+                                   ) AND resolved_by_fix_id IS NULL"#,
+                                rusqlite::params![fix.id, finding_id],
+                            );
+                        }
+                        Ok(fix)
+                    });
+                    match insert_result {
                         Ok(fix) => {
                             fix_count += 1;
-
-                            // Set reflection_scope: AI-explicit universal takes priority,
-                            // then auto-detect project scope from fix type
-                            if parsed_fix.scope.as_deref() == Some("universal") {
-                                let _ = conn.execute(
-                                    "UPDATE reflection_fixes SET reflection_scope = 'universal', applicability_context = ?1 WHERE id = ?2",
-                                    rusqlite::params![parsed_fix.applicability, fix.id],
-                                );
-                            } else {
-                                let is_project_fix = matches!(
-                                    fix.fix_type.as_str(),
-                                    "project_environment"
-                                        | "project_architecture"
-                                        | "project_test_pattern"
-                                        | "project_recurring_issue"
-                                );
-                                if is_project_fix {
-                                    let _ = conn.execute(
-                                        "UPDATE reflection_fixes SET reflection_scope = 'project', project_path = ?1 WHERE id = ?2",
-                                        rusqlite::params![ctx.project_path, fix.id],
-                                    );
-                                }
-                            }
-
-                            // Eagerly link matching error_events to this fix via resolved_by_fix_id
-                            if let Some(ref finding_id) = fix.source_finding_id {
-                                let _ = conn.execute(
-                                    r#"UPDATE error_events SET resolved_by_fix_id = ?1
-                                       WHERE signature_hash = (
-                                           SELECT signature_hash FROM task_run_findings WHERE id = ?2
-                                       ) AND resolved_by_fix_id IS NULL"#,
-                                    rusqlite::params![fix.id, finding_id],
-                                );
-                            }
 
                             let msg = format!(
                                 "Reflection fix recorded: [{}:{}] {}",
@@ -1251,10 +1236,12 @@ fn run_claude_session_inline(
                                             Ok(knowledge) => {
                                                 // Set project_path on the knowledge entry
                                                 if let Some(ref pp) = ctx.project_path {
-                                                    let _ = conn.execute(
-                                                        "UPDATE task_knowledge SET project_path = ?1 WHERE id = ?2",
-                                                        rusqlite::params![pp, knowledge.id],
-                                                    );
+                                                    let _ = db.with_conn(|c| {
+                                                        c.execute(
+                                                            "UPDATE task_knowledge SET project_path = ?1 WHERE id = ?2",
+                                                            rusqlite::params![pp, knowledge.id],
+                                                        ).map_err(|e| e.to_string())
+                                                    });
                                                 }
 
                                                 info!(
@@ -1341,7 +1328,7 @@ fn run_claude_session_inline(
                                             // Create step type knowledge entry (system-specific layer)
                                             let title =
                                                 rules::truncate_to_title(&fix.fix_description);
-                                            match step_type_knowledge::insert_knowledge(&conn, &step_type_knowledge::InsertKnowledgeInput {
+                                            match db.with_conn(|conn| step_type_knowledge::insert_knowledge(conn, &step_type_knowledge::InsertKnowledgeInput {
                                                 step_type: step_type.clone(),
                                                 layer: "system_specific".to_string(),
                                                 title: title.clone(),
@@ -1349,7 +1336,7 @@ fn run_claude_session_inline(
                                                 priority: 5,
                                                 provenance: "reflection".to_string(),
                                                 source_fix_id: Some(fix.id.clone()),
-                                            }) {
+                                            })) {
                                                 Ok(entry) => {
                                                     info!("Auto-applied reflection fix as step type knowledge: {} (step_type={})", entry.id, step_type);
                                                     let auto_msg = format!(
@@ -1391,10 +1378,12 @@ fn run_claude_session_inline(
                             {
                                 use crate::workflow_generation::rules as gen_rules;
                                 let fixes_slice = [fix];
-                                match gen_rules::create_rules_from_reflection_fixes(
-                                    &conn,
-                                    &fixes_slice,
-                                ) {
+                                match db.with_conn(|conn| {
+                                    gen_rules::create_rules_from_reflection_fixes(
+                                        conn,
+                                        &fixes_slice,
+                                    )
+                                }) {
                                     Ok(n) if n > 0 => {
                                         info!(
                                             "Created {} generation rule(s) directly from reflection fix",
@@ -1426,16 +1415,16 @@ fn run_claude_session_inline(
                     let reflection_task_run_id = sc.context.task_run_id.clone();
                     // Look up source_task_run_id from DB
                     let db = CheckpointDb::new().ok()?;
-                    // PG: complex dynamic SQL
-                    let conn = db.connection().ok()?;
-                    let source_id: Option<String> = conn
-                        .query_row(
-                            "SELECT reflection_source_task_run_id FROM task_runs WHERE id = ?1",
-                            rusqlite::params![reflection_task_run_id],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                        .flatten();
+                    let source_id: Option<String> = db.with_conn(|conn| {
+                        Ok(conn
+                            .query_row(
+                                "SELECT reflection_source_task_run_id FROM task_runs WHERE id = ?1",
+                                rusqlite::params![reflection_task_run_id],
+                                |row| row.get(0),
+                            )
+                            .ok()
+                            .flatten())
+                    }).ok()?;
                     let source_task_run_id = source_id?;
                     info!(
                         "Inferred reflection fix context from session data: source={}, reflection={}",
@@ -1478,15 +1467,6 @@ fn run_claude_session_inline(
                     );
 
                     if let Some(ref db) = db {
-                        // PG: complex dynamic SQL
-                        let conn = match db.connection() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to get database connection: {}", e);
-                                continue;
-                            }
-                        };
-
                         let input = CreateReflectionFixInput {
                             source_task_run_id: ctx.source_task_run_id.clone(),
                             reflection_task_run_id: ctx.reflection_task_run_id.clone(),
@@ -1503,7 +1483,7 @@ fn run_claude_session_inline(
                             alternatives_considered: parsed_fix.alternatives_considered,
                         };
 
-                        match reflection_storage::insert_fix(&conn, &input) {
+                        match db.with_conn(|conn| reflection_storage::insert_fix(conn, &input)) {
                             Ok(fix) => {
                                 fix_count += 1;
                                 info!(
@@ -1709,11 +1689,10 @@ fn run_claude_session_inline(
 
         if !causal_links.is_empty() {
             if let Ok(db) = CheckpointDb::new() {
-                // PG: complex dynamic SQL
-                if let Ok(conn) = db.connection() {
-                    let rfx_ctx = reflection_fix_ctx.as_ref();
-                    let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());
+                let rfx_ctx = reflection_fix_ctx.as_ref();
+                let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());
 
+                let _ = db.with_conn(|conn| {
                     // Resolve workflow_name from task_runs table
                     let workflow_name: Option<String> = task_run_id.and_then(|id| {
                         conn.query_row(
@@ -1727,7 +1706,7 @@ fn run_claude_session_inline(
 
                     for link in &causal_links {
                         match causal::insert_causal_event(
-                            &conn,
+                            conn,
                             &link.cause_type,
                             &link.cause_ref,
                             &link.effect_type,
@@ -1743,7 +1722,8 @@ fn run_claude_session_inline(
                             Err(e) => warn!("Failed to store causal link: {}", e),
                         }
                     }
-                }
+                    Ok(())
+                });
             }
         }
     }

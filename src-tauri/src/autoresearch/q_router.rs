@@ -617,58 +617,18 @@ fn parse_architecture(s: &str) -> Option<WorkflowArchitecture> {
 // SQLite helpers (shared by commands.rs and engine.rs)
 // =============================================================================
 
-/// Load all Q-table entries from SQLite.
-pub fn load_q_table_sqlite(
-    db: &crate::database::CheckpointDb,
+/// Load all Q-table entries via PG.
+pub async fn load_q_table_pg(
+    pg: &crate::database::pg::PgDb,
 ) -> Result<Vec<(String, String, f64, u32)>, String> {
-    // SQLite fallback — PG equivalent is PgDb::load_q_table() (async)
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare("SELECT state_key, action, q_value, visit_count FROM q_routing_table ORDER BY state_key, action")
-            .map_err(|e| format!("Failed to prepare Q-table query: {}", e))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let state_key: String = row.get(0)?;
-                let action: String = row.get(1)?;
-                let q_value: f64 = row.get(2)?;
-                let visit_count: i32 = row.get(3)?;
-                Ok((state_key, action, q_value, visit_count as u32))
-            })
-            .map_err(|e| format!("Failed to query Q-table: {}", e))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| format!("Failed to read Q-table row: {}", e))?);
-        }
-        Ok(results)
-    })
+    pg.load_q_table().await
 }
 
-/// Load all Q-routing overrides from SQLite.
-pub fn load_overrides_sqlite(
-    db: &crate::database::CheckpointDb,
+/// Load all Q-routing overrides via PG.
+pub async fn load_overrides_pg(
+    pg: &crate::database::pg::PgDb,
 ) -> Result<Vec<(String, String)>, String> {
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare("SELECT state_key, forced_action FROM q_routing_overrides ORDER BY state_key")
-            .map_err(|e| format!("Failed to prepare overrides query: {}", e))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                let state_key: String = row.get(0)?;
-                let forced_action: String = row.get(1)?;
-                Ok((state_key, forced_action))
-            })
-            .map_err(|e| format!("Failed to query overrides: {}", e))?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| format!("Failed to read override row: {}", e))?);
-        }
-        Ok(results)
-    })
+    pg.load_q_overrides().await
 }
 
 // =============================================================================

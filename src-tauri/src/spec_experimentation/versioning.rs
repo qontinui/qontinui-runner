@@ -1,11 +1,10 @@
 //! Spec versioning — tracks spec changes over time with content hashing and diffs.
 
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -115,8 +114,8 @@ fn count_spec_stats(spec_json: &str) -> (i64, i64) {
 
 /// Snapshot a spec's current state into the version history.
 /// Skips if content_hash matches the latest version (no changes).
-pub fn snapshot_spec_version(
-    db: &CheckpointDb,
+pub async fn snapshot_spec_version(
+    pg: &PgDb,
     spec_id: &str,
     spec_json: &str,
     change_summary: Option<&str>,
@@ -125,11 +124,8 @@ pub fn snapshot_spec_version(
     let content_hash = compute_content_hash(spec_json);
     let (assertion_count, group_count) = count_spec_stats(spec_json);
 
-    let spec_id_owned = spec_id.to_string();
-    let content_hash_clone = content_hash.clone();
-
     // Check if latest version has same hash
-    let latest = get_latest_version(db, spec_id)?;
+    let latest = get_latest_version(pg, spec_id).await?;
     if let Some(ref latest) = latest {
         if latest.content_hash == content_hash {
             return Ok(latest.clone());
@@ -143,9 +139,9 @@ pub fn snapshot_spec_version(
 
     let version = SpecVersion {
         id: id.clone(),
-        spec_id: spec_id_owned.clone(),
+        spec_id: spec_id.to_string(),
         version_number,
-        content_hash: content_hash_clone.clone(),
+        content_hash: content_hash.clone(),
         spec_json: spec_json.to_string(),
         change_summary: change_summary.map(|s| s.to_string()),
         change_type: change_type.to_string(),
@@ -155,47 +151,26 @@ pub fn snapshot_spec_version(
         created_at: now.clone(),
     };
 
-    // PG: complex dynamic SQL
-    db.with_conn({
-        let id = id.clone();
-        let spec_id = spec_id_owned.clone();
-        let hash = content_hash_clone.clone();
-        let json = spec_json.to_string();
-        let summary = change_summary.map(|s| s.to_string());
-        let ctype = change_type.to_string();
-        let parent = parent_version_id.clone();
-        let now = now.clone();
-        move |conn| {
-            conn.execute(
-                r#"INSERT INTO spec_versions (
-                    id, spec_id, version_number, content_hash, spec_json,
-                    change_summary, change_type, parent_version_id,
-                    assertion_count, group_count, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
-                params![
-                    id,
-                    spec_id,
-                    version_number,
-                    hash,
-                    json,
-                    summary,
-                    ctype,
-                    parent,
-                    assertion_count,
-                    group_count,
-                    now,
-                ],
-            )
-            .map_err(|e| format!("Failed to insert spec version: {}", e))?;
-            Ok(())
-        }
-    })?;
+    pg.insert_spec_version(
+        &id,
+        spec_id,
+        version_number,
+        &content_hash,
+        spec_json,
+        change_summary,
+        change_type,
+        parent_version_id.as_deref(),
+        assertion_count,
+        group_count,
+        &now,
+    )
+    .await?;
 
     info!(
         "Versioned spec '{}' → v{} (hash={}, {} groups, {} assertions)",
-        spec_id_owned,
+        spec_id,
         version_number,
-        &content_hash_clone[..8],
+        &content_hash[..8],
         group_count,
         assertion_count
     );
@@ -204,57 +179,47 @@ pub fn snapshot_spec_version(
 }
 
 /// Get the latest version of a spec.
-pub fn get_latest_version(db: &CheckpointDb, spec_id: &str) -> Result<Option<SpecVersion>, String> {
-    let sid = spec_id.to_string();
-    // PG: complex dynamic SQL
-    db.with_conn(move |conn| {
-        let result = conn.query_row(
-            r#"SELECT id, spec_id, version_number, content_hash, spec_json,
-                      change_summary, change_type, parent_version_id,
-                      assertion_count, group_count, created_at
-               FROM spec_versions
-               WHERE spec_id = ?1
-               ORDER BY version_number DESC
-               LIMIT 1"#,
-            params![sid],
-            row_to_spec_version,
-        );
-        match result {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query latest spec version: {}", e)),
-        }
-    })
+pub async fn get_latest_version(pg: &PgDb, spec_id: &str) -> Result<Option<SpecVersion>, String> {
+    let row = pg.get_latest_spec_version(spec_id).await?;
+    Ok(row.map(|r| SpecVersion {
+        id: r.id,
+        spec_id: r.spec_id,
+        version_number: r.version_number,
+        content_hash: r.content_hash,
+        spec_json: r.spec_json,
+        change_summary: r.change_summary,
+        change_type: r.change_type,
+        parent_version_id: r.parent_version_id,
+        assertion_count: r.assertion_count,
+        group_count: r.group_count,
+        created_at: r.created_at,
+    }))
 }
 
 /// Get version history for a spec.
-pub fn get_version_history(
-    db: &CheckpointDb,
+pub async fn get_version_history(
+    pg: &PgDb,
     spec_id: &str,
     limit: Option<i64>,
 ) -> Result<Vec<SpecVersion>, String> {
-    let sid = spec_id.to_string();
     let limit = limit.unwrap_or(50);
-    // PG: complex dynamic SQL
-    db.with_conn(move |conn| {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT id, spec_id, version_number, content_hash, spec_json,
-                          change_summary, change_type, parent_version_id,
-                          assertion_count, group_count, created_at
-                   FROM spec_versions
-                   WHERE spec_id = ?1
-                   ORDER BY version_number DESC
-                   LIMIT ?2"#,
-            )
-            .map_err(|e| format!("Failed to prepare version history query: {}", e))?;
-
-        let rows = stmt
-            .query_map(params![sid, limit], row_to_spec_version)
-            .map_err(|e| format!("Failed to query version history: {}", e))?;
-
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    })
+    let rows = pg.get_spec_version_history(spec_id, limit).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SpecVersion {
+            id: r.id,
+            spec_id: r.spec_id,
+            version_number: r.version_number,
+            content_hash: r.content_hash,
+            spec_json: r.spec_json,
+            change_summary: r.change_summary,
+            change_type: r.change_type,
+            parent_version_id: r.parent_version_id,
+            assertion_count: r.assertion_count,
+            group_count: r.group_count,
+            created_at: r.created_at,
+        })
+        .collect())
 }
 
 /// Compute a structured diff between two spec JSON strings.
@@ -430,52 +395,19 @@ pub fn diff_specs(old_json: &str, new_json: &str) -> Result<SpecDiff, String> {
 }
 
 /// Diff two spec versions by their version numbers.
-pub fn diff_spec_versions(
-    db: &CheckpointDb,
+pub async fn diff_spec_versions(
+    pg: &PgDb,
     spec_id: &str,
     from_version: i64,
     to_version: i64,
 ) -> Result<SpecDiff, String> {
-    let sid = spec_id.to_string();
-    // PG: complex dynamic SQL
-    let (old_json, new_json) = db.with_conn(move |conn| {
-        let old: String = conn
-            .query_row(
-                "SELECT spec_json FROM spec_versions WHERE spec_id = ?1 AND version_number = ?2",
-                params![sid, from_version],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Version {} not found: {}", from_version, e))?;
-        let new: String = conn
-            .query_row(
-                "SELECT spec_json FROM spec_versions WHERE spec_id = ?1 AND version_number = ?2",
-                params![sid, to_version],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Version {} not found: {}", to_version, e))?;
-        Ok((old, new))
-    })?;
-
+    let (old_json, new_json) = pg
+        .get_spec_json_for_versions(spec_id, from_version, to_version)
+        .await?;
     diff_specs(&old_json, &new_json)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
-
-fn row_to_spec_version(row: &rusqlite::Row) -> rusqlite::Result<SpecVersion> {
-    Ok(SpecVersion {
-        id: row.get(0)?,
-        spec_id: row.get(1)?,
-        version_number: row.get(2)?,
-        content_hash: row.get(3)?,
-        spec_json: row.get(4)?,
-        change_summary: row.get(5)?,
-        change_type: row.get(6)?,
-        parent_version_id: row.get(7)?,
-        assertion_count: row.get(8)?,
-        group_count: row.get(9)?,
-        created_at: row.get(10)?,
-    })
-}
 
 fn extract_groups(
     spec: &serde_json::Value,

@@ -227,11 +227,10 @@ pub async fn get_optimizer_context_handler(
     let optimizer_type = query.optimizer_type.clone().unwrap_or_default();
     let is_pipeline = optimizer_type == "pipeline_prompt";
 
-    // NOTE: Complex multi-query context builder; no single PG equivalent; stays on SQLite
-    let context = state
-        .app_state
-        .checkpoint_db
-        .with_conn(move |conn| {
+    // NOTE: Complex multi-query context builder; stays on SQLite via spawn_blocking
+    let db = state.app_state.checkpoint_db.clone();
+    let context = tokio::task::spawn_blocking(move || {
+        db.with_conn(move |conn| {
             let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
             let mut out = String::new();
 
@@ -663,15 +662,23 @@ pub async fn get_optimizer_context_handler(
 
             Ok(out)
         })
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to assemble optimizer context: {}",
-                    e
-                ))),
-            )
-        })?;
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task join error: {}", e))),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to assemble optimizer context: {}",
+                e
+            ))),
+        )
+    })?;
 
     Ok(Json(ApiResponse::success(OptimizerContext { context })))
 }
@@ -825,10 +832,9 @@ pub async fn get_autoresearch_campaigns_handler(
 ) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50);
 
-    let campaigns = state
-        .app_state
-        .checkpoint_db
-        .with_conn(move |conn| {
+    let db = state.app_state.checkpoint_db.clone();
+    let campaigns = tokio::task::spawn_blocking(move || {
+        db.with_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
                     r#"SELECT id, name, config_json, current_control_json, status,
@@ -901,7 +907,10 @@ pub async fn get_autoresearch_campaigns_handler(
 
             Ok(campaigns)
         })
-        .unwrap_or_default();
+    })
+    .await
+    .unwrap_or(Ok(Vec::new()))
+    .unwrap_or_default();
 
     Ok(Json(ApiResponse::success(campaigns)))
 }
@@ -1036,10 +1045,10 @@ pub async fn get_iteration_history_handler(
     match tier {
         ContextTier::L0 => {
             // Aggregate: group by status, compute avg iterations, confidence delta, top approaches
-            let summaries = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
+            let db = state.app_state.checkpoint_db.clone();
+            let sf = status_filter.clone();
+            let summaries = tokio::task::spawn_blocking(move || {
+                db.with_conn(move |conn| {
                     let mut sql = String::from(
                         r#"SELECT status, iteration_history
                            FROM task_runs
@@ -1047,7 +1056,7 @@ pub async fn get_iteration_history_handler(
                              AND iteration_history != '[]'"#,
                     );
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    if let Some(ref s) = status_filter {
+                    if let Some(ref s) = sf {
                         sql.push_str(" AND status = ?1");
                         param_values.push(Box::new(s.clone()));
                     }
@@ -1121,7 +1130,10 @@ pub async fn get_iteration_history_handler(
 
                     Ok(summaries)
                 })
-                .map_err(make_err)?;
+            })
+            .await
+            .map_err(|e| make_err(format!("Task join error: {}", e)))?
+            .map_err(make_err)?;
 
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(summaries).unwrap_or_default(),
@@ -1129,10 +1141,10 @@ pub async fn get_iteration_history_handler(
         }
         ContextTier::L1 => {
             // Per-run: iteration count, approaches, confidence trajectory
-            let details = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
+            let db = state.app_state.checkpoint_db.clone();
+            let sf = status_filter.clone();
+            let details = tokio::task::spawn_blocking(move || {
+                db.with_conn(move |conn| {
                     let mut sql = String::from(
                         r#"SELECT id, task_name, status, iteration_history, created_at
                            FROM task_runs
@@ -1140,7 +1152,7 @@ pub async fn get_iteration_history_handler(
                              AND iteration_history != '[]'"#,
                     );
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    if let Some(ref s) = status_filter {
+                    if let Some(ref s) = sf {
                         sql.push_str(" AND status = ?1");
                         param_values.push(Box::new(s.clone()));
                     }
@@ -1189,7 +1201,10 @@ pub async fn get_iteration_history_handler(
 
                     Ok(rows)
                 })
-                .map_err(make_err)?;
+            })
+            .await
+            .map_err(|e| make_err(format!("Task join error: {}", e)))?
+            .map_err(make_err)?;
 
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(details).unwrap_or_default(),
@@ -1197,10 +1212,10 @@ pub async fn get_iteration_history_handler(
         }
         ContextTier::L2 => {
             // Full raw iteration_history JSON per run
-            let full = state
-                .app_state
-                .checkpoint_db
-                .with_conn(move |conn| {
+            let db = state.app_state.checkpoint_db.clone();
+            let sf = status_filter.clone();
+            let full = tokio::task::spawn_blocking(move || {
+                db.with_conn(move |conn| {
                     let mut sql = String::from(
                         r#"SELECT id, task_name, status, iteration_history, created_at
                            FROM task_runs
@@ -1208,7 +1223,7 @@ pub async fn get_iteration_history_handler(
                              AND iteration_history != '[]'"#,
                     );
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    if let Some(ref s) = status_filter {
+                    if let Some(ref s) = sf {
                         sql.push_str(" AND status = ?1");
                         param_values.push(Box::new(s.clone()));
                     }
@@ -1243,7 +1258,10 @@ pub async fn get_iteration_history_handler(
 
                     Ok(rows)
                 })
-                .map_err(make_err)?;
+            })
+            .await
+            .map_err(|e| make_err(format!("Task join error: {}", e)))?
+            .map_err(make_err)?;
 
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(full).unwrap_or_default(),

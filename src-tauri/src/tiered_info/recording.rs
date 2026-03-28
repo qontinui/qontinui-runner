@@ -582,10 +582,8 @@ impl RunRecorder {
         if let Some(trid) = task_run_id {
             self.save_to_task_run_automation(db, trid, true, None)
         } else {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
             let run = self.build_run_details(RunStatus::Completed, None);
-            self.save_run(&conn, run)
+            db.with_conn(|conn| self.save_run(conn, run))
         }
     }
 
@@ -604,10 +602,8 @@ impl RunRecorder {
         if let Some(trid) = task_run_id {
             self.save_to_task_run_automation(db, trid, false, Some(error.to_string()))
         } else {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
             let run = self.build_run_details(RunStatus::Failed, Some(error));
-            self.save_run(&conn, run)
+            db.with_conn(|conn| self.save_run(conn, run))
         }
     }
 
@@ -630,10 +626,8 @@ impl RunRecorder {
                 Some("Execution timed out".to_string()),
             )
         } else {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
             let run = self.build_run_details(RunStatus::Timeout, Some("Execution timed out"));
-            self.save_run(&conn, run)
+            db.with_conn(|conn| self.save_run(conn, run))
         }
     }
 
@@ -652,10 +646,8 @@ impl RunRecorder {
             // Cancelled is still saved as failure in task_run_automation
             self.save_to_task_run_automation(db, trid, false, Some("Cancelled".to_string()))
         } else {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
             let run = self.build_run_details(RunStatus::Cancelled, None);
-            self.save_run(&conn, run)
+            db.with_conn(|conn| self.save_run(conn, run))
         }
     }
 
@@ -794,13 +786,13 @@ impl RunRecorder {
         let run_for_stats = self.build_run_details(status, error_message.as_deref());
 
         // Update statistics in the database
-        // PG: complex dynamic SQL
-        if let Ok(conn) = db.connection() {
-            if let Err(e) = update_statistics_after_run(&conn, &run_for_stats) {
+        let _ = db.with_conn(|conn| {
+            if let Err(e) = update_statistics_after_run(conn, &run_for_stats) {
                 warn!("Failed to update statistics after automation: {}", e);
                 // Don't fail the overall operation if stats update fails
             }
-        }
+            Ok(())
+        });
 
         Ok(automation_id)
     }

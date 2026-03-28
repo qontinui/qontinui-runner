@@ -600,28 +600,35 @@ impl StepExecutor {
 
             // Link any findings detected during this step's execution window
             if let Some(ref task_run_id) = self.task_run_id {
-                // PG: complex dynamic SQL
-                if let Ok(conn) = self.app_state.checkpoint_db.connection() {
-                    match crate::database::graph_ops::link_findings_to_steps_by_timestamp(
-                        &conn,
-                        task_run_id,
-                        &step_name,
-                        index as i32,
-                        &started_at,
-                        &ended_at,
-                    ) {
-                        Ok(count) if count > 0 => {
-                            info!(
-                                "Linked {} findings to step '{}' (index {})",
-                                count, step_name, index
-                            );
-                        }
-                        Ok(_) => {} // No findings to link
-                        Err(e) => {
-                            warn!("Failed to link findings to step '{}': {}", step_name, e);
+                let db_c = self.app_state.checkpoint_db.clone();
+                let trid_c = task_run_id.clone();
+                let sn_c = step_name.clone();
+                let idx_c = index as i32;
+                let sa_c = started_at.clone();
+                let ea_c = ended_at.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = db_c.connection() {
+                        match crate::database::graph_ops::link_findings_to_steps_by_timestamp(
+                            &conn,
+                            &trid_c,
+                            &sn_c,
+                            idx_c,
+                            &sa_c,
+                            &ea_c,
+                        ) {
+                            Ok(count) if count > 0 => {
+                                info!(
+                                    "Linked {} findings to step '{}' (index {})",
+                                    count, sn_c, idx_c
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("Failed to link findings to step '{}': {}", sn_c, e);
+                            }
                         }
                     }
-                }
+                }).await;
             }
 
             results.push(StepExecutionResult {

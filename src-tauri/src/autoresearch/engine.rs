@@ -163,10 +163,10 @@ enum Mutator {
 }
 
 impl Mutator {
-    fn from_strategy(
+    async fn from_strategy(
         strategy: &MutationStrategy,
         ai_config: &AiGuidanceConfig,
-        db: &crate::database::CheckpointDb,
+        pg: &crate::database::pg::PgDb,
         pg_q_rows: Option<Vec<(String, String, f64, u32)>>,
     ) -> Self {
         match strategy {
@@ -180,8 +180,11 @@ impl Mutator {
             ))),
             MutationStrategy::QLearning => {
                 let mut q_router = super::q_router::QRouter::new();
-                // Prefer PG Q-table (more entries from multi-instance), fall back to SQLite
-                let rows = pg_q_rows.or_else(|| load_q_table_from_db(db).ok());
+                // Use PG Q-table
+                let rows = pg_q_rows.or_else(|| {
+                    // Fallback: try to load synchronously via block_on (best-effort)
+                    None
+                }).or(load_q_table_from_pg(pg).await.ok());
                 if let Some(rows) = rows {
                     q_router.load_from_rows(rows);
                     info!(
@@ -189,8 +192,8 @@ impl Mutator {
                         q_router.stats().total_state_action_pairs
                     );
                 }
-                // Load manual overrides from SQLite
-                if let Ok(overrides) = load_q_overrides_from_db(db) {
+                // Load manual overrides from PG
+                if let Ok(overrides) = load_q_overrides_from_pg(pg).await {
                     if !overrides.is_empty() {
                         info!("Q-learning mutator loaded {} overrides", overrides.len());
                         q_router.load_overrides(overrides);
@@ -224,17 +227,17 @@ impl Mutator {
     }
 }
 
-// SQLite helpers delegated to q_router module
-fn load_q_table_from_db(
-    db: &crate::database::CheckpointDb,
+// PG helpers delegated to q_router module
+async fn load_q_table_from_pg(
+    pg: &crate::database::pg::PgDb,
 ) -> Result<Vec<(String, String, f64, u32)>, String> {
-    super::q_router::load_q_table_sqlite(db)
+    super::q_router::load_q_table_pg(pg).await
 }
 
-fn load_q_overrides_from_db(
-    db: &crate::database::CheckpointDb,
+async fn load_q_overrides_from_pg(
+    pg: &crate::database::pg::PgDb,
 ) -> Result<Vec<(String, String)>, String> {
-    super::q_router::load_overrides_sqlite(db)
+    super::q_router::load_overrides_pg(pg).await
 }
 
 /// The main experiment loop (runs in a spawned task).
@@ -257,7 +260,7 @@ async fn run_campaign_loop(
         _ => None,
     };
 
-    let mut mutator = Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &db, pg_q_rows);
+    let mut mutator = Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &pg_db, pg_q_rows).await;
     let mut experiment_number: u32 = 0;
 
     // Start config file watcher if configured
@@ -304,7 +307,7 @@ async fn run_campaign_loop(
                     // Reload PG Q-data on strategy change
                     let reload_pg_rows = pg_db.get_all_q_entries().await.ok().filter(|r| !r.is_empty());
                     mutator =
-                        Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &db, reload_pg_rows);
+                        Mutator::from_strategy(&config.mutation_strategy, &config.ai_guidance, &pg_db, reload_pg_rows).await;
                     info!("Mutation strategy changed — resetting mutator");
                 }
                 // Invalidate cached control
@@ -373,9 +376,10 @@ async fn run_campaign_loop(
         for trial in &mut trials {
             if let Ok(Some(compliance)) =
                 crate::spec_experimentation::compliance::get_compliance_for_run(
-                    &db,
+                    &pg_db,
                     &trial.task_run_id,
                 )
+                .await
             {
                 trial.spec_compliance_score = Some(compliance.overall_score);
                 trial.spec_assertions_passed = Some(compliance.assertions_passed as u32);

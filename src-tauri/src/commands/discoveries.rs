@@ -90,8 +90,7 @@ pub async fn get_pending_discoveries_cmd(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        get_pending_discoveries(&conn)
+        db.with_conn(|conn| get_pending_discoveries(conn))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -110,11 +109,12 @@ pub async fn get_discovery_summary(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        let status = get_sync_status(&conn)?;
-        let all = get_pending_discoveries(&conn)?;
-        let recent: Vec<DiscoveryPreview> = all.iter().take(10).map(DiscoveryPreview::from).collect();
-        Ok::<_, String>((status, recent))
+        db.with_conn(|conn| {
+            let status = get_sync_status(conn)?;
+            let all = get_pending_discoveries(conn)?;
+            let recent: Vec<DiscoveryPreview> = all.iter().take(10).map(DiscoveryPreview::from).collect();
+            Ok::<_, String>((status, recent))
+        })
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -159,8 +159,7 @@ pub async fn sync_discoveries(
     // Phase 1: Extract discoveries (sync operation)
     let db1 = db.clone();
     let to_sync = tokio::task::spawn_blocking(move || {
-        let conn = db1.connection()?;
-        extract_discoveries_for_sync(&conn)
+        db1.with_conn(|conn| extract_discoveries_for_sync(conn))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
@@ -182,10 +181,11 @@ pub async fn sync_discoveries(
     // Phase 3: Apply results to database (sync operation, fresh connection)
     let db2 = db.clone();
     let (result, remaining) = tokio::task::spawn_blocking(move || {
-        let conn = db2.connection()?;
-        let result = apply_sync_results(&conn, sync_results)?;
-        let remaining = get_pending_count(&conn).unwrap_or(0);
-        Ok::<_, String>((result, remaining))
+        db2.with_conn(|conn| {
+            let result = apply_sync_results(conn, sync_results)?;
+            let remaining = get_pending_count(conn).unwrap_or(0);
+            Ok::<_, String>((result, remaining))
+        })
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
@@ -216,8 +216,7 @@ pub async fn clear_discovery(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        discoveries::delete_discovery(&conn, &id)
+        db.with_conn(|conn| discoveries::delete_discovery(conn, &id))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -240,8 +239,7 @@ pub async fn clear_failed_discoveries(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        discoveries::cleanup_failed_discoveries(&conn)
+        db.with_conn(|conn| discoveries::cleanup_failed_discoveries(conn))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -263,8 +261,7 @@ pub async fn get_discovery_sync_status(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        get_sync_status(&conn)
+        db.with_conn(|conn| get_sync_status(conn))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;

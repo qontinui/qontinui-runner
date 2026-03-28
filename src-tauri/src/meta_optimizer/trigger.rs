@@ -249,10 +249,16 @@ pub fn check_and_launch_optimizers(
     }
 
     // Auto-extract spec compliance for spec-generated workflows
-    crate::spec_experimentation::compliance::auto_extract_spec_compliance(
-        &deps.app_state.checkpoint_db,
-        &source_task_run_id,
-    );
+    {
+        let pg = deps.app_state.pg_db.clone();
+        let trid = source_task_run_id.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::spec_experimentation::compliance::auto_extract_spec_compliance(&pg, &trid)
+                    .await;
+            })
+        });
+    }
 
     // Maintenance: dedup pending recommendations, reject stale ones, rollback stale canaries
     super::recommendations::dedup_pending_recommendations(db);
@@ -670,7 +676,15 @@ pub fn check_and_launch_optimizers_with_pg(
     if let Err(e) = super::snapshots::capture_periodic_with_pg(db, pg_db, super::types::WorkflowCategory::Main) {
         warn!("Failed to capture periodic snapshot: {}", e);
     }
-    crate::spec_experimentation::compliance::auto_extract_spec_compliance(db, &source_task_run_id);
+    {
+        let pg_clone = pg_db.clone();
+        let trid = source_task_run_id.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                crate::spec_experimentation::compliance::auto_extract_spec_compliance(&pg_clone, &trid).await;
+            })
+        });
+    }
     super::recommendations::dedup_pending_recommendations_with_pg(db, pg_db);
     super::recommendations::auto_reject_stale_recommendations_with_pg(db, pg_db);
     super::canary::auto_rollback_stale_canaries_with_pg(db, pg_db);

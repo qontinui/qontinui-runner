@@ -242,6 +242,168 @@ impl PgDb {
         Ok(())
     }
 
+    /// Get canary prompt overrides for a recommendation.
+    pub async fn get_canary_prompt_overrides(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let mut overrides = std::collections::HashMap::new();
+
+        let row = conn.query_one(
+            "SELECT recommendation_type, recommended_value, target_agent FROM meta_optimizer_recommendations WHERE id = $1",
+            &[&recommendation_id],
+        ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
+
+        let rec_type: String = row.get(0);
+        let recommended_value: Option<String> = row.get(1);
+        let target_agent: Option<String> = row.get(2);
+
+        if rec_type == "prompt_rewrite" {
+            if let Some(ref val) = recommended_value {
+                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(val) {
+                    if let (Some(agent), Some(content)) = (
+                        payload.get("agent_type").and_then(|v| v.as_str()),
+                        payload.get("prompt_content").and_then(|v| v.as_str()),
+                    ) {
+                        overrides.insert(agent.to_string(), content.to_string());
+                    }
+                }
+            }
+        }
+
+        if overrides.is_empty() {
+            if let Some(agent) = target_agent {
+                let variant_row = conn.query_opt(
+                    "SELECT prompt_content FROM prompt_registry WHERE source_recommendation_id = $1 ORDER BY version DESC LIMIT 1",
+                    &[&recommendation_id],
+                ).await.map_err(|e| format!("Failed to query prompt registry: {}", e))?;
+                if let Some(r) = variant_row {
+                    let content: String = r.get(0);
+                    overrides.insert(agent, content);
+                }
+            }
+        }
+
+        Ok(overrides)
+    }
+
+    /// Get canary config overrides for a recommendation.
+    pub async fn get_canary_config_overrides(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<Vec<(String, serde_json::Value)>, String> {
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn.query_one(
+            "SELECT recommendation_type, recommended_value FROM meta_optimizer_recommendations WHERE id = $1",
+            &[&recommendation_id],
+        ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
+
+        let rec_type: String = row.get(0);
+        let recommended_value: Option<String> = row.get(1);
+
+        if rec_type != "config_change" {
+            return Ok(Vec::new());
+        }
+
+        let Some(val) = recommended_value else {
+            return Ok(Vec::new());
+        };
+
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&val) {
+            if let (Some(key), Some(value)) = (
+                payload.get("key").and_then(|v| v.as_str()),
+                payload.get("value").cloned(),
+            ) {
+                return Ok(vec![(key.to_string(), value)]);
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Evaluate a canary: should it be promoted, rolled back, or continue?
+    pub async fn evaluate_canary(
+        &self,
+        canary_id: &str,
+    ) -> Result<crate::meta_optimizer::canary::CanaryEvaluation, String> {
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let row = conn.query_one(
+            "SELECT baseline_metrics_json, canary_metrics_json, canary_run_count FROM canary_rollouts WHERE id = $1",
+            &[&canary_id],
+        ).await.map_err(|e| format!("Canary not found: {}", e))?;
+
+        let baseline_json: String = row.get(0);
+        let canary_json: String = row.get(1);
+        let canary_count: i64 = row.get(2);
+
+        let baseline: crate::meta_optimizer::canary::CanaryMetrics =
+            serde_json::from_str(&baseline_json).unwrap_or_default();
+        let canary: crate::meta_optimizer::canary::CanaryMetrics =
+            serde_json::from_str(&canary_json).unwrap_or_default();
+
+        let min_runs = 10;
+        let min_runs_met = canary_count >= min_runs;
+
+        let baseline_total = (baseline.success_count + baseline.failure_count) as u64;
+        let canary_total = (canary.success_count + canary.failure_count) as u64;
+
+        let baseline_sr = if baseline_total > 0 {
+            baseline.success_count as f64 / baseline_total as f64 * 100.0
+        } else { 0.0 };
+        let canary_sr = if canary_total > 0 {
+            canary.success_count as f64 / canary_total as f64 * 100.0
+        } else { 0.0 };
+
+        let delta = canary_sr - baseline_sr;
+
+        let analysis = crate::stats::proportion_analysis(
+            (canary.success_count as u64, canary_total),
+            (baseline.success_count as u64, baseline_total),
+            2,
+        );
+
+        let cost_delta_pct = if baseline_total > 0 && canary_total > 0 {
+            let baseline_avg_cost = baseline.total_cost_usd / baseline_total as f64;
+            let canary_avg_cost = canary.total_cost_usd / canary_total as f64;
+            if baseline_avg_cost > 0.0 {
+                Some((canary_avg_cost - baseline_avg_cost) / baseline_avg_cost * 100.0)
+            } else { None }
+        } else { None };
+
+        let duration_delta_pct = if baseline_total > 0 && canary_total > 0 {
+            let baseline_avg_dur = baseline.total_duration_ms / baseline_total as f64;
+            let canary_avg_dur = canary.total_duration_ms / canary_total as f64;
+            if baseline_avg_dur > 0.0 {
+                Some((canary_avg_dur - baseline_avg_dur) / baseline_avg_dur * 100.0)
+            } else { None }
+        } else { None };
+
+        let verdict_enum = if !min_runs_met {
+            crate::stats::Verdict::Neutral
+        } else {
+            crate::stats::compute_verdict(
+                delta, &analysis, canary_total,
+                &crate::stats::VerdictThresholds::canary(),
+            )
+        };
+
+        Ok(crate::meta_optimizer::canary::CanaryEvaluation {
+            verdict: verdict_enum.as_canary_str().to_string(),
+            baseline_success_rate: baseline_sr,
+            canary_success_rate: canary_sr,
+            delta,
+            min_runs_met,
+            p_value: analysis.p_value,
+            confidence_interval: analysis.confidence_interval,
+            effect_size: analysis.effect_size,
+            cost_delta_pct,
+            duration_delta_pct,
+        })
+    }
+
     // ── Prompt template canary operations ────────────────────────────────
 
     /// Create a new prompt template canary.

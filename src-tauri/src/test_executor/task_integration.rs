@@ -275,48 +275,47 @@ fn insert_test_failure_finding(
     description: &str,
     test_name: &str,
 ) -> Result<String, String> {
-    // PG: complex dynamic SQL
-    let conn = db.connection().map_err(|e| format!("DB error: {}", e))?;
+    db.with_conn(|conn| {
+        let finding_id = uuid::Uuid::new_v4().to_string();
+        let signature = format!("test_failure:{}:{}", task_run_id, test_name);
+        let mut hasher = Sha256::new();
+        hasher.update(signature.as_bytes());
+        let signature_hash = format!("{:x}", hasher.finalize());
+        let now = chrono::Utc::now().to_rfc3339();
 
-    let finding_id = uuid::Uuid::new_v4().to_string();
-    let signature = format!("test_failure:{}:{}", task_run_id, test_name);
-    let mut hasher = Sha256::new();
-    hasher.update(signature.as_bytes());
-    let signature_hash = format!("{:x}", hasher.finalize());
-    let now = chrono::Utc::now().to_rfc3339();
+        // Check for existing finding with same signature
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM task_run_findings WHERE task_run_id = ? AND signature_hash = ? AND status NOT IN ('resolved', 'wont_fix')",
+                rusqlite::params![task_run_id, signature_hash],
+                |row| row.get(0),
+            )
+            .ok();
 
-    // Check for existing finding with same signature
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM task_run_findings WHERE task_run_id = ? AND signature_hash = ? AND status NOT IN ('resolved', 'wont_fix')",
-            rusqlite::params![task_run_id, signature_hash],
-            |row| row.get(0),
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        // Insert new finding
+        conn.execute(
+            "INSERT INTO task_run_findings (
+                id, task_run_id, category, severity, signature_hash,
+                title, description, status, action_type, detected_in_session, detected_at
+            ) VALUES (?, ?, 'test_failure', 'high', ?, ?, ?, 'detected', 'auto_fix', ?, ?)",
+            rusqlite::params![
+                finding_id,
+                task_run_id,
+                signature_hash,
+                title,
+                description,
+                session_num,
+                now
+            ],
         )
-        .ok();
+        .map_err(|e| format!("Insert error: {}", e))?;
 
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    // Insert new finding
-    conn.execute(
-        "INSERT INTO task_run_findings (
-            id, task_run_id, category, severity, signature_hash,
-            title, description, status, action_type, detected_in_session, detected_at
-        ) VALUES (?, ?, 'test_failure', 'high', ?, ?, ?, 'detected', 'auto_fix', ?, ?)",
-        rusqlite::params![
-            finding_id,
-            task_run_id,
-            signature_hash,
-            title,
-            description,
-            session_num,
-            now
-        ],
-    )
-    .map_err(|e| format!("Insert error: {}", e))?;
-
-    Ok(finding_id)
+        Ok(finding_id)
+    })
 }
 
 /// Format test results as AI context string

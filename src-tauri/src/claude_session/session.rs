@@ -449,23 +449,17 @@ impl ClaudeSession {
                     );
 
                     if let Some(ref db) = db {
-                        // PG: complex dynamic SQL
-                        let conn = match db.connection() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!("Failed to get database connection: {}", e);
-                                continue;
-                            }
-                        };
-
                         let is_resolved = parsed_finding.is_resolved;
 
-                        match finding_storage::insert_finding(
-                            &conn,
-                            &ctx.task_run_id,
-                            ctx.session_num,
-                            &parsed_finding,
-                        ) {
+                        let insert_result = db.with_conn(|conn| {
+                            finding_storage::insert_finding(
+                                conn,
+                                &ctx.task_run_id,
+                                ctx.session_num,
+                                &parsed_finding,
+                            )
+                        });
+                        match insert_result {
                             Ok(finding) => {
                                 let event_name = if is_resolved {
                                     "finding_resolved"

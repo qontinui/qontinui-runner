@@ -788,50 +788,42 @@ impl Orchestrator {
             return None;
         }
 
-        // PG: complex dynamic SQL
-        match self.db.connection() {
-            Ok(conn) => {
-                let config = CuratorConfig {
-                    max_errors: 20,     // Limit to avoid overwhelming context
-                    max_stack_lines: 3, // Brief excerpts
-                    ..Default::default()
-                };
-                let curator = DebugContextCurator::with_config(config);
+        self.db.with_conn(|conn| {
+            let config = CuratorConfig {
+                max_errors: 20,
+                max_stack_lines: 3,
+                ..Default::default()
+            };
+            let curator = DebugContextCurator::with_config(config);
 
-                match curator.build_context(&conn, task_run_id) {
-                    Ok(context) => {
-                        // Only include if there are actionable errors
-                        if context.total_count == 0 {
-                            return None;
-                        }
-
-                        let formatted = curator.format_for_ai(&context);
-
-                        info!(
-                            "Injecting error monitor context: {} errors ({} critical)",
-                            context.total_count,
-                            context.critical_errors.len()
-                        );
-
-                        Some(format!(
-                            "## Application Error Context\n\n\
-                             The following errors have been detected in the application logs. \
-                             Consider these when debugging or if your changes might be related.\n\n\
-                             {}\n\n---\n",
-                            formatted
-                        ))
+            match curator.build_context(conn, task_run_id) {
+                Ok(context) => {
+                    if context.total_count == 0 {
+                        return Ok(None);
                     }
-                    Err(e) => {
-                        warn!("Failed to build error monitor context: {}", e);
-                        None
-                    }
+
+                    let formatted = curator.format_for_ai(&context);
+
+                    info!(
+                        "Injecting error monitor context: {} errors ({} critical)",
+                        context.total_count,
+                        context.critical_errors.len()
+                    );
+
+                    Ok(Some(format!(
+                        "## Application Error Context\n\n\
+                         The following errors have been detected in the application logs. \
+                         Consider these when debugging or if your changes might be related.\n\n\
+                         {}\n\n---\n",
+                        formatted
+                    )))
+                }
+                Err(e) => {
+                    warn!("Failed to build error monitor context: {}", e);
+                    Ok(None)
                 }
             }
-            Err(e) => {
-                warn!("Failed to get database connection for error monitor: {}", e);
-                None
-            }
-        }
+        }).ok().flatten()
     }
 
     /// Resolve targeted errors after successful workflow completion.
@@ -849,49 +841,46 @@ impl Orchestrator {
             state.task_run_id
         );
 
-        // PG: complex dynamic SQL
-        match self.db.connection() {
-            Ok(conn) => {
-                let mut resolved_count = 0;
-                let mut failed_count = 0;
+        self.db.with_conn(|conn| {
+            let mut resolved_count = 0;
+            let mut failed_count = 0;
 
-                for error_id in &state.targeted_error_ids {
-                    let resolution_note = format!(
-                        "Auto-resolved by successful completion of workflow task {}",
-                        state.task_run_id
-                    );
+            for error_id in &state.targeted_error_ids {
+                let resolution_note = format!(
+                    "Auto-resolved by successful completion of workflow task {}",
+                    state.task_run_id
+                );
 
-                    match crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
-                        &conn,
-                        *error_id,
-                        &state.task_run_id,
-                        Some(&resolution_note),
-                    ) {
-                        Ok(_) => {
-                            resolved_count += 1;
-                            debug!("Resolved error {} via task {}", error_id, state.task_run_id);
-                        }
-                        Err(e) => {
-                            failed_count += 1;
-                            warn!("Failed to resolve error {}: {}", error_id, e);
-                        }
+                match crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
+                    conn,
+                    *error_id,
+                    &state.task_run_id,
+                    Some(&resolution_note),
+                ) {
+                    Ok(_) => {
+                        resolved_count += 1;
+                        debug!("Resolved error {} via task {}", error_id, state.task_run_id);
+                    }
+                    Err(e) => {
+                        failed_count += 1;
+                        warn!("Failed to resolve error {}: {}", error_id, e);
                     }
                 }
-
-                if resolved_count > 0 {
-                    info!(
-                        "Successfully resolved {} errors (failed: {}) for task {}",
-                        resolved_count, failed_count, state.task_run_id
-                    );
-                }
             }
-            Err(e) => {
-                error!(
-                    "Failed to get database connection for error resolution: {}",
-                    e
+
+            if resolved_count > 0 {
+                info!(
+                    "Successfully resolved {} errors (failed: {}) for task {}",
+                    resolved_count, failed_count, state.task_run_id
                 );
             }
-        }
+            Ok(())
+        }).unwrap_or_else(|e| {
+            error!(
+                "Failed to get database connection for error resolution: {}",
+                e
+            );
+        })
     }
 
     // ========================================================================

@@ -45,11 +45,13 @@ impl LoopController {
             if let Some(wf_id) = workflow_id {
                 let db = self.checkpoint_db.clone();
                 let wf_id = wf_id.to_string();
-                let _ = db.with_conn(|conn| {
-                    crate::workflow_generation::example_workflows::try_promote_on_success(
-                        conn, &wf_id,
-                    );
-                    Ok(())
+                tokio::task::spawn_blocking(move || {
+                    let _ = db.with_conn(|conn| {
+                        crate::workflow_generation::example_workflows::try_promote_on_success(
+                            conn, &wf_id,
+                        );
+                        Ok(())
+                    });
                 });
             }
 
@@ -57,27 +59,29 @@ impl LoopController {
             let db2 = self.checkpoint_db.clone();
             let exec_id2 = execution_id.to_string();
             tokio::spawn(async move {
-                let _ = db2.with_conn(|conn| {
-                    let wf_name: Option<String> = conn
-                        .query_row(
-                            "SELECT workflow_name FROM task_runs WHERE id = ?1",
-                            rusqlite::params![exec_id2],
-                            |row| row.get(0),
-                        )
-                        .ok();
-                    if let Some(wf_name) = wf_name {
-                        if let Ok(metrics) =
-                            crate::reflection::prediction::compute_convergence_score(
-                                conn, &wf_name, "workflow",
+                let _ = tokio::task::spawn_blocking(move || {
+                    db2.with_conn(|conn| {
+                        let wf_name: Option<String> = conn
+                            .query_row(
+                                "SELECT workflow_name FROM task_runs WHERE id = ?1",
+                                rusqlite::params![exec_id2],
+                                |row| row.get(0),
                             )
-                        {
-                            let _ = crate::reflection::prediction::store_convergence_snapshot(
-                                conn, &wf_name, None, "workflow", &metrics,
-                            );
+                            .ok();
+                        if let Some(wf_name) = wf_name {
+                            if let Ok(metrics) =
+                                crate::reflection::prediction::compute_convergence_score(
+                                    conn, &wf_name, "workflow",
+                                )
+                            {
+                                let _ = crate::reflection::prediction::store_convergence_snapshot(
+                                    conn, &wf_name, None, "workflow", &metrics,
+                                );
+                            }
                         }
-                    }
-                    Ok(())
-                });
+                        Ok(())
+                    })
+                }).await;
             });
 
             // Auto-capture task knowledge as observations (Engram-style cross-session memory)

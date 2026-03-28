@@ -1101,6 +1101,74 @@ pub fn list_optimizer_runs_with_pg(
     list_optimizer_runs(db)
 }
 
+/// Get a single recommendation by ID from PG (falls back to SQLite).
+#[allow(dead_code)]
+pub fn get_recommendation_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<Recommendation, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let rid = recommendation_id.to_string();
+        if let Ok(Some(rec)) = tokio::task::block_in_place(|| {
+            handle.block_on(pg.get_recommendation(&rid))
+        }) {
+            return Ok(rec);
+        }
+    }
+    get_recommendation(db, recommendation_id)
+}
+
+/// Apply a recommendation with side effects and PG dual-write.
+#[allow(dead_code)]
+pub fn apply_recommendation_with_side_effects_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<(), String> {
+    apply_recommendation_with_side_effects(db, recommendation_id)?;
+    let pg = pg_db.clone();
+    let rid = recommendation_id.to_string();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move { let _ = pg.update_recommendation_status(&rid, "applied").await; });
+    }
+    Ok(())
+}
+
+/// Dedup pending recommendations with PG dual-write (fire-and-forget).
+/// Backfills hashes and supersedes duplicates in both SQLite and PG.
+#[allow(dead_code)]
+pub fn dedup_pending_recommendations_with_pg_sync(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> usize {
+    let count = dedup_pending_recommendations(db);
+    if count > 0 {
+        let pg = pg_db.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Ok(conn) = pg.pool().get().await {
+                    let _ = conn.execute(
+                        r#"UPDATE meta_optimizer_recommendations SET status = 'superseded'
+                           WHERE id IN (
+                               SELECT r.id FROM meta_optimizer_recommendations r
+                               WHERE r.status = 'pending' AND r.content_hash IS NOT NULL
+                                 AND r.created_at > (
+                                     SELECT MIN(r2.created_at) FROM meta_optimizer_recommendations r2
+                                     WHERE r2.content_hash = r.content_hash
+                                       AND r2.status IN ('pending', 'canary', 'applied')
+                                 )
+                           )"#,
+                        &[],
+                    ).await;
+                }
+            });
+        }
+    }
+    count
+}
+
 /// Auto-evaluate applied recommendations with agentic scores, with PG dual-write.
 #[allow(dead_code)]
 pub fn auto_evaluate_with_agentic_scores_with_pg(

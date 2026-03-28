@@ -57,8 +57,7 @@ pub async fn get_config_statistics(
     let db = state.checkpoint_db.clone();
     let cid = config_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        tiered_info::get_config_statistics(&conn, &cid)
+        db.with_conn(|conn| tiered_info::get_config_statistics(conn, &cid))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))??;
@@ -83,8 +82,7 @@ pub async fn get_flaky_transitions(
     let threshold = threshold.unwrap_or(0.2);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        tiered_info::get_flaky_transitions(&conn, &config_id, threshold)
+        db.with_conn(|conn| tiered_info::get_flaky_transitions(conn, &config_id, threshold))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -106,8 +104,7 @@ pub async fn get_flaky_templates(
     let threshold = threshold.unwrap_or(0.2);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        tiered_info::get_flaky_templates(&conn, &config_id, threshold)
+        db.with_conn(|conn| tiered_info::get_flaky_templates(conn, &config_id, threshold))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -128,8 +125,7 @@ pub async fn get_debugging_context(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        tiered_info::get_debugging_context(&conn, &config_id, config_name)
+        db.with_conn(|conn| tiered_info::get_debugging_context(conn, &config_id, config_name))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -150,9 +146,10 @@ pub async fn get_debugging_context_prompt(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        tiered_info::get_debugging_context(&conn, &config_id, config_name)
-            .map(|context| tiered_info::format_debugging_context_for_prompt(&context))
+        db.with_conn(|conn| {
+            tiered_info::get_debugging_context(conn, &config_id, config_name)
+                .map(|context| tiered_info::format_debugging_context_for_prompt(&context))
+        })
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -228,12 +225,13 @@ pub async fn get_recent_runs(
     let cid = config_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        if let Some(ref cid) = cid {
-            tiered_info::get_all_recent_runs(&conn, cid, limit)
-        } else {
-            crate::mcp::automation_runs::get_all_recent_runs(&conn, limit)
-        }
+        db.with_conn(|conn| {
+            if let Some(ref cid) = cid {
+                tiered_info::get_all_recent_runs(conn, cid, limit)
+            } else {
+                crate::mcp::automation_runs::get_all_recent_runs(conn, limit)
+            }
+        })
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -255,8 +253,7 @@ pub async fn get_failed_runs(
     let limit = limit.unwrap_or(5);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        tiered_info::get_all_failed_runs(&conn, &config_id, limit)
+        db.with_conn(|conn| tiered_info::get_all_failed_runs(conn, &config_id, limit))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -297,7 +294,6 @@ pub async fn record_run(
     input: RecordRunInput,
 ) -> Result<TieredInfoResponse<String>, String> {
     let db = state.checkpoint_db.clone();
-    let conn = db.connection()?;
 
     // Parse status
     let status = match RunStatus::from_str(&input.status) {
@@ -357,59 +353,66 @@ pub async fn record_run(
     );
 
     // Update statistics
-    if let Err(e) = tiered_info::update_statistics_after_run(&conn, &run) {
-        return Ok(TieredInfoResponse::err(format!(
-            "Run recorded but stats update failed: {}",
-            e
-        )));
-    }
+    let config_id_for_stats = input.config_id.clone();
+    let project_id = input.project_id.clone();
+    let config_name = input.config_name.clone();
+    let run_id = run.id.clone();
 
-    // Analyze for discoveries (only if project_id is provided)
-    if let Some(project_id) = input.project_id {
-        // Get updated statistics for analysis
-        if let Ok(Some(stats)) = tiered_info::get_config_statistics(&conn, &input.config_id) {
-            // Get runner info for discovery context
-            let auth_manager = AuthManager::new();
-            let runner_id = auth_manager
-                .get_device_id()
-                .unwrap_or_else(|_| "unknown".to_string());
-            // Runner name is retrieved from settings, not AuthManager
-            // For now, we'll use None and let it be populated later
-            let runner_name: Option<String> = None;
+    let result = db.with_conn(|conn| {
+        if let Err(e) = tiered_info::update_statistics_after_run(conn, &run) {
+            return Err(format!("Run recorded but stats update failed: {}", e));
+        }
 
-            let context = DetectionContext {
-                runner_id,
-                runner_name,
-                project_id,
-                config_id: input.config_id.clone(),
-                config_name: input.config_name,
-            };
+        // Analyze for discoveries (only if project_id is provided)
+        if let Some(project_id) = project_id {
+            // Get updated statistics for analysis
+            if let Ok(Some(stats)) = tiered_info::get_config_statistics(conn, &config_id_for_stats) {
+                // Get runner info for discovery context
+                let auth_manager = AuthManager::new();
+                let runner_id = auth_manager
+                    .get_device_id()
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let runner_name: Option<String> = None;
 
-            let thresholds = DetectionThresholds::default();
-            let discoveries = analyze_run_for_discoveries(&run, &stats, &context, &thresholds);
+                let context = DetectionContext {
+                    runner_id,
+                    runner_name,
+                    project_id,
+                    config_id: config_id_for_stats.clone(),
+                    config_name,
+                };
 
-            if !discoveries.is_empty() {
-                info!(
-                    "Found {} discoveries from run {}, queueing for sync",
-                    discoveries.len(),
-                    run.id
-                );
+                let thresholds = DetectionThresholds::default();
+                let discoveries = analyze_run_for_discoveries(&run, &stats, &context, &thresholds);
 
-                for discovery in discoveries {
-                    match queue_discovery(&conn, discovery) {
-                        Ok(discovery_id) => {
-                            debug!("Queued discovery {} for sync", discovery_id);
-                        }
-                        Err(e) => {
-                            warn!("Failed to queue discovery: {}", e);
+                if !discoveries.is_empty() {
+                    info!(
+                        "Found {} discoveries from run {}, queueing for sync",
+                        discoveries.len(),
+                        run.id
+                    );
+
+                    for discovery in discoveries {
+                        match queue_discovery(conn, discovery) {
+                            Ok(discovery_id) => {
+                                debug!("Queued discovery {} for sync", discovery_id);
+                            }
+                            Err(e) => {
+                                warn!("Failed to queue discovery: {}", e);
+                            }
                         }
                     }
                 }
             }
         }
+        Ok(())
+    });
+
+    if let Err(e) = result {
+        return Ok(TieredInfoResponse::err(e));
     }
 
-    Ok(TieredInfoResponse::ok(run.id))
+    Ok(TieredInfoResponse::ok(run_id))
 }
 
 /// Delete old automation records to manage storage (keeps most recent N per config).
@@ -462,18 +465,19 @@ pub async fn get_execution_options(
     let tmpl = template_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        // Default flakiness threshold (20% - items with 20-80% success rate)
-        let threshold = 0.2;
-        let cache = FlakinessCache::load(&conn, &cid, threshold)?;
-        let options = if let Some(tid) = tid {
-            cache.get_transition_options(&tid)
-        } else if let Some(tmpl) = tmpl {
-            cache.get_template_options(&tmpl)
-        } else {
-            ExecutionOptions::default()
-        };
-        Ok::<_, String>(options)
+        db.with_conn(|conn| {
+            // Default flakiness threshold (20% - items with 20-80% success rate)
+            let threshold = 0.2;
+            let cache = FlakinessCache::load(conn, &cid, threshold)?;
+            let options = if let Some(tid) = tid {
+                cache.get_transition_options(&tid)
+            } else if let Some(tmpl) = tmpl {
+                cache.get_template_options(&tmpl)
+            } else {
+                ExecutionOptions::default()
+            };
+            Ok::<_, String>(options)
+        })
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -517,8 +521,7 @@ pub async fn get_flakiness_summary(
     let cid = config_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        FlakinessCache::load(&conn, &cid, threshold)
+        db.with_conn(|conn| FlakinessCache::load(conn, &cid, threshold))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;

@@ -1922,11 +1922,16 @@ impl LoopController {
 
             let pg_db_for_q = self.app_state.pg_db.clone();
             tokio::spawn(async move {
-                // Record learning outcome + agentic metrics + SQLite Q-update
-                // PG: complex dynamic SQL
-                let sqlite_ok = db.with_conn(|conn| {
-                    crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome)
-                });
+                // Record learning outcome + agentic metrics via spawn_blocking
+                let sqlite_ok = tokio::task::spawn_blocking({
+                    let db = db.clone();
+                    let outcome_ref = outcome.clone();
+                    move || {
+                        db.with_conn(|conn| {
+                            crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome_ref)
+                        })
+                    }
+                }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()));
 
                 if let Err(ref e) = sqlite_ok {
                     warn!("Failed to record learning outcome: {}", e);
@@ -2197,87 +2202,95 @@ impl LoopController {
                     .unwrap_or_else(|_| cra_workflow_name.clone());
 
                 // Cross-run analysis uses deeply-integrated SQLite functions
-                if let Err(e) = cra_db.with_conn(|conn| {
-                    match crate::reflection::cross_run_learning::post_run_analysis_with_skills(
-                        conn,
-                        &source_wf_name,
-                        &cra_task_run_id,
-                    ) {
-                        Ok((patterns, rules, fixes, extracted_skills)) => {
-                            info!(
-                                "Cross-run analysis after reflection: {} patterns, {} rules disabled, {} fixes applied, {} skills extracted",
-                                patterns, rules, fixes, extracted_skills.len()
-                            );
+                let cra_result = {
+                    let cra_db2 = cra_db.clone();
+                    let swf = source_wf_name.clone();
+                    let ctri = cra_task_run_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cra_db2.with_conn(|conn| {
+                            crate::reflection::cross_run_learning::post_run_analysis_with_skills(
+                                conn, &swf, &ctri,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                    }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+                };
+                match cra_result {
+                    Ok((patterns, rules, fixes, extracted_skills)) => {
+                        info!(
+                            "Cross-run analysis after reflection: {} patterns, {} rules disabled, {} fixes applied, {} skills extracted",
+                            patterns, rules, fixes, extracted_skills.len()
+                        );
 
-                            // Emit skill.created events and mirror to PG observations
-                            if !extracted_skills.is_empty() {
-                                let bus = crate::workflow_event_bus::get_workflow_event_bus().clone();
-                                let source_tr = cra_task_run_id.clone();
-                                let wf_name = source_wf_name.clone();
-                                let pg_for_mirror = cra_pg_db.clone();
-                                tokio::spawn(async move {
-                                    for skill in &extracted_skills {
-                                        // 1. Emit event on workflow bus
-                                        bus.emit_workflow_event(
-                                            crate::workflow_event_bus::events::SKILL_CREATED,
-                                            &source_tr,
-                                            None,
-                                            Some(&wf_name),
-                                            serde_json::json!({
-                                                "skill_id": skill.skill_id,
-                                                "skill_slug": skill.skill_slug,
-                                                "source_fix_id": skill.source_fix_id,
-                                                "source_task_run_id": skill.source_task_run_id,
-                                            }),
-                                        ).await;
+                        // Emit skill.created events and mirror to PG observations
+                        if !extracted_skills.is_empty() {
+                            let bus = crate::workflow_event_bus::get_workflow_event_bus().clone();
+                            let source_tr = cra_task_run_id.clone();
+                            let wf_name = source_wf_name.clone();
+                            let pg_for_mirror = cra_pg_db.clone();
+                            tokio::spawn(async move {
+                                for skill in &extracted_skills {
+                                    // 1. Emit event on workflow bus
+                                    bus.emit_workflow_event(
+                                        crate::workflow_event_bus::events::SKILL_CREATED,
+                                        &source_tr,
+                                        None,
+                                        Some(&wf_name),
+                                        serde_json::json!({
+                                            "skill_id": skill.skill_id,
+                                            "skill_slug": skill.skill_slug,
+                                            "source_fix_id": skill.source_fix_id,
+                                            "source_task_run_id": skill.source_task_run_id,
+                                        }),
+                                    ).await;
 
-                                        // 2. Mirror to PG observations for cross-session FTS
-                                        {
-                                            let pg = &pg_for_mirror;
-                                            let obs_input = crate::database::types::CreateObservationInput {
-                                                title: format!("Skill: {}", skill.skill_slug),
-                                                content: format!(
-                                                    "Auto-extracted procedural skill '{}' from workflow '{}' (task_run: {}, fix: {})",
-                                                    skill.skill_slug, skill.workflow_name,
-                                                    skill.source_task_run_id, skill.source_fix_id
-                                                ),
-                                                observation_type: "solution".to_string(),
-                                                scope: "project".to_string(),
-                                                topic_key: Some(format!("skill:{}", skill.skill_slug)),
-                                                project_id: None,
-                                                workflow_id: None,
-                                                task_run_id: Some(skill.source_task_run_id.clone()),
-                                                session_id: None,
-                                            };
-                                            if let Err(e) = pg.save_observation(&obs_input).await {
-                                                tracing::warn!(
-                                                    "Failed to mirror skill '{}' to PG observation: {}",
-                                                    skill.skill_slug, e
-                                                );
-                                            }
+                                    // 2. Mirror to PG observations for cross-session FTS
+                                    {
+                                        let pg = &pg_for_mirror;
+                                        let obs_input = crate::database::types::CreateObservationInput {
+                                            title: format!("Skill: {}", skill.skill_slug),
+                                            content: format!(
+                                                "Auto-extracted procedural skill '{}' from workflow '{}' (task_run: {}, fix: {})",
+                                                skill.skill_slug, skill.workflow_name,
+                                                skill.source_task_run_id, skill.source_fix_id
+                                            ),
+                                            observation_type: "solution".to_string(),
+                                            scope: "project".to_string(),
+                                            topic_key: Some(format!("skill:{}", skill.skill_slug)),
+                                            project_id: None,
+                                            workflow_id: None,
+                                            task_run_id: Some(skill.source_task_run_id.clone()),
+                                            session_id: None,
+                                        };
+                                        if let Err(e) = pg.save_observation(&obs_input).await {
+                                            tracing::warn!(
+                                                "Failed to mirror skill '{}' to PG observation: {}",
+                                                skill.skill_slug, e
+                                            );
                                         }
                                     }
-                                });
-                            }
+                                }
+                            });
+                        }
 
-                            // 3. Save detected patterns as observations
-                            if patterns > 0 {
-                                {
-                                    let pg = cra_pg_db.clone();
-                                    let wf = source_wf_name.clone();
-                                    let tr = cra_task_run_id.clone();
-                                    tokio::spawn(async move {
-                                        let obs = crate::database::types::CreateObservationInput {
-                                            title: format!("Recurring patterns in {}", wf),
-                                            content: format!(
-                                                "Cross-run analysis detected {} recurring pattern(s) and {} fix oscillation(s) \
-                                                 for workflow '{}'. {} rules auto-disabled, {} fixes auto-applied.",
-                                                patterns, 0u32, wf, rules, fixes
-                                            ),
-                                            observation_type: "pattern".to_string(),
-                                            scope: "project".to_string(),
-                                            topic_key: Some(format!("cross-run/{}", wf.to_lowercase().replace(' ', "-"))),
-                                            project_id: None,
+                        // 3. Save detected patterns as observations
+                        if patterns > 0 {
+                            {
+                                let pg = cra_pg_db.clone();
+                                let wf = source_wf_name.clone();
+                                let tr = cra_task_run_id.clone();
+                                tokio::spawn(async move {
+                                    let obs = crate::database::types::CreateObservationInput {
+                                        title: format!("Recurring patterns in {}", wf),
+                                        content: format!(
+                                            "Cross-run analysis detected {} recurring pattern(s) and {} fix oscillation(s) \
+                                             for workflow '{}'. {} rules auto-disabled, {} fixes auto-applied.",
+                                            patterns, 0u32, wf, rules, fixes
+                                        ),
+                                        observation_type: "pattern".to_string(),
+                                        scope: "project".to_string(),
+                                        topic_key: Some(format!("cross-run/{}", wf.to_lowercase().replace(' ', "-"))),
+                                        project_id: None,
                                             workflow_id: None,
                                             task_run_id: Some(tr),
                                             session_id: None,
@@ -2289,15 +2302,10 @@ impl LoopController {
                                 }
                             }
 
-                            Ok(())
-                        }
-                        Err(e) => {
-                            warn!("Cross-run analysis failed after reflection: {}", e);
-                            Ok(())
-                        }
                     }
-                }) {
-                    warn!("Cross-run analysis DB error: {}", e);
+                    Err(e) => {
+                        warn!("Cross-run analysis DB error: {}", e);
+                    }
                 }
             });
         }

@@ -887,7 +887,7 @@ pub(super) struct PromptResponseResult {
 /// to output_path so the saved artifact contains clean content.
 pub(super) async fn execute_prompt_response_mode(
     step: &ExecutionStepConfig,
-    db: &CheckpointDb,
+    db: &std::sync::Arc<CheckpointDb>,
     task_run_id: Option<&str>,
     doctor_handle: Option<DoctorHandle>,
     model_override: Option<String>,
@@ -1005,7 +1005,7 @@ pub(super) async fn execute_prompt_response_mode(
     let findings = parse_findings_from_response(&output_text);
     if !findings.is_empty() {
         if let Some(task_id) = task_run_id {
-            store_parsed_findings(db, task_id, &findings);
+            store_parsed_findings(db, task_id, &findings).await;
         } else {
             info!(
                 "Response mode: found {} findings but no task_run_id to store them",
@@ -1094,39 +1094,43 @@ pub(super) fn parse_findings_from_response(text: &str) -> Vec<ParsedFinding> {
 }
 
 /// Store parsed findings in the database for a given task run.
-pub(super) fn store_parsed_findings(
-    db: &CheckpointDb,
+pub(super) async fn store_parsed_findings(
+    db: &std::sync::Arc<CheckpointDb>,
     task_run_id: &str,
     findings: &[ParsedFinding],
 ) {
-    // PG: complex dynamic SQL
-    let conn = match db.connection() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "Failed to get database connection for storing findings: {}",
-                e
-            );
-            return;
-        }
-    };
-
-    for (idx, parsed) in findings.iter().enumerate() {
-        let session_num = (idx + 1) as u32;
-        match finding_storage::insert_finding(&conn, task_run_id, session_num, parsed) {
-            Ok(finding) => {
-                info!(
-                    "Response mode: stored finding [{}:{}] '{}'",
-                    finding.category.as_str(),
-                    finding.severity.as_str(),
-                    finding.title
-                );
-            }
+    let db_c = db.clone();
+    let task_run_id_c = task_run_id.to_string();
+    let findings_c: Vec<ParsedFinding> = findings.to_vec();
+    let _ = tokio::task::spawn_blocking(move || {
+        let conn = match db_c.connection() {
+            Ok(c) => c,
             Err(e) => {
-                warn!("Failed to store finding from response mode: {}", e);
+                warn!(
+                    "Failed to get database connection for storing findings: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        for (idx, parsed) in findings_c.iter().enumerate() {
+            let session_num = (idx + 1) as u32;
+            match finding_storage::insert_finding(&conn, &task_run_id_c, session_num, parsed) {
+                Ok(finding) => {
+                    info!(
+                        "Response mode: stored finding [{}:{}] '{}'",
+                        finding.category.as_str(),
+                        finding.severity.as_str(),
+                        finding.title
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to store finding from response mode: {}", e);
+                }
             }
         }
-    }
+    }).await;
 }
 
 // =============================================================================

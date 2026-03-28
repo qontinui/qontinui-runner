@@ -227,30 +227,32 @@ impl LoopController {
         }
 
         // Auto-detect recurring findings → known issues
-        let auto_detected_ids: Vec<String> = self
-            .checkpoint_db
-            // PG: complex dynamic SQL
-            .with_conn(|conn| {
-                match crate::known_issues::auto_detect::check_and_promote_recurring_findings(
-                    conn,
-                    &config.execution_id,
-                ) {
-                    Ok(new_ids) => {
-                        if !new_ids.is_empty() {
-                            info!(
-                                "Auto-detected {} new known issue(s) from recurring findings",
-                                new_ids.len()
-                            );
+        let auto_detected_ids: Vec<String> = {
+            let db_c = self.checkpoint_db.clone();
+            let eid_c = config.execution_id.clone();
+            tokio::task::spawn_blocking(move || {
+                db_c.with_conn(|conn| {
+                    match crate::known_issues::auto_detect::check_and_promote_recurring_findings(
+                        conn,
+                        &eid_c,
+                    ) {
+                        Ok(new_ids) => {
+                            if !new_ids.is_empty() {
+                                info!(
+                                    "Auto-detected {} new known issue(s) from recurring findings",
+                                    new_ids.len()
+                                );
+                            }
+                            Ok(new_ids)
                         }
-                        Ok(new_ids)
+                        Err(e) => {
+                            warn!("Failed to check for recurring findings: {}", e);
+                            Ok(vec![])
+                        }
                     }
-                    Err(e) => {
-                        warn!("Failed to check for recurring findings: {}", e);
-                        Ok(vec![])
-                    }
-                }
-            })
-            .unwrap_or_default();
+                })
+            }).await.unwrap_or_else(|_| Ok(vec![])).unwrap_or_default()
+        };
 
         // Notify frontend about auto-detected known issues
         if !auto_detected_ids.is_empty() {
@@ -627,36 +629,39 @@ impl LoopController {
 
         // Track regression issue step results
         {
-            let db = &self.checkpoint_db;
-            for step_result in &verification_result.step_results {
-                if let Some(ref step_id) = step_result.step_id {
-                    if let Some(issue_id) = step_id.strip_prefix("regression-") {
-                        let issue_id = issue_id.to_string();
-                        let success = step_result.success;
-                        // PG: complex dynamic SQL
+            let db = self.checkpoint_db.clone();
+            let step_results_clone: Vec<_> = verification_result.step_results.iter()
+                .filter_map(|sr| {
+                    sr.step_id.as_ref()
+                        .and_then(|sid| sid.strip_prefix("regression-"))
+                        .map(|issue_id| (issue_id.to_string(), sr.success))
+                })
+                .collect();
+            if !step_results_clone.is_empty() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    for (issue_id, success) in &step_results_clone {
                         if let Err(e) = db.with_conn(|conn| {
-                            crate::known_issues::storage::increment_checked(conn, &issue_id)?;
-                            if !success {
-                                crate::known_issues::storage::increment_detected(conn, &issue_id)?;
+                            crate::known_issues::storage::increment_checked(conn, issue_id)?;
+                            if !*success {
+                                crate::known_issues::storage::increment_detected(conn, issue_id)?;
                             } else {
-                                // Decay confidence when regression check passes
                                 if let Err(e) =
                                     crate::known_issues::storage::decay_confidence_on_pass(
-                                        conn, &issue_id,
+                                        conn, issue_id,
                                     )
                                 {
-                                    debug!("Failed to decay confidence for {}: {}", issue_id, e);
+                                    tracing::debug!("Failed to decay confidence for {}: {}", issue_id, e);
                                 }
                             }
                             Ok::<(), String>(())
                         }) {
-                            debug!(
+                            tracing::debug!(
                                 "Failed to update known issue tracking for {}: {}",
                                 issue_id, e
                             );
                         }
                     }
-                }
+                }).await;
             }
         }
 
@@ -1328,15 +1333,21 @@ impl LoopController {
                 }
 
                 // Record blame as causal events for cross-run learning.
-                // Uses SQLite (checkpoint_db) since causal_events table is local.
-                // PG: complex dynamic SQL
-                if let Ok(conn) = self.checkpoint_db.connection() {
-                    super::blame::record_blame_as_causal_events(
-                        &conn,
-                        &config.execution_id,
-                        &config.workflow_name,
-                        &report,
-                    );
+                {
+                    let db_c = self.checkpoint_db.clone();
+                    let eid_c = config.execution_id.clone();
+                    let wf_c = config.workflow_name.clone();
+                    let report_c = report.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(conn) = db_c.connection() {
+                            super::blame::record_blame_as_causal_events(
+                                &conn,
+                                &eid_c,
+                                &wf_c,
+                                &report_c,
+                            );
+                        }
+                    }).await;
                 }
             }
         }

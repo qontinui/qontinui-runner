@@ -786,6 +786,46 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
 
 // ── Prompt Template A/B Testing ──────────────────────────────────────────
 
+// ── PG-primary read wrappers (prompt/config overrides) ──────────────────
+
+/// Get canary prompt overrides from PG (falls back to SQLite).
+#[allow(dead_code)]
+pub fn get_canary_prompt_overrides_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let rid = recommendation_id.to_string();
+        if let Ok(result) = tokio::task::block_in_place(|| {
+            handle.block_on(pg.get_canary_prompt_overrides(&rid))
+        }) {
+            return Ok(result);
+        }
+    }
+    get_canary_prompt_overrides(db, recommendation_id)
+}
+
+/// Get canary config overrides from PG (falls back to SQLite).
+#[allow(dead_code)]
+pub fn get_canary_config_overrides_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<Vec<(String, serde_json::Value)>, String> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let rid = recommendation_id.to_string();
+        if let Ok(result) = tokio::task::block_in_place(|| {
+            handle.block_on(pg.get_canary_config_overrides(&rid))
+        }) {
+            return Ok(result);
+        }
+    }
+    get_canary_config_overrides(db, recommendation_id)
+}
+
 /// Per-version metrics for prompt template canary testing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PromptVersionMetrics {

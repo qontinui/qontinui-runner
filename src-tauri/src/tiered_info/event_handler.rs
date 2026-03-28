@@ -110,16 +110,18 @@ impl RunRecordingHandler {
         *self.project_id.lock().await = project_id;
 
         // Load expected durations from statistics
-        // PG: complex dynamic SQL
-        let conn = match self.db.connection() {
-            Ok(c) => c,
+        let stats_result = self.db.with_conn(|conn| {
+            get_config_statistics(conn, &config_id)
+        });
+        let stats_opt = match stats_result {
+            Ok(s) => s,
             Err(e) => {
                 warn!("Failed to get DB connection for loading stats: {}", e);
                 return;
             }
         };
 
-        if let Ok(Some(stats)) = get_config_statistics(&conn, &config_id) {
+        if let Some(stats) = stats_opt {
             let durations: HashMap<String, u64> = stats
                 .transition_stats
                 .iter()

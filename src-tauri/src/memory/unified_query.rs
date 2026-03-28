@@ -302,7 +302,6 @@ fn retrieve_sqlite(
     query: &str,
     limit: usize,
 ) -> Vec<MemoryResult> {
-    // PG: complex dynamic SQL
     match db.with_conn(|conn| {
         crate::reflection::unified_search::unified_search(conn, query, limit)
     }) {

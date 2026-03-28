@@ -232,21 +232,22 @@ pub async fn get_performance_dashboard(
         .unwrap_or(TimeRange::SevenDays);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        let summary = aggregate_summary(&conn, &config_id, &range)?;
-        let action_metrics = aggregate_action_performance(&conn, &config_id, &range)?;
-        let transition_metrics = get_transition_metrics(&conn, &config_id)?;
-        let element_metrics = get_element_metrics(&conn, &config_id)?;
-        let success_rate_trend = aggregate_success_rate_trend(&conn, &config_id, &range)?;
-        let duration_trend = aggregate_duration_trend(&conn, &config_id, &range)?;
+        db.with_conn(|conn| {
+            let summary = aggregate_summary(conn, &config_id, &range)?;
+            let action_metrics = aggregate_action_performance(conn, &config_id, &range)?;
+            let transition_metrics = get_transition_metrics(conn, &config_id)?;
+            let element_metrics = get_element_metrics(conn, &config_id)?;
+            let success_rate_trend = aggregate_success_rate_trend(conn, &config_id, &range)?;
+            let duration_trend = aggregate_duration_trend(conn, &config_id, &range)?;
 
-        Ok::<_, String>(PerformanceDashboardData {
-            summary,
-            action_metrics,
-            transition_metrics,
-            element_metrics,
-            success_rate_trend,
-            duration_trend,
+            Ok::<_, String>(PerformanceDashboardData {
+                summary,
+                action_metrics,
+                transition_metrics,
+                element_metrics,
+                success_rate_trend,
+                duration_trend,
+            })
         })
     })
     .await
@@ -277,8 +278,7 @@ pub async fn get_action_performance(
     let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        aggregate_action_performance(&conn, &config_id, &range)
+        db.with_conn(|conn| aggregate_action_performance(conn, &config_id, &range))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -298,8 +298,7 @@ pub async fn get_transition_reliability(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        get_transition_metrics(&conn, &config_id)
+        db.with_conn(|conn| get_transition_metrics(conn, &config_id))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -319,8 +318,7 @@ pub async fn get_element_resolution_metrics(
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        get_element_metrics(&conn, &config_id)
+        db.with_conn(|conn| get_element_metrics(conn, &config_id))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;
@@ -342,8 +340,7 @@ pub async fn get_success_rate_trend(
     let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        aggregate_success_rate_trend(&conn, &config_id, &range)
+        db.with_conn(|conn| aggregate_success_rate_trend(conn, &config_id, &range))
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?;

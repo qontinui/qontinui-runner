@@ -179,8 +179,8 @@ fn format_duration_ms(ms: i64) -> String {
 /// To prevent prompt bloat on iterations 4+, applies tiered compression:
 /// - Recent iteration (N-1): Full context
 /// - Old iterations (1..N-2): ~400 chars each
-fn build_compressed_iteration_history(
-    checkpoint_db: &CheckpointDb,
+async fn build_compressed_iteration_history(
+    checkpoint_db: &std::sync::Arc<CheckpointDb>,
     execution_id: &str,
     current_iteration: u32,
     process_status_summary: Option<&str>,
@@ -191,19 +191,6 @@ fn build_compressed_iteration_history(
     project_path: Option<&str>,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> Option<String> {
-    // Helper: run an async PG call synchronously via block_on.
-    macro_rules! pg_block {
-        ($pg:expr, $fut:expr) => {{
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.block_on($fut))) {
-                    Ok(result) => result,
-                    Err(_) => Err("block_on panicked (inside async context)".to_string()),
-                }
-            } else {
-                Err("no tokio runtime".to_string())
-            }
-        }};
-    }
     let mut sections = Vec::new();
     let mut budget_remaining = max_context_tokens;
     let mut sections_included: usize = 0;
@@ -218,7 +205,7 @@ fn build_compressed_iteration_history(
 
     // 1. Latest verification feedback from knowledge base (most actionable -- show first)
     // Priority: CRITICAL -- always included regardless of budget
-    if let Ok(feedback) = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, Some("verification_feedback"), false)) {
+    if let Ok(feedback) = pg_db.list_task_knowledge(execution_id, Some("verification_feedback"), false).await {
         if let Some(latest) = feedback.last() {
             let mut lines = vec!["### Last Verification Feedback".to_string()];
             lines.push(String::new());
@@ -235,7 +222,7 @@ fn build_compressed_iteration_history(
 
     // 2. Collect findings from the findings database (task_run_findings table)
     // Priority: HIGH
-    let findings_result = pg_block!(pg_db, pg_db.get_findings_for_task(execution_id));
+    let findings_result = pg_db.get_findings_for_task(execution_id).await;
     if let Ok(findings) = findings_result {
         if !findings.is_empty() {
             let mut findings_lines = vec!["### Findings from Previous Iterations".to_string()];
@@ -277,11 +264,11 @@ fn build_compressed_iteration_history(
     let recent_cutoff = current_iteration.saturating_sub(full_fidelity_iterations);
 
     // Load all observations once for efficient per-iteration lookup
-    let all_observations = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, Some("observation"), false))
+    let all_observations = pg_db.list_task_knowledge(execution_id, Some("observation"), false).await
         .unwrap_or_default();
 
     // Load all solutions for fix descriptions
-    let all_solutions = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, Some("solution"), false))
+    let all_solutions = pg_db.list_task_knowledge(execution_id, Some("solution"), false).await
         .unwrap_or_default();
 
     // --- 3a. Recent iteration (full fidelity) ---
@@ -295,7 +282,7 @@ fn build_compressed_iteration_history(
         recent_lines.push(String::new());
 
         // Full verification results for recent iteration
-        if let Ok(Some(result)) = pg_block!(pg_db, pg_db.get_verification_phase_result(execution_id, recent_iter)) {
+        if let Ok(Some(result)) = pg_db.get_verification_phase_result(execution_id, recent_iter).await {
             let passed = result
                 .get("passed_steps")
                 .and_then(|v| v.as_u64())
@@ -379,7 +366,7 @@ fn build_compressed_iteration_history(
             let mut current_failed_names: Vec<String> = Vec::new();
 
             // Verification pass/fail summary
-            if let Ok(Some(result)) = pg_block!(pg_db, pg_db.get_verification_phase_result(execution_id, iter)) {
+            if let Ok(Some(result)) = pg_db.get_verification_phase_result(execution_id, iter).await {
                 let passed = result
                     .get("passed_steps")
                     .and_then(|v| v.as_u64())
@@ -525,7 +512,7 @@ fn build_compressed_iteration_history(
     // 4. Accumulated knowledge (unresolved only -- deduped against iteration history above)
     // Priority: MEDIUM
     if budget_remaining > 200 {
-        if let Ok(all_knowledge) = pg_block!(pg_db, pg_db.list_task_knowledge(execution_id, None, false)) {
+        if let Ok(all_knowledge) = pg_db.list_task_knowledge(execution_id, None, false).await {
             if !all_knowledge.is_empty() {
                 let unresolved: Vec<_> = all_knowledge
                     .iter()
@@ -596,10 +583,15 @@ fn build_compressed_iteration_history(
     if budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
             // Try relevance-scored knowledge first (v99 cognitive system model)
-            // PG: complex dynamic SQL
-            let scored_knowledge = checkpoint_db.with_conn(|conn| {
-                crate::reflection::prediction::score_knowledge_relevance(conn, wf_name, 10)
-            });
+            let scored_knowledge = {
+                let db_c = checkpoint_db.clone();
+                let wf_c = wf_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    db_c.with_conn(|conn| {
+                        crate::reflection::prediction::score_knowledge_relevance(conn, &wf_c, 10)
+                    })
+                }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+            };
 
             if let Ok(scored) = scored_knowledge {
                 if !scored.is_empty() {
@@ -628,7 +620,7 @@ fn build_compressed_iteration_history(
                 }
             } else {
                 // Fallback: chronological ordering (pre-v99 databases)
-                if let Ok(historical) = pg_block!(pg_db, pg_db.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10)) {
+                if let Ok(historical) = pg_db.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10).await {
                     if !historical.is_empty() {
                         let mut lines =
                             vec!["### Historical Knowledge (from previous runs)".to_string()];
@@ -662,7 +654,7 @@ fn build_compressed_iteration_history(
     // Priority: MEDIUM -- only on first iteration when cross_workflow_learning is enabled
     if cross_workflow_learning && current_iteration <= 1 && budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
-            if let Ok(insights) = pg_block!(pg_db, pg_db.get_cross_workflow_knowledge(wf_name, execution_id, 3)) {
+            if let Ok(insights) = pg_db.get_cross_workflow_knowledge(wf_name, execution_id, 3).await {
                 if !insights.is_empty() {
                     let mut lines = vec!["## Insights from similar workflows".to_string()];
                     lines.push(String::new());
@@ -692,7 +684,7 @@ fn build_compressed_iteration_history(
     // Priority: MEDIUM -- only on first iteration when project_path is available
     if current_iteration <= 1 && budget_remaining > 200 {
         if let Some(pp) = project_path {
-            if let Ok(knowledge) = pg_block!(pg_db, pg_db.list_project_knowledge(pp, execution_id, 10)) {
+            if let Ok(knowledge) = pg_db.list_project_knowledge(pp, execution_id, 10).await {
                 if !knowledge.is_empty() {
                     let mut lines = vec!["## Project Knowledge".to_string()];
                     lines.push(
@@ -727,7 +719,7 @@ fn build_compressed_iteration_history(
     // 4e. Fix predictions (suggest known fixes for unresolved findings)
     // Priority: MEDIUM -- only on iteration 1, max 3 predictions
     if current_iteration <= 1 && budget_remaining > 200 {
-        let findings_result2 = pg_block!(pg_db, pg_db.get_findings_for_task(execution_id));
+        let findings_result2 = pg_db.get_findings_for_task(execution_id).await;
         if let Ok(findings) = findings_result2 {
             let unresolved_findings: Vec<_> = findings
                 .iter()
@@ -745,10 +737,16 @@ fn build_compressed_iteration_history(
                     }
                     // Use the finding's actual signature_hash for fix prediction lookup
                     let sig = &finding.signature_hash;
-                    // PG: complex dynamic SQL
-                    if let Ok(Some(predicted)) = checkpoint_db.with_conn(|conn| {
-                        crate::reflection::prediction::predict_fix_for_error(conn, sig)
-                    }) {
+                    let predicted_result = {
+                        let db_c = checkpoint_db.clone();
+                        let sig_c = sig.clone();
+                        tokio::task::spawn_blocking(move || {
+                            db_c.with_conn(|conn| {
+                                crate::reflection::prediction::predict_fix_for_error(conn, &sig_c)
+                            })
+                        }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+                    };
+                    if let Ok(Some(predicted)) = predicted_result {
                         if predicted.confidence >= 0.3 {
                             prediction_lines.push(format!(
                                 "- **[Predicted Fix, confidence: {:.0}%]** Based on {} previous successful application(s): {}",
@@ -759,12 +757,12 @@ fn build_compressed_iteration_history(
                             prediction_count += 1;
 
                             // Record that this fix was shown to the AI (PG: save_fix_application)
-                            let _ = pg_block!(pg_db, pg_db.save_fix_application(
+                            let _ = pg_db.save_fix_application(
                                 &predicted.fix_id,
                                 execution_id,
                                 Some(sig),
                                 "shown",
-                            ));
+                            ).await;
                         }
                     }
                 }
@@ -790,10 +788,15 @@ fn build_compressed_iteration_history(
     // Priority: LOW -- only when causal data exists, max 500 tokens
     if budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
-            // PG: complex dynamic SQL
-            let causal_events = checkpoint_db.with_conn(|conn| {
-                crate::reflection::causal::get_causal_events_for_workflow(conn, wf_name, 10)
-            });
+            let causal_events = {
+                let db_c = checkpoint_db.clone();
+                let wf_c = wf_name.to_string();
+                tokio::task::spawn_blocking(move || {
+                    db_c.with_conn(|conn| {
+                        crate::reflection::causal::get_causal_events_for_workflow(conn, &wf_c, 10)
+                    })
+                }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+            };
 
             if let Ok(events) = causal_events {
                 if !events.is_empty() {
@@ -856,16 +859,18 @@ fn build_compressed_iteration_history(
                         limit: 5,
                         min_similarity: 0.3,
                     };
-                    checkpoint_db
-                        // PG: complex dynamic SQL
-                        .with_conn(|conn| {
-                            crate::database::hybrid_search::hybrid_search_universal_fixes(
-                                conn,
-                                &emb,
-                                &search_config,
-                            )
-                        })
-                        .ok()
+                    {
+                        let db_c = checkpoint_db.clone();
+                        tokio::task::spawn_blocking(move || {
+                            db_c.with_conn(|conn| {
+                                crate::database::hybrid_search::hybrid_search_universal_fixes(
+                                    conn,
+                                    &emb,
+                                    &search_config,
+                                )
+                            })
+                        }).await.ok().and_then(|r| r.ok())
+                    }
                 }
                 Err(_) => None,
             }
@@ -886,14 +891,20 @@ fn build_compressed_iteration_history(
                             None,
                             |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
                         );
-                    // PG: complex dynamic SQL
-                    let _ = checkpoint_db.with_conn(|conn| {
-                        crate::meta_optimizer::agentic_metrics::rag_judge::persist_retrieval_event(
-                            conn,
-                            execution_id,
-                            &retrieval_event,
-                        )
-                    });
+                    let _ = {
+                        let db_c = checkpoint_db.clone();
+                        let eid_c = execution_id.to_string();
+                        let evt_c = retrieval_event.clone();
+                        tokio::task::spawn_blocking(move || {
+                            db_c.with_conn(|conn| {
+                                crate::meta_optimizer::agentic_metrics::rag_judge::persist_retrieval_event(
+                                    conn,
+                                    &eid_c,
+                                    &evt_c,
+                                )
+                            })
+                        }).await
+                    };
                 }
                 results
                     .iter()
@@ -909,7 +920,7 @@ fn build_compressed_iteration_history(
             _ => {
                 // SQL-only fallback: get universal fixes by reuse_count
                 // PG: get_universal_fixes
-                pg_block!(pg_db, pg_db.get_universal_fixes(5))
+                pg_db.get_universal_fixes(5).await
                     .ok()
                     .unwrap_or_default()
                     .into_iter()
@@ -956,7 +967,7 @@ fn build_compressed_iteration_history(
             .flat_map(|o| extract_changed_files_from_observation(&o.content))
             .collect();
         if let Some(wf_name) = workflow_name {
-            if let Some(section) = build_impact_context(checkpoint_db, wf_name, &changed) {
+            if let Some(section) = build_impact_context(checkpoint_db, wf_name, &changed).await {
                 let tokens = estimate_tokens(&section);
                 let capped_tokens = tokens.min(600);
                 if capped_tokens <= budget_remaining {
@@ -1221,8 +1232,8 @@ fn extract_changed_files_from_observation(content: &str) -> Vec<String> {
 ///
 /// For each changed file, looks up the architecture model for impact data.
 /// Returns None if no architecture data exists or no impacts found.
-fn build_impact_context(
-    checkpoint_db: &crate::database::CheckpointDb,
+async fn build_impact_context(
+    checkpoint_db: &std::sync::Arc<crate::database::CheckpointDb>,
     workflow_name: &str,
     changed_files: &[String],
 ) -> Option<String> {
@@ -1233,12 +1244,16 @@ fn build_impact_context(
     let mut impact_lines = Vec::new();
 
     for file_path in changed_files.iter().take(5) {
-        let impact = checkpoint_db
-            // PG: complex dynamic SQL
-            .with_conn(|conn| {
-                crate::reflection::architecture::get_impact_analysis(conn, workflow_name, file_path)
-            })
-            .ok();
+        let impact = {
+            let db_c = checkpoint_db.clone();
+            let wf_c = workflow_name.to_string();
+            let fp_c = file_path.clone();
+            tokio::task::spawn_blocking(move || {
+                db_c.with_conn(|conn| {
+                    crate::reflection::architecture::get_impact_analysis(conn, &wf_c, &fp_c)
+                })
+            }).await.ok().and_then(|r| r.ok())
+        };
 
         if let Some(analysis) = impact {
             if analysis.total_impact_radius == 0 {

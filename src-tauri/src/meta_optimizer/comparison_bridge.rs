@@ -257,3 +257,62 @@ pub fn comparison_to_recommendation_with_pg(
     }
     Ok(result)
 }
+
+/// Build a validation comparison with PG-primary read for the recommendation.
+#[allow(dead_code)]
+pub fn build_validation_comparison_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+) -> Result<Option<crate::comparison::ComparisonConfig>, String> {
+    // Try PG for the recommendation read
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let pg = pg_db.clone();
+        let rid = recommendation_id.to_string();
+        if let Ok(Some(rec)) = tokio::task::block_in_place(|| {
+            handle.block_on(pg.get_recommendation(&rid))
+        }) {
+            if rec.recommendation_type != "config_change" {
+                return Ok(None);
+            }
+            // Still need SQLite for workflow lookup (unified_workflows not in PG)
+            let workflow_id: Option<String> = db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT id FROM unified_workflows WHERE is_deleted = 0 ORDER BY updated_at DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                ).ok().ok_or_else(|| "No workflows".to_string())
+            }).ok();
+
+            let workflow_id = match workflow_id {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+
+            let recommended = rec.recommended_value.unwrap_or_else(|| "{}".to_string());
+            let overrides = vec![
+                serde_json::json!({"label": "baseline"}),
+                serde_json::json!({"label": "candidate", "config_override": recommended}),
+            ];
+
+            return Ok(Some(crate::comparison::ComparisonConfig {
+                workflow_id,
+                run_count: 2,
+                variation: crate::comparison::ComparisonVariation::Custom { overrides },
+                timeout_seconds: 600,
+            }));
+        }
+    }
+    build_validation_comparison(db, recommendation_id)
+}
+
+/// Check if bridge columns exist. SQLite-only (uses PRAGMA).
+/// PG always has these columns so this always returns true when PG is available.
+#[allow(dead_code)]
+pub fn has_bridge_columns_with_pg(
+    db: &CheckpointDb,
+    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> bool {
+    // PG schema always has these columns; SQLite may not if migration hasn't run
+    true
+}

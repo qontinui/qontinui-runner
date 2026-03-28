@@ -4,12 +4,11 @@
 //! the app should do: element coverage, cross-page consistency, mutation testing,
 //! freshness detection, and AI completeness review.
 
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -543,8 +542,8 @@ pub fn analyze_all_freshness(
 // ── Persistence ───────────────────────────────────────────────────────
 
 /// Store a spec accuracy result.
-pub fn store_accuracy_result(
-    db: &CheckpointDb,
+pub async fn store_accuracy_result(
+    pg: &PgDb,
     spec_id: &str,
     analysis_type: &str,
     score: f64,
@@ -552,84 +551,31 @@ pub fn store_accuracy_result(
 ) -> Result<String, String> {
     let id = format!("sar-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
-    let id_clone = id.clone();
 
-    // PG: complex dynamic SQL
-    db.with_conn({
-        let id = id.clone();
-        let spec_id = spec_id.to_string();
-        let analysis_type = analysis_type.to_string();
-        let detail_json = detail_json.to_string();
-        let now = now.clone();
-        move |conn| {
-            conn.execute(
-                r#"INSERT INTO spec_accuracy_results (id, spec_id, analysis_type, score, detail_json, created_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-                params![id, spec_id, analysis_type, score, detail_json, now],
-            )
-            .map_err(|e| format!("Failed to insert spec_accuracy_result: {}", e))?;
-            Ok(())
-        }
-    })?;
+    pg.insert_spec_accuracy_result(&id, spec_id, analysis_type, score, detail_json, &now)
+        .await?;
 
-    Ok(id_clone)
+    Ok(id)
 }
 
 /// Get accuracy results for a spec.
-pub fn get_accuracy_results(
-    db: &CheckpointDb,
+pub async fn get_accuracy_results(
+    pg: &PgDb,
     spec_id: Option<&str>,
     analysis_type: Option<&str>,
 ) -> Result<Vec<SpecAccuracyRecord>, String> {
-    let spec_id = spec_id.map(|s| s.to_string());
-    let analysis_type = analysis_type.map(|s| s.to_string());
-
-    // PG: complex dynamic SQL
-    db.with_conn(move |conn| {
-        let mut conditions = Vec::new();
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(ref sid) = spec_id {
-            param_values.push(Box::new(sid.clone()));
-            conditions.push(format!("spec_id = ?{}", param_values.len()));
-        }
-        if let Some(ref at) = analysis_type {
-            param_values.push(Box::new(at.clone()));
-            conditions.push(format!("analysis_type = ?{}", param_values.len()));
-        }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", conditions.join(" AND "))
-        };
-
-        let sql = format!(
-            "SELECT id, spec_id, analysis_type, score, detail_json, created_at FROM spec_accuracy_results{} ORDER BY created_at DESC LIMIT 100",
-            where_clause
-        );
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare accuracy query: {}", e))?;
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(SpecAccuracyRecord {
-                    id: row.get(0)?,
-                    spec_id: row.get(1)?,
-                    analysis_type: row.get(2)?,
-                    score: row.get(3)?,
-                    detail_json: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query accuracy results: {}", e))?;
-
-        Ok(rows.filter_map(|r| r.ok()).collect())
-    })
+    let rows = pg.get_accuracy_results(spec_id, analysis_type).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SpecAccuracyRecord {
+            id: r.id,
+            spec_id: r.spec_id,
+            analysis_type: r.analysis_type,
+            score: r.score,
+            detail_json: r.detail_json,
+            created_at: r.created_at,
+        })
+        .collect())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────

@@ -3,11 +3,10 @@
 //! Builds model scorecards from historical `phase_token_usage` and `learning_outcomes`
 //! data, enabling cost-per-quality optimization and model comparison.
 
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // =============================================================================
 // Types
@@ -63,114 +62,59 @@ pub struct ModelRecommendation {
 ///
 /// Joins `phase_token_usage` (for model and cost) with `learning_outcomes`
 /// (for success/failure) over the specified number of days.
-pub fn build_model_profile(
-    db: &CheckpointDb,
+pub async fn build_model_profile(
+    pg: &PgDb,
     model_id: &str,
     days: i64,
 ) -> Result<Option<ModelProfile>, String> {
-    let model = model_id.to_string();
     let period_start = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
-    // PG: complex dynamic SQL
-    db.with_conn(move |conn| {
-        // Get runs that used this model (via phase_token_usage) and their outcomes
-        let result = conn.query_row(
-            r#"SELECT
-                   COUNT(DISTINCT ptu.task_run_id) as run_count,
-                   COUNT(DISTINCT CASE WHEN lo.status = 'success' THEN ptu.task_run_id END) as success_count,
-                   COALESCE(AVG(lo.iterations), 0) as avg_iterations,
-                   COALESCE(AVG(lo.duration_secs * 1000), 0) as avg_duration_ms
-               FROM phase_token_usage ptu
-               JOIN learning_outcomes lo ON ptu.task_run_id = lo.task_id
-               WHERE ptu.model_used = ?1
-                 AND ptu.created_at > ?2"#,
-            params![model, period_start],
-            |row| {
-                let run_count: i64 = row.get(0)?;
-                let success_count: i64 = row.get(1)?;
-                let avg_iterations: f64 = row.get(2)?;
-                let avg_duration_ms: f64 = row.get(3)?;
-                Ok((run_count, success_count, avg_iterations, avg_duration_ms))
-            },
-        );
+    let data = pg.build_model_profile_data(model_id, &period_start).await?;
 
-        let (run_count, success_count, avg_iterations, avg_duration_ms) = match result {
-            Ok(r) => r,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(e) => return Err(format!("Failed to query model data: {}", e)),
-        };
+    let (run_count, success_count, avg_iterations, avg_duration_ms, avg_cost) = match data {
+        Some(d) => d,
+        None => return Ok(None),
+    };
 
-        if run_count == 0 {
-            return Ok(None);
-        }
+    if run_count == 0 {
+        return Ok(None);
+    }
 
-        // Get average cost per run for this model
-        let avg_cost: f64 = conn
-            .query_row(
-                r#"SELECT COALESCE(AVG(run_cost), 0) FROM (
-                       SELECT ptu.task_run_id, SUM(ptu.cost_cents) / 100.0 as run_cost
-                       FROM phase_token_usage ptu
-                       WHERE ptu.model_used = ?1 AND ptu.created_at > ?2
-                       GROUP BY ptu.task_run_id
-                   )"#,
-                params![model, period_start],
-                |row| row.get(0),
-            )
-            .unwrap_or(0.0);
+    let pass_rate = success_count as f64 / run_count as f64;
+    let cost_per_success = if success_count > 0 {
+        (avg_cost * run_count as f64) / success_count as f64
+    } else {
+        f64::INFINITY
+    };
+    let cost_efficiency = if avg_cost > 0.0 {
+        pass_rate / avg_cost
+    } else {
+        0.0
+    };
 
-        let pass_rate = success_count as f64 / run_count as f64;
-        let cost_per_success = if success_count > 0 {
-            (avg_cost * run_count as f64) / success_count as f64
-        } else {
-            f64::INFINITY
-        };
-        let cost_efficiency = if avg_cost > 0.0 {
-            pass_rate / avg_cost
-        } else {
-            0.0
-        };
-
-        Ok(Some(ModelProfile {
-            model_id: model,
-            pass_rate,
-            mean_iterations: avg_iterations,
-            mean_duration_ms: avg_duration_ms,
-            avg_cost_per_run_usd: avg_cost,
-            cost_per_success_usd: cost_per_success,
-            cost_efficiency_score: cost_efficiency,
-            trial_count: run_count as u32,
-            last_updated: chrono::Utc::now().to_rfc3339(),
-            performance_by_task_type: Vec::new(),
-        }))
-    })
+    Ok(Some(ModelProfile {
+        model_id: model_id.to_string(),
+        pass_rate,
+        mean_iterations: avg_iterations,
+        mean_duration_ms: avg_duration_ms,
+        avg_cost_per_run_usd: avg_cost,
+        cost_per_success_usd: cost_per_success,
+        cost_efficiency_score: cost_efficiency,
+        trial_count: run_count as u32,
+        last_updated: chrono::Utc::now().to_rfc3339(),
+        performance_by_task_type: Vec::new(),
+    }))
 }
 
 /// Build profiles for all models seen in the last N days.
-pub fn build_all_profiles(db: &CheckpointDb, days: i64) -> Result<Vec<ModelProfile>, String> {
+pub async fn build_all_profiles(pg: &PgDb, days: i64) -> Result<Vec<ModelProfile>, String> {
     let period_start = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
-    // Get distinct models
-    // PG: complex dynamic SQL
-    let models: Vec<String> = db.with_conn(move |conn| {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT DISTINCT model_used FROM phase_token_usage
-                   WHERE model_used IS NOT NULL AND created_at > ?1"#,
-            )
-            .map_err(|e| format!("Failed to prepare: {}", e))?;
-
-        let rows: Vec<String> = stmt
-            .query_map(params![period_start], |row| row.get(0))
-            .map_err(|e| format!("Failed to query: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
-    })?;
+    let models = pg.get_distinct_models(&period_start).await?;
 
     let mut profiles = Vec::new();
     for model_id in &models {
-        if let Some(profile) = build_model_profile(db, model_id, days)? {
+        if let Some(profile) = build_model_profile(pg, model_id, days).await? {
             profiles.push(profile);
         }
     }
@@ -186,11 +130,11 @@ pub fn build_all_profiles(db: &CheckpointDb, days: i64) -> Result<Vec<ModelProfi
 }
 
 /// Get model recommendations, optionally constrained by budget.
-pub fn get_model_recommendation(
-    db: &CheckpointDb,
+pub async fn get_model_recommendation(
+    pg: &PgDb,
     budget_constraint_usd: Option<f64>,
 ) -> Result<Vec<ModelRecommendation>, String> {
-    let profiles = build_all_profiles(db, 30)?;
+    let profiles = build_all_profiles(pg, 30).await?;
 
     let mut recommendations: Vec<ModelRecommendation> = profiles
         .into_iter()
@@ -242,63 +186,30 @@ pub fn get_model_recommendation(
 // =============================================================================
 
 /// Save a model profile to the database.
-pub fn save_model_profile(db: &CheckpointDb, profile: &ModelProfile) -> Result<(), String> {
+pub async fn save_model_profile(pg: &PgDb, profile: &ModelProfile) -> Result<(), String> {
     let id = format!("mp-{}", uuid::Uuid::new_v4());
-    let model_id = profile.model_id.clone();
     let profile_json = serde_json::to_string(profile)
         .map_err(|e| format!("Failed to serialize profile: {}", e))?;
     let trial_count = profile.trial_count as i64;
-    let last_updated = profile.last_updated.clone();
 
-    // PG: complex dynamic SQL
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO model_profiles (id, model_id, profile_json, trial_count, last_updated)
-               VALUES (?1, ?2, ?3, ?4, ?5)
-               ON CONFLICT(model_id) DO UPDATE SET
-                   profile_json = excluded.profile_json,
-                   trial_count = excluded.trial_count,
-                   last_updated = excluded.last_updated"#,
-            params![id, model_id, profile_json, trial_count, last_updated],
-        )
-        .map_err(|e| format!("Failed to save model profile: {}", e))?;
-
-        info!(
-            "Saved model profile for {} ({} trials)",
-            model_id, trial_count
-        );
-        Ok(())
-    })
+    pg.save_model_profile(&id, &profile.model_id, &profile_json, trial_count, &profile.last_updated).await
 }
 
 /// Load all saved model profiles.
-pub fn list_model_profiles(db: &CheckpointDb) -> Result<Vec<ModelProfile>, String> {
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare("SELECT profile_json FROM model_profiles ORDER BY trial_count DESC")
-            .map_err(|e| format!("Failed to prepare: {}", e))?;
-
-        let rows: Vec<ModelProfile> = stmt
-            .query_map([], |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
-            })
-            .map_err(|e| format!("Failed to query: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect();
-
-        Ok(rows)
-    })
+pub async fn list_model_profiles(pg: &PgDb) -> Result<Vec<ModelProfile>, String> {
+    let jsons = pg.list_model_profiles().await?;
+    Ok(jsons
+        .into_iter()
+        .filter_map(|json| serde_json::from_str(&json).ok())
+        .collect())
 }
 
 /// Refresh all model profiles (rebuild from historical data and persist).
-pub fn refresh_all_profiles(db: &CheckpointDb, days: i64) -> Result<Vec<ModelProfile>, String> {
-    let profiles = build_all_profiles(db, days)?;
+pub async fn refresh_all_profiles(pg: &PgDb, days: i64) -> Result<Vec<ModelProfile>, String> {
+    let profiles = build_all_profiles(pg, days).await?;
 
     for profile in &profiles {
-        save_model_profile(db, profile)?;
+        save_model_profile(pg, profile).await?;
     }
 
     info!("Refreshed {} model profiles", profiles.len());

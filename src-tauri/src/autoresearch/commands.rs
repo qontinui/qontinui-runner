@@ -297,28 +297,20 @@ pub async fn list_unified_workflows(
 // Q-routing observability (for QRoutingTab)
 // =============================================================================
 
-/// Load Q-table rows, preferring PG over SQLite.
-/// If PG is connected and query succeeds, use PG results (even if empty).
-/// Only fall back to SQLite on PG error or when PG is not configured.
+/// Load Q-table rows from PG.
 async fn load_q_rows_pg_first(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     app_state: &crate::commands::AppState,
 ) -> Vec<(String, String, f64, u32)> {
-    if let Ok(rows) = app_state.pg_db.get_all_q_entries().await {
-        return rows;
-    }
-    load_q_table(db).unwrap_or_default()
+    app_state.pg_db.get_all_q_entries().await.unwrap_or_default()
 }
 
-/// Load overrides, preferring PG over SQLite.
+/// Load overrides from PG.
 async fn load_overrides_pg_first(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     app_state: &crate::commands::AppState,
 ) -> Vec<(String, String)> {
-    if let Ok(overrides) = app_state.pg_db.get_all_q_overrides().await {
-        return overrides;
-    }
-    load_q_overrides(db).unwrap_or_default()
+    app_state.pg_db.get_all_q_overrides().await.unwrap_or_default()
 }
 
 /// Get the full Q-routing table as JSON. Prefers PG.
@@ -411,14 +403,7 @@ pub async fn remove_q_routing_override(
     Ok(true)
 }
 
-// SQLite helpers delegated to q_router module
-fn load_q_overrides(db: &CheckpointDb) -> Result<Vec<(String, String)>, String> {
-    super::q_router::load_overrides_sqlite(db)
-}
-
-fn load_q_table(db: &CheckpointDb) -> Result<Vec<(String, String, f64, u32)>, String> {
-    super::q_router::load_q_table_sqlite(db)
-}
+// (Q-table / overrides now use PG exclusively via load_q_rows_pg_first / load_overrides_pg_first)
 
 /// Reset the Q-routing table (clears all learned Q-values).
 /// Clears both PG and SQLite. Overrides are preserved.
