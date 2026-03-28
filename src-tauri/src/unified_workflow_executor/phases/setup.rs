@@ -286,6 +286,7 @@ impl SetupExecutor {
                         match execute_prompt_response_mode(
                             step,
                             &self.checkpoint_db,
+                            &self.app_state.pg_db,
                             Some(execution_id),
                             doctor_handle,
                             step_model.clone(),

@@ -129,6 +129,63 @@ impl PgDb {
         Ok(id)
     }
 
+    /// Link findings to steps by matching creation timestamps within the same task run.
+    /// Finds all findings detected during the step's execution window and creates links.
+    pub async fn link_findings_to_steps_by_timestamp(
+        &self,
+        task_run_id: &str,
+        step_name: &str,
+        step_index: i32,
+        step_started_at: &str,
+        step_completed_at: &str,
+    ) -> Result<u32, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT id FROM task_run_findings
+                   WHERE task_run_id = $1
+                   AND created_at >= $2
+                   AND created_at <= $3
+                   AND id NOT IN (SELECT finding_id FROM step_finding_links WHERE task_run_id = $1)"#,
+                &[&task_run_id, &step_started_at, &step_completed_at],
+            )
+            .await
+            .map_err(|e| format!("PG find unlinked findings: {}", e))?;
+
+        let mut count = 0u32;
+        for row in &rows {
+            let finding_id: String = row.get(0);
+            let id = format!("sfl-{}", uuid::Uuid::new_v4());
+            let confidence: f32 = 0.8;
+            if conn
+                .execute(
+                    r#"INSERT INTO step_finding_links
+                       (id, task_run_id, step_name, step_index, finding_id, link_type, confidence)
+                       VALUES ($1, $2, $3, $4, $5, 'temporal', $6)"#,
+                    &[
+                        &id.as_str(),
+                        &task_run_id,
+                        &step_name,
+                        &step_index,
+                        &finding_id.as_str(),
+                        &confidence,
+                    ],
+                )
+                .await
+                .is_ok()
+            {
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     // ========================================================================
     // Step Provenance
     // ========================================================================

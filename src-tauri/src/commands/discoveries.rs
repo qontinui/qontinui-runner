@@ -87,6 +87,7 @@ impl From<&PendingDiscovery> for DiscoveryPreview {
 pub async fn get_pending_discoveries_cmd(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<Vec<PendingDiscovery>>, String> {
+    // SQLite: complex function — discovery queue operations with payload deserialization
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -106,6 +107,7 @@ pub async fn get_pending_discoveries_cmd(
 pub async fn get_discovery_summary(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<DiscoverySummary>, String> {
+    // SQLite: complex function — multi-query sync status + discovery preview aggregation
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -156,7 +158,7 @@ pub async fn sync_discoveries(
 
     let db = &state.checkpoint_db;
 
-    // Phase 1: Extract discoveries (sync operation)
+    // SQLite: complex function — extract + transform discovery payloads for sync
     let db1 = db.clone();
     let to_sync = tokio::task::spawn_blocking(move || {
         db1.with_conn(|conn| extract_discoveries_for_sync(conn))
@@ -178,7 +180,7 @@ pub async fn sync_discoveries(
     // Phase 2: Push to backend (async operation, no connection)
     let sync_results = sync_discoveries_batch(to_sync).await;
 
-    // Phase 3: Apply results to database (sync operation, fresh connection)
+    // SQLite: complex function — apply sync results + count remaining
     let db2 = db.clone();
     let (result, remaining) = tokio::task::spawn_blocking(move || {
         db2.with_conn(|conn| {
@@ -213,6 +215,7 @@ pub async fn clear_discovery(
 ) -> Result<DiscoveryResponse<bool>, String> {
     info!("Clearing discovery {} from queue", id);
 
+    // SQLite: complex function — discovery deletion with queue management
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -236,6 +239,7 @@ pub async fn clear_failed_discoveries(
 ) -> Result<DiscoveryResponse<u32>, String> {
     info!("Clearing failed discoveries");
 
+    // SQLite: complex function — batch cleanup of failed discovery records
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -258,6 +262,7 @@ pub async fn clear_failed_discoveries(
 pub async fn get_discovery_sync_status(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<SyncStatus>, String> {
+    // SQLite: complex function — sync status aggregation with auth check
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {

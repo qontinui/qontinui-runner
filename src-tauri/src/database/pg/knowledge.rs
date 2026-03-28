@@ -50,6 +50,28 @@ impl PgDb {
         Ok(id.to_string())
     }
 
+    /// Update the project_path field on a task_knowledge entry.
+    pub async fn update_task_knowledge_project_path(
+        &self,
+        knowledge_id: &str,
+        project_path: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
+
+        conn.execute(
+            "UPDATE task_knowledge SET project_path = $1 WHERE id = $2",
+            &[&project_path, &knowledge_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_task_knowledge_project_path: {e}"))?;
+
+        Ok(())
+    }
+
     /// Store an embedding vector for a task_knowledge entry.
     pub async fn store_knowledge_embedding(
         &self,

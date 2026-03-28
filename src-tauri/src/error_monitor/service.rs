@@ -201,6 +201,7 @@ impl ErrorMonitorHandle {
 /// Error monitoring service
 pub struct ErrorMonitorService {
     db: Arc<CheckpointDb>,
+    pg_db: Arc<crate::database::pg::PgDb>,
     config: ErrorMonitorConfig,
     /// Currently monitored files with their state
     file_states: HashMap<String, FileState>,
@@ -222,6 +223,7 @@ impl ErrorMonitorService {
     /// Create a new error monitor service.
     pub fn new(
         db: Arc<CheckpointDb>,
+        pg_db: Arc<crate::database::pg::PgDb>,
         config: ErrorMonitorConfig,
     ) -> (Self, ErrorMonitorHandle, Receiver<ServiceCommand>) {
         let (command_tx, command_rx) = mpsc::channel(100);
@@ -244,6 +246,7 @@ impl ErrorMonitorService {
 
         let service = Self {
             db,
+            pg_db,
             config,
             file_states: HashMap::new(),
             current_task_run_id,
@@ -428,23 +431,9 @@ impl ErrorMonitorService {
             .collect();
 
         // Sync to database for FK integrity (error_events references log_sources.id)
-        let db = self.db.clone();
         let sources_for_db = sources.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
-            // Clear existing sources and re-insert from settings
-            conn.execute("DELETE FROM log_sources", [])
-                .map_err(|e| format!("Failed to clear log_sources: {}", e))?;
-            for source in &sources_for_db {
-                LogSourceStorage::insert(&conn, source)?;
-            }
-            Ok::<(), String>(())
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-        {
-            tracing::error!("Failed to sync log sources to database: {}", e);
+        if let Err(e) = self.pg_db.sync_log_sources(&sources_for_db).await {
+            tracing::error!("Failed to sync log sources to PG: {}", e);
         }
 
         for source in sources {
@@ -460,17 +449,9 @@ impl ErrorMonitorService {
         let path = source.path.clone();
 
         // Save to database
-        let db = self.db.clone();
         let source_clone = source.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
-            LogSourceStorage::insert(&conn, &source_clone)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task join error: {}", e)))
-        {
-            tracing::error!("Failed to save source to database: {}", e);
+        if let Err(e) = self.pg_db.create_log_source(&source_clone).await {
+            tracing::error!("Failed to save source to PG: {}", e);
         }
 
         self.add_source_internal(source);
@@ -510,17 +491,8 @@ impl ErrorMonitorService {
             .retain(|_, state| state.source_name != name);
 
         // Remove from database
-        let db = self.db.clone();
-        let name_owned = name.to_string();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            // PG: complex dynamic SQL
-            let conn = db.connection()?;
-            LogSourceStorage::delete_by_name(&conn, &name_owned)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("Task join error: {}", e)))
-        {
-            tracing::error!("Failed to delete source from database: {}", e);
+        if let Err(e) = self.pg_db.delete_log_source_by_name(name).await {
+            tracing::error!("Failed to delete source from PG: {}", e);
         }
 
         let _ = self
@@ -795,9 +767,10 @@ impl ErrorMonitorService {
 /// MUST be called from within a Tokio runtime context (e.g., inside tauri::async_runtime::spawn).
 pub async fn start_error_monitor_async(
     db: Arc<CheckpointDb>,
+    pg_db: Arc<crate::database::pg::PgDb>,
     config: ErrorMonitorConfig,
 ) -> ErrorMonitorHandle {
-    let (service, handle, command_rx) = ErrorMonitorService::new(db, config);
+    let (service, handle, command_rx) = ErrorMonitorService::new(db, pg_db, config);
 
     tokio::spawn(async move {
         service.run(command_rx).await;
@@ -813,6 +786,7 @@ mod tests {
     use tempfile::tempdir;
 
     /// Helper to create a test service via the public constructor.
+    /// Requires DATABASE_URL env var for PgDb connection.
     fn create_test_service(
         db: Arc<CheckpointDb>,
     ) -> (
@@ -820,7 +794,8 @@ mod tests {
         ErrorMonitorHandle,
         Receiver<ServiceCommand>,
     ) {
-        ErrorMonitorService::new(db, ErrorMonitorConfig::default())
+        let pg_db = crate::database::pg::PgDb::new_blocking_for_test();
+        ErrorMonitorService::new(db, pg_db, ErrorMonitorConfig::default())
     }
 
     #[tokio::test]

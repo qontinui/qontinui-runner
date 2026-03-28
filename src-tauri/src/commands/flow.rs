@@ -1434,6 +1434,7 @@ fn record_flow_learning(
     let verification_passed = outcome.verification_passed;
     let was_stopped = outcome.was_stopped;
     tokio::spawn(async move {
+        // SQLite: complex function — learning outcome recording + deterministic metrics scoring
         let db_inner = db_arc.clone();
         let record_result = tokio::task::spawn_blocking(move || {
             db_inner.with_conn(|conn| learning_recorder::record_workflow_learning(conn, &outcome))

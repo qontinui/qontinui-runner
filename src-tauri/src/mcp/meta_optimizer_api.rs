@@ -832,6 +832,7 @@ pub async fn get_autoresearch_campaigns_handler(
 ) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50);
 
+    // SQLite: complex function — nested queries (campaigns + experiments per campaign)
     let db = state.app_state.checkpoint_db.clone();
     let campaigns = tokio::task::spawn_blocking(move || {
         db.with_conn(move |conn| {
@@ -1044,7 +1045,7 @@ pub async fn get_iteration_history_handler(
 
     match tier {
         ContextTier::L0 => {
-            // Aggregate: group by status, compute avg iterations, confidence delta, top approaches
+            // SQLite: complex function — rusqlite query_map + in-memory aggregation of iteration histories
             let db = state.app_state.checkpoint_db.clone();
             let sf = status_filter.clone();
             let summaries = tokio::task::spawn_blocking(move || {
@@ -1140,7 +1141,7 @@ pub async fn get_iteration_history_handler(
             )))
         }
         ContextTier::L1 => {
-            // Per-run: iteration count, approaches, confidence trajectory
+            // SQLite: complex function — per-run iteration details with approach extraction
             let db = state.app_state.checkpoint_db.clone();
             let sf = status_filter.clone();
             let details = tokio::task::spawn_blocking(move || {
@@ -1211,7 +1212,7 @@ pub async fn get_iteration_history_handler(
             )))
         }
         ContextTier::L2 => {
-            // Full raw iteration_history JSON per run
+            // SQLite: complex function — full raw iteration_history JSON per run
             let db = state.app_state.checkpoint_db.clone();
             let sf = status_filter.clone();
             let full = tokio::task::spawn_blocking(move || {

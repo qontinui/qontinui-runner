@@ -839,4 +839,14 @@ impl PgDb {
         info!("Migrated {} token usage rows from SQLite to PostgreSQL", migrated);
         Ok(migrated)
     }
+
+    /// Blocking helper for tests: create a PgDb using DATABASE_URL.
+    /// Panics if PG is not available.
+    #[cfg(test)]
+    pub fn new_blocking_for_test() -> std::sync::Arc<Self> {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string());
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
+        std::sync::Arc::new(rt.block_on(Self::new(&url)).expect("PgDb connection for test"))
+    }
 }

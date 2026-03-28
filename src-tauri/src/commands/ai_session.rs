@@ -53,11 +53,10 @@ pub async fn list_ai_sessions(
     app_state: tauri::State<'_, Arc<AppState>>,
     session_manager: tauri::State<'_, Arc<SessionManager>>,
 ) -> Result<CommandResponse, String> {
-    let db = app_state.checkpoint_db.clone();
-    let result = tokio::task::spawn_blocking(move || db.get_ai_sessions(50, None)).await;
+    let result = app_state.pg_db.get_ai_sessions(50, None).await;
 
     match result {
-        Ok(Ok(sessions)) => {
+        Ok(sessions) => {
             let enriched: Vec<serde_json::Value> = sessions
                 .into_iter()
                 .map(|s| {
@@ -81,14 +80,9 @@ pub async fn list_ai_sessions(
                 })),
             })
         }
-        Ok(Err(e)) => Ok(CommandResponse {
-            success: false,
-            message: Some(format!("Failed to list AI sessions: {}", e)),
-            data: None,
-        }),
         Err(e) => Ok(CommandResponse {
             success: false,
-            message: Some(format!("Task failed: {}", e)),
+            message: Some(format!("Failed to list AI sessions: {}", e)),
             data: None,
         }),
     }
@@ -467,21 +461,8 @@ pub async fn get_ai_output(
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
-    let db = app_state.checkpoint_db.clone();
-    let id_clone = task_run_id.clone();
-    let result = tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await;
-
-    let db_output = match result {
-        Ok(Ok(Some(output))) => output,
-        Ok(Ok(None)) => String::new(),
-        _ => {
-            return Ok(CommandResponse {
-                success: false,
-                message: Some("Failed to get output".to_string()),
-                data: None,
-            });
-        }
-    };
+    let db_output = app_state.pg_db.get_task_output(&task_run_id).await
+        .unwrap_or_default();
 
     // If there's a live session, append any unpersisted AI output.
     // The accumulated_output contains all AI text from the current session.
@@ -570,32 +551,19 @@ pub async fn generate_workflow_from_session(
     );
 
     // Get conversation from DB output_log (needed as fallback if no source_content)
-    let db = app_state.checkpoint_db.clone();
-    let id_clone = task_run_id.clone();
-    let output_log =
-        match tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await {
-            Ok(Ok(Some(log))) => log,
-            Ok(Ok(None)) => {
-                if source_content.is_none() {
-                    return Ok(CommandResponse {
-                        success: false,
-                        message: Some("No conversation history available".to_string()),
-                        data: None,
-                    });
-                }
-                String::new()
+    let output_log = match app_state.pg_db.get_task_output(&task_run_id).await {
+        Ok(log) if !log.is_empty() => log,
+        _ => {
+            if source_content.is_none() {
+                return Ok(CommandResponse {
+                    success: false,
+                    message: Some("No conversation history available".to_string()),
+                    data: None,
+                });
             }
-            _ => {
-                if source_content.is_none() {
-                    return Ok(CommandResponse {
-                        success: false,
-                        message: Some("Failed to read conversation".to_string()),
-                        data: None,
-                    });
-                }
-                String::new()
-            }
-        };
+            String::new()
+        }
+    };
 
     // Determine the plan text to use for generation
     let plan_text = source_content.as_deref().unwrap_or(&output_log);
@@ -666,7 +634,7 @@ pub async fn generate_workflow_from_session(
         }
     }
 
-    // Get doctor handle for health monitoring
+    // SQLite: complex function — AI-driven workflow generation + pipeline artifact storage
     let doctor_handle = app_state.doctor_handle.lock().await.clone();
     let db2 = app_state.checkpoint_db.clone();
     let artifact_task_run_id = task_run_id.clone();
@@ -773,24 +741,15 @@ pub async fn generate_workflow_from_session(
                         rollback_policy: workflow.rollback_policy.clone(),
                     };
 
-                    let db_save = app_state.checkpoint_db.clone();
-                    let save_result = tokio::task::spawn_blocking(move || {
-                        db_save.create_unified_workflow(&create_req)
-                    })
-                    .await;
-
-                    match save_result {
-                        Ok(Ok(saved)) => {
+                    match app_state.pg_db.create_unified_workflow(&create_req).await {
+                        Ok(saved) => {
                             info!(
                                 "Saved generated workflow '{}' to library (id={})",
                                 saved.name, saved.id
                             );
                         }
-                        Ok(Err(e)) => {
-                            warn!("Failed to save generated workflow to library: {}", e);
-                        }
                         Err(e) => {
-                            warn!("spawn_blocking failed saving workflow: {}", e);
+                            warn!("Failed to save generated workflow to library: {}", e);
                         }
                     }
 
@@ -802,15 +761,8 @@ pub async fn generate_workflow_from_session(
                             "generated_workflow_id": wf_id,
                             "generated_workflow_name": wf_name,
                         });
-                        let db3 = app_state.checkpoint_db.clone();
-                        let trid = task_run_id.clone();
                         let rd_str = result_data.to_string();
-                        if let Err(e) = tokio::task::spawn_blocking(move || {
-                            db3.update_task_run_result_data(&trid, &rd_str)
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(e.to_string()))
-                        {
+                        if let Err(e) = app_state.pg_db.update_task_result_data(&task_run_id, &rd_str).await {
                             warn!("Failed to update AI session task run result_data: {}", e);
                         }
                     }
@@ -952,7 +904,7 @@ pub async fn resume_ai_sessions(
     session_manager: Arc<SessionManager>,
     app_handle: tauri::AppHandle,
 ) -> u32 {
-    // Query running AI sessions
+    // SQLite: complex function — resume_ai_sessions operates with CheckpointDb (no PgDb access)
     let db_for_query = db.clone();
     let ai_sessions =
         match tokio::task::spawn_blocking(move || db_for_query.get_running_ai_sessions(None)).await

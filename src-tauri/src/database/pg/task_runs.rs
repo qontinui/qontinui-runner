@@ -999,4 +999,20 @@ impl PgDb {
 
         Ok(results)
     }
+
+    /// Get workflow_name (or task_name as fallback) for a task run.
+    pub async fn get_source_workflow_name_for_task(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = $1",
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_source_workflow_name_for_task: {}", e))?;
+        Ok(row.map(|r| r.get(0)))
+    }
 }

@@ -313,6 +313,84 @@ impl PgDb {
             .ok_or_else(|| "Known issue not found after update".to_string())
     }
 
+    /// Increment times_checked and update last_checked_at.
+    pub async fn increment_known_issue_checked(&self, id: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"UPDATE known_issues
+               SET times_checked = COALESCE(times_checked, 0) + 1,
+                   last_checked_at = $2, updated_at = $2
+               WHERE id = $1"#,
+            &[&id, &now],
+        )
+        .await
+        .map_err(|e| format!("PG increment_known_issue_checked: {}", e))?;
+        Ok(())
+    }
+
+    /// Increment times_detected and update last_detected_at.
+    pub async fn increment_known_issue_detected(&self, id: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"UPDATE known_issues
+               SET times_detected = COALESCE(times_detected, 0) + 1,
+                   last_detected_at = $2, updated_at = $2
+               WHERE id = $1"#,
+            &[&id, &now],
+        )
+        .await
+        .map_err(|e| format!("PG increment_known_issue_detected: {}", e))?;
+        Ok(())
+    }
+
+    /// Decay confidence when a regression check passes (issue was NOT detected).
+    /// Confidence decays toward 0.0 by multiplying by a decay factor.
+    /// If confidence drops below the threshold (0.1), auto-resolve the issue.
+    pub async fn decay_known_issue_confidence(&self, id: &str) -> Result<(), String> {
+        const DECAY_FACTOR: f64 = 0.85;
+        const AUTO_RESOLVE_THRESHOLD: f64 = 0.1;
+
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let row = conn
+            .query_opt(
+                "SELECT confidence FROM known_issues WHERE id = $1 AND status = 'active'",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG decay confidence query: {}", e))?;
+
+        let current_confidence: f64 = match row {
+            Some(r) => r.get(0),
+            None => return Ok(()), // Not active or not found
+        };
+
+        let new_confidence = current_confidence * DECAY_FACTOR;
+
+        if new_confidence < AUTO_RESOLVE_THRESHOLD {
+            conn.execute(
+                r#"UPDATE known_issues
+                   SET confidence = $2, status = 'resolved', resolved_at = $3, updated_at = $3
+                   WHERE id = $1"#,
+                &[&id, &new_confidence, &now],
+            )
+            .await
+            .map_err(|e| format!("PG auto-resolve known issue: {}", e))?;
+        } else {
+            conn.execute(
+                r#"UPDATE known_issues SET confidence = $2, updated_at = $3 WHERE id = $1"#,
+                &[&id, &new_confidence, &now],
+            )
+            .await
+            .map_err(|e| format!("PG decay confidence: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     /// Delete a known issue by ID.
     pub async fn delete_known_issue(&self, id: &str) -> Result<bool, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;

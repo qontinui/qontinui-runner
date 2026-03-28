@@ -1082,11 +1082,10 @@ pub async fn ui_bridge_get_snapshot_handler(
     match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
         Ok(mut data) => {
             // Enrich snapshot with architecture spec summaries from the database
-            let db = state.app_state.checkpoint_db.clone();
-            let arch_result = tokio::task::spawn_blocking(move || db.get_all_cached_specs()).await;
+            let arch_result = state.app_state.pg_db.get_all_cached_specs().await;
 
             match arch_result {
-                Ok(Ok(specs)) => {
+                Ok(specs) => {
                     let summaries: Vec<serde_json::Value> = specs
                         .iter()
                         .filter(|s| crate::spec_utils::is_architecture_spec_str(&s.spec_json))
@@ -1109,14 +1108,11 @@ pub async fn ui_bridge_get_snapshot_handler(
                         }
                     }
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!(
                         "Snapshot enrichment: failed to fetch cached specs from database: {}",
                         e
                     );
-                }
-                Err(e) => {
-                    warn!("Snapshot enrichment: spawn_blocking task failed: {}", e);
                 }
             }
 

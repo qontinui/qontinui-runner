@@ -196,6 +196,62 @@ fn pg_row_to_finding(row: &tokio_postgres::Row) -> Finding {
 }
 
 impl PgDb {
+    /// Insert a test failure finding with dedup on signature_hash.
+    pub async fn insert_test_failure_finding(
+        &self,
+        task_run_id: &str,
+        session_num: i32,
+        title: &str,
+        description: &str,
+        test_name: &str,
+    ) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let signature = format!("test_failure:{}:{}", task_run_id, test_name);
+        let mut hasher = Sha256::new();
+        hasher.update(signature.as_bytes());
+        let signature_hash = format!("{:x}", hasher.finalize());
+
+        // Check for existing
+        let existing = conn
+            .query_opt(
+                "SELECT id FROM task_run_findings WHERE task_run_id = $1 AND signature_hash = $2 AND status NOT IN ('resolved', 'wont_fix')",
+                &[&task_run_id, &signature_hash],
+            )
+            .await
+            .map_err(|e| format!("PG test failure dedup check: {}", e))?;
+
+        if let Some(row) = existing {
+            return Ok(row.get(0));
+        }
+
+        let finding_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"INSERT INTO task_run_findings
+               (id, task_run_id, session_num, title, description,
+                category, severity, signature_hash, status, is_resolved, created_at)
+               VALUES ($1, $2, $3, $4, $5, 'test_failure', 'high', $6, 'active', false, $7)
+               ON CONFLICT (id) DO NOTHING"#,
+            &[
+                &finding_id.as_str(),
+                &task_run_id,
+                &session_num,
+                &title,
+                &description,
+                &signature_hash.as_str(),
+                &now.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG insert_test_failure_finding: {}", e))?;
+
+        Ok(finding_id)
+    }
+
     /// Set a user response on a finding.
     pub async fn set_finding_user_response(
         &self,

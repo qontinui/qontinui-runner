@@ -54,22 +54,15 @@ pub async fn list_task_runs(
 }
 
 /// List only running task runs.
-/// Uses spawn_blocking to avoid blocking the async runtime on database operations.
 pub async fn list_running_task_runs(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
-    let db = state.app_state.checkpoint_db.clone();
     let port = state
         .app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    tokio::task::spawn_blocking(move || db.get_running_task_runs(Some(port)))
-        .await
-        .map_err(|e| {
-            error!("spawn_blocking error in list_running_task_runs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?
+    state.app_state.pg_db.get_running_task_runs(Some(port)).await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
@@ -368,7 +361,7 @@ pub async fn generate_task_summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     info!("MCP API: Generating summary for task run: {}", id);
 
-    // Run summary generation in a blocking task
+    // SQLite: complex function — uses sync AI provider + multi-query summary generation
     let db = state.app_state.checkpoint_db.clone();
     let task_id = id.clone();
     let doctor_handle = state.doctor_handle.clone();
@@ -1777,7 +1770,7 @@ pub async fn migrate_task_run_logs(
             )
         })?;
 
-    // Run migration
+    // SQLite: complex function — file I/O + multi-table SQLite log migration
     let db = state.app_state.checkpoint_db.clone();
     let workflow_name = task_run.workflow_name.clone();
     let task_id = id.clone();
@@ -2038,12 +2031,8 @@ pub async fn sse_ai_output_for_task_run(
     }
 
     // 2. Recent output text
-    let db = state.app_state.checkpoint_db.clone();
     let id_for_output = task_run_id.clone();
-    if let Ok(Some(task_run)) = tokio::task::spawn_blocking(move || db.get_task_run(&id_for_output))
-        .await
-        .unwrap_or(Ok(None))
-    {
+    if let Ok(Some(task_run)) = state.app_state.pg_db.get_task_run(&id_for_output).await {
         let output = &task_run.output_log;
         if !output.is_empty() {
             let tail = if output.len() > 5000 {
@@ -2143,18 +2132,11 @@ pub async fn create_ai_session(
     let task_run_id = uuid::Uuid::new_v4().to_string();
 
     // Create task run record using builder pattern
-    let db = state.app_state.checkpoint_db.clone();
-    let id_clone = task_run_id.clone();
-    let name_clone = req.task_name.clone();
-    tokio::task::spawn_blocking(move || {
-        let input = CreateTaskRunInput::new(id_clone, name_clone)
-            .with_prompt("Ad-hoc AI session")
-            .with_workflow_type("chat");
-        db.create_task_run(&input)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let input = CreateTaskRunInput::new(&task_run_id, &req.task_name)
+        .with_prompt("Ad-hoc AI session")
+        .with_workflow_type("chat");
+    state.app_state.pg_db.create_task_run(&input).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Get SessionManager and spawn a new session
     let session_manager: Arc<crate::claude_session::SessionManager> = state
@@ -2254,22 +2236,7 @@ pub async fn generate_workflow_from_session(
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Get output log from DB
-    let db = state.app_state.checkpoint_db.clone();
-    let id_clone = id.clone();
-    let output_log = tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Task failed: {}", e),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
-            )
-        })?
+    let output_log = state.app_state.pg_db.get_task_output(&id).await
         .unwrap_or_default();
 
     if output_log.is_empty() {
@@ -2321,6 +2288,7 @@ pub async fn generate_workflow_from_session(
         target_runner_port: None,
     };
 
+    // SQLite: complex function — AI-driven workflow generation + pipeline artifact storage
     let doctor_handle = state.doctor_handle.clone();
     let db2 = state.app_state.checkpoint_db.clone();
     let artifact_task_run_id = id.clone();
@@ -2371,14 +2339,8 @@ pub async fn generate_workflow_from_session(
                 "generated_workflow_id": &workflow.id,
                 "generated_workflow_name": &workflow.name,
             });
-            let db3 = state.app_state.checkpoint_db.clone();
-            let trid = id.clone();
             let rd_str = result_data.to_string();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || db3.update_task_run_result_data(&trid, &rd_str))
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()))
-            {
+            if let Err(e) = state.app_state.pg_db.update_task_result_data(&id, &rd_str).await {
                 tracing::warn!("Failed to update chat task run result_data: {}", e);
             }
         }
@@ -2405,23 +2367,8 @@ pub async fn rename_task_run(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'name' field".to_string()))?
         .to_string();
 
-    let db = state.app_state.checkpoint_db.clone();
-    let id_clone = id.clone();
-    let name_clone = new_name.clone();
-    tokio::task::spawn_blocking(move || db.update_task_run_name(&id_clone, &name_clone))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Task failed: {}", e),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("DB error: {}", e),
-            )
-        })?;
+    state.app_state.pg_db.update_task_name(&id, &new_name).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "success": true,

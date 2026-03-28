@@ -629,7 +629,6 @@ impl LoopController {
 
         // Track regression issue step results
         {
-            let db = self.checkpoint_db.clone();
             let step_results_clone: Vec<_> = verification_result.step_results.iter()
                 .filter_map(|sr| {
                     sr.step_id.as_ref()
@@ -637,31 +636,19 @@ impl LoopController {
                         .map(|issue_id| (issue_id.to_string(), sr.success))
                 })
                 .collect();
-            if !step_results_clone.is_empty() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    for (issue_id, success) in &step_results_clone {
-                        if let Err(e) = db.with_conn(|conn| {
-                            crate::known_issues::storage::increment_checked(conn, issue_id)?;
-                            if !*success {
-                                crate::known_issues::storage::increment_detected(conn, issue_id)?;
-                            } else {
-                                if let Err(e) =
-                                    crate::known_issues::storage::decay_confidence_on_pass(
-                                        conn, issue_id,
-                                    )
-                                {
-                                    tracing::debug!("Failed to decay confidence for {}: {}", issue_id, e);
-                                }
-                            }
-                            Ok::<(), String>(())
-                        }) {
-                            tracing::debug!(
-                                "Failed to update known issue tracking for {}: {}",
-                                issue_id, e
-                            );
-                        }
+            for (issue_id, success) in &step_results_clone {
+                if let Err(e) = self.app_state.pg_db.increment_known_issue_checked(issue_id).await {
+                    tracing::debug!("Failed to increment checked for {}: {}", issue_id, e);
+                }
+                if !*success {
+                    if let Err(e) = self.app_state.pg_db.increment_known_issue_detected(issue_id).await {
+                        tracing::debug!("Failed to increment detected for {}: {}", issue_id, e);
                     }
-                }).await;
+                } else {
+                    if let Err(e) = self.app_state.pg_db.decay_known_issue_confidence(issue_id).await {
+                        tracing::debug!("Failed to decay confidence for {}: {}", issue_id, e);
+                    }
+                }
             }
         }
 

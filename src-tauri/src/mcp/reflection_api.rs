@@ -376,6 +376,7 @@ pub async fn evaluate_fixes_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<EvaluateQuery>,
 ) -> Result<Json<ApiResponse<EvaluateResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — batch effectiveness evaluation with multi-query analysis
     let db = state.app_state.checkpoint_db.clone();
     let wf_name = query.workflow_name.clone();
     let results = tokio::task::spawn_blocking(move || {
@@ -550,6 +551,7 @@ pub async fn predict_fix_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PredictFixQuery>,
 ) -> Result<Json<ApiResponse<Option<PredictedFix>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — prediction model scoring with multi-table joins
     let db = state.app_state.checkpoint_db.clone();
     let sig = query.signature_hash.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -591,6 +593,7 @@ pub async fn convergence_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ConvergenceQuery>,
 ) -> Result<Json<ApiResponse<ConvergenceMetrics>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — convergence gradient computation over fix history
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let scope = query.scope.clone();
@@ -633,6 +636,7 @@ pub async fn change_velocity_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ChangeVelocityQuery>,
 ) -> Result<Json<ApiResponse<f64>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — change velocity computation over fix history
     let db = state.app_state.checkpoint_db.clone();
     let component = query.component.clone();
     let window = query.window;
@@ -678,6 +682,7 @@ pub async fn scored_knowledge_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ScoredKnowledgeQuery>,
 ) -> Result<Json<ApiResponse<Vec<ScoredKnowledge>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — relevance scoring with multi-table knowledge join
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let limit = query.limit;
@@ -750,6 +755,7 @@ pub async fn causal_chain_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalTraceQuery>,
 ) -> Result<Json<ApiResponse<CausalChain>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — recursive causal chain traversal (BFS/DFS)
     let db = state.app_state.checkpoint_db.clone();
     let event_type = query.event_type.clone();
     let event_id = query.event_id.clone();
@@ -788,6 +794,7 @@ pub async fn causal_events_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalWorkflowQuery>,
 ) -> Result<Json<ApiResponse<Vec<CausalEvent>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — causal event listing with workflow join
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let limit = query.limit;
@@ -818,6 +825,7 @@ pub async fn build_causal_links_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<BuildCausalLinksQuery>,
 ) -> Result<Json<ApiResponse<u32>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — automated causal link construction from task run data
     let db = state.app_state.checkpoint_db.clone();
     let trid = query.task_run_id.clone();
     let wf = query.workflow_name.clone();
@@ -853,6 +861,7 @@ pub async fn causal_summary_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalWorkflowQuery>,
 ) -> Result<Json<ApiResponse<CausalSummary>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — aggregate causal statistics with multi-table joins
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let summary = tokio::task::spawn_blocking(move || {
@@ -929,6 +938,7 @@ pub async fn effectiveness_trend_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<EffectivenessTrendQuery>,
 ) -> Result<Json<ApiResponse<EffectivenessOverTime>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — time-bucketed effectiveness rate aggregation
     let db = state.app_state.checkpoint_db.clone();
     let bucket_type = query.bucket.as_deref().unwrap_or("week").to_string();
     let time_range = query.time_range.clone();
@@ -965,6 +975,7 @@ pub async fn architecture_graph_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> Result<Json<ApiResponse<ComponentGraph>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — architecture component graph construction
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let graph = tokio::task::spawn_blocking(move || {
@@ -997,6 +1008,7 @@ pub async fn architecture_rebuild_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> Result<Json<ApiResponse<RebuildResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — rebuild architecture model from reflection data
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -1034,6 +1046,7 @@ pub async fn architecture_component_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ComponentQuery>,
 ) -> Result<Json<ApiResponse<ComponentDetails>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — component detail aggregation with fix history
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let path = query.path.clone();
@@ -1064,6 +1077,7 @@ pub async fn architecture_impact_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ImpactQuery>,
 ) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — BFS impact analysis (max 3 hops)
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let component = query.component.clone();
@@ -1092,6 +1106,7 @@ pub async fn architecture_impact_graph_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ImpactQuery>,
 ) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — graph-enhanced BFS impact analysis
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let component = query.component.clone();
@@ -1125,6 +1140,7 @@ pub async fn workflow_trends_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TrendsQuery>,
 ) -> Result<Json<ApiResponse<WorkflowTrends>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — workflow-level convergence trend computation
     let db = state.app_state.checkpoint_db.clone();
     let time_range = query.time_range.clone();
     let wf = query.workflow_name.clone();
@@ -1155,6 +1171,7 @@ pub async fn component_trend_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ComponentTrendQuery>,
 ) -> Result<Json<ApiResponse<ComponentTrend>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — per-component health trend computation
     let db = state.app_state.checkpoint_db.clone();
     let time_range = query.time_range.clone();
     let wf = query.workflow_name.clone();
@@ -1199,6 +1216,7 @@ pub async fn convergence_status_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ConvergenceStatusQuery>,
 ) -> Result<Json<ApiResponse<ConvergenceStatus>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // SQLite: complex function — convergence/stall analysis with recommendation generation
     let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let status = tokio::task::spawn_blocking(move || {

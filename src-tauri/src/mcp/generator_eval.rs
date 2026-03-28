@@ -6,6 +6,10 @@
 //! - Edit analysis from feedback data
 //! - Benchmark management and execution
 //! - Example library (ground truth) management
+//!
+//! NOTE: All spawn_blocking calls in this module wrap complex SQLite operations
+//! (pipeline artifacts, benchmarks, edit analysis, example workflows) that have
+//! no PG equivalents yet. They use `checkpoint_db` directly.
 
 use axum::{
     extract::{Path, Query, State},

@@ -295,16 +295,13 @@ async fn retrieve_knowledge(pg: &PgDb, query: &str, limit: i64) -> Vec<MemoryRes
     }
 }
 
-/// LIKE search on SQLite tables (findings, fixes, errors, rules, workflows, ui_elements).
-/// Wraps the existing `unified_search` function.
-fn retrieve_sqlite(
-    db: &CheckpointDb,
+/// LIKE search via PG unified_search (replaces SQLite retrieve_sqlite).
+async fn retrieve_pg_unified(
+    pg: &crate::database::pg::PgDb,
     query: &str,
     limit: usize,
 ) -> Vec<MemoryResult> {
-    match db.with_conn(|conn| {
-        crate::reflection::unified_search::unified_search(conn, query, limit)
-    }) {
+    match pg.unified_search(query, limit).await {
         Ok(results) => results
             .into_iter()
             .map(|r| {
@@ -325,14 +322,14 @@ fn retrieve_sqlite(
                     snippet: truncate_str(&r.snippet, 500),
                     source_score: r.relevance_score,
                     fused_score: 0.0,
-                    timestamp: None, // SQLite unified_search doesn't return timestamps
+                    timestamp: None,
                     memory_type: r.entity_type,
                     found_by: vec![RetrievalStrategy::CategoryMatch],
                 }
             })
             .collect(),
         Err(e) => {
-            warn!("Unified memory: SQLite retrieval failed: {}", e);
+            warn!("Unified memory: PG unified search failed: {}", e);
             Vec::new()
         }
     }
@@ -513,16 +510,12 @@ pub async fn query_memory(
         }
     };
 
-    // Clone Arc handles for spawn_blocking
-    let db_clone = db.clone();
+    // PG unified search replaces SQLite retrieve_sqlite
+    let pg_for_sqlite = pg.clone();
     let sqlite_limit = params.limit * 3;
     let sqlite_fut = async move {
         if want_sqlite {
-            tokio::task::spawn_blocking(move || {
-                retrieve_sqlite(&db_clone, &sqlite_query, sqlite_limit)
-            })
-            .await
-            .unwrap_or_default()
+            retrieve_pg_unified(&pg_for_sqlite, &sqlite_query, sqlite_limit).await
         } else {
             Vec::new()
         }

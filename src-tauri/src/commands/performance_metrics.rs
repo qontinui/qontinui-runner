@@ -231,6 +231,7 @@ pub async fn get_performance_dashboard(
         .map(|s| TimeRange::from_str(&s))
         .unwrap_or(TimeRange::SevenDays);
 
+    // SQLite: complex function — multi-query performance dashboard aggregation
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             let summary = aggregate_summary(conn, &config_id, &range)?;
@@ -277,6 +278,7 @@ pub async fn get_action_performance(
     let db = state.checkpoint_db.clone();
     let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
 
+    // SQLite: complex function — action performance aggregation
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| aggregate_action_performance(conn, &config_id, &range))
     })
@@ -297,6 +299,7 @@ pub async fn get_transition_reliability(
 ) -> Result<PerformanceMetricsResponse<Vec<StateTransitionMetrics>>, String> {
     let db = state.checkpoint_db.clone();
 
+    // SQLite: complex function — transition reliability metrics
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| get_transition_metrics(conn, &config_id))
     })
@@ -317,6 +320,7 @@ pub async fn get_element_resolution_metrics(
 ) -> Result<PerformanceMetricsResponse<Vec<ElementResolutionMetrics>>, String> {
     let db = state.checkpoint_db.clone();
 
+    // SQLite: complex function — element resolution metrics
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| get_element_metrics(conn, &config_id))
     })
@@ -339,6 +343,7 @@ pub async fn get_success_rate_trend(
     let db = state.checkpoint_db.clone();
     let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
 
+    // SQLite: complex function — success rate time-series aggregation
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| aggregate_success_rate_trend(conn, &config_id, &range))
     })

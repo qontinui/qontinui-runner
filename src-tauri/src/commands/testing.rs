@@ -1540,8 +1540,7 @@ pub async fn generate_test_with_ai(
         "ai_settings": provider_settings,
     });
 
-    // Execute in spawn_blocking to avoid blocking the main thread
-    // This prevents "Not Responding" on Windows during AI generation
+    // SQLite: complex function — Python bridge IPC for AI test generation (sync bridge call)
     let result = tokio::task::spawn_blocking(move || {
         if !is_default_bridge_running(&app_state) {
             return CommandResponse {
@@ -1926,16 +1925,23 @@ pub async fn get_workflow_run_context(
     task_run_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = state.checkpoint_db.clone();
-    let tid = task_run_id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        get_workflow_run_context_inner(tid, &db)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    Ok(result)
+    match state.pg_db.get_workflow_run_context_pg(&task_run_id).await {
+        Ok(Some(context)) => Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(context),
+        }),
+        Ok(None) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Task run not found: {}", task_run_id)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to get workflow run context: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 fn get_workflow_run_context_inner(

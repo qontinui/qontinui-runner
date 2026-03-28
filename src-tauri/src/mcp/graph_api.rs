@@ -94,7 +94,7 @@ pub(crate) async fn get_or_build_graph(
         }
     }
 
-    // Build fresh graph
+    // SQLite: complex function — KnowledgeGraph::build_from_db traverses multiple tables
     let db = state.app_state.checkpoint_db.clone();
     let wf = workflow_name.map(|s| s.to_string());
     let graph = tokio::task::spawn_blocking(move || {
@@ -261,6 +261,7 @@ async fn summary_handler(
     // version so other handlers benefit.
     // If no observations, use the cached graph directly.
     if has_observations || workflow_name.is_some() {
+        // SQLite: complex function — KnowledgeGraph build + observation enrichment
         let db = state.app_state.checkpoint_db.clone();
         let wf = workflow_name.clone();
         let (summary, maybe_graph) = tokio::task::spawn_blocking(move || {

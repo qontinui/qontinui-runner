@@ -422,9 +422,8 @@ async fn handle_relay_command(
         }
 
         "chat_list_running" => {
-            let db = api_state.app_state.checkpoint_db.clone();
-            match tokio::task::spawn_blocking(move || db.get_running_task_runs(None)).await {
-                Ok(Ok(runs)) => {
+            match api_state.app_state.pg_db.get_running_task_runs(None).await {
+                Ok(runs) => {
                     let run_list: Vec<Value> = runs
                         .iter()
                         .map(|r| {
@@ -511,20 +510,13 @@ async fn handle_relay_command(
                 .map(|s| s.to_string());
             let task_run_id = uuid::Uuid::new_v4().to_string();
 
-            // 1. Create task run record in DB (fast, synchronous)
-            let db = api_state.app_state.checkpoint_db.clone();
-            let id_clone = task_run_id.clone();
-            let name_clone = task_name.to_string();
-            let create_result = tokio::task::spawn_blocking(move || {
-                db.create_task_run(
-                    &crate::database::CreateTaskRunInput::new(id_clone, name_clone)
-                        .with_prompt("Remote AI session")
-                        .with_workflow_type("chat"),
-                )
-            })
-            .await;
+            // 1. Create task run record in DB
+            let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, task_name)
+                .with_prompt("Remote AI session")
+                .with_workflow_type("chat");
+            let create_result = api_state.app_state.pg_db.create_task_run(&create_input).await;
 
-            if create_result.is_err() || create_result.as_ref().unwrap().is_err() {
+            if create_result.is_err() {
                 return Some(serde_json::json!({
                     "type": "chat_created",
                     "error": "Failed to create task run"
@@ -698,12 +690,7 @@ async fn handle_relay_command(
             }
 
             // Update status in DB
-            let db = api_state.app_state.checkpoint_db.clone();
-            let id_clone = task_run_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                db.update_task_run_status(&id_clone, "stopped")
-            })
-            .await;
+            let _ = api_state.app_state.pg_db.update_task_run_status(&task_run_id, "stopped").await;
 
             Some(serde_json::json!({
                 "type": "chat_session_state",
@@ -739,16 +726,8 @@ async fn handle_relay_command(
             }
 
             // Get conversation from DB output_log
-            let db = api_state.app_state.checkpoint_db.clone();
-            let id_clone = task_run_id.clone();
-            let output_log = match tokio::task::spawn_blocking(move || {
-                db.get_task_run_output(&id_clone)
-            })
-            .await
-            {
-                Ok(Ok(log)) => log.unwrap_or_default(),
-                _ => String::new(),
-            };
+            let output_log = api_state.app_state.pg_db.get_task_output(&task_run_id).await
+                .unwrap_or_default();
 
             if output_log.is_empty() {
                 return Some(serde_json::json!({
@@ -793,6 +772,7 @@ async fn handle_relay_command(
                 target_runner_port: None,
             };
 
+            // SQLite: complex function — AI-driven workflow generation + pipeline artifact storage
             let doctor_handle = api_state.doctor_handle.clone();
             let db2 = api_state.app_state.checkpoint_db.clone();
             let trid = task_run_id.clone();
@@ -866,26 +846,13 @@ async fn handle_relay_command(
                 }));
             }
 
-            let db = api_state.app_state.checkpoint_db.clone();
-            let id_clone = task_run_id.clone();
-            match tokio::task::spawn_blocking(move || db.get_task_run_output(&id_clone)).await {
-                Ok(Ok(Some(output))) => Some(serde_json::json!({
-                    "type": "chat_output",
-                    "task_run_id": task_run_id,
-                    "output_log": output
-                })),
-                Ok(Ok(None)) => Some(serde_json::json!({
-                    "type": "chat_output",
-                    "task_run_id": task_run_id,
-                    "output_log": ""
-                })),
-                _ => Some(serde_json::json!({
-                    "type": "chat_output",
-                    "task_run_id": task_run_id,
-                    "output_log": "",
-                    "error": "Failed to retrieve output"
-                })),
-            }
+            let output = api_state.app_state.pg_db.get_task_output(&task_run_id).await
+                .unwrap_or_default();
+            Some(serde_json::json!({
+                "type": "chat_output",
+                "task_run_id": task_run_id,
+                "output_log": output
+            }))
         }
 
         "chat_rename" => {
@@ -908,16 +875,10 @@ async fn handle_relay_command(
                 }));
             }
 
-            let db = api_state.app_state.checkpoint_db.clone();
-            let id_clone = task_run_id.clone();
-            let name_clone = new_name.clone();
-            let rename_result = tokio::task::spawn_blocking(move || {
-                db.update_task_run_name(&id_clone, &name_clone)
-            })
-            .await;
+            let rename_result = api_state.app_state.pg_db.update_task_name(&task_run_id, &new_name).await;
 
             match rename_result {
-                Ok(Ok(())) => Some(serde_json::json!({
+                Ok(()) => Some(serde_json::json!({
                     "type": "chat_renamed",
                     "task_run_id": task_run_id,
                     "new_name": new_name

@@ -41,6 +41,7 @@ pub fn get_composite_score_trend(
 /// Manually trigger baseline recomputation.
 #[tauri::command]
 pub async fn recompute_agentic_baselines(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
+    // SQLite: complex function — baseline recomputation across all agentic scoring dimensions
     let db = state.checkpoint_db.clone();
     tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {

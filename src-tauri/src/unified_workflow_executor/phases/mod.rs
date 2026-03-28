@@ -891,20 +891,10 @@ async fn build_compressed_iteration_history(
                             None,
                             |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
                         );
-                    let _ = {
-                        let db_c = checkpoint_db.clone();
-                        let eid_c = execution_id.to_string();
-                        let evt_c = retrieval_event.clone();
-                        tokio::task::spawn_blocking(move || {
-                            db_c.with_conn(|conn| {
-                                crate::meta_optimizer::agentic_metrics::rag_judge::persist_retrieval_event(
-                                    conn,
-                                    &eid_c,
-                                    &evt_c,
-                                )
-                            })
-                        }).await
-                    };
+                    let _ = pg_db.persist_retrieval_event(
+                        execution_id,
+                        &retrieval_event,
+                    ).await;
                 }
                 results
                     .iter()

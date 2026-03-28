@@ -528,6 +528,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create error monitor config for later initialization
     let error_monitor_db = checkpoint_db.clone();
+    let error_monitor_pg = shared_app_state.pg_db.clone();
 
     // Secondary instances (spawned by InstanceManager) must NOT use single-instance
     // plugin — it would prevent them from starting since they share the same binary.
@@ -1580,7 +1581,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             tauri::async_runtime::spawn(async move {
                 // Start the error monitor service (this spawns the service loop internally)
                 let error_monitor_handle =
-                    start_error_monitor_async(error_monitor_db, error_monitor_config).await;
+                    start_error_monitor_async(error_monitor_db, error_monitor_pg, error_monitor_config).await;
 
                 // Store the handle
                 let mut handle_lock = app_state_for_error_monitor.error_monitor_handle.lock().await;

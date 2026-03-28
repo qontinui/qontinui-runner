@@ -791,7 +791,7 @@ pub async fn generate_unified_workflow_handler(
     let doctor_handle = state.doctor_handle.clone();
     let db = state.app_state.checkpoint_db.clone();
 
-    // Run the generation in a blocking task since it uses sync AI provider
+    // SQLite: complex function — workflow generation uses sync AI provider + RAG context from SQLite
     let result = tokio::task::spawn_blocking(move || {
         // Get DB connection for RAG examples + filtered schema context
         let gen_result = db.with_conn(|conn| {

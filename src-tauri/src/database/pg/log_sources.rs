@@ -204,6 +204,66 @@ impl PgDb {
         Ok(rows.iter().map(|r| Self::log_source_row_to_config(r)).collect())
     }
 
+    /// Delete a log source by name.
+    pub async fn delete_log_source_by_name(&self, name: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute("DELETE FROM log_sources WHERE name = $1", &[&name])
+            .await
+            .map_err(|e| format!("PG delete_log_source_by_name: {}", e))?;
+        Ok(())
+    }
+
+    /// Sync log sources: clear all and re-insert from provided list.
+    pub async fn sync_log_sources(&self, sources: &[LogSourceConfig]) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute("DELETE FROM log_sources", &[])
+            .await
+            .map_err(|e| format!("PG clear log_sources: {}", e))?;
+
+        for source in sources {
+            let error_patterns_json = source
+                .error_patterns
+                .as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_default());
+            let warning_patterns_json = source
+                .warning_patterns
+                .as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_default());
+            let ignore_patterns_json = source
+                .ignore_patterns
+                .as_ref()
+                .map(|p| serde_json::to_string(p).unwrap_or_default());
+            let poll_ms = source.poll_interval_ms as i32;
+
+            conn.execute(
+                r#"INSERT INTO log_sources (
+                    name, description, path, path_type, format, parser,
+                    timestamp_pattern, timezone, error_patterns, warning_patterns,
+                    ignore_patterns, enabled, poll_interval_ms
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
+                &[
+                    &source.name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.description as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.path as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.path_type.as_str() as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.format.as_str() as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.parser.as_str() as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.timestamp_pattern as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.timezone as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &error_patterns_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &warning_patterns_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &ignore_patterns_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &source.enabled as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &poll_ms as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG sync_log_sources insert: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     // -- helpers --
 
     fn log_source_row_to_config(row: &tokio_postgres::Row) -> LogSourceConfig {

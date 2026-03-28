@@ -132,4 +132,106 @@ impl PgDb {
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
+
+    /// Persist a RAG retrieval event as a task_run_event.
+    pub async fn persist_retrieval_event(
+        &self,
+        task_run_id: &str,
+        event: &crate::meta_optimizer::agentic_metrics::rag_judge::RetrievalEvent,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let id = format!("tre-{}", uuid::Uuid::new_v4());
+        let data_json = serde_json::to_string(event)
+            .map_err(|e| format!("Failed to serialize retrieval event: {}", e))?;
+
+        conn.execute(
+            r#"INSERT INTO task_run_events (id, task_run_id, event_type, event_subtype, data)
+               VALUES ($1, $2, 'retrieval', $3, $4)"#,
+            &[&id.as_str(), &task_run_id, &event.source_table.as_str(), &data_json.as_str()],
+        )
+        .await
+        .map_err(|e| format!("PG persist_retrieval_event: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Load retrieval events for a task run.
+    pub async fn load_retrieval_events(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<crate::meta_optimizer::agentic_metrics::rag_judge::RetrievalEvent>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT data FROM task_run_events
+                   WHERE task_run_id = $1 AND event_type = 'retrieval'
+                   ORDER BY timestamp ASC"#,
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG load_retrieval_events: {}", e))?;
+
+        let mut events = Vec::new();
+        for row in &rows {
+            let data_json: String = row.get(0);
+            if let Ok(event) = serde_json::from_str(&data_json) {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Persist agentic metric judge scores.
+    pub async fn persist_judge_scores(
+        &self,
+        task_run_id: &str,
+        results: &[crate::meta_optimizer::agentic_metrics::MetricResult],
+    ) -> Result<(), String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        for score in results {
+            let id = format!("ams-{}", uuid::Uuid::new_v4());
+            let is_llm_judged = score.is_llm_judged;
+            let score_val = score.score;
+            let confidence = score.confidence;
+            conn.execute(
+                r#"INSERT INTO agentic_metric_scores
+                   (id, task_run_id, metric_type, score, confidence,
+                    rationale, is_llm_judged, model_used, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                   ON CONFLICT (id) DO NOTHING"#,
+                &[
+                    &id.as_str(),
+                    &task_run_id,
+                    &score.metric.as_str(),
+                    &score_val,
+                    &confidence,
+                    &score.rationale as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &is_llm_judged,
+                    &score.model_used as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &now.as_str(),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG persist_judge_scores: {}", e))?;
+        }
+
+        Ok(())
+    }
 }

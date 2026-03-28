@@ -250,6 +250,7 @@ impl AgenticExecutor {
                 match execute_prompt_response_mode(
                     &modified_step,
                     &self.checkpoint_db,
+                    &self.app_state.pg_db,
                     Some(&config.execution_id),
                     doctor_handle,
                     step_model.clone(),
@@ -1232,6 +1233,7 @@ impl AgenticExecutor {
         let result = execute_prompt_response_mode(
             &step,
             &self.checkpoint_db,
+            &self.app_state.pg_db,
             None,
             None,
             model_override,

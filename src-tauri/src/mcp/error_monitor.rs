@@ -162,8 +162,7 @@ pub async fn generate_fix_workflow(
     Json<ApiResponse<crate::error_monitor::GeneratedWorkflow>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // Workflow generation uses the curator and generator which are deeply SQLite-integrated.
-    // Run on a blocking thread to avoid blocking the async runtime.
+    // SQLite: complex function — ErrorFixWorkflowGenerator uses curator+generator deeply tied to SQLite
     let db = state.app_state.checkpoint_db.clone();
     let task_run_id = request.task_run_id;
     let max_iterations = request.max_iterations.unwrap_or(10);

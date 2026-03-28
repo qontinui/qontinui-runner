@@ -54,6 +54,7 @@ pub async fn get_config_statistics(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<TieredInfoResponse<ConfigStatistics>, String> {
+    // SQLite: complex function — multi-table config statistics aggregation
     let db = state.checkpoint_db.clone();
     let cid = config_id.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -78,6 +79,7 @@ pub async fn get_flaky_transitions(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
+    // SQLite: complex function — flakiness analysis from run data
     let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
 
@@ -100,6 +102,7 @@ pub async fn get_flaky_templates(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
+    // SQLite: complex function — flakiness analysis from template match data
     let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
 
@@ -122,6 +125,7 @@ pub async fn get_debugging_context(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<DebuggingContext>, String> {
+    // SQLite: complex function — multi-source debugging context aggregation
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -143,6 +147,7 @@ pub async fn get_debugging_context_prompt(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<String>, String> {
+    // SQLite: complex function — debugging context + markdown formatting
     let db = state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -220,6 +225,7 @@ pub async fn get_recent_runs(
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
+    // SQLite: complex function — RunDetails aggregation with multi-table joins
     let db = state.checkpoint_db.clone();
     let limit = limit.unwrap_or(10);
     let cid = config_id.clone();
@@ -249,6 +255,7 @@ pub async fn get_failed_runs(
     config_id: String,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
+    // SQLite: complex function — failed run aggregation with error classification
     let db = state.checkpoint_db.clone();
     let limit = limit.unwrap_or(5);
 
@@ -459,6 +466,7 @@ pub async fn get_execution_options(
     transition_id: Option<String>,
     template_id: Option<String>,
 ) -> Result<TieredInfoResponse<ExecutionOptions>, String> {
+    // SQLite: complex function — FlakinessCache build + execution options lookup
     let db = state.checkpoint_db.clone();
     let cid = config_id.clone();
     let tid = transition_id.clone();
@@ -466,7 +474,6 @@ pub async fn get_execution_options(
 
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            // Default flakiness threshold (20% - items with 20-80% success rate)
             let threshold = 0.2;
             let cache = FlakinessCache::load(conn, &cid, threshold)?;
             let options = if let Some(tid) = tid {
@@ -516,6 +523,7 @@ pub async fn get_flakiness_summary(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<FlakinessSummary>, String> {
+    // SQLite: complex function — FlakinessCache build from run data
     let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
     let cid = config_id.clone();

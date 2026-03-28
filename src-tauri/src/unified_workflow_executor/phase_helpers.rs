@@ -17,7 +17,7 @@ use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 use crate::doctor::DoctorHandle;
-use crate::findings::storage as finding_storage;
+
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::types::MCP_API_PORT;
 use crate::commands::execution_reporting::LLMMetrics;
@@ -888,6 +888,7 @@ pub(super) struct PromptResponseResult {
 pub(super) async fn execute_prompt_response_mode(
     step: &ExecutionStepConfig,
     db: &std::sync::Arc<CheckpointDb>,
+    pg_db: &std::sync::Arc<PgDb>,
     task_run_id: Option<&str>,
     doctor_handle: Option<DoctorHandle>,
     model_override: Option<String>,
@@ -1005,7 +1006,7 @@ pub(super) async fn execute_prompt_response_mode(
     let findings = parse_findings_from_response(&output_text);
     if !findings.is_empty() {
         if let Some(task_id) = task_run_id {
-            store_parsed_findings(db, task_id, &findings).await;
+            store_parsed_findings(pg_db, task_id, &findings).await;
         } else {
             info!(
                 "Response mode: found {} findings but no task_run_id to store them",
@@ -1093,44 +1094,52 @@ pub(super) fn parse_findings_from_response(text: &str) -> Vec<ParsedFinding> {
     findings
 }
 
-/// Store parsed findings in the database for a given task run.
+/// Store parsed findings in the database for a given task run (PG).
 pub(super) async fn store_parsed_findings(
-    db: &std::sync::Arc<CheckpointDb>,
+    pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
     findings: &[ParsedFinding],
 ) {
-    let db_c = db.clone();
-    let task_run_id_c = task_run_id.to_string();
-    let findings_c: Vec<ParsedFinding> = findings.to_vec();
-    let _ = tokio::task::spawn_blocking(move || {
-        let conn = match db_c.connection() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    "Failed to get database connection for storing findings: {}",
-                    e
-                );
-                return;
-            }
-        };
+    for (idx, parsed) in findings.iter().enumerate() {
+        let session_num = (idx + 1) as i32;
+        let id = uuid::Uuid::new_v4().to_string();
+        let signature = format!(
+            "{}:{}:{}:{}",
+            task_run_id,
+            session_num,
+            parsed.category.as_str(),
+            parsed.title
+        );
+        use sha2::{Digest, Sha256};
+        let signature_hash = format!("{:x}", Sha256::digest(signature.as_bytes()));
 
-        for (idx, parsed) in findings_c.iter().enumerate() {
-            let session_num = (idx + 1) as u32;
-            match finding_storage::insert_finding(&conn, &task_run_id_c, session_num, parsed) {
-                Ok(finding) => {
-                    info!(
-                        "Response mode: stored finding [{}:{}] '{}'",
-                        finding.category.as_str(),
-                        finding.severity.as_str(),
-                        finding.title
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to store finding from response mode: {}", e);
-                }
+        match pg_db.insert_finding_pg(
+            &id,
+            task_run_id,
+            session_num,
+            &parsed.title,
+            &parsed.description,
+            parsed.category.as_str(),
+            parsed.severity.as_str(),
+            &signature_hash,
+            if parsed.is_resolved { "resolved" } else { "detected" },
+            parsed.is_resolved,
+            None, // evidence not available in ParsedFinding
+            None,
+        ).await {
+            Ok(()) => {
+                info!(
+                    "Response mode: stored finding [{}:{}] '{}'",
+                    parsed.category.as_str(),
+                    parsed.severity.as_str(),
+                    parsed.title
+                );
+            }
+            Err(e) => {
+                warn!("Failed to store finding from response mode: {}", e);
             }
         }
-    }).await;
+    }
 }
 
 // =============================================================================

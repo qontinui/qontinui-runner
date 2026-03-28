@@ -327,6 +327,7 @@ pub async fn generate_workflow_standalone(
     let db = app_state.checkpoint_db.clone();
     let db2 = db.clone();
 
+    // SQLite: complex function — AI-driven workflow generation + pipeline artifact storage
     let gen_result = tokio::task::spawn_blocking(move || {
         let gen_result = db.with_conn({
             let db_inner = db.clone();
@@ -427,23 +428,15 @@ pub async fn generate_workflow_standalone(
                         rollback_policy: workflow.rollback_policy.clone(),
                     };
 
-                    let save_result = tokio::task::spawn_blocking(move || {
-                        db2.create_unified_workflow(&create_req)
-                    })
-                    .await;
-
-                    match save_result {
-                        Ok(Ok(saved)) => {
+                    match app_state.pg_db.create_unified_workflow(&create_req).await {
+                        Ok(saved) => {
                             info!(
                                 "Saved standalone generated workflow '{}' (id={})",
                                 saved.name, saved.id
                             );
                         }
-                        Ok(Err(e)) => {
-                            warn!("Failed to save standalone generated workflow: {}", e);
-                        }
                         Err(e) => {
-                            warn!("spawn_blocking failed saving workflow: {}", e);
+                            warn!("Failed to save standalone generated workflow: {}", e);
                         }
                     }
                 }
