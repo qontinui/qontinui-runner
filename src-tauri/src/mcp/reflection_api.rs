@@ -52,8 +52,9 @@ pub async fn create_fix_handler(
 ) -> Result<Json<ApiResponse<ReflectionFix>>, (StatusCode, Json<ApiResponse<()>>)> {
     let fix = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::insert_fix(conn, &input))
+        .pg_db
+        .save_reflection_fix(&input)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -87,6 +88,7 @@ pub async fn list_fixes_handler(
         ));
     }
 
+    // NOTE: PG get_fixes_by_workflow_name lacks effectiveness filter; stays on SQLite
     let fixes = state
         .app_state
         .checkpoint_db
@@ -117,8 +119,9 @@ pub async fn get_fix_handler(
 ) -> Result<Json<ApiResponse<ReflectionFix>>, (StatusCode, Json<ApiResponse<()>>)> {
     let fix = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::get_fix(conn, &id))
+        .pg_db
+        .get_reflection_fix(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -145,8 +148,9 @@ pub async fn update_fix_status_handler(
 ) -> Result<Json<ApiResponse<ReflectionFix>>, (StatusCode, Json<ApiResponse<()>>)> {
     state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::update_fix_status(conn, &id, &req.status))
+        .pg_db
+        .update_fix_status(&id, &req.status)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -159,8 +163,9 @@ pub async fn update_fix_status_handler(
     // Return updated fix
     let fix = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::get_fix(conn, &id))
+        .pg_db
+        .get_reflection_fix(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -187,15 +192,13 @@ pub async fn update_fix_effectiveness_handler(
 ) -> Result<Json<ApiResponse<ReflectionFix>>, (StatusCode, Json<ApiResponse<()>>)> {
     state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            storage::update_fix_effectiveness(
-                conn,
-                &id,
-                &req.effectiveness,
-                req.effectiveness_evidence.as_deref(),
-            )
-        })
+        .pg_db
+        .update_fix_effectiveness(
+            &id,
+            &req.effectiveness,
+            req.effectiveness_evidence.as_deref(),
+        )
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -210,8 +213,9 @@ pub async fn update_fix_effectiveness_handler(
 
     let fix = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::get_fix(conn, &id))
+        .pg_db
+        .get_reflection_fix(&id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -237,8 +241,9 @@ pub async fn get_fixes_for_task_run_handler(
 ) -> Result<Json<ApiResponse<Vec<ReflectionFix>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let fixes = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| storage::get_fixes_for_source_run(conn, &task_run_id))
+        .pg_db
+        .get_fixes_for_source_run(&task_run_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -429,10 +434,9 @@ pub async fn already_tried_summary_handler(
 ) -> Result<Json<ApiResponse<AlreadyTriedResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let fixes = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            storage::get_fixes_by_workflow_name(conn, &query.workflow_name, None, None)
-        })
+        .pg_db
+        .get_fixes_by_workflow_name(&query.workflow_name, None)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

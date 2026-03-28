@@ -239,7 +239,7 @@ pub async fn get_learning_dashboard_data(
 
 /// Record a task outcome for learning (saves to database).
 #[tauri::command]
-pub fn record_task_outcome(
+pub async fn record_task_outcome(
     state: State<'_, Arc<AppState>>,
     outcome: TaskOutcome,
 ) -> Result<(), String> {
@@ -273,29 +273,29 @@ pub fn record_task_outcome(
         if outcome.metrics.is_empty() && outcome.decisions.is_empty() && outcome.tags.is_empty() {
             None
         } else {
-            serde_json::to_value(serde_json::json!({
+            Some(serde_json::json!({
                 "metrics": outcome.metrics,
                 "decisions": outcome.decisions,
                 "tags": outcome.tags,
-            }))
-            .ok()
+            }).to_string())
         };
 
-    state.checkpoint_db.record_learning_outcome(
+    let id = uuid::Uuid::new_v4().to_string();
+    let tools_json = if tools.is_empty() { None } else { Some(serde_json::json!(tools).to_string()) };
+    let agents_json = if agents.is_empty() { None } else { Some(serde_json::json!(agents).to_string()) };
+
+    state.pg_db.record_learning_outcome(
+        &id,
         &outcome.task_id,
         status,
         outcome.duration_secs.map(|d| d as f64),
-        outcome.iterations,
+        outcome.iterations.map(|i| i as i32),
         outcome.strategy.as_deref(),
-        if tools.is_empty() { None } else { Some(&tools) },
-        if agents.is_empty() {
-            None
-        } else {
-            Some(&agents)
-        },
+        tools_json.as_deref(),
+        agents_json.as_deref(),
         None, // error_type - not in TaskOutcome
         error_message.as_deref(),
-        feedback_json.as_ref(),
+        feedback_json.as_deref(),
         outcome.workflow_architecture.as_deref(),
         None,  // step_count
         None,  // verification_step_count
@@ -303,7 +303,10 @@ pub fn record_task_outcome(
         false, // has_ui_bridge
         None,  // total_tokens
         None,  // total_cost_usd
-    )?;
+        None,  // technology_tags
+        None,  // domain_tags
+        None,  // complexity_tier
+    ).await?;
 
     Ok(())
 }
@@ -368,23 +371,25 @@ pub fn clear_learning_data() -> Result<(), String> {
 
 /// Add sample learning data for demonstration/testing.
 #[tauri::command]
-pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     // Add successful outcomes
     for i in 0..10 {
-        let tools = vec!["grep".to_string(), "edit".to_string()];
+        let tools_json = serde_json::json!(["grep", "edit"]).to_string();
         let strategy = if i % 2 == 0 {
             "incremental"
         } else {
             "parallel"
         };
 
-        state.checkpoint_db.record_learning_outcome(
+        let id = uuid::Uuid::new_v4().to_string();
+        state.pg_db.record_learning_outcome(
+            &id,
             &format!("sample-task-{}", i),
             "success",
             Some(60.0 + (i * 10) as f64),
-            Some(3 + (i % 5) as u32),
+            Some(3 + (i % 5) as i32),
             Some(strategy),
-            Some(&tools),
+            Some(&tools_json),
             None,
             None,
             None,
@@ -396,20 +401,25 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             false, // has_ui_bridge
             None,  // total_tokens
             None,  // total_cost_usd
-        )?;
+            None,  // technology_tags
+            None,  // domain_tags
+            None,  // complexity_tier
+        ).await?;
     }
 
     // Add some failures
     for i in 0..3 {
-        let tools = vec!["grep".to_string()];
+        let tools_json = serde_json::json!(["grep"]).to_string();
 
-        state.checkpoint_db.record_learning_outcome(
+        let id = uuid::Uuid::new_v4().to_string();
+        state.pg_db.record_learning_outcome(
+            &id,
             &format!("sample-fail-{}", i),
             "failure",
             None,
             Some(8),
             Some("exhaustive"),
-            Some(&tools),
+            Some(&tools_json),
             None,
             Some("verification"),
             Some("Verification failed"),
@@ -421,7 +431,10 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
             false, // has_ui_bridge
             None,  // total_tokens
             None,  // total_cost_usd
-        )?;
+            None,  // technology_tags
+            None,  // domain_tags
+            None,  // complexity_tier
+        ).await?;
     }
 
     Ok(())
@@ -472,8 +485,9 @@ pub async fn get_learning_outcomes_paginated(
     limit: i64,
 ) -> Result<PaginatedResult<Vec<serde_json::Value>>, String> {
     let items = state
-        .checkpoint_db
-        .get_learning_outcomes_paginated(offset, limit)?;
+        .pg_db
+        .get_learning_outcomes_paginated(offset, limit)
+        .await?;
     let total = state.pg_db.get_learning_outcomes_count().await?;
     Ok(PaginatedResult {
         items,
@@ -485,14 +499,15 @@ pub async fn get_learning_outcomes_paginated(
 
 /// Get learning statistics for a date range.
 #[tauri::command]
-pub fn get_learning_stats_by_date_range(
+pub async fn get_learning_stats_by_date_range(
     state: State<'_, Arc<AppState>>,
     start: String,
     end: String,
 ) -> Result<serde_json::Value, String> {
     state
-        .checkpoint_db
+        .pg_db
         .get_learning_stats_by_date_range(&start, &end)
+        .await
 }
 
 /// Get total count of learning outcomes.
@@ -508,14 +523,15 @@ pub async fn get_learning_outcomes_count(state: State<'_, Arc<AppState>>) -> Res
 /// Get recent task runs with their learning outcomes.
 /// This combines task run data with learning outcome data for the dashboard.
 #[tauri::command]
-pub fn get_recent_tasks_with_outcomes(
+pub async fn get_recent_tasks_with_outcomes(
     state: State<'_, Arc<AppState>>,
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(10);
     state
-        .checkpoint_db
+        .pg_db
         .get_recent_task_runs_with_outcomes(limit)
+        .await
 }
 
 /// Get the current running task (if any).
@@ -547,10 +563,10 @@ pub async fn get_current_running_task(
 /// Get the most recent task that has checkpoints.
 /// Used for auto-selecting in the checkpoint browser.
 #[tauri::command]
-pub fn get_most_recent_task_with_checkpoints(
+pub async fn get_most_recent_task_with_checkpoints(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Option<String>, String> {
-    state.checkpoint_db.get_most_recent_task_with_checkpoints()
+    state.pg_db.get_most_recent_task_with_checkpoints().await
 }
 
 /// Get learning statistics summary for dashboard display.

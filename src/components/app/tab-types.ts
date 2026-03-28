@@ -86,7 +86,8 @@ export type MainTabId =
   | "product-tours"
   | "session-recap"
   | "api-surface"
-  | "decision-trail";
+  | "decision-trail"
+  | "memory-search";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
@@ -175,6 +176,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "session-recap",
   "api-surface",
   "decision-trail",
+  "memory-search",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";

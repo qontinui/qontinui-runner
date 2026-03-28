@@ -616,14 +616,7 @@ impl LoopController {
                 if let Err(e) = self.app_state.pg_db.append_task_output_ex(&config.execution_id, &verifier_output, false, false).await {
                     warn!("PG append_task_output_ex failed: {}", e);
                 }
-                if let Err(e) = self.checkpoint_db.append_task_output_ex(
-                    &config.execution_id,
-                    &verifier_output,
-                    false,
-                    false,
-                ) {
-                    warn!("Failed to append verifier output: {}", e);
-                }
+                // PG write already done above; SQLite fallback removed
 
                 Some((verdict, verifier_duration))
             } else {
@@ -1004,14 +997,7 @@ impl LoopController {
             if let Err(e) = self.app_state.pg_db.append_task_output_ex(&config.execution_id, "", true, false).await {
                 warn!("PG append_task_output_ex (session increment) failed: {}", e);
             }
-            if let Err(e) = self.checkpoint_db.append_task_output_ex(
-                &config.execution_id,
-                "",
-                true,  // increment_session
-                false, // check_completion_marker
-            ) {
-                warn!("Failed to increment session count: {}", e);
-            }
+            // PG write already done above; SQLite fallback removed
         }
     }
 

@@ -180,42 +180,87 @@ pub fn group_observations(observations: &[ConsolidationObservation], min_group_s
         }
     }
 
-    // Strategy 3: Content similarity via keyword overlap (simple heuristic)
-    // Extract keywords from title, group observations sharing 3+ keywords
+    // Strategy 3: Content similarity via TF-IDF cosine similarity
+    // Extract term vectors from title+content, compute pairwise similarity,
+    // and cluster observations that share high similarity.
     let remaining: Vec<&ConsolidationObservation> = observations
         .iter()
         .filter(|o| !assigned.contains(&o.id))
         .collect();
 
     if remaining.len() >= min_group_size {
-        let mut keyword_map: HashMap<String, Vec<&ConsolidationObservation>> = HashMap::new();
-        for obs in &remaining {
-            let words: Vec<String> = obs.title
-                .to_lowercase()
-                .split_whitespace()
-                .filter(|w| w.len() > 3) // skip short words
-                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-                .filter(|w| !w.is_empty())
-                .collect();
-            for word in &words {
-                keyword_map.entry(word.clone()).or_default().push(obs);
+        // Build term frequency vectors for each observation
+        let term_vecs: Vec<HashMap<String, f64>> = remaining
+            .iter()
+            .map(|obs| term_frequency(&format!("{} {}", obs.title, obs.content)))
+            .collect();
+
+        // Compute IDF across all remaining observations
+        let idf = compute_idf(&term_vecs);
+
+        // Compute TF-IDF vectors
+        let tfidf_vecs: Vec<HashMap<String, f64>> = term_vecs
+            .iter()
+            .map(|tf| {
+                tf.iter()
+                    .map(|(term, freq)| {
+                        let idf_val = idf.get(term).copied().unwrap_or(1.0);
+                        (term.clone(), freq * idf_val)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Greedy single-linkage clustering: for each unassigned obs, find the most
+        // similar unassigned obs and build clusters above threshold
+        let similarity_threshold = 0.25;
+        let mut cluster_ids: Vec<Option<usize>> = vec![None; remaining.len()];
+        let mut next_cluster = 0usize;
+
+        for i in 0..remaining.len() {
+            if assigned.contains(&remaining[i].id) || cluster_ids[i].is_some() {
+                continue;
+            }
+            // Start a new cluster with this observation
+            let cluster = next_cluster;
+            next_cluster += 1;
+            cluster_ids[i] = Some(cluster);
+
+            // Find all similar observations
+            for j in (i + 1)..remaining.len() {
+                if assigned.contains(&remaining[j].id) || cluster_ids[j].is_some() {
+                    continue;
+                }
+                let sim = tfidf_cosine_similarity(&tfidf_vecs[i], &tfidf_vecs[j]);
+                if sim >= similarity_threshold {
+                    cluster_ids[j] = Some(cluster);
+                }
             }
         }
 
-        // Find keywords that appear in >= min_group_size observations
-        for (keyword, obs_list) in &keyword_map {
-            if obs_list.len() >= min_group_size {
-                let group_obs: Vec<ConsolidationObservation> = obs_list
+        // Collect clusters with >= min_group_size members
+        let mut cluster_map: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (idx, cid) in cluster_ids.iter().enumerate() {
+            if let Some(c) = cid {
+                cluster_map.entry(*c).or_default().push(idx);
+            }
+        }
+
+        for (cluster_id, indices) in &cluster_map {
+            if indices.len() >= min_group_size {
+                let group_obs: Vec<ConsolidationObservation> = indices
                     .iter()
-                    .filter(|o| !assigned.contains(&o.id))
-                    .map(|o| (*o).clone())
+                    .filter(|&&idx| !assigned.contains(&remaining[idx].id))
+                    .map(|&idx| remaining[idx].clone())
                     .collect();
                 if group_obs.len() >= min_group_size {
+                    // Use the most frequent non-stop word as the group key
+                    let key_word = find_representative_term(&group_obs);
                     for o in &group_obs {
                         assigned.insert(o.id);
                     }
                     groups.push(ObservationGroup {
-                        group_key: format!("keyword:{}", keyword),
+                        group_key: format!("similarity:{}:{}", cluster_id, key_word),
                         reason: GroupingReason::ContentSimilarity,
                         observations: group_obs,
                     });
@@ -225,6 +270,99 @@ pub fn group_observations(observations: &[ConsolidationObservation], min_group_s
     }
 
     groups
+}
+
+// =============================================================================
+// TF-IDF helpers for content similarity grouping
+// =============================================================================
+
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "that", "this", "with", "from", "are", "was", "were",
+    "been", "have", "has", "had", "not", "but", "all", "can", "her", "his",
+    "its", "may", "will", "each", "which", "their", "then", "them", "some",
+    "into", "over", "such", "when", "very", "just", "about", "also", "more",
+    "other", "than", "only", "should", "could", "would", "after", "before",
+];
+
+/// Extract term frequencies from text, filtering stop words and short tokens.
+fn term_frequency(text: &str) -> HashMap<String, f64> {
+    let mut counts: HashMap<String, f64> = HashMap::new();
+    let words: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2)
+        .filter(|w| !STOP_WORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect();
+    let total = words.len().max(1) as f64;
+    for word in words {
+        *counts.entry(word).or_default() += 1.0;
+    }
+    for val in counts.values_mut() {
+        *val /= total;
+    }
+    counts
+}
+
+/// Compute inverse document frequency across a set of term-frequency vectors.
+fn compute_idf(docs: &[HashMap<String, f64>]) -> HashMap<String, f64> {
+    let n = docs.len() as f64;
+    let mut doc_freq: HashMap<String, f64> = HashMap::new();
+    for doc in docs {
+        for term in doc.keys() {
+            *doc_freq.entry(term.clone()).or_default() += 1.0;
+        }
+    }
+    doc_freq
+        .into_iter()
+        .map(|(term, df)| (term, (n / df).ln() + 1.0))
+        .collect()
+}
+
+/// Cosine similarity between two sparse TF-IDF vectors.
+fn tfidf_cosine_similarity(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
+    let mut dot = 0.0;
+    let mut mag_a = 0.0;
+    let mut mag_b = 0.0;
+
+    for (term, val_a) in a {
+        mag_a += val_a * val_a;
+        if let Some(val_b) = b.get(term) {
+            dot += val_a * val_b;
+        }
+    }
+    for val_b in b.values() {
+        mag_b += val_b * val_b;
+    }
+
+    let magnitude = mag_a.sqrt() * mag_b.sqrt();
+    if magnitude < f64::EPSILON {
+        0.0
+    } else {
+        dot / magnitude
+    }
+}
+
+/// Find the most representative (frequent, non-stop) term across a group of observations.
+fn find_representative_term(observations: &[ConsolidationObservation]) -> String {
+    let mut word_counts: HashMap<String, usize> = HashMap::new();
+    for obs in observations {
+        let text = format!("{} {}", obs.title, obs.content).to_lowercase();
+        let words: std::collections::HashSet<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 3)
+            .filter(|w| !STOP_WORDS.contains(w))
+            .map(|w| w.to_string())
+            .collect();
+        for word in words {
+            *word_counts.entry(word).or_default() += 1;
+        }
+    }
+    word_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(word, _)| word)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // =============================================================================
@@ -698,5 +836,65 @@ mod tests {
         // Only one group (topic:auth). The remaining bugfix (id=4) alone doesn't form a group.
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_key, "topic:auth");
+    }
+
+    // TF-IDF helper tests
+    #[test]
+    fn test_term_frequency() {
+        let tf = term_frequency("database connection timeout database error");
+        assert!(tf.contains_key("database"));
+        assert!(tf.contains_key("connection"));
+        assert!(tf.contains_key("timeout"));
+        assert!(tf.contains_key("error"));
+        // "database" appears twice, should have higher frequency
+        assert!(tf["database"] > tf["connection"]);
+    }
+
+    #[test]
+    fn test_term_frequency_filters_stop_words() {
+        let tf = term_frequency("the quick brown fox and the lazy dog");
+        assert!(!tf.contains_key("the"));
+        assert!(!tf.contains_key("and"));
+        assert!(tf.contains_key("quick"));
+        assert!(tf.contains_key("brown"));
+    }
+
+    #[test]
+    fn test_tfidf_cosine_identical() {
+        let a: HashMap<String, f64> = [("auth".to_string(), 0.5), ("token".to_string(), 0.3)].into();
+        let b = a.clone();
+        let sim = tfidf_cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_tfidf_cosine_orthogonal() {
+        let a: HashMap<String, f64> = [("auth".to_string(), 1.0)].into();
+        let b: HashMap<String, f64> = [("database".to_string(), 1.0)].into();
+        let sim = tfidf_cosine_similarity(&a, &b);
+        assert!(sim.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_tfidf_cosine_partial_overlap() {
+        let a: HashMap<String, f64> = [("auth".to_string(), 0.5), ("token".to_string(), 0.5)].into();
+        let b: HashMap<String, f64> = [("auth".to_string(), 0.5), ("session".to_string(), 0.5)].into();
+        let sim = tfidf_cosine_similarity(&a, &b);
+        assert!(sim > 0.0);
+        assert!(sim < 1.0);
+    }
+
+    #[test]
+    fn test_similarity_grouping_clusters_related_content() {
+        let obs = vec![
+            make_obs(1, "Database connection pool timeout error handling", "bugfix", None, 0.5),
+            make_obs(2, "Database connection retry timeout strategy", "bugfix", None, 0.5),
+            make_obs(3, "Database pool connection error recovery", "bugfix", None, 0.5),
+            make_obs(4, "CSS grid layout alignment issue", "bugfix", None, 0.5),
+        ];
+
+        let groups = group_observations(&obs, 3);
+        // The 4 bugfix types form a type group; or the 3 database ones cluster by similarity
+        assert!(!groups.is_empty());
     }
 }

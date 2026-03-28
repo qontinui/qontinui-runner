@@ -152,16 +152,24 @@ async fn retrieve_observations(pg: &PgDb, query: &str, limit: i64) -> Vec<Memory
             !mental_model_source_ids.contains(&r.id) && !mental_model_ids.contains(&r.id)
         })
         .map(|r| {
-            let score = r.rank.unwrap_or(0.0) / max_rank;
-            let ts = chrono::DateTime::parse_from_rfc3339(&r.created_at)
+            let fts_score = r.rank.unwrap_or(0.0) / max_rank;
+            let ts = chrono::DateTime::parse_from_rfc3339(&r.valid_from)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc));
+            // Apply temporal relevance: weight FTS score by recency/currency/supersession
+            let temporal = ts.map(|vf| {
+                let vu = r.valid_until.as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                crate::database::pg::observations::temporal_score(&vf, vu.as_ref(), r.superseded_by)
+            }).unwrap_or(1.0);
+            let score = (fts_score as f64) * temporal;
             MemoryResult {
                 id: r.id.to_string(),
                 source: MemorySource::Observation,
                 title: r.title,
                 snippet: truncate_str(&r.content_preview, 500),
-                source_score: score as f64,
+                source_score: score,
                 fused_score: 0.0,
                 timestamp: ts,
                 memory_type: r.observation_type,

@@ -717,13 +717,20 @@ async fn ui_bridge_request_inner(
     {
         let mut pending = state.ui_bridge_pending.lock().await;
         pending.insert(request_id.clone(), tx);
+        state
+            .ui_bridge_pending_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Emit request to React frontend
     if let Err(e) = state.app_handle.emit("ui-bridge-request", &event_payload) {
         // Clean up the pending entry
         let mut pending = state.ui_bridge_pending.lock().await;
-        pending.remove(&request_id);
+        if pending.remove(&request_id).is_some() {
+            state
+                .ui_bridge_pending_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Err(format!("Failed to emit UI Bridge request: {}", e));
     }
 
@@ -735,7 +742,11 @@ async fn ui_bridge_request_inner(
         Err(_) => {
             // Timeout - clean up the pending entry
             let mut pending = state.ui_bridge_pending.lock().await;
-            pending.remove(&request_id);
+            if pending.remove(&request_id).is_some() {
+                state
+                    .ui_bridge_pending_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Err(format!(
                 "UI Bridge request timed out after {}ms. Is the frontend running?",
                 get_ui_bridge_timeout_ms()
@@ -757,6 +768,7 @@ pub async fn handle_ui_bridge_response(
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
         >,
     >,
+    pending_count: Arc<std::sync::atomic::AtomicUsize>,
     response: serde_json::Value,
 ) {
     let request_id = response
@@ -767,6 +779,7 @@ pub async fn handle_ui_bridge_response(
     if let Some(request_id) = request_id {
         let mut pending_map = pending.lock().await;
         if let Some(sender) = pending_map.remove(&request_id) {
+            pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             // Extract the data portion of the response
             let data = response.get("data").cloned().unwrap_or(response.clone());
             if sender.send(data).is_err() {
@@ -946,30 +959,27 @@ pub async fn ui_bridge_execute_action_handler(
             Err(_) => (false, Some("transport error".to_string()), None),
         };
 
-        let db = state.app_state.checkpoint_db.clone();
+        let pg_db = state.app_state.pg_db.clone();
         let element_id = id.clone();
         let action_for_db = action_name.clone();
 
-        // Spawn blocking DB write — fire-and-forget, never blocks the response
-        tokio::task::spawn_blocking(move || {
-            match db.with_conn(|conn| {
-                crate::database::ui_bridge_ops::insert_ui_bridge_event(
-                    conn,
-                    Some(tr_id),
-                    seq,
-                    "action_executed",
-                    Some(&element_id),
-                    None,
-                    None,
-                    Some(&action_for_db),
-                    None,
-                    result_json.as_deref(),
-                    Some(duration_ms),
-                    success,
-                    error_msg.as_deref(),
-                    None,
-                )
-            }) {
+        // Async PG write — fire-and-forget, never blocks the response
+        tokio::spawn(async move {
+            match pg_db.insert_ui_bridge_event(
+                Some(tr_id),
+                seq,
+                "action_executed",
+                Some(&element_id),
+                None,
+                None,
+                Some(&action_for_db),
+                None,
+                result_json.as_deref(),
+                Some(duration_ms),
+                success,
+                error_msg.as_deref(),
+                None,
+            ).await {
                 Ok(row_id) => info!("UI Bridge event persisted: element={}, row_id={}", element_id, row_id),
                 Err(e) => warn!("UI Bridge event persist failed: {}", e),
             }
@@ -2087,6 +2097,9 @@ async fn direct_webview_evaluate_with_result(
     {
         let mut pending = state.ui_bridge_pending.lock().await;
         pending.insert(request_id.clone(), tx);
+        state
+            .ui_bridge_pending_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Build JS that evaluates the expression and POSTs the result back
@@ -2140,7 +2153,11 @@ async fn direct_webview_evaluate_with_result(
         Err(_) => {
             // Clean up pending request
             let mut pending = state.ui_bridge_pending.lock().await;
-            pending.remove(&request_id);
+            if pending.remove(&request_id).is_some() {
+                state
+                    .ui_bridge_pending_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Err("Direct eval timed out after 10s".to_string())
         }
     }
@@ -5339,11 +5356,18 @@ pub async fn ui_bridge_capture_element_images_handler(
     {
         let mut pending = state.ui_bridge_pending.lock().await;
         pending.insert(request_id.clone(), tx);
+        state
+            .ui_bridge_pending_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     if let Err(e) = state.app_handle.emit("ui-bridge-request", &event_payload) {
         let mut pending = state.ui_bridge_pending.lock().await;
-        pending.remove(&request_id);
+        if pending.remove(&request_id).is_some() {
+            state
+                .ui_bridge_pending_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to emit request: {}", e))),
@@ -5360,7 +5384,11 @@ pub async fn ui_bridge_capture_element_images_handler(
         )),
         Err(_) => {
             let mut pending = state.ui_bridge_pending.lock().await;
-            pending.remove(&request_id);
+            if pending.remove(&request_id).is_some() {
+                state
+                    .ui_bridge_pending_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             error!("UI Bridge API: Capture element images timed out after 120s");
             Err((
                 StatusCode::GATEWAY_TIMEOUT,
@@ -5594,7 +5622,9 @@ pub async fn ui_bridge_diagnostics_handler(
     let last_pong = state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
-    let pending_count = state.ui_bridge_pending.lock().await.len();
+    let pending_count = state
+        .ui_bridge_pending_count
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "circuitBreaker": {
@@ -5644,7 +5674,8 @@ pub async fn ui_bridge_ipc_response_handler(
     Json(response): Json<serde_json::Value>,
 ) -> Json<ApiResponse<serde_json::Value>> {
     let pending = state.ui_bridge_pending.clone();
-    handle_ui_bridge_response(pending, response).await;
+    let pending_count = state.ui_bridge_pending_count.clone();
+    handle_ui_bridge_response(pending, pending_count, response).await;
     // Also update pong timestamp since this proves the frontend is alive
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6407,16 +6438,12 @@ pub async fn analytics_decay_curve_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<DecayCurveQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::DecayCurveBucket>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let eid = q.element_id;
-    let wms = q.window_ms;
-    let nw = q.windows;
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_element_decay_curve(c, &eid, wms, nw))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_element_decay_curve(&q.element_id, q.window_ms, q.windows)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6425,14 +6452,13 @@ pub async fn analytics_action_baselines_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ActionBaseline>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_action_latency_baselines(c, since))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_action_latency_baselines(since)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6441,15 +6467,13 @@ pub async fn analytics_failure_taxonomy_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::FailureCluster>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
-    let limit = q.limit;
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_failure_taxonomy(c, since, limit))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_failure_taxonomy(since, q.limit)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6458,14 +6482,13 @@ pub async fn analytics_fragility_heatmap_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementFragility>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_element_fragility_by_region(c, since))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_element_fragility_by_region(since)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6474,15 +6497,13 @@ pub async fn analytics_regressions_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AutomationRegression>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
-    let limit = q.limit;
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_automation_regressions(c, since, limit))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_automation_regressions(since, q.limit)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6491,14 +6512,13 @@ pub async fn analytics_stall_frequency_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::StallFrequency>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let since = format!("datetime('now', '{}')", days_to_sqlite_datetime(q.days));
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_stall_frequency(c, &since))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    let since = (chrono::Utc::now() - chrono::Duration::days(q.days as i64)).to_rfc3339();
+    match state.app_state.pg_db
+        .get_stall_frequency(&since)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6507,14 +6527,13 @@ pub async fn analytics_intervention_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::InterventionStats>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let since = format!("datetime('now', '{}')", days_to_sqlite_datetime(q.days));
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_intervention_effectiveness(c, &since))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    let since = (chrono::Utc::now() - chrono::Duration::days(q.days as i64)).to_rfc3339();
+    match state.app_state.pg_db
+        .get_intervention_effectiveness(&since)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6528,14 +6547,12 @@ pub async fn analytics_state_coverage_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<StateCoverageQuery>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let tr = q.task_run_id;
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_state_coverage(c, tr))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_state_coverage(q.task_run_id)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6551,14 +6568,12 @@ pub async fn analytics_annotation_gaps_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnnotationGapQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AnnotationGap>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let min = q.min_interactions;
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::get_unannotated_high_interaction_elements(c, min))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
+    match state.app_state.pg_db
+        .get_unannotated_high_interaction_elements(q.min_interactions)
+        .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -6567,6 +6582,7 @@ pub async fn analytics_health_score_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<crate::database::ui_bridge_ops::AutomationHealthScore>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // NOTE: No PG equivalent for compute_automation_health_score; stays on SQLite
     let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
     match tokio::task::spawn_blocking(move || {
@@ -6583,6 +6599,7 @@ pub async fn analytics_recommendations_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::Recommendation>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // NOTE: No PG equivalent for generate_recommendations; stays on SQLite
     let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
     match tokio::task::spawn_blocking(move || {
@@ -6655,25 +6672,14 @@ pub async fn ui_bridge_history_elements_handler(
     Query(query): Query<HistoryElementsQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let db = state.app_state.checkpoint_db.clone();
-    let task_run_id = query.task_run_id;
-
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::database::ui_bridge_ops::get_element_interactions(conn, task_run_id)
-        })
-    })
-    .await
+    match state.app_state.pg_db
+        .get_element_interactions(query.task_run_id)
+        .await
     {
-        Ok(Ok(events)) => Ok(Json(ApiResponse::success(events))),
-        Ok(Err(e)) => {
+        Ok(events) => Ok(Json(ApiResponse::success(events))),
+        Err(e) => {
             error!("UI Bridge history: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-        Err(e) => {
-            let msg = format!("UI Bridge history task failed: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
         }
     }
 }
@@ -6696,23 +6702,14 @@ pub async fn ui_bridge_history_element_handler(
     Query(query): Query<HistoryElementQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let db = state.app_state.checkpoint_db.clone();
-    let limit = query.limit;
-
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::database::ui_bridge_ops::get_element_history(conn, &id, limit))
-    })
-    .await
+    match state.app_state.pg_db
+        .get_element_history(&id, query.limit)
+        .await
     {
-        Ok(Ok(events)) => Ok(Json(ApiResponse::success(events))),
-        Ok(Err(e)) => {
+        Ok(events) => Ok(Json(ApiResponse::success(events))),
+        Err(e) => {
             error!("UI Bridge element history: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-        Err(e) => {
-            let msg = format!("UI Bridge element history task failed: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
         }
     }
 }
@@ -6742,24 +6739,14 @@ pub async fn ui_bridge_history_flaky_handler(
     Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementReliability>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let db = state.app_state.checkpoint_db.clone();
-    let min = query.min_interactions;
-    let max_rate = query.max_success_rate;
-
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::database::ui_bridge_ops::get_flaky_elements(conn, min, max_rate))
-    })
-    .await
+    match state.app_state.pg_db
+        .get_flaky_elements(query.min_interactions, query.max_success_rate)
+        .await
     {
-        Ok(Ok(elements)) => Ok(Json(ApiResponse::success(elements))),
-        Ok(Err(e)) => {
+        Ok(elements) => Ok(Json(ApiResponse::success(elements))),
+        Err(e) => {
             error!("UI Bridge flaky elements: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-        Err(e) => {
-            let msg = format!("UI Bridge flaky elements task failed: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
         }
     }
 }
@@ -6778,25 +6765,14 @@ pub async fn ui_bridge_element_reliability_handler(
     Json<ApiResponse<Option<crate::database::ui_bridge_ops::ElementReliability>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let db = state.app_state.checkpoint_db.clone();
-    let element_id = query.element_id;
-
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::database::ui_bridge_ops::get_element_reliability(conn, &element_id)
-        })
-    })
-    .await
+    match state.app_state.pg_db
+        .get_element_reliability(&query.element_id)
+        .await
     {
-        Ok(Ok(reliability)) => Ok(Json(ApiResponse::success(reliability))),
-        Ok(Err(e)) => {
+        Ok(reliability) => Ok(Json(ApiResponse::success(reliability))),
+        Err(e) => {
             error!("UI Bridge element reliability: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-        Err(e) => {
-            let msg = format!("UI Bridge element reliability task failed: {}", e);
-            error!("{}", msg);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(msg))))
         }
     }
 }

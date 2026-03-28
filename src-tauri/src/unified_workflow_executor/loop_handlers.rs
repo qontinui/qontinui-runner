@@ -1956,8 +1956,6 @@ impl LoopController {
                 };
                 if let Err(e) = self.app_state.pg_db.create_task_run_event(&findings_event).await {
                     warn!("Failed to store agentic findings event (PG): {}", e);
-                } else if let Err(e) = self.checkpoint_db.create_task_run_event(&findings_event) {
-                    warn!("Failed to store agentic findings event: {}", e);
                 }
             }
         }

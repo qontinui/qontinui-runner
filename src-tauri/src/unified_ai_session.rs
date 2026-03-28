@@ -790,17 +790,7 @@ impl UnifiedAiSessionExecutor {
                             }
                         });
                     }
-                    if let Err(e) = self.app_state.checkpoint_db.append_task_output_ex(
-                        &task_run_id,
-                        &formatted,
-                        false,
-                        false,
-                    ) {
-                        warn!(
-                            "Failed to persist {} AI output to chunks: {}",
-                            phase_label, e
-                        );
-                    }
+                    // PG write already done above via tokio::spawn; SQLite fallback removed
                 }
 
                 AiSessionResult {
@@ -926,9 +916,7 @@ impl UnifiedAiSessionExecutor {
                 }
             });
         }
-        if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event) {
-            warn!("Failed to save AI output event to database: {}", e);
-        }
+        // PG write already done above via tokio::spawn; SQLite fallback removed
     }
 
     /// Build a session ID based on the configuration.

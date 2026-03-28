@@ -903,4 +903,100 @@ impl PgDb {
             failed_count,
         })
     }
+
+    /// Pause a running task run, setting it to 'paused'.
+    pub async fn pause_task_run(&self, id: &str) -> Result<bool, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .execute(
+                "UPDATE task_runs SET status = 'paused', updated_at = NOW() WHERE id = $1 AND status = 'running'",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG pause_task_run: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    /// Unpause a paused task run, setting it back to 'running'.
+    pub async fn unpause_task_run(&self, id: &str) -> Result<bool, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .execute(
+                "UPDATE task_runs SET status = 'running', updated_at = NOW() WHERE id = $1 AND status = 'paused'",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG unpause_task_run: {}", e))?;
+        Ok(rows > 0)
+    }
+
+    /// Get recent task runs with their learning outcomes joined.
+    pub async fn get_recent_task_runs_with_outcomes(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = limit as i64;
+
+        let rows = conn
+            .query(
+                r#"SELECT
+                    t.id, t.task_name, t.prompt, t.task_type, t.status,
+                    t.sessions_count, t.max_sessions, t.error_message,
+                    COALESCE(t.summary, t.ai_summary) as summary,
+                    t.goal_achieved, t.remaining_work,
+                    t.created_at, t.updated_at, t.completed_at,
+                    l.id as outcome_id, l.status as outcome_status,
+                    l.duration_secs, l.iterations, l.strategy,
+                    l.tools_used, l.files_modified, l.error_type,
+                    l.error_message as outcome_error,
+                    l.feedback, l.created_at as outcome_created_at
+                FROM task_runs t
+                LEFT JOIN learning_outcomes l ON t.id = l.task_id
+                ORDER BY t.updated_at DESC
+                LIMIT $1"#,
+                &[&limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG get_recent_task_runs_with_outcomes: {}", e))?;
+
+        let results = rows
+            .iter()
+            .map(|r| {
+                let created: chrono::DateTime<chrono::Utc> = r.get(11);
+                let updated: chrono::DateTime<chrono::Utc> = r.get(12);
+                let completed: Option<chrono::DateTime<chrono::Utc>> = r.get(13);
+                let outcome_created: Option<chrono::DateTime<chrono::Utc>> = r.get(24);
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "task_name": r.get::<_, String>(1),
+                    "prompt": r.get::<_, Option<String>>(2),
+                    "task_type": r.get::<_, String>(3),
+                    "status": r.get::<_, String>(4),
+                    "sessions_count": r.get::<_, i32>(5),
+                    "max_sessions": r.get::<_, i32>(6),
+                    "error_message": r.get::<_, Option<String>>(7),
+                    "summary": r.get::<_, Option<String>>(8),
+                    "goal_achieved": r.get::<_, Option<bool>>(9),
+                    "remaining_work": r.get::<_, Option<String>>(10),
+                    "created_at": created.to_rfc3339(),
+                    "updated_at": updated.to_rfc3339(),
+                    "completed_at": completed.map(|dt| dt.to_rfc3339()),
+                    "outcome_id": r.get::<_, Option<String>>(14),
+                    "outcome_status": r.get::<_, Option<String>>(15),
+                    "duration_secs": r.get::<_, Option<f64>>(16),
+                    "iterations": r.get::<_, Option<i32>>(17),
+                    "strategy": r.get::<_, Option<String>>(18),
+                    "tools_used": r.get::<_, Option<String>>(19),
+                    "files_modified": r.get::<_, Option<String>>(20),
+                    "error_type": r.get::<_, Option<String>>(21),
+                    "outcome_error": r.get::<_, Option<String>>(22),
+                    "feedback": r.get::<_, Option<String>>(23),
+                    "outcome_created_at": outcome_created.map(|dt| dt.to_rfc3339()),
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
 }

@@ -509,8 +509,10 @@ impl PgDb {
             "CREATE INDEX IF NOT EXISTS idx_obs_valid_from ON observations(valid_from) WHERE NOT is_deleted",
             "CREATE INDEX IF NOT EXISTS idx_obs_valid_until ON observations(valid_until) WHERE NOT is_deleted",
             "CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_by) WHERE superseded_by IS NOT NULL",
-            // Backfill valid_from from created_at for existing rows
-            "UPDATE observations SET valid_from = created_at WHERE valid_from = NOW() AND created_at < NOW() - INTERVAL '1 second'",
+            // Backfill valid_from from created_at for existing rows that were
+            // created before the column was added (valid_from ≈ updated_at means
+            // it was set by DEFAULT NOW() during ALTER TABLE, not explicitly).
+            "UPDATE observations SET valid_from = created_at WHERE valid_from = updated_at AND created_at < updated_at - INTERVAL '1 second'",
             // Observation History table
             "CREATE TABLE IF NOT EXISTS observation_history (
                 id              BIGSERIAL PRIMARY KEY,
@@ -525,6 +527,29 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_obs_history_obs_id ON observation_history(observation_id)",
             "CREATE INDEX IF NOT EXISTS idx_obs_history_valid ON observation_history(valid_from, valid_until)",
+            // Memory consolidation columns on observations (idempotent ALTERs)
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS importance DOUBLE PRECISION NOT NULL DEFAULT 0.5",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS access_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS decay_rate DOUBLE PRECISION NOT NULL DEFAULT 0.1",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS consolidated_from BIGINT[]",
+            "ALTER TABLE observations ADD COLUMN IF NOT EXISTS is_mental_model BOOLEAN NOT NULL DEFAULT false",
+            "CREATE INDEX IF NOT EXISTS idx_obs_importance ON observations(importance) WHERE NOT is_deleted",
+            "CREATE INDEX IF NOT EXISTS idx_obs_mental_model ON observations(is_mental_model) WHERE NOT is_deleted AND is_mental_model",
+            "CREATE INDEX IF NOT EXISTS idx_obs_last_accessed ON observations(last_accessed_at) WHERE NOT is_deleted",
+            // Memory consolidation log
+            "CREATE TABLE IF NOT EXISTS memory_consolidation_log (
+                id                      BIGSERIAL PRIMARY KEY,
+                started_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at            TIMESTAMPTZ,
+                observations_scanned    INTEGER NOT NULL DEFAULT 0,
+                groups_found            INTEGER NOT NULL DEFAULT 0,
+                models_created          INTEGER NOT NULL DEFAULT 0,
+                observations_merged     INTEGER NOT NULL DEFAULT 0,
+                observations_decayed    INTEGER NOT NULL DEFAULT 0,
+                observations_archived   INTEGER NOT NULL DEFAULT 0,
+                error                   TEXT
+            )",
             // Generation Rules
             "CREATE TABLE IF NOT EXISTS generation_rules (
                 id              TEXT PRIMARY KEY,

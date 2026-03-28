@@ -408,4 +408,83 @@ impl PgDb {
 
         Ok(affected > 0)
     }
+
+    /// Get checkpoints with pagination.
+    pub async fn get_checkpoints_paginated(
+        &self,
+        task_id: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = if let Some(tid) = task_id {
+            conn.query(
+                r#"SELECT id, task_id, iteration, trigger, state, name, created_at
+                FROM orchestrator_checkpoints
+                WHERE task_id = $1
+                ORDER BY iteration ASC
+                LIMIT $2 OFFSET $3"#,
+                &[&tid, &limit, &offset],
+            )
+            .await
+        } else {
+            conn.query(
+                r#"SELECT id, task_id, iteration, trigger, state, name, created_at
+                FROM orchestrator_checkpoints
+                ORDER BY created_at DESC
+                LIMIT $1 OFFSET $2"#,
+                &[&limit, &offset],
+            )
+            .await
+        }
+        .map_err(|e| format!("PG get_checkpoints_paginated: {}", e))?;
+
+        let results = rows
+            .iter()
+            .map(|r| {
+                let state_str: Option<String> = r.get(4);
+                let state_val = state_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                let created: chrono::DateTime<chrono::Utc> = r.get(6);
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "task_id": r.get::<_, String>(1),
+                    "iteration": r.get::<_, i64>(2),
+                    "trigger": r.get::<_, String>(3),
+                    "state": state_val,
+                    "name": r.get::<_, Option<String>>(5),
+                    "created_at": created.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get total count of checkpoints (for pagination).
+    pub async fn get_checkpoints_count(&self, task_id: Option<&str>) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let count: i64 = if let Some(tid) = task_id {
+            let row = conn
+                .query_one(
+                    "SELECT COUNT(*) FROM orchestrator_checkpoints WHERE task_id = $1",
+                    &[&tid],
+                )
+                .await
+                .map_err(|e| format!("PG get_checkpoints_count: {}", e))?;
+            row.get(0)
+        } else {
+            let row = conn
+                .query_one(
+                    "SELECT COUNT(*) FROM orchestrator_checkpoints",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("PG get_checkpoints_count: {}", e))?;
+            row.get(0)
+        };
+
+        Ok(count)
+    }
 }

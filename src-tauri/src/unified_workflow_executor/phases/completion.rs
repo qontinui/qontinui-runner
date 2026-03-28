@@ -483,12 +483,12 @@ impl CompletionExecutor {
                                 if let Err(e) = self.app_state.pg_db.append_task_output_ex(execution_id, &formatted, false, false).await {
                                     warn!("PG append_task_output_ex failed: {}", e);
                                 }
-                                if let Err(e) = self.checkpoint_db.append_task_output_ex(
+                                if let Err(e) = self.app_state.pg_db.append_task_output_ex(
                                     execution_id,
                                     &formatted,
                                     false,
                                     false,
-                                ) {
+                                ).await {
                                     warn!("Failed to persist completion response-mode AI output to chunks: {}", e);
                                 }
                             }
@@ -890,20 +890,20 @@ impl CompletionExecutor {
         }
 
         // Fetch and include accumulated output_log (from agentic phases)
-        // PG-primary: try PG first (different method name), fall back to SQLite
-        let output_result: Result<String, String> = // Note: must use tokio::runtime::Handle since build_prior_phase_context is sync
+        // PG-primary via block_on since build_prior_phase_context is sync
+        let output_result: Result<String, String> =
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let pg = self.app_state.pg_db.clone();
             let id = execution_id.to_string();
             let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { self.app_state.pg_db.get_task_output(&id).await })
+                handle.block_on(async move { pg.get_task_output(&id).await })
             }));
             match pg_res {
-                Ok(Ok(output)) => Ok(output),
-                _ => self.checkpoint_db.get_full_task_output(execution_id),
+                Ok(r) => r,
+                Err(_) => Err("block_on panicked".to_string()),
             }
         } else {
-            self.checkpoint_db.get_full_task_output(execution_id)
+            Err("No tokio runtime available".to_string())
         };
         match output_result {
             Ok(output) if !output.is_empty() => {
@@ -936,14 +936,14 @@ impl CompletionExecutor {
             let pg = self.app_state.pg_db.clone();
             let id = execution_id.to_string();
             let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { self.app_state.pg_db.get_findings_for_task(&id).await })
+                handle.block_on(async move { pg.get_findings_for_task(&id).await })
             }));
             match pg_res {
                 Ok(r) => r,
-                _ => self.checkpoint_db.get_findings_for_task(execution_id),
+                Err(_) => Err("block_on panicked".to_string()),
             }
         } else {
-            self.checkpoint_db.get_findings_for_task(execution_id)
+            Err("No tokio runtime available".to_string())
         };
         match findings_result {
             Ok(findings) if !findings.is_empty() => {

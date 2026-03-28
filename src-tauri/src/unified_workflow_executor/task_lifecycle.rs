@@ -19,8 +19,8 @@ impl LoopController {
         if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
             warn!("PG complete_task_run failed: {}", e);
         }
-        if let Err(e) = self.checkpoint_db.complete_task_run(execution_id) {
-            error!("Failed to mark task {} as completed: {}", execution_id, e);
+        if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
+            error!("Failed to mark task {} as completed (PG): {}", execution_id, e);
         } else {
             info!("Marked task {} as COMPLETED", execution_id);
             // Broadcast task-run-update to both Tauri + WebSocket
@@ -193,8 +193,8 @@ impl LoopController {
         if let Err(e) = self.app_state.pg_db.fail_task_run(execution_id, reason).await {
             warn!("PG fail_task_run failed: {}", e);
         }
-        if let Err(e) = self.checkpoint_db.fail_task_run(execution_id, reason) {
-            error!("Failed to mark task {} as failed: {}", execution_id, e);
+        if let Err(e) = self.app_state.pg_db.fail_task_run(execution_id, reason).await {
+            error!("Failed to mark task {} as failed (PG): {}", execution_id, e);
         } else {
             info!("Marked task {} as FAILED: {}", execution_id, reason);
             // Broadcast task-run-update to both Tauri + WebSocket

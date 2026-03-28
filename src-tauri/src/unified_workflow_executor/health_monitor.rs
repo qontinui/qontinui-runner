@@ -551,10 +551,7 @@ pub fn detect_regression(
         };
         match pg_result {
             Some(v) => v,
-            None => match checkpoint_db.get_verification_phase_result(execution_id, prev_iter) {
-                Ok(Some(val)) => Some(val),
-                _ => None,
-            },
+            None => None,
         }
     };
     let prev_result = match prev_result {
@@ -673,9 +670,9 @@ pub fn build_resume_agentic_context(
         }))
         .ok()
         .and_then(|r| r.ok())
-        .unwrap_or_else(|| checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten())
+        .unwrap_or(None)
     } else {
-        checkpoint_db.get_verification_phase_result(execution_id, iteration).ok().flatten()
+        None
     };
     if let Some(result_json) = phase_result {
         // Try to deserialize into VerificationPhaseResult and use build_failure_context()

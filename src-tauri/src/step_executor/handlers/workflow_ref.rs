@@ -178,9 +178,7 @@ impl StepHandler for WorkflowRefHandler {
         if let Err(e) = context.app_state.pg_db.create_task_run(&input).await {
             warn!("PG create_task_run for workflow_ref failed: {}", e);
         }
-        if let Err(e) = context.app_state.checkpoint_db.create_task_run(&input) {
-            warn!("Failed to create task_run for workflow_ref: {}", e);
-        }
+        // PG write already done above; SQLite fallback removed
 
         // 8. Build LoopConfig with model inheritance
         let (provider_override, model_override, model_overrides) = if inherit_model_overrides {

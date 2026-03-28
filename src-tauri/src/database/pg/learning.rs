@@ -298,4 +298,142 @@ impl PgDb {
             "avg_cost_usd": row.avg_cost,
         }))
     }
+
+    /// Get learning outcomes with pagination.
+    pub async fn get_learning_outcomes_paginated(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
+                       tools_used, files_modified, error_type, error_message, feedback, created_at,
+                       workflow_architecture, step_count, verification_step_count,
+                       agentic_step_count, has_ui_bridge,
+                       total_tokens, total_cost_usd, composite_agentic_score,
+                       technology_tags, domain_tags, complexity_tier
+                FROM learning_outcomes
+                ORDER BY created_at DESC
+                LIMIT $1 OFFSET $2"#,
+                &[&limit, &offset],
+            )
+            .await
+            .map_err(|e| format!("PG get_learning_outcomes_paginated: {}", e))?;
+
+        let results = rows
+            .iter()
+            .map(|r| {
+                let created: chrono::DateTime<chrono::Utc> = r.get(11);
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "task_id": r.get::<_, String>(1),
+                    "status": r.get::<_, String>(2),
+                    "duration_secs": r.get::<_, Option<f64>>(3),
+                    "iterations": r.get::<_, Option<i32>>(4),
+                    "strategy": r.get::<_, Option<String>>(5),
+                    "tools_used": r.get::<_, Option<String>>(6),
+                    "files_modified": r.get::<_, Option<String>>(7),
+                    "error_type": r.get::<_, Option<String>>(8),
+                    "error_message": r.get::<_, Option<String>>(9),
+                    "feedback": r.get::<_, Option<String>>(10),
+                    "created_at": created.to_rfc3339(),
+                    "workflow_architecture": r.get::<_, Option<String>>(12),
+                    "step_count": r.get::<_, Option<i64>>(13),
+                    "verification_step_count": r.get::<_, Option<i64>>(14),
+                    "agentic_step_count": r.get::<_, Option<i64>>(15),
+                    "has_ui_bridge": r.get::<_, Option<bool>>(16),
+                    "total_tokens": r.get::<_, Option<i64>>(17),
+                    "total_cost_usd": r.get::<_, Option<f64>>(18),
+                    "composite_agentic_score": r.get::<_, Option<f64>>(19),
+                    "technology_tags": r.get::<_, Option<String>>(20),
+                    "domain_tags": r.get::<_, Option<String>>(21),
+                    "complexity_tier": r.get::<_, Option<String>>(22),
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get learning statistics for a date range.
+    pub async fn get_learning_stats_by_date_range(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<serde_json::Value, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Parse the date strings into timestamps for PG comparison
+        let start_ts = start.to_string();
+        let end_ts = end.to_string();
+
+        // Get counts by status
+        let status_rows = conn
+            .query(
+                r#"SELECT status, COUNT(*) as count
+                FROM learning_outcomes
+                WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz
+                GROUP BY status"#,
+                &[&start_ts, &end_ts],
+            )
+            .await
+            .map_err(|e| format!("PG get_learning_stats_by_date_range (status): {}", e))?;
+
+        let mut status_map = serde_json::Map::new();
+        for row in &status_rows {
+            let status: String = row.get(0);
+            let count: i64 = row.get(1);
+            status_map.insert(status, serde_json::json!(count));
+        }
+
+        // Get counts by strategy
+        let strategy_rows = conn
+            .query(
+                r#"SELECT strategy, COUNT(*) as count
+                FROM learning_outcomes
+                WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz AND strategy IS NOT NULL
+                GROUP BY strategy
+                ORDER BY count DESC"#,
+                &[&start_ts, &end_ts],
+            )
+            .await
+            .map_err(|e| format!("PG get_learning_stats_by_date_range (strategy): {}", e))?;
+
+        let mut strategy_map = serde_json::Map::new();
+        for row in &strategy_rows {
+            let strategy: String = row.get(0);
+            let count: i64 = row.get(1);
+            strategy_map.insert(strategy, serde_json::json!(count));
+        }
+
+        // Get average stats
+        let avg_row = conn
+            .query_one(
+                r#"SELECT AVG(duration_secs), AVG(iterations), COUNT(*)
+                FROM learning_outcomes
+                WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz"#,
+                &[&start_ts, &end_ts],
+            )
+            .await
+            .map_err(|e| format!("PG get_learning_stats_by_date_range (avg): {}", e))?;
+
+        let avg_duration: Option<f64> = avg_row.get(0);
+        let avg_iterations: Option<f64> = avg_row.get(1);
+        let total: i64 = avg_row.get(2);
+
+        Ok(serde_json::json!({
+            "total": total,
+            "by_status": status_map,
+            "by_strategy": strategy_map,
+            "avg_duration_secs": avg_duration,
+            "avg_iterations": avg_iterations,
+            "date_range": {
+                "start": start,
+                "end": end
+            }
+        }))
+    }
 }

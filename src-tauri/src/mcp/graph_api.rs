@@ -264,10 +264,9 @@ async fn cross_run_patterns_handler(
     let workflow_name = query.workflow_name;
     let patterns = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            cross_run_ops::get_active_patterns(conn, workflow_name.as_deref())
-        })
+        .pg_db
+        .get_active_patterns(workflow_name.as_deref())
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -294,8 +293,9 @@ async fn workflow_versions_handler(
 > {
     let versions = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| graph_ops::get_workflow_versions(conn, &query.workflow_id))
+        .pg_db
+        .get_workflow_versions(&query.workflow_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -320,6 +320,7 @@ async fn step_provenance_handler(
     Json<ApiResponse<Vec<graph_ops::StepProvenance>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    // NOTE: No PG equivalent for get_provenance_for_workflow; stays on SQLite
     let provenance = state
         .app_state
         .checkpoint_db
@@ -350,6 +351,7 @@ async fn rule_influence_handler(
     Json<ApiResponse<Vec<graph_ops::RuleInfluence>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    // NOTE: No PG equivalent for get_rule_influences; stays on SQLite
     let influences = state
         .app_state
         .checkpoint_db
@@ -378,6 +380,7 @@ async fn ineffective_rules_handler(
     Json<ApiResponse<Vec<graph_ops::IneffectiveRule>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    // NOTE: No PG equivalent for get_ineffective_rules; stays on SQLite
     let threshold = query.threshold.unwrap_or(3);
     let rules = state
         .app_state
@@ -409,8 +412,9 @@ async fn pipeline_events_handler(
 > {
     let events = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| graph_ops::get_pipeline_events(conn, &query.task_run_id))
+        .pg_db
+        .get_pipeline_events(&query.task_run_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -435,6 +439,7 @@ async fn phase_stats_handler(
     Json<ApiResponse<Vec<graph_ops::PhaseStats>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
+    // NOTE: No PG equivalent for get_phase_stats; stays on SQLite
     let stats = state
         .app_state
         .checkpoint_db

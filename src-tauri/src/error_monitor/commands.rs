@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
+use crate::commands::AppState;
 use crate::database::CheckpointDb;
 use crate::error_monitor::storage::ErrorEventStorage;
 use crate::error_monitor::types::{ErrorQuery, ErrorStatus, ErrorSummary, StoredErrorEvent};
@@ -67,11 +68,33 @@ pub async fn get_error_event(
 #[tauri::command]
 pub async fn get_unresolved_errors(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     task_run_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    let db = db.inner().clone();
     let limit = limit.unwrap_or(100);
+
+    // Try PG first
+    match app_state
+        .pg_db
+        .get_unresolved_errors(task_run_id.as_deref(), limit)
+        .await
+    {
+        Ok(pg_rows) if !pg_rows.is_empty() => {
+            // Convert serde_json::Value rows to StoredErrorEvent
+            let events: Vec<StoredErrorEvent> = pg_rows
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
+            if !events.is_empty() {
+                return Ok(events);
+            }
+        }
+        _ => {}
+    }
+
+    // Fallback to SQLite
+    let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
         ErrorEventStorage::get_unresolved(&conn, task_run_id.as_deref(), limit)
@@ -84,17 +107,28 @@ pub async fn get_unresolved_errors(
 #[tauri::command]
 pub async fn update_error_status(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     id: i64,
     status: String,
     resolution_notes: Option<String>,
 ) -> Result<(), String> {
-    let status =
+    let status_enum =
         ErrorStatus::from_str(&status).ok_or_else(|| format!("Invalid status: {}", status))?;
+
+    // Fire-and-forget PG dual-write
+    let pg = app_state.pg_db.clone();
+    let status_str = status.clone();
+    let notes = resolution_notes.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pg.update_error_status(id, &status_str, notes.as_deref()).await {
+            tracing::warn!("PG update_error_status failed: {}", e);
+        }
+    });
 
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
-        ErrorEventStorage::update_status(&conn, id, status, resolution_notes.as_deref())
+        ErrorEventStorage::update_status(&conn, id, status_enum, resolution_notes.as_deref())
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
@@ -102,7 +136,19 @@ pub async fn update_error_status(
 
 /// Acknowledge an error (mark as seen).
 #[tauri::command]
-pub async fn acknowledge_error(db: State<'_, Arc<CheckpointDb>>, id: i64) -> Result<(), String> {
+pub async fn acknowledge_error(
+    db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
+    // Fire-and-forget PG dual-write
+    let pg = app_state.pg_db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pg.update_error_status(id, "acknowledged", None).await {
+            tracing::warn!("PG acknowledge_error failed: {}", e);
+        }
+    });
+
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
@@ -116,10 +162,26 @@ pub async fn acknowledge_error(db: State<'_, Arc<CheckpointDb>>, id: i64) -> Res
 #[tauri::command]
 pub async fn resolve_error(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     id: i64,
     resolution_notes: Option<String>,
     resolved_by_task_run_id: Option<String>,
 ) -> Result<(), String> {
+    // Fire-and-forget PG dual-write
+    let pg = app_state.pg_db.clone();
+    let notes = resolution_notes.clone();
+    let task_id = resolved_by_task_run_id.clone();
+    tokio::spawn(async move {
+        let result = if let Some(ref tid) = task_id {
+            pg.mark_resolved_by_task(id, tid, notes.as_deref()).await
+        } else {
+            pg.update_error_status(id, "resolved", notes.as_deref()).await
+        };
+        if let Err(e) = result {
+            tracing::warn!("PG resolve_error failed: {}", e);
+        }
+    });
+
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
@@ -147,9 +209,19 @@ pub async fn resolve_error(
 #[tauri::command]
 pub async fn ignore_error(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     id: i64,
     reason: Option<String>,
 ) -> Result<(), String> {
+    // Fire-and-forget PG dual-write
+    let pg = app_state.pg_db.clone();
+    let notes = reason.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pg.update_error_status(id, "ignored", notes.as_deref()).await {
+            tracing::warn!("PG ignore_error failed: {}", e);
+        }
+    });
+
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
@@ -183,8 +255,17 @@ pub async fn link_error_to_finding(
 #[tauri::command]
 pub async fn get_error_summary(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     task_run_id: Option<String>,
 ) -> Result<ErrorSummary, String> {
+    // Try PG first
+    if let Ok(pg_summary) = app_state.pg_db.get_error_summary(task_run_id.as_deref()).await {
+        if let Ok(summary) = serde_json::from_value::<ErrorSummary>(pg_summary) {
+            return Ok(summary);
+        }
+    }
+
+    // Fallback to SQLite
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;
@@ -215,8 +296,17 @@ pub async fn search_errors(
 #[tauri::command]
 pub async fn has_actionable_errors(
     db: State<'_, Arc<CheckpointDb>>,
+    app_state: State<'_, Arc<AppState>>,
     task_run_id: Option<String>,
 ) -> Result<bool, String> {
+    // Try PG first
+    if let Ok(pg_summary) = app_state.pg_db.get_error_summary(task_run_id.as_deref()).await {
+        if let Some(has) = pg_summary.get("hasActionableErrors").and_then(|v| v.as_bool()) {
+            return Ok(has);
+        }
+    }
+
+    // Fallback to SQLite
     let db = db.inner().clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.connection()?;

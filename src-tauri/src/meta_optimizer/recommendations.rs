@@ -723,6 +723,29 @@ pub fn create_optimizer_run(
     Ok(id)
 }
 
+/// Create an optimizer run with PG dual-write (fire-and-forget).
+pub fn create_optimizer_run_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    optimizer_type: &str,
+    trigger_type: &str,
+    task_run_id: Option<&str>,
+) -> Result<String, String> {
+    let id = create_optimizer_run(db, optimizer_type, trigger_type, task_run_id)?;
+
+    let pg = pg_db.clone();
+    let ot = optimizer_type.to_string();
+    let tt = trigger_type.to_string();
+    let tid = task_run_id.map(|s| s.to_string());
+    tokio::spawn(async move {
+        if let Err(e) = pg.create_optimizer_run(&ot, &tt, tid.as_deref()).await {
+            tracing::warn!("PG create_optimizer_run dual-write failed: {}", e);
+        }
+    });
+
+    Ok(id)
+}
+
 /// Complete an optimizer run, recording how many runs were analyzed and recommendations produced.
 pub fn complete_optimizer_run(
     db: &CheckpointDb,
@@ -743,6 +766,27 @@ pub fn complete_optimizer_run(
         .map_err(|e| format!("Failed to complete optimizer run: {}", e))?;
         Ok(())
     })
+}
+
+/// Complete an optimizer run with PG dual-write (fire-and-forget).
+pub fn complete_optimizer_run_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    run_id: &str,
+    runs_analyzed: i64,
+    recommendations_produced: i64,
+) -> Result<(), String> {
+    complete_optimizer_run(db, run_id, runs_analyzed, recommendations_produced)?;
+
+    let pg = pg_db.clone();
+    let rid = run_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.complete_optimizer_run(&rid, runs_analyzed, recommendations_produced).await {
+            tracing::warn!("PG complete_optimizer_run dual-write failed: {}", e);
+        }
+    });
+
+    Ok(())
 }
 
 /// List optimizer runs.

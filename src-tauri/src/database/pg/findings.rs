@@ -194,3 +194,21 @@ fn pg_row_to_finding(row: &tokio_postgres::Row) -> Finding {
         updated_at: updated_at.to_rfc3339(),
     }
 }
+
+impl PgDb {
+    /// Set a user response on a finding.
+    pub async fn set_finding_user_response(
+        &self,
+        id: &str,
+        response: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_run_findings SET user_response = $1, updated_at = NOW() WHERE id = $2",
+            &[&response, &id],
+        )
+        .await
+        .map_err(|e| format!("PG set_finding_user_response: {}", e))?;
+        Ok(())
+    }
+}

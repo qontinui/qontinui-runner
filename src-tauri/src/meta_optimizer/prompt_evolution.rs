@@ -208,6 +208,28 @@ pub fn update_verdict(
     })
 }
 
+/// Update verdict with PG dual-write (fire-and-forget).
+pub fn update_verdict_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    evolution_id: &str,
+    verdict: &str,
+    score_after: Option<f64>,
+) -> Result<(), String> {
+    update_verdict(db, evolution_id, verdict, score_after)?;
+
+    let pg = pg_db.clone();
+    let eid = evolution_id.to_string();
+    let v = verdict.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.update_evolution_verdict(&eid, &v, score_after).await {
+            tracing::warn!("PG update_evolution_verdict dual-write failed: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
 /// Update the canary verdict for an evolution entry identified by its variant_id.
 pub fn update_verdict_by_variant(
     db: &CheckpointDb,
@@ -226,6 +248,45 @@ pub fn update_verdict_by_variant(
         .map_err(|e| format!("Failed to update evolution verdict by variant: {}", e))?;
         Ok(())
     })
+}
+
+/// Update verdict by variant with PG dual-write (fire-and-forget).
+pub fn update_verdict_by_variant_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    variant_id: &str,
+    verdict: &str,
+    score_after: Option<f64>,
+) -> Result<(), String> {
+    update_verdict_by_variant(db, variant_id, verdict, score_after)?;
+
+    // PG doesn't have an exact `update_by_variant` but has `update_evolution_verdict_by_recommendation`.
+    // For variant-based updates, we look up the recommendation_id first.
+    let variant_id_owned = variant_id.to_string();
+    let rec_id: Option<String> = db.with_conn({
+        let vid = variant_id_owned.clone();
+        move |conn| {
+            conn.query_row(
+                "SELECT recommendation_id FROM prompt_evolution WHERE variant_id = ?1 AND canary_verdict = ?2 ORDER BY created_at DESC LIMIT 1",
+                params![vid, verdict],
+                |row| row.get(0),
+            )
+            .ok()
+            .ok_or_else(|| "not found".to_string())
+        }
+    }).ok();
+
+    if let Some(rid) = rec_id {
+        let pg = pg_db.clone();
+        let v = verdict.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = pg.update_evolution_verdict_by_recommendation(&rid, &v, score_after).await {
+                tracing::warn!("PG update_evolution_verdict_by_recommendation dual-write failed: {}", e);
+            }
+        });
+    }
+
+    Ok(())
 }
 
 /// Get evolution history for an agent type (most recent first).

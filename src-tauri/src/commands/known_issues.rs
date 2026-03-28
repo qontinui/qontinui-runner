@@ -100,8 +100,7 @@ pub async fn list_known_issues(
     query: ListKnownIssuesQuery,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<KnownIssue>, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    storage::list_known_issues(&conn, &query)
+    app_state.pg_db.list_known_issues(&query).await
 }
 
 /// Find known issues relevant to a specific spec.
@@ -121,8 +120,7 @@ pub async fn create_known_issue(
     request: CreateKnownIssueRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<KnownIssue, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let issue = storage::insert_known_issue(&conn, &request)?;
+    let issue = app_state.pg_db.create_known_issue(&request).await?;
     info!("Created known issue: {} ({})", issue.title, issue.id);
     Ok(issue)
 }
@@ -134,8 +132,7 @@ pub async fn update_known_issue(
     request: UpdateKnownIssueRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<KnownIssue, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let issue = storage::update_known_issue(&conn, &id, &request)?;
+    let issue = app_state.pg_db.update_known_issue(&id, &request).await?;
     info!("Updated known issue: {} ({})", issue.title, issue.id);
     Ok(issue)
 }
@@ -146,8 +143,7 @@ pub async fn delete_known_issue(
     id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let deleted = storage::delete_known_issue(&conn, &id)?;
+    let deleted = app_state.pg_db.delete_known_issue(&id).await?;
     if deleted {
         info!("Deleted known issue: {}", id);
     }

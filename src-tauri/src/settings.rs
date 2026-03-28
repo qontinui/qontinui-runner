@@ -746,6 +746,65 @@ impl Default for CloudRelaySettings {
     }
 }
 
+// ============================================================================
+// Memory Consolidation Settings
+// ============================================================================
+
+/// Settings for the memory consolidation service that synthesizes observations
+/// into mental models with importance-weighted decay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConsolidationSettings {
+    /// Minimum number of observations in a group to trigger consolidation (default: 3)
+    #[serde(default = "default_min_group_size")]
+    pub min_group_size: usize,
+    /// Minimum hours between consolidation runs (default: 6.0)
+    #[serde(default = "default_cooldown_hours")]
+    pub cooldown_hours: f64,
+    /// Retention threshold — observations below this are archived (default: 0.05)
+    #[serde(default = "default_archive_threshold")]
+    pub archive_threshold: f64,
+    /// Maximum observations to scan per consolidation run (default: 500)
+    #[serde(default = "default_max_observations")]
+    pub max_observations: i64,
+    /// Model override for consolidation LLM calls (use lightweight Haiku-class)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    /// Provider override for consolidation LLM calls
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_override: Option<String>,
+}
+
+fn default_min_group_size() -> usize { 3 }
+fn default_cooldown_hours() -> f64 { 6.0 }
+fn default_archive_threshold() -> f64 { 0.05 }
+fn default_max_observations() -> i64 { 500 }
+
+impl Default for MemoryConsolidationSettings {
+    fn default() -> Self {
+        Self {
+            min_group_size: default_min_group_size(),
+            cooldown_hours: default_cooldown_hours(),
+            archive_threshold: default_archive_threshold(),
+            max_observations: default_max_observations(),
+            model_override: None,
+            provider_override: None,
+        }
+    }
+}
+
+impl From<&MemoryConsolidationSettings> for crate::memory::consolidation::ConsolidationConfig {
+    fn from(s: &MemoryConsolidationSettings) -> Self {
+        Self {
+            min_group_size: s.min_group_size,
+            cooldown_hours: s.cooldown_hours,
+            archive_threshold: s.archive_threshold,
+            max_observations: s.max_observations,
+            model_override: s.model_override.clone(),
+            provider_override: s.provider_override.clone(),
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -815,6 +874,9 @@ pub struct Settings {
     pub otel: crate::otel::OtelConfig,
     #[serde(default)]
     pub container: crate::container::container_config::ContainerConfig,
+    /// Memory consolidation settings (importance decay, grouping, LLM model)
+    #[serde(default)]
+    pub memory_consolidation: MemoryConsolidationSettings,
 }
 
 // ============================================================================

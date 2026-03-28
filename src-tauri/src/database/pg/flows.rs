@@ -456,4 +456,194 @@ impl PgDb {
         }
         Ok(imported)
     }
+
+    /// Get flow executions with optional filtering.
+    pub async fn get_flow_executions_filtered(
+        &self,
+        flow_id: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let (query, params): (String, Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>) =
+            match (flow_id, status) {
+                (Some(fid), Some(st)) => (
+                    "SELECT instance_id, flow_id, current_step, status, started_at, completed_at FROM flow_executions WHERE flow_id = $1 AND status = $2 ORDER BY started_at DESC".to_string(),
+                    vec![Box::new(fid.to_string()), Box::new(st.to_string())],
+                ),
+                (Some(fid), None) => (
+                    "SELECT instance_id, flow_id, current_step, status, started_at, completed_at FROM flow_executions WHERE flow_id = $1 ORDER BY started_at DESC".to_string(),
+                    vec![Box::new(fid.to_string())],
+                ),
+                (None, Some(st)) => (
+                    "SELECT instance_id, flow_id, current_step, status, started_at, completed_at FROM flow_executions WHERE status = $1 ORDER BY started_at DESC".to_string(),
+                    vec![Box::new(st.to_string())],
+                ),
+                (None, None) => (
+                    "SELECT instance_id, flow_id, current_step, status, started_at, completed_at FROM flow_executions ORDER BY started_at DESC".to_string(),
+                    vec![],
+                ),
+            };
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        let rows = conn
+            .query(&query, &param_refs)
+            .await
+            .map_err(|e| format!("PG get_flow_executions_filtered: {}", e))?;
+
+        let results = rows
+            .iter()
+            .map(|r| {
+                let started: chrono::DateTime<chrono::Utc> = r.get(4);
+                let completed: Option<chrono::DateTime<chrono::Utc>> = r.get(5);
+                serde_json::json!({
+                    "instance_id": r.get::<_, String>(0),
+                    "flow_id": r.get::<_, String>(1),
+                    "current_step": r.get::<_, Option<String>>(2),
+                    "status": r.get::<_, String>(3),
+                    "started_at": started.to_rfc3339(),
+                    "completed_at": completed.map(|dt| dt.to_rfc3339()),
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get flow executions with pagination.
+    pub async fn get_flow_executions_paginated(
+        &self,
+        flow_id: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = if let Some(fid) = flow_id {
+            conn.query(
+                r#"SELECT instance_id, flow_id, current_step, status, started_at, completed_at
+                FROM flow_executions WHERE flow_id = $1 ORDER BY started_at DESC LIMIT $2 OFFSET $3"#,
+                &[&fid, &limit, &offset],
+            )
+            .await
+        } else {
+            conn.query(
+                r#"SELECT instance_id, flow_id, current_step, status, started_at, completed_at
+                FROM flow_executions ORDER BY started_at DESC LIMIT $1 OFFSET $2"#,
+                &[&limit, &offset],
+            )
+            .await
+        }
+        .map_err(|e| format!("PG get_flow_executions_paginated: {}", e))?;
+
+        let results = rows
+            .iter()
+            .map(|r| {
+                let started: chrono::DateTime<chrono::Utc> = r.get(4);
+                let completed: Option<chrono::DateTime<chrono::Utc>> = r.get(5);
+                serde_json::json!({
+                    "instance_id": r.get::<_, String>(0),
+                    "flow_id": r.get::<_, String>(1),
+                    "current_step": r.get::<_, Option<String>>(2),
+                    "status": r.get::<_, String>(3),
+                    "started_at": started.to_rfc3339(),
+                    "completed_at": completed.map(|dt| dt.to_rfc3339()),
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get total count of flow executions.
+    pub async fn get_flow_executions_count(&self, flow_id: Option<&str>) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let count: i64 = if let Some(fid) = flow_id {
+            let row = conn
+                .query_one(
+                    "SELECT COUNT(*) FROM flow_executions WHERE flow_id = $1",
+                    &[&fid],
+                )
+                .await
+                .map_err(|e| format!("PG get_flow_executions_count: {}", e))?;
+            row.get(0)
+        } else {
+            let row = conn
+                .query_one("SELECT COUNT(*) FROM flow_executions", &[])
+                .await
+                .map_err(|e| format!("PG get_flow_executions_count: {}", e))?;
+            row.get(0)
+        };
+
+        Ok(count)
+    }
+
+    /// Restore a flow to a specific version.
+    pub async fn restore_flow_version(
+        &self,
+        flow_id: &str,
+        version: i32,
+        created_by: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        // Get the version to restore
+        let version_data = self
+            .get_flow_version(flow_id, version)
+            .await?
+            .ok_or_else(|| format!("Version {} not found for flow {}", version, flow_id))?;
+
+        let definition = &version_data["definition"];
+
+        // Create a backup version of the current state first
+        if let Some(current_flow) = self.get_flow(flow_id).await? {
+            self.create_flow_version(
+                flow_id,
+                &current_flow,
+                Some(&format!("Auto-backup before restoring v{}", version)),
+                created_by,
+            )
+            .await?;
+        }
+
+        // Update the flow with the restored definition
+        self.save_flow(definition).await?;
+
+        // Create a new version entry for the restoration
+        let restored = self
+            .create_flow_version(
+                flow_id,
+                definition,
+                Some(&format!("Restored from v{}", version)),
+                created_by,
+            )
+            .await?;
+
+        Ok(restored)
+    }
+
+    /// Compare two versions of a flow.
+    pub async fn compare_flow_versions(
+        &self,
+        flow_id: &str,
+        version1: i32,
+        version2: i32,
+    ) -> Result<serde_json::Value, String> {
+        let v1 = self
+            .get_flow_version(flow_id, version1)
+            .await?
+            .ok_or_else(|| format!("Version {} not found", version1))?;
+
+        let v2 = self
+            .get_flow_version(flow_id, version2)
+            .await?
+            .ok_or_else(|| format!("Version {} not found", version2))?;
+
+        Ok(serde_json::json!({
+            "flow_id": flow_id,
+            "version1": v1,
+            "version2": v2,
+        }))
+    }
 }

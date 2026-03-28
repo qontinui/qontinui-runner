@@ -137,9 +137,7 @@ impl StepHandler for WorkflowStepHandler {
         if let Err(e) = context.app_state.pg_db.create_task_run(&input).await {
             warn!("PG create_task_run for nested workflow failed: {}", e);
         }
-        if let Err(e) = context.app_state.checkpoint_db.create_task_run(&input) {
-            warn!("Failed to create task_run for nested workflow: {}", e);
-        }
+        // PG write already done above; SQLite fallback removed
 
         // 7. Build LoopConfig with the single stage
         let loop_config = LoopConfig {

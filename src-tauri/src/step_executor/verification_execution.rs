@@ -610,9 +610,7 @@ impl StepExecutor {
                         }
                     });
                 }
-                if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event) {
-                    warn!("Failed to emit verification step completion event: {}", e);
-                }
+                // PG write already done above via tokio::spawn; SQLite fallback removed
             }
 
             // Update step checkpoint to reflect completion progressively

@@ -21,8 +21,7 @@ use crate::state_machine_configs::{
 
 #[tauri::command]
 pub async fn sm_list_configs(app_state: State<'_, Arc<AppState>>) -> Result<Vec<SmConfig>, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    storage::list_configs(&conn)
+    app_state.pg_db.list_sm_configs().await
 }
 
 #[tauri::command]
@@ -39,8 +38,7 @@ pub async fn sm_create_config(
     request: CreateSmConfigRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<SmConfig, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let config = storage::insert_config(&conn, &request)?;
+    let config = app_state.pg_db.insert_sm_config(&request).await?;
     info!(
         "Created state machine config: {} ({})",
         config.name, config.id
@@ -54,8 +52,7 @@ pub async fn sm_update_config(
     request: UpdateSmConfigRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<SmConfig, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let config = storage::update_config(&conn, &id, &request)?;
+    let config = app_state.pg_db.update_sm_config(&id, &request).await?;
     info!(
         "Updated state machine config: {} ({})",
         config.name, config.id
@@ -68,8 +65,7 @@ pub async fn sm_delete_config(
     id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let deleted = storage::delete_config(&conn, &id)?;
+    let deleted = app_state.pg_db.delete_sm_config(&id).await?;
     if deleted {
         info!("Deleted state machine config: {}", id);
     }

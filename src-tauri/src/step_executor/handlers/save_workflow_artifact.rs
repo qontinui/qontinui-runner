@@ -157,9 +157,20 @@ impl SaveWorkflowArtifactHandler {
         builder: &mut PipelineArtifactBuilder,
     ) {
         // Look up the task run to get the workflow_name
-        let task_run = match context.app_state.checkpoint_db.get_task_run(task_run_id) {
-            Ok(Some(tr)) => tr,
-            _ => {
+        let task_run = match tokio::runtime::Handle::try_current()
+            .ok()
+            .and_then(|h| {
+                let pg = context.app_state.pg_db.clone();
+                let id = task_run_id.to_string();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    h.block_on(async move { pg.get_task_run(&id).await })
+                })).ok()
+            })
+            .and_then(|r| r.ok())
+            .flatten()
+        {
+            Some(tr) => tr,
+            None => {
                 tracing::debug!(
                     "Could not find task_run {} for prompt extraction",
                     task_run_id

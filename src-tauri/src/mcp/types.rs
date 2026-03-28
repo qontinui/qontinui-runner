@@ -61,6 +61,9 @@ pub struct ApiState {
     /// Pending UI Bridge requests waiting for frontend response
     pub ui_bridge_pending:
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    /// Lock-free pending request counter for the health endpoint.
+    /// Incremented when a request is inserted, decremented when removed or timed out.
+    pub ui_bridge_pending_count: Arc<std::sync::atomic::AtomicUsize>,
     /// UI Bridge circuit breaker state
     pub ui_bridge_circuit_breaker: Arc<crate::mcp::ui_bridge::UiBridgeCircuitBreaker>,
     /// UI Bridge concurrency semaphore (max 6 concurrent requests)

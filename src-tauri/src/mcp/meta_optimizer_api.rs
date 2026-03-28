@@ -201,8 +201,12 @@ pub async fn get_recommendations_handler(
 pub async fn get_optimizer_runs_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<MetaOptimizerRun>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let runs =
-        recommendations::list_optimizer_runs(&state.app_state.checkpoint_db).map_err(|e| {
+    let runs = state
+        .app_state
+        .pg_db
+        .get_recent_optimizer_runs(50)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to list optimizer runs: {}", e))),
@@ -223,6 +227,7 @@ pub async fn get_optimizer_context_handler(
     let optimizer_type = query.optimizer_type.clone().unwrap_or_default();
     let is_pipeline = optimizer_type == "pipeline_prompt";
 
+    // NOTE: Complex multi-query context builder; no single PG equivalent; stays on SQLite
     let context = state
         .app_state
         .checkpoint_db

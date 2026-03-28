@@ -150,7 +150,7 @@ pub async fn export_all_data(
     info!("Exporting all user data");
     let opts = options.unwrap_or_default();
 
-    let summary = state.checkpoint_db.get_export_summary()?;
+    let summary = state.pg_db.get_export_summary().await?;
 
     let flows = if opts.flows {
         state.pg_db.export_all_flows().await?
@@ -303,7 +303,7 @@ pub fn get_import_preview(data: ComprehensiveExport) -> Result<ImportPreview, St
 
 /// Import all data from a comprehensive backup.
 #[tauri::command]
-pub fn import_all_data(
+pub async fn import_all_data(
     state: State<'_, Arc<AppState>>,
     data: ComprehensiveExport,
     options: Option<ImportOptions>,
@@ -319,12 +319,14 @@ pub fn import_all_data(
 
     // Import flows
     if opts.flows && !data.flows.is_empty() {
-        match state.checkpoint_db.import_flows(&data.flows, conflict_mode) {
-            Ok(result) => {
-                total_imported += result.imported;
-                total_skipped += result.skipped;
-                total_errors += result.errors.len();
-                results.insert("flows".to_string(), result);
+        match state.pg_db.import_flows(&data.flows).await {
+            Ok(count) => {
+                total_imported += count as usize;
+                results.insert("flows".to_string(), ImportResult {
+                    imported: count as usize,
+                    skipped: 0,
+                    errors: vec![],
+                });
             }
             Err(e) => {
                 error!("Failed to import flows: {}", e);

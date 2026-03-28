@@ -70,6 +70,7 @@ pub mod playwright_collection;
 pub mod processes;
 pub mod prompt_snippets;
 pub mod prompts;
+pub mod query_memory_tool;
 pub mod query_tool;
 pub mod queue;
 pub mod rag;

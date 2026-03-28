@@ -322,6 +322,36 @@ fn compute_verdict(
     }
 }
 
+/// Capture a baseline snapshot with PG dual-write.
+pub fn capture_baseline_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
+    let snap_type = format!("baseline{}", category.snapshot_suffix());
+    capture_snapshot_with_pg(db, pg_db, &snap_type, None, 30, category)
+}
+
+/// Capture a periodic snapshot with PG dual-write.
+pub fn capture_periodic_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
+    let snap_type = format!("periodic{}", category.snapshot_suffix());
+    capture_snapshot_with_pg(db, pg_db, &snap_type, None, 7, category)
+}
+
+/// Capture a post-apply snapshot with PG dual-write.
+pub fn capture_post_apply_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
+    capture_snapshot_with_pg(db, pg_db, "post_apply", Some(recommendation_id), 7, category)
+}
+
 /// Update the outcome_after_apply column on a recommendation.
 pub fn update_outcome(
     db: &CheckpointDb,
@@ -547,6 +577,42 @@ pub fn capture_snapshot(
             created_at: period_end,
         })
     })
+}
+
+/// Capture a snapshot with PG dual-write (fire-and-forget).
+///
+/// Captures via SQLite (primary), then sends the snapshot row to PG.
+pub fn capture_snapshot_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    snapshot_type: &str,
+    recommendation_id: Option<&str>,
+    lookback_days: i64,
+    category: WorkflowCategory,
+) -> Result<MetaOptimizerSnapshot, String> {
+    let snap = capture_snapshot(db, snapshot_type, recommendation_id, lookback_days, category)?;
+
+    let pg = pg_db.clone();
+    let s = snap.clone();
+    tokio::spawn(async move {
+        if let Err(e) = pg
+            .save_optimizer_snapshot(
+                &s.id,
+                &s.snapshot_type,
+                &s.period_start,
+                &s.period_end,
+                &s.metrics_json,
+                s.breakdown_json.as_deref(),
+                s.recommendation_id.as_deref(),
+                s.runs_included,
+            )
+            .await
+        {
+            tracing::warn!("PG save_optimizer_snapshot dual-write failed: {}", e);
+        }
+    });
+
+    Ok(snap)
 }
 
 // ── Convenience wrappers ───────────────────────────────────────────────

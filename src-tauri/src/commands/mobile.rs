@@ -431,9 +431,7 @@ pub async fn capture_mobile_screenshot(
         };
 
         if let Err(e) = state.pg_db.create_mobile_state(&input).await {
-            warn!("Failed to save mobile state to database: {}", e);
-        } else if let Err(e) = state.checkpoint_db.create_mobile_state(&input) {
-            warn!("Failed to save mobile state to database: {}", e);
+            warn!("Failed to save mobile state to PG: {}", e);
         }
     }
 
@@ -556,9 +554,7 @@ pub async fn capture_mobile_logcat(
                     };
 
                     if let Err(e) = state.pg_db.create_mobile_log(&input).await {
-                        debug!("Failed to save mobile log: {}", e);
-                    } else if let Err(e) = state.checkpoint_db.create_mobile_log(&input) {
-                        debug!("Failed to save mobile log: {}", e);
+                        debug!("Failed to save mobile log to PG: {}", e);
                     }
                 }
             }

@@ -68,7 +68,8 @@ async fn consolidate_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ConsolidationStats>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
-    let config = ConsolidationConfig::default();
+    let settings = crate::settings::load_settings();
+    let config: ConsolidationConfig = (&settings.memory_consolidation).into();
 
     // Check cooldown
     if !crate::memory::consolidation::can_run_consolidation(pg, config.cooldown_hours).await {

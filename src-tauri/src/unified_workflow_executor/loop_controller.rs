@@ -2315,7 +2315,8 @@ impl LoopController {
         {
             let consolidation_pg = self.app_state.pg_db.clone();
             tokio::spawn(async move {
-                let config = crate::memory::consolidation::ConsolidationConfig::default();
+                let settings = crate::settings::load_settings();
+                let config: crate::memory::consolidation::ConsolidationConfig = (&settings.memory_consolidation).into();
                 if !crate::memory::consolidation::can_run_consolidation(&consolidation_pg, config.cooldown_hours).await {
                     return;
                 }

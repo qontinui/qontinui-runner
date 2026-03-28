@@ -103,6 +103,26 @@ pub fn start_canary(
     Ok(id)
 }
 
+/// Start a canary rollout with PG dual-write (fire-and-forget).
+pub fn start_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    recommendation_id: &str,
+    percentage: i64,
+) -> Result<String, String> {
+    let id = start_canary(db, recommendation_id, percentage)?;
+
+    let pg = pg_db.clone();
+    let rec_id = recommendation_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.start_canary(&rec_id, percentage as f64).await {
+            tracing::warn!("PG start_canary dual-write failed: {}", e);
+        }
+    });
+
+    Ok(id)
+}
+
 /// Get all active canary rollouts.
 pub fn get_active_canaries(db: &CheckpointDb) -> Result<Vec<CanaryRollout>, String> {
     db.with_conn(|conn| {
@@ -397,6 +417,44 @@ pub fn record_canary_run(
     })
 }
 
+/// Record a canary run with PG dual-write (fire-and-forget).
+pub fn record_canary_run_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+    is_canary: bool,
+    success: bool,
+    cost: f64,
+    duration_ms: f64,
+) -> Result<(), String> {
+    record_canary_run(db, canary_id, is_canary, success, cost, duration_ms)?;
+
+    // Read back the updated metrics to send to PG
+    let cid = canary_id.to_string();
+    let metrics = db.with_conn({
+        let cid = cid.clone();
+        move |conn| {
+            conn.query_row(
+                "SELECT baseline_metrics_json, canary_metrics_json FROM canary_rollouts WHERE id = ?1",
+                params![cid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| format!("Failed to read back canary metrics: {}", e))
+        }
+    });
+
+    if let Ok((baseline_json, canary_json)) = metrics {
+        let pg = pg_db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pg.update_canary_metrics(&cid, &baseline_json, &canary_json).await {
+                tracing::warn!("PG update_canary_metrics dual-write failed: {}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
 /// Evaluate a canary: should it be promoted, rolled back, or continue?
 ///
 /// Uses statistical tests (proportion z-test, confidence intervals, effect size)
@@ -541,6 +599,25 @@ pub fn promote_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Promote a canary with PG dual-write (fire-and-forget).
+pub fn promote_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+) -> Result<(), String> {
+    promote_canary(db, canary_id)?;
+
+    let pg = pg_db.clone();
+    let cid = canary_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.promote_canary(&cid).await {
+            tracing::warn!("PG promote_canary dual-write failed: {}", e);
+        }
+    });
+
+    Ok(())
+}
+
 /// Roll back a canary: mark recommendation as rolled_back and record evaluation metrics.
 ///
 /// Unlike the previous behavior (reverting to "pending"), this sets the recommendation
@@ -608,6 +685,25 @@ pub fn rollback_canary_with_eval(
     if let Err(e) = update_evolution_for_recommendation(db, &rec_id, "reject", score_after) {
         debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
     }
+
+    Ok(())
+}
+
+/// Roll back a canary with PG dual-write (fire-and-forget).
+pub fn rollback_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+) -> Result<(), String> {
+    rollback_canary(db, canary_id)?;
+
+    let pg = pg_db.clone();
+    let cid = canary_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.rollback_canary(&cid).await {
+            tracing::warn!("PG rollback_canary dual-write failed: {}", e);
+        }
+    });
 
     Ok(())
 }
@@ -894,6 +990,28 @@ pub fn create_prompt_template_canary(
     Ok(id)
 }
 
+/// Create a prompt template canary with PG dual-write (fire-and-forget).
+pub fn create_prompt_template_canary_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    template_id: &str,
+    baseline_version: i32,
+    candidate_version: i32,
+    traffic_pct: f64,
+) -> Result<String, String> {
+    let id = create_prompt_template_canary(db, template_id, baseline_version, candidate_version, traffic_pct)?;
+
+    let pg = pg_db.clone();
+    let tid = template_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = pg.create_template_canary(&tid, baseline_version, candidate_version, traffic_pct).await {
+            tracing::warn!("PG create_template_canary dual-write failed: {}", e);
+        }
+    });
+
+    Ok(id)
+}
+
 /// Load a prompt template canary from the database by id.
 pub fn get_prompt_template_canary(
     db: &CheckpointDb,
@@ -981,6 +1099,47 @@ pub fn record_prompt_canary_run(
 
         Ok(())
     })
+}
+
+/// Record a prompt canary run with PG dual-write (fire-and-forget).
+///
+/// The PG side uses `update_template_canary_metrics` to persist the metrics JSON.
+pub fn record_prompt_canary_run_with_pg(
+    db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    canary_id: &str,
+    used_candidate: bool,
+    success: bool,
+    cost: f64,
+    latency_ms: f64,
+    tokens: i64,
+) -> Result<(), String> {
+    record_prompt_canary_run(db, canary_id, used_candidate, success, cost, latency_ms, tokens)?;
+
+    // Read back the updated metrics to send to PG
+    let cid = canary_id.to_string();
+    let metrics = db.with_conn({
+        let cid = cid.clone();
+        move |conn| {
+            conn.query_row(
+                "SELECT baseline_metrics_json, candidate_metrics_json FROM prompt_template_canaries WHERE id = ?1",
+                params![cid],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|e| format!("Failed to read back canary metrics: {}", e))
+        }
+    });
+
+    if let Ok((baseline_json, candidate_json)) = metrics {
+        let pg = pg_db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pg.update_template_canary_metrics(&cid, &baseline_json, &candidate_json).await {
+                tracing::warn!("PG update_template_canary_metrics dual-write failed: {}", e);
+            }
+        });
+    }
+
+    Ok(())
 }
 
 /// Evaluate a prompt template canary from persisted DB state.

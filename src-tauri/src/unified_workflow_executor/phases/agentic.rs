@@ -190,7 +190,7 @@ impl AgenticExecutor {
                     }
                 });
             }
-            if let Err(e) = self.checkpoint_db.create_task_run_event(&resp_start_event) {
+            if let Err(e) = self.app_state.pg_db.create_task_run_event(&resp_start_event).await {
                 warn!("Failed to emit agentic response-mode start event: {}", e);
             }
             let resp_mode_start = std::time::Instant::now();
@@ -347,7 +347,7 @@ impl AgenticExecutor {
                                 }
                             });
                         }
-                        if let Err(e) = self.checkpoint_db.create_task_run_event(&complete_event) {
+                        if let Err(e) = self.app_state.pg_db.create_task_run_event(&complete_event).await {
                             warn!(
                                 "Failed to emit agentic response-mode completion event: {}",
                                 e
@@ -428,7 +428,7 @@ impl AgenticExecutor {
                                 }
                             });
                         }
-                        if let Err(e2) = self.checkpoint_db.create_task_run_event(&error_event) {
+                        if let Err(e2) = self.app_state.pg_db.create_task_run_event(&error_event).await {
                             warn!("Failed to emit agentic response-mode error event: {}", e2);
                         }
                         return (AgenticOutcome::Error { error: e }, Vec::new());
@@ -497,7 +497,7 @@ impl AgenticExecutor {
                 }
             });
         }
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&start_event) {
+        if let Err(e) = self.app_state.pg_db.create_task_run_event(&start_event).await {
             warn!("Failed to emit agentic start event: {}", e);
         }
 
@@ -835,13 +835,13 @@ impl AgenticExecutor {
         ).await {
             warn!("PG create_workflow_ai_session failed: {}", e);
         }
-        if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
+        if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
             &parent_task_id,
             iteration as i32,
             "agentic",
             config.stage_index.map(|i| i as i32),
             &cli_session_id,
-        ) {
+        ).await {
             warn!("Failed to create workflow AI session record: {}", e);
         }
 
@@ -914,13 +914,13 @@ impl AgenticExecutor {
             ).await {
                 warn!("PG create fallback workflow AI session failed: {}", e);
             }
-            if let Err(e) = self.checkpoint_db.create_workflow_ai_session(
+            if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
                 &parent_task_id,
                 iteration as i32,
                 "agentic",
                 config.stage_index.map(|i| i as i32),
                 &fresh_cli_id,
-            ) {
+            ).await {
                 warn!(
                     "Failed to create fallback workflow AI session record: {}",
                     e
@@ -1039,14 +1039,14 @@ impl AgenticExecutor {
             ).await {
                 warn!("PG complete_workflow_ai_session failed: {}", e);
             }
-            if let Err(e) = self.checkpoint_db.complete_workflow_ai_session(
+            if let Err(e) = self.app_state.pg_db.complete_workflow_ai_session(
                 &parent_task_id,
                 iteration as i32,
                 "agentic",
                 config.stage_index.map(|i| i as i32),
                 session_status,
                 output_len,
-            ) {
+            ).await {
                 warn!("Failed to complete workflow AI session: {}", e);
             }
             // Delete the partial in-progress output now that final output will be written
@@ -1117,7 +1117,7 @@ impl AgenticExecutor {
                 }
             });
         }
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&completion_event) {
+        if let Err(e) = self.app_state.pg_db.create_task_run_event(&completion_event).await {
             warn!("Failed to emit agentic completion event: {}", e);
         }
 

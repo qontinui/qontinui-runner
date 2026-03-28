@@ -659,13 +659,7 @@ fn now_epoch_ms() -> u64 {
 }
 
 async fn pending_count_with_timeout(state: &Arc<ApiState>) -> i32 {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        state.ui_bridge_pending.lock(),
-    )
-    .await
-    {
-        Ok(pending) => pending.len() as i32,
-        Err(_) => -1,
-    }
+    state
+        .ui_bridge_pending_count
+        .load(std::sync::atomic::Ordering::Relaxed) as i32
 }

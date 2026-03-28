@@ -94,10 +94,9 @@ async fn health(
     let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
     let responsive = last_pong > 0 && pong_age_ms < 15000;
 
-    let pending_count = {
-        let pending = state.ui_bridge_pending.lock().await;
-        pending.len()
-    };
+    let pending_count = state
+        .ui_bridge_pending_count
+        .load(std::sync::atomic::Ordering::Relaxed);
     let circuit_breaker_state = state.ui_bridge_circuit_breaker.get_state().await;
 
     let status = if last_pong > 0 { "ok" } else { "starting" };
@@ -178,6 +177,7 @@ pub fn create_router(
         extraction_state: Arc::new(crate::mcp::extraction::ExtractionState::new()),
         sdk_connection: shared_sdk_connection,
         ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        ui_bridge_pending_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ui_bridge_circuit_breaker: Arc::new(crate::mcp::ui_bridge::UiBridgeCircuitBreaker::new()),
         ui_bridge_semaphore: Arc::new(tokio::sync::Semaphore::new(6)),
         ui_bridge_last_pong: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -196,6 +196,7 @@ pub fn create_router(
     // and delivers responses to waiting HTTP handlers
     {
         let pending = api_state.ui_bridge_pending.clone();
+        let pending_count = api_state.ui_bridge_pending_count.clone();
         let handle = app_handle.clone();
 
         // We need to use tauri's listen which returns a sync result
@@ -204,8 +205,10 @@ pub fn create_router(
         use tauri::Listener;
 
         let pending_for_listener = pending.clone();
+        let pending_count_for_listener = pending_count.clone();
         let _listener_id = handle.listen("ui-bridge-response", move |event| {
             let pending = pending_for_listener.clone();
+            let pending_count = pending_count_for_listener.clone();
 
             // Parse the response payload
             if let Ok(response) = serde_json::from_str::<serde_json::Value>(event.payload()) {
@@ -213,7 +216,12 @@ pub fn create_router(
                 let runtime = tokio::runtime::Handle::try_current();
                 if let Ok(rt) = runtime {
                     rt.spawn(async move {
-                        crate::mcp::ui_bridge::handle_ui_bridge_response(pending, response).await;
+                        crate::mcp::ui_bridge::handle_ui_bridge_response(
+                            pending,
+                            pending_count,
+                            response,
+                        )
+                        .await;
                     });
                 } else {
                     warn!("UI Bridge: No tokio runtime available for response handling");
@@ -493,6 +501,7 @@ pub fn create_router(
         .merge(crate::mcp::graph_api::routes())
         .merge(crate::mcp::observations_api::routes())
         .merge(crate::mcp::memory_consolidation_api::routes())
+        .merge(crate::mcp::query_memory_tool::routes())
         .merge(crate::mcp::decision_trail_api::routes())
         .merge(crate::mcp::saved_api_requests::routes())
         .merge(crate::mcp::scheduler::routes())

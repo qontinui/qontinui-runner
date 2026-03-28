@@ -51,8 +51,8 @@ pub struct FlowSummary {
 
 /// List all saved flows.
 #[tauri::command]
-pub fn list_flows(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowSummary>, String> {
-    let flows_json = state.checkpoint_db.list_flows()?;
+pub async fn list_flows(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowSummary>, String> {
+    let flows_json = state.pg_db.list_flows().await?;
 
     let summaries = flows_json
         .into_iter()
@@ -78,8 +78,8 @@ pub fn list_flows(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowSummary>, S
 
 /// Get a flow by ID.
 #[tauri::command]
-pub fn get_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Flow>, String> {
-    let flow_json = state.checkpoint_db.get_flow(&id)?;
+pub async fn get_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Flow>, String> {
+    let flow_json = state.pg_db.get_flow(&id).await?;
 
     if let Some(f) = flow_json {
         // Try to deserialize the flow
@@ -98,16 +98,16 @@ pub fn get_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Fl
 
 /// Save a flow (create or update).
 #[tauri::command]
-pub fn save_flow(state: State<'_, Arc<AppState>>, flow: Flow) -> Result<String, String> {
+pub async fn save_flow(state: State<'_, Arc<AppState>>, flow: Flow) -> Result<String, String> {
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.checkpoint_db.save_flow(&flow_json)
+    state.pg_db.save_flow(&flow_json).await
 }
 
 /// Delete a flow by ID.
 #[tauri::command]
-pub fn delete_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
-    state.checkpoint_db.delete_flow(&id)
+pub async fn delete_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<bool, String> {
+    state.pg_db.delete_flow(&id).await
 }
 
 /// Validate a flow definition.
@@ -430,10 +430,10 @@ pub async fn get_flow_execution(
 
 /// List all flow executions.
 #[tauri::command]
-pub fn list_flow_executions(
+pub async fn list_flow_executions(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<FlowExecutionSummary>, String> {
-    let executions_json = state.checkpoint_db.list_flow_executions()?;
+    let executions_json = state.pg_db.list_flow_executions().await?;
 
     let summaries = executions_json
         .into_iter()
@@ -581,11 +581,11 @@ pub fn create_sample_flow() -> Result<Flow, String> {
 
 /// Add the sample flow to storage.
 #[tauri::command]
-pub fn add_sample_flow(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+pub async fn add_sample_flow(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let flow = create_sample_flow()?;
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.checkpoint_db.save_flow(&flow_json)
+    state.pg_db.save_flow(&flow_json).await
 }
 
 // ============================================================================
@@ -610,11 +610,11 @@ pub struct PaginatedFlowExecutionResult {
 
 /// Get flows filtered by tag.
 #[tauri::command]
-pub fn get_flows_by_tag(
+pub async fn get_flows_by_tag(
     state: State<'_, Arc<AppState>>,
     tag: String,
 ) -> Result<Vec<FlowSummary>, String> {
-    let flows_json = state.checkpoint_db.get_flows_by_tag(&tag)?;
+    let flows_json = state.pg_db.get_flows_by_tag(&tag).await?;
 
     let summaries = flows_json
         .into_iter()
@@ -640,13 +640,14 @@ pub fn get_flows_by_tag(
 
 /// Get flow executions with optional filtering.
 #[tauri::command]
-pub fn get_flow_executions_filtered(
+pub async fn get_flow_executions_filtered(
     state: State<'_, Arc<AppState>>,
     filter: FlowExecutionFilter,
 ) -> Result<Vec<FlowExecutionSummary>, String> {
     let executions_json = state
-        .checkpoint_db
-        .get_flow_executions_filtered(filter.flow_id.as_deref(), filter.status.as_deref())?;
+        .pg_db
+        .get_flow_executions_filtered(filter.flow_id.as_deref(), filter.status.as_deref())
+        .await?;
 
     let summaries = executions_json
         .into_iter()
@@ -665,7 +666,7 @@ pub fn get_flow_executions_filtered(
 
 /// Get flow executions with pagination.
 #[tauri::command]
-pub fn get_flow_executions_paginated(
+pub async fn get_flow_executions_paginated(
     state: State<'_, Arc<AppState>>,
     flow_id: Option<String>,
     offset: i64,
@@ -673,8 +674,9 @@ pub fn get_flow_executions_paginated(
 ) -> Result<PaginatedFlowExecutionResult, String> {
     let executions_json =
         state
-            .checkpoint_db
-            .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)?;
+            .pg_db
+            .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)
+            .await?;
 
     let summaries = executions_json
         .into_iter()
@@ -689,8 +691,9 @@ pub fn get_flow_executions_paginated(
         .collect();
 
     let total = state
-        .checkpoint_db
-        .get_flow_executions_count(flow_id.as_deref())?;
+        .pg_db
+        .get_flow_executions_count(flow_id.as_deref())
+        .await?;
 
     Ok(PaginatedFlowExecutionResult {
         items: summaries,
@@ -702,13 +705,14 @@ pub fn get_flow_executions_paginated(
 
 /// Get total count of flow executions.
 #[tauri::command]
-pub fn get_flow_executions_count(
+pub async fn get_flow_executions_count(
     state: State<'_, Arc<AppState>>,
     flow_id: Option<String>,
 ) -> Result<i64, String> {
     state
-        .checkpoint_db
+        .pg_db
         .get_flow_executions_count(flow_id.as_deref())
+        .await
 }
 
 // ============================================================================
@@ -997,7 +1001,7 @@ pub struct FlowVersionDetail {
 /// This stores the current state of the flow as a version, which can be
 /// restored later. Version numbers are automatically incremented.
 #[tauri::command]
-pub fn create_flow_version(
+pub async fn create_flow_version(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
     message: Option<String>,
@@ -1005,17 +1009,18 @@ pub fn create_flow_version(
 ) -> Result<FlowVersionSummary, String> {
     // Get current flow definition
     let flow_json = state
-        .checkpoint_db
-        .get_flow(&flow_id)?
+        .pg_db
+        .get_flow(&flow_id)
+        .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     // Create version
-    let version = state.checkpoint_db.create_flow_version(
+    let version = state.pg_db.create_flow_version(
         &flow_id,
         &flow_json,
         message.as_deref(),
         created_by.as_deref(),
-    )?;
+    ).await?;
 
     Ok(FlowVersionSummary {
         id: version["id"].as_str().unwrap_or("").to_string(),
@@ -1031,11 +1036,11 @@ pub fn create_flow_version(
 ///
 /// Returns version summaries (without full definitions) in descending order.
 #[tauri::command]
-pub fn list_flow_versions(
+pub async fn list_flow_versions(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
 ) -> Result<Vec<FlowVersionSummary>, String> {
-    let versions_json = state.checkpoint_db.list_flow_versions(&flow_id)?;
+    let versions_json = state.pg_db.list_flow_versions(&flow_id).await?;
 
     let summaries = versions_json
         .into_iter()
@@ -1056,12 +1061,12 @@ pub fn list_flow_versions(
 ///
 /// Returns the full version data including the flow definition.
 #[tauri::command]
-pub fn get_flow_version(
+pub async fn get_flow_version(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
     version: i32,
 ) -> Result<Option<FlowVersion>, String> {
-    let version_json = state.checkpoint_db.get_flow_version(&flow_id, version)?;
+    let version_json = state.pg_db.get_flow_version(&flow_id, version).await?;
 
     Ok(version_json.map(|v| FlowVersion {
         id: v["id"].as_str().unwrap_or("").to_string(),
@@ -1079,30 +1084,32 @@ pub fn get_flow_version(
 /// This creates a backup of the current state, then restores the flow
 /// to the specified version. Returns the new version number created.
 #[tauri::command]
-pub fn restore_flow_version(
+pub async fn restore_flow_version(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
     version: i32,
     created_by: Option<String>,
 ) -> Result<serde_json::Value, String> {
     state
-        .checkpoint_db
+        .pg_db
         .restore_flow_version(&flow_id, version, created_by.as_deref())
+        .await
 }
 
 /// Compare two versions of a flow.
 ///
 /// Returns the full definitions of both versions for client-side comparison.
 #[tauri::command]
-pub fn compare_flow_versions(
+pub async fn compare_flow_versions(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
     version1: i32,
     version2: i32,
 ) -> Result<FlowVersionComparison, String> {
     let comparison = state
-        .checkpoint_db
-        .compare_flow_versions(&flow_id, version1, version2)?;
+        .pg_db
+        .compare_flow_versions(&flow_id, version1, version2)
+        .await?;
 
     Ok(FlowVersionComparison {
         flow_id: comparison["flow_id"].as_str().unwrap_or("").to_string(),
@@ -1139,21 +1146,21 @@ pub fn compare_flow_versions(
 
 /// Delete a specific version of a flow.
 #[tauri::command]
-pub fn delete_flow_version(
+pub async fn delete_flow_version(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
     version: i32,
 ) -> Result<bool, String> {
-    state.checkpoint_db.delete_flow_version(&flow_id, version)
+    state.pg_db.delete_flow_version(&flow_id, version).await
 }
 
 /// Get the latest version number of a flow.
 #[tauri::command]
-pub fn get_latest_flow_version(
+pub async fn get_latest_flow_version(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
 ) -> Result<Option<i32>, String> {
-    state.checkpoint_db.get_latest_flow_version(&flow_id)
+    state.pg_db.get_latest_flow_version(&flow_id).await
 }
 
 // ============================================================================
@@ -1175,13 +1182,14 @@ pub struct FlowExport {
 ///
 /// Returns a JSON string that can be saved to a file.
 #[tauri::command]
-pub fn export_flow_json(
+pub async fn export_flow_json(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
 ) -> Result<String, String> {
     let flow_json = state
-        .checkpoint_db
-        .get_flow(&flow_id)?
+        .pg_db
+        .get_flow(&flow_id)
+        .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     let export = FlowExport {
@@ -1197,13 +1205,14 @@ pub fn export_flow_json(
 ///
 /// Returns a YAML string that can be saved to a file.
 #[tauri::command]
-pub fn export_flow_yaml(
+pub async fn export_flow_yaml(
     state: State<'_, Arc<AppState>>,
     flow_id: String,
 ) -> Result<String, String> {
     let flow_json = state
-        .checkpoint_db
-        .get_flow(&flow_id)?
+        .pg_db
+        .get_flow(&flow_id)
+        .await?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     let export = FlowExport {
@@ -1219,7 +1228,7 @@ pub fn export_flow_yaml(
 ///
 /// Returns the ID of the imported flow.
 #[tauri::command]
-pub fn import_flow_json(
+pub async fn import_flow_json(
     state: State<'_, Arc<AppState>>,
     content: String,
     generate_new_id: bool,
@@ -1245,7 +1254,7 @@ pub fn import_flow_json(
     // Save to database
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.checkpoint_db.save_flow(&flow_json)?;
+    state.pg_db.save_flow(&flow_json).await?;
 
     Ok(flow)
 }
@@ -1254,7 +1263,7 @@ pub fn import_flow_json(
 ///
 /// Returns the imported flow.
 #[tauri::command]
-pub fn import_flow_yaml(
+pub async fn import_flow_yaml(
     state: State<'_, Arc<AppState>>,
     content: String,
     generate_new_id: bool,
@@ -1283,21 +1292,21 @@ pub fn import_flow_yaml(
     // Save to database
     let flow_json =
         serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-    state.checkpoint_db.save_flow(&flow_json)?;
+    state.pg_db.save_flow(&flow_json).await?;
 
     Ok(flow)
 }
 
 /// Export multiple flows to a single JSON file.
 #[tauri::command]
-pub fn export_flows_bulk(
+pub async fn export_flows_bulk(
     state: State<'_, Arc<AppState>>,
     flow_ids: Vec<String>,
 ) -> Result<String, String> {
     let mut flows = Vec::new();
 
     for flow_id in flow_ids {
-        if let Some(flow_json) = state.checkpoint_db.get_flow(&flow_id)? {
+        if let Some(flow_json) = state.pg_db.get_flow(&flow_id).await? {
             flows.push(flow_json);
         }
     }
@@ -1313,7 +1322,7 @@ pub fn export_flows_bulk(
 
 /// Import multiple flows from a bulk export.
 #[tauri::command]
-pub fn import_flows_bulk(
+pub async fn import_flows_bulk(
     state: State<'_, Arc<AppState>>,
     content: String,
     generate_new_ids: bool,
@@ -1341,7 +1350,7 @@ pub fn import_flows_bulk(
 
         let flow_json =
             serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
-        state.checkpoint_db.save_flow(&flow_json)?;
+        state.pg_db.save_flow(&flow_json).await?;
 
         imported_flows.push(flow);
     }

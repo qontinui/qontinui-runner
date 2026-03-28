@@ -29,13 +29,14 @@ static REPLAY_MANAGER: Lazy<Mutex<ReplayManager>> = Lazy::new(|| Mutex::new(Repl
 
 /// List all checkpoints, optionally filtered by task ID.
 #[tauri::command]
-pub fn list_orchestrator_checkpoints(
+pub async fn list_orchestrator_checkpoints(
     state: State<'_, Arc<AppState>>,
     task_id: Option<String>,
 ) -> Result<Vec<CheckpointSummary>, String> {
     let checkpoints_json = state
-        .checkpoint_db
-        .get_orchestrator_checkpoints(task_id.as_deref())?;
+        .pg_db
+        .get_orchestrator_checkpoints(task_id.as_deref())
+        .await?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -63,11 +64,11 @@ pub fn list_orchestrator_checkpoints(
 
 /// Get a checkpoint by ID.
 #[tauri::command]
-pub fn get_orchestrator_checkpoint(
+pub async fn get_orchestrator_checkpoint(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<Option<Checkpoint>, String> {
-    let checkpoint_json = state.checkpoint_db.get_orchestrator_checkpoint(&id)?;
+    let checkpoint_json = state.pg_db.get_orchestrator_checkpoint(&id).await?;
 
     if let Some(cp) = checkpoint_json {
         // Deserialize the state snapshot from JSON
@@ -113,7 +114,7 @@ pub fn get_orchestrator_checkpoint(
 
 /// Create a manual checkpoint for a task.
 #[tauri::command]
-pub fn create_orchestrator_checkpoint(
+pub async fn create_orchestrator_checkpoint(
     app_state: State<'_, Arc<AppState>>,
     task_id: String,
     name: Option<String>,
@@ -137,45 +138,49 @@ pub fn create_orchestrator_checkpoint(
     };
 
     // Also save to in-memory manager for real-time operations
-    let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
-    let mut checkpoint =
-        Checkpoint::new(&task_id, snapshot.clone()).with_trigger(CheckpointTrigger::Manual);
+    let id = {
+        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        let mut checkpoint =
+            Checkpoint::new(&task_id, snapshot.clone()).with_trigger(CheckpointTrigger::Manual);
 
-    if let Some(ref n) = name {
-        checkpoint = checkpoint.with_name(n.clone());
-    }
-    if let Some(ref d) = description {
-        checkpoint = checkpoint.with_description(d.clone());
-    }
+        if let Some(ref n) = name {
+            checkpoint = checkpoint.with_name(n.clone());
+        }
+        if let Some(ref d) = description {
+            checkpoint = checkpoint.with_description(d.clone());
+        }
 
-    let id = manager.save(checkpoint);
+        manager.save(checkpoint)
+    }; // MutexGuard dropped here before .await
 
     // Persist to database
     let state_json = serde_json::to_value(&snapshot).unwrap_or(serde_json::json!(state));
-    app_state.checkpoint_db.save_orchestrator_checkpoint(
+    app_state.pg_db.save_orchestrator_checkpoint(
         &id,
         &task_id,
         iteration,
         "Manual",
         &state_json,
         name.as_deref(),
-    )?;
+    ).await?;
 
     Ok(id)
 }
 
 /// Delete a checkpoint by ID.
 #[tauri::command]
-pub fn delete_orchestrator_checkpoint(
+pub async fn delete_orchestrator_checkpoint(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<bool, String> {
     // Delete from in-memory manager
-    let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
-    manager.delete(&id);
+    {
+        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
+        manager.delete(&id);
+    } // MutexGuard dropped before .await
 
     // Delete from database
-    state.checkpoint_db.delete_orchestrator_checkpoint(&id)
+    state.pg_db.delete_orchestrator_checkpoint(&id).await
 }
 
 /// Find checkpoints by tag.
@@ -224,15 +229,15 @@ pub fn start_replay_session(checkpoint_id: String) -> Result<ReplaySession, Stri
 
 /// Get total checkpoint count.
 #[tauri::command]
-pub fn get_checkpoint_count(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
-    let checkpoints = state.checkpoint_db.get_orchestrator_checkpoints(None)?;
+pub async fn get_checkpoint_count(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
+    let checkpoints = state.pg_db.get_orchestrator_checkpoints(None).await?;
     Ok(checkpoints.len())
 }
 
 /// Get unique task IDs that have checkpoints.
 #[tauri::command]
-pub fn get_checkpoint_task_ids(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
-    state.checkpoint_db.get_checkpoint_task_ids()
+pub async fn get_checkpoint_task_ids(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    state.pg_db.get_checkpoint_task_ids().await
 }
 
 /// Clear all checkpoints (for testing/reset).
@@ -245,105 +250,113 @@ pub fn clear_all_checkpoints() -> Result<(), String> {
 
 /// Add sample checkpoints for demonstration.
 #[tauri::command]
-pub fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
-
+pub async fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let task_id = "sample-task-001";
 
-    // Create checkpoints for different iterations
-    for i in 1..=5 {
-        let state = match i {
-            1 => "Planning",
-            2 => "Executing",
-            3 => "Executing",
-            4 => "Verifying",
-            5 => "Completed",
-            _ => "Unknown",
-        };
+    // Collect items to save to PG after releasing the mutex
+    let mut pg_saves: Vec<(String, u32, String, serde_json::Value, Option<&'static str>)> = Vec::new();
 
-        let trigger = match i {
-            1 => CheckpointTrigger::IterationBoundary { iteration: i },
-            3 => CheckpointTrigger::Manual,
-            4 => CheckpointTrigger::VerificationBoundary,
-            5 => CheckpointTrigger::AfterSuccess {
-                operation: "Task completed".to_string(),
-            },
-            _ => CheckpointTrigger::Automatic {
-                reason: "Auto checkpoint".to_string(),
-            },
-        };
+    // Save to in-memory manager (sync, mutex held briefly)
+    {
+        let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
 
-        let trigger_str = match i {
-            1 => format!("IterationBoundary({})", i),
-            3 => "Manual".to_string(),
-            4 => "VerificationBoundary".to_string(),
-            5 => "AfterSuccess".to_string(),
-            _ => "Automatic".to_string(),
-        };
+        for i in 1..=5 {
+            let state = match i {
+                1 => "Planning",
+                2 => "Executing",
+                3 => "Executing",
+                4 => "Verifying",
+                5 => "Completed",
+                _ => "Unknown",
+            };
 
-        let snapshot = StateSnapshot {
-            state: state.to_string(),
-            iteration: i,
-            channels: HashMap::new(),
-            knowledge: (0..i)
-                .map(|j| crate::orchestrator::checkpoint::KnowledgeEntry {
-                    id: format!("knowledge-{}", j),
-                    category: "finding".to_string(),
-                    content: format!("Knowledge item {}", j),
-                    iteration: j,
-                })
-                .collect(),
-            verification: VerificationSnapshot {
-                criteria_results: HashMap::new(),
-                overall_passed: i >= 4,
-            },
-            findings: if i >= 2 {
-                vec![crate::orchestrator::checkpoint::FindingSnapshot {
-                    id: "finding-1".to_string(),
-                    category: "bug".to_string(),
-                    severity: "medium".to_string(),
-                    description: "Potential null pointer".to_string(),
-                    resolved: i >= 4,
-                }]
+            let trigger = match i {
+                1 => CheckpointTrigger::IterationBoundary { iteration: i },
+                3 => CheckpointTrigger::Manual,
+                4 => CheckpointTrigger::VerificationBoundary,
+                5 => CheckpointTrigger::AfterSuccess {
+                    operation: "Task completed".to_string(),
+                },
+                _ => CheckpointTrigger::Automatic {
+                    reason: "Auto checkpoint".to_string(),
+                },
+            };
+
+            let trigger_str = match i {
+                1 => format!("IterationBoundary({})", i),
+                3 => "Manual".to_string(),
+                4 => "VerificationBoundary".to_string(),
+                5 => "AfterSuccess".to_string(),
+                _ => "Automatic".to_string(),
+            };
+
+            let snapshot = StateSnapshot {
+                state: state.to_string(),
+                iteration: i,
+                channels: HashMap::new(),
+                knowledge: (0..i)
+                    .map(|j| crate::orchestrator::checkpoint::KnowledgeEntry {
+                        id: format!("knowledge-{}", j),
+                        category: "finding".to_string(),
+                        content: format!("Knowledge item {}", j),
+                        iteration: j,
+                    })
+                    .collect(),
+                verification: VerificationSnapshot {
+                    criteria_results: HashMap::new(),
+                    overall_passed: i >= 4,
+                },
+                findings: if i >= 2 {
+                    vec![crate::orchestrator::checkpoint::FindingSnapshot {
+                        id: "finding-1".to_string(),
+                        category: "bug".to_string(),
+                        severity: "medium".to_string(),
+                        description: "Potential null pointer".to_string(),
+                        resolved: i >= 4,
+                    }]
+                } else {
+                    vec![]
+                },
+                files_modified: if i >= 3 {
+                    vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+                } else {
+                    vec![]
+                },
+                custom_data: HashMap::new(),
+            };
+
+            let name: Option<&'static str> = if i == 3 {
+                Some("Before risky change")
             } else {
-                vec![]
-            },
-            files_modified: if i >= 3 {
-                vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
-            } else {
-                vec![]
-            },
-            custom_data: HashMap::new(),
-        };
+                None
+            };
 
-        let name = if i == 3 {
-            Some("Before risky change")
-        } else {
-            None
-        };
+            let mut checkpoint = Checkpoint::new(task_id, snapshot.clone())
+                .with_trigger(trigger)
+                .with_tag("sample");
 
-        let mut checkpoint = Checkpoint::new(task_id, snapshot.clone())
-            .with_trigger(trigger)
-            .with_tag("sample");
+            if i == 3 {
+                checkpoint = checkpoint
+                    .with_name("Before risky change")
+                    .with_description("Saving state before attempting database migration");
+            }
 
-        if i == 3 {
-            checkpoint = checkpoint
-                .with_name("Before risky change")
-                .with_description("Saving state before attempting database migration");
+            let id = manager.save(checkpoint);
+            let state_json = serde_json::to_value(&snapshot).unwrap_or(serde_json::json!(state));
+            pg_saves.push((id, i, trigger_str, state_json, name));
         }
+    } // MutexGuard dropped here
 
-        let id = manager.save(checkpoint);
-
-        // Also save to database
-        let state_json = serde_json::to_value(&snapshot).unwrap_or(serde_json::json!(state));
-        let _ = app_state.checkpoint_db.save_orchestrator_checkpoint(
-            &id,
+    // Now persist to PG (async, no mutex held)
+    for (id, i, trigger_str, state_json, name) in &pg_saves {
+        let _ = app_state.pg_db.save_orchestrator_checkpoint(
+            id,
             task_id,
-            i,
-            &trigger_str,
-            &state_json,
-            name,
-        );
+            *i,
+            trigger_str,
+            state_json,
+            *name,
+        ).await;
     }
 
     Ok(())
@@ -359,9 +372,9 @@ pub struct CheckpointStats {
 
 /// Get checkpoint statistics.
 #[tauri::command]
-pub fn get_checkpoint_stats(state: State<'_, Arc<AppState>>) -> Result<CheckpointStats, String> {
-    let checkpoints = state.checkpoint_db.get_orchestrator_checkpoints(None)?;
-    let task_ids = state.checkpoint_db.get_checkpoint_task_ids()?;
+pub async fn get_checkpoint_stats(state: State<'_, Arc<AppState>>) -> Result<CheckpointStats, String> {
+    let checkpoints = state.pg_db.get_orchestrator_checkpoints(None).await?;
+    let task_ids = state.pg_db.get_checkpoint_task_ids().await?;
 
     let mut by_trigger: HashMap<String, usize> = HashMap::new();
     for cp in &checkpoints {
@@ -591,15 +604,15 @@ pub struct PaginatedCheckpointResult {
 
 /// Get checkpoints with optional filtering.
 #[tauri::command]
-pub fn get_checkpoints_filtered(
+pub async fn get_checkpoints_filtered(
     state: State<'_, Arc<AppState>>,
     filter: CheckpointFilter,
 ) -> Result<Vec<CheckpointSummary>, String> {
-    let checkpoints_json = state.checkpoint_db.get_checkpoints_filtered(
+    let checkpoints_json = state.pg_db.get_checkpoints_filtered(
         filter.task_id.as_deref(),
         filter.trigger.as_deref(),
         filter.since.as_deref(),
-    )?;
+    ).await?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -627,7 +640,7 @@ pub fn get_checkpoints_filtered(
 
 /// Get checkpoints with pagination.
 #[tauri::command]
-pub fn get_checkpoints_paginated(
+pub async fn get_checkpoints_paginated(
     state: State<'_, Arc<AppState>>,
     task_id: Option<String>,
     offset: i64,
@@ -635,8 +648,9 @@ pub fn get_checkpoints_paginated(
 ) -> Result<PaginatedCheckpointResult, String> {
     let checkpoints_json =
         state
-            .checkpoint_db
-            .get_checkpoints_paginated(task_id.as_deref(), offset, limit)?;
+            .pg_db
+            .get_checkpoints_paginated(task_id.as_deref(), offset, limit)
+            .await?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -660,8 +674,9 @@ pub fn get_checkpoints_paginated(
         .collect();
 
     let total = state
-        .checkpoint_db
-        .get_checkpoints_count(task_id.as_deref())?;
+        .pg_db
+        .get_checkpoints_count(task_id.as_deref())
+        .await?;
 
     Ok(PaginatedCheckpointResult {
         items: summaries,
@@ -673,11 +688,12 @@ pub fn get_checkpoints_paginated(
 
 /// Get total count of checkpoints.
 #[tauri::command]
-pub fn get_checkpoints_count(
+pub async fn get_checkpoints_count(
     state: State<'_, Arc<AppState>>,
     task_id: Option<String>,
 ) -> Result<i64, String> {
     state
-        .checkpoint_db
+        .pg_db
         .get_checkpoints_count(task_id.as_deref())
+        .await
 }

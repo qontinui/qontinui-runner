@@ -355,14 +355,7 @@ impl SetupExecutor {
                                 if let Err(e) = self.app_state.pg_db.append_task_output_ex(execution_id, &formatted, false, false).await {
                                     warn!("PG append_task_output_ex failed: {}", e);
                                 }
-                                if let Err(e) = self.checkpoint_db.append_task_output_ex(
-                                    execution_id,
-                                    &formatted,
-                                    false,
-                                    false,
-                                ) {
-                                    warn!("Failed to persist setup response-mode AI output to chunks: {}", e);
-                                }
+                                // PG write already done above; SQLite fallback removed
                             }
                             // Save completion checkpoint
                             let mut resp_checkpoint = StepCheckpoint::new(

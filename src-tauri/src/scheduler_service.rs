@@ -25,7 +25,7 @@ pub struct SchedulerService {
     /// Database handle for scheduler persistence
     db: Arc<CheckpointDb>,
     /// PostgreSQL database for activity timeline and watchers (optional)
-    pg_db: Arc<PgDb>,
+    pg_db: Option<Arc<PgDb>>,
     /// Flag to stop the service
     stop_signal: Arc<AtomicBool>,
     /// Currently running task IDs
@@ -36,10 +36,10 @@ pub struct SchedulerService {
 
 impl SchedulerService {
     /// Create a new scheduler service
-    pub fn new(db: Arc<CheckpointDb>, pg_db: Arc<PgDb>) -> Self {
+    pub fn new(db: Arc<CheckpointDb>, pg_db: impl Into<Option<Arc<PgDb>>>) -> Self {
         Self {
             db,
-            pg_db,
+            pg_db: pg_db.into(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
             check_interval_secs: 60, // Check every minute
@@ -685,7 +685,8 @@ After making fixes, run tests if applicable to verify the fixes work."#
         &self,
         watcher_id: &str,
     ) -> Result<(bool, Option<String>), String> {
-        let pg = &self.pg_db;
+        let pg = self.pg_db.as_ref()
+            .ok_or_else(|| "PostgreSQL database not configured; cannot execute watcher".to_string())?;
 
         // 1. Load watcher definition
         let watcher = pg

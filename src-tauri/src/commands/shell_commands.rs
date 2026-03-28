@@ -21,7 +21,6 @@ use std::time::Instant;
 use tauri::State;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 // ============================================================================
 // Request/Response Types
@@ -98,6 +97,28 @@ pub struct ShellCommandResult {
     pub stderr: String,
     pub duration_ms: i64,
     pub executed_at: String,
+}
+
+// ============================================================================
+// Conversion Helpers
+// ============================================================================
+
+/// Convert a PG ShellCommand to the local ShellCommand type.
+fn pg_shell_command_to_local(pg: &crate::database::types::ShellCommand) -> ShellCommand {
+    ShellCommand {
+        id: pg.id.clone(),
+        name: pg.name.clone(),
+        description: pg.description.clone(),
+        command: pg.command.clone(),
+        working_directory: pg.working_directory.clone(),
+        timeout_seconds: pg.timeout_seconds,
+        fail_on_error: pg.fail_on_error,
+        category: Some(pg.category.clone()),
+        tags: pg.tags.clone(),
+        enabled: pg.enabled,
+        created_at: pg.created_at.clone(),
+        updated_at: pg.updated_at.clone(),
+    }
 }
 
 // ============================================================================
@@ -182,55 +203,37 @@ pub async fn create_shell_command(
 ) -> Result<CommandResponse, String> {
     info!("Creating shell command: {}", input.name);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-
-    let tags_json = serde_json::to_string(&input.tags.unwrap_or_default())
-        .map_err(|e| format!("Failed to serialize tags: {}", e))?;
-
     let timeout_seconds = input
         .timeout_seconds
         .unwrap_or_else(default_timeout_seconds);
     let fail_on_error = input.fail_on_error.unwrap_or_else(default_fail_on_error);
 
-    conn.execute(
-        r#"
-        INSERT INTO shell_commands (
-            id, name, description, command, working_directory,
-            timeout_seconds, fail_on_error, category, tags,
-            enabled, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-        "#,
-        params![
-            id,
-            input.name,
-            input.description,
-            input.command,
-            input.working_directory,
-            timeout_seconds,
-            fail_on_error,
-            input.category,
-            tags_json,
-            true, // enabled by default
-            now,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to create shell command: {}", e))?;
+    let pg_input = crate::database::types::CreateShellCommandInput {
+        name: input.name.clone(),
+        description: input.description,
+        command: input.command,
+        working_directory: input.working_directory,
+        timeout_seconds,
+        fail_on_error,
+        category: input.category.unwrap_or_else(|| "general".to_string()),
+        tags: input.tags.unwrap_or_default(),
+        enabled: true,
+    };
 
-    info!("Created shell command: {} ({})", input.name, id);
+    let pg_cmd = state.pg_db.create_shell_command(&pg_input).await?;
 
-    // Fetch the created command
-    drop(conn);
-    get_shell_command(id, state).await
+    info!("Created shell command: {} ({})", pg_cmd.name, pg_cmd.id);
+
+    let shell_command = pg_shell_command_to_local(&pg_cmd);
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Shell command found".to_string()),
+        data: Some(
+            serde_json::to_value(&shell_command)
+                .map_err(|e| format!("Failed to serialize shell command: {}", e))?,
+        ),
+    })
 }
 
 /// Get a single shell command by ID.
@@ -248,72 +251,9 @@ pub async fn get_shell_command(
 ) -> Result<CommandResponse, String> {
     info!("Getting shell command: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    let result = conn.query_row(
-        r#"
-        SELECT id, name, description, command, working_directory,
-               timeout_seconds, fail_on_error, category, tags,
-               enabled, created_at, updated_at
-        FROM shell_commands
-        WHERE id = ?1
-        "#,
-        params![id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // id
-                row.get::<_, String>(1)?,         // name
-                row.get::<_, Option<String>>(2)?, // description
-                row.get::<_, String>(3)?,         // command
-                row.get::<_, Option<String>>(4)?, // working_directory
-                row.get::<_, i32>(5)?,            // timeout_seconds
-                row.get::<_, bool>(6)?,           // fail_on_error
-                row.get::<_, Option<String>>(7)?, // category
-                row.get::<_, String>(8)?,         // tags
-                row.get::<_, bool>(9)?,           // enabled
-                row.get::<_, String>(10)?,        // created_at
-                row.get::<_, String>(11)?,        // updated_at
-            ))
-        },
-    );
-
-    match result {
-        Ok((
-            id,
-            name,
-            description,
-            command,
-            working_directory,
-            timeout_seconds,
-            fail_on_error,
-            category,
-            tags_str,
-            enabled,
-            created_at,
-            updated_at,
-        )) => {
-            let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
-
-            let shell_command = ShellCommand {
-                id,
-                name,
-                description,
-                command,
-                working_directory,
-                timeout_seconds,
-                fail_on_error,
-                category,
-                tags,
-                enabled,
-                created_at,
-                updated_at,
-            };
+    match state.pg_db.get_shell_command(&id).await? {
+        Some(pg_cmd) => {
+            let shell_command = pg_shell_command_to_local(&pg_cmd);
 
             Ok(CommandResponse {
                 success: true,
@@ -324,12 +264,11 @@ pub async fn get_shell_command(
                 ),
             })
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(CommandResponse {
+        None => Ok(CommandResponse {
             success: false,
             message: Some(format!("Shell command not found: {}", id)),
             data: None,
         }),
-        Err(e) => Err(format!("Failed to query shell command: {}", e)),
     }
 }
 
@@ -597,19 +536,9 @@ pub async fn delete_shell_command(
 ) -> Result<CommandResponse, String> {
     info!("Deleting shell command: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    let deleted = state.pg_db.delete_shell_command(&id).await?;
 
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    let affected = conn
-        .execute("DELETE FROM shell_commands WHERE id = ?1", params![id])
-        .map_err(|e| format!("Failed to delete shell command: {}", e))?;
-
-    if affected == 0 {
+    if !deleted {
         return Ok(CommandResponse {
             success: false,
             message: Some(format!("Shell command not found: {}", id)),
@@ -647,47 +576,25 @@ pub async fn execute_shell_command(
 ) -> Result<CommandResponse, String> {
     info!("Executing shell command: {}", id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
+    // Get the shell command from PG
+    let pg_cmd = match state.pg_db.get_shell_command(&id).await? {
+        Some(cmd) => cmd,
+        None => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Shell command not found: {}", id)),
+                data: None,
+            });
+        }
+    };
 
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
-    // Get the shell command
-    let result = conn.query_row(
-        r#"
-        SELECT id, name, command, working_directory, timeout_seconds, fail_on_error, enabled
-        FROM shell_commands
-        WHERE id = ?1
-        "#,
-        params![id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // id
-                row.get::<_, String>(1)?,         // name
-                row.get::<_, String>(2)?,         // command
-                row.get::<_, Option<String>>(3)?, // working_directory
-                row.get::<_, i32>(4)?,            // timeout_seconds
-                row.get::<_, bool>(5)?,           // fail_on_error
-                row.get::<_, bool>(6)?,           // enabled
-            ))
-        },
-    );
-
-    let (cmd_id, name, command, working_directory, timeout_seconds, fail_on_error, enabled) =
-        match result {
-            Ok(v) => v,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                return Ok(CommandResponse {
-                    success: false,
-                    message: Some(format!("Shell command not found: {}", id)),
-                    data: None,
-                });
-            }
-            Err(e) => return Err(format!("Failed to query shell command: {}", e)),
-        };
+    let cmd_id = pg_cmd.id.clone();
+    let name = pg_cmd.name.clone();
+    let command = pg_cmd.command.clone();
+    let working_directory = pg_cmd.working_directory.clone();
+    let timeout_seconds = pg_cmd.timeout_seconds;
+    let fail_on_error = pg_cmd.fail_on_error;
+    let enabled = pg_cmd.enabled;
 
     // Check if enabled
     if !enabled {
@@ -810,29 +717,25 @@ pub async fn execute_shell_command(
         (success, exit_code, stdout, stderr, duration_ms)
     };
 
-    // Store the result in the database
-    let result_id = Uuid::new_v4().to_string();
-    let executed_at = Utc::now().to_rfc3339();
+    // Store the result in PG
+    let status_str = if success { "success" } else { "failed" };
+    let started_at_str = Utc::now().to_rfc3339();
 
-    if let Err(e) = conn.execute(
-        r#"
-        INSERT INTO shell_command_results (
-            id, shell_command_id, task_run_id, success, exit_code,
-            stdout, stderr, duration_ms, executed_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-        "#,
-        params![
-            result_id,
-            cmd_id,
-            task_run_id,
-            success,
+    if let Err(e) = state
+        .pg_db
+        .save_shell_command_result(
+            &cmd_id,
+            status_str,
             exit_code,
-            stdout,
-            stderr,
-            duration_ms as i64,
-            executed_at,
-        ],
-    ) {
+            Some(&stdout),
+            Some(&stderr),
+            Some(duration_ms as i64),
+            Some(&started_at_str),
+            Some(&started_at_str),
+            task_run_id.as_deref(),
+        )
+        .await
+    {
         error!("Failed to store shell command result: {}", e);
     }
 
@@ -887,78 +790,17 @@ pub async fn get_shell_command_results(
 ) -> Result<CommandResponse, String> {
     info!("Getting results for shell command: {}", shell_command_id);
 
-    let conn = state
-        .checkpoint_db
-        .connection()
-        .map_err(|e| format!("Failed to get connection: {}", e))?;
-
-    // Ensure tables exist
-    ensure_shell_commands_tables(&conn)?;
-
     let limit = limit.unwrap_or(10);
-
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT id, shell_command_id, task_run_id, success, exit_code,
-                   stdout, stderr, duration_ms, executed_at
-            FROM shell_command_results
-            WHERE shell_command_id = ?1
-            ORDER BY executed_at DESC
-            LIMIT ?2
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let results_iter = stmt
-        .query_map(params![shell_command_id, limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // id
-                row.get::<_, String>(1)?,         // shell_command_id
-                row.get::<_, Option<String>>(2)?, // task_run_id
-                row.get::<_, bool>(3)?,           // success
-                row.get::<_, Option<i32>>(4)?,    // exit_code
-                row.get::<_, String>(5)?,         // stdout
-                row.get::<_, String>(6)?,         // stderr
-                row.get::<_, i64>(7)?,            // duration_ms
-                row.get::<_, String>(8)?,         // executed_at
-            ))
-        })
-        .map_err(|e| format!("Failed to query shell command results: {}", e))?;
-
-    let mut results: Vec<ShellCommandResult> = Vec::new();
-
-    for result in results_iter {
-        let (
-            id,
-            shell_command_id,
-            task_run_id,
-            success,
-            exit_code,
-            stdout,
-            stderr,
-            duration_ms,
-            executed_at,
-        ) = result.map_err(|e| format!("Failed to read result row: {}", e))?;
-
-        results.push(ShellCommandResult {
-            id,
-            shell_command_id,
-            task_run_id,
-            success,
-            exit_code,
-            stdout,
-            stderr,
-            duration_ms,
-            executed_at,
-        });
-    }
+    let pg_results = state
+        .pg_db
+        .get_shell_command_results(&shell_command_id, limit)
+        .await?;
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Found {} results", results.len())),
+        message: Some(format!("Found {} results", pg_results.len())),
         data: Some(
-            serde_json::to_value(&results)
+            serde_json::to_value(&pg_results)
                 .map_err(|e| format!("Failed to serialize results: {}", e))?,
         ),
     })

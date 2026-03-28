@@ -83,6 +83,7 @@ const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard
 const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
 const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHealthDashboard").then(m => ({ default: m.AutomationHealthDashboard })));
 const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser").then(m => ({ default: m.ObservationBrowser })));
+const MemoryHealthPanel = lazy(() => import("../observations/MemoryHealthPanel").then(m => ({ default: m.MemoryHealthPanel })));
 const ActivityTimelinePanel = lazy(() => import("../activity-timeline/ActivityTimelinePanel").then(m => ({ default: m.ActivityTimelinePanel })));
 const WatcherManagementPanel = lazy(() => import("../activity-timeline/WatcherManagementPanel").then(m => ({ default: m.WatcherManagementPanel })));
 const DemoVideoPanel = lazy(() => import("../demo-video/DemoVideoPanel").then(m => ({ default: m.DemoVideoPanel })));
@@ -91,6 +92,7 @@ const TourCatalog = lazy(() => import("../product-tour/TourCatalog").then(m => (
 const SessionRecapPage = lazy(() => import("../session-recap/SessionRecapPage").then(m => ({ default: m.SessionRecapPage })));
 const ApiSurfacePage = lazy(() => import("../api-surface/ApiSurfacePage").then(m => ({ default: m.ApiSurfacePage })));
 const DecisionTrailPage = lazy(() => import("../decision-trail/DecisionTrailPage").then(m => ({ default: m.DecisionTrailPage })));
+const MemorySearchPanel = lazy(() => import("../memory-search").then(m => ({ default: m.MemorySearchPanel })));
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({ id, name, description }: { id: string; name: string; description: string }) {
@@ -265,11 +267,18 @@ export function TabContent({
 
     case "observations":
       return (
-        <div className="h-full overflow-hidden">
+        <div className="h-full overflow-auto">
           <PageRegistration id="observations" name="Memory" description="Cross-session observation memory from past automation runs" />
-          <Suspense fallback={<LazyFallback />}>
-            <ObservationBrowser projectId={projectSelection.selectedProjectId} />
-          </Suspense>
+          <div className="border-b p-4">
+            <Suspense fallback={<LazyFallback />}>
+              <MemoryHealthPanel />
+            </Suspense>
+          </div>
+          <div className="h-full overflow-hidden">
+            <Suspense fallback={<LazyFallback />}>
+              <ObservationBrowser projectId={projectSelection.selectedProjectId} />
+            </Suspense>
+          </div>
         </div>
       );
 
@@ -870,6 +879,16 @@ export function TabContent({
           <PageRegistration id="api-surface" name="API Surface Map" description="Interactive map of every endpoint, command, query, and their connections — shows orphaned endpoints" />
           <Suspense fallback={<LazyFallback />}>
             <ApiSurfacePage />
+          </Suspense>
+        </div>
+      );
+
+    case "memory-search":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration id="memory-search" name="Memory Search" description="Unified memory retrieval with RRF fusion" />
+          <Suspense fallback={<LazyFallback />}>
+            <MemorySearchPanel />
           </Suspense>
         </div>
       );

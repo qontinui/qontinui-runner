@@ -167,10 +167,7 @@ impl StepEventLogger {
                 }
             });
         }
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-            warn!("Failed to log step start event: {}", e);
-            return Err(LogError::DatabaseError(e.to_string()));
-        }
+        // PG write already done above via tokio::spawn; SQLite fallback removed
 
         // Record successful logging
         self.tracker.record_start(&key);
@@ -219,10 +216,7 @@ impl StepEventLogger {
                 }
             });
         }
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-            warn!("Failed to log step complete event: {}", e);
-            return Err(LogError::DatabaseError(e.to_string()));
-        }
+        // PG write already done above via tokio::spawn; SQLite fallback removed
 
         // Record successful logging
         self.tracker.record_end(&key);
@@ -272,10 +266,7 @@ impl StepEventLogger {
                 }
             });
         }
-        if let Err(e) = self.checkpoint_db.create_task_run_event(&event) {
-            warn!("Failed to log step error event: {}", e);
-            return Err(LogError::DatabaseError(e.to_string()));
-        }
+        // PG write already done above via tokio::spawn; SQLite fallback removed
 
         // Record successful logging
         self.tracker.record_end(&key);
