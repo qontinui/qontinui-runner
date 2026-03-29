@@ -4,6 +4,7 @@
 //! AI reasoning. Inspired by haizelabs/verdict. Each judge evaluates one
 //! dimension and returns a score with natural language reasoning.
 
+use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -13,7 +14,13 @@ use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
 use crate::workflow_generation::generator::extract_json_from_response;
 use crate::workflow_generation::specification::AcceptanceCriterion;
+use super::cache::EntailmentCache;
 use super::{DimensionScore, EvaluationDimension, ScoringTier};
+
+fn entailment_cache() -> &'static Mutex<EntailmentCache> {
+    static CACHE: std::sync::OnceLock<Mutex<EntailmentCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(EntailmentCache::default_cache()))
+}
 
 // ============================================================================
 // Types
@@ -107,6 +114,19 @@ pub fn run_judge_pipeline(
     scores
 }
 
+/// Get entailment cache statistics.
+pub fn get_cache_stats() -> super::cache::CacheStats {
+    entailment_cache()
+        .lock()
+        .map(|c| c.stats())
+        .unwrap_or(super::cache::CacheStats {
+            total_entries: 0,
+            valid_entries: 0,
+            max_size: 0,
+            ttl_seconds: 0,
+        })
+}
+
 // ============================================================================
 // Individual Judges
 // ============================================================================
@@ -134,6 +154,26 @@ fn run_entailment_judge(
             });
         }
     };
+
+    let step_type = step_summary.lines().next().unwrap_or("unknown");
+
+    // Check entailment cache first
+    if let Ok(cache) = entailment_cache().lock() {
+        if let Some(cached) = cache.get(&criterion.description, step_summary, step_type) {
+            debug!(
+                "Entailment cache hit for criterion '{}': score={:.2}",
+                criterion.id, cached.score
+            );
+            return Some(DimensionScore {
+                dimension: EvaluationDimension::Entailment,
+                score: cached.score,
+                confidence: 0.85,
+                tier: cached.tier,
+                explanation: Some(cached.explanation.clone()),
+                evidence: Vec::new(),
+            });
+        }
+    }
 
     let prompt = format!(
         r#"You are evaluating whether a verification step actually PROVES its acceptance criterion is satisfied.
@@ -189,10 +229,23 @@ Respond with ONLY a JSON object:
     }
 
     let verdict = parse_judge_response(&response.output)?;
+    let score = verdict.score.clamp(0.0, 1.0);
+
+    // Store in entailment cache
+    if let Ok(mut cache) = entailment_cache().lock() {
+        cache.put(
+            &criterion.description,
+            step_summary,
+            step_type,
+            score,
+            verdict.reasoning.clone(),
+            ScoringTier::Judge,
+        );
+    }
 
     Some(DimensionScore {
         dimension: EvaluationDimension::Entailment,
-        score: verdict.score.clamp(0.0, 1.0),
+        score,
         confidence: 0.85,
         tier: ScoringTier::Judge,
         explanation: Some(verdict.reasoning),

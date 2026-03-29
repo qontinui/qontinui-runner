@@ -10,7 +10,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::Json,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde::Deserialize;
@@ -183,6 +183,13 @@ async fn repair_guidance_handler(
     Ok(Json(ApiResponse::success(result)))
 }
 
+async fn cache_stats_handler(
+    State(_state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<crate::workflow_generation::evaluation::cache::CacheStats>> {
+    let stats = crate::workflow_generation::evaluation::judges::get_cache_stats();
+    Json(ApiResponse::success(stats))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -200,5 +207,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/evaluation/repair-guidance",
             post(repair_guidance_handler),
+        )
+        .route(
+            "/evaluation/cache-stats",
+            get(cache_stats_handler),
         )
 }

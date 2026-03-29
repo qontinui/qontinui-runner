@@ -1533,14 +1533,19 @@ CREATE INDEX IF NOT EXISTS idx_task_hooks_trigger ON task_hooks(trigger_event);
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    schedule TEXT NOT NULL,
-    workflow_id TEXT,
-    workflow_name TEXT,
+    description TEXT,
     enabled BOOLEAN NOT NULL DEFAULT true,
-    last_run_at TIMESTAMPTZ,
-    next_run_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    schedule_type TEXT NOT NULL DEFAULT 'cron',
+    schedule_value TEXT NOT NULL DEFAULT '',
+    task_config TEXT NOT NULL DEFAULT '{}',
+    skip_if_completed BOOLEAN NOT NULL DEFAULT false,
+    auto_fix_on_failure BOOLEAN NOT NULL DEFAULT false,
+    success_criteria TEXT,
+    created_at TEXT NOT NULL,
+    modified_at TEXT NOT NULL,
+    next_run TEXT,
+    last_run_id TEXT,
+    condition_status TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled ON scheduled_tasks(enabled);
 

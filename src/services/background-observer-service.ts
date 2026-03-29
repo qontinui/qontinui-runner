@@ -58,7 +58,35 @@ export function startBackgroundObserver(): void {
 
   const deps: BackgroundObserverDeps = {
     snapshotManager,
-    createControlSnapshot: () => (registry as { captureSnapshot: () => ControlSnapshot }).captureSnapshot(),
+    createControlSnapshot: (): ControlSnapshot => {
+      const elements = registry.getAllElements();
+      const components = registry.getAllComponents();
+      const workflows = registry.getAllWorkflows();
+      return {
+        timestamp: Date.now(),
+        elements: elements.map((el) => ({
+          id: el.id,
+          type: el.type,
+          label: el.label,
+          actions: [...el.actions, ...(el.customActions ? Object.keys(el.customActions) : [])],
+          state: el.getState(),
+          category: el.category,
+          contentMetadata: el.contentMetadata,
+          mediaMetadata: el.mediaMetadata,
+        })),
+        components: components.map((comp) => ({
+          id: comp.id,
+          name: comp.name,
+          actions: comp.actions.map((a) => a.id),
+        })),
+        workflows: workflows.map((wf) => ({
+          id: wf.id,
+          name: wf.name,
+          stepCount: wf.steps.length,
+        })),
+        activeRuns: [],
+      };
+    },
     onCapture: persistCapture,
   };
 

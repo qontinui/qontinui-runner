@@ -46,12 +46,19 @@ impl SchedulerService {
         }
     }
 
+    /// Get a reference to the PgDb, or an error if not configured.
+    fn pg(&self) -> Result<&PgDb, String> {
+        self.pg_db
+            .as_deref()
+            .ok_or_else(|| "PostgreSQL database not configured for scheduler".to_string())
+    }
+
     /// Start the scheduler loop (runs in background)
     pub async fn start(&self) {
         info!("Starting scheduler service");
 
         // Update all next_run times on startup
-        if let Err(e) = self.update_all_next_runs_db() {
+        if let Err(e) = self.update_all_next_runs_db().await {
             error!("Failed to update next run times: {}", e);
         }
 
@@ -73,8 +80,9 @@ impl SchedulerService {
     }
 
     /// Update next_run for all tasks (DB-backed replacement for scheduler::update_all_next_runs)
-    fn update_all_next_runs_db(&self) -> Result<(), String> {
-        let tasks = self.db.get_all_scheduled_tasks()?;
+    async fn update_all_next_runs_db(&self) -> Result<(), String> {
+        let pg = self.pg()?;
+        let tasks = pg.get_all_scheduled_tasks().await?;
         let now = chrono::Utc::now();
 
         for task in &tasks {
@@ -83,7 +91,7 @@ impl SchedulerService {
             } else {
                 None
             };
-            self.db.update_task_next_run(&task.id, next.as_deref())?;
+            pg.update_task_next_run(&task.id, next.as_deref()).await?;
         }
 
         Ok(())
@@ -91,7 +99,15 @@ impl SchedulerService {
 
     /// Check and execute due tasks
     async fn tick(&self) {
-        let settings = match self.db.get_scheduler_settings() {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => {
+                error!("Scheduler tick: {}", e);
+                return;
+            }
+        };
+
+        let settings = match pg.get_scheduler_settings().await {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to load scheduler settings: {}", e);
@@ -104,7 +120,7 @@ impl SchedulerService {
             return;
         }
 
-        let tasks = match self.db.get_all_scheduled_tasks() {
+        let tasks = match pg.get_all_scheduled_tasks().await {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to load scheduled tasks: {}", e);
@@ -196,7 +212,7 @@ impl SchedulerService {
             // For Condition schedule tasks, check rearm delay.
             if matches!(task.schedule, crate::scheduler::ScheduleExpression::Condition(_)) {
                 if task.last_run.is_none() {
-                    if let Ok(history) = self.db.get_execution_history(&task.id, 1) {
+                    if let Ok(history) = pg.get_execution_history(&task.id, 1).await {
                         if let Some(latest) = history.into_iter().next() {
                             task.last_run = Some(latest);
                         }
@@ -226,9 +242,9 @@ impl SchedulerService {
                         task.name, status.idle_met, status.repo_inactive_met
                     );
                     let status_json = serde_json::to_string(&status).ok();
-                    if let Err(e) = self
-                        .db
+                    if let Err(e) = pg
                         .update_task_condition_status(&task.id, status_json.as_deref())
+                        .await
                     {
                         error!("Failed to update condition status: {}", e);
                     }
@@ -236,7 +252,7 @@ impl SchedulerService {
                 }
 
                 // Conditions met - clear status before execution
-                if let Err(e) = self.db.update_task_condition_status(&task.id, None) {
+                if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
                     error!("Failed to clear condition status: {}", e);
                 }
                 info!("Scheduler: Task '{}' conditions met, executing", task.name);
@@ -249,16 +265,20 @@ impl SchedulerService {
 
     /// Record a skipped execution
     async fn record_skipped(&self, task: &ScheduledTask) {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => { error!("record_skipped: {}", e); return; }
+        };
         let mut record = TaskExecutionRecord::new();
         record.status = ScheduledTaskStatus::Skipped;
         record.ended_at = Some(chrono::Utc::now().to_rfc3339());
 
-        if let Err(e) = self.db.insert_execution_record(&task.id, &record) {
+        if let Err(e) = pg.insert_execution_record(&task.id, &record).await {
             error!("Failed to record skipped execution: {}", e);
         }
-        if let Err(e) = self
-            .db
+        if let Err(e) = pg
             .update_task_last_run(&task.id, Some(&record.execution_id))
+            .await
         {
             error!("Failed to update task last_run: {}", e);
         }
@@ -363,14 +383,18 @@ impl SchedulerService {
         }
 
         // Record the execution
-        if let Err(e) = self.db.insert_execution_record(&task_id, &record) {
-            error!("Failed to record execution: {}", e);
-        }
-        if let Err(e) = self
-            .db
-            .update_task_last_run(&task_id, Some(&record.execution_id))
-        {
-            error!("Failed to update task last_run: {}", e);
+        if let Ok(pg) = self.pg() {
+            if let Err(e) = pg.insert_execution_record(&task_id, &record).await {
+                error!("Failed to record execution: {}", e);
+            }
+            if let Err(e) = pg
+                .update_task_last_run(&task_id, Some(&record.execution_id))
+                .await
+            {
+                error!("Failed to update task last_run: {}", e);
+            }
+        } else {
+            error!("PG not configured, cannot record execution for {}", task_id);
         }
 
         // Update next_run
@@ -385,7 +409,11 @@ impl SchedulerService {
 
     /// Update the next_run time for a task (DB-backed)
     async fn update_task_next_run_db(&self, task_id: &str) {
-        let task = match self.db.get_scheduled_task(task_id) {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => { error!("update_task_next_run_db: {}", e); return; }
+        };
+        let task = match pg.get_scheduled_task(task_id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
                 error!("Task not found for next_run update: {}", task_id);
@@ -400,7 +428,7 @@ impl SchedulerService {
         let now = chrono::Utc::now();
         let next = compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339());
 
-        if let Err(e) = self.db.update_task_next_run(task_id, next.as_deref()) {
+        if let Err(e) = pg.update_task_next_run(task_id, next.as_deref()).await {
             error!("Failed to update task next_run: {}", e);
         }
     }
@@ -955,23 +983,27 @@ impl SchedulerService {
 
     /// Record a condition timeout execution
     async fn record_condition_timeout(&self, task: &ScheduledTask) {
+        let pg = match self.pg() {
+            Ok(pg) => pg,
+            Err(e) => { error!("record_condition_timeout: {}", e); return; }
+        };
         let mut record = TaskExecutionRecord::new();
         record.status = ScheduledTaskStatus::Skipped;
         record.ended_at = Some(chrono::Utc::now().to_rfc3339());
         record.error_message = Some("Condition timeout exceeded".to_string());
 
-        if let Err(e) = self.db.insert_execution_record(&task.id, &record) {
+        if let Err(e) = pg.insert_execution_record(&task.id, &record).await {
             error!("Failed to record condition timeout: {}", e);
         }
-        if let Err(e) = self
-            .db
+        if let Err(e) = pg
             .update_task_last_run(&task.id, Some(&record.execution_id))
+            .await
         {
             error!("Failed to update task last_run: {}", e);
         }
 
         // Clear condition status
-        if let Err(e) = self.db.update_task_condition_status(&task.id, None) {
+        if let Err(e) = pg.update_task_condition_status(&task.id, None).await {
             error!("Failed to clear condition status: {}", e);
         }
 
@@ -1093,10 +1125,11 @@ pub async fn run_task_now(task_id: &str) -> Result<(), String> {
         .clone();
     drop(service_guard);
 
-    // Look up the task from the DB via the service's db handle
-    let task = service
-        .db
+    // Look up the task from PG via the service's pg_db handle
+    let pg = service.pg()?;
+    let task = pg
         .get_scheduled_task(task_id)
+        .await
         .map_err(|e| format!("Failed to look up task: {}", e))?
         .ok_or_else(|| format!("Task not found: {}", task_id))?;
 

@@ -63,9 +63,14 @@ pub struct UpdateSchedulerSettingsRequest {
 pub async fn list_scheduled_tasks(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<crate::scheduler::ScheduledTask>>> {
-    let db = &state.app_state.checkpoint_db;
-    let tasks = crate::scheduler::get_all_tasks(db);
-    Json(ApiResponse::success(tasks))
+    let pg = &state.app_state.pg_db;
+    match pg.get_all_scheduled_tasks().await {
+        Ok(tasks) => Json(ApiResponse::success(tasks)),
+        Err(e) => {
+            tracing::error!("Failed to get all scheduled tasks: {}", e);
+            Json(ApiResponse::success(Vec::new()))
+        }
+    }
 }
 
 /// Create a new scheduled task
@@ -79,26 +84,37 @@ pub async fn create_scheduled_task(
     ),
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    let db = &state.app_state.checkpoint_db;
-    let task = crate::scheduler::create_task(
-        db,
+    let pg = &state.app_state.pg_db;
+
+    let mut scheduled_task = crate::scheduler::ScheduledTask::new(
         request.name,
         request.description,
         request.schedule,
         request.task,
-        request.skip_if_completed,
-        request.auto_fix_on_failure,
-        request.success_criteria,
-        request.conditions,
-    )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to create task: {}", e))),
-        )
-    })?;
+    );
+    scheduled_task.skip_if_completed = request.skip_if_completed;
+    scheduled_task.auto_fix_on_failure = request.auto_fix_on_failure;
+    scheduled_task.success_criteria = request.success_criteria;
+    scheduled_task.conditions = request.conditions;
 
-    Ok((StatusCode::CREATED, Json(ApiResponse::success(task))))
+    let now = chrono::Utc::now();
+    scheduled_task.next_run =
+        crate::scheduler::compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339());
+
+    pg.insert_scheduled_task(&scheduled_task)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to create task: {}", e))),
+            )
+        })?;
+
+    tracing::info!(
+        "Created scheduled task: {} ({})",
+        scheduled_task.name, scheduled_task.id
+    );
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(scheduled_task))))
 }
 
 /// Get a single scheduled task by ID
@@ -107,8 +123,13 @@ pub async fn get_scheduled_task(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let db = &state.app_state.checkpoint_db;
-    let task = crate::scheduler::get_task(db, &id).ok_or_else(|| {
+    let pg = &state.app_state.pg_db;
+    let task = pg.get_scheduled_task(&id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get task: {}", e))),
+        )
+    })?.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(api_error(format!("Task not found: {}", id))),
@@ -125,28 +146,68 @@ pub async fn update_scheduled_task(
     Json(request): Json<UpdateScheduledTaskRequest>,
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    let db = &state.app_state.checkpoint_db;
-    let task = crate::scheduler::update_task(
-        db,
-        &id,
-        request.name,
-        request.description,
-        request.enabled,
-        request.schedule,
-        request.task,
-        request.skip_if_completed,
-        request.auto_fix_on_failure,
-        request.success_criteria,
-        request.conditions,
-    )
-    .map_err(|e| {
+    let pg = &state.app_state.pg_db;
+    let mut scheduled_task = pg.get_scheduled_task(&id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get task: {}", e))),
+        )
+    })?.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Task not found: {}", id))),
+        )
+    })?;
+
+    if let Some(name) = request.name {
+        scheduled_task.name = name;
+    }
+    if let Some(description) = request.description {
+        scheduled_task.description = description;
+    }
+    if let Some(enabled) = request.enabled {
+        scheduled_task.enabled = enabled;
+    }
+    if let Some(schedule) = request.schedule {
+        scheduled_task.schedule = schedule;
+    }
+    if let Some(task) = request.task {
+        scheduled_task.task = task;
+    }
+    if let Some(skip_if_completed) = request.skip_if_completed {
+        scheduled_task.skip_if_completed = skip_if_completed;
+    }
+    if let Some(auto_fix_on_failure) = request.auto_fix_on_failure {
+        scheduled_task.auto_fix_on_failure = auto_fix_on_failure;
+    }
+    if let Some(success_criteria) = request.success_criteria {
+        scheduled_task.success_criteria = success_criteria;
+    }
+    if let Some(conditions) = request.conditions {
+        scheduled_task.conditions = conditions;
+        scheduled_task.condition_status = None;
+    }
+
+    let now = chrono::Utc::now();
+    scheduled_task.next_run = if scheduled_task.enabled {
+        crate::scheduler::compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339())
+    } else {
+        None
+    };
+
+    scheduled_task.touch();
+    pg.update_scheduled_task(&scheduled_task).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to update task: {}", e))),
         )
     })?;
 
-    Ok(Json(ApiResponse::success(task)))
+    tracing::info!(
+        "Updated scheduled task: {} ({})",
+        scheduled_task.name, scheduled_task.id
+    );
+    Ok(Json(ApiResponse::success(scheduled_task)))
 }
 
 /// Delete a scheduled task
@@ -154,13 +215,27 @@ pub async fn delete_scheduled_task(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
-    crate::scheduler::delete_task(db, &id).map_err(|e| {
+    let pg = &state.app_state.pg_db;
+    // Verify task exists first
+    pg.get_scheduled_task(&id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get task: {}", e))),
+        )
+    })?.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
+            Json(api_error(format!("Task not found: {}", id))),
+        )
+    })?;
+
+    pg.delete_scheduled_task(&id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to delete task: {}", e))),
         )
     })?;
+    tracing::info!("Deleted scheduled task: {}", id);
 
     Ok(Json(ApiResponse::success(())))
 }
@@ -187,18 +262,28 @@ pub async fn get_task_history(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<Vec<crate::scheduler::TaskExecutionRecord>>> {
-    let db = &state.app_state.checkpoint_db;
-    let history = crate::scheduler::get_task_history(db, &id);
-    Json(ApiResponse::success(history))
+    let pg = &state.app_state.pg_db;
+    match pg.get_execution_history(&id, 50).await {
+        Ok(history) => Json(ApiResponse::success(history)),
+        Err(e) => {
+            tracing::error!("Failed to get task history for {}: {}", id, e);
+            Json(ApiResponse::success(Vec::new()))
+        }
+    }
 }
 
 /// Get scheduler settings
 pub async fn get_scheduler_settings(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::scheduler::SchedulerSettings>> {
-    let db = &state.app_state.checkpoint_db;
-    let settings = crate::scheduler::get_scheduler_settings(db);
-    Json(ApiResponse::success(settings))
+    let pg = &state.app_state.pg_db;
+    match pg.get_scheduler_settings().await {
+        Ok(settings) => Json(ApiResponse::success(settings)),
+        Err(e) => {
+            tracing::error!("Failed to get scheduler settings: {}", e);
+            Json(ApiResponse::success(crate::scheduler::SchedulerSettings::default()))
+        }
+    }
 }
 
 /// Update scheduler settings
@@ -206,9 +291,14 @@ pub async fn update_scheduler_settings(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<UpdateSchedulerSettingsRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
+    let pg = &state.app_state.pg_db;
     // Load current settings and apply partial update
-    let mut settings = crate::scheduler::get_scheduler_settings(db);
+    let mut settings = pg.get_scheduler_settings().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get settings: {}", e))),
+        )
+    })?;
 
     if let Some(enabled) = request.enabled {
         settings.enabled = enabled;
@@ -223,7 +313,7 @@ pub async fn update_scheduler_settings(
         settings.timezone = timezone;
     }
 
-    crate::scheduler::update_scheduler_settings(db, settings).map_err(|e| {
+    pg.update_scheduler_settings(&settings).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to update settings: {}", e))),
@@ -237,8 +327,38 @@ pub async fn update_scheduler_settings(
 pub async fn get_scheduler_status(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<crate::scheduler::SchedulerStatus>> {
-    let db = &state.app_state.checkpoint_db;
-    let status = crate::scheduler::get_scheduler_status(db);
+    let pg = &state.app_state.pg_db;
+    let tasks = pg.get_all_scheduled_tasks().await.unwrap_or_default();
+    let settings = pg.get_scheduler_settings().await.unwrap_or_default();
+
+    let running_tasks = tasks
+        .iter()
+        .filter(|t| {
+            t.last_run
+                .as_ref()
+                .map(|r| r.status == crate::scheduler::ScheduledTaskStatus::Running)
+                .unwrap_or(false)
+        })
+        .count() as u32;
+
+    let pending_tasks = tasks.iter().filter(|t| t.enabled).count() as u32;
+
+    let next_task = tasks
+        .iter()
+        .filter(|t| t.enabled && t.next_run.is_some())
+        .min_by_key(|t| t.next_run.as_ref().unwrap())
+        .map(|t| crate::scheduler::NextTaskInfo {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            next_run: t.next_run.clone().unwrap(),
+        });
+
+    let status = crate::scheduler::SchedulerStatus {
+        enabled: settings.enabled,
+        running_tasks,
+        pending_tasks,
+        next_task,
+    };
     Json(ApiResponse::success(status))
 }
 

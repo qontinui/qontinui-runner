@@ -206,8 +206,15 @@ export interface DimensionScore {
   evidence: string[];
 }
 
+export type EvaluationFlagType =
+  | "unexecutable"
+  | "placeholder"
+  | "false_positive"
+  | "no_entailment"
+  | "non_deterministic";
+
 export interface EvaluationFlag {
-  flag_type: string;
+  flag_type: EvaluationFlagType;
   message: string;
   step_id?: string;
 }
@@ -220,13 +227,13 @@ export interface StepEvaluation {
   min_score: number;
   flags: EvaluationFlag[];
   criterion_id?: string;
-  criterion_priority?: string;
+  criterion_priority?: "critical" | "important" | "optional";
 }
 
 export interface CoverageEntry {
   criterion_id: string;
   criterion_description: string;
-  criterion_priority: string;
+  criterion_priority: "critical" | "important" | "optional";
   mapped_steps: {
     step_id: string;
     step_name: string;
@@ -241,7 +248,7 @@ export interface CoverageEntry {
 export interface UncoveredCriterion {
   criterion_id: string;
   criterion_description: string;
-  priority: string;
+  priority: "critical" | "important" | "optional";
   suggested_verification: string;
 }
 
@@ -252,11 +259,13 @@ export interface SemanticCoverageMatrix {
   overall_coverage_score: number;
 }
 
+export type QualityGateLevel = "minimum" | "standard" | "strict";
+
 export interface QualityGateResult {
   passed: boolean;
-  gate_level: string;
+  gate_level: QualityGateLevel;
   failures: {
-    gate_level: string;
+    gate_level: QualityGateLevel;
     reason: string;
     step_id?: string;
     criterion_id?: string;
@@ -268,7 +277,7 @@ export interface WorkflowEvaluation {
   overall_score: number;
   coverage_matrix: SemanticCoverageMatrix;
   quality_gate: QualityGateResult;
-  scoring_strategy: string;
+  scoring_strategy: "fast_only" | "standard" | "full";
   evaluation_duration_ms: number;
 }
 

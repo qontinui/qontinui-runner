@@ -159,6 +159,8 @@ impl PrmClient {
     }
 
     /// Batch score multiple steps via the PRM service.
+    /// Used by Plan 13 (tree search) and Plan 15 (learning system).
+    #[allow(dead_code)]
     pub fn score_batch_sync(
         &self,
         steps: &[Value],
@@ -192,6 +194,8 @@ impl PrmClient {
     }
 
     /// Score an entire trajectory (PURE min-form) via the PRM service.
+    /// Used by Plan 13 (tree search) for candidate ranking.
+    #[allow(dead_code)]
     pub fn score_trajectory_sync(
         &self,
         steps: &[Value],
@@ -225,6 +229,7 @@ impl PrmClient {
     }
 
     /// Check if the PRM service is healthy.
+    #[allow(dead_code)]
     pub fn health(&self) -> bool {
         let url = format!("{}/health", self.base_url);
         match self.client.get(&url).send() {
