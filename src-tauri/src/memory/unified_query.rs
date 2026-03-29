@@ -630,7 +630,7 @@ pub async fn query_memory(
     };
 
     // PG unified search replaces SQLite retrieve_sqlite
-    let pg_for_sqlite = pg.clone();
+    let pg_for_sqlite = pg;
     let sqlite_limit = params.limit * 3;
     let sqlite_fut = async move {
         if want_sqlite {
