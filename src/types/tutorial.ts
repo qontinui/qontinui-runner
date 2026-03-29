@@ -293,7 +293,8 @@ export type TutorialFocusPage =
   | "meta-optimizer"
   | "knowledge-explorer"
   | "activity-timeline"
-  | "watchers";
+  | "watchers"
+  | "memory-search";
 
 /**
  * Complete tutorial definition

@@ -4,6 +4,7 @@
  * Provides consistent status icons and colors across the application.
  */
 
+import type { ReactElement } from "react";
 import { CheckCircle2, XCircle, AlertCircle, Clock, Activity } from "lucide-react";
 
 export type StatusType = "success" | "complete" | "failed" | "running" | "skipped" | "pending";
@@ -37,7 +38,7 @@ export function getStatusColors(status: string): { text: string; bg: string } {
  * @param className - Optional additional class names
  * @returns JSX element for the status icon
  */
-export function getStatusIcon(status: string, className?: string): JSX.Element {
+export function getStatusIcon(status: string, className?: string): ReactElement {
   const baseClass = className || "w-4 h-4";
 
   switch (status) {
