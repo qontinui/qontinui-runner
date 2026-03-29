@@ -6,7 +6,7 @@
  * Layout: LR flow showing user journeys.
  */
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -227,23 +227,24 @@ export function NavigationFlowGraph() {
   const [specs, setSpecs] = useState<PageSpec[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const resp = await fetch("http://localhost:9876/specs");
-        const json = await resp.json();
-        if (!cancelled && json.data) {
-          setSpecs(json.data);
-        }
-      } catch {
-        // Specs endpoint may not be available
-      } finally {
-        if (!cancelled) setLoading(false);
+  const loadSpecs = useCallback(async (signal: AbortSignal) => {
+    try {
+      const resp = await fetch("http://localhost:9876/specs", { signal });
+      const json = await resp.json();
+      if (!signal.aborted && json.data) {
+        setSpecs(json.data);
       }
-    })();
-    return () => { cancelled = true; };
+    } catch {
+      // Specs endpoint may not be available
+    } finally {
+      if (!signal.aborted) setLoading(false);
+    }
   }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    loadSpecs(controller.signal);
+    return () => { controller.abort(); };
+  }, [loadSpecs]);
 
   const navLinks = useMemo(() => extractNavLinks(specs), [specs]);
   const { nodes: initialNodes, edges: initialEdges } = useMemo(
@@ -254,8 +255,15 @@ export function NavigationFlowGraph() {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  useEffect(() => { setNodes(initialNodes); }, [initialNodes, setNodes]);
-  useEffect(() => { setEdges(initialEdges); }, [initialEdges, setEdges]);
+  const prevInitialRef = useRef({ nodes: initialNodes, edges: initialEdges });
+  if (prevInitialRef.current.nodes !== initialNodes) {
+    prevInitialRef.current.nodes = initialNodes;
+    setNodes(initialNodes);
+  }
+  if (prevInitialRef.current.edges !== initialEdges) {
+    prevInitialRef.current.edges = initialEdges;
+    setEdges(initialEdges);
+  }
 
   if (loading) {
     return (

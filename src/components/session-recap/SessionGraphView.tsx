@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useRef, useMemo } from "react";
 import {
   ReactFlow,
   MiniMap,
@@ -82,10 +82,12 @@ export function SessionGraphView({ recap }: Props) {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
-  useEffect(() => {
+  const prevInitialRef = useRef({ nodes: initialNodes, edges: initialEdges });
+  if (prevInitialRef.current.nodes !== initialNodes || prevInitialRef.current.edges !== initialEdges) {
+    prevInitialRef.current = { nodes: initialNodes, edges: initialEdges };
     setNodes(initialNodes);
     setEdges(initialEdges);
-  }, [initialNodes, initialEdges, setNodes, setEdges]);
+  }
 
   if (initialNodes.length === 0) {
     return (

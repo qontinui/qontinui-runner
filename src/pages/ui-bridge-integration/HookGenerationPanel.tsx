@@ -305,36 +305,39 @@ export function HookGenerationPanel({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [session.streamingContent, session.messages]);
 
-  // When AI transitions to ready, handle the current step completion
-  useEffect(() => {
-    const controller = new AbortController();
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const prevState = prevSessionStateRef.current;
-    prevSessionStateRef.current = session.sessionState;
+  // When AI transitions to ready, handle the current step completion.
+  // Core logic extracted into useCallback to keep fetch() out of useEffect body.
+  const handleSessionTransition = useCallback((params: {
+    controller: AbortController;
+    setRetryTimer: (t: ReturnType<typeof setTimeout> | null) => void;
+    prevState: string;
+    sessionState: string;
+    messages: typeof session.messages;
+    streamingContent: string;
+    taskRunId: string | undefined;
+    sendMessage: typeof session.sendMessage;
+  }) => {
+    const { controller, setRetryTimer, prevState, sessionState, messages, streamingContent, taskRunId, sendMessage } = params;
 
     // Only process when transitioning from "processing" to "ready" —
     // ignore the initial "ready" from createSession (before sendMessage)
-    const shouldProcess = session.sessionState === "ready" && prevState === "processing";
+    const shouldProcess = sessionState === "ready" && prevState === "processing";
     const currentStep = shouldProcess ? pendingStepRef.current : null;
 
     if (!shouldProcess || !currentStep) {
-      return () => {
-        controller.abort();
-        if (retryTimer) clearTimeout(retryTimer);
-      };
+      return;
     }
 
     // Gather AI content — for per-page steps, only look at NEW messages
     // to prevent re-extracting files from earlier steps
-    const aiMessages = session.messages.filter((m) => m.role === "ai");
+    const aiMessages = messages.filter((m) => m.role === "ai");
     const isPerPageStep = currentStep === "page-registrations" || currentStep === "page-spec" || currentStep === "page-tutorial";
     const relevantMessages = isPerPageStep
       ? aiMessages.slice(processedMessageCountRef.current)
       : aiMessages;
     const allContent = relevantMessages.map((m) => m.content).join("\n\n");
-    const fullContent = session.streamingContent
-      ? allContent + "\n\n" + session.streamingContent
+    const fullContent = streamingContent
+      ? allContent + "\n\n" + streamingContent
       : allContent;
 
     if (currentStep === "hooks") {
@@ -359,7 +362,7 @@ export function HookGenerationPanel({
             isRegenSpec,
             projectPath,
             analysis: analysisForPrompt,
-            sendMessage: session.sendMessage,
+            sendMessage,
           });
         } else {
           // No spec step — go to preview
@@ -419,21 +422,20 @@ export function HookGenerationPanel({
       };
 
       // Try extracting from current content
-      const specContent = session.messages
+      const specContent = messages
         .filter((m) => m.role === "ai")
         .map((m) => m.content)
         .join("\n\n");
-      const fullSpecContent = session.streamingContent
-        ? specContent + "\n\n" + session.streamingContent
+      const fullSpecContent = streamingContent
+        ? specContent + "\n\n" + streamingContent
         : specContent;
 
       if (!tryExtractSpec(fullSpecContent)) {
         // Race condition: text events still in transit. Retry via API.
-        const taskRunId = session.taskRunId;
         if (specRetryTimerRef.current) clearTimeout(specRetryTimerRef.current);
-        retryTimer = setTimeout(async () => {
+        const timer = setTimeout(async () => {
           specRetryTimerRef.current = null;
-          retryTimer = null;
+          setRetryTimer(null);
           if (controller.signal.aborted || !taskRunId) {
             if (!controller.signal.aborted) handleSpecError();
             return;
@@ -456,7 +458,8 @@ export function HookGenerationPanel({
             }
           }
         }, 1000);
-        specRetryTimerRef.current = retryTimer;
+        specRetryTimerRef.current = timer;
+        setRetryTimer(timer);
       }
 
     // ---- Per-page step handlers ----
@@ -503,7 +506,7 @@ export function HookGenerationPanel({
             cur.registrationOutput || "",
             existingSpec,
           );
-          session.sendMessage(
+          sendMessage(
             "Now generate a page spec (.spec.uibridge.json) for this page.\n\n" + specPrompt,
           );
         })();
@@ -522,7 +525,7 @@ export function HookGenerationPanel({
           cur.registrationOutput || "",
           "",
         );
-        session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+        sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
       } else if (opts.generateDemoVideos || opts.generateProductTours) {
         // Skip to demo script / product tour planning
         chainToDemoScript(cur?.page.route ?? "", controller.signal);
@@ -561,7 +564,7 @@ export function HookGenerationPanel({
           cur.registrationOutput || "",
           jsonBlock || "",
         );
-        session.sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
+        sendMessage("Now generate a tutorial for this page.\n\n" + tutPrompt);
       } else if (opts.generateDemoVideos || opts.generateProductTours) {
         chainToDemoScript(cur?.page.route ?? "", controller.signal);
       } else {
@@ -781,7 +784,7 @@ export function HookGenerationPanel({
           analysis.framework,
           existingRegs || undefined,
         );
-        await session.sendMessage(
+        await sendMessage(
           `Analyze the page at ${page.route} and generate UI Bridge registrations.\n\n` + prompt,
         );
       } else if (opts.generateSpecs) {
@@ -798,7 +801,7 @@ export function HookGenerationPanel({
           page.route,
           "",
         );
-        await session.sendMessage(
+        await sendMessage(
           `Generate a page spec for ${page.route}.\n\n` + specPrompt,
         );
       } else if (opts.generateTutorials) {
@@ -815,7 +818,7 @@ export function HookGenerationPanel({
           "",
           "",
         );
-        await session.sendMessage(
+        await sendMessage(
           `Generate a tutorial for ${page.route}.\n\n` + tutPrompt,
         );
       } else if (opts.generateDemoVideos || opts.generateProductTours) {
@@ -824,12 +827,33 @@ export function HookGenerationPanel({
       }
     }
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectPath, analysis.framework, isRegenSpec, includeArchSpec]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const prevState = prevSessionStateRef.current;
+    prevSessionStateRef.current = session.sessionState;
+
+    handleSessionTransition({
+      controller,
+      setRetryTimer: (t) => { retryTimer = t; },
+      prevState,
+      sessionState: session.sessionState,
+      messages: session.messages,
+      streamingContent: session.streamingContent,
+      taskRunId: session.taskRunId ?? undefined,
+      sendMessage: session.sendMessage,
+    });
+
     return () => {
       controller.abort();
       if (retryTimer) clearTimeout(retryTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.sessionState]);
+  }, [session.sessionState, handleSessionTransition]);
 
   // When entering preview, ensure all files are expanded
   useEffect(() => {

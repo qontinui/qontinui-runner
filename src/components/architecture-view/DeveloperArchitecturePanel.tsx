@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { LayoutDashboard, GitBranch, Cpu, Search, Bot, Loader2, Boxes } from "lucide-react";
 import type { SdkArchitectureGraph } from "@/types/architecture";
 import { DeveloperOverviewPanel } from "./DeveloperOverviewPanel";
@@ -35,25 +35,26 @@ export function DeveloperArchitecturePanel({
 
   // Load spec page IDs for coverage overlay badges
   const [specPageIds, setSpecPageIds] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const resp = await fetch("http://localhost:9876/specs");
-        const json = await resp.json();
-        if (!cancelled && json.data) {
-          const ids = new Set<string>();
-          for (const spec of json.data) {
-            if (spec.metadata?.pageId) ids.add(spec.metadata.pageId);
-          }
-          setSpecPageIds(ids);
+  const loadSpecPageIds = useCallback(async (signal: AbortSignal) => {
+    try {
+      const resp = await fetch("http://localhost:9876/specs", { signal });
+      const json = await resp.json();
+      if (!signal.aborted && json.data) {
+        const ids = new Set<string>();
+        for (const spec of json.data) {
+          if (spec.metadata?.pageId) ids.add(spec.metadata.pageId);
         }
-      } catch {
-        // Specs endpoint may not be available
+        setSpecPageIds(ids);
       }
-    })();
-    return () => { cancelled = true; };
+    } catch {
+      // Specs endpoint may not be available
+    }
   }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    loadSpecPageIds(controller.signal);
+    return () => { controller.abort(); };
+  }, [loadSpecPageIds]);
 
   const clampedIndex = useMemo(
     () => Math.min(selectedProjectIndex, Math.max(0, specs.length - 1)),

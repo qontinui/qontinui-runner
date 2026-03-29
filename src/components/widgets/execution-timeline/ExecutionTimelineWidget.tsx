@@ -7,7 +7,7 @@
  * Provides a high-level overview of workflow execution progress.
  */
 
-import React, { useState, useCallback, useEffect, useMemo } from "react";
+import React, { useState, useCallback, useMemo, useRef } from "react";
 import {
   Terminal,
   CheckCircle,
@@ -769,32 +769,24 @@ export function ExecutionTimelineWidget({
   // User-explicit iteration expand/collapse overrides (key -> expanded boolean)
   const [userIterationToggles, setUserIterationToggles] = useState<Map<string, boolean>>(new Map());
 
-  // Track the previous iteration counts to detect new iterations (state so useMemo stays pure)
-  const [prevIterationCounts, setPrevIterationCounts] = useState<Map<string, number>>(new Map());
-
-  // Build current iteration counts from phaseGroups (pure derivation for useMemo + useEffect)
-  const currentIterationCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const group of phaseGroups) {
-      if (!group.hasIterations || group.iterationGroups.length === 0) continue;
-      const groupId = `${group.stageIndex}:${group.phase}`;
-      counts.set(groupId, group.iterationGroups.length);
-    }
-    return counts;
-  }, [phaseGroups]);
+  // Track the previous iteration counts to detect new iterations (ref avoids extra re-render)
+  const prevIterationCountsRef = useRef<Map<string, number>>(new Map());
 
   // Compute expanded iterations during render by merging auto-defaults with user overrides.
   // Auto-default: expand the latest iteration in each phase.
   // When a new iteration appears, user overrides for that phase are ignored so the latest expands.
+  // Also updates prevIterationCountsRef so the next render can detect new iterations.
   const expandedIterations = useMemo(() => {
     const result = new Set<string>();
+    const nextCounts = new Map<string, number>();
 
     for (const group of phaseGroups) {
       if (!group.hasIterations || group.iterationGroups.length === 0) continue;
 
       const groupId = `${group.stageIndex}:${group.phase}`;
-      const prevCount = prevIterationCounts.get(groupId) ?? 0;
+      const prevCount = prevIterationCountsRef.current.get(groupId) ?? 0;
       const currentCount = group.iterationGroups.length;
+      nextCounts.set(groupId, currentCount);
       const maxIteration = Math.max(...group.iterationGroups.map((g) => g.iteration));
       const isNewIteration = currentCount > prevCount;
 
@@ -821,13 +813,11 @@ export function ExecutionTimelineWidget({
       }
     }
 
-    return result;
-  }, [phaseGroups, userIterationToggles, prevIterationCounts]);
+    // Update ref so the next render can detect new iterations
+    prevIterationCountsRef.current = nextCounts;
 
-  // Sync previous iteration counts after render so the next render can detect new iterations
-  useEffect(() => {
-    setPrevIterationCounts(currentIterationCounts);
-  }, [currentIterationCounts]);
+    return result;
+  }, [phaseGroups, userIterationToggles]);
 
   const handleIterationToggle = useCallback((key: string, expanded: boolean) => {
     setUserIterationToggles((prev) => {
