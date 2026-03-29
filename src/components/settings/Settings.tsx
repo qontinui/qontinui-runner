@@ -24,6 +24,7 @@ import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
 import { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 import { RunnerInstancesSettings } from "./RunnerInstancesSettings";
+import { NotificationSettings } from "./NotificationSettings";
 import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
 import type { Project, ConnectionInfo } from "../../types/auth";
@@ -60,6 +61,7 @@ type SettingsTab =
   | "mcp"
   | "log-sources"
   | "execution-variables"
+  | "notifications"
   | "general"
   | "storage"
   | "backup"
@@ -82,6 +84,7 @@ const VALID_TABS = [
   "mcp",
   "log-sources",
   "execution-variables",
+  "notifications",
   "general",
   "storage",
   "backup",
@@ -193,6 +196,8 @@ export function Settings({
         return <LogSourcesSettings onLog={onLog} />;
       case "execution-variables":
         return <ExecutionVariablesSettings onLog={onLog} />;
+      case "notifications":
+        return <NotificationSettings onLog={onLog} />;
       case "general":
         return <GeneralSettings onLog={onLog} />;
       case "storage":

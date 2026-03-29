@@ -20,6 +20,7 @@ import type {
   FixableErrorsSummary,
   ErrorStatus,
   LogSourceConfig,
+  RecurrenceEntry,
 } from "../types/errorMonitor";
 
 /**
@@ -110,6 +111,14 @@ export const errorMonitorService = {
    */
   async linkErrorToFinding(errorId: number, findingId: number): Promise<void> {
     return invoke("link_error_to_finding", { errorId, findingId });
+  },
+
+  /**
+   * Get recurrence history for an error signature.
+   * Returns past resolved entries sharing the same signature_hash.
+   */
+  async getRecurrenceHistory(signatureHash: string): Promise<RecurrenceEntry[]> {
+    return invoke("get_error_recurrence_history", { signatureHash });
   },
 
   // ===========================================================================

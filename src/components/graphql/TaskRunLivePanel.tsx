@@ -183,7 +183,7 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
       )}
 
       {/* Error monitor summary for this run */}
-      <RunErrorSummary taskRunId={taskRunId} />
+      <RunErrorSummary taskRunId={taskRunId} taskRunName={taskRun?.taskName} />
 
       {/* Summary */}
       {taskRun.summary && (

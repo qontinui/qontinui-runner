@@ -887,3 +887,223 @@ impl ErrorEventStorage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Create a minimal in-memory database with just log_sources and error_events tables.
+    /// We skip the full schema (which requires task_runs etc.) since insert_or_increment
+    /// doesn't need those — it only reads/writes error_events directly.
+    fn create_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE log_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                path TEXT NOT NULL,
+                path_type TEXT DEFAULT 'file',
+                format TEXT DEFAULT 'plaintext',
+                parser TEXT DEFAULT 'generic',
+                timestamp_pattern TEXT,
+                timezone TEXT DEFAULT 'local',
+                error_patterns TEXT,
+                warning_patterns TEXT,
+                ignore_patterns TEXT,
+                enabled INTEGER DEFAULT 1,
+                poll_interval_ms INTEGER DEFAULT 5000,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE error_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_source_id INTEGER REFERENCES log_sources(id) ON DELETE SET NULL,
+                log_source_name TEXT NOT NULL,
+                task_run_id TEXT,
+                workflow_step_id TEXT,
+                log_timestamp TEXT,
+                captured_at TEXT NOT NULL DEFAULT (datetime('now')),
+                severity TEXT NOT NULL DEFAULT 'error',
+                error_type TEXT,
+                error_code TEXT,
+                message TEXT NOT NULL,
+                stack_trace TEXT,
+                context_lines TEXT,
+                raw_entry TEXT,
+                file_path TEXT,
+                line_number INTEGER,
+                column_number INTEGER,
+                function_name TEXT,
+                signature_hash TEXT NOT NULL,
+                occurrence_count INTEGER DEFAULT 1,
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT DEFAULT 'new',
+                finding_id INTEGER,
+                resolved_by_task_run_id TEXT,
+                resolved_by_fix_id TEXT,
+                resolution_notes TEXT,
+                message_embedding BLOB,
+                trace_id TEXT,
+                acknowledged_at TEXT,
+                resolved_at TEXT
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Build a minimal ErrorEvent for testing.
+    fn make_error_event(source: &str, message: &str) -> ErrorEvent {
+        ErrorEvent {
+            log_source_name: source.to_string(),
+            severity: ErrorSeverity::Error,
+            error_type: Some("TestError".to_string()),
+            error_code: None,
+            message: message.to_string(),
+            stack_trace: None,
+            location: None,
+            context_lines: None,
+            raw_entry: message.to_string(),
+            log_timestamp: None,
+            trace_id: None,
+        }
+    }
+
+    /// Helper to read the status of an error event by ID.
+    fn get_status(conn: &Connection, id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM error_events WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Helper to read the occurrence_count of an error event by ID.
+    fn get_occurrence_count(conn: &Connection, id: i64) -> u32 {
+        conn.query_row(
+            "SELECT occurrence_count FROM error_events WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Helper to count total rows in error_events.
+    fn count_events(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM error_events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    // ---------------------------------------------------------------
+    // insert_or_increment: recurrence detection tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_new_error_with_no_history_is_new() {
+        let conn = create_test_db();
+        let event = make_error_event("test-source", "something broke");
+
+        let id =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+
+        assert_eq!(get_status(&conn, id), "new");
+        assert_eq!(get_occurrence_count(&conn, id), 1);
+    }
+
+    #[test]
+    fn test_recurring_after_resolved_predecessor() {
+        let conn = create_test_db();
+        let event = make_error_event("test-source", "connection timeout");
+
+        // Insert the first occurrence
+        let id1 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+        assert_eq!(get_status(&conn, id1), "new");
+
+        // Mark it resolved
+        conn.execute(
+            "UPDATE error_events SET status = 'resolved' WHERE id = ?1",
+            params![id1],
+        )
+        .unwrap();
+
+        // Insert the same error again — should be detected as recurring
+        let id2 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+
+        assert_ne!(id1, id2, "should create a new row, not reuse the resolved one");
+        assert_eq!(get_status(&conn, id2), "recurring");
+        assert_eq!(count_events(&conn), 2);
+    }
+
+    #[test]
+    fn test_ignored_predecessor_does_not_trigger_recurring() {
+        let conn = create_test_db();
+        let event = make_error_event("test-source", "noisy warning");
+
+        // Insert and mark as ignored
+        let id1 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+        conn.execute(
+            "UPDATE error_events SET status = 'ignored' WHERE id = ?1",
+            params![id1],
+        )
+        .unwrap();
+
+        // Insert the same error again — ignored is NOT in ('resolved', 'wont_fix'),
+        // but it IS in the exclusion list for the duplicate check.
+        // The duplicate-check excludes resolved/wont_fix/ignored, so this should be a new row.
+        let id2 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+
+        assert_ne!(id1, id2);
+        // Ignored is not in ('resolved', 'wont_fix'), so was_previously_resolved = false → "new"
+        assert_eq!(get_status(&conn, id2), "new");
+    }
+
+    #[test]
+    fn test_duplicate_unresolved_increments_count() {
+        let conn = create_test_db();
+        let event = make_error_event("test-source", "repeated failure");
+
+        let id1 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+        assert_eq!(get_occurrence_count(&conn, id1), 1);
+
+        // Insert the same event again while the first is still unresolved
+        let id2 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+
+        assert_eq!(id1, id2, "should return the same row ID (deduplicated)");
+        assert_eq!(get_occurrence_count(&conn, id1), 2);
+        assert_eq!(count_events(&conn), 1, "no new row should be created");
+    }
+
+    #[test]
+    fn test_wont_fix_predecessor_triggers_recurring() {
+        let conn = create_test_db();
+        let event = make_error_event("test-source", "known issue");
+
+        let id1 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+        conn.execute(
+            "UPDATE error_events SET status = 'wont_fix' WHERE id = ?1",
+            params![id1],
+        )
+        .unwrap();
+
+        let id2 =
+            ErrorEventStorage::insert_or_increment(&conn, &event, None, None, None).unwrap();
+
+        assert_ne!(id1, id2);
+        // wont_fix IS in ('resolved', 'wont_fix') → recurring
+        assert_eq!(get_status(&conn, id2), "recurring");
+    }
+}

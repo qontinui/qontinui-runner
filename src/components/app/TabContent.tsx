@@ -24,6 +24,7 @@ import type { UseProjectLogsReturn } from "@/hooks/project-logs";
 import type { useProjectSelection } from "@/hooks/useProjectSelection";
 import type { UseWebSocketAutoConnectReturn } from "@/hooks/useWebSocketAutoConnect";
 import type { MainTabId, LogSubTab } from "./tab-types";
+import type { ErrorMonitorScope } from "./useAppNavigation";
 import { LogSourcesConfigTab } from "./LogSourcesConfigTab";
 
 import { LogsTab } from "@/components/LogsTab";
@@ -167,6 +168,8 @@ export interface TabContentProps {
   handleCopyLogs: () => Promise<void>;
   clearActionLogs: () => Promise<void>;
   clearAllLogs: () => Promise<void>;
+  errorMonitorScope?: ErrorMonitorScope;
+  clearErrorMonitorScope?: () => void;
 }
 
 export function TabContent({
@@ -207,6 +210,8 @@ export function TabContent({
   handleCopyLogs,
   clearActionLogs,
   clearAllLogs,
+  errorMonitorScope,
+  clearErrorMonitorScope,
 }: TabContentProps) {
   const execution = useExecution();
 
@@ -245,7 +250,11 @@ export function TabContent({
       return (
         <div className="h-full overflow-hidden">
           <PageRegistration id="error-monitor" name="Error Monitor" description="Real-time application error monitoring and log analysis" />
-          <ErrorMonitorTab />
+          <ErrorMonitorTab
+            taskRunId={errorMonitorScope?.taskRunId}
+            taskRunName={errorMonitorScope?.taskRunName}
+            onClearScope={clearErrorMonitorScope}
+          />
         </div>
       );
 

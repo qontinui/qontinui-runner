@@ -5,6 +5,7 @@ export type { TabContentProps } from "./TabContent";
 export { LogSourcesConfigTab } from "./LogSourcesConfigTab";
 export { AppToasts } from "./AppToasts";
 export { useAppNavigation } from "./useAppNavigation";
+export type { ErrorMonitorScope } from "./useAppNavigation";
 export { useRunLastWorkflow } from "./useRunLastWorkflow";
 export type { MainTabId, LogSubTab } from "./tab-types";
 export { migrateTabId, SIDEBAR_COLLAPSED_KEY } from "./tab-types";

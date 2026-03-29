@@ -25,6 +25,11 @@ const PAGE_TO_TAB: Record<string, MainTabId> = {
   "state-machine": "state-machine",
 };
 
+export interface ErrorMonitorScope {
+  taskRunId?: string;
+  taskRunName?: string;
+}
+
 interface UseAppNavigationReturn {
   activeTab: MainTabId;
   setActiveTab: (tab: MainTabId) => void;
@@ -34,6 +39,8 @@ interface UseAppNavigationReturn {
   setTerminalSessionCount: (count: number) => void;
   staleTaskMessage: string | null;
   setStaleTaskMessage: (msg: string | null) => void;
+  errorMonitorScope: ErrorMonitorScope;
+  clearErrorMonitorScope: () => void;
   ProfilerWrapper: ReturnType<typeof useRenderPerformance>["ProfilerWrapper"];
 }
 
@@ -55,6 +62,11 @@ export function useAppNavigation(): UseAppNavigationReturn {
   const autoCollapsedRef = useRef(false);
 
   const [staleTaskMessage, setStaleTaskMessage] = useState<string | null>(null);
+  const [errorMonitorScope, setErrorMonitorScope] = useState<ErrorMonitorScope>({});
+
+  const clearErrorMonitorScope = useCallback(() => {
+    setErrorMonitorScope({});
+  }, []);
 
   useEffect(() => {
     if (isApiReady && getApiPort() !== 9876) {
@@ -119,7 +131,9 @@ export function useAppNavigation(): UseAppNavigationReturn {
   }, []);
 
   useEffect(() => {
-    const handleNavigateToErrorMonitor = () => {
+    const handleNavigateToErrorMonitor = (e: CustomEvent<{ taskRunId?: string; taskRunName?: string }>) => {
+      const { taskRunId, taskRunName } = e.detail ?? {};
+      setErrorMonitorScope({ taskRunId, taskRunName });
       setActiveTab("error-monitor");
     };
     window.addEventListener("navigate-to-error-monitor", handleNavigateToErrorMonitor);
@@ -189,6 +203,8 @@ export function useAppNavigation(): UseAppNavigationReturn {
     setTerminalSessionCount,
     staleTaskMessage,
     setStaleTaskMessage,
+    errorMonitorScope,
+    clearErrorMonitorScope,
     ProfilerWrapper,
   };
 }

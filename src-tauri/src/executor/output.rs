@@ -6,7 +6,7 @@ use serde_json::json;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Handles output processing from Python executor
 pub struct OutputProcessor;
@@ -180,6 +180,7 @@ impl OutputProcessor {
         error_monitor_tx: Option<tokio::sync::mpsc::Sender<String>>,
     ) {
         let reader = BufReader::new(stderr);
+        let mut dropped_count: u64 = 0;
         for line in reader.lines().map_while(Result::ok) {
             Self::log_python_stderr(&line);
 
@@ -188,8 +189,22 @@ impl OutputProcessor {
             // if the channel is full, the line is dropped (acceptable since
             // the error monitor also has periodic file-based polling).
             if let Some(ref tx) = error_monitor_tx {
-                let _ = tx.try_send(line);
+                if tx.try_send(line).is_err() {
+                    dropped_count += 1;
+                    if dropped_count % 100 == 0 {
+                        warn!(
+                            "Error monitor channel full: {} stderr lines dropped so far",
+                            dropped_count
+                        );
+                    }
+                }
             }
+        }
+        if dropped_count > 0 {
+            warn!(
+                "Stderr reader ending with {} total dropped lines (channel full)",
+                dropped_count
+            );
         }
         info!("Stderr reader thread ending");
     }

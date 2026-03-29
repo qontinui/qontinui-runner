@@ -8,12 +8,28 @@
 //! Log source management is handled through global log source settings
 //! (Settings > Log Sources). See `commands::global_log_sources`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tauri::State;
 
+use serde::Serialize;
 use crate::commands::AppState;
+use crate::error_monitor::curator::{CuratedError, DebugContext};
 use crate::error_monitor::types::{ErrorStatus, ErrorSummary, StoredErrorEvent};
+
+/// A single past resolution entry for recurrence history display.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecurrenceEntry {
+    pub id: i64,
+    pub status: String,
+    pub resolved_at: Option<String>,
+    pub resolution_notes: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub occurrence_count: i32,
+}
 
 // =============================================================================
 // Error Event Commands
@@ -283,52 +299,151 @@ pub async fn acknowledge_all_errors(
 // Debug Context Curator Commands
 // =============================================================================
 
-use crate::error_monitor::curator::{CuratorConfig, DebugContext, DebugContextCurator};
+// CuratedError, DebugContext already imported at top of file
 
 /// Get curated debug context for the AI debug agent.
 ///
-/// Note: The curator uses SQLite connection internally for complex cross-table queries.
-/// This is retained because the curator logic is deeply coupled to SQLite.
+/// Builds error context from PG, then enriches it with unified memory search
+/// results (findings, fixes, observations, graph nodes) related to the errors.
 #[tauri::command]
 pub async fn get_debug_context(
+    app_state: State<'_, Arc<AppState>>,
     db: State<'_, Arc<crate::database::CheckpointDb>>,
     task_run_id: Option<String>,
     max_errors: Option<usize>,
 ) -> Result<DebugContext, String> {
-    let db = db.inner().clone();
-    let config = CuratorConfig {
-        max_errors: max_errors.unwrap_or(50),
-        ..Default::default()
-    };
+    let checkpoint_db = db.inner().clone();
+    let max_err = max_errors.unwrap_or(50);
 
-    tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        let curator = DebugContextCurator::with_config(config);
-        curator.build_context(&conn, task_run_id.as_deref())
+    // PG-primary: build debug context from PG
+    let pg = crate::database::pg::PgDb::global();
+    let errors = pg.get_unresolved_errors(task_run_id.as_deref(), max_err).await?;
+
+    // Build a DebugContext from PG error records
+    let mut critical_errors = Vec::new();
+    let mut error_list = Vec::new();
+    let mut warnings = Vec::new();
+
+    for err in &errors {
+        let severity = err["severity"].as_str().unwrap_or("error");
+        let location = match (err["file_path"].as_str(), err["line_number"].as_i64()) {
+            (Some(f), Some(l)) => Some(format!("{}:{}", f, l)),
+            (Some(f), None) => Some(f.to_string()),
+            _ => None,
+        };
+
+        let curated = CuratedError {
+            id: err["id"].as_i64().unwrap_or(0),
+            error_type: err["error_type"].as_str().map(String::from),
+            message: err["message"].as_str().unwrap_or("").to_string(),
+            location,
+            stack_excerpt: err["stack_trace"].as_str().map(|s| {
+                s.lines().take(3).collect::<Vec<_>>().join("\n")
+            }),
+            occurrence_count: err["occurrence_count"].as_i64().unwrap_or(1) as u32,
+            source: err["log_source_name"].as_str().unwrap_or("unknown").to_string(),
+            priority_score: match severity {
+                "critical" => 100,
+                "error" => 50,
+                _ => 10,
+            },
+            investigation_hints: Vec::new(),
+            related_errors: Vec::new(),
+        };
+
+        match severity {
+            "critical" => critical_errors.push(curated),
+            "warning" => warnings.push(curated),
+            _ => error_list.push(curated),
+        }
+    }
+
+    let total_count = (critical_errors.len() + error_list.len() + warnings.len()) as u32;
+    let has_critical = !critical_errors.is_empty();
+    let summary = format!("{} errors ({} critical, {} warnings)", total_count, critical_errors.len(), warnings.len());
+
+    // Enrich with unified memory search for context related to the errors
+    let mut focus_areas = Vec::new();
+    if total_count > 0 {
+        let memory = crate::orchestrator::memory::MemorySystem::new();
+        let unified_ctx = memory
+            .build_context_unified(
+                5,
+                &summary,
+                &app_state.pg_db,
+                checkpoint_db,
+            )
+            .await;
+
+        if !unified_ctx.is_empty() {
+            // Extract individual lines from the unified context as focus areas
+            for line in unified_ctx.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    focus_areas.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(DebugContext {
+        summary,
+        critical_errors,
+        errors: error_list,
+        warnings,
+        patterns: Vec::new(),
+        focus_areas,
+        total_count,
+        requires_immediate_action: has_critical,
+        source_descriptions: std::collections::HashMap::new(),
     })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Get debug context formatted as a string for AI consumption.
 ///
-/// Note: The curator uses SQLite connection internally for complex cross-table queries.
-/// This is retained because the curator logic is deeply coupled to SQLite.
+/// Builds the PG error context, then appends unified memory search results
+/// so the AI agent has cross-run patterns, related fixes, and observations
+/// alongside the raw error list.
 #[tauri::command]
 pub async fn get_debug_context_for_ai(
+    app_state: State<'_, Arc<AppState>>,
     db: State<'_, Arc<crate::database::CheckpointDb>>,
     task_run_id: Option<String>,
 ) -> Result<String, String> {
-    let db = db.inner().clone();
+    let checkpoint_db = db.inner().clone();
 
-    tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        let curator = DebugContextCurator::new();
-        let context = curator.build_context(&conn, task_run_id.as_deref())?;
-        Ok(curator.format_for_ai(&context))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    // PG-primary: build formatted debug context
+    let pg = crate::database::pg::PgDb::global();
+    let base_context = pg
+        .build_error_monitor_context(task_run_id.as_deref(), 50)
+        .await?;
+
+    match base_context {
+        Some(context) => {
+            // Enrich with unified memory search using the error context as query
+            // Use first 200 chars of the error context as the search query
+            let search_query: String = context.chars().take(200).collect();
+            let memory = crate::orchestrator::memory::MemorySystem::new();
+            let unified_ctx = memory
+                .build_context_unified(
+                    5,
+                    &search_query,
+                    &app_state.pg_db,
+                    checkpoint_db,
+                )
+                .await;
+
+            if unified_ctx.is_empty() {
+                Ok(context)
+            } else {
+                Ok(format!(
+                    "{}\n\n## Related Memory Context\n{}",
+                    context, unified_ctx
+                ))
+            }
+        }
+        None => Ok(String::new()),
+    }
 }
 
 /// Open a file in the user's editor at a specific line.
@@ -355,6 +470,23 @@ pub async fn open_error_in_editor(
     // Fallback: try to open just the file with the default handler
     open::that(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
     Ok(())
+}
+
+/// Get recurrence history for an error signature.
+///
+/// Returns past resolved/wont_fix entries sharing the same signature_hash,
+/// so the UI can show how many times this error has recurred.
+#[tauri::command]
+pub async fn get_error_recurrence_history(
+    app_state: State<'_, Arc<AppState>>,
+    signature_hash: String,
+) -> Result<Vec<RecurrenceEntry>, String> {
+    let rows = app_state
+        .pg_db
+        .get_error_recurrence_history(&signature_hash)
+        .await?;
+
+    Ok(rows)
 }
 
 /// Get all commands that should be registered with Tauri.
@@ -392,6 +524,7 @@ macro_rules! error_monitor_commands {
             $crate::error_monitor::commands::get_debug_context,
             $crate::error_monitor::commands::get_debug_context_for_ai,
             $crate::error_monitor::commands::open_error_in_editor,
+            $crate::error_monitor::commands::get_error_recurrence_history,
             $crate::error_monitor::workflow::generate_error_fix_workflow,
             $crate::error_monitor::workflow::generate_single_error_fix_workflow,
             $crate::error_monitor::workflow::check_fixable_errors,

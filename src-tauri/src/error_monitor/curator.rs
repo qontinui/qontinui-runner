@@ -568,6 +568,15 @@ impl DebugContextCurator {
             return Vec::new();
         }
 
+        // Guard: skip O(n^2) pairwise comparison when the set is too large
+        if error_ids.len() > 200 {
+            tracing::debug!(
+                "Skipping embedding clustering: {} error_ids exceeds 200 limit",
+                error_ids.len()
+            );
+            return Vec::new();
+        }
+
         // Build a parameterized IN clause
         let placeholders: Vec<String> = (1..=error_ids.len()).map(|i| format!("?{}", i)).collect();
         let sql = format!(
@@ -1021,5 +1030,195 @@ mod tests {
         assert!(hints
             .iter()
             .any(|h| h.contains("None/null") || h.contains("types")));
+    }
+
+    // ---------------------------------------------------------------
+    // Embedding pattern detection tests
+    // ---------------------------------------------------------------
+
+    /// Create a minimal in-memory database with the error_events table for embedding tests.
+    fn create_embedding_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE error_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_source_id INTEGER,
+                log_source_name TEXT NOT NULL,
+                task_run_id TEXT,
+                workflow_step_id TEXT,
+                log_timestamp TEXT,
+                captured_at TEXT NOT NULL DEFAULT (datetime('now')),
+                severity TEXT NOT NULL DEFAULT 'error',
+                error_type TEXT,
+                error_code TEXT,
+                message TEXT NOT NULL,
+                stack_trace TEXT,
+                context_lines TEXT,
+                raw_entry TEXT,
+                file_path TEXT,
+                line_number INTEGER,
+                column_number INTEGER,
+                function_name TEXT,
+                signature_hash TEXT NOT NULL,
+                occurrence_count INTEGER DEFAULT 1,
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                status TEXT DEFAULT 'new',
+                finding_id INTEGER,
+                resolved_by_task_run_id TEXT,
+                resolved_by_fix_id TEXT,
+                resolution_notes TEXT,
+                message_embedding BLOB,
+                trace_id TEXT,
+                acknowledged_at TEXT,
+                resolved_at TEXT
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Create a 384-dim f32 embedding as a little-endian byte blob, normalized to unit length.
+    fn make_embedding(base_value: f32) -> Vec<u8> {
+        let dim = 384;
+        let embedding: Vec<f32> = (0..dim)
+            .map(|i| base_value + (i as f32) * 0.001)
+            .collect();
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normalized: Vec<f32> = embedding.iter().map(|x| x / norm).collect();
+        normalized
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    /// Insert an error event with an embedding into the test DB and return its id.
+    fn insert_error_with_embedding(
+        conn: &rusqlite::Connection,
+        message: &str,
+        embedding: &[u8],
+    ) -> i64 {
+        conn.execute(
+            r#"INSERT INTO error_events (log_source_name, message, signature_hash, message_embedding)
+               VALUES ('test', ?1, ?2, ?3)"#,
+            rusqlite::params![message, format!("hash_{}", message), embedding],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Helper to build an orthogonal embedding blob (non-zero only in the second half of dims).
+    fn make_orthogonal_embedding() -> Vec<u8> {
+        let dim = 384;
+        let mut emb = vec![0.0f32; dim];
+        for v in emb.iter_mut().skip(dim / 2) {
+            *v = 1.0;
+        }
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        emb.iter()
+            .map(|x| x / norm)
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn test_embedding_patterns_empty_ids() {
+        let conn = create_embedding_test_db();
+        let curator = DebugContextCurator::new();
+
+        let patterns = curator.detect_embedding_patterns(&conn, &[]);
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_embedding_patterns_single_error() {
+        let conn = create_embedding_test_db();
+        let curator = DebugContextCurator::new();
+
+        let emb = make_embedding(1.0);
+        let id = insert_error_with_embedding(&conn, "single error", &emb);
+
+        let patterns = curator.detect_embedding_patterns(&conn, &[id]);
+        assert!(
+            patterns.is_empty(),
+            "need at least 2 errors to form a cluster"
+        );
+    }
+
+    #[test]
+    fn test_embedding_patterns_two_identical_embeddings() {
+        let conn = create_embedding_test_db();
+        let curator = DebugContextCurator::new();
+
+        let emb = make_embedding(1.0);
+        let id1 = insert_error_with_embedding(&conn, "error A", &emb);
+        let id2 = insert_error_with_embedding(&conn, "error B", &emb);
+
+        let patterns = curator.detect_embedding_patterns(&conn, &[id1, id2]);
+        assert_eq!(patterns.len(), 1, "identical embeddings should cluster");
+        assert_eq!(patterns[0].error_ids.len(), 2);
+        assert_eq!(patterns[0].pattern_type, PatternType::SimilarEmbedding);
+    }
+
+    #[test]
+    fn test_embedding_patterns_two_very_different_embeddings() {
+        let conn = create_embedding_test_db();
+        let curator = DebugContextCurator::new();
+
+        // emb_a: non-zero only in the first half of dimensions
+        let dim = 384;
+        let mut emb_a = vec![0.0f32; dim];
+        for v in emb_a.iter_mut().take(dim / 2) {
+            *v = 1.0;
+        }
+        let norm_a: f32 = emb_a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let blob_a: Vec<u8> = emb_a
+            .iter()
+            .map(|x| x / norm_a)
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        // emb_b: non-zero only in the second half → orthogonal to emb_a
+        let blob_b = make_orthogonal_embedding();
+
+        let id1 = insert_error_with_embedding(&conn, "network error", &blob_a);
+        let id2 = insert_error_with_embedding(&conn, "syntax error", &blob_b);
+
+        let patterns = curator.detect_embedding_patterns(&conn, &[id1, id2]);
+        assert!(
+            patterns.is_empty(),
+            "orthogonal embeddings should NOT cluster (cosine sim ~0)"
+        );
+    }
+
+    #[test]
+    fn test_embedding_patterns_three_errors_partial_cluster() {
+        let conn = create_embedding_test_db();
+        let curator = DebugContextCurator::new();
+
+        // Two identical embeddings
+        let emb_similar = make_embedding(1.0);
+        let id1 = insert_error_with_embedding(&conn, "timeout error in API", &emb_similar);
+        let id2 = insert_error_with_embedding(&conn, "timeout error in DB", &emb_similar);
+
+        // One orthogonal embedding
+        let blob_diff = make_orthogonal_embedding();
+        let id3 = insert_error_with_embedding(&conn, "unrelated issue", &blob_diff);
+
+        let patterns = curator.detect_embedding_patterns(&conn, &[id1, id2, id3]);
+        assert_eq!(patterns.len(), 1, "should find exactly one cluster");
+        assert_eq!(
+            patterns[0].error_ids.len(),
+            2,
+            "cluster should contain only the two similar errors"
+        );
+        assert!(patterns[0].error_ids.contains(&id1));
+        assert!(patterns[0].error_ids.contains(&id2));
+        assert!(
+            !patterns[0].error_ids.contains(&id3),
+            "the different error should not be in the cluster"
+        );
     }
 }

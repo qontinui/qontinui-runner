@@ -80,7 +80,7 @@ import "./index.css";
 declare global {
   interface WindowEventMap {
     "ui-bridge-navigate": CustomEvent<{ page: string; url?: string }>;
-    "navigate-to-error-monitor": Event;
+    "navigate-to-error-monitor": CustomEvent<{ taskRunId?: string; taskRunName?: string }>;
     "navigate-to-active": Event;
     "sm-show-exploration": Event;
     "runner-name-changed": CustomEvent<string>;
@@ -112,6 +112,8 @@ function AppContent() {
     setTerminalSessionCount,
     staleTaskMessage,
     setStaleTaskMessage,
+    errorMonitorScope,
+    clearErrorMonitorScope,
     ProfilerWrapper,
   } = useAppNavigation();
 
@@ -392,6 +394,8 @@ function AppContent() {
                 handleCopyLogs={handleCopyLogs}
                 clearActionLogs={clearActionLogs}
                 clearAllLogs={clearAllLogs}
+                errorMonitorScope={errorMonitorScope}
+                clearErrorMonitorScope={clearErrorMonitorScope}
               />
               <div className={`absolute inset-0 ${activeTab === "terminal" ? "" : "hidden"}`}>
                 <TerminalPage

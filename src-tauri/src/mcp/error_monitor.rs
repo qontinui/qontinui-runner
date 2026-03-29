@@ -162,25 +162,18 @@ pub async fn generate_fix_workflow(
     Json<ApiResponse<crate::error_monitor::GeneratedWorkflow>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // SQLite: complex function — ErrorFixWorkflowGenerator uses curator+generator deeply tied to SQLite
-    let db = state.app_state.checkpoint_db.clone();
-    let task_run_id = request.task_run_id;
+    let task_run_id = request.task_run_id.unwrap_or_default();
     let max_iterations = request.max_iterations.unwrap_or(10);
 
-    match tokio::task::spawn_blocking(move || {
-        let conn = db.connection().map_err(|e| format!("Database error: {}", e))?;
-        let config = crate::error_monitor::ErrorFixWorkflowConfig {
-            task_run_id,
-            max_iterations,
-            ..Default::default()
-        };
-        let generator = crate::error_monitor::ErrorFixWorkflowGenerator::with_config(config);
-        generator.generate(&conn).map_err(|e| format!("Failed to generate workflow: {}", e))
-    }).await {
-        Ok(Ok(workflow)) => Ok(Json(ApiResponse::success(workflow))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
-    }
+    let result = state.app_state.pg_db
+        .generate_error_fix_workflow(&task_run_id, max_iterations)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    // Convert to the expected type via serde
+    let workflow: crate::error_monitor::GeneratedWorkflow = serde_json::from_value(result)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("Deserialization: {}", e)))))?;
+    Ok(Json(ApiResponse::success(workflow)))
 }
 
 /// Create routes for this module.

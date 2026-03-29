@@ -331,6 +331,51 @@ impl PgDb {
         Ok(())
     }
 
+    /// Get recurrence history for a given signature_hash.
+    ///
+    /// Returns past resolved/wont_fix entries so the UI can display how many
+    /// times this error pattern has recurred and been resolved.
+    pub async fn get_error_recurrence_history(
+        &self,
+        signature_hash: &str,
+    ) -> Result<Vec<crate::error_monitor::commands::RecurrenceEntry>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, status, resolved_at::TEXT, resolution_notes,
+                       first_seen_at::TEXT, last_seen_at::TEXT, occurrence_count
+                FROM error_events
+                WHERE signature_hash = $1 AND status IN ('resolved', 'wont_fix')
+                ORDER BY resolved_at DESC NULLS LAST
+                LIMIT 10
+                "#,
+                &[&signature_hash],
+            )
+            .await
+            .map_err(|e| format!("PG get_error_recurrence_history: {}", e))?;
+
+        let entries = rows
+            .iter()
+            .map(|row| crate::error_monitor::commands::RecurrenceEntry {
+                id: row.get(0),
+                status: row.get(1),
+                resolved_at: row.get(2),
+                resolution_notes: row.get(3),
+                first_seen_at: row.get(4),
+                last_seen_at: row.get(5),
+                occurrence_count: row.get(6),
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
     // ========================================================================
     // Internal helpers
     // ========================================================================

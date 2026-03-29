@@ -109,6 +109,11 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
   const [editingProfile, setEditingProfile] = useState<GlobalLogSourceProfile | null>(null);
   const [showAddSource, setShowAddSource] = useState(false);
   const [showAddProfile, setShowAddProfile] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    type: "source" | "profile";
+    id: string;
+    name: string;
+  } | null>(null);
 
   // Load settings on mount
   useEffect(() => {
@@ -414,7 +419,9 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
                   key={source.id}
                   source={source}
                   onEdit={() => setEditingSource(source)}
-                  onDelete={() => deleteSource(source.id)}
+                  onDelete={() =>
+                    setDeleteConfirm({ type: "source", id: source.id, name: source.name })
+                  }
                   onToggle={() => toggleSourceEnabled(source.id)}
                   getCategoryColor={getCategoryColor}
                 />
@@ -467,7 +474,9 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
                   isDefault={settings.default_profile_id === profile.id}
                   sources={settings.sources}
                   onEdit={() => setEditingProfile(profile)}
-                  onDelete={() => deleteProfile(profile.id)}
+                  onDelete={() =>
+                    setDeleteConfirm({ type: "profile", id: profile.id, name: profile.name })
+                  }
                   onSetDefault={() => setDefaultProfile(profile.id)}
                 />
               ))
@@ -513,6 +522,46 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
             setEditingProfile(null);
           }}
         />
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deleteConfirm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-background rounded-lg shadow-xl w-full max-w-sm p-4 space-y-4">
+            <div className="flex items-center gap-2">
+              <Trash2 className="w-5 h-5 text-destructive" />
+              <h3 className="font-medium">Delete {deleteConfirm.type === "source" ? "Source" : "Profile"}</h3>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Are you sure you want to delete{" "}
+              <span className="font-medium text-foreground">{deleteConfirm.name}</span>?
+              {deleteConfirm.type === "source" &&
+                " It will also be removed from any profiles that reference it."}
+              {" "}This action cannot be undone until you save.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setDeleteConfirm(null)}
+                className="px-3 py-1.5 text-sm hover:bg-muted rounded-md"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (deleteConfirm.type === "source") {
+                    deleteSource(deleteConfirm.id);
+                  } else {
+                    deleteProfile(deleteConfirm.id);
+                  }
+                  setDeleteConfirm(null);
+                }}
+                className="px-3 py-1.5 text-sm bg-destructive text-destructive-foreground rounded-md hover:bg-destructive/90"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -562,8 +611,21 @@ function SourceRow({
           className="text-xs text-muted-foreground truncate"
         >
           {source.path}
+          {source.format !== "plaintext" && (
+            <span className="ml-1 text-muted-foreground/60">({source.format})</span>
+          )}
+          {source.parser !== "generic" && (
+            <span className="ml-1 text-muted-foreground/60">[{source.parser}]</span>
+          )}
         </div>
       </div>
+      <span
+        data-content-role="badge"
+        data-content-label="source type"
+        className="px-1.5 py-0.5 text-[10px] bg-muted/60 rounded capitalize"
+      >
+        {source.type}
+      </span>
       <span
         data-content-role="badge"
         data-content-label="source category"
@@ -799,6 +861,7 @@ function SourceEditor({
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               >
                 <option value="file">File</option>
+                <option value="glob">Glob</option>
                 <option value="directory">Directory</option>
               </select>
             </div>
@@ -820,16 +883,23 @@ function SourceEditor({
             </div>
           </div>
 
-          {form.type === "directory" && (
+          {(form.type === "directory" || form.type === "glob") && (
             <div>
-              <label className="text-xs font-medium">Pattern</label>
+              <label className="text-xs font-medium">
+                {form.type === "glob" ? "Glob Pattern *" : "Pattern"}
+              </label>
               <input
                 type="text"
                 value={form.pattern}
                 onChange={(e) => setForm((f) => ({ ...f, pattern: e.target.value }))}
-                placeholder="*.log"
+                placeholder={form.type === "glob" ? "**/*.log" : "*.log"}
                 className="w-full mt-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
               />
+              {form.type === "glob" && (
+                <p className="text-[10px] text-muted-foreground mt-1">
+                  Glob pattern relative to the path above (e.g. **/*.log, app-*.log)
+                </p>
+              )}
             </div>
           )}
 

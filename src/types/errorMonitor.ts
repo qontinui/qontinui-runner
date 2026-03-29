@@ -140,6 +140,28 @@ export interface StoredErrorEvent {
 }
 
 // =============================================================================
+// Recurrence History Types
+// =============================================================================
+
+/** A past resolution entry for recurrence history display */
+export interface RecurrenceEntry {
+  /** Error event ID */
+  id: number;
+  /** Status when resolved (resolved or wont_fix) */
+  status: string;
+  /** When the error was resolved */
+  resolvedAt: string | null;
+  /** Notes about the resolution */
+  resolutionNotes: string | null;
+  /** When this occurrence was first seen */
+  firstSeenAt: string;
+  /** When this occurrence was last seen */
+  lastSeenAt: string;
+  /** Number of occurrences in this cycle */
+  occurrenceCount: number;
+}
+
+// =============================================================================
 // Query Types
 // =============================================================================
 

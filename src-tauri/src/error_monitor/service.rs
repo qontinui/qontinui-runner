@@ -200,11 +200,43 @@ impl ErrorMonitorHandle {
         let command_tx = self.command_tx.clone();
         tokio::spawn(async move {
             // Batch lines to avoid sending one-at-a-time through the command channel.
-            // Flush every 50 lines or when the channel is empty (try_recv returns Empty).
+            // Flush every 50 lines or after 2 seconds of inactivity (whichever comes first).
             let mut batch: Vec<ErrorEvent> = Vec::new();
             const BATCH_SIZE: usize = 50;
+            const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-            while let Some(line) = line_rx.recv().await {
+            loop {
+                let line = if batch.is_empty() {
+                    // No partial batch — just wait for next line without timeout
+                    match line_rx.recv().await {
+                        Some(l) => l,
+                        None => break,
+                    }
+                } else {
+                    // Partial batch exists — apply timeout so slow trickles get flushed
+                    tokio::select! {
+                        result = line_rx.recv() => {
+                            match result {
+                                Some(l) => l,
+                                None => {
+                                    // Stream closed — flush remaining below
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(FLUSH_TIMEOUT) => {
+                            // Timeout: flush partial batch
+                            let errors = std::mem::take(&mut batch);
+                            let _ = command_tx
+                                .send(ServiceCommand::IngestStreamErrors {
+                                    source_name: source_name.clone(),
+                                    errors,
+                                })
+                                .await;
+                            continue;
+                        }
+                    }
+                };
                 // Only ingest lines that look like errors or warnings.
                 // The pipeline processors will do full parsing/dedup, but we
                 // pre-filter to avoid flooding the pipeline with debug/info lines.
@@ -250,7 +282,7 @@ impl ErrorMonitorHandle {
                         })
                         .await;
                 }
-            }
+            } // end loop
 
             // Flush remaining
             if !batch.is_empty() {
@@ -947,5 +979,120 @@ mod tests {
             .unwrap();
         assert!(content.contains("ERROR: Something went wrong"));
         assert!(!content.contains("Initial content"));
+    }
+
+    // ---------------------------------------------------------------
+    // Stderr ingestion task: line filtering tests
+    // ---------------------------------------------------------------
+    //
+    // spawn_stderr_ingestion_task sends filtered lines through the
+    // command channel as IngestStreamErrors. We test the filtering
+    // logic by creating the channel pair, sending lines, and verifying
+    // which lines produce IngestStreamErrors commands.
+
+    #[tokio::test]
+    async fn test_stderr_ingestion_filters_error_lines() {
+        // Construct a minimal ErrorMonitorHandle directly — no PgDb needed.
+        // We only need the command channel to observe what spawn_stderr_ingestion_task sends.
+        let (command_tx, mut command_rx) = mpsc::channel::<ServiceCommand>(100);
+        let (_event_tx, event_rx) = mpsc::channel::<ErrorMonitorEvent>(10);
+        let handle = ErrorMonitorHandle {
+            command_tx,
+            event_rx: Arc::new(RwLock::new(Some(event_rx))),
+        };
+
+        let (line_tx, line_rx) = tokio::sync::mpsc::channel::<String>(100);
+
+        handle.spawn_stderr_ingestion_task("test-stderr".to_string(), line_rx);
+
+        // Send a mix of error-like and non-error lines
+        let lines = vec![
+            "INFO: Starting up",                      // should be filtered out
+            "DEBUG: connecting to database",           // should be filtered out
+            "ERROR: connection refused",               // should be forwarded
+            "  File \"main.py\", line 42",            // should be filtered out (no error keyword)
+            "Traceback (most recent call last):",     // should be forwarded
+            "WARNING: deprecated API call",            // should be forwarded
+            "All systems nominal",                     // should be filtered out
+            "CRITICAL: disk full",                     // should be forwarded
+            "fatal: not a git repository",             // should be forwarded
+            "panic: runtime error",                    // should be forwarded
+        ];
+
+        for line in &lines {
+            line_tx.send(line.to_string()).await.unwrap();
+        }
+        // Drop sender to signal stream end, which flushes the batch
+        drop(line_tx);
+
+        // Collect all IngestStreamErrors commands
+        let mut ingested_messages: Vec<String> = Vec::new();
+
+        // The task will flush remaining batch when the channel closes,
+        // then the task ends. We read until the command channel is empty.
+        // Use a short timeout to avoid hanging if something goes wrong.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = tokio::time::timeout_at(deadline, command_rx.recv()).await;
+            match result {
+                Ok(Some(ServiceCommand::IngestStreamErrors { errors, .. })) => {
+                    for e in errors {
+                        ingested_messages.push(e.message.clone());
+                    }
+                }
+                Ok(Some(ServiceCommand::Stop)) => break,
+                Ok(Some(_)) => {} // ignore other commands
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // timeout
+            }
+        }
+
+        // Verify error-like lines were forwarded
+        assert!(
+            ingested_messages.iter().any(|m| m.contains("connection refused")),
+            "ERROR line should be forwarded"
+        );
+        assert!(
+            ingested_messages.iter().any(|m| m.contains("Traceback")),
+            "Traceback line should be forwarded"
+        );
+        assert!(
+            ingested_messages.iter().any(|m| m.contains("deprecated API")),
+            "WARNING line should be forwarded"
+        );
+        assert!(
+            ingested_messages.iter().any(|m| m.contains("disk full")),
+            "CRITICAL line should be forwarded"
+        );
+        assert!(
+            ingested_messages.iter().any(|m| m.contains("fatal: not a git")),
+            "fatal line should be forwarded"
+        );
+        assert!(
+            ingested_messages.iter().any(|m| m.contains("panic: runtime")),
+            "panic line should be forwarded"
+        );
+
+        // Verify non-error lines were NOT forwarded
+        assert!(
+            !ingested_messages.iter().any(|m| m.contains("Starting up")),
+            "INFO line should be filtered out"
+        );
+        assert!(
+            !ingested_messages.iter().any(|m| m.contains("connecting to database")),
+            "DEBUG line should be filtered out"
+        );
+        assert!(
+            !ingested_messages.iter().any(|m| m.contains("All systems nominal")),
+            "Normal line should be filtered out"
+        );
+
+        // Total forwarded should be 6
+        assert_eq!(
+            ingested_messages.len(),
+            6,
+            "expected 6 error/warning-like lines to be forwarded, got {}",
+            ingested_messages.len()
+        );
     }
 }

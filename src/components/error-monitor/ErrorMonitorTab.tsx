@@ -5,7 +5,7 @@
  * Shows a list of errors with filtering, status management, and fix workflow generation.
  */
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   AlertCircle,
   AlertTriangle,
@@ -29,7 +29,7 @@ import { ScrollArea } from "../ui/ScrollArea";
 import { getStatusColors } from "@/design-system";
 import { useErrorEvents, useErrorSummary, useDebugContext } from "../../hooks/useErrorMonitor";
 import { errorMonitorService, formatErrorTime } from "../../services/error-monitor-service";
-import type { StoredErrorEvent, ErrorSeverity, ErrorStatus } from "../../types/errorMonitor";
+import type { StoredErrorEvent, ErrorSeverity, ErrorStatus, RecurrenceEntry } from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
 import { BrowserErrorsPanel } from "./BrowserErrorsPanel";
 // Log source management is now in Settings > Log Sources (LogSourcesSettings.tsx)
@@ -114,6 +114,70 @@ function StatusBadge({ status }: { status: ErrorStatus }) {
     >
       {config.label}
     </span>
+  );
+}
+
+function RecurrenceHistory({ signatureHash }: { signatureHash: string }) {
+  const [entries, setEntries] = useState<RecurrenceEntry[] | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    errorMonitorService
+      .getRecurrenceHistory(signatureHash)
+      .then((data) => {
+        if (!cancelled) setEntries(data);
+      })
+      .catch(() => {
+        if (!cancelled) setEntries([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [signatureHash]);
+
+  if (loading) {
+    return (
+      <div className="text-xs text-muted-foreground py-1">Loading recurrence history...</div>
+    );
+  }
+
+  if (!entries || entries.length === 0) {
+    return null;
+  }
+
+  return (
+    <div>
+      <span className="text-xs font-medium text-orange-400">
+        Previously resolved {entries.length} time{entries.length !== 1 ? "s" : ""}
+      </span>
+      <div className="mt-1 space-y-1">
+        {entries.map((entry) => (
+          <div
+            key={entry.id}
+            className="flex items-center gap-2 text-xs text-muted-foreground bg-orange-500/5 px-2 py-1 rounded"
+          >
+            <span className="shrink-0">
+              {entry.resolvedAt
+                ? new Date(entry.resolvedAt).toLocaleDateString()
+                : "unknown date"}
+            </span>
+            <span className="text-orange-400/60">|</span>
+            <span className="shrink-0">x{entry.occurrenceCount}</span>
+            {entry.resolutionNotes && (
+              <>
+                <span className="text-orange-400/60">|</span>
+                <span className="truncate">{entry.resolutionNotes}</span>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -245,6 +309,11 @@ function ErrorItem({
             </div>
           )}
 
+          {/* Recurrence history (only for recurring errors) */}
+          {error.status === "recurring" && (
+            <RecurrenceHistory signatureHash={error.signatureHash} />
+          )}
+
           {/* Open in Editor */}
           {error.location?.filePath && (
             <div className="flex gap-2 pt-2">
@@ -360,6 +429,7 @@ export function ErrorMonitorTab({
   ]);
   const [showFilters, setShowFilters] = useState(false);
   const [expandedErrorId, setExpandedErrorId] = useState<number | null>(null);
+  const [selectedPatternIds, setSelectedPatternIds] = useState<Set<number> | null>(null);
   // Data hooks
   const {
     errors,
@@ -381,18 +451,29 @@ export function ErrorMonitorTab({
   const { context: debugContext } = useDebugContext({ taskRunId });
   const patterns = debugContext?.patterns ?? [];
 
-  // Filter errors by search text
+  // Filter errors by search text and selected pattern
   const filteredErrors = useMemo(() => {
-    if (!searchText) return errors;
-    const search = searchText.toLowerCase();
-    return errors.filter(
-      (e) =>
-        e.message.toLowerCase().includes(search) ||
-        e.errorType?.toLowerCase().includes(search) ||
-        e.logSourceName.toLowerCase().includes(search) ||
-        e.workflowName?.toLowerCase().includes(search),
-    );
-  }, [errors, searchText]);
+    let result = errors;
+
+    // Pattern cluster filter
+    if (selectedPatternIds) {
+      result = result.filter((e) => selectedPatternIds.has(e.id));
+    }
+
+    // Text search filter
+    if (searchText) {
+      const search = searchText.toLowerCase();
+      result = result.filter(
+        (e) =>
+          e.message.toLowerCase().includes(search) ||
+          e.errorType?.toLowerCase().includes(search) ||
+          e.logSourceName.toLowerCase().includes(search) ||
+          e.workflowName?.toLowerCase().includes(search),
+      );
+    }
+
+    return result;
+  }, [errors, searchText, selectedPatternIds]);
 
   const severityOptions: ErrorSeverity[] = ["critical", "error", "warning", "info", "debug"];
   const statusOptions: ErrorStatus[] = [
@@ -420,10 +501,11 @@ export function ErrorMonitorTab({
     setSelectedSeverities([]);
     setSelectedStatuses([]);
     setSearchText("");
+    setSelectedPatternIds(null);
   };
 
   const hasActiveFilters =
-    selectedSeverities.length > 0 || selectedStatuses.length > 0 || searchText.length > 0;
+    selectedSeverities.length > 0 || selectedStatuses.length > 0 || searchText.length > 0 || selectedPatternIds !== null;
 
   return (
     <div className="flex flex-col h-full">
@@ -600,21 +682,67 @@ export function ErrorMonitorTab({
       {/* Detected patterns */}
       {patterns.length > 0 && (
         <div className="px-4 py-2 border-b border-border bg-muted/20">
-          <span className="text-xs font-medium text-muted-foreground">
-            Detected Patterns ({patterns.length})
-          </span>
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium text-muted-foreground">
+              Detected Patterns ({patterns.length})
+            </span>
+            {selectedPatternIds && (
+              <button
+                onClick={() => setSelectedPatternIds(null)}
+                className="text-xs text-purple-400 hover:text-purple-300 flex items-center gap-1"
+              >
+                <X className="w-3 h-3" />
+                Clear pattern filter
+              </button>
+            )}
+          </div>
           <div className="mt-1 space-y-1">
-            {patterns.map((p, i) => (
-              <div key={i} className="text-xs flex items-center gap-2 text-muted-foreground">
-                <span className="px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded">
-                  {(p.patternType ?? "unknown").replace(/_/g, " ")}
-                </span>
-                <span>{p.name}</span>
-                <span className="text-muted-foreground/60">
-                  ({p.frequency ?? p.matchCount ?? 0} errors)
-                </span>
-              </div>
-            ))}
+            {patterns.map((p, i) => {
+              const patternErrorIds = p.errorIds ?? [];
+              const isSelected =
+                selectedPatternIds !== null &&
+                patternErrorIds.length > 0 &&
+                patternErrorIds.every((id: number) => selectedPatternIds.has(id)) &&
+                selectedPatternIds.size === patternErrorIds.length;
+
+              return (
+                <div
+                  key={i}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    if (isSelected) {
+                      setSelectedPatternIds(null);
+                    } else if (patternErrorIds.length > 0) {
+                      setSelectedPatternIds(new Set(patternErrorIds));
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (isSelected) {
+                        setSelectedPatternIds(null);
+                      } else if (patternErrorIds.length > 0) {
+                        setSelectedPatternIds(new Set(patternErrorIds));
+                      }
+                    }
+                  }}
+                  className={cn(
+                    "text-xs flex items-center gap-2 text-muted-foreground px-2 py-1 rounded cursor-pointer transition-colors",
+                    "hover:bg-muted/40",
+                    isSelected && "ring-1 ring-purple-500 bg-purple-500/10",
+                  )}
+                >
+                  <span className="px-1.5 py-0.5 bg-purple-500/20 text-purple-400 rounded">
+                    {(p.patternType ?? "unknown").replace(/_/g, " ")}
+                  </span>
+                  <span className="flex-1">{p.name}</span>
+                  <span className={cn("text-muted-foreground/60", isSelected && "text-purple-400")}>
+                    {p.frequency ?? p.matchCount ?? 0} errors
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

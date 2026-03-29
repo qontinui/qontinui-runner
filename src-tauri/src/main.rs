@@ -250,7 +250,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         match rt.block_on(crate::database::pg::PgDb::new(&pg_url)) {
             Ok(pg) => {
                 info!("PostgreSQL connected successfully");
-                Arc::new(pg)
+                let pg = Arc::new(pg);
+                crate::database::pg::PgDb::set_global(pg.clone());
+                pg
             }
             Err(e) => {
                 error!("PostgreSQL connection failed: {}. Ensure docker-compose PG is running.", e);
@@ -1211,6 +1213,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             error_monitor::commands::get_debug_context,
             error_monitor::commands::get_debug_context_for_ai,
             error_monitor::commands::open_error_in_editor,
+            error_monitor::commands::get_error_recurrence_history,
             error_monitor::workflow::generate_error_fix_workflow,
             error_monitor::workflow::generate_single_error_fix_workflow,
             error_monitor::workflow::check_fixable_errors,
@@ -1705,6 +1708,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             database::embedding_jobs::start_embedding_job(
                 embedding_db,
                 database::embedding_jobs::EmbeddingJobConfig::default(),
+            );
+
+            // Start memory consolidation scheduler in background
+            info!("Starting memory consolidation scheduler");
+            let scheduler_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();
+            memory::scheduler::start_memory_scheduler(
+                scheduler_pg,
+                memory::scheduler::MemorySchedulerConfig::default(),
             );
 
             // Auto-start MCP servers marked with auto_start in background

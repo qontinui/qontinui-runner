@@ -509,13 +509,37 @@ pub async fn generate_error_fix_workflow(
     let db = db.inner().clone();
     let config = config.unwrap_or_default();
 
-    tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        let generator = ErrorFixWorkflowGenerator::with_config(config);
-        generator.generate(&conn)
+    // PG-primary: use PG error context to generate fix workflow
+    let pg = crate::database::pg::PgDb::global();
+    let errors = pg.get_unresolved_errors(config.task_run_id.as_deref(), 50).await?;
+    if errors.is_empty() {
+        return Err("No errors to fix".to_string());
+    }
+    let has_critical = errors.iter().any(|e| e["severity"].as_str() == Some("critical"));
+    let error_count = errors.len() as u32;
+    let targeted_error_ids: Vec<i64> = errors.iter()
+        .filter_map(|e| e["id"].as_i64())
+        .collect();
+    let error_summary: Vec<String> = errors.iter()
+        .map(|e| format!("[{}] {}", e["severity"].as_str().unwrap_or("unknown"), e["message"].as_str().unwrap_or("(no message)")))
+        .collect();
+    let ai_prompt = format!(
+        "Fix the following application errors:\n\n{}\n\nDebug, identify root causes, and fix all errors.",
+        error_summary.join("\n")
+    );
+    let description = format!("Fix {} errors ({} critical)", error_count, if has_critical { "has" } else { "no" });
+    let workflow = json!({
+        "name": config.name,
+        "steps": [],
+        "prompt": ai_prompt,
+        "targeted_error_ids": targeted_error_ids,
+    });
+    Ok(GeneratedWorkflow {
+        workflow_json: workflow,
+        description,
+        error_count,
+        has_critical,
     })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Tauri command to generate a workflow to fix a single error.
@@ -526,15 +550,34 @@ pub async fn generate_single_error_fix_workflow(
     db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
     error_id: i64,
 ) -> Result<GeneratedWorkflow, String> {
-    let db = db.inner().clone();
+    let _db = db.inner().clone();
 
-    tokio::task::spawn_blocking(move || {
-        let conn = db.connection()?;
-        let generator = ErrorFixWorkflowGenerator::new();
-        generator.generate_for_single_error(&conn, error_id)
+    // PG-primary: get single error and generate workflow
+    let pg = crate::database::pg::PgDb::global();
+    let errors = pg.get_unresolved_errors(None, 200).await?;
+    let target_error = errors.iter().find(|e| e["id"].as_i64() == Some(error_id))
+        .ok_or_else(|| format!("Error {} not found or already resolved", error_id))?;
+
+    let severity = target_error["severity"].as_str().unwrap_or("error");
+    let message = target_error["message"].as_str().unwrap_or("(no message)");
+    let file_path = target_error["file_path"].as_str().unwrap_or("");
+
+    let ai_prompt = format!(
+        "Fix this {} error: {}\nFile: {}\n\nAnalyze the root cause and implement a fix.",
+        severity, message, file_path
+    );
+    let workflow = json!({
+        "name": format!("Fix Error #{}", error_id),
+        "steps": [],
+        "prompt": ai_prompt,
+        "targeted_error_ids": [error_id],
+    });
+    Ok(GeneratedWorkflow {
+        workflow_json: workflow,
+        description: format!("Fix single error: {}", truncate_str(message, 100)),
+        error_count: 1,
+        has_critical: severity == "critical",
     })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
 }
 
 /// Check if there are fixable errors and return a summary.
