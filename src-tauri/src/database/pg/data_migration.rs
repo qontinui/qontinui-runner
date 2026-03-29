@@ -33,6 +33,9 @@ async fn pg_table_has_data(
     conn: &deadpool_postgres::Object,
     table: &str,
 ) -> Result<bool, String> {
+    if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Err(format!("Invalid table name: {}", table));
+    }
     let sql = format!("SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)", table);
     let row = conn
         .query_one(&sql as &str, &[])

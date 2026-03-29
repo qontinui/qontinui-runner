@@ -515,17 +515,30 @@ async fn run_consolidation_inner(
             group.observations.len()
         );
 
-        let response = ai_provider::run_prompt_with_model_override(
-            &prompt,
-            &context,
-            None, // doctor_handle
-            config.model_override.as_deref(),
-            config.provider_override.as_deref(),
-            Some(0.3), // low temperature for structured output
-            Some(1024),
-            None, // fallback_model
-            None, // fallback_provider
-        );
+        let model_override = config.model_override.clone();
+        let provider_override = config.provider_override.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            ai_provider::run_prompt_with_model_override(
+                &prompt,
+                &context,
+                None, // doctor_handle
+                model_override.as_deref(),
+                provider_override.as_deref(),
+                Some(0.3), // low temperature for structured output
+                Some(1024),
+                None, // fallback_model
+                None, // fallback_provider
+            )
+        })
+        .await;
+
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Consolidation spawn_blocking failed for group '{}': {}", group.group_key, e);
+                continue;
+            }
+        };
 
         if !response.success {
             warn!(
