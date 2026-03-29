@@ -7,6 +7,7 @@ use crate::commands::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
+use tracing::warn;
 
 // ============================================================================
 // Response types
@@ -222,7 +223,7 @@ pub async fn get_playbook_entries(
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| warn!("Row deserialization failed: {e}")).ok())
         .collect();
 
     Ok(entries)
@@ -263,7 +264,7 @@ pub async fn get_curated_examples(
             }))
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| warn!("Row deserialization failed: {e}")).ok())
         .collect();
 
     Ok(examples)
@@ -315,7 +316,7 @@ pub async fn get_template_performance(
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| warn!("Row deserialization failed: {e}")).ok())
         .collect();
 
     Ok(templates)
@@ -353,7 +354,7 @@ pub async fn get_gepa_runs(
             })
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| warn!("Row deserialization failed: {e}")).ok())
         .collect();
 
     Ok(runs)
@@ -390,7 +391,7 @@ pub async fn get_template_lifecycle_history(
             }))
         })
         .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| warn!("Row deserialization failed: {e}")).ok())
         .collect();
 
     Ok(events)

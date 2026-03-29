@@ -491,7 +491,9 @@ async fn run_consolidation_inner(
         let new_decay = importance::compute_decay_rate(new_importance, obs.is_mental_model);
 
         if (new_importance - obs.importance).abs() > 0.01 || (new_decay - obs.decay_rate).abs() > 0.001 {
-            let _ = pg.update_observation_importance(obs.id, new_importance, new_decay).await;
+            if let Err(e) = pg.update_observation_importance(obs.id, new_importance, new_decay).await {
+                tracing::warn!("Failed to update observation importance for id {}: {e}", obs.id);
+            }
         }
     }
 
@@ -590,7 +592,9 @@ async fn run_consolidation_inner(
                 // Reduce importance of superseded source observations by 50%
                 for &obs_id in &result.supersedes {
                     if source_ids.contains(&obs_id) {
-                        let _ = pg.reduce_observation_importance(obs_id, 0.5).await;
+                        if let Err(e) = pg.reduce_observation_importance(obs_id, 0.5).await {
+                            tracing::warn!("Failed to reduce observation importance for id {obs_id}: {e}");
+                        }
                         stats.observations_merged += 1;
                     }
                 }
