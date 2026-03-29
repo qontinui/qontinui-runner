@@ -123,7 +123,6 @@ function RecurrenceHistory({ signatureHash }: { signatureHash: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     errorMonitorService
       .getRecurrenceHistory(signatureHash)
       .then((data) => {

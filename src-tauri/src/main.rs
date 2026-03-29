@@ -519,8 +519,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         canvas_state: Arc::new(tokio::sync::RwLock::new(
             crate::mcp::canvas::CanvasState::new(),
         )),
-        orchestration_loop: std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::orchestration_loop::loop_engine::LoopState::new(),
+        orchestration_loops: std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::orchestration_loop::loop_engine::MultiLoopManager::new(),
         )),
         container_executor: TokioMutex::new(None), // Initialized via container settings when enabled
     });
@@ -1245,6 +1245,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             orchestration_loop::commands::stop_orchestration_loop,
             orchestration_loop::commands::get_orchestration_loop_status,
             orchestration_loop::commands::signal_orchestration_restart,
+            // Multi-loop orchestration commands
+            orchestration_loop::commands::start_multi_orchestration_loop,
+            orchestration_loop::commands::stop_orchestration_loop_by_id,
+            orchestration_loop::commands::stop_all_orchestration_loops,
+            orchestration_loop::commands::get_multi_orchestration_loop_status,
+            orchestration_loop::commands::signal_orchestration_restart_by_id,
             // Autoresearch commands (autonomous workflow optimization loop)
             autoresearch::commands::start_autoresearch,
             autoresearch::commands::stop_autoresearch,

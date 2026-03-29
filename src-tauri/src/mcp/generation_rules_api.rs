@@ -89,6 +89,9 @@ pub async fn create_rule_handler(
             )
         })?;
 
+    // Bump graph cache generation so the knowledge graph rebuilds on next access
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "generation_rule_mutation").await;
+
     info!(
         "HTTP: Created generation rule {} (agent={}, section={})",
         rule.id, rule.agent, rule.section
@@ -120,6 +123,9 @@ pub async fn update_rule_handler(
             )
         })?;
 
+    // Bump graph cache generation so the knowledge graph rebuilds on next access
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "generation_rule_mutation").await;
+
     info!("HTTP: Updated generation rule {}", rule.id);
 
     Ok(Json(ApiResponse::success(rule)))
@@ -148,6 +154,7 @@ pub async fn delete_rule_handler(
         })?;
 
     if deleted {
+        crate::mcp::graph_api::invalidate_graph_cache(&state, "delete_generation_rule").await;
         info!("HTTP: Deleted generation rule {}", id);
         Ok(Json(ApiResponse::success(true)))
     } else {

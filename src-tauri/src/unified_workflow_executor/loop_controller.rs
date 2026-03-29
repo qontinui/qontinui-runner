@@ -729,10 +729,11 @@ impl LoopController {
         let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
         {
             let active_canary: Option<(String, String)> =
-                match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db) {
+                match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db, &self.app_state.pg_db) {
                     Ok(canaries) => canaries.into_iter().find_map(|c| {
                         if crate::meta_optimizer::canary::should_apply_canary(
                             &self.checkpoint_db,
+                            &self.app_state.pg_db,
                             &c.recommendation_id,
                         ) {
                             info!(
@@ -752,6 +753,7 @@ impl LoopController {
             if let Some((_, ref rec_id)) = active_canary {
                 match crate::meta_optimizer::canary::get_canary_config_overrides(
                     &self.checkpoint_db,
+                    &self.app_state.pg_db,
                     rec_id,
                 ) {
                     Ok(overrides) => {
@@ -1497,6 +1499,7 @@ impl LoopController {
                     let stage_duration_ms = start.elapsed().as_millis() as f64;
                     let _ = crate::meta_optimizer::canary::record_canary_run(
                         &self.checkpoint_db,
+                        &self.app_state.pg_db,
                         canary_id,
                         config.is_canary_run,
                         loop_result.verification_passed,
@@ -1923,23 +1926,16 @@ impl LoopController {
             let pg_db_for_q = self.app_state.pg_db.clone();
             tokio::spawn(async move {
                 // Record learning outcome + agentic metrics via spawn_blocking
-                let sqlite_ok = tokio::task::spawn_blocking({
-                    let db = db.clone();
-                    let outcome_ref = outcome.clone();
-                    move || {
-                        db.with_conn(|conn| {
-                            crate::orchestrator::learning_recorder::record_workflow_learning(conn, &outcome_ref)
-                        })
-                    }
-                }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()));
+                // SQLite: spawn_blocking-wrapped, removed with SQLite
+                // PG-primary: record learning outcome directly
+                let pg_learning_ok = pg_db_for_q.record_workflow_learning_from_outcome(&outcome).await;
 
-                if let Err(ref e) = sqlite_ok {
+                if let Err(ref e) = pg_learning_ok {
                     warn!("Failed to record learning outcome: {}", e);
                 }
 
-                // PG Q-routing update — only if SQLite recording succeeded
-                // (composite_agentic_score is read back from SQLite)
-                if sqlite_ok.is_ok() {
+                // PG Q-routing update — only if PG recording succeeded
+                if pg_learning_ok.is_ok() {
                     // PG: get_composite_agentic_score
                     let composite_score = pg_db_for_q
                         .get_composite_agentic_score(&outcome.task_run_id)
@@ -2201,19 +2197,14 @@ impl LoopController {
                     .await
                     .unwrap_or_else(|_| cra_workflow_name.clone());
 
-                // Cross-run analysis uses deeply-integrated SQLite functions
+                // PG-primary: cross-run analysis
                 let cra_result = {
-                    let cra_db2 = cra_db.clone();
                     let swf = source_wf_name.clone();
                     let ctri = cra_task_run_id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        cra_db2.with_conn(|conn| {
-                            crate::reflection::cross_run_learning::post_run_analysis_with_skills(
-                                conn, &swf, &ctri,
-                            )
-                            .map_err(|e| e.to_string())
-                        })
-                    }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+                    match cra_pg_db.post_run_analysis(&swf, &ctri).await {
+                        Ok((patterns, rules, fixes)) => Ok((patterns, rules, fixes, Vec::<crate::reflection::cross_run_learning::ExtractedSkill>::new())),
+                        Err(e) => Err(e),
+                    }
                 };
                 match cra_result {
                     Ok((patterns, rules, fixes, extracted_skills)) => {

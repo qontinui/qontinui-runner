@@ -201,30 +201,27 @@ impl SubscriptionRoot {
                     break;
                 }
 
-                let loop_state = state
-                    .app_state
-                    .orchestration_loop
-                    .lock()
-                    .await;
+                let status = crate::orchestration_loop::loop_engine::get_status_compat(
+                    state.app_state.orchestration_loops.clone(),
+                )
+                .await;
 
-                let phase_str = format!("{:?}", loop_state.phase);
+                let phase_str = format!("{:?}", status.phase);
                 let is_terminal = matches!(
                     phase_str.as_str(),
                     "Complete" | "Stopped" | "Error"
                 );
 
                 yield GqlOrchestrationLoopStatus {
-                    running: loop_state.running,
+                    running: status.running,
                     phase: phase_str,
-                    current_iteration: loop_state.current_iteration as i32,
-                    started_at: loop_state
-                        .started_at
-                        .map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
-                    error: loop_state.error.clone(),
+                    current_iteration: status.current_iteration as i32,
+                    started_at: status.started_at,
+                    error: status.error,
                 };
 
                 // After loop finishes, emit final state then close
-                if is_terminal && !loop_state.running {
+                if is_terminal && !status.running {
                     terminal_ticks += 1;
                     if terminal_ticks >= 2 {
                         break;

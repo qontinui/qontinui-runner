@@ -90,6 +90,9 @@ pub async fn update_finding_status_handler(
         )
     })?;
 
+    // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "finding_mutation").await;
+
     info!(
         "HTTP: Updated finding {} to status {}",
         finding_id,
@@ -118,6 +121,9 @@ pub async fn resolve_finding_handler(
             Json(api_error(format!("Failed to resolve finding: {}", e))),
         )
     })?;
+
+    // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "finding_mutation").await;
 
     info!("HTTP: Resolved finding {}", finding_id);
 
@@ -193,6 +199,10 @@ pub async fn clear_all_findings_handler(
             }
             cleared_count += 1;
         }
+    }
+
+    if cleared_count > 0 {
+        crate::mcp::graph_api::invalidate_graph_cache(&state, "clear_all_findings").await;
     }
 
     info!(

@@ -3,11 +3,13 @@
 //! Runs the iterative workflow loop: execute → reflect → evaluate exit → between-iterations.
 
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::context_summarizer::{ContextSummarizer, IterationContext, estimate_tokens};
+use super::diagnostician;
 use super::fix_agent;
 use super::intervention;
 use super::remote_client::{RunnerClient, SupervisorClient};
@@ -19,6 +21,27 @@ use crate::ai_provider::routing::run_prompt_sync;
 
 /// Shared loop state, protected by a mutex for concurrent access from commands/API.
 pub type SharedLoopState = Arc<Mutex<LoopState>>;
+
+/// Multi-loop state: maps loop IDs to individual loop states + metadata.
+pub struct MultiLoopManager {
+    pub loops: HashMap<LoopId, SharedLoopState>,
+    pub metadata: LoopMetadataMap,
+    /// Global stop_all_on_error flag from the most recent multi-loop launch.
+    pub stop_all_on_error: bool,
+}
+
+impl MultiLoopManager {
+    pub fn new() -> Self {
+        Self {
+            loops: HashMap::new(),
+            metadata: HashMap::new(),
+            stop_all_on_error: false,
+        }
+    }
+}
+
+/// Shared multi-loop manager.
+pub type SharedLoopStates = Arc<Mutex<MultiLoopManager>>;
 
 /// Internal mutable state for the orchestration loop.
 pub struct LoopState {
@@ -151,6 +174,286 @@ pub async fn signal_restart(loop_state: SharedLoopState) -> Result<(), String> {
     state.restart_signaled = true;
     info!("Orchestration loop: restart signaled");
     Ok(())
+}
+
+// --- Default loop ID for backwards-compatible single-loop API ---
+
+const DEFAULT_LOOP_ID: &str = "default";
+
+/// Get or create the default loop state within the multi-loop manager.
+async fn get_or_create_default(states: &SharedLoopStates) -> SharedLoopState {
+    let mut mgr = states.lock().await;
+    mgr.loops
+        .entry(DEFAULT_LOOP_ID.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(LoopState::new())))
+        .clone()
+}
+
+/// Start a single loop using the default loop ID (backwards-compatible).
+pub async fn start_loop_compat(
+    states: SharedLoopStates,
+    config: OrchestrationLoopConfig,
+) -> Result<(), String> {
+    let loop_state = get_or_create_default(&states).await;
+    start_loop(loop_state, config).await
+}
+
+/// Stop the default loop (backwards-compatible).
+pub async fn stop_loop_compat(states: SharedLoopStates) -> Result<(), String> {
+    let loop_state = get_or_create_default(&states).await;
+    stop_loop(loop_state).await
+}
+
+/// Get status of the default loop (backwards-compatible).
+pub async fn get_status_compat(states: SharedLoopStates) -> OrchestrationLoopStatus {
+    let loop_state = get_or_create_default(&states).await;
+    get_status(loop_state).await
+}
+
+/// Signal restart on the default loop (backwards-compatible).
+pub async fn signal_restart_compat(states: SharedLoopStates) -> Result<(), String> {
+    let loop_state = get_or_create_default(&states).await;
+    signal_restart(loop_state).await
+}
+
+// --- Multi-loop management ---
+
+/// Start multiple loops simultaneously, each targeting a different runner.
+pub async fn start_multi_loop(
+    states: SharedLoopStates,
+    multi_config: MultiLoopConfig,
+) -> Result<(), String> {
+    if multi_config.loops.is_empty() {
+        return Err("No loops configured".to_string());
+    }
+
+    // Validate no duplicate loop IDs
+    let mut seen_ids = std::collections::HashSet::new();
+    for entry in &multi_config.loops {
+        if !seen_ids.insert(entry.loop_id.clone()) {
+            return Err(format!("Duplicate loop ID: {}", entry.loop_id));
+        }
+    }
+    let loop_count = seen_ids.len();
+    drop(seen_ids);
+
+    // Validate no duplicate target runner ports
+    let mut seen_ports = std::collections::HashSet::new();
+    for entry in &multi_config.loops {
+        let port = entry.config.target_runner_port.unwrap_or(0);
+        if port > 0 && !seen_ports.insert(port) {
+            return Err(format!(
+                "Multiple loops target the same runner port: {}",
+                port
+            ));
+        }
+    }
+
+    // Health-check all target runners before starting any loops
+    for entry in &multi_config.loops {
+        let port = entry.config.target_runner_port.unwrap_or_else(|| {
+            std::env::var("QONTINUI_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(9876)
+        });
+        let runner = RunnerClient::new(port);
+        if !runner.is_healthy().await {
+            return Err(format!(
+                "Target runner on port {} (loop '{}') is not healthy",
+                port, entry.loop_id
+            ));
+        }
+    }
+
+    // Check none of the requested loop IDs are already running
+    {
+        let mgr = states.lock().await;
+        for entry in &multi_config.loops {
+            if let Some(existing) = mgr.loops.get(&entry.loop_id) {
+                let state = existing.lock().await;
+                if state.running {
+                    return Err(format!("Loop '{}' is already running", entry.loop_id));
+                }
+            }
+        }
+    }
+
+    // Launch each loop
+    let stop_all_on_error = multi_config.stop_all_on_error;
+    for entry in multi_config.loops {
+        let loop_state = Arc::new(Mutex::new(LoopState::new()));
+        let mut mgr = states.lock().await;
+        mgr.loops.insert(entry.loop_id.clone(), loop_state.clone());
+        mgr.metadata.insert(
+            entry.loop_id.clone(),
+            LoopMetadata {
+                label: entry.label.clone(),
+                stop_all_on_error,
+            },
+        );
+        mgr.stop_all_on_error = stop_all_on_error;
+        drop(mgr);
+
+        start_loop(loop_state.clone(), entry.config).await.map_err(|e| {
+            format!("Failed to start loop '{}': {}", entry.loop_id, e)
+        })?;
+
+        // If stop_all_on_error, spawn a watcher for this loop
+        if stop_all_on_error {
+            let states_clone = states.clone();
+            let loop_id = entry.loop_id.clone();
+            let loop_state_clone = loop_state.clone();
+            tokio::spawn(async move {
+                watch_loop_for_error(states_clone, loop_id, loop_state_clone).await;
+            });
+        }
+    }
+
+    info!(
+        "Multi-loop started: {} loops, stop_all_on_error={}",
+        loop_count,
+        stop_all_on_error
+    );
+
+    Ok(())
+}
+
+/// Watches a single loop and stops all others if it errors out.
+async fn watch_loop_for_error(
+    states: SharedLoopStates,
+    loop_id: LoopId,
+    loop_state: SharedLoopState,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let state = loop_state.lock().await;
+        if !state.running {
+            if state.phase == LoopPhase::Error {
+                warn!(
+                    "Loop '{}' errored — stopping all loops (stop_all_on_error)",
+                    loop_id
+                );
+                drop(state);
+                if let Err(e) = stop_all_loops(states).await {
+                    error!("Failed to stop all loops after error: {}", e);
+                }
+            }
+            return;
+        }
+    }
+}
+
+/// Stop a specific loop by ID.
+pub async fn stop_loop_by_id(states: SharedLoopStates, loop_id: &str) -> Result<(), String> {
+    let mgr = states.lock().await;
+    let loop_state = mgr
+        .loops
+        .get(loop_id)
+        .ok_or_else(|| format!("No loop with ID '{}'", loop_id))?
+        .clone();
+    drop(mgr);
+    stop_loop(loop_state).await
+}
+
+/// Stop all running loops.
+pub async fn stop_all_loops(states: SharedLoopStates) -> Result<(), String> {
+    let mgr = states.lock().await;
+    let loop_states: Vec<SharedLoopState> = mgr.loops.values().cloned().collect();
+    drop(mgr);
+
+    for ls in loop_states {
+        let state = ls.lock().await;
+        if state.running {
+            if let Some(tx) = &state.stop_tx {
+                let _ = tx.send(true);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get aggregated status of all loops.
+pub async fn get_multi_status(states: SharedLoopStates) -> MultiLoopStatus {
+    let mgr = states.lock().await;
+    let mut loop_statuses = Vec::new();
+    let mut all_complete = true;
+    let mut any_error = false;
+
+    for (loop_id, loop_state) in &mgr.loops {
+        let state = loop_state.lock().await;
+        let status = state.to_status();
+
+        if status.running {
+            all_complete = false;
+        }
+        if status.phase == LoopPhase::Error {
+            any_error = true;
+        }
+
+        let label = mgr.metadata.get(loop_id).and_then(|m| m.label.clone());
+
+        loop_statuses.push(LoopInstanceStatus {
+            loop_id: loop_id.clone(),
+            label,
+            status,
+        });
+    }
+
+    // If no loops exist, all_complete is vacuously true but not meaningful
+    if mgr.loops.is_empty() {
+        all_complete = false;
+    }
+
+    MultiLoopStatus {
+        loops: loop_statuses,
+        all_complete,
+        any_error,
+        stop_all_on_error: mgr.stop_all_on_error,
+    }
+}
+
+/// Signal restart on a specific loop by ID.
+pub async fn signal_restart_by_id(
+    states: SharedLoopStates,
+    loop_id: &str,
+) -> Result<(), String> {
+    let mgr = states.lock().await;
+    let loop_state = mgr
+        .loops
+        .get(loop_id)
+        .ok_or_else(|| format!("No loop with ID '{}'", loop_id))?
+        .clone();
+    drop(mgr);
+    signal_restart(loop_state).await
+}
+
+/// Remove completed/stopped/errored loops from the manager.
+pub async fn cleanup_finished_loops(states: SharedLoopStates) {
+    let mut mgr = states.lock().await;
+    let finished_ids: Vec<LoopId> = {
+        let mut ids = Vec::new();
+        for (id, ls) in &mgr.loops {
+            let state = ls.lock().await;
+            if !state.running && state.phase != LoopPhase::Idle {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    };
+
+    for id in &finished_ids {
+        // Don't remove the default loop — just let it reset
+        if id != DEFAULT_LOOP_ID {
+            mgr.loops.remove(id);
+            mgr.metadata.remove(id);
+        }
+    }
+
+    if !finished_ids.is_empty() {
+        info!("Cleaned up {} finished loops", finished_ids.len());
+    }
 }
 
 /// The main loop implementation.
@@ -403,6 +706,7 @@ async fn run_loop(
                     rebuild_triggered: None,
                     stall_detected: stall_detected_this_iteration.clone(),
                     context_summarized: None,
+                    diagnostic_result: None,
                 };
                 {
                     let mut state = loop_state.lock().await;
@@ -469,6 +773,7 @@ async fn run_loop(
                     rebuild_triggered: None,
                     stall_detected: None,
                     context_summarized: None,
+                    diagnostic_result: None,
                 };
 
                 {
@@ -561,6 +866,18 @@ async fn run_loop(
                 None,
                 None,
             )),
+            ExitStrategy::DiagnosticEvaluation => {
+                // DiagnosticEvaluation only applies in pipeline mode.
+                // In simple mode, fall back to WorkflowVerification behavior.
+                Ok((
+                    ExitCheckResult {
+                        should_exit: true,
+                        reason: "DiagnosticEvaluation in simple mode — treated as WorkflowVerification".to_string(),
+                    },
+                    None,
+                    None,
+                ))
+            }
         };
 
         let (exit_check, reflection_task_run_id, fix_count) = match exit_check {
@@ -631,6 +948,7 @@ async fn run_loop(
             rebuild_triggered: None,
             stall_detected: stall_detected_this_iteration,
             context_summarized: context_summarized_this_iteration,
+            diagnostic_result: None,
         };
 
         {
@@ -986,6 +1304,7 @@ async fn run_pipeline_loop(
     };
     let mut current_workflow_id = config.workflow_id.clone();
     let mut rebuild_needed = pipeline.build.is_some(); // Build on first iteration if configured
+    let mut diagnostic_history: Vec<DiagnosticResult> = Vec::new();
 
     // Initialize stall detector and context summarizer from config
     let mut stall_detector = config.stall_detection.as_ref().map(|c| StallDetector::new(c.clone()));
@@ -1032,11 +1351,22 @@ async fn run_pipeline_loop(
                     state.phase = LoopPhase::BuildingWorkflow;
                 }
 
+                // Inject diagnostic context from previous iterations if available
+                let build_context = if pipeline.diagnose.is_some() && !diagnostic_history.is_empty() {
+                    let ctx = diagnostician::build_diagnostic_context(
+                        &diagnostic_history,
+                        build_config.context.as_deref(),
+                    );
+                    if ctx.is_empty() { build_config.context.clone() } else { Some(ctx) }
+                } else {
+                    build_config.context.clone()
+                };
+
                 info!("Building workflow from description...");
                 match runner
                     .generate_workflow(
                         &build_config.description,
-                        build_config.context.as_deref(),
+                        build_context.as_deref(),
                         build_config.context_ids.as_deref(),
                     )
                     .await
@@ -1127,9 +1457,78 @@ async fn run_pipeline_loop(
                     rebuild_triggered,
                     stall_detected_this_iteration,
                     None,
+                    None,
                 )
                 .await;
                 return;
+            }
+        }
+
+        // --- Phase 2b: Diagnose (if configured) ---
+        let mut diagnostic_result_this_iteration: Option<DiagnosticResult> = None;
+        if let Some(diagnose_config) = &pipeline.diagnose {
+            {
+                let mut state = loop_state.lock().await;
+                state.phase = LoopPhase::Diagnosing;
+            }
+
+            info!("Running diagnostic evaluation...");
+            match diagnostician::run_diagnostic(
+                &runner,
+                diagnose_config,
+                &diagnostic_history,
+                iteration,
+            )
+            .await
+            {
+                Ok(result) => {
+                    info!(
+                        "Diagnostic result: passed={}, root_cause={:?}",
+                        result.passed, result.root_cause
+                    );
+                    diagnostic_history.push(result.clone());
+                    diagnostic_result_this_iteration = Some(result);
+                }
+                Err(e) => {
+                    warn!("Diagnostic evaluation failed: {}", e);
+                }
+            }
+
+            // DiagnosticEvaluation exit strategy: exit if diagnostic passed
+            if matches!(config.exit_strategy, ExitStrategy::DiagnosticEvaluation) {
+                if let Some(ref diag) = diagnostic_result_this_iteration {
+                    if diag.passed {
+                        info!("Diagnostic evaluation passed — exiting pipeline loop");
+                        record_pipeline_result(
+                            &loop_state,
+                            iteration,
+                            &iter_start,
+                            &task_run_id,
+                            None,
+                            None,
+                            true,
+                            "Diagnostic evaluation passed — all assertions pass, page healthy",
+                            generated_workflow_id,
+                            fixes_implemented,
+                            rebuild_triggered,
+                            stall_detected_this_iteration,
+                            None,
+                            diagnostic_result_this_iteration,
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+
+            // If diagnostic failed, force rebuild so next iteration re-generates
+            // the workflow with diagnostic context injected
+            if let Some(ref diag) = diagnostic_result_this_iteration {
+                if !diag.passed && pipeline.build.is_some() {
+                    info!("Diagnostic failed — will rebuild workflow next iteration with diagnostic context");
+                    rebuild_needed = true;
+                    rebuild_triggered = Some(true);
+                }
             }
         }
 
@@ -1158,6 +1557,7 @@ async fn run_pipeline_loop(
                     rebuild_triggered,
                     None,
                     None,
+                    diagnostic_result_this_iteration,
                 )
                 .await;
                 break;
@@ -1198,8 +1598,8 @@ async fn run_pipeline_loop(
         let fix_count = fixes.len() as u32;
         info!("Reflection found {} fixes", fix_count);
 
-        // Exit if 0 fixes
-        if fix_count == 0 {
+        // Exit if 0 fixes (skip this exit when DiagnosticEvaluation is the authority)
+        if fix_count == 0 && !matches!(config.exit_strategy, ExitStrategy::DiagnosticEvaluation) {
             info!("Pipeline complete: 0 fixes found");
             record_pipeline_result(
                 &loop_state,
@@ -1215,6 +1615,7 @@ async fn run_pipeline_loop(
                 rebuild_triggered,
                 None,
                 None,
+                diagnostic_result_this_iteration,
             )
             .await;
             break;
@@ -1373,6 +1774,7 @@ async fn run_pipeline_loop(
             rebuild_triggered,
             stall_detected_this_iteration,
             context_summarized_this_iteration,
+            diagnostic_result_this_iteration,
         )
         .await;
 
@@ -1423,6 +1825,7 @@ async fn record_pipeline_result(
     rebuild_triggered: Option<bool>,
     stall_detected: Option<String>,
     context_summarized: Option<bool>,
+    diagnostic_result: Option<DiagnosticResult>,
 ) {
     let result = IterationResult {
         iteration,
@@ -1440,6 +1843,7 @@ async fn record_pipeline_result(
         rebuild_triggered,
         stall_detected,
         context_summarized,
+        diagnostic_result,
     };
 
     let mut state = loop_state.lock().await;

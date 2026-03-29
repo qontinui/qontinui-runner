@@ -1,8 +1,12 @@
-//! Learning outcome and pattern recorder.
+//! Learning outcome and pattern recorder (LEGACY SQLite implementation).
 //!
 //! Records workflow execution outcomes to the `learning_outcomes` and
 //! `learning_patterns` tables for use by the self-improvement analyzer.
-//! These tables were previously dormant — this module activates them.
+//!
+//! MIGRATION NOTE: PG equivalents exist in `database::pg::learning` and
+//! `database::pg::spec_experimentation` (`record_workflow_learning_from_outcome`).
+//! The only remaining caller of this SQLite path is `autoresearch::engine::record_learning`.
+//! Once autoresearch is migrated to PG, this module can be removed.
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -919,7 +923,20 @@ fn gather_llm_judge_input(
     db: &crate::database::CheckpointDb,
     task_run_id: &str,
 ) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
-    // PG: complex dynamic SQL
+    // PG-primary: sync function (called from spawn_blocking)
+    let pg = crate::database::pg::PgDb::global();
+    tokio::runtime::Handle::current().block_on(async {
+        pg.gather_llm_judge_input(task_run_id).await
+    })
+}
+
+// Legacy SQLite implementation (no longer called)
+#[allow(dead_code)]
+fn _gather_llm_judge_input_sqlite(
+    db: &crate::database::CheckpointDb,
+    task_run_id: &str,
+) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
+    use rusqlite::params;
     db.with_conn(|conn| {
         let (prompt, execution_steps, summary, goal_achieved, status): (
             Option<String>,
@@ -992,31 +1009,14 @@ pub fn spawn_rag_judge_if_eligible(
     task_run_id: String,
 ) {
     tokio::spawn(async move {
-        // Check if this run has retrieval events
-        let load_result = {
-            let db_c = db.clone();
-            let tid_c = task_run_id.clone();
-            tokio::task::spawn_blocking(move || {
-                db_c.with_conn(|conn| {
-                    let events = crate::meta_optimizer::agentic_metrics::rag_judge::load_retrieval_events(
-                        conn,
-                        &tid_c,
-                    )?;
-                    let prompt: String = conn
-                        .query_row(
-                            "SELECT COALESCE(prompt, '') FROM task_runs WHERE id = ?1",
-                            params![tid_c],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or_default();
-                    Ok((events, prompt))
-                })
-            }).await
-        };
-        let (retrieval_events, task_prompt) = match load_result {
-            Ok(Ok((events, prompt))) if !events.is_empty() => (events, prompt),
+        // PG-primary: load retrieval events and prompt
+        let pg = crate::database::pg::PgDb::global();
+        let load_result = pg.load_retrieval_events(&task_run_id).await;
+        let retrieval_events = match load_result {
+            Ok(events) if !events.is_empty() => events,
             _ => return, // No retrieval events or error — skip
         };
+        let task_prompt = pg.get_workflow_name_for_task_run(&task_run_id).await.unwrap_or_default();
 
         let rag_input = crate::meta_optimizer::agentic_metrics::rag_judge::RagJudgeInput {
             task_run_id: task_run_id.clone(),
@@ -1061,72 +1061,16 @@ pub fn spawn_rag_judge_if_eligible(
     });
 }
 
-/// Persist judge scores to SQLite (for use in spawn_blocking).
+/// Persist judge scores via PG (sync wrapper for use in spawn_blocking).
 fn persist_judge_scores_sqlite(
-    db: &crate::database::CheckpointDb,
+    _db: &crate::database::CheckpointDb,
     task_run_id: &str,
     results: &[crate::meta_optimizer::agentic_metrics::MetricResult],
 ) -> Result<(), String> {
-    db.with_conn(|conn| {
-        let now = chrono::Utc::now().to_rfc3339();
-        for score in results {
-            let id = format!("ams-{}", Uuid::new_v4());
-            conn.execute(
-                r#"INSERT OR REPLACE INTO agentic_metric_scores
-                    (id, task_run_id, metric_type, score, confidence,
-                     rationale, is_llm_judged, model_used, created_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                params![
-                    id,
-                    task_run_id,
-                    score.metric.as_str(),
-                    score.score,
-                    score.confidence,
-                    score.rationale,
-                    score.is_llm_judged as i32,
-                    score.model_used,
-                    now,
-                ],
-            )
-            .map_err(|e| format!("Failed to insert score: {}", e))?;
-        }
-
-        // Recompute composite score
-        let mut stmt = conn
-            .prepare("SELECT metric_type, score FROM agentic_metric_scores WHERE task_run_id = ?1")
-            .map_err(|e| format!("Failed to query scores: {}", e))?;
-        let raw_scores: Vec<(String, f64)> = stmt
-            .query_map(params![task_run_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })
-            .map_err(|e| format!("Failed to read scores: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
-
-        let all_scores: Vec<crate::meta_optimizer::agentic_metrics::MetricResult> = raw_scores
-            .into_iter()
-            .filter_map(|(mt, s)| {
-                metric_from_str(&mt).map(|m| crate::meta_optimizer::agentic_metrics::MetricResult {
-                    metric: m,
-                    score: s,
-                    confidence: 0.7,
-                    rationale: String::new(),
-                    is_llm_judged: false,
-                    model_used: None,
-                })
-            })
-            .collect();
-
-        let composite = crate::meta_optimizer::agentic_metrics::composite_score(&all_scores);
-        conn.execute(
-            "UPDATE learning_outcomes SET composite_agentic_score = ?1 WHERE task_id = ?2",
-            params![composite, task_run_id],
-        )
-        .map_err(|e| format!("Failed to update composite score: {}", e))?;
-
-        info!("Judge scores persisted for {}: composite={:.3}", task_run_id, composite);
-        Ok(())
+    // PG-primary: sync function (called from spawn_blocking)
+    let pg = crate::database::pg::PgDb::global();
+    tokio::runtime::Handle::current().block_on(async {
+        pg.persist_judge_scores(task_run_id, results).await
     })
 }
 

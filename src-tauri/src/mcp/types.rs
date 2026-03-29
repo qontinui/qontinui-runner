@@ -18,12 +18,17 @@ use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
 use crate::reflection::graph_engine::KnowledgeGraph;
 
-/// Cached knowledge graph with TTL-based invalidation.
+/// Cached knowledge graph with TTL + generation-based invalidation.
 /// The graph is wrapped in `Arc` so it can be shared without cloning the
-/// entire petgraph structure.
+/// entire petgraph structure. The `generation` field tracks the cache
+/// generation at build time — when `graph_cache_generation` on `ApiState`
+/// is bumped (e.g. after a finding/fix/rule write), the cache is
+/// considered stale even if the TTL hasn't expired.
 pub struct CachedKnowledgeGraph {
     pub graph: Arc<KnowledgeGraph>,
     pub built_at: std::time::Instant,
+    /// Generation counter snapshot when this cache entry was built.
+    pub generation: u64,
 }
 
 /// Default port for the MCP API server
@@ -107,6 +112,10 @@ pub struct ApiState {
     /// Cached knowledge graph with TTL-based invalidation (60s).
     /// Avoids rebuilding the expensive petgraph on every request.
     pub knowledge_graph_cache: Arc<tokio::sync::RwLock<Option<CachedKnowledgeGraph>>>,
+    /// Generation counter for event-driven graph cache invalidation.
+    /// Bumped by write handlers (findings, fixes, rules, observations, patterns)
+    /// so the graph rebuilds on next access even if the TTL hasn't expired.
+    pub graph_cache_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Response for API endpoints

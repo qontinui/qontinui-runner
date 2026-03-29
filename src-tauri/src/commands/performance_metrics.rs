@@ -231,39 +231,18 @@ pub async fn get_performance_dashboard(
         .map(|s| TimeRange::from_str(&s))
         .unwrap_or(TimeRange::SevenDays);
 
-    // SQLite: complex function — multi-query performance dashboard aggregation
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let summary = aggregate_summary(conn, &config_id, &range)?;
-            let action_metrics = aggregate_action_performance(conn, &config_id, &range)?;
-            let transition_metrics = get_transition_metrics(conn, &config_id)?;
-            let element_metrics = get_element_metrics(conn, &config_id)?;
-            let success_rate_trend = aggregate_success_rate_trend(conn, &config_id, &range)?;
-            let duration_trend = aggregate_duration_trend(conn, &config_id, &range)?;
+    let range_days = match range {
+        TimeRange::TwentyFourHours => 1,
+        TimeRange::SevenDays => 7,
+        TimeRange::ThirtyDays => 30,
+        _ => 30,
+    };
 
-            Ok::<_, String>(PerformanceDashboardData {
-                summary,
-                action_metrics,
-                transition_metrics,
-                element_metrics,
-                success_rate_trend,
-                duration_trend,
-            })
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(dashboard) => {
-            debug!(
-                "Performance dashboard: {} actions, {} transitions, {} elements",
-                dashboard.action_metrics.len(),
-                dashboard.transition_metrics.len(),
-                dashboard.element_metrics.len()
-            );
-            Ok(PerformanceMetricsResponse::ok(dashboard))
-        }
+    match state.pg_db.get_performance_dashboard(&config_id, range_days).await {
+        Ok(val) => match serde_json::from_value(val) {
+            Ok(dashboard) => Ok(PerformanceMetricsResponse::ok(dashboard)),
+            Err(e) => Ok(PerformanceMetricsResponse::err(format!("Deserialization error: {}", e))),
+        },
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
 }
@@ -275,18 +254,14 @@ pub async fn get_action_performance(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<ActionPerformanceMetrics>>, String> {
-    let db = state.checkpoint_db.clone();
     let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
+    let range_days = match range { TimeRange::TwentyFourHours => 1, TimeRange::SevenDays => 7, TimeRange::ThirtyDays => 30, _ => 30 };
 
-    // SQLite: complex function — action performance aggregation
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| aggregate_action_performance(conn, &config_id, &range))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(metrics) => Ok(PerformanceMetricsResponse::ok(metrics)),
+    match state.pg_db.get_action_performance(&config_id, range_days).await {
+        Ok(vals) => {
+            let metrics: Vec<ActionPerformanceMetrics> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(PerformanceMetricsResponse::ok(metrics))
+        }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
 }
@@ -297,17 +272,11 @@ pub async fn get_transition_reliability(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<PerformanceMetricsResponse<Vec<StateTransitionMetrics>>, String> {
-    let db = state.checkpoint_db.clone();
-
-    // SQLite: complex function — transition reliability metrics
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| get_transition_metrics(conn, &config_id))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(metrics) => Ok(PerformanceMetricsResponse::ok(metrics)),
+    match state.pg_db.get_transition_metrics(&config_id).await {
+        Ok(vals) => {
+            let metrics: Vec<StateTransitionMetrics> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(PerformanceMetricsResponse::ok(metrics))
+        }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
 }
@@ -318,17 +287,11 @@ pub async fn get_element_resolution_metrics(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<PerformanceMetricsResponse<Vec<ElementResolutionMetrics>>, String> {
-    let db = state.checkpoint_db.clone();
-
-    // SQLite: complex function — element resolution metrics
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| get_element_metrics(conn, &config_id))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(metrics) => Ok(PerformanceMetricsResponse::ok(metrics)),
+    match state.pg_db.get_element_metrics(&config_id).await {
+        Ok(vals) => {
+            let metrics: Vec<ElementResolutionMetrics> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(PerformanceMetricsResponse::ok(metrics))
+        }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
 }
@@ -340,18 +303,14 @@ pub async fn get_success_rate_trend(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<TimeSeriesDataPoint>>, String> {
-    let db = state.checkpoint_db.clone();
     let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
+    let range_days = match range { TimeRange::TwentyFourHours => 1, TimeRange::SevenDays => 7, TimeRange::ThirtyDays => 30, _ => 30 };
 
-    // SQLite: complex function — success rate time-series aggregation
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| aggregate_success_rate_trend(conn, &config_id, &range))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(trend) => Ok(PerformanceMetricsResponse::ok(trend)),
+    match state.pg_db.get_success_rate_trend(&config_id, range_days).await {
+        Ok(vals) => {
+            let trend: Vec<TimeSeriesDataPoint> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(PerformanceMetricsResponse::ok(trend))
+        }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
 }

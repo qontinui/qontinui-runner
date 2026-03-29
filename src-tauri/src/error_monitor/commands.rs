@@ -25,9 +25,9 @@ const DEFAULT_RECENT_HOURS: u32 = 24;
 const DEFAULT_RECENT_LIMIT: u32 = 10;
 const DEFAULT_DEBUG_CONTEXT_MAX_ERRORS: usize = 50;
 const STACK_TRACE_EXCERPT_LINES: usize = 3;
-const PRIORITY_CRITICAL: i32 = 100;
-const PRIORITY_ERROR: i32 = 50;
-const PRIORITY_WARNING: i32 = 10;
+const PRIORITY_CRITICAL: u32 = 100;
+const PRIORITY_ERROR: u32 = 50;
+const PRIORITY_WARNING: u32 = 10;
 
 /// A single past resolution entry for recurrence history display.
 #[derive(Debug, Clone, Serialize)]

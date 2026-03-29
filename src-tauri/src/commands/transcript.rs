@@ -319,53 +319,32 @@ pub async fn generate_workflow_standalone(
         discover_ui_bridge_specs: None,
         simple_mode: None,
         tool_tags: None,
+        exploration_settings: None,
         target_runner_port: None,
     };
 
     // Get doctor handle for health monitoring
     let doctor_handle = app_state.doctor_handle.lock().await.clone();
-    let db = app_state.checkpoint_db.clone();
-    let db2 = db.clone();
+    let pg_db = app_state.pg_db.clone();
 
-    // SQLite: complex function — AI-driven workflow generation + pipeline artifact storage
     let gen_result = tokio::task::spawn_blocking(move || {
-        let gen_result = db.with_conn({
-            let db_inner = db.clone();
-            move |conn| {
-                let (response, artifact) = crate::workflow_generation::generate_workflow(
-                    request,
-                    doctor_handle.as_ref(),
-                    Some(conn),
-                    None,
-                );
-                // Save pipeline artifact (no task_run_id for standalone generation)
-                if let Err(e) = db_inner.save_pipeline_artifact(&artifact) {
-                    tracing::warn!("Failed to save pipeline artifact: {}", e);
-                }
-                Ok(response)
-            }
-        });
-        match gen_result {
-            Ok(response) => response,
-            Err(e) => {
-                warn!("DB access failed for standalone workflow generation: {}", e);
-                crate::workflow_generation::GenerateWorkflowResponse {
-                    workflow: None,
-                    validation_errors: vec![],
-                    success: false,
-                    error: Some(format!("Database error during generation: {}", e)),
-                    model_used: None,
-                    verification_iterations: vec![],
-                    hardening_summary: None,
-                    discovery_calls: vec![],
-                    acceptance_criteria: None,
-                    quality_report: None,
-                    confidence_score: None,
-                }
-            }
-        }
+        let (response, artifact) = crate::workflow_generation::generate_workflow(
+            request,
+            doctor_handle.as_ref(),
+            None,
+            None,
+        );
+        (response, artifact)
     })
     .await;
+
+    // Save pipeline artifact to PG (async, outside spawn_blocking)
+    if let Ok((_, ref artifact)) = gen_result {
+        if let Err(e) = pg_db.save_generation_artifact(artifact).await {
+            tracing::warn!("Failed to save pipeline artifact to PG: {}", e);
+        }
+    }
+    let gen_result = gen_result.map(|(response, _)| response);
 
     match gen_result {
         Ok(response) => {

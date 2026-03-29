@@ -789,46 +789,16 @@ pub async fn generate_unified_workflow_handler(
 
     // Clone handles so they can be moved into the blocking closure
     let doctor_handle = state.doctor_handle.clone();
-    let db = state.app_state.checkpoint_db.clone();
+    let pg_db = state.app_state.pg_db.clone();
 
-    // SQLite: complex function — workflow generation uses sync AI provider + RAG context from SQLite
-    let result = tokio::task::spawn_blocking(move || {
-        // Get DB connection for RAG examples + filtered schema context
-        let gen_result = db.with_conn(|conn| {
-            let (response, artifact) = workflow_generation::generate_workflow(
-                request,
-                doctor_handle.as_ref(),
-                Some(conn),
-                None, // Embedding computed lazily if embedding API is available
-            );
-            // Save pipeline artifact for generator evaluation
-            if let Err(e) = db.save_pipeline_artifact(&artifact) {
-                tracing::warn!("Failed to save pipeline artifact: {}", e);
-            }
-            Ok(response)
-        });
-        match gen_result {
-            Ok(response) => response,
-            Err(e) => {
-                warn!(
-                    "DB access failed for workflow generation, falling back to no-DB path: {}",
-                    e
-                );
-                workflow_generation::GenerateWorkflowResponse {
-                    workflow: None,
-                    validation_errors: vec![],
-                    success: false,
-                    error: Some(format!("Database error during generation: {}", e)),
-                    model_used: None,
-                    verification_iterations: vec![],
-                    hardening_summary: None,
-                    discovery_calls: vec![],
-                    acceptance_criteria: None,
-                    quality_report: None,
-                    confidence_score: None,
-                }
-            }
-        }
+    let (result, artifact) = tokio::task::spawn_blocking(move || {
+        let (response, artifact) = workflow_generation::generate_workflow(
+            request,
+            doctor_handle.as_ref(),
+            None,
+            None,
+        );
+        (response, artifact)
     })
     .await
     .map_err(|e| {
@@ -841,6 +811,13 @@ pub async fn generate_unified_workflow_handler(
             Json(api_error(format!("Failed to generate workflow: {}", e))),
         )
     })?;
+
+    // Save pipeline artifact to PG (async)
+    if let Err(e) = pg_db.save_generation_artifact(&artifact).await {
+        tracing::warn!("Failed to save pipeline artifact to PG: {}", e);
+    }
+
+    let result = result;
 
     if result.success {
         info!(
@@ -875,9 +852,7 @@ pub async fn generate_unified_workflow_async_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<workflow_generation::GenerateWorkflowRequest>,
 ) -> Result<Json<ApiResponse<GenerateWorkflowAsyncResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::workflow_generation::meta_workflow::{
-        build_historical_context, build_meta_workflow_template,
-    };
+    use crate::workflow_generation::meta_workflow::build_meta_workflow_template;
 
     info!(
         "Generating unified workflow async from description: {}...",
@@ -903,20 +878,9 @@ pub async fn generate_unified_workflow_async_handler(
         }
     }
 
-    // Build historical context from database (best-effort, falls back gracefully)
-    let historical_context = state
-        .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            Ok(build_historical_context(
-                conn,
-                &request.description,
-                None, // Embedding computed lazily if embedding API is available
-                request.category.as_deref(),
-            ))
-        })
-        .ok()
-        .flatten();
+    // TODO: migrate build_historical_context sub-queries (self_improve, similar_workflows,
+    // gt_references, past_fixes) to PG, then re-enable. Until then, skip historical context.
+    let historical_context: Option<crate::workflow_generation::meta_workflow::HistoricalContext> = None;
 
     // Build the meta-workflow
     let meta_workflow =
@@ -2545,6 +2509,52 @@ async fn sync_slash_commands_handler(
 // End Unified Workflows HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// Exploration Pipeline Handlers
+// ============================================================================
+
+/// Query parameters for the templates list endpoint.
+#[derive(Debug, Deserialize)]
+struct TemplatesQuery {
+    domain: Option<String>,
+}
+
+/// List step templates, optionally filtered by domain.
+async fn list_templates_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<TemplatesQuery>,
+) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let domain_filter = params.domain;
+
+    let templates = state.app_state.pg_db
+        .list_templates(domain_filter.as_deref())
+        .await
+        .map_err(|e| (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to load templates: {}", e))),
+        ))?;
+
+    Ok(Json(ApiResponse::success(templates)))
+}
+
+/// Get exploration stats for a workflow.
+async fn get_exploration_stats_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(workflow_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.pg_db.get_exploration_stats(&workflow_id).await {
+        Ok(Some(stats)) => Ok(Json(ApiResponse::success(stats))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("No exploration stats found for {}", workflow_id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get exploration stats: {}", e))),
+        )),
+    }
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -2578,6 +2588,12 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(run_composed_workflow),
         )
         .route("/slash-commands/sync", post(sync_slash_commands_handler))
+        // Exploration pipeline endpoints
+        .route("/generation/templates", get(list_templates_handler))
+        .route(
+            "/generation/exploration-stats/{workflow_id}",
+            get(get_exploration_stats_handler),
+        )
         // Parameterized paths after all literal paths
         .route(
             "/unified-workflows/{id}",

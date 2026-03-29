@@ -3,11 +3,12 @@
 //! Captures periodic performance snapshots from learning_outcomes + phase_token_usage
 //! to track progress over time and measure the impact of applied recommendations.
 
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::info;
 
 use super::types::WorkflowCategory;
+use crate::database::pg::PgDb;
 use crate::database::CheckpointDb;
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -90,28 +91,17 @@ pub struct RecommendationOutcome {
 /// sample sizes are too small for statistical analysis.
 pub fn evaluate_recommendation_outcome(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<RecommendationOutcome, String> {
     let rec_id = recommendation_id.to_string();
 
     // Fetch the recommendation
-    let rec = db.with_conn({
-        let rec_id = rec_id.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT target_agent, applied_at FROM meta_optimizer_recommendations WHERE id = ?1",
-                rusqlite::params![rec_id],
-                |row| {
-                    let target_agent: Option<String> = row.get(0)?;
-                    let applied_at: Option<String> = row.get(1)?;
-                    Ok((target_agent, applied_at))
-                },
-            )
-            .map_err(|e| format!("Recommendation not found: {}", e))
-        }
+    let (target_agent, applied_at) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.get_recommendation_outcome_info(&rec_id).await
+        })
     })?;
-
-    let (target_agent, applied_at) = rec;
 
     let applied_at = match applied_at {
         Some(a) => a,
@@ -138,53 +128,25 @@ pub fn evaluate_recommendation_outcome(
         let before_start = (applied - chrono::Duration::days(7)).to_rfc3339();
         let after_end = (applied + chrono::Duration::days(7)).to_rfc3339();
 
-        let before = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db,
-            &agent,
-            &before_start,
-            &applied_at,
-        )?;
-        let after = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db,
-            &agent,
-            &applied_at,
-            &after_end,
-        )?;
+        let before = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                pg_db.get_agent_aggregates_for_period(&agent, &before_start, &applied_at).await
+            })
+        })?;
+        let after = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                pg_db.get_agent_aggregates_for_period(&agent, &applied_at, &after_end).await
+            })
+        })?;
 
         compute_verdict(before, after)
     } else {
         // No target agent: compare post_apply snapshot against baseline
-        let baseline = get_latest_baseline(db, WorkflowCategory::Main)?;
-        let post_snap: Option<MetaOptimizerSnapshot> = db.with_conn({
-            let rec_id = rec_id.clone();
-            move |conn| {
-                let result = conn.query_row(
-                    r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                              breakdown_json, recommendation_id, runs_included, created_at
-                       FROM meta_optimizer_snapshots
-                       WHERE recommendation_id = ?1 AND snapshot_type = 'post_apply'
-                       ORDER BY created_at DESC LIMIT 1"#,
-                    rusqlite::params![rec_id],
-                    |row| {
-                        Ok(MetaOptimizerSnapshot {
-                            id: row.get(0)?,
-                            snapshot_type: row.get(1)?,
-                            period_start: row.get(2)?,
-                            period_end: row.get(3)?,
-                            metrics_json: row.get(4)?,
-                            breakdown_json: row.get(5)?,
-                            recommendation_id: row.get(6)?,
-                            runs_included: row.get(7)?,
-                            created_at: row.get(8)?,
-                        })
-                    },
-                );
-                match result {
-                    Ok(snap) => Ok(Some(snap)),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                    Err(e) => Err(format!("Failed to query post_apply snapshot: {}", e)),
-                }
-            }
+        let baseline = get_latest_baseline(db, pg_db, WorkflowCategory::Main)?;
+        let post_snap = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                pg_db.get_post_apply_snapshot(&rec_id).await
+            })
         })?;
 
         let baseline_metrics = baseline
@@ -251,7 +213,7 @@ pub fn evaluate_recommendation_outcome(
     // Persist the outcome to the recommendation row
     let outcome_json = serde_json::to_string(&outcome)
         .map_err(|e| format!("Failed to serialize outcome: {}", e))?;
-    update_outcome(db, &rec_id, &outcome_json)?;
+    update_outcome(db, pg_db, &rec_id, &outcome_json)?;
 
     Ok(outcome)
 }
@@ -322,69 +284,60 @@ fn compute_verdict(
     }
 }
 
-/// Capture a baseline snapshot with PG dual-write.
+/// Capture a baseline snapshot (backward compat, delegates to primary).
+#[allow(dead_code)]
 pub fn capture_baseline_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    let snap_type = format!("baseline{}", category.snapshot_suffix());
-    capture_snapshot_with_pg(db, pg_db, &snap_type, None, 30, category)
+    capture_baseline(db, pg_db, category)
 }
 
-/// Capture a periodic snapshot with PG dual-write.
+/// Capture a periodic snapshot (backward compat, delegates to primary).
+#[allow(dead_code)]
 pub fn capture_periodic_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    let snap_type = format!("periodic{}", category.snapshot_suffix());
-    capture_snapshot_with_pg(db, pg_db, &snap_type, None, 7, category)
+    capture_periodic(db, pg_db, category)
 }
 
-/// Capture a post-apply snapshot with PG dual-write.
+/// Capture a post-apply snapshot (backward compat, delegates to primary).
+#[allow(dead_code)]
 pub fn capture_post_apply_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_snapshot_with_pg(db, pg_db, "post_apply", Some(recommendation_id), 7, category)
+    capture_post_apply(db, pg_db, recommendation_id, category)
 }
 
 /// Update the outcome_after_apply column on a recommendation.
 pub fn update_outcome(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     outcome_json: &str,
 ) -> Result<(), String> {
-    let id = recommendation_id.to_string();
-    let json = outcome_json.to_string();
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            "UPDATE meta_optimizer_recommendations SET outcome_after_apply = ?1 WHERE id = ?2",
-            rusqlite::params![json, id],
-        )
-        .map_err(|e| format!("Failed to update outcome: {}", e))?;
-        Ok(())
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.update_recommendation_outcome(recommendation_id, outcome_json).await
+        })
     })
 }
 
-/// Update outcome with PG dual-write (fire-and-forget).
+/// Update outcome with PG (same as update_outcome now, kept for backward compat).
 #[allow(dead_code)]
 pub fn update_outcome_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     outcome_json: &str,
 ) -> Result<(), String> {
-    update_outcome(db, recommendation_id, outcome_json)?;
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    let json = outcome_json.to_string();
-    tokio::spawn(async move { let _ = pg.update_recommendation_outcome(&rid, &json).await; });
-    Ok(())
+    update_outcome(db, pg_db, recommendation_id, outcome_json)
 }
 
 // ── Core snapshot capture ──────────────────────────────────────────────
@@ -396,239 +349,31 @@ pub fn update_outcome_with_pg(
 /// - `lookback_days`: how many days of data to include
 pub fn capture_snapshot(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     snapshot_type: &str,
     recommendation_id: Option<&str>,
     lookback_days: i64,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    let id = format!("mos-{}", uuid::Uuid::new_v4());
-    let snap_type = snapshot_type.to_string();
-    let rec_id = recommendation_id.map(|s| s.to_string());
-    let id_clone = id.clone();
-
-    db.with_conn(move |conn| {
-        let now = chrono::Utc::now();
-        let period_end = now.to_rfc3339();
-        let period_start = (now - chrono::Duration::days(lookback_days)).to_rfc3339();
-
-        let helper_filter = category.sql_filter("tr");
-
-        // ── Aggregate metrics from learning_outcomes ───────────────────
-        let (total_runs, successful_runs, failed_runs, partial_runs, avg_duration, avg_iterations): (
-            i64, i64, i64, i64, f64, f64,
-        ) = conn
-            .query_row(
-                &format!(
-                    r#"SELECT
-                           COUNT(*),
-                           SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END),
-                           SUM(CASE WHEN lo.status = 'failure' THEN 1 ELSE 0 END),
-                           SUM(CASE WHEN lo.status = 'partial' THEN 1 ELSE 0 END),
-                           COALESCE(AVG(lo.duration_secs), 0.0),
-                           COALESCE(AVG(lo.iterations), 0.0)
-                       FROM learning_outcomes lo
-                       JOIN task_runs tr ON lo.task_id = tr.id
-                       WHERE lo.created_at > ?1
-                         AND (lo.iterations IS NULL OR lo.iterations > 0){}"#,
-                    helper_filter
-                ),
-                params![period_start],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("Failed to query learning_outcomes metrics: {}", e))?;
-
-        let success_rate = if total_runs > 0 {
-            successful_runs as f64 / total_runs as f64
-        } else {
-            0.0
-        };
-
-        // ── Average cost per run via LEFT JOIN on phase_token_usage ────
-        let avg_cost_cents: f64 = conn
-            .query_row(
-                &format!(
-                    r#"SELECT COALESCE(AVG(run_cost), 0.0) FROM (
-                           SELECT lo.task_id, COALESCE(SUM(ptu.cost_cents), 0) as run_cost
-                           FROM learning_outcomes lo
-                           JOIN task_runs tr ON lo.task_id = tr.id
-                           LEFT JOIN phase_token_usage ptu ON ptu.task_run_id = lo.task_id
-                           WHERE lo.created_at > ?1{}
-                           GROUP BY lo.task_id
-                       )"#,
-                    helper_filter
-                ),
-                params![period_start],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to query cost metrics: {}", e))?;
-
-        // ── Spec compliance average (if any spec compliance data exists) ──
-        let avg_spec_compliance: Option<f64> = conn
-            .query_row(
-                "SELECT AVG(overall_score) FROM spec_compliance_results WHERE created_at > ?1",
-                params![period_start],
-                |row| row.get::<_, Option<f64>>(0),
-            )
-            .unwrap_or(None);
-
-        // ── Composite agentic score average ──
-        let avg_composite_agentic_score: Option<f64> = conn
-            .query_row(
-                "SELECT AVG(composite_agentic_score) FROM learning_outcomes WHERE created_at > ?1 AND composite_agentic_score IS NOT NULL",
-                params![period_start],
-                |row| row.get::<_, Option<f64>>(0),
-            )
-            .unwrap_or(None);
-
-        let metrics = SnapshotMetrics {
-            success_rate,
-            avg_duration_secs: avg_duration,
-            avg_iterations,
-            avg_cost_cents,
-            total_runs,
-            successful_runs,
-            failed_runs,
-            partial_runs,
-            avg_spec_compliance,
-            avg_composite_agentic_score,
-        };
-
-        let metrics_json = serde_json::to_string(&metrics)
-            .map_err(|e| format!("Failed to serialize metrics: {}", e))?;
-
-        // ── Per-architecture breakdown (if data exists) ───────────────
-        let breakdown_json: Option<String> = {
-            let mut stmt = conn
-                .prepare(
-                    &format!(
-                        r#"SELECT lo.workflow_architecture, COUNT(*) as cnt,
-                                  SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as sr,
-                                  AVG(lo.duration_secs) as avg_dur,
-                                  AVG(lo.iterations) as avg_iter
-                           FROM learning_outcomes lo
-                           JOIN task_runs tr ON lo.task_id = tr.id
-                           WHERE lo.created_at > ?1 AND lo.workflow_architecture IS NOT NULL
-                             AND (lo.iterations IS NULL OR lo.iterations > 0){}
-                           GROUP BY lo.workflow_architecture"#,
-                        helper_filter
-                    ),
-                )
-                .map_err(|e| format!("Failed to prepare breakdown query: {}", e))?;
-
-            let rows: Vec<serde_json::Value> = stmt
-                .query_map(params![period_start], |row| {
-                    let arch: String = row.get(0)?;
-                    let count: i64 = row.get(1)?;
-                    let sr: f64 = row.get(2)?;
-                    let avg_dur: f64 = row.get(3)?;
-                    let avg_iter: f64 = row.get(4)?;
-                    Ok(serde_json::json!({
-                        "architecture": arch,
-                        "count": count,
-                        "success_rate": sr,
-                        "avg_duration_secs": avg_dur,
-                        "avg_iterations": avg_iter,
-                    }))
-                })
-                .map_err(|e| format!("Failed to query breakdown: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if rows.is_empty() {
-                None
-            } else {
-                Some(
-                    serde_json::to_string(&rows)
-                        .map_err(|e| format!("Failed to serialize breakdown: {}", e))?,
-                )
-            }
-        };
-
-        // ── Insert snapshot row ───────────────────────────────────────
-        conn.execute(
-            r#"INSERT INTO meta_optimizer_snapshots
-               (id, snapshot_type, period_start, period_end, metrics_json, breakdown_json,
-                recommendation_id, runs_included, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-            params![
-                id_clone,
-                snap_type,
-                period_start,
-                period_end,
-                metrics_json,
-                breakdown_json,
-                rec_id,
-                total_runs,
-                period_end,
-            ],
-        )
-        .map_err(|e| format!("Failed to insert snapshot: {}", e))?;
-
-        info!(
-            "Captured {} snapshot {} ({} runs, success_rate={:.1}%)",
-            snap_type,
-            id_clone,
-            total_runs,
-            success_rate * 100.0
-        );
-
-        Ok(MetaOptimizerSnapshot {
-            id: id_clone,
-            snapshot_type: snap_type,
-            period_start,
-            period_end: period_end.clone(),
-            metrics_json,
-            breakdown_json,
-            recommendation_id: rec_id,
-            runs_included: total_runs,
-            created_at: period_end,
+    let category_filter = category.sql_filter("tr");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.pg_capture_snapshot(snapshot_type, recommendation_id, lookback_days, &category_filter).await
         })
     })
 }
 
-/// Capture a snapshot with PG dual-write (fire-and-forget).
-///
-/// Captures via SQLite (primary), then sends the snapshot row to PG.
+/// Capture a snapshot (same as capture_snapshot now, kept for backward compat).
+#[allow(dead_code)]
 pub fn capture_snapshot_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     snapshot_type: &str,
     recommendation_id: Option<&str>,
     lookback_days: i64,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    let snap = capture_snapshot(db, snapshot_type, recommendation_id, lookback_days, category)?;
-
-    let pg = pg_db.clone();
-    let s = snap.clone();
-    tokio::spawn(async move {
-        if let Err(e) = pg
-            .save_optimizer_snapshot(
-                &s.id,
-                &s.snapshot_type,
-                &s.period_start,
-                &s.period_end,
-                &s.metrics_json,
-                s.breakdown_json.as_deref(),
-                s.recommendation_id.as_deref(),
-                s.runs_included,
-            )
-            .await
-        {
-            tracing::warn!("PG save_optimizer_snapshot dual-write failed: {}", e);
-        }
-    });
-
-    Ok(snap)
+    capture_snapshot(db, pg_db, snapshot_type, recommendation_id, lookback_days, category)
 }
 
 // ── Convenience wrappers ───────────────────────────────────────────────
@@ -637,29 +382,32 @@ pub fn capture_snapshot_with_pg(
 /// Snapshot type is suffixed by category (e.g., "baseline", "baseline_reflection").
 pub fn capture_baseline(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
     let snap_type = format!("baseline{}", category.snapshot_suffix());
-    capture_snapshot(db, &snap_type, None, 30, category)
+    capture_snapshot(db, pg_db, &snap_type, None, 30, category)
 }
 
 /// Capture a periodic snapshot (last 7 days).
 /// Snapshot type is suffixed by category (e.g., "periodic", "periodic_reflection").
 pub fn capture_periodic(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
     let snap_type = format!("periodic{}", category.snapshot_suffix());
-    capture_snapshot(db, &snap_type, None, 7, category)
+    capture_snapshot(db, pg_db, &snap_type, None, 7, category)
 }
 
 /// Capture a post-apply snapshot to measure recommendation impact (last 7 days).
 pub fn capture_post_apply(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_snapshot(db, "post_apply", Some(recommendation_id), 7, category)
+    capture_snapshot(db, pg_db, "post_apply", Some(recommendation_id), 7, category)
 }
 
 // ── Query helpers ──────────────────────────────────────────────────────
@@ -667,144 +415,44 @@ pub fn capture_post_apply(
 /// Get the latest baseline snapshot for the given category.
 pub fn get_latest_baseline(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<Option<MetaOptimizerSnapshot>, String> {
-    let snap_type_owned = format!("baseline{}", category.snapshot_suffix());
-    db.with_conn(move |conn| {
-        let result = conn.query_row(
-            r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                      breakdown_json, recommendation_id, runs_included, created_at
-               FROM meta_optimizer_snapshots
-               WHERE snapshot_type = ?1
-               ORDER BY created_at DESC
-               LIMIT 1"#,
-            params![snap_type_owned],
-            |row| {
-                Ok(MetaOptimizerSnapshot {
-                    id: row.get(0)?,
-                    snapshot_type: row.get(1)?,
-                    period_start: row.get(2)?,
-                    period_end: row.get(3)?,
-                    metrics_json: row.get(4)?,
-                    breakdown_json: row.get(5)?,
-                    recommendation_id: row.get(6)?,
-                    runs_included: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
-            },
-        );
-
-        match result {
-            Ok(snap) => Ok(Some(snap)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query baseline snapshot: {}", e)),
-        }
+    let snap_type = format!("baseline{}", category.snapshot_suffix());
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.get_latest_baseline_snapshot(&snap_type).await
+        })
     })
 }
 
 /// List snapshots with optional type filter.
 pub fn list_snapshots(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     snapshot_type: Option<&str>,
 ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
-    let snap_type = snapshot_type.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let (sql, has_filter) = if snap_type.is_some() {
-            (
-                r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
-                   FROM meta_optimizer_snapshots
-                   WHERE snapshot_type = ?1
-                   ORDER BY created_at DESC
-                   LIMIT 100"#
-                    .to_string(),
-                true,
-            )
-        } else {
-            (
-                r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
-                   FROM meta_optimizer_snapshots
-                   ORDER BY created_at DESC
-                   LIMIT 100"#
-                    .to_string(),
-                false,
-            )
-        };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare snapshot query: {}", e))?;
-
-        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<MetaOptimizerSnapshot> {
-            Ok(MetaOptimizerSnapshot {
-                id: row.get(0)?,
-                snapshot_type: row.get(1)?,
-                period_start: row.get(2)?,
-                period_end: row.get(3)?,
-                metrics_json: row.get(4)?,
-                breakdown_json: row.get(5)?,
-                recommendation_id: row.get(6)?,
-                runs_included: row.get(7)?,
-                created_at: row.get(8)?,
-            })
-        };
-
-        let rows: Vec<MetaOptimizerSnapshot> = if has_filter {
-            stmt.query_map(params![snap_type.unwrap()], map_row)
-                .map_err(|e| format!("Failed to query snapshots: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map([], map_row)
-                .map_err(|e| format!("Failed to query snapshots: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        Ok(rows)
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.list_snapshots(snapshot_type).await
+        })
     })
 }
 
 /// Get a full progress summary: baseline vs current, deltas, and all snapshots.
 pub fn get_progress_summary(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<ProgressSummary, String> {
-    let baseline_snap = get_latest_baseline(db, category)?;
+    let baseline_snap = get_latest_baseline(db, pg_db, category)?;
 
     // Get latest periodic snapshot for this category
     let periodic_type = format!("periodic{}", category.snapshot_suffix());
-    let current_snap: Option<MetaOptimizerSnapshot> = db.with_conn(move |conn| {
-        let result = conn.query_row(
-            r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                      breakdown_json, recommendation_id, runs_included, created_at
-               FROM meta_optimizer_snapshots
-               WHERE snapshot_type = ?1
-               ORDER BY created_at DESC
-               LIMIT 1"#,
-            params![periodic_type],
-            |row| {
-                Ok(MetaOptimizerSnapshot {
-                    id: row.get(0)?,
-                    snapshot_type: row.get(1)?,
-                    period_start: row.get(2)?,
-                    period_end: row.get(3)?,
-                    metrics_json: row.get(4)?,
-                    breakdown_json: row.get(5)?,
-                    recommendation_id: row.get(6)?,
-                    runs_included: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
-            },
-        );
-
-        match result {
-            Ok(snap) => Ok(Some(snap)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query periodic snapshot: {}", e)),
-        }
+    let current_snap: Option<MetaOptimizerSnapshot> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.get_latest_baseline_snapshot(&periodic_type).await
+        })
     })?;
 
     let baseline_metrics = baseline_snap
@@ -825,15 +473,12 @@ pub fn get_progress_summary(
         _ => None,
     };
 
-    let snapshots = list_snapshots(db, None)?;
+    let snapshots = list_snapshots(db, pg_db, None)?;
 
-    let applied_recommendations_count: i64 = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Failed to count applied recommendations: {}", e))
+    let applied_recommendations_count: i64 = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.count_applied_recommendations().await
+        })
     })?;
 
     Ok(ProgressSummary {
@@ -845,142 +490,44 @@ pub fn get_progress_summary(
     })
 }
 
-// ── PG-primary read wrappers ───────────────────────────────────────────
+// ── Backward-compat wrappers (same as primary now) ────────────────────
 
-/// Get the latest baseline snapshot with PG-primary read.
+/// Get the latest baseline snapshot (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_latest_baseline_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<Option<MetaOptimizerSnapshot>, String> {
-    let snap_type = format!("baseline{}", category.snapshot_suffix());
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let st = snap_type.clone();
-        if let Ok(result) = handle.block_on(pg.get_latest_baseline_snapshot(&st)) {
-            return Ok(result);
-        }
-    }
-    get_latest_baseline(db, category)
+    get_latest_baseline(db, pg_db, category)
 }
 
-/// List snapshots with PG-primary read.
+/// List snapshots (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn list_snapshots_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     snapshot_type: Option<&str>,
 ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let st = snapshot_type.map(|s| s.to_string());
-        if let Ok(result) = handle.block_on(pg.list_snapshots(st.as_deref())) {
-            return Ok(result);
-        }
-    }
-    list_snapshots(db, snapshot_type)
+    list_snapshots(db, pg_db, snapshot_type)
 }
 
-/// Get a full progress summary with PG-primary read for snapshot components.
+/// Get a full progress summary (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_progress_summary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<ProgressSummary, String> {
-    let baseline_snap = get_latest_baseline_with_pg(db, pg_db, category)?;
-
-    let periodic_type = format!("periodic{}", category.snapshot_suffix());
-    let current_snap: Option<MetaOptimizerSnapshot> = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let pt = periodic_type.clone();
-        handle.block_on(pg.get_latest_baseline_snapshot(&pt)).unwrap_or(None)
-    } else {
-        None
-    }.or_else(|| {
-        db.with_conn(move |conn| {
-            let result = conn.query_row(
-                r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
-                   FROM meta_optimizer_snapshots WHERE snapshot_type = ?1
-                   ORDER BY created_at DESC LIMIT 1"#,
-                rusqlite::params![periodic_type],
-                |row| {
-                    Ok(MetaOptimizerSnapshot {
-                        id: row.get(0)?, snapshot_type: row.get(1)?, period_start: row.get(2)?,
-                        period_end: row.get(3)?, metrics_json: row.get(4)?, breakdown_json: row.get(5)?,
-                        recommendation_id: row.get(6)?, runs_included: row.get(7)?, created_at: row.get(8)?,
-                    })
-                },
-            );
-            match result {
-                Ok(snap) => Ok(Some(snap)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(format!("Failed to query periodic snapshot: {}", e)),
-            }
-        }).unwrap_or(None)
-    });
-
-    let baseline_metrics = baseline_snap
-        .as_ref()
-        .and_then(|s| serde_json::from_str::<SnapshotMetrics>(&s.metrics_json).ok());
-    let current_metrics = current_snap
-        .as_ref()
-        .and_then(|s| serde_json::from_str::<SnapshotMetrics>(&s.metrics_json).ok());
-
-    let delta = match (&baseline_metrics, &current_metrics) {
-        (Some(b), Some(c)) => Some(MetricsDelta {
-            success_rate_delta: c.success_rate - b.success_rate,
-            duration_delta: c.avg_duration_secs - b.avg_duration_secs,
-            iterations_delta: c.avg_iterations - b.avg_iterations,
-            cost_delta: c.avg_cost_cents - b.avg_cost_cents,
-        }),
-        _ => None,
-    };
-
-    let snapshots = list_snapshots_with_pg(db, pg_db, None)?;
-
-    let applied_recommendations_count: i64 = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        handle.block_on(pg.count_applied_recommendations()).unwrap_or_else(|_| {
-            db.with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
-                    [], |row| row.get(0),
-                ).map_err(|e| format!("{}", e))
-            }).unwrap_or(0)
-        })
-    } else {
-        db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
-                [], |row| row.get(0),
-            ).map_err(|e| format!("{}", e))
-        }).unwrap_or(0)
-    };
-
-    Ok(ProgressSummary {
-        baseline: baseline_metrics,
-        current: current_metrics,
-        delta,
-        snapshots,
-        applied_recommendations_count,
-    })
+    get_progress_summary(db, pg_db, category)
 }
 
-/// Evaluate recommendation outcome with PG dual-write for persisted outcome.
+/// Evaluate recommendation outcome (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn evaluate_recommendation_outcome_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<RecommendationOutcome, String> {
-    let outcome = evaluate_recommendation_outcome(db, recommendation_id)?;
-    // Fire-and-forget PG write for the outcome
-    let outcome_json = serde_json::to_string(&outcome).unwrap_or_default();
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    tokio::spawn(async move { let _ = pg.update_recommendation_outcome(&rid, &outcome_json).await; });
-    Ok(outcome)
+    evaluate_recommendation_outcome(db, pg_db, recommendation_id)
 }

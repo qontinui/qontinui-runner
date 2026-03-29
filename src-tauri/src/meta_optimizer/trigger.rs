@@ -9,15 +9,13 @@
 //! 3. `is_fixer` / `is_reflection` / `is_follow_up` column checks on source
 
 use tauri::Emitter;
+use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
 use super::types::{MetaOptimizerDeps, OptimizerType};
 use crate::database::CheckpointDb;
 
-/// Default number of completed runs required before triggering an optimizer.
-const DEFAULT_THRESHOLD: i64 = 2;
-
-/// Check whether a specific optimizer should be launched.
+/// Check whether a specific optimizer should be launched (PG-primary).
 ///
 /// Guards:
 /// 1. No optimizer of this type already running
@@ -26,125 +24,25 @@ const DEFAULT_THRESHOLD: i64 = 2;
 /// 4. Source run is not meta_optimizer/fixer/reflection/follow_up
 pub fn should_launch_optimizer(
     db: &CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     optimizer_type: OptimizerType,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
-    let source_id = source_task_run_id.to_string();
     let opt_type = optimizer_type.as_str().to_string();
+    let source_id = source_task_run_id.to_string();
 
-    db.with_conn(move |conn| {
-        // Guard 0: Check if an optimizer of this type is already running
-        let has_running: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_meta_optimizer = 1 AND workflow_type = 'unified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
+    let result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.should_launch_optimizer(&opt_type, &source_id))
+    })?;
 
-        if has_running {
-            debug!("Skipping {} — a meta-optimizer is already running", opt_type);
-            return Ok(false);
-        }
-
-        // Guard 1: Source must not be a meta-optimizer, fixer, reflection, or follow-up run
-        let is_excluded: bool = conn
-            .query_row(
-                r#"SELECT (COALESCE(is_meta_optimizer, 0) != 0
-                       OR COALESCE(is_fixer, 0) != 0
-                       OR COALESCE(is_reflection, 0) != 0
-                       OR COALESCE(is_follow_up, 0) != 0)
-                   FROM task_runs WHERE id = ?1"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(true); // Default to excluded if not found
-
-        if is_excluded {
-            debug!("Skipping {} — source {} is an excluded run type", opt_type, source_id);
-            return Ok(false);
-        }
-
-        // Guard 2: Meta-optimizer must be enabled in settings (defaults to true for dev_mode)
-        let enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.meta_optimizer_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-
-        if !enabled {
-            debug!("Meta-optimizer disabled in settings");
-            return Ok(false);
-        }
-
-        // Guard 3: Threshold check — count completed runs since last optimizer run of this type
-        let last_optimizer_run_at: Option<String> = conn
-            .query_row(
-                "SELECT MAX(created_at) FROM meta_optimizer_runs WHERE optimizer_type = ?1 AND status = 'complete'",
-                rusqlite::params![opt_type],
-                |row| row.get(0),
-            )
-            .unwrap_or(None);
-
-        let completed_since: i64 = if let Some(ref since) = last_optimizer_run_at {
-            // Count completed workflow runs (not meta-optimizer/fixer/reflection/follow-up) since last optimizer run
-            conn.query_row(
-                r#"SELECT COUNT(*) FROM task_runs
-                   WHERE status IN ('complete', 'failed')
-                     AND COALESCE(is_meta_optimizer, 0) = 0
-                     AND COALESCE(is_fixer, 0) = 0
-                     AND COALESCE(is_reflection, 0) = 0
-                     AND COALESCE(is_follow_up, 0) = 0
-                     AND workflow_type = 'unified'
-                     AND created_at > ?1"#,
-                rusqlite::params![since],
-                |row| row.get(0),
-            )
-            .unwrap_or(0)
-        } else {
-            // No previous optimizer run — count all completed runs
-            conn.query_row(
-                r#"SELECT COUNT(*) FROM task_runs
-                   WHERE status IN ('complete', 'failed')
-                     AND COALESCE(is_meta_optimizer, 0) = 0
-                     AND COALESCE(is_fixer, 0) = 0
-                     AND COALESCE(is_reflection, 0) = 0
-                     AND COALESCE(is_follow_up, 0) = 0
-                     AND workflow_type = 'unified'"#,
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0)
-        };
-
-        // Get configured threshold (default 10)
-        let threshold: i64 = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.meta_optimizer_threshold') AS INTEGER), ?1) FROM settings WHERE key = 'dev_mode'",
-                rusqlite::params![DEFAULT_THRESHOLD],
-                |row| row.get(0),
-            )
-            .unwrap_or(DEFAULT_THRESHOLD);
-
-        if completed_since < threshold {
-            debug!(
-                "Skipping {} — only {} completed runs since last optimizer (threshold: {})",
-                opt_type, completed_since, threshold
-            );
-            return Ok(false);
-        }
-
+    if result {
         info!(
-            "Meta-optimizer {} threshold met: {} completed runs (threshold: {})",
-            opt_type, completed_since, threshold
+            "Meta-optimizer {} threshold met for source {}",
+            opt_type, source_id
         );
-        Ok(true)
-    })
+    }
+
+    Ok(result)
 }
 
 /// Additional guards specific to the meta-prompt optimizer.
@@ -153,7 +51,7 @@ pub fn should_launch_optimizer(
 /// 1. A prompt group exists with failure_rate > 30% and >= 10 samples
 /// 2. No active evolution (canary in progress) for the worst-performing group
 /// 3. 24-hour cooldown per agent_type since last rewrite attempt
-fn should_launch_meta_prompt_optimizer(db: &CheckpointDb) -> bool {
+fn should_launch_meta_prompt_optimizer(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>) -> bool {
     // Check if there's an optimization target meeting the threshold
     let target = match super::prompt_extractor::select_optimization_target(db, 10, 0.30) {
         Ok(Some(t)) => t,
@@ -168,7 +66,7 @@ fn should_launch_meta_prompt_optimizer(db: &CheckpointDb) -> bool {
     };
 
     // Check no active canary for this agent_type
-    if super::prompt_evolution::has_active_evolution(db, &target.agent_type) {
+    if super::prompt_evolution::has_active_evolution(db, pg_db, &target.agent_type) {
         debug!(
             "MetaPrompt guard: active evolution already in progress for {}",
             target.agent_type
@@ -177,9 +75,9 @@ fn should_launch_meta_prompt_optimizer(db: &CheckpointDb) -> bool {
     }
 
     // Adaptive cooldown based on consecutive rejections (circuit breaker)
-    let consecutive = super::prompt_evolution::count_consecutive_rejections(db, &target.agent_type);
+    let consecutive = super::prompt_evolution::count_consecutive_rejections(db, pg_db, &target.agent_type);
     let cooldown_hours = super::prompt_evolution::adaptive_cooldown_hours(consecutive);
-    if super::prompt_evolution::is_in_cooldown(db, &target.agent_type, cooldown_hours) {
+    if super::prompt_evolution::is_in_cooldown(db, pg_db, &target.agent_type, cooldown_hours) {
         debug!(
             "MetaPrompt guard: {} is in {}h cooldown (consecutive_rejections={})",
             target.agent_type, cooldown_hours, consecutive
@@ -191,7 +89,7 @@ fn should_launch_meta_prompt_optimizer(db: &CheckpointDb) -> bool {
     let current_prompt = super::prompt_extractor::get_default_agent_prompt(&target.agent_type);
     if !current_prompt.is_empty() {
         let current_hash = super::prompt_evolution::compute_prompt_hash(&current_prompt);
-        if super::prompt_evolution::has_baseline_drifted(db, &target.agent_type, &current_hash) {
+        if super::prompt_evolution::has_baseline_drifted(db, pg_db, &target.agent_type, &current_hash) {
             warn!(
                 "MetaPrompt guard: baseline prompt for {} has drifted — existing canary results may be invalid",
                 target.agent_type
@@ -220,12 +118,13 @@ pub fn check_and_launch_optimizers(
     let mut launched = Vec::new();
     let db = &deps.app_state.checkpoint_db;
 
+    let pg_db = &deps.app_state.pg_db;
     for optimizer_type in OptimizerType::all() {
-        match should_launch_optimizer(db, *optimizer_type, &source_task_run_id) {
+        match should_launch_optimizer(db, pg_db, *optimizer_type, &source_task_run_id) {
             Ok(true) => {
                 // Meta-prompt optimizer has additional guards beyond the generic ones
                 if *optimizer_type == OptimizerType::MetaPrompt
-                    && !should_launch_meta_prompt_optimizer(db)
+                    && !should_launch_meta_prompt_optimizer(db, pg_db)
                 {
                     debug!("Skipping MetaPrompt — additional guards not met");
                     continue;
@@ -243,6 +142,7 @@ pub fn check_and_launch_optimizers(
     // Capture periodic performance snapshot for progress tracking
     if let Err(e) = super::snapshots::capture_periodic(
         &deps.app_state.checkpoint_db,
+        &deps.app_state.pg_db,
         super::types::WorkflowCategory::Main,
     ) {
         warn!("Failed to capture periodic snapshot: {}", e);
@@ -261,44 +161,45 @@ pub fn check_and_launch_optimizers(
     }
 
     // Maintenance: dedup pending recommendations, reject stale ones, rollback stale canaries
-    super::recommendations::dedup_pending_recommendations(db);
-    super::recommendations::auto_reject_stale_recommendations(db);
-    super::canary::auto_rollback_stale_canaries(db);
+    let pg_db = &deps.app_state.pg_db;
+    super::recommendations::dedup_pending_recommendations(db, pg_db);
+    super::recommendations::auto_reject_stale_recommendations(db, pg_db);
+    super::canary::auto_rollback_stale_canaries(db, pg_db);
 
     // Sweep pending recommendations from previous runs that now qualify for
     // auto-apply or canary entry (pass None to match all optimizer_run_ids).
-    super::parser::auto_apply_high_confidence(db, None);
+    super::parser::auto_apply_high_confidence(db, pg_db, None);
 
     // Auto-evaluate applied recommendations that are due for re-evaluation.
     // Only re-evaluate recs applied >7 days ago whose verdict is still "insufficient_data".
-    auto_evaluate_outcomes(db);
+    auto_evaluate_outcomes(db, pg_db);
 
     // Auto-evaluate canary rollouts and promote/rollback when threshold is met.
-    auto_evaluate_canaries(db, Some(&deps.app_handle));
+    auto_evaluate_canaries(db, pg_db, Some(&deps.app_handle));
 
     // Run data-driven cost optimization analysis (no AI session needed).
     // Generates recommendations for high-token agents, cost concentration, etc.
-    run_cost_analysis(db);
+    run_cost_analysis(db, pg_db);
 
     // Recompute agentic metric baselines from accumulated successful runs.
     // Fast — only queries learning_outcomes aggregates, no LLM calls.
-    if let Err(e) = db.with_conn(|conn| {
-        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn).map(|_| ())
-    }) {
+    if let Err(e) = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.recompute_agentic_baselines())
+    }).map(|_| ()) {
         debug!("Baseline recomputation skipped: {}", e);
     }
 
     // Evaluate applied recommendations using composite agentic scores.
     // Compares pre/post-apply score averages to measure recommendation effectiveness.
-    super::recommendations::auto_evaluate_with_agentic_scores(db);
+    super::recommendations::auto_evaluate_with_agentic_scores(db, pg_db);
 
     Ok(launched)
 }
 
 /// Re-evaluate applied recommendations whose outcome is still "insufficient_data"
 /// and were applied at least 7 days ago (enough time for post-apply data to accumulate).
-fn auto_evaluate_outcomes(db: &CheckpointDb) {
-    let recs = match super::recommendations::list_recommendations(db, None, Some("applied")) {
+fn auto_evaluate_outcomes(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
+    let recs = match super::recommendations::list_recommendations(db, pg_db, None, Some("applied")) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -330,7 +231,7 @@ fn auto_evaluate_outcomes(db: &CheckpointDb) {
         };
 
         if needs_eval {
-            match super::snapshots::evaluate_recommendation_outcome(db, &rec.id) {
+            match super::snapshots::evaluate_recommendation_outcome(db, pg_db, &rec.id) {
                 Ok(outcome) => {
                     if outcome.verdict != "insufficient_data" {
                         info!(
@@ -352,8 +253,8 @@ fn auto_evaluate_outcomes(db: &CheckpointDb) {
 ///
 /// When `app_handle` is provided and a rollback verdict is reached, a
 /// `canary-alert` Tauri event is emitted so the frontend can show a notification.
-fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandle>) {
-    let canaries = match super::canary::get_active_canaries(db) {
+fn auto_evaluate_canaries(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, app_handle: Option<&tauri::AppHandle>) {
+    let canaries = match super::canary::get_active_canaries(db, pg_db) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -364,14 +265,14 @@ fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandl
             continue;
         }
 
-        match super::canary::evaluate_canary(db, &canary.id) {
+        match super::canary::evaluate_canary(db, pg_db, &canary.id) {
             Ok(eval) => match eval.verdict.as_str() {
                 "promote" => {
                     info!(
                             "Auto-promoting canary {} (delta={:+.1}pp, canary_sr={:.1}%, baseline_sr={:.1}%)",
                             canary.id, eval.delta, eval.canary_success_rate, eval.baseline_success_rate
                         );
-                    if let Err(e) = super::canary::promote_canary(db, &canary.id) {
+                    if let Err(e) = super::canary::promote_canary(db, pg_db, &canary.id) {
                         warn!("Failed to auto-promote canary {}: {}", canary.id, e);
                     }
                 }
@@ -400,7 +301,7 @@ fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandl
                     }
 
                     if let Err(e) =
-                        super::canary::rollback_canary_with_eval(db, &canary.id, Some(&eval))
+                        super::canary::rollback_canary_with_eval(db, pg_db, &canary.id, Some(&eval))
                     {
                         warn!("Failed to auto-rollback canary {}: {}", canary.id, e);
                     }
@@ -417,6 +318,7 @@ fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandl
                         let new_pct = std::cmp::min(canary.percentage + 10, 50);
                         if let Err(e) = super::canary::update_canary_percentage(
                             db,
+                            pg_db,
                             &canary.id,
                             new_pct,
                         ) {
@@ -442,12 +344,12 @@ fn auto_evaluate_canaries(db: &CheckpointDb, app_handle: Option<&tauri::AppHandl
 
 /// Run data-driven cost analysis and generate cost recommendations.
 /// This does not require an AI session — it's purely SQL-based analysis.
-fn run_cost_analysis(db: &CheckpointDb) {
+fn run_cost_analysis(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
     // Load existing recommendations to avoid duplicates
-    let existing = super::recommendations::list_recommendations(db, Some("pipeline_prompt"), None)
+    let existing = super::recommendations::list_recommendations(db, pg_db, Some("pipeline_prompt"), None)
         .unwrap_or_default();
 
-    let recs = super::cost_optimizer::generate_cost_recommendations(db, &existing);
+    let recs = super::cost_optimizer::generate_cost_recommendations(db, pg_db, &existing);
     if !recs.is_empty() {
         info!("Cost optimizer produced {} recommendation(s)", recs.len());
     }
@@ -473,7 +375,7 @@ pub fn launch_optimizer_manual(
         if let Ok(Some(target)) =
             super::prompt_extractor::select_optimization_target(db, 10, 0.30)
         {
-            if super::prompt_evolution::has_active_evolution(db, &target.agent_type) {
+            if super::prompt_evolution::has_active_evolution(db, &deps.app_state.pg_db, &target.agent_type) {
                 return Err(format!(
                     "Cannot trigger MetaPrompt optimizer: active canary already in progress for {}",
                     target.agent_type
@@ -512,6 +414,7 @@ fn launch_optimizer_internal(
     // Create optimizer run record
     let optimizer_run_id = super::recommendations::create_optimizer_run(
         db,
+        &deps.app_state.pg_db,
         optimizer_type.as_str(),
         trigger_type,
         Some(&task_run_id),
@@ -525,19 +428,11 @@ fn launch_optimizer_internal(
     );
 
     // Query completed optimizer run count for style rotation (PromptWizard-inspired diversity)
-    let opt_type_str = optimizer_type.as_str().to_string();
-    let style_index: u32 = db
-        .with_conn(move |conn| {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM meta_optimizer_runs WHERE optimizer_type = ?1",
-                    rusqlite::params![opt_type_str],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            Ok(count as u32)
-        })
-        .unwrap_or(0);
+    let style_index: u32 = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(deps.app_state.pg_db.count_optimizer_runs_by_type(optimizer_type.as_str()))
+    })
+    .unwrap_or(0) as u32;
 
     info!(
         "Style rotation: optimizer_type={}, run_count={}, style_index={}",
@@ -658,9 +553,9 @@ pub fn check_and_launch_optimizers_with_pg(
     let pg_db = &deps.app_state.pg_db;
 
     for optimizer_type in OptimizerType::all() {
-        match should_launch_optimizer(db, *optimizer_type, &source_task_run_id) {
+        match should_launch_optimizer(db, pg_db, *optimizer_type, &source_task_run_id) {
             Ok(true) => {
-                if *optimizer_type == OptimizerType::MetaPrompt && !should_launch_meta_prompt_optimizer(db) {
+                if *optimizer_type == OptimizerType::MetaPrompt && !should_launch_meta_prompt_optimizer(db, pg_db) {
                     debug!("Skipping MetaPrompt — additional guards not met");
                     continue;
                 }
@@ -673,7 +568,7 @@ pub fn check_and_launch_optimizers_with_pg(
             Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
         }
     }
-    if let Err(e) = super::snapshots::capture_periodic_with_pg(db, pg_db, super::types::WorkflowCategory::Main) {
+    if let Err(e) = super::snapshots::capture_periodic(db, pg_db, super::types::WorkflowCategory::Main) {
         warn!("Failed to capture periodic snapshot: {}", e);
     }
     {
@@ -685,19 +580,19 @@ pub fn check_and_launch_optimizers_with_pg(
             })
         });
     }
-    super::recommendations::dedup_pending_recommendations_with_pg(db, pg_db);
-    super::recommendations::auto_reject_stale_recommendations_with_pg(db, pg_db);
-    super::canary::auto_rollback_stale_canaries_with_pg(db, pg_db);
-    super::parser::auto_apply_high_confidence_with_pg(db, pg_db, None);
-    auto_evaluate_outcomes(db);
-    auto_evaluate_canaries(db, Some(&deps.app_handle));
-    run_cost_analysis(db);
-    if let Err(e) = db.with_conn(|conn| {
-        crate::meta_optimizer::agentic_metrics::scoring::recompute_all_baselines(conn).map(|_| ())
-    }) {
+    super::recommendations::dedup_pending_recommendations(db, pg_db);
+    super::recommendations::auto_reject_stale_recommendations(db, pg_db);
+    super::canary::auto_rollback_stale_canaries(db, pg_db);
+    super::parser::auto_apply_high_confidence(db, pg_db, None);
+    auto_evaluate_outcomes(db, pg_db);
+    auto_evaluate_canaries(db, pg_db, Some(&deps.app_handle));
+    run_cost_analysis(db, pg_db);
+    if let Err(e) = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.recompute_agentic_baselines())
+    }).map(|_| ()) {
         debug!("Baseline recomputation skipped: {}", e);
     }
-    super::recommendations::auto_evaluate_with_agentic_scores(db);
+    super::recommendations::auto_evaluate_with_agentic_scores(db, pg_db);
     Ok(launched)
 }
 

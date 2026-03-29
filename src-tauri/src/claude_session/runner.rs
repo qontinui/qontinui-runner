@@ -742,6 +742,10 @@ fn run_claude_session_inline(
     let session_ctx_for_findings = session_ctx.clone();
 
     let finding_processor_handle = thread::spawn(move || {
+        let pg_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok();
         let mut detected_findings: Vec<Finding> = Vec::new();
 
         // Only process if we have a finding context
@@ -782,14 +786,16 @@ fn run_claude_session_inline(
                     // Check if this is a resolved finding (marked via :resolved modifier)
                     let is_resolved = parsed_finding.is_resolved;
 
-                    let insert_result = db.with_conn(|conn| {
-                        finding_storage::insert_finding(
-                            conn,
+                    let insert_result = if let Some(ref rt) = pg_rt {
+                        let pg = crate::database::pg::PgDb::global();
+                        rt.block_on(pg.insert_parsed_finding(
                             &ctx.task_run_id,
                             ctx.session_num,
                             &parsed_finding,
-                        )
-                    });
+                        ))
+                    } else {
+                        Err("No PG runtime available for finding insert".to_string())
+                    };
                     match insert_result {
                         Ok(finding) => {
                             // Emit appropriate event to frontend based on status
@@ -844,7 +850,7 @@ fn run_claude_session_inline(
                                 let description = finding.description.clone();
                                 let task_run_id = ctx.task_run_id.clone();
                                 let finding_title = finding.title.clone();
-                                tokio::spawn(async move {
+                                if let Some(ref rt) = pg_rt { rt.spawn(async move {
                                     let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
                                     if let Some(data) = crate::knowledge_acquisition::vuln_enrichment::enrich_from_description(&description, &ka).await {
                                         tracing::info!(
@@ -874,7 +880,7 @@ fn run_claude_session_inline(
                                             }
                                         }
                                     }
-                                });
+                                }); }
                             }
 
                             detected_findings.push(finding);
@@ -1094,6 +1100,10 @@ fn run_claude_session_inline(
         let mut fix_count: u32 = 0;
 
         if let Some(ctx) = reflection_fix_ctx_for_processor {
+            let pg_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
             let db = match CheckpointDb::new() {
                 Ok(db) => Some(db),
                 Err(e) => {
@@ -1120,7 +1130,7 @@ fn run_claude_session_inline(
                     parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
                 );
 
-                if let Some(ref db) = db {
+                if pg_rt.is_some() || db.is_some() {
                     let input = CreateReflectionFixInput {
                         source_task_run_id: ctx.source_task_run_id.clone(),
                         reflection_task_run_id: ctx.reflection_task_run_id.clone(),
@@ -1137,41 +1147,46 @@ fn run_claude_session_inline(
                         alternatives_considered: parsed_fix.alternatives_considered,
                     };
 
-                    let insert_result = db.with_conn(|conn| {
-                        let fix = reflection_storage::insert_fix(conn, &input)?;
-                        // Set reflection_scope
-                        if parsed_fix.scope.as_deref() == Some("universal") {
-                            let _ = conn.execute(
-                                "UPDATE reflection_fixes SET reflection_scope = 'universal', applicability_context = ?1 WHERE id = ?2",
-                                rusqlite::params![parsed_fix.applicability, fix.id],
-                            );
-                        } else {
-                            let is_project_fix = matches!(
-                                fix.fix_type.as_str(),
-                                "project_environment"
-                                    | "project_architecture"
-                                    | "project_test_pattern"
-                                    | "project_recurring_issue"
-                            );
-                            if is_project_fix {
-                                let _ = conn.execute(
-                                    "UPDATE reflection_fixes SET reflection_scope = 'project', project_path = ?1 WHERE id = ?2",
-                                    rusqlite::params![ctx.project_path, fix.id],
-                                );
+                    let insert_result: Result<crate::reflection::types::ReflectionFix, String> = if let Some(ref rt) = pg_rt {
+                        let pg = crate::database::pg::PgDb::global();
+                        match rt.block_on(pg.save_reflection_fix(&input)) {
+                            Ok(fix) => {
+                                // Set reflection_scope via PG
+                                if parsed_fix.scope.as_deref() == Some("universal") {
+                                    let _ = rt.block_on(pg.update_fix_scope(
+                                        &fix.id,
+                                        "universal",
+                                        None,
+                                        parsed_fix.applicability.as_deref(),
+                                    ));
+                                } else {
+                                    let is_project_fix = matches!(
+                                        fix.fix_type.as_str(),
+                                        "project_environment"
+                                            | "project_architecture"
+                                            | "project_test_pattern"
+                                            | "project_recurring_issue"
+                                    );
+                                    if is_project_fix {
+                                        let _ = rt.block_on(pg.update_fix_scope(
+                                            &fix.id,
+                                            "project",
+                                            ctx.project_path.as_deref(),
+                                            None,
+                                        ));
+                                    }
+                                }
+                                // Link error_events via PG
+                                if let Some(ref finding_id) = fix.source_finding_id {
+                                    let _ = rt.block_on(pg.link_error_events_to_fix(&fix.id, finding_id));
+                                }
+                                Ok(fix)
                             }
+                            Err(e) => Err(e),
                         }
-                        // Link error_events
-                        if let Some(ref finding_id) = fix.source_finding_id {
-                            let _ = conn.execute(
-                                r#"UPDATE error_events SET resolved_by_fix_id = ?1
-                                   WHERE signature_hash = (
-                                       SELECT signature_hash FROM task_run_findings WHERE id = ?2
-                                   ) AND resolved_by_fix_id IS NULL"#,
-                                rusqlite::params![fix.id, finding_id],
-                            );
-                        }
-                        Ok(fix)
-                    });
+                    } else {
+                        Err("No PG runtime available for reflection fix insert".to_string())
+                    };
                     match insert_result {
                         Ok(fix) => {
                             fix_count += 1;
@@ -1223,30 +1238,37 @@ fn run_claude_session_inline(
                                         let related_files: Vec<String> =
                                             fix.file_changed.iter().cloned().collect();
 
-                                        match db.create_task_knowledge(
-                                            &ctx.source_task_run_id,
-                                            category,
-                                            "reflection",
-                                            1,
-                                            &fix.fix_description,
-                                            fix.file_changed.as_deref(),
-                                            &fix.confidence,
-                                            &related_files,
-                                        ) {
-                                            Ok(knowledge) => {
+                                        let knowledge_result = if let Some(ref rt) = pg_rt {
+                                            let pg = crate::database::pg::PgDb::global();
+                                            let kid = uuid::Uuid::new_v4().to_string();
+                                            let related_files_json = serde_json::to_string(&related_files).unwrap_or_default();
+                                            rt.block_on(pg.create_task_knowledge(
+                                                &kid,
+                                                &ctx.source_task_run_id,
+                                                category,
+                                                "reflection",
+                                                1,
+                                                &fix.fix_description,
+                                                fix.file_changed.as_deref(),
+                                                &fix.confidence,
+                                                &related_files_json,
+                                            )).map(|id| id)
+                                        } else {
+                                            Err("No PG runtime".to_string())
+                                        };
+                                        match knowledge_result {
+                                            Ok(knowledge_id) => {
                                                 // Set project_path on the knowledge entry
                                                 if let Some(ref pp) = ctx.project_path {
-                                                    let _ = db.with_conn(|c| {
-                                                        c.execute(
-                                                            "UPDATE task_knowledge SET project_path = ?1 WHERE id = ?2",
-                                                            rusqlite::params![pp, knowledge.id],
-                                                        ).map_err(|e| e.to_string())
-                                                    });
+                                                    if let Some(ref rt) = pg_rt {
+                                                        let pg = crate::database::pg::PgDb::global();
+                                                        let _ = rt.block_on(pg.update_task_knowledge_project_path(&knowledge_id, pp));
+                                                    }
                                                 }
 
                                                 info!(
                                                     "Auto-applied project fix as knowledge: {} (category={}, project={:?})",
-                                                    knowledge.id, category, ctx.project_path
+                                                    knowledge_id, category, ctx.project_path
                                                 );
                                                 let auto_msg = format!(
                                                     "Auto-applied project fix as {} knowledge: {}",
@@ -1281,18 +1303,27 @@ fn run_claude_session_inline(
                                         let related_files: Vec<String> =
                                             fix.file_changed.iter().cloned().collect();
 
-                                        match db.create_task_knowledge(
-                                            &ctx.source_task_run_id,
-                                            category,
-                                            "reflection",
-                                            1,
-                                            &fix.fix_description,
-                                            fix.file_changed.as_deref(),
-                                            &fix.confidence,
-                                            &related_files,
-                                        ) {
-                                            Ok(knowledge) => {
-                                                info!("Auto-applied reflection fix as knowledge entry: {}", knowledge.id);
+                                        let kb_result = if let Some(ref rt) = pg_rt {
+                                            let pg = crate::database::pg::PgDb::global();
+                                            let kid = uuid::Uuid::new_v4().to_string();
+                                            let related_files_json = serde_json::to_string(&related_files).unwrap_or_default();
+                                            rt.block_on(pg.create_task_knowledge(
+                                                &kid,
+                                                &ctx.source_task_run_id,
+                                                category,
+                                                "reflection",
+                                                1,
+                                                &fix.fix_description,
+                                                fix.file_changed.as_deref(),
+                                                &fix.confidence,
+                                                &related_files_json,
+                                            ))
+                                        } else {
+                                            Err("No PG runtime".to_string())
+                                        };
+                                        match kb_result {
+                                            Ok(knowledge_id) => {
+                                                info!("Auto-applied reflection fix as knowledge entry: {}", knowledge_id);
                                                 let auto_msg = format!(
                                                     "Auto-applied fix as {} knowledge: {}",
                                                     category, fix.fix_description
@@ -1328,7 +1359,7 @@ fn run_claude_session_inline(
                                             // Create step type knowledge entry (system-specific layer)
                                             let title =
                                                 rules::truncate_to_title(&fix.fix_description);
-                                            match db.with_conn(|conn| step_type_knowledge::insert_knowledge(conn, &step_type_knowledge::InsertKnowledgeInput {
+                                            let stk_input = step_type_knowledge::InsertKnowledgeInput {
                                                 step_type: step_type.clone(),
                                                 layer: "system_specific".to_string(),
                                                 title: title.clone(),
@@ -1336,7 +1367,14 @@ fn run_claude_session_inline(
                                                 priority: 5,
                                                 provenance: "reflection".to_string(),
                                                 source_fix_id: Some(fix.id.clone()),
-                                            })) {
+                                            };
+                                            let stk_result = if let Some(ref rt) = pg_rt {
+                                                let pg = crate::database::pg::PgDb::global();
+                                                rt.block_on(pg.insert_step_type_knowledge(&stk_input))
+                                            } else {
+                                                Err("No PG runtime".to_string())
+                                            };
+                                            match stk_result {
                                                 Ok(entry) => {
                                                     info!("Auto-applied reflection fix as step type knowledge: {} (step_type={})", entry.id, step_type);
                                                     let auto_msg = format!(
@@ -1376,14 +1414,14 @@ fn run_claude_session_inline(
                             // Direct promotion: create a generation rule immediately
                             // for qualifying fix types at high/medium confidence.
                             {
-                                use crate::workflow_generation::rules as gen_rules;
                                 let fixes_slice = [fix];
-                                match db.with_conn(|conn| {
-                                    gen_rules::create_rules_from_reflection_fixes(
-                                        conn,
-                                        &fixes_slice,
-                                    )
-                                }) {
+                                let rules_result = if let Some(ref rt) = pg_rt {
+                                    let pg = crate::database::pg::PgDb::global();
+                                    rt.block_on(pg.create_rules_from_reflection_fixes(&fixes_slice))
+                                } else {
+                                    Err("No PG runtime".to_string())
+                                };
+                                match rules_result {
                                     Ok(n) if n > 0 => {
                                         info!(
                                             "Created {} generation rule(s) directly from reflection fix",
@@ -1409,22 +1447,19 @@ fn run_claude_session_inline(
         } else {
             // No explicit reflection fix context — try to infer it from session data.
             // This handles cases where the context wasn't wired through (defensive fallback).
+            let pg_rt_infer = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
             let inferred_ctx: Option<ReflectionFixContext> = session_ctx_for_reflection
                 .as_ref()
                 .and_then(|sc| {
                     let reflection_task_run_id = sc.context.task_run_id.clone();
-                    // Look up source_task_run_id from DB
-                    let db = CheckpointDb::new().ok()?;
-                    let source_id: Option<String> = db.with_conn(|conn| {
-                        Ok(conn
-                            .query_row(
-                                "SELECT reflection_source_task_run_id FROM task_runs WHERE id = ?1",
-                                rusqlite::params![reflection_task_run_id],
-                                |row| row.get(0),
-                            )
-                            .ok()
-                            .flatten())
-                    }).ok()?;
+                    // Look up source_task_run_id from PG
+                    let source_id: Option<String> = pg_rt_infer.as_ref().and_then(|rt| {
+                        let pg = crate::database::pg::PgDb::global();
+                        rt.block_on(pg.get_source_task_run_id_for_reflection(&reflection_task_run_id)).ok()?
+                    });
                     let source_task_run_id = source_id?;
                     info!(
                         "Inferred reflection fix context from session data: source={}, reflection={}",
@@ -1466,7 +1501,7 @@ fn run_claude_session_inline(
                         parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
                     );
 
-                    if let Some(ref db) = db {
+                    {
                         let input = CreateReflectionFixInput {
                             source_task_run_id: ctx.source_task_run_id.clone(),
                             reflection_task_run_id: ctx.reflection_task_run_id.clone(),
@@ -1483,7 +1518,13 @@ fn run_claude_session_inline(
                             alternatives_considered: parsed_fix.alternatives_considered,
                         };
 
-                        match db.with_conn(|conn| reflection_storage::insert_fix(conn, &input)) {
+                        let fix_result = if let Some(ref rt) = pg_rt_infer {
+                            let pg = crate::database::pg::PgDb::global();
+                            rt.block_on(pg.save_reflection_fix(&input))
+                        } else {
+                            Err("No PG runtime".to_string())
+                        };
+                        match fix_result {
                             Ok(fix) => {
                                 fix_count += 1;
                                 info!(
@@ -1688,42 +1729,36 @@ fn run_claude_session_inline(
         };
 
         if !causal_links.is_empty() {
-            if let Ok(db) = CheckpointDb::new() {
+            if let Ok(causal_rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                let pg = crate::database::pg::PgDb::global();
                 let rfx_ctx = reflection_fix_ctx.as_ref();
                 let task_run_id = rfx_ctx.map(|c| c.source_task_run_id.as_str());
 
-                let _ = db.with_conn(|conn| {
-                    // Resolve workflow_name from task_runs table
-                    let workflow_name: Option<String> = task_run_id.and_then(|id| {
-                        conn.query_row(
-                            "SELECT workflow_name FROM task_runs WHERE id = ?1",
-                            rusqlite::params![id],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                        .flatten()
-                    });
-
-                    for link in &causal_links {
-                        match causal::insert_causal_event(
-                            conn,
-                            &link.cause_type,
-                            &link.cause_ref,
-                            &link.effect_type,
-                            &link.effect_ref,
-                            &link.relationship,
-                            "medium", // AI-identified links are medium confidence
-                            "ai_identified",
-                            task_run_id,
-                            workflow_name.as_deref(),
-                            Some(&link.description),
-                        ) {
-                            Ok(_) => causal_link_count += 1,
-                            Err(e) => warn!("Failed to store causal link: {}", e),
-                        }
-                    }
-                    Ok(())
+                // Resolve workflow_name from PG
+                let workflow_name: Option<String> = task_run_id.and_then(|id| {
+                    causal_rt.block_on(pg.get_workflow_name_for_task_run(id)).ok()
                 });
+
+                for link in &causal_links {
+                    match causal_rt.block_on(pg.insert_causal_event(
+                        &link.cause_type,
+                        &link.cause_ref,
+                        &link.effect_type,
+                        &link.effect_ref,
+                        &link.relationship,
+                        "medium", // AI-identified links are medium confidence
+                        "ai_identified",
+                        workflow_name.as_deref(),
+                        task_run_id,
+                        Some(&link.description),
+                    )) {
+                        Ok(()) => causal_link_count += 1,
+                        Err(e) => warn!("Failed to store causal link: {}", e),
+                    }
+                }
             }
         }
     }

@@ -719,6 +719,7 @@ impl AgenticExecutor {
             if let Some((_, ref rec_id)) = config.active_canary {
                 match crate::meta_optimizer::canary::get_canary_prompt_overrides(
                     &self.checkpoint_db,
+                    &self.app_state.pg_db,
                     rec_id,
                 ) {
                     Ok(overrides) => {

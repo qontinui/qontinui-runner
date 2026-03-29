@@ -3,11 +3,13 @@
 //! Curates test cases from successful historical runs to serve as regression
 //! baselines when evaluating new prompt variants.
 
-use rusqlite::params;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 use tracing::info;
 
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // =============================================================================
 // Types
@@ -52,95 +54,41 @@ pub struct GoldenEntryMetrics {
 // =============================================================================
 
 /// Save or update a golden dataset.
-pub fn save_golden_dataset(db: &CheckpointDb, dataset: &GoldenDataset) -> Result<(), String> {
+pub fn save_golden_dataset(db: &CheckpointDb, pg_db: &Arc<PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
     let id = dataset.id.clone();
     let agent_type = dataset.agent_type.clone();
     let name = dataset.name.clone();
     let entries_json = serde_json::to_string(&dataset.entries)
         .map_err(|e| format!("Failed to serialize entries: {}", e))?;
     let entry_count = dataset.entries.len() as i64;
-    let now = chrono::Utc::now().to_rfc3339();
 
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO golden_datasets (id, agent_type, name, entries_json, entry_count, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-               ON CONFLICT(id) DO UPDATE SET
-                   name = excluded.name,
-                   entries_json = excluded.entries_json,
-                   entry_count = excluded.entry_count,
-                   updated_at = excluded.updated_at"#,
-            params![id, agent_type, name, entries_json, entry_count, now],
-        )
-        .map_err(|e| format!("Failed to save golden dataset: {}", e))?;
-
-        info!("Saved golden dataset {} ({} entries)", id, entry_count);
-        Ok(())
-    })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.save_golden_dataset(&id, &agent_type, &name, &entries_json, entry_count))
+    })?;
+    info!("Saved golden dataset {} ({} entries)", id, entry_count);
+    Ok(())
 }
 
 /// List golden datasets, optionally filtered by agent type.
 pub fn list_golden_datasets(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<GoldenDataset>, String> {
-    let agent = agent_type.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let (sql, has_filter) = if agent.is_some() {
-            (
-                r#"SELECT id, agent_type, name, entries_json, created_at, updated_at
-                   FROM golden_datasets WHERE agent_type = ?1 ORDER BY updated_at DESC"#,
-                true,
-            )
-        } else {
-            (
-                r#"SELECT id, agent_type, name, entries_json, created_at, updated_at
-                   FROM golden_datasets ORDER BY updated_at DESC"#,
-                false,
-            )
-        };
-
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<GoldenDataset> {
-            let entries_json: String = row.get(3)?;
-            let entries: Vec<GoldenEntry> = serde_json::from_str(&entries_json).unwrap_or_default();
-            Ok(GoldenDataset {
-                id: row.get(0)?,
-                agent_type: row.get(1)?,
-                name: row.get(2)?,
-                entries,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        };
-
-        let rows: Vec<GoldenDataset> = if has_filter {
-            stmt.query_map(params![agent.unwrap()], map_row)
-                .map_err(|e| format!("Failed to query: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map([], map_row)
-                .map_err(|e| format!("Failed to query: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        Ok(rows)
-    })
+    let tuples = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_golden_datasets(agent_type))
+    })?;
+    let datasets: Vec<GoldenDataset> = tuples.into_iter().map(|(id, agent_type, name, entries_json, created_at, updated_at)| {
+        let entries: Vec<GoldenEntry> = serde_json::from_str(&entries_json).unwrap_or_default();
+        GoldenDataset { id, agent_type, name, entries, created_at, updated_at }
+    }).collect();
+    Ok(datasets)
 }
 
 /// Delete a golden dataset.
-pub fn delete_golden_dataset(db: &CheckpointDb, dataset_id: &str) -> Result<(), String> {
-    let id = dataset_id.to_string();
-    db.with_conn(move |conn| {
-        conn.execute("DELETE FROM golden_datasets WHERE id = ?1", params![id])
-            .map_err(|e| format!("Failed to delete golden dataset: {}", e))?;
-        Ok(())
+pub fn delete_golden_dataset(db: &CheckpointDb, pg_db: &Arc<PgDb>, dataset_id: &str) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.delete_golden_dataset(dataset_id))
     })
 }
 
@@ -150,56 +98,30 @@ pub fn delete_golden_dataset(db: &CheckpointDb, dataset_id: &str) -> Result<(), 
 /// their task summaries and metrics as golden entries.
 pub fn build_from_history(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: &str,
     max_entries: usize,
 ) -> Result<GoldenDataset, String> {
-    let agent = agent_type.to_string();
     let limit = max_entries as i64;
 
-    let entries: Vec<GoldenEntry> = db.with_conn(move |conn| {
-        let period_start = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT pat.task_run_id, tr.name, pat.duration_ms, pat.success
-                   FROM pipeline_agent_traces pat
-                   JOIN task_runs tr ON pat.task_run_id = tr.id
-                   WHERE pat.agent_type = ?1
-                     AND pat.success = 1
-                     AND pat.created_at > ?2
-                   ORDER BY pat.created_at DESC
-                   LIMIT ?3"#,
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows: Vec<GoldenEntry> = stmt
-            .query_map(params![agent, period_start, limit], |row| {
-                let task_run_id: String = row.get(0)?;
-                let task_name: String = row.get(1)?;
-                let duration_ms: i64 = row.get(2)?;
-                let success: bool = row.get(3)?;
-
-                // Use a simple hash of task name for deduplication
-                let input_hash = format!("{:x}", md5_hash(&task_name));
-
-                Ok(GoldenEntry {
-                    input_hash,
-                    input_summary: task_name,
-                    expected_success: true,
-                    source_task_run_id: Some(task_run_id),
-                    baseline_metrics: Some(GoldenEntryMetrics {
-                        iterations: 0, // Not available from pipeline traces directly
-                        duration_ms: duration_ms as u64,
-                        success,
-                    }),
-                })
-            })
-            .map_err(|e| format!("Failed to query traces: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+    let raw_entries = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.build_golden_entries_from_history(agent_type, limit))
     })?;
+
+    let entries: Vec<GoldenEntry> = raw_entries.into_iter().map(|(task_run_id, task_name, duration_ms, success)| {
+        let input_hash = format!("{:x}", md5_hash(&task_name));
+        GoldenEntry {
+            input_hash,
+            input_summary: task_name,
+            expected_success: true,
+            source_task_run_id: Some(task_run_id),
+            baseline_metrics: Some(GoldenEntryMetrics {
+                iterations: 0,
+                duration_ms: duration_ms as u64,
+                success,
+            }),
+        }
+    }).collect();
 
     // Deduplicate by input_hash
     let mut seen = std::collections::HashSet::new();
@@ -220,7 +142,8 @@ pub fn build_from_history(
         updated_at: now,
     };
 
-    save_golden_dataset(db, &dataset)?;
+    // Save to PG (primary storage for golden datasets)
+    save_golden_dataset(db, pg_db, &dataset)?;
 
     Ok(dataset)
 }
@@ -228,59 +151,37 @@ pub fn build_from_history(
 // ── PG dual-write wrappers ─────────────────────────────────────────────
 
 /// Save a golden dataset with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use save_golden_dataset directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn save_golden_dataset_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
-    save_golden_dataset(db, dataset)?;
-    let pg = pg_db.clone();
-    let id = dataset.id.clone(); let at = dataset.agent_type.clone(); let name = dataset.name.clone();
-    let ej = serde_json::to_string(&dataset.entries).unwrap_or_default(); let ec = dataset.entries.len() as i64;
-    tokio::spawn(async move { let _ = pg.save_golden_dataset(&id, &at, &name, &ej, ec).await; });
-    Ok(())
+    save_golden_dataset(db, pg_db, dataset)
 }
 
 /// Delete a golden dataset with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use delete_golden_dataset directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn delete_golden_dataset_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset_id: &str) -> Result<(), String> {
-    delete_golden_dataset(db, dataset_id)?;
-    let pg = pg_db.clone(); let did = dataset_id.to_string();
-    tokio::spawn(async move { let _ = pg.delete_golden_dataset(&did).await; });
-    Ok(())
+    delete_golden_dataset(db, pg_db, dataset_id)
 }
 
 /// Build a golden dataset from history with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use build_from_history directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn build_from_history_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, max_entries: usize) -> Result<GoldenDataset, String> {
-    let dataset = build_from_history(db, agent_type, max_entries)?;
-    let pg = pg_db.clone();
-    let id = dataset.id.clone(); let at = dataset.agent_type.clone(); let name = dataset.name.clone();
-    let ej = serde_json::to_string(&dataset.entries).unwrap_or_default(); let ec = dataset.entries.len() as i64;
-    tokio::spawn(async move { let _ = pg.save_golden_dataset(&id, &at, &name, &ej, ec).await; });
-    Ok(dataset)
+    build_from_history(db, pg_db, agent_type, max_entries)
 }
 
 // ── PG-primary read wrappers ─────────────────────────────────────────────
 
 /// List golden datasets with PG-primary read.
+#[deprecated(note = "Use list_golden_datasets directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_golden_datasets_with_pg(
     db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<GoldenDataset>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let at = agent_type.map(|s| s.to_string());
-        if let Ok(rows) = handle.block_on(pg.list_golden_datasets(at.as_deref())) {
-            let datasets: Vec<GoldenDataset> = rows.into_iter().map(|(id, agent_type, name, entries_json, created_at, updated_at)| {
-                let entries: Vec<GoldenEntry> = serde_json::from_str(&entries_json).unwrap_or_default();
-                GoldenDataset { id, agent_type, name, entries, created_at, updated_at }
-            }).collect();
-            if !datasets.is_empty() {
-                return Ok(datasets);
-            }
-        }
-    }
-    list_golden_datasets(db, agent_type)
+    list_golden_datasets(db, pg_db, agent_type)
 }
 
 /// Simple string hash for deduplication (not cryptographic).

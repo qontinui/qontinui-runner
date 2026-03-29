@@ -267,4 +267,109 @@ impl PgDb {
         .map_err(|e| format!("PG set_finding_user_response: {}", e))?;
         Ok(())
     }
+
+    /// Insert a parsed finding from the AI output parser (PG equivalent of finding_storage::insert_finding).
+    /// Returns the Finding object.
+    pub async fn insert_parsed_finding(
+        &self,
+        task_run_id: &str,
+        session_num: u32,
+        parsed: &crate::findings::ParsedFinding,
+    ) -> Result<Finding, String> {
+        use sha2::{Digest, Sha256};
+
+        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let now = chrono::Utc::now();
+        let now_str = now.to_rfc3339();
+        let id = uuid::Uuid::new_v4().to_string();
+
+        // Compute signature hash
+        let sig_input = format!(
+            "{}:{}:{}:{}",
+            parsed.category.as_str(),
+            parsed.title,
+            parsed.file.as_deref().unwrap_or(""),
+            parsed.line.unwrap_or(0),
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(sig_input.as_bytes());
+        let signature_hash = format!("{:x}", hasher.finalize());
+
+        // Check for existing finding with same signature
+        let existing = conn
+            .query_opt(
+                "SELECT id FROM task_run_findings WHERE task_run_id = $1 AND signature_hash = $2 AND status NOT IN ('resolved', 'wont_fix')",
+                &[&task_run_id, &signature_hash],
+            )
+            .await
+            .map_err(|e| format!("PG finding dedup check: {}", e))?;
+
+        if let Some(row) = existing {
+            let existing_id: String = row.get(0);
+            return self.get_finding(&existing_id).await?
+                .ok_or_else(|| "Existing finding not found after dedup".to_string());
+        }
+
+        // Determine action type
+        let action_type = if parsed.needs_input {
+            "needs_user_input"
+        } else {
+            match parsed.category {
+                FindingCategory::AlreadyFixed | FindingCategory::ExpectedBehavior => "informational",
+                _ => "auto_fix",
+            }
+        };
+
+        // Determine initial status
+        let initial_status = if parsed.is_resolved {
+            "resolved"
+        } else if parsed.needs_input {
+            "needs_input"
+        } else {
+            "detected"
+        };
+
+        let input_options_json = parsed
+            .options
+            .as_ref()
+            .map(|opts| serde_json::to_string(opts).unwrap_or_default());
+
+        let session_i32 = session_num as i32;
+
+        conn.execute(
+            r#"INSERT INTO task_run_findings (
+                id, task_run_id, detected_in_session, category, severity, status,
+                action_type, title, description, file_path, line_number, column_number,
+                code_snippet, signature_hash, needs_input, question, input_options,
+                detected_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)
+            ON CONFLICT (id) DO NOTHING"#,
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &task_run_id,
+                &session_i32,
+                &parsed.category.as_str(),
+                &parsed.severity.as_str(),
+                &initial_status,
+                &action_type,
+                &parsed.title.as_str(),
+                &parsed.description.as_str() as &(dyn tokio_postgres::types::ToSql + Sync),
+                &parsed.file.as_deref() as &(dyn tokio_postgres::types::ToSql + Sync),
+                &parsed.line.map(|l| l as i32) as &(dyn tokio_postgres::types::ToSql + Sync),
+                &None::<i32> as &(dyn tokio_postgres::types::ToSql + Sync),
+                &None::<String> as &(dyn tokio_postgres::types::ToSql + Sync),
+                &signature_hash.as_str(),
+                &parsed.needs_input,
+                &parsed.question.as_deref() as &(dyn tokio_postgres::types::ToSql + Sync),
+                &input_options_json.as_deref() as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now_str.as_str(),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG insert_parsed_finding: {}", e))?;
+
+        self.get_finding(&id).await?
+            .ok_or_else(|| "Finding not found after PG insert".to_string())
+    }
 }

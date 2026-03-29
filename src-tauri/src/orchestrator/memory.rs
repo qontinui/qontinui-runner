@@ -894,6 +894,136 @@ impl MemorySystem {
 
         context
     }
+
+    /// Persist all high-confidence learnings to PostgreSQL for cross-session survival.
+    ///
+    /// Maps the in-memory `Learning` struct to the `learning_patterns` table,
+    /// storing tags and application history in the JSON context column.
+    pub async fn persist_learnings_to_pg(&self, pg: &PgDb) -> Result<usize, String> {
+        let learnings = self.long_term.get_by_confidence(0.5);
+        let mut persisted = 0;
+
+        for learning in learnings {
+            let context = serde_json::json!({
+                "tags": learning.tags,
+                "applied_in_tasks": learning.applied_in_tasks,
+                "confirmations": learning.confirmations,
+                "created_at": learning.created_at,
+                "updated_at": learning.updated_at,
+            })
+            .to_string();
+
+            match pg
+                .save_learning_pattern(
+                    &learning.id,
+                    &learning.category,
+                    &learning.insight,
+                    learning.confidence as f64,
+                    learning.confirmations as i32,
+                    Some(&context),
+                )
+                .await
+            {
+                Ok(_) => persisted += 1,
+                Err(e) => {
+                    tracing::warn!("Failed to persist learning {}: {}", learning.id, e);
+                }
+            }
+        }
+
+        Ok(persisted)
+    }
+
+    /// Load learnings from PostgreSQL into the in-memory system.
+    ///
+    /// Restores cross-session learnings on startup by reading from the
+    /// `learning_patterns` table and mapping them back to `Learning` structs.
+    pub async fn restore_learnings_from_pg(&mut self, pg: &PgDb) -> Result<usize, String> {
+        let patterns = pg.get_learning_patterns().await?;
+        let mut restored = 0;
+
+        for pattern in &patterns {
+            let id = pattern
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            // Skip if already loaded (avoid duplicates on multiple restores)
+            if self.long_term.find_by_id(&id).is_some() {
+                continue;
+            }
+
+            let category = pattern
+                .get("pattern_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let insight = pattern
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let confidence = pattern
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5) as f32;
+            let occurrences = pattern
+                .get("occurrences")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1) as u32;
+
+            // Parse context JSON for tags and applied_in_tasks
+            let context_val = pattern.get("context").cloned().unwrap_or_default();
+            let tags: Vec<String> = context_val
+                .get("tags")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let applied_in_tasks: Vec<String> = context_val
+                .get("applied_in_tasks")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let created_at = context_val
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    pattern
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+            let updated_at = context_val
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    pattern
+                        .get("updated_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+            let learning = Learning {
+                id,
+                category,
+                insight,
+                confidence,
+                confirmations: occurrences,
+                applied_in_tasks,
+                created_at,
+                updated_at,
+                tags,
+            };
+
+            self.long_term.store_learning(learning);
+            restored += 1;
+        }
+
+        Ok(restored)
+    }
 }
 
 /// Summary statistics for memory system.

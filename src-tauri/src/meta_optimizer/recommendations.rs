@@ -2,13 +2,16 @@
 //!
 //! All optimizer outputs go here with status `pending`. Human reviews from UI.
 
+use std::sync::Arc;
 use rusqlite::params;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::runtime::Handle;
 use tracing::{info, warn};
 
 use super::types::{MetaOptimizerRun, Recommendation};
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 /// Compute a content hash for deduplication based on semantic identity fields.
 /// Two recommendations with the same hash are semantically identical regardless
@@ -32,17 +35,10 @@ pub fn compute_content_hash(
 
 /// Check if a recommendation with the same content hash already exists
 /// in a non-terminal state (pending, canary, applied).
-pub fn is_content_duplicate(db: &CheckpointDb, content_hash: &str) -> bool {
-    let hash = content_hash.to_string();
-    db.with_conn(move |conn| {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE content_hash = ?1 AND status IN ('pending', 'canary', 'applied')",
-                params![hash],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        Ok(count > 0)
+pub fn is_content_duplicate(db: &CheckpointDb, pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
+    let _ = db;
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.is_content_duplicate(content_hash))
     })
     .unwrap_or(false)
 }
@@ -86,6 +82,7 @@ struct RulePayload {
 /// Create a new recommendation.
 pub fn create_recommendation(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     recommendation_type: &str,
     target_agent: Option<&str>,
@@ -126,38 +123,14 @@ pub fn create_recommendation(
         eval_status: None,
     };
 
-    let rec_clone = rec.clone();
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO meta_optimizer_recommendations
-               (id, optimizer_type, recommendation_type, target_agent, title, description,
-                current_value, recommended_value, evidence, confidence, status,
-                optimizer_run_id, created_at, content_hash)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13)"#,
-            params![
-                rec_clone.id,
-                rec_clone.optimizer_type,
-                rec_clone.recommendation_type,
-                rec_clone.target_agent,
-                rec_clone.title,
-                rec_clone.description,
-                rec_clone.current_value,
-                rec_clone.recommended_value,
-                rec_clone.evidence,
-                rec_clone.confidence,
-                rec_clone.optimizer_run_id,
-                rec_clone.created_at,
-                content_hash,
-            ],
-        )
-        .map_err(|e| format!("Failed to create recommendation: {}", e))?;
-
-        info!(
-            "Created recommendation {} ({})",
-            rec_clone.id, rec_clone.title
-        );
-        Ok(())
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.create_recommendation(
+            &rec.id, optimizer_type, recommendation_type, target_agent,
+            title, description, current_value, recommended_value,
+            evidence, confidence, optimizer_run_id, &content_hash,
+        ))
     })?;
+    info!("Created recommendation {} ({})", rec.id, rec.title);
 
     Ok(rec)
 }
@@ -165,138 +138,49 @@ pub fn create_recommendation(
 /// List recommendations with optional filters.
 pub fn list_recommendations(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     optimizer_type: Option<&str>,
     status: Option<&str>,
 ) -> Result<Vec<Recommendation>, String> {
-    let optimizer_type = optimizer_type.map(|s| s.to_string());
-    let status = status.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let mut sql = String::from(
-            r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
-                      current_value, recommended_value, evidence, confidence, status,
-                      applied_at, outcome_after_apply, optimizer_run_id, created_at,
-                      eval_result_id, eval_status
-               FROM meta_optimizer_recommendations WHERE 1=1"#,
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut param_idx = 1;
-
-        if let Some(ref ot) = optimizer_type {
-            sql.push_str(&format!(" AND optimizer_type = ?{}", param_idx));
-            param_values.push(Box::new(ot.clone()));
-            param_idx += 1;
-        }
-        if let Some(ref st) = status {
-            sql.push_str(&format!(" AND status = ?{}", param_idx));
-            param_values.push(Box::new(st.clone()));
-        }
-        sql.push_str(" ORDER BY created_at DESC");
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                Ok(Recommendation {
-                    id: row.get(0)?,
-                    optimizer_type: row.get(1)?,
-                    recommendation_type: row.get(2)?,
-                    target_agent: row.get(3)?,
-                    title: row.get(4)?,
-                    description: row.get(5)?,
-                    current_value: row.get(6)?,
-                    recommended_value: row.get(7)?,
-                    evidence: row.get(8)?,
-                    confidence: row.get(9)?,
-                    status: row.get(10)?,
-                    applied_at: row.get(11)?,
-                    outcome_after_apply: row.get(12)?,
-                    optimizer_run_id: row.get(13)?,
-                    created_at: row.get(14)?,
-                    eval_result_id: row.get(15).ok().flatten(),
-                    eval_status: row.get(16).ok().flatten(),
-                })
-            })
-            .map_err(|e| format!("Failed to query recommendations: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_recommendations(optimizer_type, status))
     })
 }
 
 /// Apply a recommendation (updates status to 'applied').
 /// This is the simple status-only flip — prefer `apply_recommendation_with_side_effects`.
-pub fn apply_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Result<(), String> {
-    let id = recommendation_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    db.with_conn(move |conn| {
-        let affected = conn
-            .execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'applied', applied_at = ?1 WHERE id = ?2 AND status IN ('pending', 'canary')",
-                params![now, id],
-            )
-            .map_err(|e| format!("Failed to apply recommendation: {}", e))?;
-
-        if affected == 0 {
-            return Err(format!("Recommendation {} not found or not in pending/canary status", id));
-        }
-
-        info!("Applied recommendation {}", id);
-        Ok(())
-    })
+pub fn apply_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "applied"))
+    })?;
+    info!("Applied recommendation {}", recommendation_id);
+    Ok(())
 }
 
 /// Fetch a single recommendation by ID.
 fn get_recommendation(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Recommendation, String> {
-    let id = recommendation_id.to_string();
-    db.with_conn(move |conn| {
-        conn.query_row(
-            r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
-                      current_value, recommended_value, evidence, confidence, status,
-                      applied_at, outcome_after_apply, optimizer_run_id, created_at,
-                      eval_result_id, eval_status
-               FROM meta_optimizer_recommendations WHERE id = ?1"#,
-            params![id],
-            |row| {
-                Ok(Recommendation {
-                    id: row.get(0)?,
-                    optimizer_type: row.get(1)?,
-                    recommendation_type: row.get(2)?,
-                    target_agent: row.get(3)?,
-                    title: row.get(4)?,
-                    description: row.get(5)?,
-                    current_value: row.get(6)?,
-                    recommended_value: row.get(7)?,
-                    evidence: row.get(8)?,
-                    confidence: row.get(9)?,
-                    status: row.get(10)?,
-                    applied_at: row.get(11)?,
-                    outcome_after_apply: row.get(12)?,
-                    optimizer_run_id: row.get(13)?,
-                    created_at: row.get(14)?,
-                    eval_result_id: row.get(15).ok().flatten(),
-                    eval_status: row.get(16).ok().flatten(),
-                })
-            },
-        )
-        .map_err(|e| format!("Recommendation not found: {}", e))
-    })
+    let result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_recommendation(recommendation_id))
+    })?;
+    result.ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))
 }
 
 /// Apply a recommendation **and** perform the appropriate side-effect based on
 /// `recommendation_type`. If the side-effect fails the status is NOT updated.
 pub fn apply_recommendation_with_side_effects(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<(), String> {
-    let rec = get_recommendation(db, recommendation_id)?;
+    let id = recommendation_id.to_string();
+    let rec = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_recommendation(&id))
+    })?
+    .ok_or_else(|| format!("Recommendation not found: {}", id))?;
 
     if rec.status != "pending" && rec.status != "canary" {
         return Err(format!(
@@ -311,10 +195,10 @@ pub fn apply_recommendation_with_side_effects(
         .ok_or_else(|| format!("Recommendation {} has no recommended_value", rec.id))?;
 
     match rec.recommendation_type.as_str() {
-        "prompt_rewrite" => apply_prompt_rewrite(db, &rec.id, recommended_value)?,
+        "prompt_rewrite" => apply_prompt_rewrite(db, pg_db, &rec.id, recommended_value)?,
         "config_change" => apply_config_change(db, recommended_value)?,
-        "rule_create" => apply_rule_create(db, &rec.id, recommended_value)?,
-        "rule_update" => apply_rule_update(db, recommended_value)?,
+        "rule_create" => apply_rule_create(db, pg_db, &rec.id, recommended_value)?,
+        "rule_update" => apply_rule_update(db, pg_db, recommended_value)?,
         other => {
             warn!(
                 "Unknown recommendation_type '{}' for {}; applying status-only",
@@ -323,12 +207,15 @@ pub fn apply_recommendation_with_side_effects(
         }
     }
 
-    // Side-effect succeeded — now flip the status
-    apply_recommendation(db, recommendation_id)?;
+    // Side-effect succeeded — now flip the status via PG
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.apply_recommendation_with_timestamp(&id))
+    })?;
 
     // Capture a snapshot to measure impact of this recommendation
     if let Err(e) = super::snapshots::capture_post_apply(
         db,
+        pg_db,
         recommendation_id,
         super::types::WorkflowCategory::Main,
     ) {
@@ -336,7 +223,7 @@ pub fn apply_recommendation_with_side_effects(
     }
 
     // Evaluate outcome immediately (will likely be "insufficient_data" initially)
-    if let Err(e) = super::snapshots::evaluate_recommendation_outcome(db, recommendation_id) {
+    if let Err(e) = super::snapshots::evaluate_recommendation_outcome(db, pg_db, recommendation_id) {
         warn!("Failed to evaluate recommendation outcome: {}", e);
     }
 
@@ -347,6 +234,7 @@ pub fn apply_recommendation_with_side_effects(
 
 fn apply_prompt_rewrite(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     recommended_value: &str,
 ) -> Result<(), String> {
@@ -355,13 +243,14 @@ fn apply_prompt_rewrite(
 
     let variant = super::prompt_registry::create_variant(
         db,
+        pg_db,
         &payload.agent_type,
         &payload.variant_name,
         &payload.prompt_content,
         Some(recommendation_id),
     )?;
 
-    super::prompt_registry::activate_variant(db, &variant.id)?;
+    super::prompt_registry::activate_variant(db, pg_db, &variant.id)?;
 
     info!(
         "Applied prompt_rewrite recommendation {}: created and activated variant {}",
@@ -385,6 +274,7 @@ fn apply_config_change(db: &CheckpointDb, recommended_value: &str) -> Result<(),
 
 fn apply_rule_create(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     recommended_value: &str,
 ) -> Result<(), String> {
@@ -392,38 +282,38 @@ fn apply_rule_create(
         .map_err(|e| format!("Invalid rule_create payload: {}", e))?;
 
     let rec_id = recommendation_id.to_string();
-    db.with_conn(move |conn| {
-        let rule_number = payload.rule_number.unwrap_or_else(|| {
-            crate::workflow_generation::rules::next_rule_number(
-                conn,
-                &payload.agent,
-                &payload.section,
-            )
-        });
 
-        let input = crate::workflow_generation::rules::InsertRuleInput {
-            agent: payload.agent.clone(),
-            section: payload.section.clone(),
-            rule_number,
-            title: payload.title.clone(),
-            content: payload.content.clone(),
-            condition: payload.condition.clone(),
-            provenance: "meta_optimizer".to_string(),
-            source_fix_id: Some(rec_id.clone()),
-            severity: None,
-            examples_json: payload.examples_json.clone(),
-        };
+    let rule_number = match payload.rule_number {
+        Some(n) => n,
+        None => tokio::task::block_in_place(|| {
+            Handle::current().block_on(pg_db.next_rule_number(&payload.agent, &payload.section))
+        })?,
+    };
 
-        let rule = crate::workflow_generation::rules::insert_rule(conn, &input)?;
-        info!(
-            "Applied rule_create recommendation {}: created rule {}",
-            rec_id, rule.id
-        );
-        Ok(())
-    })
+    let input = crate::workflow_generation::rules::InsertRuleInput {
+        agent: payload.agent.clone(),
+        section: payload.section.clone(),
+        rule_number,
+        title: payload.title.clone(),
+        content: payload.content.clone(),
+        condition: payload.condition.clone(),
+        provenance: "meta_optimizer".to_string(),
+        source_fix_id: Some(rec_id.clone()),
+        severity: None,
+        examples_json: payload.examples_json.clone(),
+    };
+
+    let rule = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.insert_rule(&input))
+    })?;
+    info!(
+        "Applied rule_create recommendation {}: created rule {}",
+        rec_id, rule.id
+    );
+    Ok(())
 }
 
-fn apply_rule_update(db: &CheckpointDb, recommended_value: &str) -> Result<(), String> {
+fn apply_rule_update(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), String> {
     let payload: RulePayload = serde_json::from_str(recommended_value)
         .map_err(|e| format!("Invalid rule_update payload: {}", e))?;
 
@@ -431,45 +321,33 @@ fn apply_rule_update(db: &CheckpointDb, recommended_value: &str) -> Result<(), S
         .rule_id
         .ok_or_else(|| "rule_update payload missing 'rule_id'".to_string())?;
 
-    db.with_conn(move |conn| {
-        let input = crate::workflow_generation::rules::UpdateRuleInput {
-            title: Some(payload.title),
-            content: Some(payload.content),
-            condition: payload.condition,
-            status: payload.status,
-            rule_number: payload.rule_number,
-            severity: None,
-            examples_json: payload.examples_json,
-        };
+    let input = crate::workflow_generation::rules::UpdateRuleInput {
+        title: Some(payload.title),
+        content: Some(payload.content),
+        condition: payload.condition,
+        status: payload.status,
+        rule_number: payload.rule_number,
+        severity: None,
+        examples_json: payload.examples_json,
+    };
 
-        let rule = crate::workflow_generation::rules::update_rule(conn, &rule_id, &input)?;
-        info!(
-            "Applied rule_update: updated rule {} ({})",
-            rule.id, rule.title
-        );
-        Ok(())
-    })
+    let rule = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_rule(&rule_id, &input))
+    })?;
+    info!(
+        "Applied rule_update: updated rule {} ({})",
+        rule.id, rule.title
+    );
+    Ok(())
 }
 
 /// Reject a recommendation.
-pub fn reject_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Result<(), String> {
-    let id = recommendation_id.to_string();
-
-    db.with_conn(move |conn| {
-        let affected = conn
-            .execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE id = ?1 AND status = 'pending'",
-                params![id],
-            )
-            .map_err(|e| format!("Failed to reject recommendation: {}", e))?;
-
-        if affected == 0 {
-            return Err(format!("Recommendation {} not found or not pending", id));
-        }
-
-        info!("Rejected recommendation {}", id);
-        Ok(())
-    })
+pub fn reject_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "rejected"))
+    })?;
+    info!("Rejected recommendation {}", recommendation_id);
+    Ok(())
 }
 
 /// Deduplicate pending recommendations by content hash.
@@ -478,38 +356,10 @@ pub fn reject_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Resu
 /// and supersedes newer pending duplicates. Canary and applied recs are not touched
 /// (they represent active rollouts or already-applied changes). Also backfills
 /// content_hash for older rows that lack it.
-pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
-    // First, backfill content_hash for any pending recs that don't have one
-    let pending = match list_recommendations(db, None, Some("pending")) {
-        Ok(recs) => recs,
-        Err(_) => return 0,
-    };
-
-    let mut backfilled = 0usize;
-    for rec in &pending {
-        let hash = compute_content_hash(
-            &rec.optimizer_type,
-            &rec.recommendation_type,
-            rec.target_agent.as_deref(),
-            rec.recommended_value.as_deref(),
-        );
-        let id = rec.id.clone();
-        if let Ok(affected) = db.with_conn(move |conn| {
-            conn.execute(
-                "UPDATE meta_optimizer_recommendations SET content_hash = ?1 WHERE id = ?2 AND content_hash IS NULL",
-                params![hash, id],
-            )
-            .map_err(|e| format!("Failed to backfill hash: {}", e))
-        }) {
-            if affected > 0 {
-                backfilled += 1;
-            }
-        }
-    }
-
-    // Now find and supersede duplicates (keep oldest per hash)
-    let superseded: usize = db
-        .with_conn(|conn| {
+pub fn dedup_pending_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usize {
+    let superseded = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
             let affected = conn
                 .execute(
                     r#"UPDATE meta_optimizer_recommendations SET status = 'superseded'
@@ -522,20 +372,18 @@ pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
                                    AND r2.status IN ('pending', 'canary', 'applied')
                              )
                        )"#,
-                    [],
+                    &[],
                 )
-                .map_err(|e| format!("Dedup query failed: {}", e))?;
-            Ok(affected)
+                .await
+                .map_err(|e| format!("Dedup query failed: {e}"))?;
+            Ok::<u64, String>(affected)
         })
-        .unwrap_or(0);
+    })
+    .unwrap_or(0) as usize;
 
     if superseded > 0 {
-        info!(
-            "Dedup: superseded {} duplicate pending recommendation(s) (backfilled {} hashes)",
-            superseded, backfilled
-        );
+        info!("Dedup: superseded {} duplicate pending recommendation(s)", superseded);
     }
-
     superseded
 }
 
@@ -543,34 +391,30 @@ pub fn dedup_pending_recommendations(db: &CheckpointDb) -> usize {
 ///
 /// Stale recs block the optimizer from regenerating fresh suggestions for the
 /// same targets. Rejecting them frees those slots while preserving history.
-pub fn auto_reject_stale_recommendations(db: &CheckpointDb) -> usize {
+pub fn auto_reject_stale_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usize {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
 
-    let rejected: usize = db
-        .with_conn(move |conn| {
-            let affected = conn
-                .execute(
-                    "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE status = 'pending' AND created_at < ?1",
-                    params![cutoff],
-                )
-                .map_err(|e| format!("Stale rejection failed: {}", e))?;
-            Ok(affected)
+    let rejected = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+            let affected = conn.execute(
+                "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE status = 'pending' AND created_at < $1",
+                &[&cutoff],
+            ).await.map_err(|e| format!("PG stale rejection: {e}"))?;
+            Ok::<u64, String>(affected)
         })
-        .unwrap_or(0);
+    })
+    .unwrap_or(0) as usize;
 
     if rejected > 0 {
-        info!(
-            "Auto-rejected {} stale pending recommendation(s) (older than 30 days)",
-            rejected
-        );
+        info!("Auto-rejected {} stale pending recommendation(s) (older than 30 days)", rejected);
     }
-
     rejected
 }
 
 /// Roll back an applied recommendation, undoing side-effects where possible.
-pub fn rollback_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Result<(), String> {
-    let rec = get_recommendation(db, recommendation_id)?;
+pub fn rollback_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
+    let rec = get_recommendation(db, pg_db, recommendation_id)?;
 
     if rec.status != "applied" {
         return Err(format!(
@@ -585,7 +429,7 @@ pub fn rollback_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Re
     if let Some(ref recommended_value) = rec.recommended_value {
         match rec.recommendation_type.as_str() {
             "rule_create" | "rule_update" => {
-                if let Err(e) = rollback_rule(db, &rec.id, recommended_value) {
+                if let Err(e) = rollback_rule(db, pg_db, &rec.id, recommended_value) {
                     warn!("Failed to rollback rule side-effect for {}: {}", rec.id, e);
                 }
             }
@@ -612,27 +456,17 @@ pub fn rollback_recommendation(db: &CheckpointDb, recommendation_id: &str) -> Re
     }
 
     // Flip the status to rolled_back
-    let id = recommendation_id.to_string();
-    db.with_conn(move |conn| {
-        let affected = conn
-            .execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'rolled_back' WHERE id = ?1 AND status = 'applied'",
-                params![id],
-            )
-            .map_err(|e| format!("Failed to rollback recommendation: {}", e))?;
-
-        if affected == 0 {
-            return Err(format!("Recommendation {} not found or not applied", id));
-        }
-
-        info!("Rolled back recommendation {}", id);
-        Ok(())
-    })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "rolled_back"))
+    })?;
+    info!("Rolled back recommendation {}", recommendation_id);
+    Ok(())
 }
 
 /// Undo a rule side-effect by disabling the rule that was created/updated.
 fn rollback_rule(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     recommended_value: &str,
 ) -> Result<(), String> {
@@ -643,40 +477,35 @@ fn rollback_rule(
             .ok()
             .and_then(|p| p.rule_id);
 
-    let rec_id = recommendation_id.to_string();
-
-    db.with_conn(move |conn| {
-        let target_rule_id = if let Some(id) = rule_id_from_payload {
-            id
-        } else {
-            // Find rule created by this recommendation (source_fix_id = recommendation_id)
-            conn.query_row(
-                "SELECT id FROM generation_rules WHERE source_fix_id = ?1 LIMIT 1",
-                params![rec_id],
-                |row| row.get::<_, String>(0),
+    let target_rule_id = if let Some(id) = rule_id_from_payload {
+        id
+    } else {
+        tokio::task::block_in_place(|| {
+            Handle::current().block_on(pg_db.find_rule_by_source_fix_id(recommendation_id))
+        })?
+        .ok_or_else(|| {
+            format!(
+                "Could not find rule created by recommendation {}",
+                recommendation_id
             )
-            .map_err(|e| {
-                format!(
-                    "Could not find rule created by recommendation {}: {}",
-                    rec_id, e
-                )
-            })?
-        };
+        })?
+    };
 
-        let input = crate::workflow_generation::rules::UpdateRuleInput {
-            title: None,
-            content: None,
-            condition: None,
-            status: Some("disabled".to_string()),
-            rule_number: None,
-            severity: None,
-            examples_json: None,
-        };
+    let input = crate::workflow_generation::rules::UpdateRuleInput {
+        title: None,
+        content: None,
+        condition: None,
+        status: Some("disabled".to_string()),
+        rule_number: None,
+        severity: None,
+        examples_json: None,
+    };
 
-        crate::workflow_generation::rules::update_rule(conn, &target_rule_id, &input)?;
-        info!("Rollback: disabled rule {}", target_rule_id);
-        Ok(())
-    })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_rule(&target_rule_id, &input))
+    })?;
+    info!("Rollback: disabled rule {}", target_rule_id);
+    Ok(())
 }
 
 /// Undo a config change by restoring the `current_value`.
@@ -697,130 +526,58 @@ fn rollback_config_change(db: &CheckpointDb, current_value: &str) -> Result<(), 
 /// Create a new optimizer run record.
 pub fn create_optimizer_run(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     trigger_type: &str,
     task_run_id: Option<&str>,
 ) -> Result<String, String> {
-    let id = format!("morun-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
-    let id_clone = id.clone();
-    let optimizer_type = optimizer_type.to_string();
-    let trigger_type = trigger_type.to_string();
-    let task_run_id = task_run_id.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO meta_optimizer_runs
-               (id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
-                task_run_id, status, created_at)
-               VALUES (?1, ?2, ?3, 0, 0, ?4, 'running', ?5)"#,
-            params![id_clone, optimizer_type, trigger_type, task_run_id, now],
-        )
-        .map_err(|e| format!("Failed to create optimizer run: {}", e))?;
-        Ok(())
-    })?;
-
-    Ok(id)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.create_optimizer_run(optimizer_type, trigger_type, task_run_id))
+    })
 }
 
 /// Create an optimizer run with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use create_optimizer_run directly — it is now PG-primary")]
 pub fn create_optimizer_run_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     trigger_type: &str,
     task_run_id: Option<&str>,
 ) -> Result<String, String> {
-    let id = create_optimizer_run(db, optimizer_type, trigger_type, task_run_id)?;
-
-    let pg = pg_db.clone();
-    let ot = optimizer_type.to_string();
-    let tt = trigger_type.to_string();
-    let tid = task_run_id.map(|s| s.to_string());
-    tokio::spawn(async move {
-        if let Err(e) = pg.create_optimizer_run(&ot, &tt, tid.as_deref()).await {
-            tracing::warn!("PG create_optimizer_run dual-write failed: {}", e);
-        }
-    });
-
-    Ok(id)
+    create_optimizer_run(db, pg_db, optimizer_type, trigger_type, task_run_id)
 }
 
 /// Complete an optimizer run, recording how many runs were analyzed and recommendations produced.
 pub fn complete_optimizer_run(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     run_id: &str,
     runs_analyzed: i64,
     recommendations_produced: i64,
 ) -> Result<(), String> {
-    let run_id = run_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"UPDATE meta_optimizer_runs
-               SET status = 'complete', runs_analyzed = ?1, recommendations_produced = ?2, completed_at = ?3
-               WHERE id = ?4"#,
-            params![runs_analyzed, recommendations_produced, now, run_id],
-        )
-        .map_err(|e| format!("Failed to complete optimizer run: {}", e))?;
-        Ok(())
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.complete_optimizer_run(run_id, runs_analyzed, recommendations_produced))
     })
 }
 
 /// Complete an optimizer run with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use complete_optimizer_run directly — it is now PG-primary")]
 pub fn complete_optimizer_run_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     run_id: &str,
     runs_analyzed: i64,
     recommendations_produced: i64,
 ) -> Result<(), String> {
-    complete_optimizer_run(db, run_id, runs_analyzed, recommendations_produced)?;
-
-    let pg = pg_db.clone();
-    let rid = run_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.complete_optimizer_run(&rid, runs_analyzed, recommendations_produced).await {
-            tracing::warn!("PG complete_optimizer_run dual-write failed: {}", e);
-        }
-    });
-
-    Ok(())
+    complete_optimizer_run(db, pg_db, run_id, runs_analyzed, recommendations_produced)
 }
 
 /// List optimizer runs.
-pub fn list_optimizer_runs(db: &CheckpointDb) -> Result<Vec<MetaOptimizerRun>, String> {
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
-                          task_run_id, status, created_at, completed_at
-                   FROM meta_optimizer_runs
-                   ORDER BY created_at DESC
-                   LIMIT 100"#,
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(MetaOptimizerRun {
-                    id: row.get(0)?,
-                    optimizer_type: row.get(1)?,
-                    trigger_type: row.get(2)?,
-                    runs_analyzed: row.get(3)?,
-                    recommendations_produced: row.get(4)?,
-                    task_run_id: row.get(5)?,
-                    status: row.get(6)?,
-                    created_at: row.get(7)?,
-                    completed_at: row.get(8)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query runs: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+pub fn list_optimizer_runs(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
+    let _ = db;
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_optimizer_runs())
     })
 }
 
@@ -831,8 +588,8 @@ pub fn list_optimizer_runs(db: &CheckpointDb) -> Result<Vec<MetaOptimizerRun>, S
 /// outcome_after_apply with the evidence. If negative, flags for rollback.
 ///
 /// Called from the maintenance block in trigger.rs.
-pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
-    let recs = match list_recommendations(db, None, Some("applied")) {
+pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb, pg_db: &Arc<PgDb>) {
+    let recs = match list_recommendations(db, pg_db, None, Some("applied")) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -843,50 +600,14 @@ pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
             None => continue,
         };
 
-        // Need at least 5 post-apply runs for meaningful comparison
-        let rec_id = rec.id.clone();
-        let result = db.with_conn(move |conn| {
-            // Count post-apply runs with agentic scores
-            let post_count: i64 = conn
-                .query_row(
-                    r#"SELECT COUNT(*) FROM learning_outcomes
-                       WHERE created_at > ?1 AND composite_agentic_score IS NOT NULL
-                         AND (iterations IS NULL OR iterations > 0)"#,
-                    params![applied_at],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
+        // Query pre/post agentic scores from PG (learning_outcomes is also in PG)
+        let result: Result<Option<(String, f64)>, String> = (|| {
+            let eval = tokio::task::block_in_place(|| {
+                Handle::current().block_on(pg_db.get_agentic_score_evaluation(&applied_at))
+            })?;
 
-            if post_count < 5 {
-                return Ok(None); // Insufficient data
-            }
-
-            // Average composite score BEFORE the recommendation was applied
-            let pre_avg: Option<f64> = conn
-                .query_row(
-                    r#"SELECT AVG(composite_agentic_score) FROM learning_outcomes
-                       WHERE created_at <= ?1 AND composite_agentic_score IS NOT NULL
-                         AND (iterations IS NULL OR iterations > 0)"#,
-                    params![applied_at],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-
-            // Average composite score AFTER
-            let post_avg: Option<f64> = conn
-                .query_row(
-                    r#"SELECT AVG(composite_agentic_score) FROM learning_outcomes
-                       WHERE created_at > ?1 AND composite_agentic_score IS NOT NULL
-                         AND (iterations IS NULL OR iterations > 0)"#,
-                    params![applied_at],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten();
-
-            match (pre_avg, post_avg) {
-                (Some(pre), Some(post)) if pre > 0.0 => {
+            match eval {
+                Some((pre, post, post_count)) => {
                     let delta = post - pre;
                     let delta_pct = (delta / pre) * 100.0;
                     let verdict = if delta_pct > 5.0 {
@@ -907,17 +628,17 @@ pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
                         "evaluated_by": "agentic_metrics",
                     });
 
-                    conn.execute(
-                        "UPDATE meta_optimizer_recommendations SET outcome_after_apply = ?1 WHERE id = ?2",
-                        params![outcome.to_string(), rec_id],
-                    )
-                    .map_err(|e| format!("Failed to update outcome: {}", e))?;
+                    tokio::task::block_in_place(|| {
+                        Handle::current().block_on(
+                            pg_db.update_recommendation_outcome_json(&rec.id, &outcome.to_string()),
+                        )
+                    })?;
 
                     Ok(Some((verdict.to_string(), delta_pct)))
                 }
-                _ => Ok(None),
+                None => Ok(None),
             }
-        });
+        })();
 
         match result {
             Ok(Some((verdict, delta_pct))) => {
@@ -940,13 +661,14 @@ pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb) {
     }
 }
 
-// ── PG dual-write wrappers ─────────────────────────────────────────────
+// ── PG dual-write wrappers (now just delegate to PG-primary originals) ───
 
 /// Create a recommendation with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use create_recommendation directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn create_recommendation_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     recommendation_type: &str,
     target_agent: Option<&str>,
@@ -958,238 +680,143 @@ pub fn create_recommendation_with_pg(
     confidence: f64,
     optimizer_run_id: Option<&str>,
 ) -> Result<Recommendation, String> {
-    let rec = create_recommendation(
-        db, optimizer_type, recommendation_type, target_agent, title,
+    create_recommendation(
+        db, pg_db, optimizer_type, recommendation_type, target_agent, title,
         description, current_value, recommended_value, evidence, confidence, optimizer_run_id,
-    )?;
-    let pg = pg_db.clone();
-    let r = rec.clone();
-    let ch = compute_content_hash(optimizer_type, recommendation_type, target_agent, recommended_value);
-    tokio::spawn(async move {
-        let _ = pg.create_recommendation(
-            &r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(),
-            &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(),
-            r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch,
-        ).await;
-    });
-    Ok(rec)
+    )
 }
 
 /// Apply a recommendation with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use apply_recommendation directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn apply_recommendation_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<(), String> {
-    apply_recommendation(db, recommendation_id)?;
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    tokio::spawn(async move { let _ = pg.update_recommendation_status(&rid, "applied").await; });
-    Ok(())
+    apply_recommendation(db, pg_db, recommendation_id)
 }
 
 /// Reject a recommendation with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use reject_recommendation directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn reject_recommendation_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<(), String> {
-    reject_recommendation(db, recommendation_id)?;
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    tokio::spawn(async move { let _ = pg.update_recommendation_status(&rid, "rejected").await; });
-    Ok(())
+    reject_recommendation(db, pg_db, recommendation_id)
 }
 
 /// Rollback a recommendation with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use rollback_recommendation directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn rollback_recommendation_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<(), String> {
-    rollback_recommendation(db, recommendation_id)?;
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    tokio::spawn(async move { let _ = pg.update_recommendation_status(&rid, "rolled_back").await; });
-    Ok(())
+    rollback_recommendation(db, pg_db, recommendation_id)
 }
 
 /// Dedup pending recommendations with PG dual-write.
+#[deprecated(note = "Use dedup_pending_recommendations directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn dedup_pending_recommendations_with_pg(
     db: &CheckpointDb,
-    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> usize {
-    dedup_pending_recommendations(db)
+    dedup_pending_recommendations(db, pg_db)
 }
 
 /// Auto-reject stale recommendations with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use auto_reject_stale_recommendations directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn auto_reject_stale_recommendations_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> usize {
-    let count = auto_reject_stale_recommendations(db);
-    if count > 0 {
-        let pg = pg_db.clone();
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-        tokio::spawn(async move {
-            if let Ok(conn) = pg.pool().get().await {
-                let _ = conn.execute(
-                    "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE status = 'pending' AND created_at < $1",
-                    &[&cutoff],
-                ).await;
-            }
-        });
-    }
-    count
+    auto_reject_stale_recommendations(db, pg_db)
 }
 
-// ── PG-primary read wrappers ─────────────────────────────────────────────
+// ── PG-primary read wrappers (now just delegate to PG-primary originals) ──
 
 /// Check content duplicate with PG-primary read.
+#[deprecated(note = "Use is_content_duplicate directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn is_content_duplicate_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     content_hash: &str,
 ) -> bool {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let ch = content_hash.to_string();
-        if let Ok(result) = handle.block_on(pg.is_content_duplicate(&ch)) {
-            return result;
-        }
-    }
-    is_content_duplicate(db, content_hash)
+    is_content_duplicate(db, pg_db, content_hash)
 }
 
 /// List recommendations with PG-primary read.
+#[deprecated(note = "Use list_recommendations directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_recommendations_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     optimizer_type: Option<&str>,
     status: Option<&str>,
 ) -> Result<Vec<Recommendation>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let ot = optimizer_type.map(|s| s.to_string());
-        let st = status.map(|s| s.to_string());
-        if let Ok(result) = handle.block_on(pg.list_recommendations(ot.as_deref(), st.as_deref())) {
-            return Ok(result);
-        }
-    }
-    list_recommendations(db, optimizer_type, status)
+    list_recommendations(db, pg_db, optimizer_type, status)
 }
 
 /// List optimizer runs with PG-primary read.
+#[deprecated(note = "Use list_optimizer_runs directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_optimizer_runs_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> Result<Vec<MetaOptimizerRun>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        if let Ok(result) = handle.block_on(pg.list_optimizer_runs()) {
-            return Ok(result);
-        }
-    }
-    list_optimizer_runs(db)
+    list_optimizer_runs(db, pg_db)
 }
 
 /// Get a single recommendation by ID from PG (falls back to SQLite).
+#[deprecated(note = "Use get_recommendation (private) or list_recommendations instead")]
 #[allow(dead_code)]
 pub fn get_recommendation_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Recommendation, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let rid = recommendation_id.to_string();
-        if let Ok(Some(rec)) = tokio::task::block_in_place(|| {
-            handle.block_on(pg.get_recommendation(&rid))
-        }) {
-            return Ok(rec);
-        }
-    }
-    get_recommendation(db, recommendation_id)
+    get_recommendation(db, pg_db, recommendation_id)
 }
 
 /// Apply a recommendation with side effects and PG dual-write.
+#[deprecated(note = "Use apply_recommendation_with_side_effects directly")]
 #[allow(dead_code)]
 pub fn apply_recommendation_with_side_effects_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<(), String> {
-    apply_recommendation_with_side_effects(db, recommendation_id)?;
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move { let _ = pg.update_recommendation_status(&rid, "applied").await; });
-    }
-    Ok(())
+    apply_recommendation_with_side_effects(db, pg_db, recommendation_id)
 }
 
 /// Dedup pending recommendations with PG dual-write (fire-and-forget).
-/// Backfills hashes and supersedes duplicates in both SQLite and PG.
+#[deprecated(note = "Use dedup_pending_recommendations directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn dedup_pending_recommendations_with_pg_sync(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> usize {
-    let count = dedup_pending_recommendations(db);
-    if count > 0 {
-        let pg = pg_db.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Ok(conn) = pg.pool().get().await {
-                    let _ = conn.execute(
-                        r#"UPDATE meta_optimizer_recommendations SET status = 'superseded'
-                           WHERE id IN (
-                               SELECT r.id FROM meta_optimizer_recommendations r
-                               WHERE r.status = 'pending' AND r.content_hash IS NOT NULL
-                                 AND r.created_at > (
-                                     SELECT MIN(r2.created_at) FROM meta_optimizer_recommendations r2
-                                     WHERE r2.content_hash = r.content_hash
-                                       AND r2.status IN ('pending', 'canary', 'applied')
-                                 )
-                           )"#,
-                        &[],
-                    ).await;
-                }
-            });
-        }
-    }
-    count
+    dedup_pending_recommendations(db, pg_db)
 }
 
 /// Auto-evaluate applied recommendations with agentic scores, with PG dual-write.
+#[deprecated(note = "Use auto_evaluate_with_agentic_scores directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn auto_evaluate_with_agentic_scores_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) {
-    auto_evaluate_with_agentic_scores(db);
-    // PG dual-write: sync any updated outcome_after_apply values
-    if let Ok(recs) = list_recommendations(db, None, Some("applied")) {
-        let pg = pg_db.clone();
-        tokio::spawn(async move {
-            for r in &recs {
-                if let Some(ref outcome) = r.outcome_after_apply {
-                    let _ = pg.update_recommendation_outcome(&r.id, outcome).await;
-                }
-            }
-        });
-    }
+    auto_evaluate_with_agentic_scores(db, pg_db);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
     use crate::database::CheckpointDb;

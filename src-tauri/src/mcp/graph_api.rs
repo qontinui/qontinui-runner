@@ -19,7 +19,7 @@ use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
 use crate::memory::unified_query::{self, MemorySource, UnifiedMemoryQuery};
 use crate::reflection::{
-    cross_run_learning, fuzzy_matching, graph_engine::KnowledgeGraph,
+    fuzzy_matching, graph_engine::KnowledgeGraph,
     graph_types::GraphSummary, unified_search,
 };
 
@@ -79,22 +79,39 @@ const GRAPH_TTL_SECS: u64 = 60;
 /// Only full (non-workflow-scoped) graphs are cached. Workflow-scoped graphs
 /// are always built fresh because they differ per workflow name.
 ///
+/// The cache is considered valid when **both**:
+/// 1. The TTL hasn't expired (60s)
+/// 2. The generation counter hasn't been bumped since the cached build
+///
+/// Write handlers (findings, fixes, rules, observations, patterns) bump the
+/// generation counter via [`bump_graph_cache_generation`] so the graph
+/// rebuilds on next access even if the TTL hasn't expired.
+///
 /// Returns an `Arc<KnowledgeGraph>` so callers can share without cloning.
 pub(crate) async fn get_or_build_graph(
     state: &ApiState,
     workflow_name: Option<&str>,
 ) -> Result<Arc<KnowledgeGraph>, String> {
+    let current_generation = state
+        .graph_cache_generation
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     // Only use cache for full graphs (no workflow scope)
     if workflow_name.is_none() {
         let cache = state.knowledge_graph_cache.read().await;
         if let Some(cached) = cache.as_ref() {
-            if cached.built_at.elapsed().as_secs() < GRAPH_TTL_SECS {
+            let ttl_ok = cached.built_at.elapsed().as_secs() < GRAPH_TTL_SECS;
+            let gen_ok = cached.generation == current_generation;
+            if ttl_ok && gen_ok {
                 return Ok(Arc::clone(&cached.graph));
             }
         }
     }
 
-    // SQLite: complex function — KnowledgeGraph::build_from_db traverses multiple tables
+    // REMAINING SQLite: KnowledgeGraph::build_from_db traverses 25+ SQLite tables
+    // (workflows, task_runs, findings, fixes, errors, rules, patterns, knowledge,
+    // step_defs, ui_elements, skills, plus linking queries). A full PG migration
+    // requires creating a build_from_pg method on KnowledgeGraph.
     let db = state.app_state.checkpoint_db.clone();
     let wf = workflow_name.map(|s| s.to_string());
     let graph = tokio::task::spawn_blocking(move || {
@@ -114,10 +131,53 @@ pub(crate) async fn get_or_build_graph(
         *cache = Some(CachedKnowledgeGraph {
             graph: Arc::clone(&graph),
             built_at: std::time::Instant::now(),
+            generation: current_generation,
         });
     }
 
     Ok(graph)
+}
+
+/// Bump the graph cache generation counter, causing the next `get_or_build_graph`
+/// call to rebuild instead of serving stale data.
+///
+/// Call this after any write that affects graph content (findings, fixes, rules,
+/// observations, cross-run patterns, etc.).
+pub(crate) fn bump_graph_cache_generation(state: &ApiState) {
+    state
+        .graph_cache_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Invalidate the cached knowledge graph, forcing a rebuild on next access.
+///
+/// This bumps the generation counter **and** emits a
+/// `graph.cache_invalidated` event on the workflow event bus so that
+/// any subscribers (e.g. background pre-warmers, dashboards) can react.
+pub(crate) async fn invalidate_graph_cache(state: &ApiState, reason: &str) {
+    let new_gen = state
+        .graph_cache_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    tracing::debug!(
+        "Graph cache invalidated (generation={}, reason={})",
+        new_gen,
+        reason
+    );
+
+    // Fire-and-forget event on the workflow event bus
+    let bus = crate::workflow_event_bus::get_workflow_event_bus();
+    let event = crate::workflow_event_bus::WorkflowEvent {
+        name: crate::workflow_event_bus::events::GRAPH_CACHE_INVALIDATED.to_string(),
+        data: serde_json::json!({
+            "generation": new_gen,
+            "reason": reason,
+        }),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        idempotency_key: None,
+        source: crate::workflow_event_bus::EventSource::default(),
+    };
+    let _ = bus.emit(event).await;
 }
 
 // ============================================================================
@@ -148,6 +208,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/graph/skill-metrics", get(skill_metrics_handler))
         // Unified memory search (RRF fusion across all stores)
         .route("/memory/search", get(memory_search_handler))
+        // Explicit cache invalidation endpoints
+        .route("/graph/invalidate-cache", post(invalidate_graph_cache_handler))
+        .route("/memory/invalidate-graph-cache", post(invalidate_graph_cache_handler))
 }
 
 // ============================================================================
@@ -261,7 +324,7 @@ async fn summary_handler(
     // version so other handlers benefit.
     // If no observations, use the cached graph directly.
     if has_observations || workflow_name.is_some() {
-        // SQLite: complex function — KnowledgeGraph build + observation enrichment
+        // REMAINING SQLite: KnowledgeGraph::build_from_db (see get_or_build_graph comment)
         let db = state.app_state.checkpoint_db.clone();
         let wf = workflow_name.clone();
         let (summary, maybe_graph) = tokio::task::spawn_blocking(move || {
@@ -293,10 +356,14 @@ async fn summary_handler(
 
         // Cache the enriched graph for other handlers (only full graphs)
         if workflow_name.is_none() {
+            let current_generation = state
+                .graph_cache_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
             let mut cache = state.knowledge_graph_cache.write().await;
             *cache = Some(CachedKnowledgeGraph {
                 graph: Arc::new(maybe_graph),
                 built_at: std::time::Instant::now(),
+                generation: current_generation,
             });
         }
 
@@ -558,14 +625,9 @@ async fn detect_patterns_handler(
 > {
     let (patterns_detected, rules_disabled, fixes_auto_applied) = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            cross_run_learning::post_run_analysis(
-                conn,
-                &query.workflow_name,
-                &query.task_run_id,
-            )
-        })
+        .pg_db
+        .post_run_analysis(&query.workflow_name, &query.task_run_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -575,6 +637,9 @@ async fn detect_patterns_handler(
                 ))),
             )
         })?;
+
+    // Post-run analysis may create/disable rules and patterns — invalidate graph cache
+    invalidate_graph_cache(&state, "detect_patterns").await;
 
     Ok(Json(ApiResponse::success(DetectPatternsResponse {
         patterns_detected,
@@ -598,16 +663,9 @@ async fn similar_errors_handler(
     let limit = query.limit.unwrap_or(10);
     let results = state
         .app_state
-        .checkpoint_db
-        .with_conn(|conn| {
-            fuzzy_matching::find_similar_errors(
-                conn,
-                &query.description,
-                None, // No embedding for HTTP text-only queries
-                min_similarity,
-                limit,
-            )
-        })
+        .pg_db
+        .find_similar_errors(&query.description, min_similarity, limit)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -764,6 +822,24 @@ struct MemorySearchResponse {
     results: Vec<unified_query::MemoryResult>,
     total: usize,
     query: String,
+}
+
+/// POST /memory/invalidate-graph-cache — explicitly bump the generation counter
+/// and emit a `graph.cache_invalidated` event on the workflow event bus.
+///
+/// Useful for external callers or internal processes that write graph-relevant
+/// data outside the standard HTTP handlers (e.g. background tasks, CLI tools).
+async fn invalidate_graph_cache_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    invalidate_graph_cache(&state, "explicit_api_call").await;
+    let gen = state
+        .graph_cache_generation
+        .load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("Graph cache invalidated via API (generation={})", gen);
+    Json(ApiResponse::success(
+        serde_json::json!({ "generation": gen }),
+    ))
 }
 
 async fn memory_search_handler(

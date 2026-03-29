@@ -18,6 +18,9 @@ use std::collections::HashMap;
 use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
+use crate::workflow_generation::learning_orchestrator::{
+    LearningConfig, LearningOrchestrator, RunContext,
+};
 use crate::error_monitor::{CuratorConfig, DebugContextCurator};
 use crate::execution_context::AiSessionContext;
 use crate::orchestrator::{
@@ -669,6 +672,8 @@ pub struct Orchestrator {
     doctor_handle: Option<DoctorHandle>,
     /// Optional PostgreSQL database for unified memory queries.
     pg_db: Option<Arc<PgDb>>,
+    /// Adaptive learning orchestrator for post-run learning hooks.
+    learning_orchestrator: std::sync::Mutex<LearningOrchestrator>,
 }
 
 impl Orchestrator {
@@ -692,6 +697,9 @@ impl Orchestrator {
             hook_executor: HookExecutor::empty(),
             doctor_handle,
             pg_db: None,
+            learning_orchestrator: std::sync::Mutex::new(LearningOrchestrator::new(
+                LearningConfig::default(),
+            )),
         }
     }
 
@@ -717,6 +725,9 @@ impl Orchestrator {
             hook_executor: HookExecutor::empty(),
             doctor_handle,
             pg_db: None,
+            learning_orchestrator: std::sync::Mutex::new(LearningOrchestrator::new(
+                LearningConfig::default(),
+            )),
         }
     }
 
@@ -788,42 +799,29 @@ impl Orchestrator {
             return None;
         }
 
-        self.db.with_conn(|conn| {
-            let config = CuratorConfig {
-                max_errors: 20,
-                max_stack_lines: 3,
-                ..Default::default()
-            };
-            let curator = DebugContextCurator::with_config(config);
-
-            match curator.build_context(conn, task_run_id) {
-                Ok(context) => {
-                    if context.total_count == 0 {
-                        return Ok(None);
+        // PG-primary: sync method context, use block_in_place
+        let pg = crate::database::pg::PgDb::global();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match pg.build_error_monitor_context(task_run_id, 20).await {
+                    Ok(Some(formatted)) => {
+                        info!("Injecting error monitor context from PG");
+                        Ok::<_, String>(Some(format!(
+                            "## Application Error Context\n\n\
+                             The following errors have been detected in the application logs. \
+                             Consider these when debugging or if your changes might be related.\n\n\
+                             {}\n\n---\n",
+                            formatted
+                        )))
                     }
-
-                    let formatted = curator.format_for_ai(&context);
-
-                    info!(
-                        "Injecting error monitor context: {} errors ({} critical)",
-                        context.total_count,
-                        context.critical_errors.len()
-                    );
-
-                    Ok(Some(format!(
-                        "## Application Error Context\n\n\
-                         The following errors have been detected in the application logs. \
-                         Consider these when debugging or if your changes might be related.\n\n\
-                         {}\n\n---\n",
-                        formatted
-                    )))
+                    Ok(None) => Ok(None),
+                    Err(e) => {
+                        warn!("Failed to build error monitor context: {}", e);
+                        Ok(None)
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to build error monitor context: {}", e);
-                    Ok(None)
-                }
-            }
-        }).ok().flatten()
+            }).ok().flatten()
+        })
     }
 
     /// Resolve targeted errors after successful workflow completion.
@@ -841,46 +839,43 @@ impl Orchestrator {
             state.task_run_id
         );
 
-        self.db.with_conn(|conn| {
-            let mut resolved_count = 0;
-            let mut failed_count = 0;
+        // PG-primary: sync method context, use block_in_place
+        let pg = crate::database::pg::PgDb::global();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut resolved_count = 0;
+                let mut failed_count = 0;
 
-            for error_id in &state.targeted_error_ids {
-                let resolution_note = format!(
-                    "Auto-resolved by successful completion of workflow task {}",
-                    state.task_run_id
-                );
+                for error_id in &state.targeted_error_ids {
+                    let resolution_note = format!(
+                        "Auto-resolved by successful completion of workflow task {}",
+                        state.task_run_id
+                    );
 
-                match crate::error_monitor::ErrorEventStorage::mark_resolved_by_task(
-                    conn,
-                    *error_id,
-                    &state.task_run_id,
-                    Some(&resolution_note),
-                ) {
-                    Ok(_) => {
-                        resolved_count += 1;
-                        debug!("Resolved error {} via task {}", error_id, state.task_run_id);
-                    }
-                    Err(e) => {
-                        failed_count += 1;
-                        warn!("Failed to resolve error {}: {}", error_id, e);
+                    match pg.mark_resolved_by_task(
+                        *error_id,
+                        &state.task_run_id,
+                        Some(&resolution_note),
+                    ).await {
+                        Ok(_) => {
+                            resolved_count += 1;
+                            debug!("Resolved error {} via task {}", error_id, state.task_run_id);
+                        }
+                        Err(e) => {
+                            failed_count += 1;
+                            warn!("Failed to resolve error {}: {}", error_id, e);
+                        }
                     }
                 }
-            }
 
-            if resolved_count > 0 {
-                info!(
-                    "Successfully resolved {} errors (failed: {}) for task {}",
-                    resolved_count, failed_count, state.task_run_id
-                );
-            }
-            Ok(())
-        }).unwrap_or_else(|e| {
-            error!(
-                "Failed to get database connection for error resolution: {}",
-                e
-            );
-        })
+                if resolved_count > 0 {
+                    info!(
+                        "Successfully resolved {} errors (failed: {}) for task {}",
+                        resolved_count, failed_count, state.task_run_id
+                    );
+                }
+            })
+        });
     }
 
     // ========================================================================
@@ -2251,6 +2246,9 @@ impl Orchestrator {
         // Record learning outcome to database for AI learning system
         self.record_learning_outcome(state, &result);
 
+        // Run adaptive learning orchestrator (playbook, few-shot, template lifecycle)
+        self.run_adaptive_learning(state, &result);
+
         // Resolve targeted errors on successful completion
         if is_success && !state.targeted_error_ids.is_empty() {
             self.resolve_targeted_errors(state);
@@ -2440,6 +2438,65 @@ impl Orchestrator {
                     strategy.as_deref(),
                     files_modified.clone(),
                 );
+            }
+        }
+    }
+
+    /// Run the adaptive learning orchestrator after a task completes.
+    ///
+    /// This extracts lessons, curates few-shot examples, tracks template usage,
+    /// and triggers GEPA/PRM retrain when thresholds are met.
+    fn run_adaptive_learning(
+        &self,
+        state: &OrchestratorState,
+        result: &TaskCompletionResult,
+    ) {
+        let conn = match self.db.get_conn() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Cannot run adaptive learning — no DB connection: {}", e);
+                return;
+            }
+        };
+
+        let (iterations, overall_score) = match result {
+            TaskCompletionResult::Success { iterations, .. } => (*iterations, 0.85),
+            TaskCompletionResult::Failed { iterations, .. } => (*iterations, 0.3),
+            TaskCompletionResult::Stopped { at_iteration, .. } => (*at_iteration, 0.2),
+            TaskCompletionResult::Paused { at_iteration, .. } => (*at_iteration, 0.5),
+        };
+
+        // Use first domain assignment if available, otherwise "general"
+        let domain = state
+            .domain_assignments
+            .first()
+            .map(|d| d.domain_id.clone())
+            .unwrap_or_else(|| "general".to_string());
+
+        let run_context = RunContext {
+            run_id: state.task_run_id.clone(),
+            overall_score,
+            iterations,
+            domain,
+            step_evaluation_summaries: None,
+            used_templates: None,
+            description: Some(state.task_run_id.clone()),
+        };
+
+        match self.learning_orchestrator.lock() {
+            Ok(mut orchestrator) => {
+                let actions = orchestrator.on_run_complete(&run_context, &conn);
+                if actions.has_activity() {
+                    debug!(
+                        "Adaptive learning for run {}: {} lessons, {} examples",
+                        state.task_run_id,
+                        actions.lessons_added,
+                        actions.examples_extracted,
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Failed to lock learning orchestrator: {}", e);
             }
         }
     }

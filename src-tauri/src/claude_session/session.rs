@@ -451,13 +451,16 @@ impl ClaudeSession {
                     if let Some(ref db) = db {
                         let is_resolved = parsed_finding.is_resolved;
 
-                        let insert_result = db.with_conn(|conn| {
-                            finding_storage::insert_finding(
-                                conn,
-                                &ctx.task_run_id,
-                                ctx.session_num,
-                                &parsed_finding,
-                            )
+                        // PG-primary: sync thread context, use block_in_place
+                        let pg = crate::database::pg::PgDb::global();
+                        let insert_result = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                pg.insert_parsed_finding(
+                                    &ctx.task_run_id,
+                                    ctx.session_num,
+                                    &parsed_finding,
+                                ).await
+                            })
                         });
                         match insert_result {
                             Ok(finding) => {

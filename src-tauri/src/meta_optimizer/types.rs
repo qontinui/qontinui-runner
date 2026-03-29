@@ -51,6 +51,24 @@ impl WorkflowCategory {
         }
     }
 
+    /// Returns a SQL WHERE clause fragment for PG (boolean columns, not integer).
+    /// `alias` is the table alias for task_runs (e.g., "tr").
+    pub fn pg_sql_filter(&self, alias: &str) -> String {
+        match self {
+            Self::Main => format!(
+                " AND COALESCE({a}.is_fixer, false) = false \
+                 AND COALESCE({a}.is_reflection, false) = false \
+                 AND COALESCE({a}.is_follow_up, false) = false \
+                 AND COALESCE({a}.is_meta_optimizer, false) = false",
+                a = alias
+            ),
+            Self::Reflections => format!(" AND COALESCE({}.is_reflection, false) = true", alias),
+            Self::Fixers => format!(" AND COALESCE({}.is_fixer, false) = true", alias),
+            Self::FollowUps => format!(" AND COALESCE({}.is_follow_up, false) = true", alias),
+            Self::MetaOptimizer => format!(" AND COALESCE({}.is_meta_optimizer, false) = true", alias),
+        }
+    }
+
     /// Returns the snapshot type suffix for this category.
     pub fn snapshot_suffix(&self) -> &'static str {
         match self {

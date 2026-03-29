@@ -271,4 +271,149 @@ impl PgDb {
 
         Ok(affected > 0)
     }
+
+    /// PG equivalent of exploration_stats query for a workflow.
+    pub async fn get_exploration_stats(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+
+        let row = conn
+            .query_opt(
+                r#"SELECT id, workflow_id, total_candidates, search_depth, search_duration_ms,
+                          best_score, strategy_used, score_progression, created_at
+                   FROM exploration_stats
+                   WHERE workflow_id = $1
+                   ORDER BY created_at DESC LIMIT 1"#,
+                &[&workflow_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_exploration_stats: {}", e))?;
+
+        match row {
+            Some(r) => Ok(Some(serde_json::json!({
+                "id": r.get::<_, String>(0),
+                "workflow_id": r.get::<_, String>(1),
+                "total_candidates": r.get::<_, i32>(2),
+                "search_depth": r.get::<_, i32>(3),
+                "search_duration_ms": r.get::<_, i64>(4),
+                "best_score": r.get::<_, Option<f64>>(5),
+                "strategy_used": r.get::<_, Option<String>>(6),
+                "score_progression": r.get::<_, Option<String>>(7),
+                "created_at": r.get::<_, String>(8),
+            }))),
+            None => Ok(None),
+        }
+    }
+
+    /// PG equivalent of template library list (returns empty if table missing).
+    pub async fn list_templates(
+        &self,
+        domain_filter: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+
+        // Check if the step_templates table exists in PG
+        let exists = conn
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'step_templates')",
+                &[],
+            )
+            .await
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+
+        if !exists {
+            return Ok(vec![]);
+        }
+
+        let rows = if let Some(domain) = domain_filter {
+            conn.query(
+                "SELECT id, name, domain, template_json, created_at FROM step_templates WHERE domain = $1 ORDER BY name",
+                &[&domain],
+            ).await
+        } else {
+            conn.query(
+                "SELECT id, name, domain, template_json, created_at FROM step_templates ORDER BY name",
+                &[],
+            ).await
+        }.map_err(|e| format!("PG list_templates: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "name": r.get::<_, String>(1),
+                    "domain": r.get::<_, String>(2),
+                    "template_json": r.get::<_, String>(3),
+                    "created_at": r.get::<_, String>(4),
+                })
+            })
+            .collect())
+    }
+
+    // ========================================================================
+    // Generation Rules — helpers for meta-optimizer recommendations
+    // ========================================================================
+
+    /// Get the next rule number for a given agent/section.
+    pub async fn next_rule_number(&self, agent: &str, section: &str) -> Result<i32, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_one(
+            "SELECT COALESCE(MAX(rule_number), 0) + 1 FROM generation_rules WHERE agent = $1 AND section = $2",
+            &[&agent, &section],
+        ).await.map_err(|e| format!("PG next_rule_number: {}", e))?;
+        Ok(row.get(0))
+    }
+
+    /// Insert a new generation rule (PG version matching the SQLite insert_rule).
+    pub async fn insert_rule(
+        &self,
+        input: &crate::workflow_generation::rules::InsertRuleInput,
+    ) -> Result<crate::workflow_generation::rules::GenerationRule, String> {
+        self.upsert_rule(input).await
+    }
+
+    /// Check if a generation rule exists by ID.
+    pub async fn rule_exists(&self, id: &str) -> Result<bool, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_one(
+            "SELECT COUNT(*) > 0 FROM generation_rules WHERE id = $1",
+            &[&id],
+        ).await.map_err(|e| format!("PG rule_exists: {}", e))?;
+        Ok(row.get(0))
+    }
+
+    /// Get examples_json for a rule.
+    pub async fn get_rule_examples_json(&self, id: &str) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT examples_json FROM generation_rules WHERE id = $1",
+            &[&id],
+        ).await.map_err(|e| format!("PG get_rule_examples: {}", e))?;
+        Ok(row.and_then(|r| r.get(0)))
+    }
+
+    /// Update examples_json for a rule.
+    pub async fn update_rule_examples(&self, id: &str, examples_json: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE generation_rules SET examples_json = $1, updated_at = $2 WHERE id = $3",
+            &[&examples_json, &now, &id],
+        ).await.map_err(|e| format!("PG update_rule_examples: {}", e))?;
+        Ok(())
+    }
+
+    /// Find a rule by source_fix_id (used for rollback).
+    pub async fn find_rule_by_source_fix_id(&self, source_fix_id: &str) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT id FROM generation_rules WHERE source_fix_id = $1 LIMIT 1",
+            &[&source_fix_id],
+        ).await.map_err(|e| format!("PG find_rule_by_source_fix_id: {}", e))?;
+        Ok(row.map(|r| r.get(0)))
+    }
 }

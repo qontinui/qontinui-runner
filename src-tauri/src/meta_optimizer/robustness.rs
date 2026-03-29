@@ -3,11 +3,13 @@
 //! Generates adversarial/edge-case inputs for prompt variants and tests them
 //! before deployment. Integrates with the eval spec system from Phase 3.
 
-use rusqlite::params;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 use tracing::info;
 
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // =============================================================================
 // Types
@@ -116,6 +118,7 @@ pub struct RobustnessFailure {
 /// Combines synthetic adversarial inputs with golden regression cases from history.
 pub fn generate_test_cases(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: &str,
     categories: &[RobustnessCategory],
 ) -> Result<Vec<RobustnessTestCase>, String> {
@@ -136,7 +139,7 @@ pub fn generate_test_cases(
                 cases.extend(generate_adversarial_format_cases(agent_type));
             }
             RobustnessCategory::RegressionSuite => {
-                cases.extend(generate_regression_cases(db, agent_type)?);
+                cases.extend(generate_regression_cases(db, pg_db, agent_type)?);
             }
         }
     }
@@ -277,10 +280,21 @@ fn generate_adversarial_format_cases(agent_type: &str) -> Vec<RobustnessTestCase
 
 /// Generate regression test cases from golden datasets.
 fn generate_regression_cases(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Vec<RobustnessTestCase>, String> {
-    let datasets = super::golden_dataset::list_golden_datasets(db, Some(agent_type))?;
+    let tuples = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.query_golden_datasets_by_agent(agent_type))
+    })?;
+    let datasets: Vec<super::golden_dataset::GoldenDataset> = tuples
+        .into_iter()
+        .map(|(id, agent_type, name, entries_json, created_at, updated_at)| {
+            let entries: Vec<super::golden_dataset::GoldenEntry> =
+                serde_json::from_str(&entries_json).unwrap_or_default();
+            super::golden_dataset::GoldenDataset { id, agent_type, name, entries, created_at, updated_at }
+        })
+        .collect();
 
     let mut cases = Vec::new();
     for dataset in datasets {
@@ -374,7 +388,7 @@ pub fn evaluate_robustness(
 // =============================================================================
 
 /// Save a robustness report.
-pub fn save_robustness_report(db: &CheckpointDb, report: &RobustnessReport) -> Result<(), String> {
+pub fn save_robustness_report(db: &CheckpointDb, pg_db: &Arc<PgDb>, report: &RobustnessReport) -> Result<(), String> {
     let id = report.id.clone();
     let variant_id = report.prompt_variant_id.clone();
     let rec_id = report.recommendation_id.clone();
@@ -383,66 +397,35 @@ pub fn save_robustness_report(db: &CheckpointDb, report: &RobustnessReport) -> R
     let failed = report.failed as i64;
     let report_json =
         serde_json::to_string(report).map_err(|e| format!("Failed to serialize report: {}", e))?;
-    let created_at = report.created_at.clone();
 
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO robustness_reports
-               (id, prompt_variant_id, recommendation_id, total_tests, passed, failed, report_json, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-            params![id, variant_id, rec_id, total, passed, failed, report_json, created_at],
-        )
-        .map_err(|e| format!("Failed to save robustness report: {}", e))?;
-
-        info!(
-            "Saved robustness report {} ({}/{} passed)",
-            id, passed, total
-        );
-        Ok(())
-    })
+    let pg_result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.save_robustness_report(
+            &id,
+            variant_id.as_deref(),
+            rec_id.as_deref(),
+            total,
+            passed,
+            failed,
+            &report_json,
+        ))
+    });
+    pg_result?;
+    info!("Saved robustness report {} ({}/{} passed)", id, passed, total);
+    Ok(())
 }
 
 /// List robustness reports, optionally filtered.
 pub fn list_robustness_reports(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<RobustnessReport>, String> {
-    let variant = prompt_variant_id.map(|s| s.to_string());
-    let rec = recommendation_id.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let mut sql = String::from("SELECT report_json FROM robustness_reports WHERE 1=1");
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut idx = 1;
-
-        if let Some(ref v) = variant {
-            sql.push_str(&format!(" AND prompt_variant_id = ?{}", idx));
-            param_values.push(Box::new(v.clone()));
-            idx += 1;
-        }
-        if let Some(ref r) = rec {
-            sql.push_str(&format!(" AND recommendation_id = ?{}", idx));
-            param_values.push(Box::new(r.clone()));
-        }
-        sql.push_str(" ORDER BY created_at DESC LIMIT 50");
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows: Vec<RobustnessReport> = stmt
-            .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
-            })
-            .map_err(|e| format!("Failed to query reports: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect();
-
-        Ok(rows)
-    })
+    let jsons = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_robustness_reports(prompt_variant_id, recommendation_id))
+    })?;
+    let reports: Vec<RobustnessReport> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+    Ok(reports)
 }
 
 // =============================================================================
@@ -452,16 +435,17 @@ pub fn list_robustness_reports(
 /// Run a full robustness test suite for an agent and save the report.
 pub fn run_robustness_test(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: &str,
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<RobustnessReport, String> {
     let categories = RobustnessCategory::all();
-    let test_cases = generate_test_cases(db, agent_type, categories)?;
+    let test_cases = generate_test_cases(db, pg_db, agent_type, categories)?;
 
     let report = evaluate_robustness(&test_cases, prompt_variant_id, recommendation_id);
 
-    save_robustness_report(db, &report)?;
+    save_robustness_report(db, pg_db, &report)?;
 
     info!(
         "Robustness test for {}: {}/{} passed across {} categories",
@@ -477,32 +461,23 @@ pub fn run_robustness_test(
 // ── PG dual-write wrappers ─────────────────────────────────────────────
 
 /// Save a robustness report with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use save_robustness_report directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn save_robustness_report_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, report: &RobustnessReport) -> Result<(), String> {
-    save_robustness_report(db, report)?;
-    let pg = pg_db.clone();
-    let id = report.id.clone(); let vid = report.prompt_variant_id.clone(); let rid = report.recommendation_id.clone();
-    let total = report.total_tests as i64; let passed = report.passed as i64; let failed = report.failed as i64;
-    let rj = serde_json::to_string(report).unwrap_or_default();
-    tokio::spawn(async move { let _ = pg.save_robustness_report(&id, vid.as_deref(), rid.as_deref(), total, passed, failed, &rj).await; });
-    Ok(())
+    save_robustness_report(db, pg_db, report)
 }
 
 /// Run a full robustness test with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use run_robustness_test directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn run_robustness_test_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>) -> Result<RobustnessReport, String> {
-    let report = run_robustness_test(db, agent_type, prompt_variant_id, recommendation_id)?;
-    let pg = pg_db.clone();
-    let id = report.id.clone(); let vid = report.prompt_variant_id.clone(); let rid = report.recommendation_id.clone();
-    let total = report.total_tests as i64; let passed = report.passed as i64; let failed = report.failed as i64;
-    let rj = serde_json::to_string(&report).unwrap_or_default();
-    tokio::spawn(async move { let _ = pg.save_robustness_report(&id, vid.as_deref(), rid.as_deref(), total, passed, failed, &rj).await; });
-    Ok(report)
+    run_robustness_test(db, pg_db, agent_type, prompt_variant_id, recommendation_id)
 }
 
 // ── PG-primary read wrappers ─────────────────────────────────────────────
 
 /// List robustness reports with PG-primary read.
+#[deprecated(note = "Use list_robustness_reports directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_robustness_reports_with_pg(
     db: &CheckpointDb,
@@ -510,18 +485,7 @@ pub fn list_robustness_reports_with_pg(
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<RobustnessReport>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let v = prompt_variant_id.map(|s| s.to_string());
-        let r = recommendation_id.map(|s| s.to_string());
-        if let Ok(jsons) = handle.block_on(pg.list_robustness_reports(v.as_deref(), r.as_deref())) {
-            let reports: Vec<RobustnessReport> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
-            if !reports.is_empty() {
-                return Ok(reports);
-            }
-        }
-    }
-    list_robustness_reports(db, prompt_variant_id, recommendation_id)
+    list_robustness_reports(db, pg_db, prompt_variant_id, recommendation_id)
 }
 
 #[cfg(test)]

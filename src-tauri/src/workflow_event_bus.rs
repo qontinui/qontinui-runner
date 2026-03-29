@@ -406,6 +406,8 @@ pub mod events {
     pub const SKILL_UPDATED: &str = "skill.updated";
     /// A skill-informed iteration failed (triggers self-repair evaluation).
     pub const SKILL_FAILED: &str = "skill.failed";
+    /// The knowledge graph cache was invalidated (finding/fix/rule/observation mutation).
+    pub const GRAPH_CACHE_INVALIDATED: &str = "graph.cache_invalidated";
 }
 
 // =============================================================================

@@ -162,7 +162,7 @@ pub async fn get_prompt_variants_handler(
     Query(query): Query<PromptVariantQuery>,
 ) -> Result<Json<ApiResponse<Vec<PromptVariant>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let variants =
-        prompt_registry::list_variants(&state.app_state.checkpoint_db, query.agent_type.as_deref())
+        prompt_registry::list_variants(&state.app_state.checkpoint_db, &state.app_state.pg_db, query.agent_type.as_deref())
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -182,6 +182,7 @@ pub async fn get_recommendations_handler(
 ) -> Result<Json<ApiResponse<Vec<Recommendation>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let recs = recommendations::list_recommendations(
         &state.app_state.checkpoint_db,
+        &state.app_state.pg_db,
         query.optimizer_type.as_deref(),
         query.status.as_deref(),
     )
@@ -227,10 +228,27 @@ pub async fn get_optimizer_context_handler(
     let optimizer_type = query.optimizer_type.clone().unwrap_or_default();
     let is_pipeline = optimizer_type == "pipeline_prompt";
 
-    // NOTE: Complex multi-query context builder; stays on SQLite via spawn_blocking
-    let db = state.app_state.checkpoint_db.clone();
-    let context = tokio::task::spawn_blocking(move || {
-        db.with_conn(move |conn| {
+    let context = state.app_state.pg_db
+        .get_optimizer_context(is_pipeline)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to assemble optimizer context: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(OptimizerContext { context })))
+}
+
+// NOTE: The original ~450-line SQLite optimizer context builder was removed.
+// PgDb::get_optimizer_context provides equivalent functionality.
+
+/* BEGIN_REMOVED -- original SQLite optimizer context (~430 lines) removed during PG migration */
+/*
             let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
             let mut out = String::new();
 
@@ -660,28 +678,8 @@ pub async fn get_optimizer_context_handler(
                 let _ = writeln!(out, "No optimizer history data available yet. This is likely the first run.");
             }
 
-            Ok(out)
-        })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to assemble optimizer context: {}",
-                e
-            ))),
-        )
-    })?;
-
-    Ok(Json(ApiResponse::success(OptimizerContext { context })))
-}
+*/
+/* END_REMOVED */
 
 /// GET /meta-optimizer/cost-analysis
 ///
@@ -694,7 +692,7 @@ pub async fn get_cost_analysis_handler(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     let summary =
-        crate::meta_optimizer::cost_optimizer::build_cost_analysis(&state.app_state.checkpoint_db)
+        crate::meta_optimizer::cost_optimizer::build_cost_analysis(&state.app_state.checkpoint_db, &state.app_state.pg_db)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -830,88 +828,12 @@ pub async fn get_autoresearch_campaigns_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<AutoresearchQuery>,
 ) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50);
+    let limit = query.limit.unwrap_or(50) as i64;
 
-    // SQLite: complex function — nested queries (campaigns + experiments per campaign)
-    let db = state.app_state.checkpoint_db.clone();
-    let campaigns = tokio::task::spawn_blocking(move || {
-        db.with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    r#"SELECT id, name, config_json, current_control_json, status,
-                              experiment_count, accepted_count, created_at
-                       FROM autoresearch_campaigns
-                       ORDER BY created_at DESC
-                       LIMIT ?1"#,
-                )
-                .map_err(|e| format!("Failed to prepare autoresearch_campaigns query: {}", e))?;
-
-            let campaigns: Vec<serde_json::Value> = stmt
-                .query_map(params![limit as i64], |row| {
-                    Ok((
-                        row.get::<_, String>(0).unwrap_or_default(),
-                        row.get::<_, String>(1).unwrap_or_default(),
-                        row.get::<_, String>(2).unwrap_or_default(),
-                        row.get::<_, String>(3).unwrap_or_default(),
-                        row.get::<_, String>(4).unwrap_or_default(),
-                        row.get::<_, i64>(5).unwrap_or(0),
-                        row.get::<_, i64>(6).unwrap_or(0),
-                        row.get::<_, String>(7).unwrap_or_default(),
-                    ))
-                })
-                .map_err(|e| format!("Failed to query autoresearch_campaigns: {}", e))?
-                .filter_map(|r| r.ok())
-                .map(|(id, name, config_json, current_control_json, status, experiment_count, accepted_count, created_at)| {
-                    // Fetch experiments for this campaign
-                    let experiments: Vec<serde_json::Value> = conn
-                        .prepare(
-                            r#"SELECT id, experiment_number, config_json, aggregate_json,
-                                      accepted, reason, p_value, created_at
-                               FROM autoresearch_experiments
-                               WHERE campaign_id = ?1
-                               ORDER BY experiment_number DESC
-                               LIMIT 10"#,
-                        )
-                        .and_then(|mut exp_stmt| {
-                            let exps = exp_stmt
-                                .query_map(params![id], |row| {
-                                    Ok(serde_json::json!({
-                                        "id": row.get::<_, String>(0).unwrap_or_default(),
-                                        "experiment_number": row.get::<_, i64>(1).unwrap_or(0),
-                                        "config_json": row.get::<_, String>(2).unwrap_or_default(),
-                                        "aggregate_json": row.get::<_, String>(3).unwrap_or_default(),
-                                        "accepted": row.get::<_, i64>(4).unwrap_or(0) != 0,
-                                        "reason": row.get::<_, Option<String>>(5).unwrap_or(None),
-                                        "p_value": row.get::<_, Option<f64>>(6).unwrap_or(None),
-                                        "created_at": row.get::<_, String>(7).unwrap_or_default(),
-                                    }))
-                                })?
-                                .filter_map(|r| r.ok())
-                                .collect();
-                            Ok(exps)
-                        })
-                        .unwrap_or_default();
-
-                    serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "config_json": config_json,
-                        "current_control_json": current_control_json,
-                        "status": status,
-                        "experiment_count": experiment_count,
-                        "accepted_count": accepted_count,
-                        "created_at": created_at,
-                        "experiments": experiments,
-                    })
-                })
-                .collect();
-
-            Ok(campaigns)
-        })
-    })
-    .await
-    .unwrap_or(Ok(Vec::new()))
-    .unwrap_or_default();
+    let campaigns = state.app_state.pg_db
+        .get_autoresearch_campaigns_with_experiments(limit)
+        .await
+        .unwrap_or_default();
 
     Ok(Json(ApiResponse::success(campaigns)))
 }
@@ -983,7 +905,7 @@ pub async fn apply_recommendation_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    recommendations::apply_recommendation_with_side_effects(&state.app_state.checkpoint_db, &id)
+    recommendations::apply_recommendation_with_side_effects(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1000,7 +922,7 @@ pub async fn reject_recommendation_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    recommendations::reject_recommendation(&state.app_state.checkpoint_db, &id).map_err(|e| {
+    recommendations::reject_recommendation(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to reject recommendation: {}", e))),
@@ -1043,233 +965,45 @@ pub async fn get_iteration_history_handler(
         )
     };
 
+    let pg = &state.app_state.pg_db;
     match tier {
         ContextTier::L0 => {
-            // SQLite: complex function — rusqlite query_map + in-memory aggregation of iteration histories
-            let db = state.app_state.checkpoint_db.clone();
-            let sf = status_filter.clone();
-            let summaries = tokio::task::spawn_blocking(move || {
-                db.with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT status, iteration_history
-                           FROM task_runs
-                           WHERE iteration_history IS NOT NULL
-                             AND iteration_history != '[]'"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    if let Some(ref s) = sf {
-                        sql.push_str(" AND status = ?1");
-                        param_values.push(Box::new(s.clone()));
-                    }
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-
-                    let rows: Vec<(String, String)> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    // Group by status and compute aggregates
-                    let mut groups: std::collections::HashMap<String, Vec<Vec<serde_json::Value>>> =
-                        std::collections::HashMap::new();
-                    for (status, history_json) in &rows {
-                        if let Ok(entries) =
-                            serde_json::from_str::<Vec<serde_json::Value>>(history_json)
-                        {
-                            groups.entry(status.clone()).or_default().push(entries);
-                        }
-                    }
-
-                    let mut summaries = Vec::new();
-                    for (status, runs) in &groups {
-                        let run_count = runs.len() as i64;
-                        let mut total_iterations: usize = 0;
-                        let mut total_confidence_delta: f64 = 0.0;
-                        let mut approach_counts: std::collections::HashMap<String, usize> =
-                            std::collections::HashMap::new();
-
-                        for entries in runs {
-                            total_iterations += entries.len();
-                            for entry in entries {
-                                if let Some(delta) =
-                                    entry.get("confidence_delta").and_then(|d| d.as_f64())
-                                {
-                                    total_confidence_delta += delta;
-                                }
-                                if let Some(approach) =
-                                    entry.get("approach").and_then(|a| a.as_str())
-                                {
-                                    let key: String = approach.chars().take(50).collect();
-                                    *approach_counts.entry(key).or_default() += 1;
-                                }
-                            }
-                        }
-
-                        let mut top_approaches: Vec<(String, usize)> =
-                            approach_counts.into_iter().collect();
-                        top_approaches.sort_by(|a, b| b.1.cmp(&a.1));
-                        let top_5: Vec<String> = top_approaches
-                            .into_iter()
-                            .take(5)
-                            .map(|(approach, count)| format!("{} (x{})", approach, count))
-                            .collect();
-
-                        summaries.push(crate::meta_optimizer::types::IterationHistorySummaryL0 {
-                            status: status.clone(),
-                            run_count,
-                            avg_iterations: total_iterations as f64 / run_count as f64,
-                            avg_final_confidence_delta: total_confidence_delta / run_count as f64,
-                            most_common_approaches: top_5,
-                        });
-                    }
-
-                    Ok(summaries)
-                })
-            })
-            .await
-            .map_err(|e| make_err(format!("Task join error: {}", e)))?
-            .map_err(make_err)?;
-
+            let summaries = pg
+                .get_iteration_history_l0(limit, status_filter.as_deref())
+                .await
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(summaries).unwrap_or_default(),
             )))
         }
         ContextTier::L1 => {
-            // SQLite: complex function — per-run iteration details with approach extraction
-            let db = state.app_state.checkpoint_db.clone();
-            let sf = status_filter.clone();
-            let details = tokio::task::spawn_blocking(move || {
-                db.with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, task_name, status, iteration_history, created_at
-                           FROM task_runs
-                           WHERE iteration_history IS NOT NULL
-                             AND iteration_history != '[]'"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    if let Some(ref s) = sf {
-                        sql.push_str(" AND status = ?1");
-                        param_values.push(Box::new(s.clone()));
-                    }
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-
-                    let rows: Vec<crate::meta_optimizer::types::IterationHistoryDetailL1> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            let id: String = row.get(0)?;
-                            let task_name: String = row.get(1)?;
-                            let status: String = row.get(2)?;
-                            let history_json: String = row.get(3)?;
-                            let created_at: String = row.get(4)?;
-
-                            let entries: Vec<serde_json::Value> =
-                                serde_json::from_str(&history_json).unwrap_or_default();
-
-                            let iteration_count = entries.len();
-                            let total_confidence_delta: f64 = entries
-                                .iter()
-                                .filter_map(|e| e.get("confidence_delta").and_then(|d| d.as_f64()))
-                                .sum();
-                            let approaches: Vec<String> = entries
-                                .iter()
-                                .filter_map(|e| {
-                                    e.get("approach").and_then(|a| a.as_str()).map(String::from)
-                                })
-                                .collect();
-
-                            Ok(crate::meta_optimizer::types::IterationHistoryDetailL1 {
-                                task_run_id: id,
-                                task_name,
-                                status,
-                                iteration_count,
-                                total_confidence_delta,
-                                approaches,
-                                created_at,
-                            })
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    Ok(rows)
-                })
-            })
-            .await
-            .map_err(|e| make_err(format!("Task join error: {}", e)))?
-            .map_err(make_err)?;
-
+            let details = pg
+                .get_iteration_history_l1(limit, status_filter.as_deref())
+                .await
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(details).unwrap_or_default(),
             )))
         }
         ContextTier::L2 => {
-            // SQLite: complex function — full raw iteration_history JSON per run
-            let db = state.app_state.checkpoint_db.clone();
-            let sf = status_filter.clone();
-            let full = tokio::task::spawn_blocking(move || {
-                db.with_conn(move |conn| {
-                    let mut sql = String::from(
-                        r#"SELECT id, task_name, status, iteration_history, created_at
-                           FROM task_runs
-                           WHERE iteration_history IS NOT NULL
-                             AND iteration_history != '[]'"#,
-                    );
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    if let Some(ref s) = sf {
-                        sql.push_str(" AND status = ?1");
-                        param_values.push(Box::new(s.clone()));
-                    }
-                    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
-
-                    let mut stmt = conn
-                        .prepare(&sql)
-                        .map_err(|e| format!("Query error: {}", e))?;
-
-                    let rows: Vec<serde_json::Value> = stmt
-                        .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                            let id: String = row.get(0)?;
-                            let task_name: String = row.get(1)?;
-                            let status: String = row.get(2)?;
-                            let history_json: String = row.get(3)?;
-                            let created_at: String = row.get(4)?;
-
-                            let entries: serde_json::Value =
-                                serde_json::from_str(&history_json).unwrap_or_default();
-
-                            Ok(serde_json::json!({
-                                "task_run_id": id,
-                                "task_name": task_name,
-                                "status": status,
-                                "iteration_history": entries,
-                                "created_at": created_at,
-                            }))
-                        })
-                        .map_err(|e| format!("Query error: {}", e))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    Ok(rows)
-                })
-            })
-            .await
-            .map_err(|e| make_err(format!("Task join error: {}", e)))?
-            .map_err(make_err)?;
-
+            let full = pg
+                .get_iteration_history_l2(limit, status_filter.as_deref())
+                .await
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(full).unwrap_or_default(),
             )))
         }
     }
 }
+
+// NOTE: ~200 lines of SQLite iteration history code removed during PG migration.
+// PgDb::get_iteration_history_l0/l1/l2 provides equivalent functionality.
+
+// Removed SQLite iteration history code — now served from PG.
+// The original dead code block has been deleted.
+// (Removed dead SQLite iteration_history code block)
+
 
 // ---------------------------------------------------------------------------
 // Eval spec handlers
@@ -1299,6 +1033,7 @@ async fn get_eval_specs_handler(
 
     let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
         &state.app_state.checkpoint_db,
+        &state.app_state.pg_db,
         q.target_agent.as_deref(),
     )
     .map_err(make_err)?;
@@ -1319,7 +1054,7 @@ async fn create_eval_spec_handler(
         )
     };
 
-    crate::meta_optimizer::eval_spec::save_eval_spec(&state.app_state.checkpoint_db, &spec)
+    crate::meta_optimizer::eval_spec::save_eval_spec(&state.app_state.checkpoint_db, &state.app_state.pg_db, &spec)
         .map_err(make_err)?;
 
     Ok(Json(ApiResponse::success(serde_json::json!({
@@ -1341,6 +1076,7 @@ async fn get_eval_results_handler(
 
     let results = crate::meta_optimizer::eval_spec::list_eval_results(
         &state.app_state.checkpoint_db,
+        &state.app_state.pg_db,
         q.spec_id.as_deref(),
         q.recommendation_id.as_deref(),
     )
@@ -1367,6 +1103,7 @@ async fn evaluate_recommendation_handler(
 
     let result = crate::meta_optimizer::eval_runner::validate_recommendation(
         &state.app_state.checkpoint_db,
+        &state.app_state.pg_db,
         &id,
     )
     .map_err(make_err)?;
@@ -1414,6 +1151,7 @@ async fn evaluate_with_io_handler(
             // Look up by ID
             let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
                 &state.app_state.checkpoint_db,
+                &state.app_state.pg_db,
                 None,
             )
             .map_err(make_err)?;
@@ -1509,7 +1247,7 @@ pub async fn get_canaries_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let canaries =
-        crate::meta_optimizer::canary::get_active_canaries(&state.app_state.checkpoint_db)
+        crate::meta_optimizer::canary::get_active_canaries(&state.app_state.checkpoint_db, &state.app_state.pg_db)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1564,7 +1302,7 @@ pub async fn get_canary_history_handler(
         .unwrap_or(20u32);
 
     let history =
-        crate::meta_optimizer::canary::get_canary_history(&state.app_state.checkpoint_db, limit)
+        crate::meta_optimizer::canary::get_canary_history(&state.app_state.checkpoint_db, &state.app_state.pg_db, limit)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1582,7 +1320,7 @@ pub async fn promote_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::meta_optimizer::canary::promote_canary(&state.app_state.checkpoint_db, &id).map_err(
+    crate::meta_optimizer::canary::promote_canary(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id).map_err(
         |e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1598,7 +1336,7 @@ pub async fn rollback_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::meta_optimizer::canary::rollback_canary(&state.app_state.checkpoint_db, &id).map_err(
+    crate::meta_optimizer::canary::rollback_canary(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id).map_err(
         |e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1614,7 +1352,7 @@ pub async fn evaluate_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let eval = crate::meta_optimizer::canary::evaluate_canary(&state.app_state.checkpoint_db, &id)
+    let eval = crate::meta_optimizer::canary::evaluate_canary(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1648,13 +1386,14 @@ async fn get_prompt_optimization_status_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let db = &state.app_state.checkpoint_db;
+    let pg_db = &state.app_state.pg_db;
 
     let samples =
         crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db(&samples, db);
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, db, pg_db);
     let evolution =
-        crate::meta_optimizer::prompt_evolution::get_evolution_history(db, None, 50)
+        crate::meta_optimizer::prompt_evolution::get_evolution_history(db, pg_db, None, 50)
             .unwrap_or_default();
 
     let active_canaries: Vec<_> = evolution
@@ -1679,11 +1418,12 @@ async fn get_prompt_group_metrics_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let db = &state.app_state.checkpoint_db;
+    let pg_db = &state.app_state.pg_db;
 
     let samples =
         crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db(&samples, db);
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, db, pg_db);
 
     Ok(Json(ApiResponse {
         success: true,
@@ -1698,6 +1438,7 @@ async fn get_prompt_optimization_evidence_handler(
     Query(query): Query<PromptEvidenceQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let db = &state.app_state.checkpoint_db;
+    let pg_db = &state.app_state.pg_db;
     let phase = query.phase.as_deref().unwrap_or("generation");
     let max_failures = query.max_failures.unwrap_or(5);
     let max_successes = query.max_successes.unwrap_or(2);
@@ -1728,10 +1469,12 @@ async fn get_prompt_evolution_handler(
     Query(query): Query<PromptEvolutionQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let db = &state.app_state.checkpoint_db;
+    let pg_db = &state.app_state.pg_db;
     let limit = query.limit.unwrap_or(50) as usize;
 
     let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(
         db,
+        pg_db,
         query.agent_type.as_deref(),
         limit,
     )

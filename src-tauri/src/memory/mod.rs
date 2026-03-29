@@ -13,4 +13,5 @@
 pub mod consolidation;
 pub mod decay;
 pub mod importance;
+pub mod scheduler;
 pub mod unified_query;

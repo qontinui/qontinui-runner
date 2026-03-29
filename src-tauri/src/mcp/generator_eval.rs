@@ -412,8 +412,8 @@ async fn run_benchmark_handler(
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.app_state.checkpoint_db.clone();
+    let pg_db = state.app_state.pg_db.clone();
     let doctor_handle = state.doctor_handle.clone();
-    let db2 = state.app_state.checkpoint_db.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         // Load benchmark
@@ -430,20 +430,13 @@ async fn run_benchmark_handler(
         };
 
         let start = std::time::Instant::now();
-        let (gen_response, artifact) = db2.with_conn(|conn| {
-            Ok(crate::workflow_generation::generate_workflow(
-                request,
-                doctor_handle.as_ref(),
-                Some(conn),
-                None,
-            ))
-        })?;
+        let (gen_response, artifact) = crate::workflow_generation::generate_workflow(
+            request,
+            doctor_handle.as_ref(),
+            None,
+            None,
+        );
         let duration_ms = start.elapsed().as_millis() as u64;
-
-        // Save the pipeline artifact
-        if let Err(e) = db.save_pipeline_artifact(&artifact) {
-            warn!("Failed to save benchmark pipeline artifact: {}", e);
-        }
 
         // Score the result
         let (score, passed) = if let Some(ref workflow) = gen_response.workflow {
@@ -485,7 +478,7 @@ async fn run_benchmark_handler(
 
         db.save_benchmark_result(&result)?;
 
-        Ok::<_, String>(result)
+        Ok::<_, String>((result, artifact))
     })
     .await
     .map_err(|e| {
@@ -495,6 +488,13 @@ async fn run_benchmark_handler(
         )
     })?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+
+    let (result, artifact) = result;
+
+    // Save pipeline artifact to PG (async, non-blocking)
+    if let Err(e) = pg_db.save_generation_artifact(&artifact).await {
+        warn!("Failed to save benchmark pipeline artifact to PG: {}", e);
+    }
 
     Ok(Json(ApiResponse::success(
         serde_json::to_value(result).unwrap_or_default(),

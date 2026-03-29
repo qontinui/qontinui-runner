@@ -29,6 +29,7 @@ use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
 use crate::workflow_generation::prompt_analysis;
+use crate::workflow_generation::evaluation;
 use crate::workflow_generation::revision;
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
@@ -39,6 +40,10 @@ use crate::workflow_generation::self_improve;
 use crate::workflow_generation::spec_synthesis;
 use crate::workflow_generation::specification;
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow};
+use super::complexity::assess_complexity;
+use super::domain_routing::VerificationDomain;
+use super::explorer::{explore_candidates, ExplorationConfig, ExplorationResult};
+use super::template_library;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -47,6 +52,26 @@ use tracing::{debug, error, info, warn};
 // ============================================================================
 // Public types
 // ============================================================================
+
+/// Settings for the exploration-based generation pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorationSettings {
+    /// Enable candidate exploration (default: true for complex, false for simple)
+    #[serde(default)]
+    pub exploration_enabled: Option<bool>,
+    /// Max candidates to explore per domain (default: 5)
+    #[serde(default)]
+    pub max_candidates: Option<usize>,
+    /// Target quality score to stop early (default: 0.85)
+    #[serde(default)]
+    pub target_score: Option<f64>,
+    /// Enable domain decomposition for complex workflows (default: true)
+    #[serde(default)]
+    pub decomposition_enabled: Option<bool>,
+    /// Enable template injection (default: true)
+    #[serde(default)]
+    pub template_injection_enabled: Option<bool>,
+}
 
 /// Request to generate a workflow from natural language
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +174,10 @@ pub struct GenerateWorkflowRequest {
     #[serde(default)]
     pub tool_tags: Option<Vec<String>>,
 
+    /// Exploration settings for candidate search (default: auto based on complexity)
+    #[serde(default)]
+    pub exploration_settings: Option<ExplorationSettings>,
+
     /// Target runner port for workflows that manage a different instance.
     /// Used by the orchestration loop to target a specific runner for execution.
     #[serde(default)]
@@ -187,6 +216,7 @@ impl Default for GenerateWorkflowRequest {
             discover_ui_bridge_specs: None,
             simple_mode: None,
             tool_tags: None,
+            exploration_settings: None,
             target_runner_port: None,
         }
     }
@@ -204,6 +234,124 @@ pub struct VerificationIteration {
     /// Error message if the fixer agent failed (e.g., produced invalid JSON)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_error: Option<String>,
+}
+
+/// Exploration statistics for the response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorationStats {
+    pub total_candidates_explored: usize,
+    pub search_depth_reached: usize,
+    pub search_duration_ms: u64,
+    pub score_progression: Vec<(usize, f64)>,
+    pub strategy_used: String,
+}
+
+/// Merge the best steps from two candidates when runner-up has stronger individual steps.
+///
+/// For each step in `best_steps`, checks if `runner_up_steps` has a step with the same
+/// name that has more fields filled in (check_type, expected, command all present).
+/// If the runner-up's step is more complete, it is substituted.
+/// This is a conservative merge — never adds new steps, only substitutes.
+pub fn merge_candidates(
+    best_steps: &[serde_json::Value],
+    runner_up_steps: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    // Build a name → step index for runner-up steps
+    let runner_up_by_name: std::collections::HashMap<String, &serde_json::Value> = runner_up_steps
+        .iter()
+        .filter_map(|s| {
+            s.get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| (name.to_lowercase(), s))
+        })
+        .collect();
+
+    best_steps
+        .iter()
+        .map(|best_step| {
+            let best_name = best_step
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            if best_name.is_empty() {
+                return best_step.clone();
+            }
+
+            if let Some(runner_step) = runner_up_by_name.get(&best_name) {
+                let best_completeness = step_completeness(best_step);
+                let runner_completeness = step_completeness(runner_step);
+                if runner_completeness > best_completeness {
+                    (*runner_step).clone()
+                } else {
+                    best_step.clone()
+                }
+            } else {
+                best_step.clone()
+            }
+        })
+        .collect()
+}
+
+/// Count how many key fields are present and non-empty on a step.
+fn step_completeness(step: &serde_json::Value) -> u32 {
+    let mut score = 0u32;
+    for field in &["command", "check_type", "expected", "url", "name", "description", "criterion_id"] {
+        if let Some(v) = step.get(*field) {
+            match v {
+                serde_json::Value::String(s) if !s.is_empty() => score += 1,
+                serde_json::Value::Null => {}
+                _ => score += 1,
+            }
+        }
+    }
+    score
+}
+
+/// State for the fixer loop with backtracking support.
+pub struct FixerLoopState {
+    pub exploration_result: Option<ExplorationResult>,
+    pub current_candidate_index: usize,
+    pub fix_iterations_on_current: u32,
+    pub max_fix_iterations_per_candidate: u32,
+    pub backtracked: bool,
+}
+
+impl FixerLoopState {
+    pub fn new(exploration_result: Option<ExplorationResult>, max_fix_iters: u32) -> Self {
+        Self {
+            exploration_result,
+            current_candidate_index: 0,
+            fix_iterations_on_current: 0,
+            max_fix_iterations_per_candidate: max_fix_iters.max(1),
+            backtracked: false,
+        }
+    }
+
+    /// Check if we should backtrack to runner-up candidate.
+    pub fn should_backtrack(&self) -> bool {
+        self.fix_iterations_on_current >= self.max_fix_iterations_per_candidate
+            && self.current_candidate_index == 0
+            && self
+                .exploration_result
+                .as_ref()
+                .map(|r| r.runner_up.is_some())
+                .unwrap_or(false)
+    }
+
+    /// Get the runner-up candidate's steps.
+    pub fn backtrack(&mut self) -> Option<Vec<serde_json::Value>> {
+        if let Some(ref result) = self.exploration_result {
+            if let Some(ref runner_up) = result.runner_up {
+                self.current_candidate_index = 1;
+                self.fix_iterations_on_current = 0;
+                self.backtracked = true;
+                return Some(runner_up.steps.clone());
+            }
+        }
+        None
+    }
 }
 
 /// Response from workflow generation
@@ -237,6 +385,12 @@ pub struct GenerateWorkflowResponse {
     /// Confidence score (0.0–1.0) reflecting overall generation quality
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence_score: Option<f32>,
+    /// Step quality evaluation from the evaluation engine
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_evaluation: Option<evaluation::WorkflowEvaluation>,
+    /// Exploration statistics (when exploration was used)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exploration_stats: Option<ExplorationStats>,
 }
 
 // ============================================================================
@@ -905,6 +1059,226 @@ pub fn generate_workflow(
         .map(|c| super::instrumentation::build_graph_context(c, None))
         .unwrap_or_default();
 
+    // ── Exploration-Based Generation (when criteria available) ────────────
+    let mut exploration_stats: Option<ExplorationStats> = None;
+    let exploration_result: Option<ExplorationResult> = if !effective_simple
+        && acceptance_criteria.is_some()
+        && request.exploration_settings.as_ref().and_then(|s| s.exploration_enabled) != Some(false)
+    {
+        let criteria = acceptance_criteria.as_ref().unwrap();
+        let assessment = assess_complexity(&criteria.criteria);
+
+        // Re-classify any General-bucket criteria using LLM fallback
+        let assessment = if assessment.domains.contains(&VerificationDomain::General) && !effective_simple {
+            use super::domain_routing::classify_criteria_domains_with_llm_fallback;
+            let reclassified = classify_criteria_domains_with_llm_fallback(
+                &criteria.criteria,
+                doctor_handle,
+                generation_model,
+                generation_provider,
+            );
+            // Rebuild assessment with reclassified domains
+            let new_domains: Vec<VerificationDomain> = reclassified.keys().copied().collect();
+            let domain_count = new_domains.len();
+            super::complexity::ComplexityAssessment {
+                domains: new_domains,
+                domain_count,
+                ..assessment
+            }
+        } else {
+            assessment
+        };
+
+        info!(
+            "Exploration complexity: {:?} ({} criteria, {} domains)",
+            assessment.level, assessment.criteria_count, assessment.domain_count
+        );
+
+        // Only run exploration for Moderate/Complex workflows
+        if matches!(
+            assessment.level,
+            super::complexity::ComplexityLevel::Moderate | super::complexity::ComplexityLevel::Complex
+        ) {
+            let context = super::domain_generators::DomainContext {
+                discovery_context: discovery_context.clone(),
+                resolved_contexts: resolved_contexts.clone(),
+                user_description: effective_request.description.clone(),
+            };
+
+            match &assessment.recommendation {
+                super::complexity::GenerationStrategy::SinglePass => {
+                    // Single exploration call (existing path)
+                    let domain = if assessment.domains.len() == 1 {
+                        assessment.domains[0]
+                    } else {
+                        VerificationDomain::General
+                    };
+
+                    let templates = template_library::find_matching_templates_for_criteria(
+                        &criteria.criteria,
+                        &domain,
+                        conn,
+                    );
+                    let template_refs: Vec<super::template_library::StepTemplate> =
+                        templates.iter().map(|(t, _)| t.clone()).collect();
+
+                    let mut config = ExplorationConfig::for_domain(domain);
+                    // Apply user overrides from exploration_settings
+                    if let Some(ref settings) = request.exploration_settings {
+                        if let Some(max) = settings.max_candidates {
+                            config.max_candidates = max;
+                        }
+                        if let Some(target) = settings.target_score {
+                            config.target_score = target;
+                        }
+                        if settings.exploration_enabled == Some(false) {
+                            config.enabled = false;
+                        }
+                    }
+                    let result = explore_candidates(
+                        &criteria.criteria,
+                        domain,
+                        &context,
+                        &template_refs,
+                        &config,
+                        doctor_handle,
+                        generation_model,
+                        generation_provider,
+                    );
+
+                    info!(
+                        "Exploration complete: {} candidates, best score={:.3}, depth={}",
+                        result.total_candidates_explored,
+                        result.best_candidate.score.unwrap_or(0.0),
+                        result.search_depth_reached,
+                    );
+
+                    exploration_stats = Some(ExplorationStats {
+                        total_candidates_explored: result.total_candidates_explored,
+                        search_depth_reached: result.search_depth_reached,
+                        search_duration_ms: result.search_duration_ms,
+                        score_progression: result.score_progression.clone(),
+                        strategy_used: format!("{:?}", result.best_candidate.strategy),
+                    });
+
+                    Some(result)
+                }
+                super::complexity::GenerationStrategy::Decomposed { phases } => {
+                    // Per-domain exploration: run each phase independently, merge results
+                    let mut all_steps: Vec<serde_json::Value> = Vec::new();
+                    let mut best_exploration: Option<ExplorationResult> = None;
+
+                    for phase in phases {
+                        // Get criteria for this phase
+                        let phase_criteria: Vec<&super::specification::AcceptanceCriterion> = criteria.criteria.iter()
+                            .filter(|c| phase.criteria_ids.contains(&c.id))
+                            .collect();
+
+                        if phase_criteria.is_empty() {
+                            continue;
+                        }
+
+                        let phase_criteria_owned: Vec<super::specification::AcceptanceCriterion> =
+                            phase_criteria.iter().map(|c| (*c).clone()).collect();
+
+                        let domain_templates = template_library::find_matching_templates_for_criteria(
+                            &phase_criteria_owned,
+                            &phase.domain,
+                            conn,
+                        );
+                        let template_refs: Vec<super::template_library::StepTemplate> =
+                            domain_templates.iter().map(|(t, _)| t.clone()).collect();
+
+                        let mut phase_config = ExplorationConfig::for_domain(phase.domain);
+                        // Apply user overrides from exploration_settings
+                        if let Some(ref settings) = request.exploration_settings {
+                            if let Some(max) = settings.max_candidates {
+                                phase_config.max_candidates = max;
+                            }
+                            if let Some(target) = settings.target_score {
+                                phase_config.target_score = target;
+                            }
+                            if settings.exploration_enabled == Some(false) {
+                                phase_config.enabled = false;
+                            }
+                        }
+                        let phase_result = explore_candidates(
+                            &phase_criteria_owned,
+                            phase.domain,
+                            &context,
+                            &template_refs,
+                            &phase_config,
+                            doctor_handle,
+                            generation_model,
+                            generation_provider,
+                        );
+
+                        info!(
+                            "Phase {:?}: {} candidates, best score={:.3}",
+                            phase.domain,
+                            phase_result.total_candidates_explored,
+                            phase_result.best_candidate.score.unwrap_or(0.0),
+                        );
+
+                        all_steps.extend(phase_result.best_candidate.steps.clone());
+
+                        // Keep the exploration result with the best score for backtracking
+                        if best_exploration.as_ref().map(|e| e.best_candidate.score.unwrap_or(0.0)).unwrap_or(0.0)
+                            < phase_result.best_candidate.score.unwrap_or(0.0)
+                        {
+                            best_exploration = Some(phase_result);
+                        }
+                    }
+
+                    if !all_steps.is_empty() {
+                        // Build combined exploration result
+                        let combined = ExplorationResult {
+                            best_candidate: super::explorer::SearchNode {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                steps: all_steps,
+                                score: best_exploration.as_ref().and_then(|e| e.best_candidate.score),
+                                parent_id: None,
+                                children: vec![],
+                                visits: 1,
+                                strategy: super::explorer::GenerationVariant::Standard,
+                                depth: 0,
+                            },
+                            runner_up: best_exploration.as_ref().and_then(|e| e.runner_up.clone()),
+                            total_candidates_explored: best_exploration.as_ref().map(|e| e.total_candidates_explored).unwrap_or(0),
+                            search_depth_reached: best_exploration.as_ref().map(|e| e.search_depth_reached).unwrap_or(0),
+                            search_duration_ms: best_exploration.as_ref().map(|e| e.search_duration_ms).unwrap_or(0),
+                            score_progression: best_exploration.as_ref().map(|e| e.score_progression.clone()).unwrap_or_default(),
+                        };
+
+                        exploration_stats = Some(ExplorationStats {
+                            total_candidates_explored: combined.total_candidates_explored,
+                            search_depth_reached: combined.search_depth_reached,
+                            search_duration_ms: combined.search_duration_ms,
+                            score_progression: combined.score_progression.clone(),
+                            strategy_used: "decomposed".to_string(),
+                        });
+
+                        Some(combined)
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            debug!("Skipping exploration: simple complexity level");
+            None
+        }
+    } else {
+        None
+    };
+
+    // Seed template database (idempotent)
+    if let Some(c) = conn {
+        if let Err(e) = template_library::seed_database(c) {
+            debug!("Template seeding skipped: {}", e);
+        }
+    }
+
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
     let builder_start = Instant::now();
     let mut builder_insights_parts: Vec<String> = Vec::new();
@@ -913,6 +1287,18 @@ pub fn generate_workflow(
         .map(self_improve::format_builder_insights)
     {
         builder_insights_parts.push(insights);
+    }
+    // Inject adaptive learning context (playbook lessons + few-shot examples)
+    if let Some(c) = conn {
+        let learning_ctx = super::learning_orchestrator::build_learning_context(
+            None, // domain not yet known at builder stage
+            10,   // max lessons
+            3,    // max few-shot examples
+            c,
+        );
+        if !learning_ctx.is_empty() {
+            builder_insights_parts.push(learning_ctx);
+        }
     }
     if let Some(ref patterns) = pattern_context {
         builder_insights_parts.push(patterns.clone());
@@ -928,21 +1314,132 @@ pub fn generate_workflow(
     } else {
         Some(builder_insights_parts.join("\n\n"))
     };
-    let mut workflow = match run_builder_agent(
-        &effective_request,
-        &discovery_context,
-        acceptance_criteria.as_ref(),
-        doctor_handle,
-        conn,
-        query_embedding,
-        generation_model,
-        generation_provider,
-        builder_insights_section.as_deref(),
-    ) {
-        Ok((w, prompt)) => {
-            artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
-            artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
-            artifact_builder.builder_prompt = Some(prompt);
+    // If exploration produced a good candidate, inject its steps into a workflow.
+    // Otherwise, fall back to the standard builder agent.
+    let mut workflow = if let Some(ref expl_result) = exploration_result {
+        if expl_result.best_candidate.score.unwrap_or(0.0) >= 0.5 {
+            info!(
+                "Using exploration best candidate (score={:.3})",
+                expl_result.best_candidate.score.unwrap_or(0.0)
+            );
+            // Attempt to merge best + runner-up steps for higher quality
+            let merged_steps = if let Some(ref runner_up) = expl_result.runner_up {
+                merge_candidates(&expl_result.best_candidate.steps, &runner_up.steps)
+            } else {
+                expl_result.best_candidate.steps.clone()
+            };
+            match build_workflow_from_explored_steps(&effective_request, &merged_steps) {
+                Some(w) => {
+                    artifact_builder.builder_duration_ms =
+                        Some(builder_start.elapsed().as_millis() as u64);
+                    artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
+                    if let Some(c) = conn {
+                        super::instrumentation::emit_pipeline_event(
+                            c, "", None, "phase_end", "builder",
+                            None, None,
+                            Some(builder_start.elapsed().as_millis() as u64),
+                            None, None, None,
+                        );
+                    }
+                    w
+                }
+                None => {
+                    info!("Failed to build workflow from explored steps, falling back to builder agent");
+                    match run_builder_agent(
+                        &effective_request,
+                        &discovery_context,
+                        acceptance_criteria.as_ref(),
+                        doctor_handle,
+                        conn,
+                        query_embedding,
+                        generation_model,
+                        generation_provider,
+                        builder_insights_section.as_deref(),
+                    ) {
+                        Ok((w, prompt)) => {
+                            artifact_builder.builder_duration_ms =
+                                Some(builder_start.elapsed().as_millis() as u64);
+                            artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
+                            artifact_builder.builder_prompt = Some(prompt);
+                            if let Some(c) = conn {
+                                super::instrumentation::emit_pipeline_event(
+                                    c, "", None, "phase_end", "builder",
+                                    None, None,
+                                    Some(builder_start.elapsed().as_millis() as u64),
+                                    None, None, None,
+                                );
+                            }
+                            w
+                        }
+                        Err(resp) => {
+                            artifact_builder.builder_duration_ms =
+                                Some(builder_start.elapsed().as_millis() as u64);
+                            artifact_builder.success = false;
+                            artifact_builder.error_message = resp.error.clone();
+                            let artifact =
+                                artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+                            return (*resp, artifact);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Score too low, use standard builder
+            match run_builder_agent(
+                &effective_request,
+                &discovery_context,
+                acceptance_criteria.as_ref(),
+                doctor_handle,
+                conn,
+                query_embedding,
+                generation_model,
+                generation_provider,
+                builder_insights_section.as_deref(),
+            ) {
+                Ok((w, prompt)) => {
+                    artifact_builder.builder_duration_ms =
+                        Some(builder_start.elapsed().as_millis() as u64);
+                    artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
+                    artifact_builder.builder_prompt = Some(prompt);
+                    if let Some(c) = conn {
+                        super::instrumentation::emit_pipeline_event(
+                            c, "", None, "phase_end", "builder",
+                            None, None,
+                            Some(builder_start.elapsed().as_millis() as u64),
+                            None, None, None,
+                        );
+                    }
+                    w
+                }
+                Err(resp) => {
+                    artifact_builder.builder_duration_ms =
+                        Some(builder_start.elapsed().as_millis() as u64);
+                    artifact_builder.success = false;
+                    artifact_builder.error_message = resp.error.clone();
+                    let artifact =
+                        artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+                    return (*resp, artifact);
+                }
+            }
+        }
+    } else {
+        // No exploration, standard path
+        match run_builder_agent(
+            &effective_request,
+            &discovery_context,
+            acceptance_criteria.as_ref(),
+            doctor_handle,
+            conn,
+            query_embedding,
+            generation_model,
+            generation_provider,
+            builder_insights_section.as_deref(),
+        ) {
+            Ok((w, prompt)) => {
+                artifact_builder.builder_duration_ms =
+                    Some(builder_start.elapsed().as_millis() as u64);
+                artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
+                artifact_builder.builder_prompt = Some(prompt);
                 if let Some(c) = conn {
                     super::instrumentation::emit_pipeline_event(
                         c, "", None, "phase_end", "builder",
@@ -951,14 +1448,17 @@ pub fn generate_workflow(
                         None, None, None,
                     );
                 }
-            w
-        }
-        Err(resp) => {
-            artifact_builder.builder_duration_ms = Some(builder_start.elapsed().as_millis() as u64);
-            artifact_builder.success = false;
-            artifact_builder.error_message = resp.error.clone();
-            let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
-            return (*resp, artifact);
+                w
+            }
+            Err(resp) => {
+                artifact_builder.builder_duration_ms =
+                    Some(builder_start.elapsed().as_millis() as u64);
+                artifact_builder.success = false;
+                artifact_builder.error_message = resp.error.clone();
+                let artifact =
+                    artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+                return (*resp, artifact);
+            }
         }
     };
 
@@ -1011,6 +1511,7 @@ pub fn generate_workflow(
     // ── Step 2–3: Verification ↔ Fixer loop ────────────────────────────────
     let verification_start = Instant::now();
     let mut iterations: Vec<VerificationIteration> = Vec::new();
+    let mut fixer_state = FixerLoopState::new(exploration_result, max_fix_iters);
 
     if max_fix_iters > 0 {
         let mut previous_issue_count: Option<usize> = None;
@@ -1054,6 +1555,9 @@ pub fn generate_workflow(
                 break;
             }
 
+            // Track fix iterations for backtracking decisions
+            fixer_state.fix_iterations_on_current += 1;
+
             // Convergence detection: compare to previous iteration
             if let Some(prev) = previous_issue_count {
                 if issue_count >= prev {
@@ -1065,6 +1569,28 @@ pub fn generate_workflow(
                         "Fix loop not converging: {} -> {} issues",
                         prev, issue_count
                     );
+
+                    // Check if we should backtrack to runner-up candidate
+                    if fixer_state.should_backtrack() {
+                        if let Some(runner_up_steps) = fixer_state.backtrack() {
+                            info!("Backtracking to exploration runner-up candidate");
+                            if let Some(backtrack_wf) =
+                                build_workflow_from_explored_steps(&effective_request, &runner_up_steps)
+                            {
+                                workflow = backtrack_wf;
+                                fix_workflow(&mut workflow);
+                                previous_issue_count = None; // Reset convergence detection
+                                iterations.push(VerificationIteration {
+                                    iteration: iter_num,
+                                    issues,
+                                    fix_applied: true,
+                                    fix_error: None,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
                     iterations.push(VerificationIteration {
                         iteration: iter_num,
                         issues,
@@ -1407,6 +1933,8 @@ pub fn generate_workflow(
             acceptance_criteria,
             quality_report: Some(quality_report),
             confidence_score: Some(confidence_score),
+            workflow_evaluation: None,
+            exploration_stats: exploration_stats.clone(),
         };
         return (response, artifact);
     } else if confidence_score < 0.6 {
@@ -1620,6 +2148,31 @@ pub fn generate_workflow(
         }
     }
 
+    // ── Step Quality Evaluation Engine ────────────────────────────────────
+    // Run Tier 1 (fast deterministic) evaluation on all verification steps.
+    // Standard/Full strategies are reserved for explicit API calls to avoid
+    // adding latency to every generation pipeline run.
+    let workflow_evaluation = evaluation::evaluate_workflow(
+        &workflow,
+        acceptance_criteria.as_ref(),
+        evaluation::ScoringStrategy::FastOnly,
+        doctor_handle,
+        None, // model (not needed for FastOnly)
+        None, // provider (not needed for FastOnly)
+        None, // prm_base_url
+    );
+    info!(
+        "Step quality evaluation: overall={:.3}, gate={}, duration={}ms",
+        workflow_evaluation.overall_score,
+        if workflow_evaluation.quality_gate.passed { "PASS" } else { "FAIL" },
+        workflow_evaluation.evaluation_duration_ms,
+    );
+
+    // Enrich quality report with semantic coverage matrix from evaluation
+    let mut quality_report = quality_report;
+    quality_report.semantic_coverage_matrix =
+        Some(workflow_evaluation.coverage_matrix.clone());
+
     let response = GenerateWorkflowResponse {
         workflow: Some(workflow),
         validation_errors,
@@ -1632,9 +2185,75 @@ pub fn generate_workflow(
         acceptance_criteria,
         quality_report: Some(quality_report),
         confidence_score: Some(confidence_score),
+        workflow_evaluation: Some(workflow_evaluation),
+        exploration_stats,
     };
 
     (response, artifact)
+}
+
+// ============================================================================
+// Exploration → Workflow Conversion
+// ============================================================================
+
+/// Build a [`UnifiedWorkflow`] from exploration-generated steps.
+///
+/// Creates a minimal workflow shell with the explored steps injected as
+/// `verification_steps`. The caller should run [`fix_workflow`] afterwards to
+/// normalise IDs, timestamps, and phase mismatches.
+fn build_workflow_from_explored_steps(
+    request: &GenerateWorkflowRequest,
+    steps: &[serde_json::Value],
+) -> Option<UnifiedWorkflow> {
+    if steps.is_empty() {
+        return None;
+    }
+
+    // Derive a name from the description (first 80 chars, trimmed)
+    let name = {
+        let n: String = request.description.chars().take(80).collect();
+        let trimmed = n.trim().to_string();
+        if trimmed.is_empty() {
+            "Explored Workflow".to_string()
+        } else {
+            trimmed
+        }
+    };
+
+    let category = request
+        .category
+        .as_deref()
+        .unwrap_or("generated");
+    let tags = request
+        .tags
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+
+    // Build a minimal JSON that serde can deserialize into a UnifiedWorkflow.
+    // Missing fields will use their serde defaults.
+    let workflow_json = serde_json::json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "name": name,
+        "description": request.description,
+        "category": category,
+        "tags": tags,
+        "setup_steps": [],
+        "verification_steps": steps,
+        "agentic_steps": [],
+        "completion_steps": [],
+        "stages": [],
+        "max_iterations": request.max_iterations.unwrap_or(10),
+        "log_source_selection": "default",
+    });
+
+    match serde_json::from_value::<UnifiedWorkflow>(workflow_json) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            warn!("Failed to build workflow from explored steps: {}", e);
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -1778,6 +2397,11 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
         );
     }
 
+    // Append structured output format instructions
+    let output_format_instructions = super::structured_output::build_output_format_instructions();
+    final_prompt.push_str("\n\n");
+    final_prompt.push_str(&output_format_instructions);
+
     sections.push(final_prompt);
     let full_prompt = sections.join("\n\n");
 
@@ -1816,6 +2440,8 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
             acceptance_criteria: None,
             quality_report: None,
             confidence_score: None,
+            workflow_evaluation: None,
+            exploration_stats: None,
         }));
     }
 
@@ -1823,7 +2449,20 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     let json_text = extract_json_from_response(&ai_result.output);
 
     serde_json::from_str::<UnifiedWorkflow>(&json_text)
-        .map(|w| (w, full_prompt))
+        .map(|w| {
+            // Validate parsed workflow against schema
+            if let Ok(workflow_json) = serde_json::to_value(&w) {
+                let schema_errors = super::structured_output::validate_against_schema(&workflow_json);
+                if !schema_errors.is_empty() {
+                    warn!(
+                        "Structured output schema validation found {} issues: {:?}",
+                        schema_errors.len(),
+                        &schema_errors[..schema_errors.len().min(3)]
+                    );
+                }
+            }
+            (w, full_prompt)
+        })
         .map_err(|e| {
             error!("Failed to parse builder agent JSON: {}", e);
             warn!("Response text: {}", &json_text[..json_text.len().min(500)]);
@@ -1842,6 +2481,8 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
                 acceptance_criteria: None,
                 quality_report: None,
                 confidence_score: None,
+                workflow_evaluation: None,
+                exploration_stats: None,
             })
         })
 }

@@ -88,6 +88,12 @@ pub struct QualityReport {
     pub pass: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_matrix: Option<CoverageMatrix>,
+    /// Semantic coverage matrix from the evaluation engine (entailment-scored).
+    /// Present when evaluation data is available; strictly more informative
+    /// than the name-matching `coverage_matrix`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_coverage_matrix:
+        Option<super::evaluation::coverage::SemanticCoverageMatrix>,
 }
 
 // ============================================================================
@@ -511,6 +517,7 @@ pub fn run_quality_analysis(
         score,
         pass,
         coverage_matrix,
+        semantic_coverage_matrix: None,
     }
 }
 
@@ -1220,6 +1227,7 @@ mod tests {
             score: 0.9,
             pass: true,
             coverage_matrix: None,
+            semantic_coverage_matrix: None,
         };
 
         let json = serde_json::to_string(&report).unwrap();

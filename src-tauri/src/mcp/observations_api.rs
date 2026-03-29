@@ -81,6 +81,9 @@ async fn save_handler(
         )
     })?;
 
+    // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "observation_created").await;
+
     Ok(Json(ApiResponse::success(serde_json::json!({ "id": id }))))
 }
 
@@ -220,7 +223,10 @@ async fn update_handler(
     })?;
 
     match updated {
-        Some(id) => Ok(Json(ApiResponse::success(serde_json::json!({ "id": id })))),
+        Some(id) => {
+            crate::mcp::graph_api::invalidate_graph_cache(&state, "observation_updated").await;
+            Ok(Json(ApiResponse::success(serde_json::json!({ "id": id }))))
+        }
         None => Err((
             StatusCode::NOT_FOUND,
             Json(api_error(format!("Observation {} not found", id))),
@@ -246,6 +252,7 @@ async fn delete_handler(
     })?;
 
     if deleted {
+        crate::mcp::graph_api::invalidate_graph_cache(&state, "observation_deleted").await;
         Ok(Json(ApiResponse::success(serde_json::json!({ "deleted": true }))))
     } else {
         Err((
@@ -477,6 +484,7 @@ async fn supersede_handler(
         })?;
 
     if superseded {
+        crate::mcp::graph_api::invalidate_graph_cache(&state, "observation_superseded").await;
         Ok(Json(ApiResponse::success(serde_json::json!({
             "superseded": true,
             "observation_id": id,

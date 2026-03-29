@@ -1944,6 +1944,10 @@ pub async fn get_workflow_run_context(
     }
 }
 
+// LEGACY: Dead code — uses direct SQLite connection for multi-table task run context query.
+// All these queries (task_runs, task_run_automation, task_run_screenshots, etc.) have PG
+// equivalents via PgDb methods. Remove this function once confirmed unused.
+#[allow(dead_code)]
 fn get_workflow_run_context_inner(
     task_run_id: String,
     db: &std::sync::Arc<crate::database::CheckpointDb>,

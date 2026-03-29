@@ -11,7 +11,7 @@ use crate::test_executor::{
     create_findings_for_failures, execute_tests_for_trigger, format_results_for_ai,
     TriggerTestsResult,
 };
-use crate::tiered_info::{get_config_statistics, RunRecorder, TransitionRecord};
+use crate::tiered_info::{RunRecorder, TransitionRecord};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -109,31 +109,11 @@ impl RunRecordingHandler {
         *self.config_id.lock().await = Some(config_id.clone());
         *self.project_id.lock().await = project_id;
 
-        // Load expected durations from statistics
-        let stats_result = self.db.with_conn(|conn| {
-            get_config_statistics(conn, &config_id)
-        });
-        let stats_opt = match stats_result {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("Failed to get DB connection for loading stats: {}", e);
-                return;
-            }
-        };
-
-        if let Some(stats) = stats_opt {
-            let durations: HashMap<String, u64> = stats
-                .transition_stats
-                .iter()
-                .map(|(k, v)| (k.clone(), v.avg_duration_ms))
-                .collect();
-
-            *self.expected_durations.lock().await = durations;
-            debug!(
-                "Loaded {} expected durations from statistics",
-                stats.transition_stats.len()
-            );
-        }
+        // Expected durations are loaded from PG task_run_automation records.
+        // config_statistics was a SQLite-only optimization; PG stores transition data
+        // in task_run_automation.transitions_executed JSON, so we start with empty durations
+        // and let anomaly detection rely on the per-run thresholds.
+        debug!("Config set for {}, expected durations will be populated from PG if available", config_id);
     }
 
     /// Handle a workflow started event.

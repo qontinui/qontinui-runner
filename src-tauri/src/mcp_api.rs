@@ -190,6 +190,7 @@ pub fn create_router(
         instance_manager,
         ui_bridge_event_sequence: std::sync::atomic::AtomicI64::new(0),
         knowledge_graph_cache: Arc::new(tokio::sync::RwLock::new(None)),
+        graph_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // Set up UI Bridge response listener
@@ -475,6 +476,7 @@ pub fn create_router(
         .merge(crate::mcp::generation_rules_api::routes())
         .merge(crate::mcp::meta_optimizer_api::routes())
         .merge(crate::mcp::generator_eval::routes())
+        .merge(crate::mcp::step_evaluation_api::routes())
         .merge(crate::mcp::hooks::routes())
         .merge(crate::mcp::inngest::routes())
         .merge(crate::mcp::api_spec_verify::routes())
@@ -534,6 +536,7 @@ pub fn create_router(
         .merge(crate::mcp::session_recap::routes())
         .merge(crate::mcp::api_surface::routes())
         .merge(crate::mcp::api_surface_diff::routes())
+        .merge(crate::mcp::prm_export::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(axum::middleware::from_fn(

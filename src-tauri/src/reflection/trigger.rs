@@ -42,123 +42,15 @@ pub struct ReflectionDeps {
 /// - Reflection is disabled in settings
 /// - The workflow failed catastrophically (no useful data to analyze)
 pub fn should_launch_reflection(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
-    let source_id = source_task_run_id.to_string();
-
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        // Guard 0: Check if a reflection for the SAME workflow is already running.
-        // Only block if the running reflection's source shares the same workflow_name
-        // as our source task run. Unrelated stale reflections must not block new ones.
-        let has_running: bool = conn
-            .query_row(
-                r#"SELECT COUNT(*) > 0 FROM task_runs r
-                   WHERE r.status = 'running'
-                     AND r.is_reflection = 1
-                     AND r.workflow_type = 'unified'
-                     AND r.reflection_source_task_run_id IN (
-                         SELECT s.id FROM task_runs s
-                         WHERE s.workflow_name = (
-                             SELECT workflow_name FROM task_runs WHERE id = ?1
-                         )
-                     )"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if has_running {
-            debug!("Skipping reflection — a reflection for the same workflow is already running");
-            return Ok(false);
-        }
-
-        // Guard 1: Check if source task run is already a reflection run
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
-
-        if is_reflection {
-            debug!(
-                "Skipping reflection for {} — source is already a reflection run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 1b: Check if source task run is a fixer run
-        let is_fixer: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap_or(false);
-
-        if is_fixer {
-            debug!(
-                "Skipping reflection for {} — source is a fixer run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 2: Check reflection_enabled setting
-        let reflection_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(json_extract(value, '$.reflection_enabled'), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true); // Default to enabled if setting doesn't exist
-
-        if !reflection_enabled {
-            debug!("Reflection disabled in settings");
-            return Ok(false);
-        }
-
-        // Guard 3: Check that the source run has meaningful output to analyze
-        // Use output chunks table since output_log column may be empty for chunked storage
-        let has_output: bool = conn
-            .query_row(
-                r#"SELECT COALESCE(
-                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
-                    0
-                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !has_output {
-            debug!(
-                "Skipping reflection for {} — insufficient output to analyze",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 4: Convergence suppression — skip reflection if the workflow has
-        // had N consecutive successful runs with zero findings. This prevents
-        // spawning vacuous reflections that find nothing new.
-        let converged = has_converged(conn, &source_id)?;
-        if converged {
-            info!(
-                "Skipping reflection for {} — workflow has converged",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        Ok(true)
+    // PG-primary: sync function context, use block_in_place
+    let pg = crate::database::pg::PgDb::global();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg.should_launch_reflection(source_task_run_id).await
+        })
     })
 }
 
@@ -625,8 +517,8 @@ pub fn analyze_convergence_status(
 /// workflow programmatically, and spawns it via LoopController.
 ///
 /// This is a synchronous function that spawns the workflow asynchronously.
-// PG: complex dynamic SQL
-/// All database operations use `with_conn` (sync) and the workflow is launched
+// PG: complex dynamic SQL — already migrated to PG where possible
+/// Database operations use PG (sync via block_on) and the workflow is launched
 /// via `spawn_workflow_with_panic_guard` (fire-and-forget).
 pub fn launch_reflection(
     deps: ReflectionDeps,
@@ -639,16 +531,12 @@ pub fn launch_reflection(
         return Ok("skipped".to_string());
     }
 
-    // Get source task run details
-    let source_id = source_task_run_id.clone();
-    // PG: complex dynamic SQL
-    let workflow_name = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
-            rusqlite::params![source_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| format!("Failed to get source task run: {}", e))
+    // Get source task run details via PG
+    let pg = crate::database::pg::PgDb::global();
+    let workflow_name = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg.get_workflow_name_for_task_run(&source_task_run_id).await
+        })
     })?;
 
     // Create reflection task run ID
@@ -765,121 +653,15 @@ pub fn launch_reflection(
 /// Similar to `should_launch_reflection` but uses project-scoped convergence
 /// and has its own "already running" guard keyed by project path.
 pub fn should_launch_project_reflection(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
-    let source_id = source_task_run_id.to_string();
-
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        // Guard 0: Block if a project reflection for the SAME workflow is already running
-        let has_running: bool = conn
-            .query_row(
-                r#"SELECT COUNT(*) > 0 FROM task_runs r
-                   WHERE r.status = 'running'
-                     AND r.is_reflection = 1
-                     AND r.workflow_type = 'unified'
-                     AND r.workflow_name LIKE 'Project Reflection:%'
-                     AND r.reflection_source_task_run_id IN (
-                         SELECT s.id FROM task_runs s
-                         WHERE s.workflow_name = (
-                             SELECT workflow_name FROM task_runs WHERE id = ?1
-                         )
-                     )"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if has_running {
-            debug!("Skipping project reflection — one for the same workflow is already running");
-            return Ok(false);
-        }
-
-        // Guard 1: Check if source task run is already a reflection run
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
-
-        if is_reflection {
-            debug!(
-                "Skipping project reflection for {} — source is already a reflection run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 1b: Check if source task run is a fixer run
-        let is_fixer: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap_or(false);
-
-        if is_fixer {
-            debug!(
-                "Skipping project reflection for {} — source is a fixer run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 2: Check project_reflection_enabled setting (default: true)
-        let project_reflection_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(json_extract(value, '$.project_reflection_enabled'), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-
-        if !project_reflection_enabled {
-            debug!("Project reflection disabled in settings");
-            return Ok(false);
-        }
-
-        // Guard 3: Check output threshold
-        let has_output: bool = conn
-            .query_row(
-                r#"SELECT COALESCE(
-                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
-                    0
-                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !has_output {
-            debug!(
-                "Skipping project reflection for {} — insufficient output",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 4: Project-scoped convergence
-        // Check last N project reflections for the same workflow — if all produced 0 fixes,
-        // the project is well-documented and we can skip.
-        let converged = has_project_converged(conn, &source_id)?;
-        if converged {
-            info!(
-                "Skipping project reflection for {} — project knowledge has converged",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        Ok(true)
+    // PG-primary: sync function context, use block_in_place
+    let pg = crate::database::pg::PgDb::global();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg.should_launch_project_reflection(source_task_run_id).await
+        })
     })
 }
 
@@ -983,62 +765,12 @@ pub fn launch_project_reflection(
         return Ok("skipped".to_string());
     }
 
-    // Get source task run details
-    let source_id = source_task_run_id.clone();
-    // PG: complex dynamic SQL
-    let (workflow_name, project_path) = db.with_conn(|conn| {
-        let wf_name: String = conn
-            .query_row(
-                "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|e| format!("Failed to get source task run: {}", e))?;
-
-        // Try to get project path from the workflow's step JSON arrays.
-        // shell_command_working_directory is a per-step field stored in JSON, not a table column.
-        let proj_path: Option<String> = conn
-            .query_row(
-                r#"SELECT COALESCE(
-                    json_extract(s.value, '$.shell_command_working_directory'),
-                    json_extract(s.value, '$.working_directory')
-                )
-                FROM unified_workflows uw, json_each(uw.setup_steps) s
-                INNER JOIN task_runs tr ON tr.workflow_name = uw.name
-                WHERE tr.id = ?1
-                  AND COALESCE(
-                    json_extract(s.value, '$.shell_command_working_directory'),
-                    json_extract(s.value, '$.working_directory')
-                  ) IS NOT NULL
-                LIMIT 1"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten()
-            // Fallback: check agentic_steps if setup_steps had nothing
-            .or_else(|| {
-                conn.query_row(
-                    r#"SELECT COALESCE(
-                        json_extract(s.value, '$.shell_command_working_directory'),
-                        json_extract(s.value, '$.working_directory')
-                    )
-                    FROM unified_workflows uw, json_each(uw.agentic_steps) s
-                    INNER JOIN task_runs tr ON tr.workflow_name = uw.name
-                    WHERE tr.id = ?1
-                      AND COALESCE(
-                        json_extract(s.value, '$.shell_command_working_directory'),
-                        json_extract(s.value, '$.working_directory')
-                      ) IS NOT NULL
-                    LIMIT 1"#,
-                    rusqlite::params![source_id],
-                    |row| row.get(0),
-                )
-                .ok()
-                .flatten()
-            });
-
-        Ok((wf_name, proj_path))
+    // Get source task run details via PG
+    let pg = crate::database::pg::PgDb::global();
+    let (workflow_name, project_path) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg.get_workflow_name_and_project_path(&source_task_run_id).await
+        })
     })?;
 
     let reflection_id = uuid::Uuid::new_v4().to_string();
@@ -1148,173 +880,15 @@ pub fn launch_project_reflection(
 /// Similar guards to other reflection types, plus checks for UI Bridge
 /// activity in the source workflow (skips if workflow had no UI Bridge usage).
 pub fn should_launch_ui_bridge_reflection(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     source_task_run_id: &str,
 ) -> Result<bool, String> {
-    let source_id = source_task_run_id.to_string();
-
-    // PG: complex dynamic SQL
-    db.with_conn(|conn| {
-        // Guard 0: Block if a UI Bridge reflection for the SAME workflow is already running
-        let has_running: bool = conn
-            .query_row(
-                r#"SELECT COUNT(*) > 0 FROM task_runs r
-                   WHERE r.status = 'running'
-                     AND r.is_reflection = 1
-                     AND r.workflow_type = 'unified'
-                     AND r.workflow_name LIKE 'UI Bridge Reflection:%'
-                     AND r.reflection_source_task_run_id IN (
-                         SELECT s.id FROM task_runs s
-                         WHERE s.workflow_name = (
-                             SELECT workflow_name FROM task_runs WHERE id = ?1
-                         )
-                     )"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if has_running {
-            debug!("Skipping UI Bridge reflection — one for the same workflow is already running");
-            return Ok(false);
-        }
-
-        // Guard 1: Check if source task run is already a reflection run
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .map_err(|e| format!("Failed to check is_reflection: {}", e))?;
-
-        if is_reflection {
-            debug!(
-                "Skipping UI Bridge reflection for {} — source is already a reflection run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 1b: Check if source task run is a fixer run
-        let is_fixer: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params![source_id],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap_or(false);
-
-        if is_fixer {
-            debug!(
-                "Skipping UI Bridge reflection for {} — source is a fixer run",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 2: Check ui_bridge_reflection_enabled setting (default: true)
-        let enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(json_extract(value, '$.ui_bridge_reflection_enabled'), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-
-        if !enabled {
-            debug!("UI Bridge reflection disabled in settings");
-            return Ok(false);
-        }
-
-        // Guard 3: Check output threshold
-        let has_output: bool = conn
-            .query_row(
-                r#"SELECT COALESCE(
-                    (SELECT SUM(LENGTH(content)) FROM task_run_output_chunks WHERE task_run_id = ?1),
-                    0
-                ) + LENGTH(COALESCE((SELECT output_log FROM task_runs WHERE id = ?1), '')) > 100"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !has_output {
-            debug!(
-                "Skipping UI Bridge reflection for {} — insufficient output",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 4: Check that the source workflow actually used or could have used UI Bridge.
-        // Look for UI Bridge step checkpoints, or AI output mentioning ui-bridge/ui_bridge.
-        let has_ui_bridge_activity: bool = conn
-            .query_row(
-                r#"SELECT (
-                    -- Check step checkpoints for UI Bridge steps
-                    (SELECT COUNT(*) FROM workflow_step_checkpoints
-                     WHERE task_run_id = ?1
-                       AND (step_type LIKE '%ui_bridge%' OR step_type LIKE '%ui-bridge%'
-                            OR step_name LIKE '%UI Bridge%' OR step_name LIKE '%ui_bridge%'
-                            OR step_name LIKE '%snapshot%' OR step_name LIKE '%discover%'))
-                    +
-                    -- Check if the workflow definition references UI Bridge
-                    (SELECT COUNT(*) FROM unified_workflows uw
-                     INNER JOIN task_runs tr ON tr.workflow_name = uw.name
-                     WHERE tr.id = ?1
-                       AND (uw.setup_steps LIKE '%ui_bridge%' OR uw.setup_steps LIKE '%ui-bridge%'
-                            OR uw.verification_steps LIKE '%ui_bridge%' OR uw.verification_steps LIKE '%ui-bridge%'
-                            OR uw.agentic_steps LIKE '%ui_bridge%' OR uw.agentic_steps LIKE '%ui-bridge%'
-                            OR uw.completion_steps LIKE '%ui_bridge%' OR uw.completion_steps LIKE '%ui-bridge%'))
-                ) > 0"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        // Also check if the AI output mentions UI Bridge (covers AI-driven usage)
-        let ai_mentions_ui_bridge: bool = if !has_ui_bridge_activity {
-            conn.query_row(
-                r#"SELECT COALESCE(
-                    (SELECT 1 FROM task_run_output_chunks
-                     WHERE task_run_id = ?1
-                       AND (content LIKE '%ui-bridge%' OR content LIKE '%ui_bridge%'
-                            OR content LIKE '%/control/snapshot%' OR content LIKE '%/control/discover%')
-                     LIMIT 1),
-                    0
-                ) > 0"#,
-                rusqlite::params![source_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false)
-        } else {
-            true
-        };
-
-        if !has_ui_bridge_activity && !ai_mentions_ui_bridge {
-            debug!(
-                "Skipping UI Bridge reflection for {} — no UI Bridge activity detected",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        // Guard 5: Convergence check using project-style convergence
-        // (last N UI Bridge reflections for same workflow produced zero fixes)
-        let converged = has_ui_bridge_converged(conn, &source_id)?;
-        if converged {
-            info!(
-                "Skipping UI Bridge reflection for {} — UI Bridge improvements have converged",
-                source_id
-            );
-            return Ok(false);
-        }
-
-        Ok(true)
+    // PG-primary: sync function context, use block_in_place
+    let pg = crate::database::pg::PgDb::global();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg.should_launch_ui_bridge_reflection(source_task_run_id).await
+        })
     })
 }
 
@@ -1394,16 +968,12 @@ pub fn launch_ui_bridge_reflection(
         return Ok("skipped".to_string());
     }
 
-    // Get source task run details
-    let source_id = source_task_run_id.clone();
-    // PG: complex dynamic SQL
-    let workflow_name = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = ?1",
-            rusqlite::params![source_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| format!("Failed to get source task run: {}", e))
+    // Get source task run details via PG
+    let pg = crate::database::pg::PgDb::global();
+    let workflow_name = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg.get_workflow_name_for_task_run(&source_task_run_id).await
+        })
     })?;
 
     let reflection_id = uuid::Uuid::new_v4().to_string();

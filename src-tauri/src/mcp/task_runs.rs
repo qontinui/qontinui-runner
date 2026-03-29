@@ -2285,44 +2285,23 @@ pub async fn generate_workflow_from_session(
         discover_ui_bridge_specs: None,
         simple_mode: None,
         tool_tags: None,
+        exploration_settings: None,
         target_runner_port: None,
     };
 
-    // SQLite: complex function — AI-driven workflow generation + pipeline artifact storage
     let doctor_handle = state.doctor_handle.clone();
-    let db2 = state.app_state.checkpoint_db.clone();
+    let pg_db = state.app_state.pg_db.clone();
     let artifact_task_run_id = id.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
-        let gen_result = db2.with_conn(|conn| {
-            let (response, mut artifact) = crate::workflow_generation::generate_workflow(
-                request,
-                doctor_handle.as_ref(),
-                Some(conn),
-                None,
-            );
-            artifact.task_run_id = Some(artifact_task_run_id.clone());
-            if let Err(e) = db2.save_pipeline_artifact(&artifact) {
-                tracing::warn!("Failed to save pipeline artifact: {}", e);
-            }
-            Ok(response)
-        });
-        match gen_result {
-            Ok(response) => response,
-            Err(e) => crate::workflow_generation::GenerateWorkflowResponse {
-                workflow: None,
-                validation_errors: vec![],
-                success: false,
-                error: Some(format!("Database error during generation: {}", e)),
-                model_used: None,
-                verification_iterations: vec![],
-                hardening_summary: None,
-                discovery_calls: vec![],
-                acceptance_criteria: None,
-                quality_report: None,
-                confidence_score: None,
-            },
-        }
+        let (response, mut artifact) = crate::workflow_generation::generate_workflow(
+            request,
+            doctor_handle.as_ref(),
+            None,
+            None,
+        );
+        artifact.task_run_id = Some(artifact_task_run_id.clone());
+        (response, artifact)
     })
     .await
     .map_err(|e| {
@@ -2331,6 +2310,12 @@ pub async fn generate_workflow_from_session(
             format!("Generation task failed: {}", e),
         )
     })?;
+
+    // Save pipeline artifact to PG (async)
+    if let Err(e) = pg_db.save_generation_artifact(&gen_result.1).await {
+        tracing::warn!("Failed to save pipeline artifact to PG: {}", e);
+    }
+    let gen_result = gen_result.0;
 
     // Store generated_workflow_id in result_data (mirrors Tauri IPC command behavior)
     if gen_result.success {

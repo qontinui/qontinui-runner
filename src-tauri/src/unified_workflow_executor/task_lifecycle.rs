@@ -17,9 +17,6 @@ impl LoopController {
     /// parse meta-optimizer recommendations, and check chain triggers.
     pub(crate) async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
         if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
-            warn!("PG complete_task_run failed: {}", e);
-        }
-        if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
             error!("Failed to mark task {} as completed (PG): {}", execution_id, e);
         } else {
             info!("Marked task {} as COMPLETED", execution_id);
@@ -43,45 +40,27 @@ impl LoopController {
 
             // Fire-and-forget: try to promote workflow to example library
             if let Some(wf_id) = workflow_id {
-                let db = self.checkpoint_db.clone();
                 let wf_id = wf_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let _ = db.with_conn(|conn| {
-                        crate::workflow_generation::example_workflows::try_promote_on_success(
-                            conn, &wf_id,
-                        );
-                        Ok(())
-                    });
+                // PG-primary: async context, fire-and-forget
+                let pg = self.app_state.pg_db.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pg.try_promote_on_success(&wf_id).await {
+                        tracing::warn!("Failed to promote workflow to examples: {}", e);
+                    }
                 });
             }
 
-            // Auto-store convergence snapshot on completion
-            let db2 = self.checkpoint_db.clone();
+            // Auto-store convergence snapshot on completion via PG
+            let pg2 = self.app_state.pg_db.clone();
             let exec_id2 = execution_id.to_string();
             tokio::spawn(async move {
-                let _ = tokio::task::spawn_blocking(move || {
-                    db2.with_conn(|conn| {
-                        let wf_name: Option<String> = conn
-                            .query_row(
-                                "SELECT workflow_name FROM task_runs WHERE id = ?1",
-                                rusqlite::params![exec_id2],
-                                |row| row.get(0),
-                            )
-                            .ok();
-                        if let Some(wf_name) = wf_name {
-                            if let Ok(metrics) =
-                                crate::reflection::prediction::compute_convergence_score(
-                                    conn, &wf_name, "workflow",
-                                )
-                            {
-                                let _ = crate::reflection::prediction::store_convergence_snapshot(
-                                    conn, &wf_name, None, "workflow", &metrics,
-                                );
-                            }
-                        }
-                        Ok(())
-                    })
-                }).await;
+                // PG-primary: async context
+                let wf_name = pg2.get_workflow_name_for_task_run(&exec_id2).await.ok();
+                if let Some(wf_name) = wf_name {
+                    if let Ok(metrics) = pg2.compute_convergence_score(&wf_name, "workflow").await {
+                        let _ = pg2.store_convergence_snapshot(&wf_name, None, "workflow", &metrics).await;
+                    }
+                }
             });
 
             // Auto-capture task knowledge as observations (Engram-style cross-session memory)
@@ -126,6 +105,7 @@ impl LoopController {
                     let output = &task_run.output_log;
                     match crate::meta_optimizer::parser::save_parsed_recommendations(
                         &db,
+                        &pg,
                         &optimizer_type,
                         Some(&optimizer_run_id),
                         output,
@@ -139,6 +119,7 @@ impl LoopController {
                             if let Err(e) =
                                 crate::meta_optimizer::recommendations::complete_optimizer_run(
                                     &db,
+                                    &pg,
                                     &optimizer_run_id,
                                     0, // runs_analyzed is not tracked here
                                     count as i64,
@@ -188,9 +169,6 @@ impl LoopController {
         reason: &str,
         workflow_id: Option<&str>,
     ) {
-        if let Err(e) = self.app_state.pg_db.fail_task_run(execution_id, reason).await {
-            warn!("PG fail_task_run failed: {}", e);
-        }
         if let Err(e) = self.app_state.pg_db.fail_task_run(execution_id, reason).await {
             error!("Failed to mark task {} as failed (PG): {}", execution_id, e);
         } else {
@@ -388,10 +366,12 @@ impl LoopController {
                         let pg = pg_db.clone();
                         let record_clone = record.clone();
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            handle.block_on(async move {
-                                if let Err(e) = pg_db.insert_worktree(&record_clone).await {
-                                    warn!("PG insert_worktree failed: {}", e);
-                                }
+                            tokio::task::block_in_place(|| {
+                                handle.block_on(async move {
+                                    if let Err(e) = pg.insert_worktree(&record_clone).await {
+                                        warn!("PG insert_worktree failed: {}", e);
+                                    }
+                                })
                             })
                         }));
                     }

@@ -1118,4 +1118,1627 @@ impl PgDb {
         ).await.map_err(|e| format!("PG update_evolution_verdict_by_variant: {}", e))?;
         Ok(())
     }
+
+    // =========================================================================
+    // Optimizer Context (PG equivalent of meta_optimizer_api context builder)
+    // =========================================================================
+
+    /// PG equivalent of the optimizer context builder in meta_optimizer_api.rs.
+    /// Returns a markdown-formatted context string for AI consumption.
+    pub async fn get_optimizer_context(&self, is_pipeline: bool) -> Result<String, String> {
+        use std::fmt::Write;
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let mut out = String::new();
+
+        // 1. Performance Summary
+        let result = conn
+            .query_one(
+                r#"SELECT
+                    COUNT(*) as total_runs,
+                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as successful,
+                    SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END) as partial,
+                    SUM(CASE WHEN status='failure' THEN 1 ELSE 0 END) as failed,
+                    COALESCE(ROUND(AVG(duration_secs)::numeric, 1), 0) as avg_duration,
+                    COALESCE(ROUND(AVG(iterations)::numeric, 1), 0) as avg_iterations
+                FROM learning_outcomes
+                WHERE created_at > $1
+                  AND (iterations IS NULL OR iterations > 0)"#,
+                &[&since],
+            )
+            .await;
+
+        if let Ok(row) = result {
+            let total: i64 = row.get(0);
+            if total > 0 {
+                let success: i64 = row.get(1);
+                let partial: i64 = row.get(2);
+                let failed: i64 = row.get(3);
+                let success_pct = 100.0 * success as f64 / total as f64;
+                let partial_pct = 100.0 * partial as f64 / total as f64;
+                let failed_pct = 100.0 * failed as f64 / total as f64;
+
+                let _ = writeln!(out, "## Performance Summary (last 30 days)");
+                let _ = writeln!(
+                    out,
+                    "- {} total runs: {} successful ({:.1}%), {} partial ({:.1}%), {} failed ({:.1}%)",
+                    total, success, success_pct, partial, partial_pct, failed, failed_pct
+                );
+            }
+        }
+
+        // 2. Recent optimizer runs
+        let runs = conn
+            .query(
+                r#"SELECT id, optimizer_type, status, improvements_found,
+                          recommendations_count, duration_ms, created_at
+                   FROM meta_optimizer_runs
+                   ORDER BY created_at DESC LIMIT 5"#,
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        if !runs.is_empty() {
+            let _ = writeln!(out, "\n## Recent Optimizer Runs");
+            for row in &runs {
+                let opt_type: String = row.get(1);
+                let status: String = row.get(2);
+                let improvements: i32 = row.get(3);
+                let recs: i32 = row.get(4);
+                let _ = writeln!(
+                    out,
+                    "- {} optimizer: {} ({} improvements, {} recommendations)",
+                    opt_type, status, improvements, recs
+                );
+            }
+        }
+
+        // 3. Active recommendations
+        let recs = conn
+            .query(
+                r#"SELECT optimizer_type, recommendation_type, title, status
+                   FROM meta_optimizer_recommendations
+                   WHERE status IN ('pending', 'applied')
+                   ORDER BY created_at DESC LIMIT 10"#,
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+
+        if !recs.is_empty() {
+            let _ = writeln!(out, "\n## Active Recommendations");
+            for row in &recs {
+                let opt_type: String = row.get(0);
+                let title: String = row.get(2);
+                let status: String = row.get(3);
+                let _ = writeln!(out, "- [{}] {} ({})", opt_type, title, status);
+            }
+        }
+
+        if out.is_empty() {
+            let _ = writeln!(out, "No optimizer data available for the last 30 days.");
+        }
+
+        Ok(out)
+    }
+
+    /// PG equivalent of the autoresearch campaigns query.
+    pub async fn get_autoresearch_campaigns_with_experiments(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+
+        let campaigns = conn
+            .query(
+                r#"SELECT id, name, config_json, current_control_json, status,
+                          experiment_count, accepted_count, created_at
+                   FROM autoresearch_campaigns
+                   ORDER BY created_at DESC
+                   LIMIT $1"#,
+                &[&limit],
+            )
+            .await
+            .map_err(|e| format!("PG autoresearch_campaigns: {}", e))?;
+
+        let mut result = Vec::new();
+        for row in &campaigns {
+            let id: String = row.get(0);
+            let name: String = row.get(1);
+            let config_json: String = row.get(2);
+            let current_control_json: String = row.get(3);
+            let status: String = row.get(4);
+            let experiment_count: i64 = row.get(5);
+            let accepted_count: i64 = row.get(6);
+            let created_at: String = row.get(7);
+
+            // Fetch experiments for this campaign
+            let experiments = conn
+                .query(
+                    r#"SELECT id, experiment_number, config_json, aggregate_json,
+                              accepted, reason, p_value, created_at
+                       FROM autoresearch_experiments
+                       WHERE campaign_id = $1
+                       ORDER BY experiment_number DESC
+                       LIMIT 10"#,
+                    &[&id],
+                )
+                .await
+                .unwrap_or_default();
+
+            let exp_values: Vec<serde_json::Value> = experiments
+                .iter()
+                .map(|er| {
+                    serde_json::json!({
+                        "id": er.get::<_, String>(0),
+                        "experiment_number": er.get::<_, i32>(1),
+                        "config_json": er.get::<_, String>(2),
+                        "aggregate_json": er.get::<_, Option<String>>(3),
+                        "accepted": er.get::<_, Option<bool>>(4),
+                        "reason": er.get::<_, Option<String>>(5),
+                        "p_value": er.get::<_, Option<f64>>(6),
+                        "created_at": er.get::<_, String>(7),
+                    })
+                })
+                .collect();
+
+            result.push(serde_json::json!({
+                "id": id,
+                "name": name,
+                "config_json": config_json,
+                "current_control_json": current_control_json,
+                "status": status,
+                "experiment_count": experiment_count,
+                "accepted_count": accepted_count,
+                "created_at": created_at,
+                "experiments": exp_values,
+            }));
+        }
+
+        Ok(result)
+    }
+
+    /// PG equivalent of iteration history queries (L0 summary).
+    pub async fn get_iteration_history_l0(
+        &self,
+        limit: i64,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+
+        let rows = if let Some(status) = status_filter {
+            conn.query(
+                r#"SELECT status, iteration_history
+                   FROM task_runs
+                   WHERE iteration_history IS NOT NULL
+                     AND iteration_history != '[]'
+                     AND status = $1
+                   ORDER BY created_at DESC LIMIT $2"#,
+                &[&status, &limit],
+            ).await
+        } else {
+            conn.query(
+                r#"SELECT status, iteration_history
+                   FROM task_runs
+                   WHERE iteration_history IS NOT NULL
+                     AND iteration_history != '[]'
+                   ORDER BY created_at DESC LIMIT $1"#,
+                &[&limit],
+            ).await
+        }.map_err(|e| format!("PG iteration_history_l0: {}", e))?;
+
+        // Group by status and compute aggregates
+        let mut groups: std::collections::HashMap<String, Vec<Vec<serde_json::Value>>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let status: String = row.get(0);
+            let history_json: String = row.get(1);
+            if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&history_json) {
+                groups.entry(status).or_default().push(entries);
+            }
+        }
+
+        let mut summaries = Vec::new();
+        for (status, runs) in &groups {
+            let run_count = runs.len() as i64;
+            let mut total_iterations: usize = 0;
+            let mut total_confidence_delta: f64 = 0.0;
+            let mut approach_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for entries in runs {
+                total_iterations += entries.len();
+                for e in entries {
+                    if let Some(d) = e.get("confidence_delta").and_then(|d| d.as_f64()) {
+                        total_confidence_delta += d;
+                    }
+                    if let Some(a) = e.get("approach").and_then(|a| a.as_str()) {
+                        *approach_counts.entry(a.to_string()).or_default() += 1;
+                    }
+                }
+            }
+
+            let avg_iterations = if run_count > 0 { total_iterations as f64 / run_count as f64 } else { 0.0 };
+            let avg_confidence_delta = if total_iterations > 0 { total_confidence_delta / total_iterations as f64 } else { 0.0 };
+
+            summaries.push(serde_json::json!({
+                "status": status,
+                "run_count": run_count,
+                "avg_iterations": avg_iterations,
+                "avg_confidence_delta": avg_confidence_delta,
+                "top_approaches": approach_counts,
+            }));
+        }
+
+        Ok(summaries)
+    }
+
+    /// PG equivalent of iteration history queries (L1 per-run details).
+    pub async fn get_iteration_history_l1(
+        &self,
+        limit: i64,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+
+        let rows = if let Some(status) = status_filter {
+            conn.query(
+                r#"SELECT id, task_name, status, iteration_history, created_at
+                   FROM task_runs
+                   WHERE iteration_history IS NOT NULL
+                     AND iteration_history != '[]'
+                     AND status = $1
+                   ORDER BY created_at DESC LIMIT $2"#,
+                &[&status, &limit],
+            ).await
+        } else {
+            conn.query(
+                r#"SELECT id, task_name, status, iteration_history, created_at
+                   FROM task_runs
+                   WHERE iteration_history IS NOT NULL
+                     AND iteration_history != '[]'
+                   ORDER BY created_at DESC LIMIT $1"#,
+                &[&limit],
+            ).await
+        }.map_err(|e| format!("PG iteration_history_l1: {}", e))?;
+
+        let details: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let task_name: String = row.get(1);
+                let status: String = row.get(2);
+                let history_json: String = row.get(3);
+                let created_at: String = row.get(4);
+
+                let entries: Vec<serde_json::Value> =
+                    serde_json::from_str(&history_json).unwrap_or_default();
+                let iteration_count = entries.len();
+                let total_confidence_delta: f64 = entries
+                    .iter()
+                    .filter_map(|e| e.get("confidence_delta").and_then(|d| d.as_f64()))
+                    .sum();
+                let approaches: Vec<String> = entries
+                    .iter()
+                    .filter_map(|e| e.get("approach").and_then(|a| a.as_str()).map(String::from))
+                    .collect();
+
+                serde_json::json!({
+                    "task_run_id": id,
+                    "task_name": task_name,
+                    "status": status,
+                    "iteration_count": iteration_count,
+                    "total_confidence_delta": total_confidence_delta,
+                    "approaches": approaches,
+                    "created_at": created_at,
+                })
+            })
+            .collect();
+
+        Ok(details)
+    }
+
+    /// PG equivalent of iteration history queries (L2 full raw data).
+    pub async fn get_iteration_history_l2(
+        &self,
+        limit: i64,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+
+        let rows = if let Some(status) = status_filter {
+            conn.query(
+                r#"SELECT id, task_name, status, iteration_history, created_at
+                   FROM task_runs
+                   WHERE iteration_history IS NOT NULL
+                     AND iteration_history != '[]'
+                     AND status = $1
+                   ORDER BY created_at DESC LIMIT $2"#,
+                &[&status, &limit],
+            ).await
+        } else {
+            conn.query(
+                r#"SELECT id, task_name, status, iteration_history, created_at
+                   FROM task_runs
+                   WHERE iteration_history IS NOT NULL
+                     AND iteration_history != '[]'
+                   ORDER BY created_at DESC LIMIT $1"#,
+                &[&limit],
+            ).await
+        }.map_err(|e| format!("PG iteration_history_l2: {}", e))?;
+
+        let full: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let task_name: String = row.get(1);
+                let status: String = row.get(2);
+                let history_json: String = row.get(3);
+                let created_at: String = row.get(4);
+                let entries: serde_json::Value =
+                    serde_json::from_str(&history_json).unwrap_or_default();
+
+                serde_json::json!({
+                    "task_run_id": id,
+                    "task_name": task_name,
+                    "status": status,
+                    "iteration_history": entries,
+                    "created_at": created_at,
+                })
+            })
+            .collect();
+
+        Ok(full)
+    }
+
+    // ========================================================================
+    // Cost optimizer — pipeline_agent_traces queries
+    // ========================================================================
+
+    /// Query per-agent token/cost averages over the last 30 days (non-zero tokens only).
+    pub async fn query_agent_cost_stats(
+        &self,
+        since: &str,
+    ) -> Result<Vec<(String, i64, f64, f64, f64, f64)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT
+                    agent_type,
+                    COUNT(*)::bigint as run_count,
+                    ROUND(AVG(tokens_in)::numeric, 0)::double precision as avg_tokens_in,
+                    ROUND(AVG(tokens_out)::numeric, 0)::double precision as avg_tokens_out,
+                    ROUND(AVG(cost_usd)::numeric, 6)::double precision as avg_cost,
+                    ROUND(SUM(cost_usd)::numeric, 4)::double precision as total_cost
+                FROM pipeline_agent_traces
+                WHERE created_at > $1
+                    AND (tokens_in > 0 OR tokens_out > 0)
+                GROUP BY agent_type
+                ORDER BY total_cost DESC"#,
+                &[&since],
+            )
+            .await
+            .map_err(|e| format!("PG query_agent_cost_stats: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, i64>(1),
+                    r.get::<_, f64>(2),
+                    r.get::<_, f64>(3),
+                    r.get::<_, f64>(4),
+                    r.get::<_, f64>(5),
+                )
+            })
+            .collect())
+    }
+
+    /// Query agents that have traces but zero tokens (instrumentation gap).
+    pub async fn query_zero_token_agents(
+        &self,
+        since: &str,
+    ) -> Result<Vec<(String, i64)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT agent_type, COUNT(*)::bigint as run_count
+                FROM pipeline_agent_traces
+                WHERE created_at > $1
+                    AND tokens_in = 0 AND tokens_out = 0
+                GROUP BY agent_type
+                HAVING COUNT(*) >= 5
+                ORDER BY run_count DESC"#,
+                &[&since],
+            )
+            .await
+            .map_err(|e| format!("PG query_zero_token_agents: {}", e))?;
+        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+    }
+
+    /// Compare cost over recent vs previous 15-day window.
+    pub async fn compute_cost_trend(
+        &self,
+        mid: &str,
+        start: &str,
+    ) -> Result<(f64, f64), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let recent_row = conn
+            .query_one(
+                "SELECT COALESCE(SUM(cost_usd), 0)::double precision FROM pipeline_agent_traces WHERE created_at > $1",
+                &[&mid],
+            )
+            .await
+            .map_err(|e| format!("PG compute_cost_trend recent: {}", e))?;
+        let recent_cost: f64 = recent_row.get(0);
+
+        let previous_row = conn
+            .query_one(
+                "SELECT COALESCE(SUM(cost_usd), 0)::double precision FROM pipeline_agent_traces WHERE created_at > $1 AND created_at <= $2",
+                &[&start, &mid],
+            )
+            .await
+            .map_err(|e| format!("PG compute_cost_trend previous: {}", e))?;
+        let previous_cost: f64 = previous_row.get(0);
+        Ok((recent_cost, previous_cost))
+    }
+
+    // ========================================================================
+    // Comparison bridge queries
+    // ========================================================================
+
+    /// Load a comparison run by ID (for meta-optimizer bridge).
+    pub async fn get_comparison_run_for_bridge(
+        &self,
+        comparison_id: &str,
+    ) -> Result<Option<(String, Option<String>, Option<String>, String, String, String, String)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT entries_json, comparison_report, recommendation_json,
+                          status, workflow_id, workflow_name, created_at
+                   FROM comparison_runs WHERE id = $1"#,
+                &[&comparison_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_comparison_run: {}", e))?;
+        Ok(row.map(|r| {
+            (
+                r.get::<_, String>(0),
+                r.get::<_, Option<String>>(1),
+                r.get::<_, Option<String>>(2),
+                r.get::<_, String>(3),
+                r.get::<_, String>(4),
+                r.get::<_, String>(5),
+                r.get::<_, String>(6),
+            )
+        }))
+    }
+
+    /// Update comparison_runs to link recommendation.
+    pub async fn update_comparison_recommendation_link(
+        &self,
+        recommendation_id: &str,
+        comparison_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE comparison_runs SET recommendation_id = $1, source = 'meta_optimizer' WHERE id = $2",
+            &[&recommendation_id, &comparison_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_comparison_recommendation_link: {}", e))?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Parser — auto-apply queries
+    // ========================================================================
+
+    /// Auto-reject finding recommendations.
+    pub async fn reject_finding_recommendations(
+        &self,
+        optimizer_run_id: Option<&str>,
+    ) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let affected = conn
+            .execute(
+                r#"UPDATE meta_optimizer_recommendations
+                   SET status = 'rejected',
+                       outcome_after_apply = 'Auto-rejected: findings are diagnostic observations, not actionable changes'
+                   WHERE status = 'pending'
+                     AND recommendation_type = 'finding'
+                     AND ($1::text IS NULL OR optimizer_run_id = $1)"#,
+                &[&optimizer_run_id as &(dyn tokio_postgres::types::ToSql + Sync)],
+            )
+            .await
+            .map_err(|e| format!("PG reject_finding_recommendations: {}", e))?;
+        Ok(affected as i64)
+    }
+
+    /// Query pending recommendations by type and min confidence.
+    pub async fn query_pending_recommendations_by_type(
+        &self,
+        recommendation_types: &[&str],
+        min_confidence: f64,
+        optimizer_run_id: Option<&str>,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let types_str: Vec<String> = recommendation_types.iter().map(|s| s.to_string()).collect();
+        // Build IN clause dynamically
+        let placeholders: Vec<String> = (0..types_str.len()).map(|i| format!("${}", i + 3)).collect();
+        let in_clause = placeholders.join(", ");
+        let sql = format!(
+            r#"SELECT id, confidence FROM meta_optimizer_recommendations
+               WHERE status = 'pending'
+                 AND recommendation_type IN ({})
+                 AND confidence >= $1
+                 AND ($2::text IS NULL OR optimizer_run_id = $2)
+               ORDER BY confidence DESC"#,
+            in_clause
+        );
+
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        params.push(Box::new(min_confidence));
+        params.push(Box::new(optimizer_run_id.map(|s| s.to_string()) as Option<String>));
+        for t in &types_str {
+            params.push(Box::new(t.clone()));
+        }
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let rows = conn.query(&sql, &param_refs).await
+            .map_err(|e| format!("PG query_pending_recommendations_by_type: {}", e))?;
+        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1))).collect())
+    }
+
+    /// Count rejected recommendations with a given title.
+    pub async fn count_rejected_by_title(&self, title: &str) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM meta_optimizer_recommendations WHERE title = $1 AND status = 'rejected'",
+                &[&title],
+            )
+            .await
+            .map_err(|e| format!("PG count_rejected_by_title: {}", e))?;
+        Ok(row.get(0))
+    }
+
+    // ========================================================================
+    // Golden dataset — build from history (pipeline_agent_traces)
+    // ========================================================================
+
+    /// Query recent successful pipeline traces for golden dataset building.
+    pub async fn query_golden_entries_from_traces(
+        &self,
+        agent_type: &str,
+        since: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64, bool)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT pat.task_run_id, tr.name, pat.duration_ms, pat.success
+                   FROM pipeline_agent_traces pat
+                   JOIN task_runs tr ON pat.task_run_id = tr.id
+                   WHERE pat.agent_type = $1
+                     AND pat.success = true
+                     AND pat.created_at > $2
+                   ORDER BY pat.created_at DESC
+                   LIMIT $3"#,
+                &[&agent_type, &since, &limit],
+            )
+            .await
+            .map_err(|e| format!("PG query_golden_entries_from_traces: {}", e))?;
+        Ok(rows.iter().map(|r| {
+            (
+                r.get::<_, String>(0),
+                r.get::<_, String>(1),
+                r.get::<_, i64>(2),
+                r.get::<_, bool>(3),
+            )
+        }).collect())
+    }
+
+    /// List golden datasets for a specific agent type (for robustness regression cases).
+    pub async fn query_golden_datasets_by_agent(
+        &self,
+        agent_type: &str,
+    ) -> Result<Vec<(String, String, String, String, String, String)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, agent_type, name, entries_json, created_at, updated_at
+                   FROM golden_datasets WHERE agent_type = $1 ORDER BY updated_at DESC"#,
+                &[&agent_type],
+            )
+            .await
+            .map_err(|e| format!("PG query_golden_datasets_by_agent: {}", e))?;
+        Ok(rows.iter().map(|r| {
+            (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5))
+        }).collect())
+    }
+
+    // ========================================================================
+    // Trigger — optimizer run count
+    // ========================================================================
+
+    /// Count optimizer runs for a given type (for style rotation).
+    pub async fn count_optimizer_runs_by_type(&self, optimizer_type: &str) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM meta_optimizer_runs WHERE optimizer_type = $1",
+                &[&optimizer_type],
+            )
+            .await
+            .map_err(|e| format!("PG count_optimizer_runs_by_type: {}", e))?;
+        Ok(row.get(0))
+    }
+
+    // ========================================================================
+    // Recommendations — agentic score evaluation
+    // ========================================================================
+
+    /// Get pre/post agentic scores for a recommendation.
+    pub async fn get_agentic_score_evaluation(
+        &self,
+        applied_at: &str,
+    ) -> Result<Option<(f64, f64, i64)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Count post-apply runs
+        let post_count_row = conn
+            .query_one(
+                r#"SELECT COUNT(*)::bigint FROM learning_outcomes
+                   WHERE created_at > $1 AND composite_agentic_score IS NOT NULL
+                     AND (iterations IS NULL OR iterations > 0)"#,
+                &[&applied_at],
+            )
+            .await
+            .map_err(|e| format!("PG agentic score post count: {}", e))?;
+        let post_count: i64 = post_count_row.get(0);
+
+        if post_count < 5 {
+            return Ok(None);
+        }
+
+        // Pre-apply average
+        let pre_row = conn
+            .query_one(
+                r#"SELECT AVG(composite_agentic_score)::double precision FROM learning_outcomes
+                   WHERE created_at <= $1 AND composite_agentic_score IS NOT NULL
+                     AND (iterations IS NULL OR iterations > 0)"#,
+                &[&applied_at],
+            )
+            .await
+            .map_err(|e| format!("PG agentic score pre avg: {}", e))?;
+        let pre_avg: Option<f64> = pre_row.get(0);
+
+        // Post-apply average
+        let post_row = conn
+            .query_one(
+                r#"SELECT AVG(composite_agentic_score)::double precision FROM learning_outcomes
+                   WHERE created_at > $1 AND composite_agentic_score IS NOT NULL
+                     AND (iterations IS NULL OR iterations > 0)"#,
+                &[&applied_at],
+            )
+            .await
+            .map_err(|e| format!("PG agentic score post avg: {}", e))?;
+        let post_avg: Option<f64> = post_row.get(0);
+
+        match (pre_avg, post_avg) {
+            (Some(pre), Some(post)) if pre > 0.0 => Ok(Some((pre, post, post_count))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Update recommendation outcome with agentic score evaluation.
+    pub async fn update_recommendation_outcome_json(
+        &self,
+        recommendation_id: &str,
+        outcome_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE meta_optimizer_recommendations SET outcome_after_apply = $1 WHERE id = $2",
+            &[&outcome_json, &recommendation_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_recommendation_outcome_json: {}", e))?;
+        Ok(())
+    }
+
+    /// Update recommendation status with applied_at timestamp.
+    pub async fn apply_recommendation_with_timestamp(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE meta_optimizer_recommendations SET status = 'applied', applied_at = $1 WHERE id = $2 AND status IN ('pending', 'canary')",
+            &[&now, &recommendation_id],
+        )
+        .await
+        .map_err(|e| format!("PG apply_recommendation_with_timestamp: {}", e))?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Snapshot capture (PG-primary)
+    // ========================================================================
+
+    /// Capture a performance snapshot from learning_outcomes + phase_token_usage (PG-primary).
+    pub async fn pg_capture_snapshot(
+        &self,
+        snapshot_type: &str,
+        recommendation_id: Option<&str>,
+        lookback_days: i64,
+        category_filter: &str,
+    ) -> Result<MetaOptimizerSnapshot, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let id = format!("mos-{}", uuid::Uuid::new_v4());
+        let now = chrono::Utc::now();
+        let period_end = now.to_rfc3339();
+        let period_start = (now - chrono::Duration::days(lookback_days)).to_rfc3339();
+
+        // Aggregate metrics from learning_outcomes
+        let agg_sql = format!(
+            r#"SELECT
+                   COUNT(*),
+                   SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN lo.status = 'failure' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN lo.status = 'partial' THEN 1 ELSE 0 END),
+                   COALESCE(AVG(lo.duration_secs), 0.0),
+                   COALESCE(AVG(lo.iterations::double precision), 0.0)
+               FROM learning_outcomes lo
+               JOIN task_runs tr ON lo.task_id = tr.id
+               WHERE lo.created_at > $1
+                 AND (lo.iterations IS NULL OR lo.iterations > 0){}"#,
+            category_filter
+        );
+        let agg_row = conn.query_one(&agg_sql, &[&period_start])
+            .await.map_err(|e| format!("PG capture_snapshot agg: {}", e))?;
+        let total_runs: i64 = agg_row.get(0);
+        let successful_runs: i64 = agg_row.get(1);
+        let failed_runs: i64 = agg_row.get(2);
+        let partial_runs: i64 = agg_row.get(3);
+        let avg_duration: f64 = agg_row.get(4);
+        let avg_iterations: f64 = agg_row.get(5);
+
+        let success_rate = if total_runs > 0 {
+            successful_runs as f64 / total_runs as f64
+        } else {
+            0.0
+        };
+
+        // Average cost per run
+        let cost_sql = format!(
+            r#"SELECT COALESCE(AVG(run_cost), 0.0) FROM (
+                   SELECT lo.task_id, COALESCE(SUM(ptu.cost_cents), 0) as run_cost
+                   FROM learning_outcomes lo
+                   JOIN task_runs tr ON lo.task_id = tr.id
+                   LEFT JOIN phase_token_usage ptu ON ptu.task_run_id = lo.task_id
+                   WHERE lo.created_at > $1{}
+                   GROUP BY lo.task_id
+               ) sub"#,
+            category_filter
+        );
+        let cost_row = conn.query_one(&cost_sql, &[&period_start])
+            .await.map_err(|e| format!("PG capture_snapshot cost: {}", e))?;
+        let avg_cost_cents: f64 = cost_row.get(0);
+
+        // Spec compliance average
+        let sc_row = conn.query_one(
+            "SELECT AVG(overall_score) FROM spec_compliance_results WHERE created_at > $1",
+            &[&period_start],
+        ).await.ok();
+        let avg_spec_compliance: Option<f64> = sc_row.and_then(|r| r.get(0));
+
+        // Composite agentic score average
+        let cas_row = conn.query_one(
+            "SELECT AVG(composite_agentic_score) FROM learning_outcomes WHERE created_at > $1 AND composite_agentic_score IS NOT NULL",
+            &[&period_start],
+        ).await.ok();
+        let avg_composite_agentic_score: Option<f64> = cas_row.and_then(|r| r.get(0));
+
+        let metrics = crate::meta_optimizer::snapshots::SnapshotMetrics {
+            success_rate,
+            avg_duration_secs: avg_duration,
+            avg_iterations,
+            avg_cost_cents,
+            total_runs,
+            successful_runs,
+            failed_runs,
+            partial_runs,
+            avg_spec_compliance,
+            avg_composite_agentic_score,
+        };
+        let metrics_json = serde_json::to_string(&metrics)
+            .map_err(|e| format!("Failed to serialize metrics: {}", e))?;
+
+        // Per-architecture breakdown
+        let breakdown_sql = format!(
+            r#"SELECT lo.workflow_architecture, COUNT(*) as cnt,
+                      SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as sr,
+                      AVG(lo.duration_secs) as avg_dur,
+                      AVG(lo.iterations::double precision) as avg_iter
+               FROM learning_outcomes lo
+               JOIN task_runs tr ON lo.task_id = tr.id
+               WHERE lo.created_at > $1 AND lo.workflow_architecture IS NOT NULL
+                 AND (lo.iterations IS NULL OR lo.iterations > 0){}
+               GROUP BY lo.workflow_architecture"#,
+            category_filter
+        );
+        let breakdown_rows = conn.query(&breakdown_sql, &[&period_start])
+            .await.map_err(|e| format!("PG capture_snapshot breakdown: {}", e))?;
+        let breakdown_json: Option<String> = if breakdown_rows.is_empty() {
+            None
+        } else {
+            let entries: Vec<serde_json::Value> = breakdown_rows.iter().map(|row| {
+                serde_json::json!({
+                    "architecture": row.get::<_, String>(0),
+                    "count": row.get::<_, i64>(1),
+                    "success_rate": row.get::<_, f64>(2),
+                    "avg_duration_secs": row.get::<_, f64>(3),
+                    "avg_iterations": row.get::<_, f64>(4),
+                })
+            }).collect();
+            Some(serde_json::to_string(&entries)
+                .map_err(|e| format!("Failed to serialize breakdown: {}", e))?)
+        };
+
+        // Insert snapshot row
+        conn.execute(
+            r#"INSERT INTO meta_optimizer_snapshots
+               (id, snapshot_type, period_start, period_end, metrics_json, breakdown_json,
+                recommendation_id, runs_included, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &snapshot_type,
+                &period_start,
+                &period_end,
+                &metrics_json,
+                &breakdown_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &recommendation_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &total_runs,
+                &period_end,
+            ],
+        ).await.map_err(|e| format!("PG capture_snapshot insert: {}", e))?;
+
+        info!(
+            "PG: Captured {} snapshot {} ({} runs, success_rate={:.1}%)",
+            snapshot_type, id, total_runs, success_rate * 100.0
+        );
+
+        Ok(MetaOptimizerSnapshot {
+            id,
+            snapshot_type: snapshot_type.to_string(),
+            period_start,
+            period_end: period_end.clone(),
+            metrics_json,
+            breakdown_json,
+            recommendation_id: recommendation_id.map(|s| s.to_string()),
+            runs_included: total_runs,
+            created_at: period_end,
+        })
+    }
+
+    /// Get recommendation target_agent and applied_at for outcome evaluation.
+    pub async fn get_recommendation_outcome_info(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_one(
+            "SELECT target_agent, applied_at FROM meta_optimizer_recommendations WHERE id = $1",
+            &[&recommendation_id],
+        ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
+        Ok((row.get(0), row.get(1)))
+    }
+
+    /// Get a post_apply snapshot for a recommendation.
+    pub async fn get_post_apply_snapshot(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<Option<MetaOptimizerSnapshot>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
+                      breakdown_json, recommendation_id, runs_included, created_at
+               FROM meta_optimizer_snapshots
+               WHERE recommendation_id = $1 AND snapshot_type = 'post_apply'
+               ORDER BY created_at DESC LIMIT 1"#,
+            &[&recommendation_id],
+        ).await.map_err(|e| format!("PG get_post_apply_snapshot: {}", e))?;
+        Ok(row.map(|r| MetaOptimizerSnapshot {
+            id: r.get(0), snapshot_type: r.get(1), period_start: r.get(2),
+            period_end: r.get(3), metrics_json: r.get(4), breakdown_json: r.get(5),
+            recommendation_id: r.get(6), runs_included: r.get(7), created_at: r.get(8),
+        }))
+    }
+
+    /// Get agent trace aggregates for a time period (PG equivalent of pipeline_traces::get_agent_aggregates_for_period).
+    pub async fn get_agent_aggregates_for_period(
+        &self,
+        agent_type: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<crate::database::pipeline_traces::AgentTraceAggregate>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_one(
+            r#"SELECT
+                agent_type,
+                COUNT(*) as run_count,
+                AVG(duration_ms) as avg_duration_ms,
+                AVG(cost_usd) as avg_cost_usd,
+                SUM(CASE WHEN downstream_success = 1 THEN 1 ELSE 0 END) as success_count,
+                SUM(CASE WHEN downstream_success = 0 THEN 1 ELSE 0 END) as failure_count,
+                AVG(tokens_in::double precision) as avg_tokens_in,
+                AVG(tokens_out::double precision) as avg_tokens_out
+            FROM pipeline_agent_traces
+            WHERE agent_type = $1 AND created_at >= $2 AND created_at <= $3"#,
+            &[&agent_type, &start, &end],
+        ).await.map_err(|e| format!("PG get_agent_aggregates_for_period: {}", e))?;
+        let run_count: i64 = row.get(1);
+        if run_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::database::pipeline_traces::AgentTraceAggregate {
+            agent_type: row.get(0),
+            run_count,
+            avg_duration_ms: row.get(2),
+            avg_cost_usd: row.get(3),
+            success_count: row.get(4),
+            failure_count: row.get(5),
+            avg_tokens_in: row.get(6),
+            avg_tokens_out: row.get(7),
+        }))
+    }
+
+    /// Record prompt evolution with full parameters (including baseline_prompt_hash and consecutive_rejections).
+    pub async fn record_prompt_evolution_full(
+        &self,
+        id: &str,
+        agent_type: &str,
+        parent_variant_id: Option<&str>,
+        variant_id: &str,
+        recommendation_id: Option<&str>,
+        critique: Option<&str>,
+        changes_summary: Option<&str>,
+        score_before: Option<f64>,
+        baseline_prompt_hash: Option<&str>,
+        consecutive_rejections: i32,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO prompt_evolution
+               (id, agent_type, parent_variant_id, variant_id, recommendation_id,
+                critique, changes_summary, canary_verdict, score_before, score_after,
+                baseline_prompt_hash, consecutive_rejections, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, NULL, $9, $10, $11)
+               ON CONFLICT (id) DO NOTHING"#,
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &agent_type,
+                &parent_variant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &variant_id,
+                &recommendation_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &critique as &(dyn tokio_postgres::types::ToSql + Sync),
+                &changes_summary as &(dyn tokio_postgres::types::ToSql + Sync),
+                &score_before as &(dyn tokio_postgres::types::ToSql + Sync),
+                &baseline_prompt_hash as &(dyn tokio_postgres::types::ToSql + Sync),
+                &consecutive_rejections,
+                &now,
+            ],
+        ).await.map_err(|e| format!("PG record_prompt_evolution_full: {}", e))?;
+        info!("PG: Recorded prompt evolution {} for agent {} (consecutive_rejections={})", id, agent_type, consecutive_rejections);
+        Ok(())
+    }
+
+    /// Look up recommendation_id for a variant (used by update_verdict_by_variant dual-write).
+    pub async fn get_recommendation_id_for_variant(
+        &self,
+        variant_id: &str,
+        verdict: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT recommendation_id FROM prompt_evolution WHERE variant_id = $1 AND canary_verdict = $2 ORDER BY created_at DESC LIMIT 1",
+            &[&variant_id, &verdict],
+        ).await.map_err(|e| format!("PG get_recommendation_id_for_variant: {}", e))?;
+        Ok(row.and_then(|r| r.get(0)))
+    }
+
+    // ========================================================================
+    // Trigger — should_launch_optimizer (PG-primary)
+    // ========================================================================
+
+    /// Check whether a specific optimizer should be launched (PG version).
+    ///
+    /// Guards:
+    /// 1. No optimizer of this type already running
+    /// 2. Meta-optimizer enabled in settings
+    /// 3. Threshold met: completed runs since last optimizer run >= N
+    /// 4. Source run is not meta_optimizer/fixer/reflection/follow_up
+    pub async fn should_launch_optimizer(
+        &self,
+        optimizer_type: &str,
+        source_task_run_id: &str,
+    ) -> Result<bool, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Guard 0: Check if any meta-optimizer is already running
+        let row = conn.query_one(
+            "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_meta_optimizer = true AND workflow_type = 'unified'",
+            &[],
+        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+        let has_running: bool = row.get(0);
+        if has_running {
+            return Ok(false);
+        }
+
+        // Guard 1: Source must not be a meta-optimizer, fixer, reflection, or follow-up run
+        let row = conn.query_opt(
+            r#"SELECT (COALESCE(is_meta_optimizer, false)
+                    OR COALESCE(is_fixer, false)
+                    OR COALESCE(is_reflection, false)
+                    OR COALESCE(is_follow_up, false))
+               FROM task_runs WHERE id = $1"#,
+            &[&source_task_run_id],
+        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+        let is_excluded: bool = row.map(|r| r.get(0)).unwrap_or(true);
+        if is_excluded {
+            return Ok(false);
+        }
+
+        // Guard 2: Meta-optimizer must be enabled in settings
+        let dev_mode_row = conn.query_opt(
+            "SELECT value FROM settings WHERE key = 'dev_mode'",
+            &[],
+        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+
+        let (enabled, threshold) = match dev_mode_row {
+            Some(r) => {
+                let val: String = r.get(0);
+                let parsed = serde_json::from_str::<serde_json::Value>(&val).ok();
+                let en = parsed.as_ref()
+                    .and_then(|v| v.get("meta_optimizer_enabled"))
+                    .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true" || s == "1")))
+                    .unwrap_or(true);
+                let th = parsed.as_ref()
+                    .and_then(|v| v.get("meta_optimizer_threshold"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(2);
+                (en, th)
+            }
+            None => (true, 2i64),
+        };
+        if !enabled {
+            return Ok(false);
+        }
+
+        // Guard 3: Threshold check
+        let last_run_row = conn.query_opt(
+            "SELECT MAX(created_at) FROM meta_optimizer_runs WHERE optimizer_type = $1 AND status = 'complete'",
+            &[&optimizer_type],
+        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+        let last_optimizer_run_at: Option<String> = last_run_row.and_then(|r| r.get(0));
+
+        let completed_since: i64 = if let Some(ref since) = last_optimizer_run_at {
+            let row = conn.query_one(
+                r#"SELECT COUNT(*) FROM task_runs
+                   WHERE status IN ('complete', 'failed')
+                     AND COALESCE(is_meta_optimizer, false) = false
+                     AND COALESCE(is_fixer, false) = false
+                     AND COALESCE(is_reflection, false) = false
+                     AND COALESCE(is_follow_up, false) = false
+                     AND workflow_type = 'unified'
+                     AND created_at > $1"#,
+                &[since],
+            ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+            row.get(0)
+        } else {
+            let row = conn.query_one(
+                r#"SELECT COUNT(*) FROM task_runs
+                   WHERE status IN ('complete', 'failed')
+                     AND COALESCE(is_meta_optimizer, false) = false
+                     AND COALESCE(is_fixer, false) = false
+                     AND COALESCE(is_reflection, false) = false
+                     AND COALESCE(is_follow_up, false) = false
+                     AND workflow_type = 'unified'"#,
+                &[],
+            ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+            row.get(0)
+        };
+
+        Ok(completed_since >= threshold)
+    }
+
+    // ========================================================================
+    // Golden dataset — build from history (PG-primary)
+    // ========================================================================
+
+    /// Query golden entries from pipeline_agent_traces + task_runs.
+    pub async fn build_golden_entries_from_history(
+        &self,
+        agent_type: &str,
+        max_entries: i64,
+    ) -> Result<Vec<(String, String, i64, bool)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let period_start = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+
+        let rows = conn.query(
+            r#"SELECT pat.task_run_id, tr.task_name, pat.duration_ms, pat.downstream_success
+               FROM pipeline_agent_traces pat
+               JOIN task_runs tr ON pat.task_run_id = tr.id
+               WHERE pat.agent_type = $1
+                 AND pat.downstream_success = true
+                 AND pat.created_at > $2
+               ORDER BY pat.created_at DESC
+               LIMIT $3"#,
+            &[&agent_type, &period_start, &max_entries],
+        ).await.map_err(|e| format!("PG build_golden_entries: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            let task_run_id: String = r.get(0);
+            let task_name: String = r.get(1);
+            let duration_ms: i64 = r.get(2);
+            let success: bool = r.get::<_, Option<bool>>(3).unwrap_or(false);
+            (task_run_id, task_name, duration_ms, success)
+        }).collect())
+    }
+
+    // ========================================================================
+    // Prompt extraction — PG-primary queries
+    // ========================================================================
+
+    /// Extract prompt samples from recent runs (PG version).
+    pub async fn extract_prompt_samples(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String, f64, String, i64, f64)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn.query(
+            r#"SELECT
+                   ptu.task_run_id,
+                   ptu.phase,
+                   COALESCE(tr.workflow_name, ptu.phase) AS agent_type,
+                   COALESCE(lo.composite_agentic_score, 0.0) AS outcome_score,
+                   COALESCE(lo.status, tr.status) AS outcome_status,
+                   COALESCE(ptu.iteration, 0) AS iteration,
+                   COALESCE(ptu.cost_cents, 0)::float8 / 100.0 AS cost_usd
+               FROM phase_token_usage ptu
+               INNER JOIN task_runs tr ON tr.id = ptu.task_run_id
+               LEFT JOIN learning_outcomes lo ON lo.task_id = tr.id
+               WHERE tr.status IN ('complete', 'failed')
+                 AND COALESCE(tr.is_meta_optimizer, false) = false
+                 AND COALESCE(tr.is_fixer, false) = false
+                 AND COALESCE(tr.is_reflection, false) = false
+                 AND COALESCE(tr.is_follow_up, false) = false
+                 AND ptu.phase IN ('generation', 'verification', 'agentic')
+               ORDER BY outcome_score ASC
+               LIMIT $1"#,
+            &[&limit],
+        ).await.map_err(|e| format!("PG extract_prompt_samples: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            (
+                r.get::<_, String>(0),
+                r.get::<_, String>(1),
+                r.get::<_, String>(2),
+                r.get::<_, f64>(3),
+                r.get::<_, String>(4),
+                r.get::<_, i64>(5),
+                r.get::<_, f64>(6),
+            )
+        }).collect())
+    }
+
+    /// Collect failure and success evidence samples for a specific prompt group (PG version).
+    pub async fn collect_evidence_samples(
+        &self,
+        phase: &str,
+        agent_type: &str,
+        max_failures: i64,
+        max_successes: i64,
+    ) -> Result<(Vec<(String, String, String, f64, String, i64, f64)>, Vec<(String, String, String, f64, String, i64, f64)>), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let agent_filter = if agent_type.is_empty() {
+            String::new()
+        } else {
+            " AND COALESCE(tr.workflow_name, ptu.phase) = $3".to_string()
+        };
+
+        // Failures (score < 0.5)
+        let fail_sql = format!(
+            r#"SELECT
+                   ptu.task_run_id,
+                   ptu.phase,
+                   COALESCE(tr.workflow_name, ptu.phase),
+                   COALESCE(lo.composite_agentic_score, 0.0),
+                   COALESCE(lo.status, tr.status),
+                   COALESCE(ptu.iteration, 0),
+                   COALESCE(ptu.cost_cents, 0)::float8 / 100.0
+               FROM phase_token_usage ptu
+               INNER JOIN task_runs tr ON tr.id = ptu.task_run_id
+               LEFT JOIN learning_outcomes lo ON lo.task_id = tr.id
+               WHERE ptu.phase = $1
+                 AND tr.status IN ('complete', 'failed')
+                 AND COALESCE(tr.is_meta_optimizer, false) = false
+                 AND COALESCE(tr.is_fixer, false) = false
+                 AND COALESCE(lo.composite_agentic_score, 0.0) < 0.5
+                 {}
+               ORDER BY lo.created_at DESC
+               LIMIT $2"#,
+            agent_filter
+        );
+
+        let failures: Vec<(String, String, String, f64, String, i64, f64)> = if agent_type.is_empty() {
+            let rows = conn.query(&fail_sql, &[&phase, &max_failures])
+                .await.map_err(|e| format!("PG failures query: {}", e))?;
+            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
+        } else {
+            let rows = conn.query(&fail_sql, &[&phase, &max_failures, &agent_type])
+                .await.map_err(|e| format!("PG failures query: {}", e))?;
+            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
+        };
+
+        // Successes (score > 0.8)
+        let success_sql = format!(
+            r#"SELECT
+                   ptu.task_run_id,
+                   ptu.phase,
+                   COALESCE(tr.workflow_name, ptu.phase),
+                   COALESCE(lo.composite_agentic_score, 0.0),
+                   COALESCE(lo.status, tr.status),
+                   COALESCE(ptu.iteration, 0),
+                   COALESCE(ptu.cost_cents, 0)::float8 / 100.0
+               FROM phase_token_usage ptu
+               INNER JOIN task_runs tr ON tr.id = ptu.task_run_id
+               LEFT JOIN learning_outcomes lo ON lo.task_id = tr.id
+               WHERE ptu.phase = $1
+                 AND tr.status IN ('complete', 'failed')
+                 AND COALESCE(tr.is_meta_optimizer, false) = false
+                 AND COALESCE(tr.is_fixer, false) = false
+                 AND COALESCE(lo.composite_agentic_score, 0.0) > 0.8
+                 {}
+               ORDER BY lo.created_at DESC
+               LIMIT $2"#,
+            agent_filter
+        );
+
+        let successes: Vec<(String, String, String, f64, String, i64, f64)> = if agent_type.is_empty() {
+            let rows = conn.query(&success_sql, &[&phase, &max_successes])
+                .await.map_err(|e| format!("PG successes query: {}", e))?;
+            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
+        } else {
+            let rows = conn.query(&success_sql, &[&phase, &max_successes, &agent_type])
+                .await.map_err(|e| format!("PG successes query: {}", e))?;
+            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
+        };
+
+        Ok((failures, successes))
+    }
+
+    // ========================================================================
+    // Comparison bridge — most recent active workflow
+    // ========================================================================
+
+    /// Get the most recent active (non-deleted) workflow ID.
+    pub async fn get_most_recent_workflow_id(&self) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT id FROM unified_workflows WHERE is_deleted = false ORDER BY updated_at DESC LIMIT 1",
+            &[],
+        ).await.map_err(|e| format!("PG get_most_recent_workflow_id: {}", e))?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    // ========================================================================
+    // Failure analysis — PG-primary complex analytics
+    // ========================================================================
+
+    /// Get comprehensive failure analysis over a time period (PG version).
+    pub async fn get_failure_analysis(
+        &self,
+        since: &str,
+        category: &crate::meta_optimizer::types::WorkflowCategory,
+    ) -> Result<crate::meta_optimizer::failure_analysis::FailureAnalysis, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let filter = category.pg_sql_filter("tr");
+        let task_runs_filter = category.pg_sql_filter("task_runs");
+
+        // Run totals
+        let total_runs: i64 = conn.query_one(
+            &format!("SELECT COUNT(*) FROM task_runs WHERE created_at > $1{}", task_runs_filter.replace("task_runs.", "")),
+            &[&since],
+        ).await.map(|r| r.get(0)).unwrap_or(0);
+
+        let failed_runs: i64 = conn.query_one(
+            &format!("SELECT COUNT(*) FROM task_runs WHERE status IN ('failed', 'stopped') AND created_at > $1{}", task_runs_filter.replace("task_runs.", "")),
+            &[&since],
+        ).await.map(|r| r.get(0)).unwrap_or(0);
+
+        let failure_rate = if total_runs > 0 { 100.0 * failed_runs as f64 / total_runs as f64 } else { 0.0 };
+
+        // Abort reasons from learning_outcomes
+        let mut abort_reasons: Vec<crate::meta_optimizer::failure_analysis::AbortReason> = Vec::new();
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT
+                     CASE
+                         WHEN lo.status = 'partial' THEN 'stopped_by_user'
+                         WHEN lo.error_type IS NOT NULL THEN lo.error_type
+                         ELSE 'unknown_failure'
+                     END as reason,
+                     COUNT(*) as count
+                 FROM learning_outcomes lo
+                 JOIN task_runs tr ON lo.task_id = tr.id
+                 WHERE lo.status != 'success' AND lo.created_at > $1{}
+                 GROUP BY reason
+                 ORDER BY count DESC"#,
+                filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                abort_reasons.push(crate::meta_optimizer::failure_analysis::AbortReason {
+                    reason: r.get(0), count: r.get(1), percentage: 0.0,
+                });
+            }
+        }
+
+        // Abort reasons from task_runs
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT
+                     CASE
+                         WHEN error_message LIKE '%max iterations%' OR error_message LIKE '%max_iterations%' OR error_message LIKE '%iteration budget%' OR error_message LIKE '%iterations exhausted%' THEN 'max_iterations_reached'
+                         WHEN error_message LIKE '%Max sessions%' OR error_message LIKE '%sessions exhausted%' THEN 'max_sessions_reached'
+                         WHEN error_message LIKE '%setup failed%' THEN 'setup_failure'
+                         WHEN error_message LIKE '%Unfixable errors%' THEN 'unfixable_errors'
+                         WHEN error_message LIKE '%stopped%' OR status = 'stopped' THEN 'stopped_by_user'
+                         WHEN error_message LIKE '%Critical failure%' OR error_message LIKE '%critical%' THEN 'critical_failure'
+                         WHEN error_message LIKE '%no iterations ran%' THEN 'zero_iterations'
+                         WHEN error_message LIKE '%interrupted%' OR error_message LIKE '%restart%' THEN 'interrupted'
+                         WHEN error_message IS NOT NULL THEN 'runtime_error'
+                         WHEN goal_achieved = 0 THEN 'goal_not_achieved'
+                         ELSE 'unknown'
+                     END as reason,
+                     COUNT(*) as count
+                 FROM task_runs
+                 WHERE status IN ('failed', 'stopped') AND created_at > $1{}
+                 GROUP BY reason
+                 ORDER BY count DESC"#,
+                task_runs_filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                let reason: String = r.get(0);
+                let count: i64 = r.get(1);
+                if let Some(existing) = abort_reasons.iter_mut().find(|a| a.reason == reason) {
+                    existing.count += count;
+                } else {
+                    abort_reasons.push(crate::meta_optimizer::failure_analysis::AbortReason {
+                        reason, count, percentage: 0.0,
+                    });
+                }
+            }
+        }
+        let total_abort: i64 = abort_reasons.iter().map(|r| r.count).sum();
+        if total_abort > 0 {
+            for r in &mut abort_reasons { r.percentage = 100.0 * r.count as f64 / total_abort as f64; }
+        }
+        abort_reasons.sort_by(|a, b| b.count.cmp(&a.count));
+
+        // Verification failures
+        let mut verification_failures = Vec::new();
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT vpr.iteration,
+                     SUM(vpr.total_steps) as total_checks,
+                     SUM(vpr.failed_steps) as failed_checks,
+                     ROUND(100.0 * SUM(vpr.failed_steps) / NULLIF(SUM(vpr.total_steps), 0), 1) as failure_rate,
+                     SUM(CASE WHEN vpr.critical_failure THEN 1 ELSE 0 END) as critical_failure_count
+                 FROM workflow_verification_phase_results vpr
+                 JOIN task_runs tr ON vpr.task_run_id = tr.id
+                 WHERE vpr.created_at > $1{}
+                 GROUP BY vpr.iteration ORDER BY vpr.iteration"#,
+                filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                verification_failures.push(crate::meta_optimizer::failure_analysis::VerificationFailurePattern {
+                    iteration: r.get::<_, i64>(0),
+                    total_checks: r.get::<_, i64>(1),
+                    failed_checks: r.get::<_, i64>(2),
+                    failure_rate: r.get::<_, Option<f64>>(3).unwrap_or(0.0),
+                    critical_failure_count: r.get::<_, i64>(4),
+                });
+            }
+        }
+
+        // Finding distribution
+        let mut finding_distribution = Vec::new();
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT trf.category, COUNT(*) as count
+                 FROM task_run_findings trf
+                 JOIN task_runs tr ON trf.task_run_id = tr.id
+                 WHERE trf.detected_at > $1{}
+                 GROUP BY trf.category ORDER BY count DESC"#,
+                filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                finding_distribution.push(crate::meta_optimizer::failure_analysis::CategoryCount {
+                    category: r.get(0), count: r.get(1),
+                });
+            }
+        }
+
+        // Severity distribution
+        let mut severity_distribution = Vec::new();
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT trf.severity, COUNT(*) as count
+                 FROM task_run_findings trf
+                 JOIN task_runs tr ON trf.task_run_id = tr.id
+                 WHERE trf.detected_at > $1{}
+                 GROUP BY trf.severity
+                 ORDER BY CASE trf.severity
+                     WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3
+                     WHEN 'low' THEN 4 WHEN 'info' THEN 5 END"#,
+                filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                severity_distribution.push(crate::meta_optimizer::failure_analysis::CategoryCount {
+                    category: r.get(0), count: r.get(1),
+                });
+            }
+        }
+
+        // Fix effectiveness
+        let mut reflection_fix_effectiveness = Vec::new();
+        if let Ok(rows) = conn.query(
+            r#"SELECT fix_type, source_agent,
+                 COUNT(*) as total,
+                 SUM(CASE WHEN effectiveness IS NULL OR effectiveness = 'effective' THEN 1 ELSE 0 END) as effective,
+                 SUM(CASE WHEN effectiveness = 'ineffective' THEN 1 ELSE 0 END) as ineffective,
+                 SUM(CASE WHEN effectiveness = 'caused_regression' THEN 1 ELSE 0 END) as caused_regression
+             FROM reflection_fixes
+             WHERE created_at > $1
+             GROUP BY fix_type, source_agent ORDER BY total DESC"#,
+            &[&since],
+        ).await {
+            for r in &rows {
+                let total: i64 = r.get(2);
+                let effective: i64 = r.get(3);
+                reflection_fix_effectiveness.push(crate::meta_optimizer::failure_analysis::FixEffectivenessRecord {
+                    fix_type: r.get(0),
+                    source_agent: r.get(1),
+                    total,
+                    effective,
+                    ineffective: r.get(4),
+                    caused_regression: r.get(5),
+                    effectiveness_rate: if total > 0 { 100.0 * effective as f64 / total as f64 } else { 0.0 },
+                });
+            }
+        }
+
+        // Generation quality
+        let mut generation_quality = crate::meta_optimizer::failure_analysis::GenerationQualityMetrics {
+            total_feedback: 0, edits: 0, deletes: 0, avg_rating: None,
+            most_edited_fields: Vec::new(), delete_reasons: Vec::new(),
+        };
+        if let Ok(r) = conn.query_one(
+            r#"SELECT COUNT(*), SUM(CASE WHEN feedback_type = 'edit' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN feedback_type = 'delete' THEN 1 ELSE 0 END),
+                 AVG(CASE WHEN feedback_type = 'rating' THEN rating END)
+             FROM workflow_generation_feedback WHERE created_at > $1"#,
+            &[&since],
+        ).await {
+            generation_quality.total_feedback = r.get(0);
+            generation_quality.edits = r.get(1);
+            generation_quality.deletes = r.get(2);
+            generation_quality.avg_rating = r.get(3);
+        }
+        if let Ok(rows) = conn.query(
+            r#"SELECT edited_field, COUNT(*) FROM workflow_generation_feedback
+             WHERE feedback_type = 'edit' AND edited_field IS NOT NULL AND created_at > $1
+             GROUP BY edited_field ORDER BY COUNT(*) DESC LIMIT 10"#,
+            &[&since],
+        ).await {
+            generation_quality.most_edited_fields = rows.iter().map(|r| crate::meta_optimizer::failure_analysis::CategoryCount {
+                category: r.get(0), count: r.get(1),
+            }).collect();
+        }
+        if let Ok(rows) = conn.query(
+            r#"SELECT COALESCE(delete_reason, 'unspecified'), COUNT(*) FROM workflow_generation_feedback
+             WHERE feedback_type = 'delete' AND created_at > $1
+             GROUP BY COALESCE(delete_reason, 'unspecified') ORDER BY COUNT(*) DESC"#,
+            &[&since],
+        ).await {
+            generation_quality.delete_reasons = rows.iter().map(|r| crate::meta_optimizer::failure_analysis::CategoryCount {
+                category: r.get(0), count: r.get(1),
+            }).collect();
+        }
+
+        // Pipeline agent failures
+        let mut pipeline_agent_failures = Vec::new();
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT pat.agent_type,
+                     COUNT(*) as total_runs,
+                     SUM(CASE WHEN pat.downstream_success = false THEN 1 ELSE 0 END) as failures,
+                     AVG(pat.duration_ms) as avg_duration_ms,
+                     AVG(pat.cost_usd) as avg_cost_usd
+                 FROM pipeline_agent_traces pat
+                 JOIN task_runs tr ON pat.task_run_id = tr.id
+                 WHERE pat.created_at > $1 AND pat.downstream_success IS NOT NULL{}
+                 GROUP BY pat.agent_type ORDER BY pat.agent_type"#,
+                filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                let total_runs: i64 = r.get(1);
+                let failures: i64 = r.get(2);
+                pipeline_agent_failures.push(crate::meta_optimizer::failure_analysis::PipelineAgentFailureRecord {
+                    agent_type: r.get(0),
+                    total_runs,
+                    failures,
+                    failure_rate: if total_runs > 0 { 100.0 * failures as f64 / total_runs as f64 } else { 0.0 },
+                    avg_duration_ms: r.get::<_, Option<f64>>(3).unwrap_or(0.0),
+                    avg_cost_usd: r.get::<_, Option<f64>>(4).unwrap_or(0.0),
+                });
+            }
+        }
+
+        // Recurring issues
+        let mut recurring_issues = Vec::new();
+        if let Ok(rows) = conn.query(
+            &format!(
+                r#"SELECT trf.signature_hash, trf.title, trf.category, trf.severity,
+                     COUNT(*) as occurrence_count, MAX(trf.detected_at) as last_seen
+                 FROM task_run_findings trf
+                 JOIN task_runs tr ON trf.task_run_id = tr.id
+                 WHERE trf.detected_at > $1 AND trf.signature_hash IS NOT NULL{}
+                 GROUP BY trf.signature_hash, trf.title, trf.category, trf.severity
+                 HAVING COUNT(*) >= 2 ORDER BY occurrence_count DESC LIMIT 20"#,
+                filter
+            ),
+            &[&since],
+        ).await {
+            for r in &rows {
+                recurring_issues.push(crate::meta_optimizer::failure_analysis::RecurringIssue {
+                    signature_hash: r.get(0), title: r.get(1), category: r.get(2),
+                    severity: r.get(3), occurrence_count: r.get(4), last_seen: r.get(5),
+                });
+            }
+        }
+
+        Ok(crate::meta_optimizer::failure_analysis::FailureAnalysis {
+            period_days: 0, // caller sets this
+            total_runs,
+            failed_runs,
+            failure_rate,
+            abort_reasons,
+            verification_failures,
+            finding_distribution,
+            severity_distribution,
+            reflection_fix_effectiveness,
+            generation_quality,
+            pipeline_agent_failures,
+            recurring_issues,
+            agentic_metric_summary: Vec::new(), // caller fills this
+        })
+    }
 }

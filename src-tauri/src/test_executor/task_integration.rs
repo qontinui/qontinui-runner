@@ -266,55 +266,29 @@ pub fn create_findings_for_failures(
     }
 }
 
-/// Insert a test failure finding into the database
+/// Insert a test failure finding into the database via PG.
+/// Uses block_in_place to call the async PG method from sync context.
 fn insert_test_failure_finding(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     task_run_id: &str,
     session_num: i32,
     title: &str,
     description: &str,
     test_name: &str,
 ) -> Result<String, String> {
-    db.with_conn(|conn| {
-        let finding_id = uuid::Uuid::new_v4().to_string();
-        let signature = format!("test_failure:{}:{}", task_run_id, test_name);
-        let mut hasher = Sha256::new();
-        hasher.update(signature.as_bytes());
-        let signature_hash = format!("{:x}", hasher.finalize());
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // Check for existing finding with same signature
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT id FROM task_run_findings WHERE task_run_id = ? AND signature_hash = ? AND status NOT IN ('resolved', 'wont_fix')",
-                rusqlite::params![task_run_id, signature_hash],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-
-        // Insert new finding
-        conn.execute(
-            "INSERT INTO task_run_findings (
-                id, task_run_id, category, severity, signature_hash,
-                title, description, status, action_type, detected_in_session, detected_at
-            ) VALUES (?, ?, 'test_failure', 'high', ?, ?, ?, 'detected', 'auto_fix', ?, ?)",
-            rusqlite::params![
-                finding_id,
+    // PG-primary: use block_in_place since this is called from sync context within async runtime.
+    use crate::database::pg::PgDb;
+    let pg_db = PgDb::global();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            pg_db.insert_test_failure_finding(
                 task_run_id,
-                signature_hash,
+                session_num,
                 title,
                 description,
-                session_num,
-                now
-            ],
-        )
-        .map_err(|e| format!("Insert error: {}", e))?;
-
-        Ok(finding_id)
+                test_name,
+            ).await
+        })
     })
 }
 

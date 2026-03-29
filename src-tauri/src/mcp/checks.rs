@@ -207,6 +207,8 @@ pub async fn create_check_handler(
     info!("Creating check: {}", input.name);
     match state.app_state.pg_db.create_check(&input).await {
         Ok(check) => {
+            // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
+            crate::mcp::graph_api::invalidate_graph_cache(&state, "check_created").await;
             info!("Created check: {} ({})", check.name, check.id);
             Ok(Json(ApiResponse::success(check)))
         }

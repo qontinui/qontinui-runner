@@ -22,6 +22,7 @@
 
 pub mod commands;
 pub mod context_summarizer;
+pub mod diagnostician;
 pub mod fix_agent;
 pub mod intervention;
 pub mod loop_engine;

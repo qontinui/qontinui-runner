@@ -56,8 +56,15 @@ pub mod step_type_knowledge;
 pub mod hooks;
 pub mod comparison;
 pub mod tiered_info;
+pub mod adaptive_learning;
 
+use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
+
+/// Global PgDb instance, set once during app initialization.
+/// Allows sync-context code (thread spawns, closures) to access PG
+/// without threading Arc<PgDb> through every call chain.
+static GLOBAL_PG_DB: OnceLock<Arc<PgDb>> = OnceLock::new();
 
 /// PostgreSQL connection pool backed by deadpool-postgres.
 pub struct PgDb {
@@ -65,6 +72,28 @@ pub struct PgDb {
 }
 
 impl PgDb {
+    /// Set the global PgDb instance. Call once during app initialization.
+    /// Warns and ignores if called more than once.
+    pub fn set_global(pg_db: Arc<PgDb>) {
+        GLOBAL_PG_DB
+            .set(pg_db)
+            .unwrap_or_else(|_| warn!("PgDb::set_global called more than once (ignored)"));
+    }
+
+    /// Get the global PgDb instance. Panics if not initialized.
+    /// Use from sync contexts where Arc<PgDb> is not threaded through.
+    pub fn global() -> Arc<PgDb> {
+        GLOBAL_PG_DB
+            .get()
+            .expect("PgDb::global() called before PgDb::set_global()")
+            .clone()
+    }
+
+    /// Try to get the global PgDb instance. Returns None if not initialized.
+    pub fn try_global() -> Option<Arc<PgDb>> {
+        GLOBAL_PG_DB.get().cloned()
+    }
+
     /// Connect to PostgreSQL using the given connection string.
     ///
     /// The connection string should NOT include search_path — it's set per-connection

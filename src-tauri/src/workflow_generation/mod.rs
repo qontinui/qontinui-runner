@@ -4,15 +4,23 @@
 //! natural language descriptions using AI.
 
 pub mod benchmark;
+pub mod complexity;
 pub mod decomposition;
+pub mod domain_generators;
+pub mod domain_routing;
 pub mod dependency_analysis;
 pub mod discovery_tools;
+pub mod evaluation;
 pub mod example_workflows;
+pub mod explorer;
 pub mod feedback;
+pub mod few_shot_curator;
 pub mod generator;
+pub mod gepa_optimizer;
 pub mod hardener;
 pub mod instrumentation;
 pub mod investigator;
+pub mod learning_orchestrator;
 pub mod meta_workflow;
 pub mod pattern_mining;
 pub mod pipeline_artifacts;
@@ -27,7 +35,12 @@ pub mod spec_synthesis;
 pub mod specification;
 pub mod step_type_knowledge;
 pub mod step_type_metadata;
+pub mod structured_output;
+pub mod template_library;
+pub mod template_lifecycle;
 pub mod template_promotion;
+pub mod prm_export;
+pub mod reflector;
 pub mod training_data;
 pub mod validation;
 pub mod verification_templates;

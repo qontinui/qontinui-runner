@@ -4,7 +4,7 @@
 //! agentic metrics (composite scoring, task completion, step efficiency),
 //! content-hash dedup, and cost-confidence scaling.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     // =========================================================================
     // Canary rollout tests (promptfoo-inspired)

@@ -19,8 +19,8 @@ use crate::reflection::architecture::{
 };
 use crate::reflection::causal::{self, CausalChain, CausalEvent, CausalSummary};
 use crate::reflection::context;
-use crate::reflection::prediction::{self, ConvergenceMetrics, PredictedFix, ScoredKnowledge};
-use crate::reflection::storage::{self, ReflectionRunSummary};
+use crate::reflection::prediction::{ConvergenceMetrics, PredictedFix, ScoredKnowledge};
+use crate::reflection::storage::ReflectionRunSummary;
 use crate::reflection::trends::{self, ComponentTrend, EffectivenessOverTime, WorkflowTrends};
 use crate::reflection::trigger::ConvergenceStatus;
 use crate::reflection::types::{
@@ -61,6 +61,9 @@ pub async fn create_fix_handler(
                 Json(api_error(format!("Failed to create reflection fix: {}", e))),
             )
         })?;
+
+    // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "create_fix").await;
 
     info!(
         "HTTP: Created reflection fix {} (type: {})",
@@ -155,6 +158,9 @@ pub async fn update_fix_status_handler(
             )
         })?;
 
+    // Invalidate graph cache — fix status change affects graph edges
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "update_fix_status").await;
+
     info!("HTTP: Updated fix {} status to {}", id, req.status);
 
     // Return updated fix
@@ -202,6 +208,9 @@ pub async fn update_fix_effectiveness_handler(
                 Json(api_error(format!("Failed to update effectiveness: {}", e))),
             )
         })?;
+
+    // Invalidate graph cache — effectiveness change affects graph weights
+    crate::mcp::graph_api::invalidate_graph_cache(&state, "update_fix_effectiveness").await;
 
     info!(
         "HTTP: Updated fix {} effectiveness to {}",
@@ -376,22 +385,13 @@ pub async fn evaluate_fixes_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<EvaluateQuery>,
 ) -> Result<Json<ApiResponse<EvaluateResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — batch effectiveness evaluation with multi-query analysis
-    let db = state.app_state.checkpoint_db.clone();
     let wf_name = query.workflow_name.clone();
-    let results = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::reflection::effectiveness::evaluate_pending_fixes(conn, &wf_name)
-        })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let results = state
+        .app_state
+        .pg_db
+        .evaluate_pending_fixes(&wf_name)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to evaluate fixes: {}", e))),
@@ -401,8 +401,13 @@ pub async fn evaluate_fixes_handler(
     let evaluated_count = results.len() as u32;
     let effective_count = results
         .iter()
-        .filter(|r| r.effectiveness == crate::reflection::types::FixEffectiveness::Effective)
+        .filter(|r| r.effectiveness.as_deref() == Some("effective"))
         .count() as u32;
+
+    // Batch effectiveness evaluation changes graph weights
+    if evaluated_count > 0 {
+        crate::mcp::graph_api::invalidate_graph_cache(&state, "evaluate_fixes").await;
+    }
 
     Ok(Json(ApiResponse::success(EvaluateResponse {
         evaluated_count,
@@ -551,20 +556,13 @@ pub async fn predict_fix_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PredictFixQuery>,
 ) -> Result<Json<ApiResponse<Option<PredictedFix>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — prediction model scoring with multi-table joins
-    let db = state.app_state.checkpoint_db.clone();
     let sig = query.signature_hash.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| prediction::predict_fix_for_error(conn, &sig))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let result = state
+        .app_state
+        .pg_db
+        .predict_fix_for_error(&sig)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to predict fix: {}", e))),
@@ -593,21 +591,14 @@ pub async fn convergence_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ConvergenceQuery>,
 ) -> Result<Json<ApiResponse<ConvergenceMetrics>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — convergence gradient computation over fix history
-    let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let scope = query.scope.clone();
-    let metrics = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| prediction::compute_convergence_score(conn, &wf, &scope))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let metrics = state
+        .app_state
+        .pg_db
+        .compute_convergence_score(&wf, &scope)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to compute convergence: {}", e))),
@@ -636,21 +627,14 @@ pub async fn change_velocity_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ChangeVelocityQuery>,
 ) -> Result<Json<ApiResponse<f64>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — change velocity computation over fix history
-    let db = state.app_state.checkpoint_db.clone();
     let component = query.component.clone();
     let window = query.window;
-    let velocity = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| prediction::compute_change_velocity(conn, &component, window))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let velocity = state
+        .app_state
+        .pg_db
+        .compute_change_velocity(&component, window)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(
@@ -682,21 +666,14 @@ pub async fn scored_knowledge_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ScoredKnowledgeQuery>,
 ) -> Result<Json<ApiResponse<Vec<ScoredKnowledge>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — relevance scoring with multi-table knowledge join
-    let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
     let limit = query.limit;
-    let scored = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| prediction::score_knowledge_relevance(conn, &wf, limit))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let scored = state
+        .app_state
+        .pg_db
+        .score_knowledge_relevance(&wf, limit)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to score knowledge: {}", e))),
@@ -755,28 +732,12 @@ pub async fn causal_chain_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalTraceQuery>,
 ) -> Result<Json<ApiResponse<CausalChain>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — recursive causal chain traversal (BFS/DFS)
-    let db = state.app_state.checkpoint_db.clone();
-    let event_type = query.event_type.clone();
-    let event_id = query.event_id.clone();
-    let direction = query.direction.clone();
-    let max_depth = query.max_depth;
-    let chain = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            if direction == "backward" {
-                causal::trace_causal_chain_backward(conn, &event_type, &event_id, max_depth)
-            } else {
-                causal::trace_causal_chain_forward(conn, &event_type, &event_id, max_depth)
-            }
-        })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
+    let pg = &state.app_state.pg_db;
+    let chain = if query.direction == "backward" {
+        pg.trace_causal_chain_backward(&query.event_type, &query.event_id, query.max_depth).await
+    } else {
+        pg.trace_causal_chain_forward(&query.event_type, &query.event_id, query.max_depth).await
+    }
     .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -794,21 +755,10 @@ pub async fn causal_events_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalWorkflowQuery>,
 ) -> Result<Json<ApiResponse<Vec<CausalEvent>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — causal event listing with workflow join
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let limit = query.limit;
-    let events = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| causal::get_causal_events_for_workflow(conn, &wf, limit))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let events = state.app_state.pg_db
+        .get_causal_events_typed(&query.workflow_name, query.limit)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get causal events: {}", e))),
@@ -825,26 +775,20 @@ pub async fn build_causal_links_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<BuildCausalLinksQuery>,
 ) -> Result<Json<ApiResponse<u32>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — automated causal link construction from task run data
-    let db = state.app_state.checkpoint_db.clone();
-    let trid = query.task_run_id.clone();
-    let wf = query.workflow_name.clone();
-    let count = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| causal::build_automated_causal_links(conn, &trid, &wf))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let count = state.app_state.pg_db
+        .build_automated_causal_links(&query.task_run_id, &query.workflow_name)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to build causal links: {}", e))),
             )
         })?;
+
+    // Causal links affect the knowledge graph topology
+    if count > 0 {
+        crate::mcp::graph_api::invalidate_graph_cache(&state, "build_causal_links").await;
+    }
 
     info!(
         "HTTP: Built {} automated causal links for task_run={}, workflow={}",
@@ -861,20 +805,10 @@ pub async fn causal_summary_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalWorkflowQuery>,
 ) -> Result<Json<ApiResponse<CausalSummary>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — aggregate causal statistics with multi-table joins
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let summary = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| causal::get_causal_summary(conn, &wf))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let summary = state.app_state.pg_db
+        .get_causal_summary(&query.workflow_name)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get causal summary: {}", e))),
@@ -938,24 +872,11 @@ pub async fn effectiveness_trend_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<EffectivenessTrendQuery>,
 ) -> Result<Json<ApiResponse<EffectivenessOverTime>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — time-bucketed effectiveness rate aggregation
-    let db = state.app_state.checkpoint_db.clone();
-    let bucket_type = query.bucket.as_deref().unwrap_or("week").to_string();
-    let time_range = query.time_range.clone();
-    let wf = query.workflow_name.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            trends::get_effectiveness_over_time(conn, &wf, &bucket_type, time_range.as_deref())
-        })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let bucket_type = query.bucket.as_deref().unwrap_or("week");
+    let result = state.app_state.pg_db
+        .get_effectiveness_over_time(&query.workflow_name, bucket_type, query.time_range.as_deref())
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(
@@ -975,20 +896,10 @@ pub async fn architecture_graph_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> Result<Json<ApiResponse<ComponentGraph>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — architecture component graph construction
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let graph = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| architecture::get_component_graph(conn, &wf))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let graph = state.app_state.pg_db
+        .get_component_graph(&query.workflow_name)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(
@@ -1008,20 +919,10 @@ pub async fn architecture_rebuild_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> Result<Json<ApiResponse<RebuildResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — rebuild architecture model from reflection data
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| architecture::rebuild_architecture_model(conn, &wf))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let result = state.app_state.pg_db
+        .rebuild_architecture_model(&query.workflow_name)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(
@@ -1046,21 +947,10 @@ pub async fn architecture_component_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ComponentQuery>,
 ) -> Result<Json<ApiResponse<ComponentDetails>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — component detail aggregation with fix history
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let path = query.path.clone();
-    let details = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| architecture::get_component_details(conn, &wf, &path))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let details = state.app_state.pg_db
+        .get_component_details(&query.workflow_name, &query.path)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get component details: {}", e))),
@@ -1077,21 +967,10 @@ pub async fn architecture_impact_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ImpactQuery>,
 ) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — BFS impact analysis (max 3 hops)
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let component = query.component.clone();
-    let impact = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| architecture::get_impact_analysis(conn, &wf, &component))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let impact = state.app_state.pg_db
+        .get_architecture_impact_analysis(&query.workflow_name, &query.component)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get impact analysis: {}", e))),
@@ -1106,21 +985,10 @@ pub async fn architecture_impact_graph_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ImpactQuery>,
 ) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — graph-enhanced BFS impact analysis
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = query.workflow_name.clone();
-    let component = query.component.clone();
-    let impact = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| architecture::get_impact_analysis_with_graph(conn, &wf, &component))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let impact = state.app_state.pg_db
+        .get_impact_analysis_with_graph(&query.workflow_name, &query.component)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(
@@ -1140,21 +1008,10 @@ pub async fn workflow_trends_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TrendsQuery>,
 ) -> Result<Json<ApiResponse<WorkflowTrends>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — workflow-level convergence trend computation
-    let db = state.app_state.checkpoint_db.clone();
-    let time_range = query.time_range.clone();
-    let wf = query.workflow_name.clone();
-    let wf_trends = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| trends::get_workflow_trends(conn, &wf, time_range.as_deref()))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let wf_trends = state.app_state.pg_db
+        .get_workflow_trends(&query.workflow_name, query.time_range.as_deref())
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get workflow trends: {}", e))),
@@ -1171,24 +1028,10 @@ pub async fn component_trend_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ComponentTrendQuery>,
 ) -> Result<Json<ApiResponse<ComponentTrend>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — per-component health trend computation
-    let db = state.app_state.checkpoint_db.clone();
-    let time_range = query.time_range.clone();
-    let wf = query.workflow_name.clone();
-    let path = query.path.clone();
-    let trend = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            trends::get_component_trend(conn, &wf, &path, time_range.as_deref())
-        })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let trend = state.app_state.pg_db
+        .get_component_trend(&query.workflow_name, &query.path, query.time_range.as_deref())
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get component trend: {}", e))),
@@ -1216,22 +1059,13 @@ pub async fn convergence_status_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ConvergenceStatusQuery>,
 ) -> Result<Json<ApiResponse<ConvergenceStatus>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // SQLite: complex function — convergence/stall analysis with recommendation generation
-    let db = state.app_state.checkpoint_db.clone();
     let wf = query.workflow_name.clone();
-    let status = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            crate::reflection::trigger::analyze_convergence_status(conn, &wf)
-        })
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
+    let status = state
+        .app_state
+        .pg_db
+        .analyze_convergence_status(&wf)
+        .await
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(

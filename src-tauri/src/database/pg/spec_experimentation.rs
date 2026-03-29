@@ -1601,4 +1601,497 @@ impl PgDb {
 
         Ok(())
     }
+
+    // ========================================================================
+    // Causal events (PG equivalents for reflection/causal.rs)
+    // ========================================================================
+
+    /// Insert a causal event into PG.
+    pub async fn insert_causal_event(
+        &self,
+        cause_type: &str,
+        cause_ref: &str,
+        effect_type: &str,
+        effect_ref: &str,
+        relationship: &str,
+        confidence: &str,
+        source: &str,
+        workflow_name: Option<&str>,
+        task_run_id: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"INSERT INTO causal_events
+               (id, cause_event_type, cause_event_ref, effect_event_type, effect_event_ref,
+                relationship, confidence, source, workflow_name, task_run_id, description, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               ON CONFLICT DO NOTHING"#,
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &cause_type, &cause_ref, &effect_type, &effect_ref,
+                &relationship, &confidence, &source,
+                &workflow_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &description as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG insert_causal_event: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Get causal events for a workflow.
+    pub async fn get_causal_events_for_workflow(
+        &self,
+        workflow_name: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::reflection::causal::CausalEvent>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, cause_event_type, cause_event_ref, effect_event_type,
+                          effect_event_ref, relationship, confidence, source,
+                          workflow_name, task_run_id, description, created_at::TEXT
+                   FROM causal_events
+                   WHERE workflow_name = $1
+                   ORDER BY created_at DESC
+                   LIMIT $2"#,
+                &[&workflow_name, &limit],
+            )
+            .await
+            .map_err(|e| format!("PG get_causal_events: {e}"))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| crate::reflection::causal::CausalEvent {
+                id: r.get(0),
+                cause_event_type: r.get(1),
+                cause_event_id: r.get(2),
+                effect_event_type: r.get(3),
+                effect_event_id: r.get(4),
+                relationship: r.get(5),
+                confidence: r.get(6),
+                source: r.get(7),
+                workflow_name: r.get(8),
+                task_run_id: r.get(9),
+                description: r.get(10),
+                created_at: r.get(11),
+            })
+            .collect())
+    }
+
+    /// Get impact analysis for a file in a workflow.
+    pub async fn get_impact_analysis(
+        &self,
+        workflow_name: &str,
+        file_path: &str,
+    ) -> Result<crate::reflection::architecture::ImpactAnalysis, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT component_path, relationship_type, impact_direction
+                   FROM architecture_components
+                   WHERE workflow_name = $1
+                     AND (component_path = $2 OR related_file = $2)
+                   LIMIT 20"#,
+                &[&workflow_name, &file_path],
+            )
+            .await
+            .unwrap_or_default();
+
+        let direct_impacts: Vec<crate::reflection::architecture::ImpactEntry> = rows
+            .iter()
+            .map(|r| crate::reflection::architecture::ImpactEntry {
+                component_path: r.get(0),
+                relationship_type: r.get(1),
+                strength: 1,
+            })
+            .collect();
+
+        let total = direct_impacts.len() as u32;
+
+        Ok(crate::reflection::architecture::ImpactAnalysis {
+            component: file_path.to_string(),
+            direct_impacts,
+            transitive_impacts: vec![],
+            total_impact_radius: total,
+            highest_risk_path: vec![],
+        })
+    }
+
+    // ========================================================================
+    // Known issues auto-detection
+    // ========================================================================
+
+    /// Check and promote recurring findings to known issues.
+    /// Returns IDs of newly created known issues.
+    pub async fn check_and_promote_recurring_findings(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+
+        // Find findings with 3+ occurrences across task runs
+        let rows = conn
+            .query(
+                r#"SELECT trf.signature_hash, trf.title, trf.description, COUNT(*) as cnt
+                   FROM task_run_findings trf
+                   WHERE trf.signature_hash IN (
+                       SELECT signature_hash FROM task_run_findings WHERE task_run_id = $1
+                   )
+                   AND trf.signature_hash IS NOT NULL
+                   AND trf.signature_hash NOT IN (
+                       SELECT COALESCE(signature_hash, '') FROM known_issues
+                       WHERE signature_hash IS NOT NULL
+                   )
+                   GROUP BY trf.signature_hash, trf.title, trf.description
+                   HAVING COUNT(*) >= 3
+                   LIMIT 10"#,
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG check_recurring: {e}"))?;
+
+        let mut new_ids = Vec::new();
+        for row in &rows {
+            let sig: String = row.get(0);
+            let title: String = row.get(1);
+            let description: Option<String> = row.get(2);
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+
+            let result = conn
+                .execute(
+                    r#"INSERT INTO known_issues
+                       (id, title, description, signature_hash, status, auto_detected, created_at)
+                       VALUES ($1, $2, $3, $4, 'new', true, $5)
+                       ON CONFLICT DO NOTHING"#,
+                    &[
+                        &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &title,
+                        &description as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &sig,
+                        &now,
+                    ],
+                )
+                .await;
+
+            if let Ok(n) = result {
+                if n > 0 {
+                    new_ids.push(id);
+                }
+            }
+        }
+
+        Ok(new_ids)
+    }
+
+    // ========================================================================
+    // Example workflows promotion
+    // ========================================================================
+
+    /// Try to promote a workflow to the example library on success.
+    pub async fn try_promote_on_success(&self, workflow_id: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+
+        // Check if workflow has enough successful runs
+        let success_count: i64 = conn
+            .query_one(
+                r#"SELECT COUNT(*) FROM task_runs
+                   WHERE workflow_name = (SELECT name FROM unified_workflows WHERE id = $1)
+                     AND status IN ('complete', 'completed')
+                     AND goal_achieved = true"#,
+                &[&workflow_id],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
+
+        if success_count >= 3 {
+            // Check if already in example library
+            let existing: bool = conn
+                .query_one(
+                    "SELECT COUNT(*) > 0 FROM example_workflows WHERE source_workflow_id = $1",
+                    &[&workflow_id],
+                )
+                .await
+                .map(|r| r.get(0))
+                .unwrap_or(true);
+
+            if !existing {
+                let id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().to_rfc3339();
+
+                let _ = conn
+                    .execute(
+                        r#"INSERT INTO example_workflows
+                           (id, source_workflow_id, success_count, promoted_at)
+                           VALUES ($1, $2, $3, $4)
+                           ON CONFLICT DO NOTHING"#,
+                        &[
+                            &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                            &workflow_id,
+                            &(success_count as i32),
+                            &now,
+                        ],
+                    )
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Workflow learning from learning_recorder.rs
+    // ========================================================================
+
+    /// Record workflow learning from a completed task outcome.
+    pub async fn record_workflow_learning_from_outcome(
+        &self,
+        outcome: &crate::orchestrator::learning_recorder::WorkflowOutcome,
+    ) -> Result<(), String> {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let tools_json = if !outcome.tools_used.is_empty() {
+            Some(serde_json::to_string(&outcome.tools_used).unwrap_or_default())
+        } else {
+            None
+        };
+        let files_json = if !outcome.files_modified.is_empty() {
+            Some(serde_json::to_string(&outcome.files_modified).unwrap_or_default())
+        } else {
+            None
+        };
+
+        self.record_learning_outcome(
+            &id,
+            &outcome.task_run_id,
+            &outcome.status,
+            Some(outcome.duration_secs),
+            Some(outcome.iterations as i32),
+            None, // strategy
+            tools_json.as_deref(),
+            files_json.as_deref(),
+            outcome.error_type.as_deref(),
+            outcome.error_message.as_deref(),
+            None, // feedback
+            outcome.workflow_architecture.as_deref(),
+            outcome.step_count,
+            outcome.verification_step_count,
+            outcome.agentic_step_count,
+            outcome.has_ui_bridge,
+            outcome.total_tokens.map(|t| t as i64),
+            outcome.total_cost_usd,
+            None, // technology_tags
+            None, // domain_tags
+            None, // complexity_tier
+        ).await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // LLM Judge input gathering
+    // ========================================================================
+
+    /// Gather input data for the LLM judge from PG.
+    pub async fn gather_llm_judge_input(
+        &self,
+        task_run_id: &str,
+    ) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+
+        let row = conn
+            .query_one(
+                r#"SELECT prompt, execution_steps_json, summary, goal_achieved, status
+                   FROM task_runs WHERE id = $1"#,
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("Failed to query task_run {}: {e}", task_run_id))?;
+
+        let prompt: Option<String> = row.get(0);
+        let execution_steps: Option<String> = row.get(1);
+        let summary: Option<String> = row.get(2);
+        let goal_achieved: Option<bool> = row.get(3);
+        let status: String = row.get(4);
+
+        // Build execution trace summary
+        let trace_rows = conn
+            .query(
+                r#"SELECT message FROM task_run_events
+                   WHERE task_run_id = $1
+                     AND event_type = 'step_execution'
+                   ORDER BY timestamp ASC
+                   LIMIT 20"#,
+                &[&task_run_id],
+            )
+            .await
+            .unwrap_or_default();
+
+        let execution_trace_summary = if !trace_rows.is_empty() {
+            let msgs: Vec<String> = trace_rows.iter().map(|r| r.get::<_, String>(0)).collect();
+            Some(msgs.join("\n"))
+        } else {
+            None
+        };
+
+        Ok(crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
+            task_run_id: task_run_id.to_string(),
+            task_prompt: prompt.unwrap_or_default(),
+            execution_plan: execution_steps,
+            outcome_summary: summary,
+            goal_achieved,
+            status,
+            execution_trace_summary,
+        })
+    }
+
+    // ========================================================================
+    // Error monitor context (PG equivalent of DebugContextCurator)
+    // ========================================================================
+
+    /// Build error monitor debug context for AI injection.
+    /// Returns formatted string or None if no errors.
+    pub async fn build_error_monitor_context(
+        &self,
+        task_run_id: Option<&str>,
+        max_errors: usize,
+    ) -> Result<Option<String>, String> {
+        let errors = self.get_unresolved_errors(task_run_id, max_errors).await?;
+
+        if errors.is_empty() {
+            return Ok(None);
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!("## Error Monitor ({} unresolved errors)", errors.len()));
+
+        for err in &errors {
+            let severity = err["severity"].as_str().unwrap_or("unknown");
+            let message = err["message"].as_str().unwrap_or("(no message)");
+            let file = err["file_path"].as_str().unwrap_or("");
+            let line_num = err["line_number"].as_i64().unwrap_or(0);
+
+            if file.is_empty() {
+                lines.push(format!("- [{}] {}", severity.to_uppercase(), message));
+            } else {
+                lines.push(format!("- [{}] {} ({}:{})", severity.to_uppercase(), message, file, line_num));
+            }
+        }
+
+        Ok(Some(lines.join("\n")))
+    }
+
+    // ========================================================================
+    // Generation rules from reflection fixes
+    // ========================================================================
+
+    /// Create generation rules from reflection fixes (PG equivalent).
+    /// Returns the number of rules created.
+    pub async fn create_rules_from_reflection_fixes(
+        &self,
+        fixes: &[crate::reflection::types::ReflectionFix],
+    ) -> Result<usize, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+        let mut count = 0;
+
+        for fix in fixes {
+            // Only high/medium confidence fixes
+            if !matches!(fix.confidence.as_str(), "high" | "medium") {
+                continue;
+            }
+            // Only qualifying fix types
+            if !matches!(
+                fix.fix_type.as_str(),
+                "instruction_clarification" | "workflow_step_rewrite" | "prompt_refinement"
+                    | "verification_improvement" | "error_handling"
+            ) {
+                continue;
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            let title = if fix.fix_description.len() > 100 {
+                format!("{}...", &fix.fix_description[..97])
+            } else {
+                fix.fix_description.clone()
+            };
+
+            let result = conn
+                .execute(
+                    r#"INSERT INTO generation_rules
+                       (id, rule_type, title, content, priority, is_active,
+                        source_fix_id, provenance, created_at)
+                       VALUES ($1, $2, $3, $4, 5, true, $5, 'reflection', $6)
+                       ON CONFLICT DO NOTHING"#,
+                    &[
+                        &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &fix.fix_type,
+                        &title,
+                        &fix.fix_description,
+                        &fix.id as &(dyn tokio_postgres::types::ToSql + Sync),
+                        &now,
+                    ],
+                )
+                .await;
+
+            if let Ok(n) = result {
+                if n > 0 {
+                    count += 1;
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    // ========================================================================
+    // Hybrid search for universal fixes
+    // ========================================================================
+
+    /// SQL-based fallback for universal fixes retrieval (no embedding required).
+    pub async fn get_universal_fixes_by_text(
+        &self,
+        query_text: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
+
+        let search = format!("%{}%", &query_text[..query_text.len().min(100)]);
+
+        let rows = conn
+            .query(
+                r#"SELECT rf.fix_description, rf.fix_type, rf.file_changed
+                   FROM reflection_fixes rf
+                   WHERE rf.reflection_scope = 'universal'
+                     AND rf.status = 'applied'
+                     AND rf.effectiveness IN ('effective', 'pending')
+                     AND rf.fix_description ILIKE $1
+                   ORDER BY rf.created_at DESC
+                   LIMIT $2"#,
+                &[&search, &limit],
+            )
+            .await
+            .map_err(|e| format!("PG get_universal_fixes: {e}"))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let desc: String = r.get(0);
+                let fix_type: String = r.get(1);
+                let file: Option<String> = r.get(2);
+                (desc, fix_type, file)
+            })
+            .collect())
+    }
 }

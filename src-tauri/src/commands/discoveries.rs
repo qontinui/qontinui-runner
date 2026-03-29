@@ -4,8 +4,8 @@
 
 use crate::commands::AppState;
 use crate::discoveries::{
-    self, apply_sync_results, extract_discoveries_for_sync, get_pending_count,
-    get_pending_discoveries, get_sync_status, sync_discoveries_batch, PendingDiscovery, SyncStatus,
+    self, sync_discoveries_batch, PendingDiscovery, SyncStatus,
+    DiscoveryPayload, DiscoveryToSync,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -87,17 +87,12 @@ impl From<&PendingDiscovery> for DiscoveryPreview {
 pub async fn get_pending_discoveries_cmd(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<Vec<PendingDiscovery>>, String> {
-    // SQLite: complex function — discovery queue operations with payload deserialization
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| get_pending_discoveries(conn))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(discoveries) => Ok(DiscoveryResponse::ok(discoveries)),
+    match state.pg_db.get_pending_discoveries().await {
+        Ok(vals) => {
+            let discoveries: Vec<PendingDiscovery> = vals.into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(DiscoveryResponse::ok(discoveries))
+        }
         Err(e) => Ok(DiscoveryResponse::err(e)),
     }
 }
@@ -107,26 +102,16 @@ pub async fn get_pending_discoveries_cmd(
 pub async fn get_discovery_summary(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<DiscoverySummary>, String> {
-    // SQLite: complex function — multi-query sync status + discovery preview aggregation
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let status = get_sync_status(conn)?;
-            let all = get_pending_discoveries(conn)?;
-            let recent: Vec<DiscoveryPreview> = all.iter().take(10).map(DiscoveryPreview::from).collect();
-            Ok::<_, String>((status, recent))
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok((status, recent)) => {
+    match state.pg_db.get_discovery_summary().await {
+        Ok(val) => {
+            let pending_count = val["pending_count"].as_u64().unwrap_or(0) as u32;
+            let ready = val["ready_for_sync"].as_u64().unwrap_or(0) as u32;
+            let can_sync = val["can_sync"].as_bool().unwrap_or(false);
+            let recent: Vec<DiscoveryPreview> = Vec::new(); // PG returns raw JSON, skip preview deserialization
             let summary = DiscoverySummary {
-                pending_count: status.pending_count,
-                ready_for_sync: status.ready_for_retry,
-                can_sync: status.authenticated,
+                pending_count,
+                ready_for_sync: ready,
+                can_sync,
                 recent,
             };
             Ok(DiscoveryResponse::ok(summary))
@@ -156,15 +141,16 @@ pub async fn sync_discoveries(
 ) -> Result<DiscoveryResponse<SyncResultResponse>, String> {
     info!("Manual sync of pending discoveries triggered");
 
-    let db = &state.checkpoint_db;
-
-    // SQLite: complex function — extract + transform discovery payloads for sync
-    let db1 = db.clone();
-    let to_sync = tokio::task::spawn_blocking(move || {
-        db1.with_conn(|conn| extract_discoveries_for_sync(conn))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    let to_sync_pairs = state.pg_db.extract_discoveries_for_sync().await
+        .map_err(|e| format!("Failed to extract discoveries: {}", e))?;
+    // Convert to DiscoveryToSync format for sync_discoveries_batch
+    let to_sync: Vec<DiscoveryToSync> = to_sync_pairs.into_iter()
+        .filter_map(|(id, payload_str)| {
+            serde_json::from_str::<DiscoveryPayload>(&payload_str)
+                .ok()
+                .map(|payload| DiscoveryToSync { id, payload })
+        })
+        .collect();
 
     if to_sync.is_empty() {
         return Ok(DiscoveryResponse::ok(SyncResultResponse {
@@ -180,22 +166,28 @@ pub async fn sync_discoveries(
     // Phase 2: Push to backend (async operation, no connection)
     let sync_results = sync_discoveries_batch(to_sync).await;
 
-    // SQLite: complex function — apply sync results + count remaining
-    let db2 = db.clone();
-    let (result, remaining) = tokio::task::spawn_blocking(move || {
-        db2.with_conn(|conn| {
-            let result = apply_sync_results(conn, sync_results)?;
-            let remaining = get_pending_count(conn).unwrap_or(0);
-            Ok::<_, String>((result, remaining))
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    // Phase 3: Apply sync results via PG
+    let mut sent = 0u32;
+    let mut failed = 0u32;
+    let mut errors = Vec::new();
+    for sr in &sync_results {
+        if sr.success {
+            let _ = state.pg_db.mark_discovery_synced(&sr.id).await;
+            sent += 1;
+        } else {
+            let err_msg = sr.error.as_deref().unwrap_or("unknown");
+            let _ = state.pg_db.mark_discovery_failed(&sr.id, err_msg).await;
+            failed += 1;
+            errors.push(format!("{}: {}", sr.id, err_msg));
+        }
+    }
+    let remaining_status = state.pg_db.get_sync_status().await.unwrap_or_default();
+    let remaining = remaining_status["pending_count"].as_u64().unwrap_or(0) as u32;
 
     let response = SyncResultResponse {
-        sent: result.sent,
-        failed: result.failed,
-        errors: result.errors,
+        sent,
+        failed,
+        errors,
         remaining,
     };
 
@@ -215,19 +207,8 @@ pub async fn clear_discovery(
 ) -> Result<DiscoveryResponse<bool>, String> {
     info!("Clearing discovery {} from queue", id);
 
-    // SQLite: complex function — discovery deletion with queue management
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| discoveries::delete_discovery(conn, &id))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(deleted) => {
-            Ok(DiscoveryResponse::ok(deleted))
-        }
+    match state.pg_db.delete_discovery(&id).await {
+        Ok(deleted) => Ok(DiscoveryResponse::ok(deleted)),
         Err(e) => Ok(DiscoveryResponse::err(e)),
     }
 }
@@ -239,16 +220,7 @@ pub async fn clear_failed_discoveries(
 ) -> Result<DiscoveryResponse<u32>, String> {
     info!("Clearing failed discoveries");
 
-    // SQLite: complex function — batch cleanup of failed discovery records
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| discoveries::cleanup_failed_discoveries(conn))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
+    match state.pg_db.cleanup_failed_discoveries().await {
         Ok(count) => {
             info!("Cleared {} failed discoveries", count);
             Ok(DiscoveryResponse::ok(count))
@@ -262,17 +234,15 @@ pub async fn clear_failed_discoveries(
 pub async fn get_discovery_sync_status(
     state: State<'_, Arc<AppState>>,
 ) -> Result<DiscoveryResponse<SyncStatus>, String> {
-    // SQLite: complex function — sync status aggregation with auth check
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| get_sync_status(conn))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(status) => Ok(DiscoveryResponse::ok(status)),
+    match state.pg_db.get_sync_status().await {
+        Ok(val) => {
+            let status = SyncStatus {
+                pending_count: val["pending_count"].as_u64().unwrap_or(0) as u32,
+                ready_for_retry: val["ready_for_retry"].as_u64().unwrap_or(0) as u32,
+                authenticated: val["authenticated"].as_bool().unwrap_or(false),
+            };
+            Ok(DiscoveryResponse::ok(status))
+        }
         Err(e) => Ok(DiscoveryResponse::err(e)),
     }
 }

@@ -507,6 +507,75 @@ impl RunnerClient {
         self.get_task_run_status(task_run_id).await
     }
 
+    /// Get page health diagnostic from UI Bridge.
+    pub async fn get_page_health(&self) -> Result<serde_json::Value, String> {
+        let url = format!("{}/ui-bridge/control/page-health", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get page health: {}", e))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse page health: {}", e))?;
+        let data = if body.get("success").is_some() {
+            body.get("data").cloned().unwrap_or(body.clone())
+        } else {
+            body
+        };
+        Ok(data)
+    }
+
+    /// Get a DOM snapshot from UI Bridge.
+    pub async fn get_ui_snapshot(&self) -> Result<serde_json::Value, String> {
+        let url = format!("{}/ui-bridge/control/snapshot", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to get UI snapshot: {}", e))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse UI snapshot: {}", e))?;
+        let data = if body.get("success").is_some() {
+            body.get("data").cloned().unwrap_or(body.clone())
+        } else {
+            body
+        };
+        Ok(data)
+    }
+
+    /// Run assertions against the current UI state via UI Bridge.
+    pub async fn run_assertions(
+        &self,
+        assertions: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let url = format!("{}/ui-bridge/control/assert", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "assertions": assertions }))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to run assertions: {}", e))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse assertion response: {}", e))?;
+        let data = if body.get("success").is_some() {
+            body.get("data").cloned().unwrap_or(body.clone())
+        } else {
+            body
+        };
+        Ok(data.as_array().cloned().unwrap_or_else(|| vec![data]))
+    }
+
     /// Wait for the runner to become healthy.
     /// Returns false if the timeout elapses or the stop signal is received.
     pub async fn wait_for_healthy(

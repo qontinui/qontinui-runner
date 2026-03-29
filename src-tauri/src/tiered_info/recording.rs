@@ -583,7 +583,7 @@ impl RunRecorder {
             self.save_to_task_run_automation(db, trid, true, None)
         } else {
             let run = self.build_run_details(RunStatus::Completed, None);
-            db.with_conn(|conn| self.save_run(conn, run))
+            self.save_run_stats_only(run)
         }
     }
 
@@ -603,7 +603,7 @@ impl RunRecorder {
             self.save_to_task_run_automation(db, trid, false, Some(error.to_string()))
         } else {
             let run = self.build_run_details(RunStatus::Failed, Some(error));
-            db.with_conn(|conn| self.save_run(conn, run))
+            self.save_run_stats_only(run)
         }
     }
 
@@ -627,7 +627,7 @@ impl RunRecorder {
             )
         } else {
             let run = self.build_run_details(RunStatus::Timeout, Some("Execution timed out"));
-            db.with_conn(|conn| self.save_run(conn, run))
+            self.save_run_stats_only(run)
         }
     }
 
@@ -647,8 +647,25 @@ impl RunRecorder {
             self.save_to_task_run_automation(db, trid, false, Some("Cancelled".to_string()))
         } else {
             let run = self.build_run_details(RunStatus::Cancelled, None);
-            db.with_conn(|conn| self.save_run(conn, run))
+            self.save_run_stats_only(run)
         }
+    }
+
+    /// Save run without DB (statistics-only logging, no table to write to for non-task-run recordings).
+    fn save_run_stats_only(self, run: RunDetails) -> Result<String, String> {
+        let run_id = run.id.clone();
+        warn!(
+            "Run {} does not have a task_run_id - logging stats only (no task_run_automation record)",
+            run_id
+        );
+        info!(
+            "Run {} stats: states={}, transitions={}, anomalies={}",
+            run_id,
+            run.states_visited.len(),
+            run.transitions_executed.len(),
+            run.anomalies.len()
+        );
+        Ok(run_id)
     }
 
     /// Save automation metrics to task_run_automation table.
@@ -785,14 +802,8 @@ impl RunRecorder {
 
         let run_for_stats = self.build_run_details(status, error_message.as_deref());
 
-        // Update statistics in the database
-        let _ = db.with_conn(|conn| {
-            if let Err(e) = update_statistics_after_run(conn, &run_for_stats) {
-                warn!("Failed to update statistics after automation: {}", e);
-                // Don't fail the overall operation if stats update fails
-            }
-            Ok(())
-        });
+        // Statistics update is now handled by PG task_run_automation records.
+        // The config_statistics table was a SQLite-only optimization; PG aggregates at query time.
 
         Ok(automation_id)
     }

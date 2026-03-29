@@ -228,30 +228,24 @@ impl LoopController {
 
         // Auto-detect recurring findings → known issues
         let auto_detected_ids: Vec<String> = {
-            let db_c = self.checkpoint_db.clone();
             let eid_c = config.execution_id.clone();
-            tokio::task::spawn_blocking(move || {
-                db_c.with_conn(|conn| {
-                    match crate::known_issues::auto_detect::check_and_promote_recurring_findings(
-                        conn,
-                        &eid_c,
-                    ) {
-                        Ok(new_ids) => {
-                            if !new_ids.is_empty() {
-                                info!(
-                                    "Auto-detected {} new known issue(s) from recurring findings",
-                                    new_ids.len()
-                                );
-                            }
-                            Ok(new_ids)
-                        }
-                        Err(e) => {
-                            warn!("Failed to check for recurring findings: {}", e);
-                            Ok(vec![])
-                        }
+            // PG-primary: async context, call PG directly
+            let pg = self.app_state.pg_db.clone();
+            match pg.check_and_promote_recurring_findings(&eid_c).await {
+                Ok(new_ids) => {
+                    if !new_ids.is_empty() {
+                        info!(
+                            "Auto-detected {} new known issue(s) from recurring findings",
+                            new_ids.len()
+                        );
                     }
-                })
-            }).await.unwrap_or_else(|_| Ok(vec![])).unwrap_or_default()
+                    new_ids
+                }
+                Err(e) => {
+                    warn!("Failed to check for recurring findings: {}", e);
+                    vec![]
+                }
+            }
         };
 
         // Notify frontend about auto-detected known issues
@@ -1319,22 +1313,49 @@ impl LoopController {
                     });
                 }
 
-                // Record blame as causal events for cross-run learning.
+                // Record blame as causal events for cross-run learning (PG-primary).
                 {
-                    let db_c = self.checkpoint_db.clone();
                     let eid_c = config.execution_id.clone();
                     let wf_c = config.workflow_name.clone();
                     let report_c = report.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(conn) = db_c.connection() {
-                            super::blame::record_blame_as_causal_events(
-                                &conn,
-                                &eid_c,
-                                &wf_c,
-                                &report_c,
+                    let pg = self.app_state.pg_db.clone();
+                    // Fire-and-forget: record blame causal events
+                    tokio::spawn(async move {
+                        for attr in &report_c.attributions {
+                            let cause_id = format!("iter-{}-change", attr.blamed_iteration);
+                            let effect_id = format!("verification-{}", attr.failed_step);
+                            let confidence = if attr.confidence >= 0.8 { "high" }
+                                else if attr.confidence >= 0.5 { "medium" }
+                                else { "low" };
+                            let files: Vec<&str> = attr.implicated_changes.iter()
+                                .map(|c| c.file_path.as_str()).collect();
+                            let description = format!(
+                                "Iteration {} change to [{}] caused '{}' to fail (confidence: {:.0}%)",
+                                attr.blamed_iteration, files.join(", "),
+                                attr.failed_step, attr.confidence * 100.0,
                             );
+                            let _ = pg.insert_causal_event(
+                                "iteration_change", &cause_id,
+                                "verification_failure", &effect_id,
+                                "caused_by_change", confidence, "blame_engine",
+                                Some(&wf_c), Some(&eid_c), Some(&description),
+                            ).await;
                         }
-                    }).await;
+                        for osc in &report_c.oscillating_files {
+                            let cause_id = format!("oscillation-{}", osc.file_path);
+                            let effect_id = format!("stuck-on-{}", osc.file_path);
+                            let description = format!(
+                                "File '{}' oscillating across {} consecutive iterations",
+                                osc.file_path, osc.consecutive_blames,
+                            );
+                            let _ = pg.insert_causal_event(
+                                "oscillation", &cause_id,
+                                "stuck_pattern", &effect_id,
+                                "oscillation_detected", "high", "blame_engine",
+                                Some(&wf_c), Some(&eid_c), Some(&description),
+                            ).await;
+                        }
+                    });
                 }
             }
         }

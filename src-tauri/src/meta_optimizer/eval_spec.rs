@@ -4,11 +4,13 @@
 //! recommendations before human review. Inspired by promptfoo's declarative
 //! YAML-based eval configs.
 
-use rusqlite::params;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 use tracing::info;
 
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // =============================================================================
 // Core types
@@ -175,117 +177,53 @@ pub struct EvalComparison {
 // =============================================================================
 
 /// Create or update an eval spec.
-pub fn save_eval_spec(db: &CheckpointDb, spec: &EvalSpec) -> Result<(), String> {
+pub fn save_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec: &EvalSpec) -> Result<(), String> {
     let id = spec.id.clone();
     let name = spec.name.clone();
     let target_agent = spec.target_agent.clone();
     let spec_json =
         serde_json::to_string(spec).map_err(|e| format!("Failed to serialize spec: {}", e))?;
-    let now = chrono::Utc::now().to_rfc3339();
 
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO eval_specs (id, name, target_agent, spec_json, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-               ON CONFLICT(id) DO UPDATE SET
-                   name = excluded.name,
-                   target_agent = excluded.target_agent,
-                   spec_json = excluded.spec_json,
-                   updated_at = excluded.updated_at"#,
-            params![id, name, target_agent, spec_json, now],
-        )
-        .map_err(|e| format!("Failed to save eval spec: {}", e))?;
-
-        info!("Saved eval spec {} ({})", id, name);
-        Ok(())
-    })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.save_eval_spec(&id, &name, &target_agent.clone().unwrap_or_default(), &spec_json))
+    })?;
+    info!("Saved eval spec {} ({})", id, name);
+    Ok(())
 }
 
 /// List all eval specs, optionally filtered by target agent.
 pub fn list_eval_specs(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     target_agent: Option<&str>,
 ) -> Result<Vec<EvalSpec>, String> {
-    let agent = target_agent.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let (sql, has_filter) = if agent.is_some() {
-            (
-                "SELECT spec_json FROM eval_specs WHERE target_agent = ?1 ORDER BY updated_at DESC",
-                true,
-            )
-        } else {
-            (
-                "SELECT spec_json FROM eval_specs ORDER BY updated_at DESC",
-                false,
-            )
-        };
-
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows: Vec<EvalSpec> = if has_filter {
-            stmt.query_map(params![agent.unwrap()], |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
-            })
-            .map_err(|e| format!("Failed to query eval specs: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
-            })
-            .map_err(|e| format!("Failed to query eval specs: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect()
-        };
-
-        Ok(rows)
-    })
+    let jsons = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_eval_specs(target_agent))
+    })?;
+    let specs: Vec<EvalSpec> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+    Ok(specs)
 }
 
 /// Get a single eval spec by ID.
-pub fn get_eval_spec(db: &CheckpointDb, spec_id: &str) -> Result<Option<EvalSpec>, String> {
-    let id = spec_id.to_string();
-
-    db.with_conn(move |conn| {
-        let result = conn.query_row(
-            "SELECT spec_json FROM eval_specs WHERE id = ?1",
-            params![id],
-            |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
-            },
-        );
-
-        match result {
-            Ok(json) => serde_json::from_str(&json)
-                .map(Some)
-                .map_err(|e| format!("Failed to deserialize eval spec: {}", e)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query eval spec: {}", e)),
-        }
-    })
+pub fn get_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec_id: &str) -> Result<Option<EvalSpec>, String> {
+    let result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_eval_spec(spec_id))
+    })?;
+    match result {
+        Some(json) => serde_json::from_str(&json).map(Some).map_err(|e| format!("Failed to deserialize eval spec: {}", e)),
+        None => Ok(None),
+    }
 }
 
 /// Delete an eval spec.
-pub fn delete_eval_spec(db: &CheckpointDb, spec_id: &str) -> Result<(), String> {
-    let id = spec_id.to_string();
-
-    db.with_conn(move |conn| {
-        conn.execute("DELETE FROM eval_specs WHERE id = ?1", params![id])
-            .map_err(|e| format!("Failed to delete eval spec: {}", e))?;
-        Ok(())
+pub fn delete_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec_id: &str) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.delete_eval_spec(spec_id))
     })
 }
 
 /// Save an eval result.
-pub fn save_eval_result(db: &CheckpointDb, result: &EvalResult) -> Result<(), String> {
+pub fn save_eval_result(db: &CheckpointDb, pg_db: &Arc<PgDb>, result: &EvalResult) -> Result<(), String> {
     let id = result.id.clone();
     let spec_id = result.spec_id.clone();
     let recommendation_id = result.recommendation_id.clone();
@@ -294,91 +232,41 @@ pub fn save_eval_result(db: &CheckpointDb, result: &EvalResult) -> Result<(), St
         .map_err(|e| format!("Failed to serialize eval result: {}", e))?;
     let p_value = result.comparison.as_ref().and_then(|c| c.p_value);
     let trials_run = result.trials_run as i64;
-    let created_at = result.created_at.clone();
 
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO eval_results
-               (id, spec_id, recommendation_id, status, result_json, p_value, trials_run, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-               ON CONFLICT(id) DO UPDATE SET
-                   status = excluded.status,
-                   result_json = excluded.result_json,
-                   p_value = excluded.p_value,
-                   trials_run = excluded.trials_run"#,
-            params![id, spec_id, recommendation_id, status, result_json, p_value, trials_run, created_at],
-        )
-        .map_err(|e| format!("Failed to save eval result: {}", e))?;
-
-        info!("Saved eval result {} (status={})", id, status);
-        Ok(())
-    })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.save_eval_result(&id, &spec_id, recommendation_id.as_deref(), &status, &result_json, p_value, trials_run))
+    })?;
+    info!("Saved eval result {} (status={})", id, status);
+    Ok(())
 }
 
 /// List eval results, optionally filtered by spec or recommendation.
 pub fn list_eval_results(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     spec_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<EvalResult>, String> {
-    let spec = spec_id.map(|s| s.to_string());
-    let rec = recommendation_id.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let mut sql = String::from("SELECT result_json FROM eval_results WHERE 1=1");
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let mut idx = 1;
-
-        if let Some(ref s) = spec {
-            sql.push_str(&format!(" AND spec_id = ?{}", idx));
-            param_values.push(Box::new(s.clone()));
-            idx += 1;
-        }
-        if let Some(ref r) = rec {
-            sql.push_str(&format!(" AND recommendation_id = ?{}", idx));
-            param_values.push(Box::new(r.clone()));
-        }
-        sql.push_str(" ORDER BY created_at DESC LIMIT 50");
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows: Vec<EvalResult> = stmt
-            .query_map(rusqlite::params_from_iter(param_values.iter()), |row| {
-                let json: String = row.get(0)?;
-                Ok(json)
-            })
-            .map_err(|e| format!("Failed to query eval results: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter_map(|json| serde_json::from_str(&json).ok())
-            .collect();
-
-        Ok(rows)
-    })
+    let jsons = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_eval_results(spec_id, recommendation_id))
+    })?;
+    let results: Vec<EvalResult> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+    Ok(results)
 }
 
 /// Update the eval_status and eval_result_id on a recommendation.
 pub fn attach_eval_result(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     eval_result_id: &str,
     eval_status: &str,
 ) -> Result<(), String> {
-    let rec_id = recommendation_id.to_string();
-    let result_id = eval_result_id.to_string();
-    let status = eval_status.to_string();
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            "UPDATE meta_optimizer_recommendations SET eval_result_id = ?1, eval_status = ?2 WHERE id = ?3",
-            params![result_id, status, rec_id],
-        )
-        .map_err(|e| format!("Failed to attach eval result: {}", e))?;
-
-        info!("Attached eval result {} to recommendation {} (status={})", result_id, rec_id, status);
-        Ok(())
-    })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.attach_eval_result(recommendation_id, eval_result_id, eval_status))
+    })?;
+    info!("Attached eval result {} to recommendation {} (status={})", eval_result_id, recommendation_id, eval_status);
+    Ok(())
 }
 
 // =============================================================================
@@ -456,96 +344,69 @@ pub fn generate_default_spec(db: &CheckpointDb, target_agent: &str) -> Result<Ev
 
 // ── PG dual-write wrappers ─────────────────────────────────────────────
 
+/// Generate default eval spec with PG fallback (currently delegates to SQLite).
+pub fn generate_default_spec_with_pg(
+    db: &CheckpointDb,
+    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    target_agent: &str,
+) -> Result<EvalSpec, String> {
+    generate_default_spec(db, target_agent)
+}
+
 /// Save an eval spec with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use save_eval_spec directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn save_eval_spec_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, spec: &EvalSpec) -> Result<(), String> {
-    save_eval_spec(db, spec)?;
-    let pg = pg_db.clone();
-    let id = spec.id.clone();
-    let name = spec.name.clone();
-    let ta = spec.target_agent.clone().unwrap_or_default();
-    let sj = serde_json::to_string(spec).unwrap_or_default();
-    tokio::spawn(async move { let _ = pg.save_eval_spec(&id, &name, &ta, &sj).await; });
-    Ok(())
+    save_eval_spec(db, pg_db, spec)
 }
 
 /// Delete an eval spec with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use delete_eval_spec directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn delete_eval_spec_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, spec_id: &str) -> Result<(), String> {
-    delete_eval_spec(db, spec_id)?;
-    let pg = pg_db.clone();
-    let sid = spec_id.to_string();
-    tokio::spawn(async move { let _ = pg.delete_eval_spec(&sid).await; });
-    Ok(())
+    delete_eval_spec(db, pg_db, spec_id)
 }
 
 /// Save an eval result with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use save_eval_result directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn save_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, result: &EvalResult) -> Result<(), String> {
-    save_eval_result(db, result)?;
-    let pg = pg_db.clone();
-    let r = result.clone();
-    let rj = serde_json::to_string(&r).unwrap_or_default();
-    let pv = r.comparison.as_ref().and_then(|c| c.p_value);
-    let tr = r.trials_run as i64;
-    tokio::spawn(async move { let _ = pg.save_eval_result(&r.id, &r.spec_id, r.recommendation_id.as_deref(), &r.status, &rj, pv, tr).await; });
-    Ok(())
+    save_eval_result(db, pg_db, result)
 }
 
 /// Attach eval result to recommendation with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use attach_eval_result directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn attach_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, recommendation_id: &str, eval_result_id: &str, eval_status: &str) -> Result<(), String> {
-    attach_eval_result(db, recommendation_id, eval_result_id, eval_status)?;
-    let pg = pg_db.clone();
-    let rid = recommendation_id.to_string();
-    let erid = eval_result_id.to_string();
-    let es = eval_status.to_string();
-    tokio::spawn(async move { let _ = pg.attach_eval_result(&rid, &erid, &es).await; });
-    Ok(())
+    attach_eval_result(db, pg_db, recommendation_id, eval_result_id, eval_status)
 }
 
 // ── PG-primary read wrappers ─────────────────────────────────────────────
 
 /// List eval specs with PG-primary read.
+#[deprecated(note = "Use list_eval_specs directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_eval_specs_with_pg(
     db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     target_agent: Option<&str>,
 ) -> Result<Vec<EvalSpec>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let ta = target_agent.map(|s| s.to_string());
-        if let Ok(jsons) = handle.block_on(pg.list_eval_specs(ta.as_deref())) {
-            let specs: Vec<EvalSpec> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
-            if !specs.is_empty() {
-                return Ok(specs);
-            }
-        }
-    }
-    list_eval_specs(db, target_agent)
+    list_eval_specs(db, pg_db, target_agent)
 }
 
 /// Get a single eval spec with PG-primary read.
+#[deprecated(note = "Use get_eval_spec directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn get_eval_spec_with_pg(
     db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     spec_id: &str,
 ) -> Result<Option<EvalSpec>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let sid = spec_id.to_string();
-        if let Ok(Some(json)) = handle.block_on(pg.get_eval_spec(&sid)) {
-            if let Ok(spec) = serde_json::from_str::<EvalSpec>(&json) {
-                return Ok(Some(spec));
-            }
-        }
-    }
-    get_eval_spec(db, spec_id)
+    get_eval_spec(db, pg_db, spec_id)
 }
 
 /// List eval results with PG-primary read.
+#[deprecated(note = "Use list_eval_results directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_eval_results_with_pg(
     db: &CheckpointDb,
@@ -553,16 +414,5 @@ pub fn list_eval_results_with_pg(
     spec_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<EvalResult>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let s = spec_id.map(|s| s.to_string());
-        let r = recommendation_id.map(|s| s.to_string());
-        if let Ok(jsons) = handle.block_on(pg.list_eval_results(s.as_deref(), r.as_deref())) {
-            let results: Vec<EvalResult> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
-            if !results.is_empty() {
-                return Ok(results);
-            }
-        }
-    }
-    list_eval_results(db, spec_id, recommendation_id)
+    list_eval_results(db, pg_db, spec_id, recommendation_id)
 }

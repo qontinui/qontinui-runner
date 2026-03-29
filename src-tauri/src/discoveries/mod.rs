@@ -44,6 +44,6 @@ pub use storage::{
 };
 pub use sync::{
     apply_sync_results, extract_discoveries_for_sync, get_sync_status, sync_discoveries_batch,
-    SyncStatus,
+    DiscoveryToSync, SyncStatus,
 };
-pub use types::PendingDiscovery;
+pub use types::{DiscoveryPayload, PendingDiscovery};

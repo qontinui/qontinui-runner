@@ -49,6 +49,7 @@ use tokio::sync::Mutex as TokioMutex;
 // Command modules organized by domain
 pub mod accessibility;
 pub mod activity_timeline; // Screenpipe-inspired searchable capture history
+pub mod adaptive_learning; // Adaptive learning: playbook, curated examples, GEPA, template lifecycle
 pub mod agentic_metrics;
 pub mod ai_data;
 pub mod ai_generation; // AI generation for builder tabs (context, api request, task, exploration)
@@ -198,7 +199,8 @@ pub struct AppState {
     /// Agent sends structured JSON panels via HTTP; frontend renders them.
     pub canvas_state: Arc<tokio::sync::RwLock<crate::mcp::canvas::CanvasState>>,
     /// Orchestration loop state for runner-side workflow loop management.
-    pub orchestration_loop: crate::orchestration_loop::loop_engine::SharedLoopState,
+    /// Multi-loop manager: supports concurrent loops targeting different runners.
+    pub orchestration_loops: crate::orchestration_loop::loop_engine::SharedLoopStates,
     /// Container isolation executor for running shell commands inside Docker containers.
     /// When `Some` and `is_available()`, shell commands are executed in isolated containers
     /// instead of on the host. Falls back to host execution when `None` or unavailable.

@@ -9,10 +9,13 @@
 //! This module extracts these markers, parses key-value pairs inside, and saves
 //! them as `meta_optimizer_recommendations` records via `recommendations::create_recommendation`.
 
+use std::sync::Arc;
+use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
 use super::recommendations;
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // ── Parsed types ────────────────────────────────────────────────────────
 
@@ -394,6 +397,7 @@ pub fn parse_meta_prompt_rewrites(output: &str) -> Vec<ParsedMetaPromptRewrite> 
 /// title match for older rows without hashes.
 fn is_duplicate_recommendation(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     title: &str,
     optimizer_type: &str,
     recommendation_type: &str,
@@ -407,21 +411,15 @@ fn is_duplicate_recommendation(
         recommended_value,
     );
     // Check content hash first (covers pending, canary, applied)
-    if super::recommendations::is_content_duplicate(db, &hash) {
+    if super::recommendations::is_content_duplicate(db, pg_db, &hash) {
         return true;
     }
     // Fallback: title match for rejected recs (rejected can't be re-created with same title)
-    let title = title.to_string();
-    db.with_conn(move |conn| {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE title = ?1 AND status = 'rejected'",
-                rusqlite::params![title],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        Ok(count > 0)
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(pg_db.count_rejected_by_title(title))
     })
+    .map(|c| c > 0)
     .unwrap_or(false)
 }
 
@@ -434,6 +432,7 @@ fn is_duplicate_recommendation(
 /// Returns the number of recommendations created.
 pub fn save_parsed_recommendations(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     optimizer_run_id: Option<&str>,
     output: &str,
@@ -477,6 +476,7 @@ pub fn save_parsed_recommendations(
 
                 if is_duplicate_recommendation(
                     db,
+                    pg_db,
                     &title,
                     optimizer_type,
                     "prompt_rewrite",
@@ -489,6 +489,7 @@ pub fn save_parsed_recommendations(
 
                 recommendations::create_recommendation(
                     db,
+                    pg_db,
                     optimizer_type,
                     "prompt_rewrite",
                     Some(&rec.agent_type),
@@ -549,6 +550,7 @@ pub fn save_parsed_recommendations(
 
                 if is_duplicate_recommendation(
                     db,
+                    pg_db,
                     &title,
                     optimizer_type,
                     "config_change",
@@ -561,6 +563,7 @@ pub fn save_parsed_recommendations(
 
                 recommendations::create_recommendation(
                     db,
+                    pg_db,
                     optimizer_type,
                     "config_change",
                     None,
@@ -621,6 +624,7 @@ pub fn save_parsed_recommendations(
 
                 if is_duplicate_recommendation(
                     db,
+                    pg_db,
                     &title,
                     optimizer_type,
                     "config_change",
@@ -633,6 +637,7 @@ pub fn save_parsed_recommendations(
 
                 recommendations::create_recommendation(
                     db,
+                    pg_db,
                     optimizer_type,
                     "config_change",
                     None,
@@ -664,6 +669,7 @@ pub fn save_parsed_recommendations(
                 .to_string();
                 if is_duplicate_recommendation(
                     db,
+                    pg_db,
                     &title,
                     optimizer_type,
                     "finding",
@@ -675,6 +681,7 @@ pub fn save_parsed_recommendations(
                 }
                 recommendations::create_recommendation(
                     db,
+                    pg_db,
                     optimizer_type,
                     "finding", // Not actionable as config_change
                     None,
@@ -747,6 +754,7 @@ pub fn save_parsed_recommendations(
 
                 if is_duplicate_recommendation(
                     db,
+                    pg_db,
                     &title,
                     optimizer_type,
                     rec_type,
@@ -759,6 +767,7 @@ pub fn save_parsed_recommendations(
 
                 recommendations::create_recommendation(
                     db,
+                    pg_db,
                     optimizer_type,
                     rec_type,
                     Some(&rec.agent),
@@ -780,7 +789,7 @@ pub fn save_parsed_recommendations(
                     "Parsed {} RULE_EXAMPLE(s) from output — attaching to existing rules",
                     examples.len()
                 );
-                save_rule_examples(db, &examples);
+                save_rule_examples(db, pg_db, &examples);
             }
         }
 
@@ -822,6 +831,7 @@ pub fn save_parsed_recommendations(
 
                 if is_duplicate_recommendation(
                     db,
+                    pg_db,
                     &title,
                     optimizer_type,
                     "prompt_rewrite",
@@ -835,6 +845,7 @@ pub fn save_parsed_recommendations(
                 // Semantic similarity guard: reject near-duplicate rewrites
                 let rejected_prompts = super::prompt_evolution::get_rejected_prompt_contents(
                     db,
+                    pg_db,
                     &rec.target_agent,
                 )
                 .unwrap_or_default();
@@ -892,6 +903,7 @@ pub fn save_parsed_recommendations(
                 // Create the recommendation
                 let recommendation = recommendations::create_recommendation(
                     db,
+                    pg_db,
                     optimizer_type,
                     "prompt_rewrite",
                     Some(&rec.target_agent),
@@ -907,6 +919,7 @@ pub fn save_parsed_recommendations(
                 // Create prompt variant immediately (inactive)
                 let variant = super::prompt_registry::create_variant(
                     db,
+                    pg_db,
                     &rec.target_agent,
                     &variant_name,
                     &rec.rewritten_prompt,
@@ -914,7 +927,7 @@ pub fn save_parsed_recommendations(
                 )?;
 
                 // Get the current active variant as parent
-                let parent_id = super::prompt_registry::get_active_prompt(db, &rec.target_agent)
+                let parent_id = super::prompt_registry::get_active_prompt(db, pg_db, &rec.target_agent)
                     .ok()
                     .flatten()
                     .map(|v| v.id);
@@ -939,6 +952,7 @@ pub fn save_parsed_recommendations(
                 // Record evolution entry with baseline hash
                 let _ = super::prompt_evolution::record_evolution_full(
                     db,
+                    pg_db,
                     &rec.target_agent,
                     parent_id.as_deref(),
                     &variant.id,
@@ -952,7 +966,7 @@ pub fn save_parsed_recommendations(
                 // Auto-start canary for the new variant
                 if rec.confidence >= 0.60 {
                     if let Err(e) =
-                        super::canary::start_canary(db, &recommendation.id, 20)
+                        super::canary::start_canary(db, pg_db, &recommendation.id, 20)
                     {
                         warn!(
                             "Failed to auto-start canary for meta-prompt rewrite {}: {}",
@@ -985,7 +999,7 @@ pub fn save_parsed_recommendations(
         );
 
         // Auto-apply high-confidence rule recommendations
-        auto_apply_high_confidence(db, optimizer_run_id);
+        auto_apply_high_confidence(db, pg_db, optimizer_run_id);
     }
 
     Ok(count)
@@ -999,28 +1013,13 @@ pub fn save_parsed_recommendations(
 ///   so they can be evaluated before full promotion.
 /// - `config_change` with confidence >= 0.75 are started as canary rollouts at 10%
 ///   (more conservative since config changes affect global behavior).
-pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&str>) {
-    let run_id = optimizer_run_id.map(|s| s.to_string());
-
+pub fn auto_apply_high_confidence(db: &CheckpointDb, pg_db: &Arc<PgDb>, optimizer_run_id: Option<&str>) {
     // Auto-reject findings — they are diagnostic observations, not actionable changes
-    let findings_rejected: i64 = db
-        .with_conn({
-            let run_id = run_id.clone();
-            move |conn| {
-                conn.execute(
-                    r#"UPDATE meta_optimizer_recommendations
-                       SET status = 'rejected',
-                           outcome_after_apply = 'Auto-rejected: findings are diagnostic observations, not actionable changes'
-                       WHERE status = 'pending'
-                         AND recommendation_type = 'finding'
-                         AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
-                    rusqlite::params![run_id],
-                )
-                .map(|n| n as i64)
-                .map_err(|e| format!("Failed to auto-reject findings: {}", e))
-            }
-        })
-        .unwrap_or(0);
+    let findings_rejected: i64 = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(pg_db.reject_finding_recommendations(optimizer_run_id))
+    })
+    .unwrap_or(0);
 
     if findings_rejected > 0 {
         info!(
@@ -1030,35 +1029,19 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
     }
 
     // Auto-apply rule changes (safest, most reversible)
-    let rule_candidates: Vec<(String, f64)> = db
-        .with_conn({
-            let run_id = run_id.clone();
-            move |conn| {
-                let mut stmt = conn
-                    .prepare(
-                        r#"SELECT id, confidence FROM meta_optimizer_recommendations
-                           WHERE status = 'pending'
-                             AND recommendation_type IN ('rule_create', 'rule_update')
-                             AND confidence >= 0.85
-                             AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
-                    )
-                    .map_err(|e| format!("Query error: {}", e))?;
-
-                let rows = stmt
-                    .query_map(rusqlite::params![run_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                    })
-                    .map_err(|e| format!("Query error: {}", e))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                Ok(rows)
-            }
-        })
-        .unwrap_or_default();
+    let rule_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            pg_db.query_pending_recommendations_by_type(
+                &["rule_create", "rule_update"],
+                0.85,
+                optimizer_run_id,
+            ),
+        )
+    })
+    .unwrap_or_default();
 
     for (rec_id, confidence) in &rule_candidates {
-        match super::recommendations::apply_recommendation_with_side_effects(db, rec_id) {
+        match super::recommendations::apply_recommendation_with_side_effects(db, pg_db, rec_id) {
             Ok(()) => {
                 info!(
                     "Auto-applied high-confidence recommendation {} (confidence: {:.0}%)",
@@ -1082,33 +1065,19 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
     // Auto-canary prompt rewrites with high confidence (>= 0.85)
     // These are started as canary rollouts at 20% rather than applied directly,
     // since prompt changes have broader impact and benefit from A/B evaluation.
-    let run_id_for_config = run_id.clone();
-    let prompt_candidates: Vec<(String, f64)> = db
-        .with_conn(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    r#"SELECT id, confidence FROM meta_optimizer_recommendations
-                       WHERE status = 'pending'
-                         AND recommendation_type = 'prompt_rewrite'
-                         AND confidence >= 0.75
-                         AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
-                )
-                .map_err(|e| format!("Query error: {}", e))?;
-
-            let rows = stmt
-                .query_map(rusqlite::params![run_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                })
-                .map_err(|e| format!("Query error: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            Ok(rows)
-        })
-        .unwrap_or_default();
+    let prompt_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            pg_db.query_pending_recommendations_by_type(
+                &["prompt_rewrite"],
+                0.75,
+                optimizer_run_id,
+            ),
+        )
+    })
+    .unwrap_or_default();
 
     for (rec_id, confidence) in &prompt_candidates {
-        match super::canary::start_canary(db, rec_id, 20) {
+        match super::canary::start_canary(db, pg_db, rec_id, 20) {
             Ok(canary_id) => {
                 info!(
                     "Auto-started canary {} for prompt recommendation {} (confidence: {:.0}%, rollout: 20%)",
@@ -1133,35 +1102,19 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
 
     // Auto-canary config changes with high confidence (>= 0.85) at conservative 10% rollout.
     // Config changes affect global behavior, so use lower rollout than prompt rewrites.
-    let config_candidates: Vec<(String, f64)> = db
-        .with_conn({
-            let run_id = run_id_for_config.clone();
-            move |conn| {
-                let mut stmt = conn
-                    .prepare(
-                        r#"SELECT id, confidence FROM meta_optimizer_recommendations
-                           WHERE status = 'pending'
-                             AND recommendation_type = 'config_change'
-                             AND confidence >= 0.75
-                             AND (?1 IS NULL OR optimizer_run_id = ?1)"#,
-                    )
-                    .map_err(|e| format!("Query error: {}", e))?;
-
-                let rows = stmt
-                    .query_map(rusqlite::params![run_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                    })
-                    .map_err(|e| format!("Query error: {}", e))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                Ok(rows)
-            }
-        })
-        .unwrap_or_default();
+    let config_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            pg_db.query_pending_recommendations_by_type(
+                &["config_change"],
+                0.75,
+                optimizer_run_id,
+            ),
+        )
+    })
+    .unwrap_or_default();
 
     for (rec_id, confidence) in &config_candidates {
-        match super::canary::start_canary(db, rec_id, 10) {
+        match super::canary::start_canary(db, pg_db, rec_id, 10) {
             Ok(canary_id) => {
                 info!(
                     "Auto-started canary {} for config recommendation {} (confidence: {:.0}%, rollout: 10%)",
@@ -1190,23 +1143,15 @@ pub fn auto_apply_high_confidence(db: &CheckpointDb, optimizer_run_id: Option<&s
 /// Each `ParsedRuleExample` is converted to a JSON array entry and merged
 /// into the target rule's `examples_json` column. Examples are additive and
 /// low-risk, so they bypass the recommendation lifecycle.
-fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
+fn save_rule_examples(db: &CheckpointDb, pg_db: &Arc<PgDb>, examples: &[ParsedRuleExample]) {
     for ex in examples {
-        let rule_id = ex.rule_id.clone();
-        let positive = ex.positive_example.clone();
-        let negative = ex.negative_example.clone();
-        let pos_explanation = ex.positive_explanation.clone();
-        let neg_explanation = ex.negative_explanation.clone();
+        let rule_id = &ex.rule_id;
 
-        let result = db.with_conn(move |conn| {
+        let result: Result<(), String> = (|| {
             // Check rule exists
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM generation_rules WHERE id = ?1",
-                    rusqlite::params![rule_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
+            let exists = tokio::task::block_in_place(|| {
+                Handle::current().block_on(pg_db.rule_exists(rule_id))
+            })?;
 
             if !exists {
                 warn!("RULE_EXAMPLE targets non-existent rule: {}", rule_id);
@@ -1215,46 +1160,39 @@ fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
 
             // Build examples array
             let mut new_examples = Vec::new();
-            if !positive.is_empty() {
+            if !ex.positive_example.is_empty() {
                 new_examples.push(serde_json::json!({
                     "type": "positive",
-                    "output": positive,
-                    "explanation": pos_explanation,
+                    "output": ex.positive_example,
+                    "explanation": ex.positive_explanation,
                 }));
             }
-            if !negative.is_empty() {
+            if !ex.negative_example.is_empty() {
                 new_examples.push(serde_json::json!({
                     "type": "negative",
-                    "output": negative,
-                    "explanation": neg_explanation,
+                    "output": ex.negative_example,
+                    "explanation": ex.negative_explanation,
                 }));
             }
 
             // Merge with existing examples (if any), capping at 4 total
-            let existing_json: Option<String> = conn
-                .query_row(
-                    "SELECT examples_json FROM generation_rules WHERE id = ?1",
-                    rusqlite::params![rule_id],
-                    |row| row.get(0),
-                )
-                .ok();
+            let existing_json = tokio::task::block_in_place(|| {
+                Handle::current().block_on(pg_db.get_rule_examples_json(rule_id))
+            })?;
 
             let mut all_examples: Vec<serde_json::Value> = existing_json
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default();
 
             all_examples.extend(new_examples);
-            // Cap at 4 examples per rule to prevent context bloat
             all_examples.truncate(4);
 
             let merged_json = serde_json::to_string(&all_examples)
                 .map_err(|e| format!("JSON serialization error: {}", e))?;
 
-            conn.execute(
-                "UPDATE generation_rules SET examples_json = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![merged_json, chrono::Utc::now().to_rfc3339(), rule_id],
-            )
-            .map_err(|e| format!("Failed to update rule examples: {}", e))?;
+            tokio::task::block_in_place(|| {
+                Handle::current().block_on(pg_db.update_rule_examples(rule_id, &merged_json))
+            })?;
 
             info!(
                 "Attached {} example(s) to rule {}",
@@ -1262,7 +1200,7 @@ fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
                 rule_id
             );
             Ok(())
-        });
+        })();
 
         if let Err(e) = result {
             warn!("Failed to save rule example for {}: {}", ex.rule_id, e);
@@ -1273,6 +1211,7 @@ fn save_rule_examples(db: &CheckpointDb, examples: &[ParsedRuleExample]) {
 // ── PG dual-write wrappers ─────────────────────────────────────────────
 
 /// Save parsed recommendations with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use save_parsed_recommendations directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn save_parsed_recommendations_with_pg(
     db: &crate::database::CheckpointDb,
@@ -1281,35 +1220,18 @@ pub fn save_parsed_recommendations_with_pg(
     optimizer_run_id: Option<&str>,
     output: &str,
 ) -> Result<usize, String> {
-    let count = save_parsed_recommendations(db, optimizer_type, optimizer_run_id, output)?;
-    if count > 0 {
-        if let Ok(recs) = super::recommendations::list_recommendations(db, Some(optimizer_type), Some("pending")) {
-            let pg = pg_db.clone();
-            tokio::spawn(async move {
-                for r in &recs {
-                    let ch = super::recommendations::compute_content_hash(&r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), r.recommended_value.as_deref());
-                    let _ = pg.create_recommendation(&r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(), r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch).await;
-                }
-            });
-        }
-    }
-    Ok(count)
+    save_parsed_recommendations(db, pg_db, optimizer_type, optimizer_run_id, output)
 }
 
 /// Auto-apply high-confidence recommendations with PG dual-write.
+#[deprecated(note = "Use auto_apply_high_confidence directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn auto_apply_high_confidence_with_pg(
     db: &crate::database::CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     optimizer_run_id: Option<&str>,
 ) {
-    auto_apply_high_confidence(db, optimizer_run_id);
-    let pg = pg_db.clone();
-    if let Ok(applied) = super::recommendations::list_recommendations(db, None, Some("applied")) {
-        tokio::spawn(async move {
-            for r in &applied { let _ = pg.update_recommendation_status(&r.id, "applied").await; }
-        });
-    }
+    auto_apply_high_confidence(db, pg_db, optimizer_run_id);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

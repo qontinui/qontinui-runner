@@ -4,10 +4,13 @@
 //! a comprehensive view of what's going wrong: abort reasons, verification failures,
 //! finding distributions, fix effectiveness, generation quality, and recurring issues.
 
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 
 use super::types::WorkflowCategory;
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 use rusqlite::params;
 use tracing::debug;
 
@@ -99,38 +102,35 @@ pub struct RecurringIssue {
 
 pub fn get_failure_analysis(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     days: u32,
     category: WorkflowCategory,
 ) -> Result<FailureAnalysis, String> {
-    db.with_conn(|conn| {
-        let since = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
-        debug!(days, %since, "Running failure analysis");
+    let since = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+    debug!(days, %since, "Running failure analysis (PG)");
 
-        let (total_runs, failed_runs) = query_run_totals(conn, &since, category);
-        let failure_rate = if total_runs > 0 {
-            100.0 * failed_runs as f64 / total_runs as f64
-        } else {
-            0.0
-        };
+    let mut analysis = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_failure_analysis(&since, &category))
+    })?;
 
-        Ok(FailureAnalysis {
-            period_days: days,
-            total_runs,
-            failed_runs,
-            failure_rate,
-            abort_reasons: query_abort_reasons(conn, &since, category),
-            verification_failures: query_verification_failures(conn, &since, category),
-            finding_distribution: query_finding_distribution(conn, &since, category),
-            severity_distribution: query_severity_distribution(conn, &since, category),
-            reflection_fix_effectiveness: query_fix_effectiveness(conn, &since),
-            generation_quality: query_generation_quality(conn, &since),
-            pipeline_agent_failures: query_pipeline_agent_failures(conn, &since, category),
-            recurring_issues: query_recurring_issues(conn, &since, category),
-            agentic_metric_summary: db
-                .get_agentic_metric_aggregates(days as i64)
-                .unwrap_or_default(),
-        })
-    })
+    analysis.period_days = days;
+    analysis.agentic_metric_summary = db
+        .get_agentic_metric_aggregates(days as i64)
+        .unwrap_or_default();
+
+    Ok(analysis)
+}
+
+// ── PG dual-write wrappers ──────────────────────────────────────────────
+
+/// Get failure analysis with PG (now primary).
+pub fn get_failure_analysis_with_pg(
+    db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
+    days: u32,
+    category: WorkflowCategory,
+) -> Result<FailureAnalysis, String> {
+    get_failure_analysis(db, pg_db, days, category)
 }
 
 // ── Private Query Functions ──────────────────────────────────────────────

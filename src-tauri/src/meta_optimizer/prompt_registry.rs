@@ -3,15 +3,32 @@
 //! Stores prompt variants for pipeline agents. The optimizer creates new variants;
 //! humans activate them from the UI.
 
+use std::sync::Arc;
 use rusqlite::params;
+use tokio::runtime::Handle;
 use tracing::info;
 
 use super::types::PromptVariant;
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 /// Get the currently active prompt for a given agent type.
 /// Returns None if no active variant exists (pipeline should use its default).
 pub fn get_active_prompt(
+    db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
+    agent_type: &str,
+) -> Result<Option<PromptVariant>, String> {
+    let _ = db;
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_active_prompt(agent_type))
+    })
+}
+
+/// Get the active prompt using SQLite only (for contexts without PG access).
+/// Retained for backward compatibility in compute_group_metrics_inner.
+#[allow(dead_code)]
+pub(crate) fn get_active_prompt_sqlite(
     db: &CheckpointDb,
     agent_type: &str,
 ) -> Result<Option<PromptVariant>, String> {
@@ -21,26 +38,15 @@ pub fn get_active_prompt(
             r#"SELECT id, agent_type, variant_name, prompt_content, version,
                       is_active, source_recommendation_id, performance_metrics,
                       created_at, updated_at
-               FROM prompt_registry
-               WHERE agent_type = ?1 AND is_active = 1
-               LIMIT 1"#,
+               FROM prompt_registry WHERE agent_type = ?1 AND is_active = 1 LIMIT 1"#,
             params![agent_type],
-            |row| {
-                Ok(PromptVariant {
-                    id: row.get(0)?,
-                    agent_type: row.get(1)?,
-                    variant_name: row.get(2)?,
-                    prompt_content: row.get(3)?,
-                    version: row.get(4)?,
-                    is_active: row.get::<_, i32>(5)? != 0,
-                    source_recommendation_id: row.get(6)?,
-                    performance_metrics: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            },
+            |row| Ok(PromptVariant {
+                id: row.get(0)?, agent_type: row.get(1)?, variant_name: row.get(2)?,
+                prompt_content: row.get(3)?, version: row.get(4)?, is_active: row.get::<_, i32>(5)? != 0,
+                source_recommendation_id: row.get(6)?, performance_metrics: row.get(7)?,
+                created_at: row.get(8)?, updated_at: row.get(9)?,
+            }),
         );
-
         match result {
             Ok(variant) => Ok(Some(variant)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -52,156 +58,32 @@ pub fn get_active_prompt(
 /// Create a new prompt variant (initially inactive).
 pub fn create_variant(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: &str,
     variant_name: &str,
     prompt_content: &str,
     source_recommendation_id: Option<&str>,
 ) -> Result<PromptVariant, String> {
-    let id = format!("pv-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
-    let agent_type = agent_type.to_string();
-    let variant_name = variant_name.to_string();
-    let prompt_content = prompt_content.to_string();
-    let source_rec_id = source_recommendation_id.map(|s| s.to_string());
-    let id_clone = id.clone();
-    let now_clone = now.clone();
-
-    db.with_conn(move |conn| {
-        // Determine next version for this agent_type + variant_name
-        let next_version: i32 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_registry WHERE agent_type = ?1 AND variant_name = ?2",
-                params![agent_type, variant_name],
-                |row| row.get(0),
-            )
-            .unwrap_or(1);
-
-        conn.execute(
-            r#"INSERT INTO prompt_registry
-               (id, agent_type, variant_name, prompt_content, version, is_active,
-                source_recommendation_id, performance_metrics, created_at, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, '{}', ?7, ?7)"#,
-            params![
-                id_clone,
-                agent_type,
-                variant_name,
-                prompt_content,
-                next_version,
-                source_rec_id,
-                now_clone,
-            ],
-        )
-        .map_err(|e| format!("Failed to create prompt variant: {}", e))?;
-
-        info!("Created prompt variant {} for agent {} (v{})", id_clone, agent_type, next_version);
-
-        Ok(PromptVariant {
-            id: id_clone,
-            agent_type,
-            variant_name,
-            prompt_content,
-            version: next_version,
-            is_active: false,
-            source_recommendation_id: source_rec_id,
-            performance_metrics: Some("{}".to_string()),
-            created_at: now_clone.clone(),
-            updated_at: now_clone,
-        })
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.create_prompt_variant(agent_type, variant_name, prompt_content, source_recommendation_id))
     })
 }
 
 /// Activate a prompt variant (deactivating any previously active variant for that agent_type).
-pub fn activate_variant(db: &CheckpointDb, variant_id: &str) -> Result<(), String> {
-    let variant_id = variant_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    db.with_conn(move |conn| {
-        // Get the agent_type for this variant
-        let agent_type: String = conn
-            .query_row(
-                "SELECT agent_type FROM prompt_registry WHERE id = ?1",
-                params![variant_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Variant not found: {}", e))?;
-
-        // Deactivate all variants for this agent_type
-        conn.execute(
-            "UPDATE prompt_registry SET is_active = 0, updated_at = ?1 WHERE agent_type = ?2",
-            params![now, agent_type],
-        )
-        .map_err(|e| format!("Failed to deactivate variants: {}", e))?;
-
-        // Activate the requested variant
-        conn.execute(
-            "UPDATE prompt_registry SET is_active = 1, updated_at = ?1 WHERE id = ?2",
-            params![now, variant_id],
-        )
-        .map_err(|e| format!("Failed to activate variant: {}", e))?;
-
-        info!(
-            "Activated prompt variant {} for agent {}",
-            variant_id, agent_type
-        );
-        Ok(())
+pub fn activate_variant(db: &CheckpointDb, pg_db: &Arc<PgDb>, variant_id: &str) -> Result<(), String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.activate_variant(variant_id))
     })
 }
 
 /// List all prompt variants, optionally filtered by agent type.
 pub fn list_variants(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<PromptVariant>, String> {
-    let agent_type = agent_type.map(|s| s.to_string());
-
-    db.with_conn(move |conn| {
-        let (sql, param): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(ref at) = agent_type {
-                (
-                    r#"SELECT id, agent_type, variant_name, prompt_content, version,
-                          is_active, source_recommendation_id, performance_metrics,
-                          created_at, updated_at
-                   FROM prompt_registry WHERE agent_type = ?1
-                   ORDER BY agent_type, variant_name, version DESC"#
-                        .to_string(),
-                    vec![Box::new(at.clone())],
-                )
-            } else {
-                (
-                    r#"SELECT id, agent_type, variant_name, prompt_content, version,
-                          is_active, source_recommendation_id, performance_metrics,
-                          created_at, updated_at
-                   FROM prompt_registry
-                   ORDER BY agent_type, variant_name, version DESC"#
-                        .to_string(),
-                    vec![],
-                )
-            };
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(param.iter()), |row| {
-                Ok(PromptVariant {
-                    id: row.get(0)?,
-                    agent_type: row.get(1)?,
-                    variant_name: row.get(2)?,
-                    prompt_content: row.get(3)?,
-                    version: row.get(4)?,
-                    is_active: row.get::<_, i32>(5)? != 0,
-                    source_recommendation_id: row.get(6)?,
-                    performance_metrics: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query variants: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.list_variants(agent_type))
     })
 }
 
@@ -209,93 +91,48 @@ pub fn list_variants(
 /// Returns None if no variant with that version exists.
 pub fn get_prompt_by_version(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     agent_type: &str,
     version: i32,
 ) -> Result<Option<PromptVariant>, String> {
-    let agent_type = agent_type.to_string();
-    db.with_conn(move |conn| {
-        let result = conn.query_row(
-            r#"SELECT id, agent_type, variant_name, prompt_content, version,
-                      is_active, source_recommendation_id, performance_metrics,
-                      created_at, updated_at
-               FROM prompt_registry
-               WHERE agent_type = ?1 AND version = ?2
-               LIMIT 1"#,
-            params![agent_type, version],
-            |row| {
-                Ok(PromptVariant {
-                    id: row.get(0)?,
-                    agent_type: row.get(1)?,
-                    variant_name: row.get(2)?,
-                    prompt_content: row.get(3)?,
-                    version: row.get(4)?,
-                    is_active: row.get::<_, i32>(5)? != 0,
-                    source_recommendation_id: row.get(6)?,
-                    performance_metrics: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            },
-        );
-
-        match result {
-            Ok(variant) => Ok(Some(variant)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to get prompt by version: {}", e)),
-        }
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_prompt_by_version(agent_type, version))
     })
 }
 
 /// Update performance metrics for a prompt variant.
 pub fn update_performance_metrics(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     variant_id: &str,
     metrics_json: &str,
 ) -> Result<(), String> {
-    let variant_id = variant_id.to_string();
-    let metrics_json = metrics_json.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            "UPDATE prompt_registry SET performance_metrics = ?1, updated_at = ?2 WHERE id = ?3",
-            params![metrics_json, now, variant_id],
-        )
-        .map_err(|e| format!("Failed to update metrics: {}", e))?;
-        Ok(())
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_performance_metrics(variant_id, metrics_json))
     })
 }
 
 // ── PG dual-write wrappers ─────────────────────────────────────────────
 
 /// Create a prompt variant with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use create_variant directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn create_variant_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, variant_name: &str, prompt_content: &str, source_recommendation_id: Option<&str>) -> Result<PromptVariant, String> {
-    let variant = create_variant(db, agent_type, variant_name, prompt_content, source_recommendation_id)?;
-    let pg = pg_db.clone();
-    let at = agent_type.to_string(); let vn = variant_name.to_string(); let pc = prompt_content.to_string(); let sri = source_recommendation_id.map(|s| s.to_string());
-    tokio::spawn(async move { let _ = pg.create_prompt_variant(&at, &vn, &pc, sri.as_deref()).await; });
-    Ok(variant)
+    create_variant(db, pg_db, agent_type, variant_name, prompt_content, source_recommendation_id)
 }
 
 /// Activate a prompt variant with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use activate_variant directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn activate_variant_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, variant_id: &str) -> Result<(), String> {
-    activate_variant(db, variant_id)?;
-    let pg = pg_db.clone();
-    let vid = variant_id.to_string();
-    tokio::spawn(async move { let _ = pg.activate_variant(&vid).await; });
-    Ok(())
+    activate_variant(db, pg_db, variant_id)
 }
 
 /// Update performance metrics with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use update_performance_metrics directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn update_performance_metrics_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, variant_id: &str, metrics_json: &str) -> Result<(), String> {
-    update_performance_metrics(db, variant_id, metrics_json)?;
-    let pg = pg_db.clone();
-    let vid = variant_id.to_string(); let mj = metrics_json.to_string();
-    tokio::spawn(async move { let _ = pg.update_performance_metrics(&vid, &mj).await; });
-    Ok(())
+    update_performance_metrics(db, pg_db, variant_id, metrics_json)
 }
 
 // ── PG-primary read wrappers ─────────────────────────────────────────────
@@ -314,24 +151,18 @@ pub fn get_active_prompt_with_pg(
             return Ok(result);
         }
     }
-    get_active_prompt(db, agent_type)
+    get_active_prompt(db, pg_db, agent_type)
 }
 
 /// List all prompt variants with PG-primary read.
+#[deprecated(note = "Use list_variants directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_variants_with_pg(
     db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<PromptVariant>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let at = agent_type.map(|s| s.to_string());
-        if let Ok(result) = handle.block_on(pg.list_variants(at.as_deref())) {
-            return Ok(result);
-        }
-    }
-    list_variants(db, agent_type)
+    list_variants(db, pg_db, agent_type)
 }
 
 /// Get a prompt variant by version with PG-primary read.
@@ -349,10 +180,10 @@ pub fn get_prompt_by_version_with_pg(
             return Ok(result);
         }
     }
-    get_prompt_by_version(db, agent_type, version)
+    get_prompt_by_version(db, pg_db, agent_type, version)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
     use crate::database::CheckpointDb;

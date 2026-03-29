@@ -3,6 +3,7 @@
 //! Runs baseline trials (current config) and candidate trials (with recommendation
 //! applied), then compares statistically using the shared `stats` module.
 
+use std::sync::Arc;
 use tracing::info;
 
 use super::eval_spec::{
@@ -14,6 +15,7 @@ use super::llm_judge_metrics::{
     evaluate_hallucination, JudgeInput, JudgeResult,
 };
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // =============================================================================
 // Core evaluation logic
@@ -31,6 +33,7 @@ use crate::database::CheckpointDb;
 /// * `db` — database handle
 pub fn evaluate_spec(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     spec: &EvalSpec,
     recommendation_id: Option<&str>,
 ) -> Result<EvalResult, String> {
@@ -67,7 +70,7 @@ pub fn evaluate_spec(
 
     // If recommendation is applied, get post-apply metrics
     let candidate_agg = if let Some(rec_id) = recommendation_id {
-        get_post_apply_metrics(db, rec_id, spec.target_agent.as_deref())?
+        get_post_apply_metrics(db, pg_db, rec_id, spec.target_agent.as_deref())?
     } else {
         None
     };
@@ -151,11 +154,11 @@ pub fn evaluate_spec(
     };
 
     // Persist
-    super::eval_spec::save_eval_result(db, &result)?;
+    super::eval_spec::save_eval_result(db, pg_db, &result)?;
 
     // If tied to a recommendation, attach the result
     if let Some(rec_id) = recommendation_id {
-        super::eval_spec::attach_eval_result(db, rec_id, &result_id, status)?;
+        super::eval_spec::attach_eval_result(db, pg_db, rec_id, &result_id, status)?;
     }
 
     info!(
@@ -170,46 +173,43 @@ pub fn evaluate_spec(
 /// (or generating a default one).
 pub fn validate_recommendation(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<EvalResult, String> {
     let rec_id = recommendation_id.to_string();
 
-    // Get recommendation details
-    let (target_agent, rec_type): (Option<String>, String) = db.with_conn({
-        let rec_id = rec_id.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT target_agent, recommendation_type FROM meta_optimizer_recommendations WHERE id = ?1",
-                rusqlite::params![rec_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| format!("Recommendation not found: {}", e))
-        }
-    })?;
+    // Get recommendation details from PG
+    let rec = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.get_recommendation(&rec_id))
+    })?
+    .ok_or_else(|| format!("Recommendation not found: {}", rec_id))?;
+    let target_agent = rec.target_agent;
+    let rec_type = rec.recommendation_type;
 
     // Find or generate an eval spec
     let spec = if let Some(ref agent) = target_agent {
         // Look for an existing spec for this agent
-        let specs = super::eval_spec::list_eval_specs(db, Some(agent))?;
+        let specs = super::eval_spec::list_eval_specs(db, pg_db, Some(agent))?;
         if let Some(spec) = specs.into_iter().next() {
             spec
         } else {
             // Auto-generate a default spec
             let spec = super::eval_spec::generate_default_spec(db, agent)?;
-            super::eval_spec::save_eval_spec(db, &spec)?;
+            super::eval_spec::save_eval_spec(db, pg_db, &spec)?;
             spec
         }
     } else {
         return Err("Cannot validate recommendation without target_agent".to_string());
     };
 
-    let result = evaluate_spec(db, &spec, Some(recommendation_id))?;
+    let result = evaluate_spec(db, pg_db, &spec, Some(recommendation_id))?;
 
     // For prompt_rewrite recommendations, also run robustness tests
     if rec_type == "prompt_rewrite" {
         if let Some(ref agent) = target_agent {
             match super::robustness::run_robustness_test(
                 db,
+                pg_db,
                 agent,
                 None, // no specific prompt variant
                 Some(recommendation_id),
@@ -243,22 +243,19 @@ pub fn validate_recommendation(
 /// Get post-apply metrics for a recommendation (7-day window after applied_at).
 fn get_post_apply_metrics(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     target_agent: Option<&str>,
 ) -> Result<Option<EvalAggregateMetrics>, String> {
     let rec_id = recommendation_id.to_string();
 
-    let applied_at: Option<String> = db.with_conn({
-        let rec_id = rec_id.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT applied_at FROM meta_optimizer_recommendations WHERE id = ?1",
-                rusqlite::params![rec_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to get applied_at: {}", e))
-        }
-    })?;
+    let applied_at: Option<String> = {
+        let rec = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.get_recommendation(recommendation_id))
+        })?
+        .ok_or_else(|| format!("Recommendation not found: {}", recommendation_id))?;
+        rec.applied_at
+    };
 
     let applied_at = match applied_at {
         Some(a) => a,
@@ -512,16 +509,7 @@ pub fn validate_recommendation_with_pg(
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     recommendation_id: &str,
 ) -> Result<EvalResult, String> {
-    let result = validate_recommendation(db, recommendation_id)?;
-    let pg = pg_db.clone();
-    let r = result.clone();
-    let rj = serde_json::to_string(&r).unwrap_or_default();
-    let pv = r.comparison.as_ref().and_then(|c| c.p_value);
-    let tr = r.trials_run as i64;
-    tokio::spawn(async move {
-        let _ = pg.save_eval_result(&r.id, &r.spec_id, r.recommendation_id.as_deref(), &r.status, &rj, pv, tr).await;
-    });
-    Ok(result)
+    validate_recommendation(db, pg_db, recommendation_id)
 }
 
 #[cfg(test)]

@@ -83,6 +83,7 @@ pub async fn start_comparison(
 
     // Launch runs via local HTTP API in background
     let db = app_state.checkpoint_db.clone();
+    let pg_db_for_spawn = app_state.pg_db.clone();
     let api_port = app_state
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -127,13 +128,12 @@ pub async fn start_comparison(
         let ejs = serde_json::to_string(&updated_entries).unwrap_or_default();
         let all_failed = updated_entries.iter().all(|e| e.status == "failed");
         let new_status = if all_failed { "failed" } else { "running" };
-        let _ = db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE comparison_runs SET entries_json = ?1, status = ?2 WHERE id = ?3",
-                rusqlite::params![ejs, new_status, comp_id],
-            )
-            .map_err(|e| format!("{}", e))?;
-            Ok(())
+        let pg_db = pg_db_for_spawn.clone();
+        let comp_id_pg = comp_id.clone();
+        let ejs_pg = ejs.clone();
+        let status_pg = new_status.to_string();
+        tokio::spawn(async move {
+            let _ = pg_db.update_comparison_entries(&comp_id_pg, &ejs_pg, &status_pg).await;
         });
     });
 

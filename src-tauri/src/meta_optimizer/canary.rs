@@ -2,11 +2,13 @@
 //!
 //! Allows testing a recommendation on a percentage of runs before full rollout.
 
-use rusqlite::params;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanaryRollout {
@@ -69,95 +71,33 @@ pub struct CanaryEvaluation {
 /// Start a canary rollout for a recommendation.
 pub fn start_canary(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     percentage: i64,
 ) -> Result<String, String> {
-    let id = format!("canary-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
-    let rec_id = recommendation_id.to_string();
-    let id_clone = id.clone();
     let percentage = percentage.clamp(1, 100);
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO canary_rollouts
-               (id, recommendation_id, percentage, status, start_date,
-                baseline_run_count, canary_run_count,
-                baseline_metrics_json, canary_metrics_json, created_at)
-               VALUES (?1, ?2, ?3, 'active', ?4, 0, 0, '{}', '{}', ?4)"#,
-            params![id_clone, rec_id, percentage, now],
-        )
-        .map_err(|e| format!("Failed to create canary rollout: {}", e))?;
-
-        // Update recommendation status to "canary"
-        conn.execute(
-            "UPDATE meta_optimizer_recommendations SET status = 'canary' WHERE id = ?1 AND status = 'pending'",
-            params![rec_id],
-        )
-        .map_err(|e| format!("Failed to update recommendation status: {}", e))?;
-
-        info!("Started canary rollout {} for recommendation {} at {}%", id_clone, rec_id, percentage);
-        Ok(())
-    })?;
-
-    Ok(id)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            pg_db.start_canary(recommendation_id, percentage as f64).await
+        })
+    })
 }
 
 /// Start a canary rollout with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use start_canary directly — it is now PG-primary")]
 pub fn start_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     percentage: i64,
 ) -> Result<String, String> {
-    let id = start_canary(db, recommendation_id, percentage)?;
-
-    let pg = pg_db.clone();
-    let rec_id = recommendation_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.start_canary(&rec_id, percentage as f64).await {
-            tracing::warn!("PG start_canary dual-write failed: {}", e);
-        }
-    });
-
-    Ok(id)
+    start_canary(db, pg_db, recommendation_id, percentage)
 }
 
 /// Get all active canary rollouts.
-pub fn get_active_canaries(db: &CheckpointDb) -> Result<Vec<CanaryRollout>, String> {
-    db.with_conn(|conn| {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT id, recommendation_id, percentage, status, start_date, end_date,
-                          baseline_run_count, canary_run_count,
-                          baseline_metrics_json, canary_metrics_json, created_at
-                   FROM canary_rollouts
-                   WHERE status = 'active'
-                   ORDER BY created_at DESC"#,
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let results = stmt
-            .query_map([], |row| {
-                Ok(CanaryRollout {
-                    id: row.get(0)?,
-                    recommendation_id: row.get(1)?,
-                    percentage: row.get(2)?,
-                    status: row.get(3)?,
-                    start_date: row.get(4)?,
-                    end_date: row.get(5)?,
-                    baseline_run_count: row.get(6)?,
-                    canary_run_count: row.get(7)?,
-                    baseline_metrics_json: row.get(8)?,
-                    canary_metrics_json: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query canaries: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(results)
+pub fn get_active_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<CanaryRollout>, String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_active_canaries())
     })
 }
 
@@ -167,65 +107,22 @@ pub fn get_active_canaries(db: &CheckpointDb) -> Result<Vec<CanaryRollout>, Stri
 /// inconclusive after many runs.
 pub fn update_canary_percentage(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     new_percentage: i64,
 ) -> Result<(), String> {
-    let canary_id = canary_id.to_string();
     let pct = new_percentage.clamp(1, 100);
 
-    db.with_conn(move |conn| {
-        conn.execute(
-            "UPDATE canary_rollouts SET percentage = ?1 WHERE id = ?2 AND status = 'active'",
-            params![pct, canary_id],
-        )
-        .map_err(|e| format!("Failed to update canary percentage: {}", e))?;
-        Ok(())
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.update_canary_percentage(canary_id, pct))
     })
 }
 
 /// Get completed canary rollouts (promoted or rolled back) for history display.
-pub fn get_canary_history(db: &CheckpointDb, limit: u32) -> Result<Vec<serde_json::Value>, String> {
+pub fn get_canary_history(db: &CheckpointDb, pg_db: &Arc<PgDb>, limit: u32) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.min(100) as i64;
-    db.with_conn(move |conn| {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT c.id, c.recommendation_id, c.percentage, c.status,
-                          c.start_date, c.end_date,
-                          c.baseline_run_count, c.canary_run_count,
-                          c.baseline_metrics_json, c.canary_metrics_json, c.created_at,
-                          r.title, r.target_agent, r.recommendation_type
-                   FROM canary_rollouts c
-                   LEFT JOIN meta_optimizer_recommendations r ON r.id = c.recommendation_id
-                   WHERE c.status IN ('promoted', 'rolled_back')
-                   ORDER BY c.end_date DESC
-                   LIMIT ?1"#,
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        let results: Vec<serde_json::Value> = stmt
-            .query_map(params![limit], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "recommendation_id": row.get::<_, String>(1)?,
-                    "percentage": row.get::<_, i64>(2)?,
-                    "status": row.get::<_, String>(3)?,
-                    "start_date": row.get::<_, String>(4)?,
-                    "end_date": row.get::<_, Option<String>>(5)?,
-                    "baseline_run_count": row.get::<_, i64>(6)?,
-                    "canary_run_count": row.get::<_, i64>(7)?,
-                    "baseline_metrics_json": row.get::<_, String>(8)?,
-                    "canary_metrics_json": row.get::<_, String>(9)?,
-                    "created_at": row.get::<_, String>(10)?,
-                    "recommendation_title": row.get::<_, Option<String>>(11)?,
-                    "target_agent": row.get::<_, Option<String>>(12)?,
-                    "recommendation_type": row.get::<_, Option<String>>(13)?,
-                }))
-            })
-            .map_err(|e| format!("Failed to query canary history: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(results)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_canary_history(limit))
     })
 }
 
@@ -234,54 +131,11 @@ pub fn get_canary_history(db: &CheckpointDb, limit: u32) -> Result<Vec<serde_jso
 /// or an empty map otherwise. This is used to inject the canary prompt during pipeline execution.
 pub fn get_canary_prompt_overrides(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let rec_id = recommendation_id.to_string();
-    let mut overrides = std::collections::HashMap::new();
-
-    db.with_conn(move |conn| {
-        let (rec_type, recommended_value, target_agent): (String, Option<String>, Option<String>) =
-            conn.query_row(
-                "SELECT recommendation_type, recommended_value, target_agent FROM meta_optimizer_recommendations WHERE id = ?1",
-                params![rec_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|e| format!("Recommendation not found: {}", e))?;
-
-        if rec_type == "prompt_rewrite" {
-            if let Some(ref val) = recommended_value {
-                // Parse the prompt_rewrite payload: { agent_type, variant_name, prompt_content }
-                if let Ok(payload) = serde_json::from_str::<serde_json::Value>(val) {
-                    if let (Some(agent), Some(content)) = (
-                        payload.get("agent_type").and_then(|v| v.as_str()),
-                        payload.get("prompt_content").and_then(|v| v.as_str()),
-                    ) {
-                        overrides.insert(agent.to_string(), content.to_string());
-                    }
-                }
-            }
-        } else if rec_type == "config_change" {
-            // Config changes could target a specific agent — store the target for reference
-            // but config changes are applied differently (via settings), not prompt injection.
-            // No prompt override needed.
-        }
-
-        // If no payload-based override, check if there's a prompt variant created by this recommendation
-        if overrides.is_empty() {
-            if let Some(agent) = target_agent {
-                let variant_content: Option<String> = conn.query_row(
-                    "SELECT prompt_content FROM prompt_registry WHERE source_recommendation_id = ?1 ORDER BY version DESC LIMIT 1",
-                    params![rec_id],
-                    |row| row.get(0),
-                ).ok();
-
-                if let Some(content) = variant_content {
-                    overrides.insert(agent, content);
-                }
-            }
-        }
-
-        Ok(overrides)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_canary_prompt_overrides(recommendation_id))
     })
 }
 
@@ -289,58 +143,18 @@ pub fn get_canary_prompt_overrides(
 /// Returns a vec of (key, serde_json::Value) pairs to apply as temporary settings during canary runs.
 pub fn get_canary_config_overrides(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
-    let rec_id = recommendation_id.to_string();
-    db.with_conn(move |conn| {
-        let (rec_type, recommended_value): (String, Option<String>) = conn
-            .query_row(
-                "SELECT recommendation_type, recommended_value FROM meta_optimizer_recommendations WHERE id = ?1",
-                params![rec_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| format!("Recommendation not found: {}", e))?;
-
-        if rec_type != "config_change" {
-            return Ok(Vec::new());
-        }
-
-        let Some(val) = recommended_value else {
-            return Ok(Vec::new());
-        };
-
-        // Parse ConfigChangePayload: { key, value }
-        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&val) {
-            if let (Some(key), Some(value)) = (
-                payload.get("key").and_then(|v| v.as_str()),
-                payload.get("value").cloned(),
-            ) {
-                return Ok(vec![(key.to_string(), value)]);
-            }
-        }
-
-        Ok(Vec::new())
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_canary_config_overrides(recommendation_id))
     })
 }
 
 /// Probabilistic check: should this run use the canary config?
-pub fn should_apply_canary(db: &CheckpointDb, recommendation_id: &str) -> bool {
-    let rec_id = recommendation_id.to_string();
-    db.with_conn(move |conn| {
-        let percentage: i64 = conn
-            .query_row(
-                "SELECT percentage FROM canary_rollouts WHERE recommendation_id = ?1 AND status = 'active' LIMIT 1",
-                params![rec_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if percentage <= 0 {
-            return Ok(false);
-        }
-
-        let roll: f64 = rand::random::<f64>() * 100.0;
-        Ok(roll < percentage as f64)
+pub fn should_apply_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> bool {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.should_apply_canary(recommendation_id))
     })
     .unwrap_or(false)
 }
@@ -348,250 +162,86 @@ pub fn should_apply_canary(db: &CheckpointDb, recommendation_id: &str) -> bool {
 /// Record a completed run as either baseline or canary.
 pub fn record_canary_run(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     is_canary: bool,
     success: bool,
     cost: f64,
     duration_ms: f64,
 ) -> Result<(), String> {
-    let canary_id = canary_id.to_string();
+    // PG-primary: load current metrics from PG, update, write back
+    let pg_result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let (baseline_json, canary_json) = pg_db.get_canary_metrics(canary_id).await?;
+            let mut baseline: CanaryMetrics = serde_json::from_str(&baseline_json).unwrap_or_default();
+            let mut canary_m: CanaryMetrics = serde_json::from_str(&canary_json).unwrap_or_default();
+            let metrics = if is_canary { &mut canary_m } else { &mut baseline };
+            if success { metrics.success_count += 1; } else { metrics.failure_count += 1; }
+            metrics.total_cost_usd += cost;
+            metrics.total_duration_ms += duration_ms;
+            let new_baseline = serde_json::to_string(&baseline).unwrap_or_default();
+            let new_canary = serde_json::to_string(&canary_m).unwrap_or_default();
+            let run_type = if is_canary { "canary" } else { "baseline" };
+            pg_db.record_canary_run(canary_id, run_type, if is_canary { &new_canary } else { &new_baseline }).await?;
+            // Also update full metrics
+            pg_db.update_canary_metrics(canary_id, &new_baseline, &new_canary).await?;
+            Ok::<(), String>(())
+        })
+    });
 
-    db.with_conn(move |conn| {
-        // Load current metrics
-        let (baseline_json, canary_json): (String, String) = conn
-            .query_row(
-                "SELECT baseline_metrics_json, canary_metrics_json FROM canary_rollouts WHERE id = ?1",
-                params![canary_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| format!("Canary not found: {}", e))?;
-
-        let mut baseline: CanaryMetrics =
-            serde_json::from_str(&baseline_json).unwrap_or_default();
-        let mut canary: CanaryMetrics =
-            serde_json::from_str(&canary_json).unwrap_or_default();
-
-        let metrics = if is_canary { &mut canary } else { &mut baseline };
-        if success {
-            metrics.success_count += 1;
-        } else {
-            metrics.failure_count += 1;
-        }
-        metrics.total_cost_usd += cost;
-        metrics.total_duration_ms += duration_ms;
-
-        let count_field = if is_canary { "canary_run_count" } else { "baseline_run_count" };
-        let baseline_json = serde_json::to_string(&baseline).unwrap_or_default();
-        let canary_json = serde_json::to_string(&canary).unwrap_or_default();
-
-        conn.execute(
-            &format!(
-                "UPDATE canary_rollouts SET {} = {} + 1, baseline_metrics_json = ?1, canary_metrics_json = ?2 WHERE id = ?3",
-                count_field, count_field
-            ),
-            params![baseline_json, canary_json, canary_id],
-        )
-        .map_err(|e| format!("Failed to record canary run: {}", e))?;
-
-        // Best-effort: insert a per-run record into canary_run_records
-        let record_id = format!("crr-{}", uuid::Uuid::new_v4());
-        let created_at = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = conn.execute(
-            r#"INSERT INTO canary_run_records
-               (id, canary_id, is_canary, task_run_id, success, cost_usd, duration_ms, created_at)
-               VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)"#,
-            params![
-                record_id,
-                canary_id,
-                is_canary as i32,
-                success as i32,
-                cost,
-                duration_ms,
-                created_at,
-            ],
-        ) {
-            warn!("Failed to insert canary_run_record: {}", e);
-        }
-
-        Ok(())
-    })
+    pg_result
 }
 
 /// Record a canary run with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use record_canary_run directly — it is now PG-primary")]
 pub fn record_canary_run_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     is_canary: bool,
     success: bool,
     cost: f64,
     duration_ms: f64,
 ) -> Result<(), String> {
-    record_canary_run(db, canary_id, is_canary, success, cost, duration_ms)?;
-
-    // Read back the updated metrics to send to PG
-    let cid = canary_id.to_string();
-    let metrics = db.with_conn({
-        let cid = cid.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT baseline_metrics_json, canary_metrics_json FROM canary_rollouts WHERE id = ?1",
-                params![cid],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .map_err(|e| format!("Failed to read back canary metrics: {}", e))
-        }
-    });
-
-    if let Ok((baseline_json, canary_json)) = metrics {
-        let pg = pg_db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = pg.update_canary_metrics(&cid, &baseline_json, &canary_json).await {
-                tracing::warn!("PG update_canary_metrics dual-write failed: {}", e);
-            }
-        });
-    }
-
-    Ok(())
+    record_canary_run(db, pg_db, canary_id, is_canary, success, cost, duration_ms)
 }
 
 /// Evaluate a canary: should it be promoted, rolled back, or continue?
 ///
 /// Uses statistical tests (proportion z-test, confidence intervals, effect size)
 /// instead of simple threshold-based verdicts.
-pub fn evaluate_canary(db: &CheckpointDb, canary_id: &str) -> Result<CanaryEvaluation, String> {
-    let canary_id = canary_id.to_string();
-
-    db.with_conn(move |conn| {
-        let (baseline_json, canary_json, canary_count): (String, String, i64) = conn
-            .query_row(
-                "SELECT baseline_metrics_json, canary_metrics_json, canary_run_count FROM canary_rollouts WHERE id = ?1",
-                params![canary_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|e| format!("Canary not found: {}", e))?;
-
-        let baseline: CanaryMetrics = serde_json::from_str(&baseline_json).unwrap_or_default();
-        let canary: CanaryMetrics = serde_json::from_str(&canary_json).unwrap_or_default();
-
-        let min_runs = 10;
-        let min_runs_met = canary_count >= min_runs;
-
-        let baseline_total = (baseline.success_count + baseline.failure_count) as u64;
-        let canary_total = (canary.success_count + canary.failure_count) as u64;
-
-        let baseline_sr = if baseline_total > 0 {
-            baseline.success_count as f64 / baseline_total as f64 * 100.0
-        } else {
-            0.0
-        };
-        let canary_sr = if canary_total > 0 {
-            canary.success_count as f64 / canary_total as f64 * 100.0
-        } else {
-            0.0
-        };
-
-        let delta = canary_sr - baseline_sr;
-
-        // Statistical analysis (requires at least 2 runs per group)
-        let analysis = crate::stats::proportion_analysis(
-            (canary.success_count as u64, canary_total),
-            (baseline.success_count as u64, baseline_total),
-            2,
-        );
-        let p_value = analysis.p_value;
-        let confidence_interval = analysis.confidence_interval;
-        let effect_size = analysis.effect_size;
-
-        // Cost and duration deltas
-        let cost_delta_pct = if baseline_total > 0 && canary_total > 0 {
-            let baseline_avg_cost = baseline.total_cost_usd / baseline_total as f64;
-            let canary_avg_cost = canary.total_cost_usd / canary_total as f64;
-            if baseline_avg_cost > 0.0 {
-                Some((canary_avg_cost - baseline_avg_cost) / baseline_avg_cost * 100.0)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let duration_delta_pct = if baseline_total > 0 && canary_total > 0 {
-            let baseline_avg_dur = baseline.total_duration_ms / baseline_total as f64;
-            let canary_avg_dur = canary.total_duration_ms / canary_total as f64;
-            if baseline_avg_dur > 0.0 {
-                Some((canary_avg_dur - baseline_avg_dur) / baseline_avg_dur * 100.0)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Verdict using shared statistical verdict with canary thresholds
-        let verdict_enum = if !min_runs_met {
-            crate::stats::Verdict::Neutral // will map to "continue"
-        } else {
-            crate::stats::compute_verdict(
-                delta,
-                &analysis,
-                canary_total,
-                &crate::stats::VerdictThresholds::canary(),
-            )
-        };
-        let verdict = verdict_enum.as_canary_str();
-
-        Ok(CanaryEvaluation {
-            verdict: verdict.to_string(),
-            baseline_success_rate: baseline_sr,
-            canary_success_rate: canary_sr,
-            delta,
-            min_runs_met,
-            p_value,
-            confidence_interval,
-            effect_size,
-            cost_delta_pct,
-            duration_delta_pct,
-        })
+pub fn evaluate_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> Result<CanaryEvaluation, String> {
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.evaluate_canary(canary_id))
     })
 }
 
 /// Promote a canary: apply the recommendation globally.
-pub fn promote_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> {
+pub fn promote_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
     let canary_id_str = canary_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
 
-    // Get recommendation_id
-    let rec_id: String = db.with_conn({
-        let canary_id = canary_id_str.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT recommendation_id FROM canary_rollouts WHERE id = ?1",
-                params![canary_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Canary not found: {}", e))
-        }
+    // Get recommendation_id from PG
+    let rec_id: String = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+            let row = conn.query_one(
+                "SELECT recommendation_id FROM canary_rollouts WHERE id = $1",
+                &[&canary_id_str],
+            ).await.map_err(|e| format!("PG canary lookup: {e}"))?;
+            Ok::<String, String>(row.get(0))
+        })
     })?;
 
     // Apply the recommendation fully
-    super::recommendations::apply_recommendation_with_side_effects(db, &rec_id)?;
+    super::recommendations::apply_recommendation_with_side_effects(db, pg_db, &rec_id)?;
 
     // Update canary status
-    db.with_conn({
-        let canary_id = canary_id_str;
-        move |conn| {
-            conn.execute(
-                "UPDATE canary_rollouts SET status = 'promoted', end_date = ?1 WHERE id = ?2",
-                params![now, canary_id],
-            )
-            .map_err(|e| format!("Failed to promote canary: {}", e))?;
-            Ok(())
-        }
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.promote_canary(&canary_id_str))
     })?;
 
     // Update prompt evolution verdict if this was a meta-prompt rewrite canary
-    if let Err(e) = update_evolution_for_recommendation(db, &rec_id, "adopt", None) {
+    if let Err(e) = update_evolution_for_recommendation(db, pg_db, &rec_id, "adopt", None) {
         debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
     }
 
@@ -600,89 +250,64 @@ pub fn promote_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> 
 }
 
 /// Promote a canary with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use promote_canary directly — it is now PG-primary")]
 pub fn promote_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<(), String> {
-    promote_canary(db, canary_id)?;
-
-    let pg = pg_db.clone();
-    let cid = canary_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.promote_canary(&cid).await {
-            tracing::warn!("PG promote_canary dual-write failed: {}", e);
-        }
-    });
-
-    Ok(())
+    promote_canary(db, pg_db, canary_id)
 }
 
 /// Roll back a canary: mark recommendation as rolled_back and record evaluation metrics.
-///
-/// Unlike the previous behavior (reverting to "pending"), this sets the recommendation
-/// status to "rolled_back" so it is not re-attempted, and records the canary evaluation
-/// metrics that triggered the rollback decision.
-pub fn rollback_canary(db: &CheckpointDb, canary_id: &str) -> Result<(), String> {
-    rollback_canary_with_eval(db, canary_id, None)
+pub fn rollback_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
+    rollback_canary_with_eval(db, pg_db, canary_id, None)
 }
 
 /// Roll back a canary with optional evaluation metrics to record on the recommendation.
 pub fn rollback_canary_with_eval(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     eval: Option<&CanaryEvaluation>,
 ) -> Result<(), String> {
     let canary_id_str = canary_id.to_string();
-    let now = chrono::Utc::now().to_rfc3339();
     let eval_json = eval
         .and_then(|e| serde_json::to_string(e).ok())
         .unwrap_or_else(|| "{}".to_string());
 
-    // Get rec_id outside the closure so we can use it for evolution update
-    let rec_id: String = db.with_conn({
-        let canary_id = canary_id_str.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT recommendation_id FROM canary_rollouts WHERE id = ?1",
-                params![canary_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Canary not found: {}", e))
-        }
+    // Get rec_id from PG
+    let rec_id: String = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+            let row = conn.query_one(
+                "SELECT recommendation_id FROM canary_rollouts WHERE id = $1",
+                &[&canary_id_str],
+            ).await.map_err(|e| format!("PG canary lookup: {e}"))?;
+            Ok::<String, String>(row.get(0))
+        })
     })?;
 
-    db.with_conn({
-        let canary_id = canary_id_str.clone();
-        let rec_id = rec_id.clone();
-        move |conn| {
-            // Update canary status
-            conn.execute(
-                "UPDATE canary_rollouts SET status = 'rolled_back', end_date = ?1 WHERE id = ?2",
-                params![now, canary_id],
-            )
-            .map_err(|e| format!("Failed to rollback canary: {}", e))?;
-
-            // Mark recommendation as rolled_back (not pending) and record eval metrics
-            conn.execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'rolled_back', outcome_after_apply = ?1 WHERE id = ?2",
-                params![eval_json, rec_id],
-            )
-            .map_err(|e| format!("Failed to update recommendation status: {}", e))?;
-
-            info!(
-                "Rolled back canary {} (recommendation {} -> rolled_back)",
-                canary_id, rec_id
-            );
-            Ok(())
-        }
+    // Update canary status and recommendation
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            pg_db.rollback_canary(&canary_id_str).await?;
+            // Also update recommendation outcome
+            pg_db.update_recommendation_outcome(&rec_id, &eval_json).await?;
+            Ok::<(), String>(())
+        })
     })?;
+
+    info!(
+        "Rolled back canary {} (recommendation {} -> rolled_back)",
+        canary_id_str, rec_id
+    );
 
     // Compute canary success rate as score_after for evolution tracking
     let score_after = eval.map(|e| e.canary_success_rate / 100.0);
 
     // Update prompt evolution verdict if this was a meta-prompt rewrite canary
-    if let Err(e) = update_evolution_for_recommendation(db, &rec_id, "reject", score_after) {
+    if let Err(e) = update_evolution_for_recommendation(db, pg_db, &rec_id, "reject", score_after) {
         debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
     }
 
@@ -690,22 +315,13 @@ pub fn rollback_canary_with_eval(
 }
 
 /// Roll back a canary with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use rollback_canary directly — it is now PG-primary")]
 pub fn rollback_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<(), String> {
-    rollback_canary(db, canary_id)?;
-
-    let pg = pg_db.clone();
-    let cid = canary_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.rollback_canary(&cid).await {
-            tracing::warn!("PG rollback_canary dual-write failed: {}", e);
-        }
-    });
-
-    Ok(())
+    rollback_canary(db, pg_db, canary_id)
 }
 
 /// Update the prompt evolution verdict for a recommendation.
@@ -715,36 +331,31 @@ pub fn rollback_canary_with_pg(
 /// meta-prompt optimizer.
 fn update_evolution_for_recommendation(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     verdict: &str,
     score_after: Option<f64>,
 ) -> Result<(), String> {
-    let rec_id = recommendation_id.to_string();
-    let verdict_str = verdict.to_string();
-
-    db.with_conn(move |conn| {
-        let updated = conn
-            .execute(
-                "UPDATE prompt_evolution SET canary_verdict = ?1, score_after = ?2 WHERE recommendation_id = ?3 AND canary_verdict IS NULL",
-                params![verdict_str, score_after, rec_id],
-            )
-            .map_err(|e| format!("Failed to update evolution verdict: {}", e))?;
-
-        if updated > 0 {
-            info!(
-                "Updated prompt evolution verdict for recommendation {}: {}",
-                rec_id, verdict_str
-            );
-        }
-        Ok(())
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+            let updated = conn.execute(
+                "UPDATE prompt_evolution SET canary_verdict = $1, score_after = $2 WHERE recommendation_id = $3 AND canary_verdict IS NULL",
+                &[&verdict, &score_after as &(dyn tokio_postgres::types::ToSql + Sync), &recommendation_id],
+            ).await.map_err(|e| format!("PG update evolution: {e}"))?;
+            if updated > 0 {
+                info!("Updated prompt evolution verdict for recommendation {}: {}", recommendation_id, verdict);
+            }
+            Ok::<(), String>(())
+        })
     })
 }
 
 /// Auto-rollback canary rollouts that have been active for more than 30 days
 /// without reaching a promote/rollback verdict. Stale canaries block the optimizer
 /// from generating fresh recommendations for the same target.
-pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
-    let canaries = match get_active_canaries(db) {
+pub fn auto_rollback_stale_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usize {
+    let canaries = match get_active_canaries(db, pg_db) {
         Ok(c) => c,
         Err(_) => return 0,
     };
@@ -753,7 +364,6 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
     let mut rolled_back = 0;
 
     for canary in &canaries {
-        // Only rollback canaries started more than 30 days ago
         let started = if canary.start_date.is_empty() {
             &canary.created_at
         } else {
@@ -767,7 +377,7 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
             "Auto-rolling-back stale canary {} (active since {}, {} canary runs)",
             canary.id, started, canary.canary_run_count
         );
-        if let Err(e) = rollback_canary(db, &canary.id) {
+        if let Err(e) = rollback_canary(db, pg_db, &canary.id) {
             warn!("Failed to auto-rollback stale canary {}: {}", canary.id, e);
         } else {
             rolled_back += 1;
@@ -789,41 +399,25 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb) -> usize {
 // ── PG-primary read wrappers (prompt/config overrides) ──────────────────
 
 /// Get canary prompt overrides from PG (falls back to SQLite).
+#[deprecated(note = "Use get_canary_prompt_overrides directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn get_canary_prompt_overrides_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let rid = recommendation_id.to_string();
-        if let Ok(result) = tokio::task::block_in_place(|| {
-            handle.block_on(pg.get_canary_prompt_overrides(&rid))
-        }) {
-            return Ok(result);
-        }
-    }
-    get_canary_prompt_overrides(db, recommendation_id)
+    get_canary_prompt_overrides(db, pg_db, recommendation_id)
 }
 
 /// Get canary config overrides from PG (falls back to SQLite).
+#[deprecated(note = "Use get_canary_config_overrides directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn get_canary_config_overrides_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let rid = recommendation_id.to_string();
-        if let Ok(result) = tokio::task::block_in_place(|| {
-            handle.block_on(pg.get_canary_config_overrides(&rid))
-        }) {
-            return Ok(result);
-        }
-    }
-    get_canary_config_overrides(db, recommendation_id)
+    get_canary_config_overrides(db, pg_db, recommendation_id)
 }
 
 /// Per-version metrics for prompt template canary testing.
@@ -982,114 +576,46 @@ pub fn evaluate_prompt_canary(canary: &PromptTemplateCanary) -> CanaryEvaluation
 /// Create a new prompt template canary and persist it to the database.
 pub fn create_prompt_template_canary(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     template_id: &str,
     baseline_version: i32,
     candidate_version: i32,
     traffic_pct: f64,
 ) -> Result<String, String> {
-    let id = format!("ptc-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
-    let traffic_pct = traffic_pct.clamp(0.0, 1.0);
-    let empty_metrics = serde_json::to_string(&PromptVersionMetrics::default())
-        .unwrap_or_else(|_| "{}".to_string());
-
-    let id_clone = id.clone();
-    let template_id = template_id.to_string();
-
-    db.with_conn(move |conn| {
-        conn.execute(
-            r#"INSERT INTO prompt_template_canaries
-               (id, template_id, baseline_version, candidate_version,
-                traffic_percentage, status,
-                baseline_metrics_json, candidate_metrics_json,
-                created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)"#,
-            params![
-                id_clone,
-                template_id,
-                baseline_version,
-                candidate_version,
-                traffic_pct,
-                empty_metrics,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Failed to create prompt template canary: {}", e))?;
-
-        info!(
-            "Created prompt template canary {} for template {} (v{} vs v{}, {}% candidate traffic)",
-            id_clone,
-            template_id,
-            baseline_version,
-            candidate_version,
-            (traffic_pct * 100.0) as i64,
-        );
-        Ok(())
-    })?;
-
-    Ok(id)
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.create_template_canary(template_id, baseline_version, candidate_version, traffic_pct))
+    })
 }
 
 /// Create a prompt template canary with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use create_prompt_template_canary directly — it is now PG-primary")]
 pub fn create_prompt_template_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     template_id: &str,
     baseline_version: i32,
     candidate_version: i32,
     traffic_pct: f64,
 ) -> Result<String, String> {
-    let id = create_prompt_template_canary(db, template_id, baseline_version, candidate_version, traffic_pct)?;
-
-    let pg = pg_db.clone();
-    let tid = template_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.create_template_canary(&tid, baseline_version, candidate_version, traffic_pct).await {
-            tracing::warn!("PG create_template_canary dual-write failed: {}", e);
-        }
-    });
-
-    Ok(id)
+    create_prompt_template_canary(db, pg_db, template_id, baseline_version, candidate_version, traffic_pct)
 }
 
 /// Load a prompt template canary from the database by id.
 pub fn get_prompt_template_canary(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<PromptTemplateCanary, String> {
-    let canary_id = canary_id.to_string();
-    db.with_conn(move |conn| {
-        conn.query_row(
-            r#"SELECT id, template_id, baseline_version, candidate_version,
-                      traffic_percentage, status,
-                      baseline_metrics_json, candidate_metrics_json,
-                      created_at, ended_at
-               FROM prompt_template_canaries WHERE id = ?1"#,
-            params![canary_id],
-            |row| {
-                let baseline_json: String = row.get(6)?;
-                let candidate_json: String = row.get(7)?;
-                Ok(PromptTemplateCanary {
-                    id: row.get(0)?,
-                    template_id: row.get(1)?,
-                    baseline_version: row.get(2)?,
-                    candidate_version: row.get(3)?,
-                    traffic_percentage: row.get(4)?,
-                    status: row.get(5)?,
-                    baseline_metrics: serde_json::from_str(&baseline_json).unwrap_or_default(),
-                    candidate_metrics: serde_json::from_str(&candidate_json).unwrap_or_default(),
-                    created_at: row.get(8)?,
-                    ended_at: row.get(9)?,
-                })
-            },
-        )
-        .map_err(|e| format!("Prompt template canary not found: {}", e))
-    })
+    let result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_template_canary(canary_id))
+    })?;
+    result.ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))
 }
 
 /// Record a result for a prompt template canary and persist updated metrics.
 pub fn record_prompt_canary_run(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     used_candidate: bool,
     success: bool,
@@ -1097,56 +623,32 @@ pub fn record_prompt_canary_run(
     latency_ms: f64,
     tokens: i64,
 ) -> Result<(), String> {
-    let canary_id = canary_id.to_string();
-
-    db.with_conn(move |conn| {
-        let (baseline_json, candidate_json): (String, String) = conn
-            .query_row(
-                "SELECT baseline_metrics_json, candidate_metrics_json FROM prompt_template_canaries WHERE id = ?1",
-                params![canary_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| format!("Prompt template canary not found: {}", e))?;
-
-        let mut baseline: PromptVersionMetrics =
-            serde_json::from_str(&baseline_json).unwrap_or_default();
-        let mut candidate: PromptVersionMetrics =
-            serde_json::from_str(&candidate_json).unwrap_or_default();
-
-        let metrics = if used_candidate {
-            &mut candidate
-        } else {
-            &mut baseline
-        };
-        metrics.run_count += 1;
-        if success {
-            metrics.success_count += 1;
-        } else {
-            metrics.failure_count += 1;
-        }
-        metrics.total_cost_usd += cost;
-        metrics.total_latency_ms += latency_ms;
-        metrics.total_tokens += tokens;
-
-        let baseline_json = serde_json::to_string(&baseline).unwrap_or_default();
-        let candidate_json = serde_json::to_string(&candidate).unwrap_or_default();
-
-        conn.execute(
-            "UPDATE prompt_template_canaries SET baseline_metrics_json = ?1, candidate_metrics_json = ?2 WHERE id = ?3",
-            params![baseline_json, candidate_json, canary_id],
-        )
-        .map_err(|e| format!("Failed to record prompt canary run: {}", e))?;
-
-        Ok(())
-    })
+    // PG-primary: load metrics, update, write back
+    let pg_result = tokio::task::block_in_place(|| {
+        Handle::current().block_on(async {
+            let canary = pg_db.get_template_canary(canary_id).await?
+                .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?;
+            let mut baseline = canary.baseline_metrics;
+            let mut candidate = canary.candidate_metrics;
+            let metrics = if used_candidate { &mut candidate } else { &mut baseline };
+            metrics.run_count += 1;
+            if success { metrics.success_count += 1; } else { metrics.failure_count += 1; }
+            metrics.total_cost_usd += cost;
+            metrics.total_latency_ms += latency_ms;
+            metrics.total_tokens += tokens;
+            let b_json = serde_json::to_string(&baseline).unwrap_or_default();
+            let c_json = serde_json::to_string(&candidate).unwrap_or_default();
+            pg_db.update_template_canary_metrics(canary_id, &b_json, &c_json).await
+        })
+    });
+    pg_result
 }
 
 /// Record a prompt canary run with PG dual-write (fire-and-forget).
-///
-/// The PG side uses `update_template_canary_metrics` to persist the metrics JSON.
+#[deprecated(note = "Use record_prompt_canary_run directly — it is now PG-primary")]
 pub fn record_prompt_canary_run_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     used_candidate: bool,
     success: bool,
@@ -1154,40 +656,16 @@ pub fn record_prompt_canary_run_with_pg(
     latency_ms: f64,
     tokens: i64,
 ) -> Result<(), String> {
-    record_prompt_canary_run(db, canary_id, used_candidate, success, cost, latency_ms, tokens)?;
-
-    // Read back the updated metrics to send to PG
-    let cid = canary_id.to_string();
-    let metrics = db.with_conn({
-        let cid = cid.clone();
-        move |conn| {
-            conn.query_row(
-                "SELECT baseline_metrics_json, candidate_metrics_json FROM prompt_template_canaries WHERE id = ?1",
-                params![cid],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .map_err(|e| format!("Failed to read back canary metrics: {}", e))
-        }
-    });
-
-    if let Ok((baseline_json, candidate_json)) = metrics {
-        let pg = pg_db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = pg.update_template_canary_metrics(&cid, &baseline_json, &candidate_json).await {
-                tracing::warn!("PG update_template_canary_metrics dual-write failed: {}", e);
-            }
-        });
-    }
-
-    Ok(())
+    record_prompt_canary_run(db, pg_db, canary_id, used_candidate, success, cost, latency_ms, tokens)
 }
 
 /// Evaluate a prompt template canary from persisted DB state.
 pub fn evaluate_prompt_canary_from_db(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<CanaryEvaluation, String> {
-    let canary = get_prompt_template_canary(db, canary_id)?;
+    let canary = get_prompt_template_canary(db, pg_db, canary_id)?;
     Ok(evaluate_prompt_canary(&canary))
 }
 
@@ -1213,50 +691,15 @@ pub struct CanaryResolvedPrompt {
 /// loads the chosen version from the prompt registry, and returns it.
 pub fn resolve_prompt_with_canary(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     template_id: &str,
     default_content: &str,
 ) -> CanaryResolvedPrompt {
-    // Look up an active canary for this template_id
-    let template_id_owned = template_id.to_string();
-    let canary_opt: Option<PromptTemplateCanary> = db
-        .with_conn(move |conn| {
-            let result = conn.query_row(
-                r#"SELECT id, template_id, baseline_version, candidate_version,
-                          traffic_percentage, status,
-                          baseline_metrics_json, candidate_metrics_json,
-                          created_at, ended_at
-                   FROM prompt_template_canaries
-                   WHERE template_id = ?1 AND status = 'active'
-                   LIMIT 1"#,
-                params![template_id_owned],
-                |row| {
-                    let baseline_json: String = row.get(6)?;
-                    let candidate_json: String = row.get(7)?;
-                    Ok(PromptTemplateCanary {
-                        id: row.get(0)?,
-                        template_id: row.get(1)?,
-                        baseline_version: row.get(2)?,
-                        candidate_version: row.get(3)?,
-                        traffic_percentage: row.get(4)?,
-                        status: row.get(5)?,
-                        baseline_metrics: serde_json::from_str(&baseline_json).unwrap_or_default(),
-                        candidate_metrics: serde_json::from_str(&candidate_json)
-                            .unwrap_or_default(),
-                        created_at: row.get(8)?,
-                        ended_at: row.get(9)?,
-                    })
-                },
-            );
-            match result {
-                Ok(c) => Ok(Some(c)),
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => {
-                    warn!("Failed to query prompt template canary: {}", e);
-                    Ok(None)
-                }
-            }
-        })
-        .unwrap_or(None);
+    // Look up active canary from PG
+    let canary_opt: Option<PromptTemplateCanary> = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.get_active_template_canary(template_id))
+    })
+    .unwrap_or(None);
 
     let Some(canary) = canary_opt else {
         return CanaryResolvedPrompt {
@@ -1276,6 +719,7 @@ pub fn resolve_prompt_with_canary(
     // Load the prompt content for the selected version from the registry
     let content = match super::prompt_registry::get_prompt_by_version(
         db,
+        pg_db,
         &canary.template_id,
         version,
     ) {
@@ -1394,6 +838,7 @@ pub async fn resolve_prompt_with_canary_pg(
 /// the case where no canary was active (canary_id is None — silently no-ops).
 pub fn record_canary_outcome(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     used_candidate: bool,
     success: bool,
@@ -1403,6 +848,7 @@ pub fn record_canary_outcome(
 ) {
     if let Err(e) = record_prompt_canary_run(
         db,
+        pg_db,
         canary_id,
         used_candidate,
         success,
@@ -1427,11 +873,7 @@ pub fn update_canary_percentage_with_pg(
     canary_id: &str,
     new_percentage: i64,
 ) -> Result<(), String> {
-    update_canary_percentage(db, canary_id, new_percentage)?;
-    let pg = pg_db.clone();
-    let cid = canary_id.to_string();
-    tokio::spawn(async move { let _ = pg.update_canary_percentage(&cid, new_percentage).await; });
-    Ok(())
+    update_canary_percentage(db, pg_db, canary_id, new_percentage)
 }
 
 /// Roll back a canary with evaluation metrics and PG dual-write (fire-and-forget).
@@ -1442,44 +884,25 @@ pub fn rollback_canary_with_eval_pg(
     canary_id: &str,
     eval: Option<&CanaryEvaluation>,
 ) -> Result<(), String> {
-    rollback_canary_with_eval(db, canary_id, eval)?;
-    let pg = pg_db.clone();
-    let cid = canary_id.to_string();
-    tokio::spawn(async move { let _ = pg.rollback_canary(&cid).await; });
-    Ok(())
+    rollback_canary_with_eval(db, pg_db, canary_id, eval)
 }
 
 /// Auto-rollback stale canaries with PG dual-write.
+#[deprecated(note = "Use auto_rollback_stale_canaries directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn auto_rollback_stale_canaries_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> usize {
-    let canaries = match get_active_canaries(db) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    let mut rolled_back = 0;
-    for canary in &canaries {
-        let started = if canary.start_date.is_empty() { &canary.created_at } else { &canary.start_date };
-        if started.as_str() >= cutoff.as_str() { continue; }
-        info!("Auto-rolling-back stale canary {} (active since {}, {} canary runs)", canary.id, started, canary.canary_run_count);
-        if let Err(e) = rollback_canary_with_pg(db, pg_db, &canary.id) {
-            warn!("Failed to auto-rollback stale canary {}: {}", canary.id, e);
-        } else {
-            rolled_back += 1;
-        }
-    }
-    if rolled_back > 0 { info!("Auto-rolled-back {} stale canary rollout(s) (active >30 days)", rolled_back); }
-    rolled_back
+    auto_rollback_stale_canaries(db, pg_db)
 }
 
 /// Record canary outcome with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use record_prompt_canary_run directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn record_canary_outcome_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     used_candidate: bool,
     success: bool,
@@ -1487,170 +910,87 @@ pub fn record_canary_outcome_with_pg(
     latency_ms: f64,
     tokens: i64,
 ) {
+    #[allow(deprecated)]
     if let Err(e) = record_prompt_canary_run_with_pg(db, pg_db, canary_id, used_candidate, success, cost_usd, latency_ms, tokens) {
         warn!("Failed to record canary outcome for {}: {}", canary_id, e);
     }
 }
 
-// ── PG-primary read wrappers ───────────────────────────────────────────
+// ── PG-primary read wrappers (now just delegate to PG-primary originals) ──
 
 /// Get all active canary rollouts with PG-primary read.
+#[deprecated(note = "Use get_active_canaries directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn get_active_canaries_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> Result<Vec<CanaryRollout>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        if let Ok(result) = handle.block_on(pg.get_active_canaries()) {
-            return Ok(result);
-        }
-    }
-    get_active_canaries(db)
+    get_active_canaries(db, pg_db)
 }
 
 /// Get canary history with PG-primary read.
+#[deprecated(note = "Use get_canary_history directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn get_canary_history_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     limit: u32,
 ) -> Result<Vec<serde_json::Value>, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let lim = limit.min(100) as i64;
-        if let Ok(result) = handle.block_on(pg.get_canary_history(lim)) {
-            return Ok(result);
-        }
-    }
-    get_canary_history(db, limit)
+    get_canary_history(db, pg_db, limit)
 }
 
 /// Probabilistic check with PG-primary read: should this run use the canary config?
+#[deprecated(note = "Use should_apply_canary directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn should_apply_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> bool {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let rid = recommendation_id.to_string();
-        if let Ok(result) = handle.block_on(pg.should_apply_canary(&rid)) {
-            return result;
-        }
-    }
-    should_apply_canary(db, recommendation_id)
+    should_apply_canary(db, pg_db, recommendation_id)
 }
 
 /// Evaluate a canary with PG-primary read for metrics.
+#[deprecated(note = "Use evaluate_canary directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn evaluate_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<CanaryEvaluation, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let cid = canary_id.to_string();
-        if let Ok(metrics) = handle.block_on(pg.get_canary_metrics(&cid)) {
-            // Parse metrics and evaluate locally
-            let (baseline_json, canary_json) = metrics;
-            let baseline: CanaryMetrics = serde_json::from_str(&baseline_json).unwrap_or_default();
-            let canary: CanaryMetrics = serde_json::from_str(&canary_json).unwrap_or_default();
-
-            let baseline_total = (baseline.success_count + baseline.failure_count) as u64;
-            let canary_total = (canary.success_count + canary.failure_count) as u64;
-            let baseline_sr = if baseline_total > 0 { baseline.success_count as f64 / baseline_total as f64 * 100.0 } else { 0.0 };
-            let canary_sr = if canary_total > 0 { canary.success_count as f64 / canary_total as f64 * 100.0 } else { 0.0 };
-            let delta = canary_sr - baseline_sr;
-            let min_runs_met = canary_total >= 10;
-
-            let analysis = crate::stats::proportion_analysis(
-                (canary.success_count as u64, canary_total),
-                (baseline.success_count as u64, baseline_total),
-                2,
-            );
-
-            let cost_delta_pct = if baseline_total > 0 && canary_total > 0 {
-                let b_avg = baseline.total_cost_usd / baseline_total as f64;
-                let c_avg = canary.total_cost_usd / canary_total as f64;
-                if b_avg > 0.0 { Some((c_avg - b_avg) / b_avg * 100.0) } else { None }
-            } else { None };
-            let duration_delta_pct = if baseline_total > 0 && canary_total > 0 {
-                let b_avg = baseline.total_duration_ms / baseline_total as f64;
-                let c_avg = canary.total_duration_ms / canary_total as f64;
-                if b_avg > 0.0 { Some((c_avg - b_avg) / b_avg * 100.0) } else { None }
-            } else { None };
-
-            let verdict_enum = if !min_runs_met {
-                crate::stats::Verdict::Neutral
-            } else {
-                crate::stats::compute_verdict(delta, &analysis, canary_total, &crate::stats::VerdictThresholds::canary())
-            };
-
-            return Ok(CanaryEvaluation {
-                verdict: verdict_enum.as_canary_str().to_string(),
-                baseline_success_rate: baseline_sr, canary_success_rate: canary_sr,
-                delta, min_runs_met,
-                p_value: analysis.p_value, confidence_interval: analysis.confidence_interval,
-                effect_size: analysis.effect_size, cost_delta_pct, duration_delta_pct,
-            });
-        }
-    }
-    evaluate_canary(db, canary_id)
+    evaluate_canary(db, pg_db, canary_id)
 }
 
 /// Get prompt template canary with PG-primary read.
+#[deprecated(note = "Use get_prompt_template_canary directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn get_prompt_template_canary_with_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<PromptTemplateCanary, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let pg = pg_db.clone();
-        let cid = canary_id.to_string();
-        if let Ok(Some(result)) = handle.block_on(pg.get_template_canary(&cid)) {
-            return Ok(result);
-        }
-    }
-    get_prompt_template_canary(db, canary_id)
+    get_prompt_template_canary(db, pg_db, canary_id)
 }
 
 /// Promote a canary with PG dual-write including evolution verdict.
+#[deprecated(note = "Use promote_canary directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn promote_canary_with_evolution_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<(), String> {
-    promote_canary(db, canary_id)?;
-    let pg = pg_db.clone();
-    let cid = canary_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.promote_canary(&cid).await {
-            tracing::warn!("PG promote_canary dual-write failed: {}", e);
-        }
-    });
-    Ok(())
+    promote_canary(db, pg_db, canary_id)
 }
 
 /// Rollback canary with eval and PG dual-write including evolution verdict.
+#[deprecated(note = "Use rollback_canary_with_eval directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn rollback_canary_with_eval_and_pg(
     db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    pg_db: &Arc<PgDb>,
     canary_id: &str,
     eval: Option<&CanaryEvaluation>,
 ) -> Result<(), String> {
-    rollback_canary_with_eval(db, canary_id, eval)?;
-    let pg = pg_db.clone();
-    let cid = canary_id.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = pg.rollback_canary(&cid).await {
-            tracing::warn!("PG rollback_canary dual-write failed: {}", e);
-        }
-    });
-    Ok(())
+    rollback_canary_with_eval(db, pg_db, canary_id, eval)
 }

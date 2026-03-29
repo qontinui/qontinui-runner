@@ -4,11 +4,13 @@
 //! joining with `learning_outcomes` for outcome scores, and grouping by
 //! (phase, agent_type) to identify which prompts have the worst outcomes.
 
-use rusqlite::params;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
 use tracing::debug;
 
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 /// A single prompt sample from a completed run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,11 +46,49 @@ pub fn extract_prompt_samples(
     db: &CheckpointDb,
     limit: usize,
 ) -> Result<Vec<PromptSample>, String> {
+    // Get pg_db from the app state via a thread-local or pass it through
+    // For backward compat, delegate to extract_prompt_samples_pg with a fallback
+    // This function is called from select_optimization_target which only has db
+    // We'll use the PG path via the _with_pg wrapper
+    extract_prompt_samples_sqlite(db, limit)
+}
+
+/// Extract prompt samples using PG (primary path).
+pub fn extract_prompt_samples_pg(
+    pg_db: &Arc<PgDb>,
+    limit: usize,
+) -> Result<Vec<PromptSample>, String> {
+    let limit = limit as i64;
+
+    let rows = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.extract_prompt_samples(limit))
+    })?;
+
+    let samples: Vec<PromptSample> = rows.into_iter().map(|(task_run_id, phase, agent_type, outcome_score, outcome_status, iteration, cost_usd)| {
+        PromptSample {
+            task_run_id,
+            phase,
+            agent_type,
+            prompt_text: String::new(),
+            outcome_score,
+            outcome_status,
+            iteration: iteration as u32,
+            cost_usd,
+        }
+    }).collect();
+
+    debug!("Extracted {} prompt samples (PG)", samples.len());
+    Ok(samples)
+}
+
+/// SQLite fallback for extract_prompt_samples (kept for backward compat).
+fn extract_prompt_samples_sqlite(
+    db: &CheckpointDb,
+    limit: usize,
+) -> Result<Vec<PromptSample>, String> {
     let limit = limit as i64;
 
     db.with_conn(move |conn| {
-        // Join phase_token_usage with learning_outcomes via task_run_id → task_runs → learning_outcomes
-        // phase_token_usage has phase, iteration; learning_outcomes has composite_agentic_score, status
         let mut stmt = conn
             .prepare(
                 r#"SELECT
@@ -74,12 +114,12 @@ pub fn extract_prompt_samples(
             .map_err(|e| format!("Failed to prepare prompt extraction query: {}", e))?;
 
         let rows = stmt
-            .query_map(params![limit], |row| {
+            .query_map(rusqlite::params![limit], |row| {
                 Ok(PromptSample {
                     task_run_id: row.get(0)?,
                     phase: row.get(1)?,
                     agent_type: row.get(2)?,
-                    prompt_text: String::new(), // Populated separately if needed
+                    prompt_text: String::new(),
                     outcome_score: row.get(3)?,
                     outcome_status: row.get(4)?,
                     iteration: row.get::<_, i64>(5)? as u32,
@@ -147,7 +187,7 @@ fn compute_group_metrics_inner(
             // falling back to the hardcoded default for the agent type.
             let latest_prompt = db
                 .and_then(|db| {
-                    super::prompt_registry::get_active_prompt(db, &agent_type)
+                    super::prompt_registry::get_active_prompt_sqlite(db, &agent_type)
                         .ok()
                         .flatten()
                         .map(|v| v.prompt_content)
@@ -271,20 +311,57 @@ pub fn collect_evidence_samples(
     max_failures: usize,
     max_successes: usize,
 ) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
+    // Kept as SQLite fallback for callers without pg_db
+    collect_evidence_samples_sqlite(db, phase, agent_type, max_failures, max_successes)
+}
+
+/// Collect evidence samples using PG (primary path).
+pub fn collect_evidence_samples_pg(
+    pg_db: &Arc<PgDb>,
+    phase: &str,
+    agent_type: &str,
+    max_failures: usize,
+    max_successes: usize,
+) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
+    let (fail_tuples, success_tuples) = tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.collect_evidence_samples(
+            phase, agent_type, max_failures as i64, max_successes as i64,
+        ))
+    })?;
+
+    let to_sample = |t: (String, String, String, f64, String, i64, f64)| -> PromptSample {
+        PromptSample {
+            task_run_id: t.0, phase: t.1, agent_type: t.2, prompt_text: String::new(),
+            outcome_score: t.3, outcome_status: t.4, iteration: t.5 as u32, cost_usd: t.6,
+        }
+    };
+
+    Ok((
+        fail_tuples.into_iter().map(to_sample).collect(),
+        success_tuples.into_iter().map(to_sample).collect(),
+    ))
+}
+
+/// SQLite fallback for collect_evidence_samples.
+fn collect_evidence_samples_sqlite(
+    db: &CheckpointDb,
+    phase: &str,
+    agent_type: &str,
+    max_failures: usize,
+    max_successes: usize,
+) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
     let phase_owned = phase.to_string();
     let agent_type_owned = agent_type.to_string();
     let max_failures = max_failures as i64;
     let max_successes = max_successes as i64;
 
     db.with_conn(move |conn| {
-        // Build optional agent_type filter
         let agent_filter = if agent_type_owned.is_empty() {
             String::new()
         } else {
             " AND COALESCE(tr.workflow_name, ptu.phase) = ?3".to_string()
         };
 
-        // Failures (score < 0.5)
         let fail_sql = format!(
             r#"SELECT
                    ptu.task_run_id,
@@ -308,38 +385,26 @@ pub fn collect_evidence_samples(
             agent_filter
         );
 
-        let mut fail_stmt = conn
-            .prepare(&fail_sql)
+        let mut fail_stmt = conn.prepare(&fail_sql)
             .map_err(|e| format!("Failed to prepare failure query: {}", e))?;
 
         let fail_params: Vec<Box<dyn rusqlite::types::ToSql>> = if agent_type_owned.is_empty() {
             vec![Box::new(phase_owned.clone()), Box::new(max_failures)]
         } else {
-            vec![
-                Box::new(phase_owned.clone()),
-                Box::new(max_failures),
-                Box::new(agent_type_owned.clone()),
-            ]
+            vec![Box::new(phase_owned.clone()), Box::new(max_failures), Box::new(agent_type_owned.clone())]
         };
 
         let failures: Vec<PromptSample> = fail_stmt
             .query_map(rusqlite::params_from_iter(fail_params.iter()), |row| {
                 Ok(PromptSample {
-                    task_run_id: row.get(0)?,
-                    phase: row.get(1)?,
-                    agent_type: row.get(2)?,
-                    prompt_text: String::new(),
-                    outcome_score: row.get(3)?,
-                    outcome_status: row.get(4)?,
-                    iteration: row.get::<_, i64>(5)? as u32,
-                    cost_usd: row.get(6)?,
+                    task_run_id: row.get(0)?, phase: row.get(1)?, agent_type: row.get(2)?,
+                    prompt_text: String::new(), outcome_score: row.get(3)?,
+                    outcome_status: row.get(4)?, iteration: row.get::<_, i64>(5)? as u32, cost_usd: row.get(6)?,
                 })
             })
             .map_err(|e| format!("Failed to query failures: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .filter_map(|r| r.ok()).collect();
 
-        // Successes (score > 0.8)
         let success_sql = format!(
             r#"SELECT
                    ptu.task_run_id,
@@ -363,39 +428,60 @@ pub fn collect_evidence_samples(
             agent_filter
         );
 
-        let mut success_stmt = conn
-            .prepare(&success_sql)
+        let mut success_stmt = conn.prepare(&success_sql)
             .map_err(|e| format!("Failed to prepare success query: {}", e))?;
 
         let success_params: Vec<Box<dyn rusqlite::types::ToSql>> = if agent_type_owned.is_empty() {
             vec![Box::new(phase_owned), Box::new(max_successes)]
         } else {
-            vec![
-                Box::new(phase_owned),
-                Box::new(max_successes),
-                Box::new(agent_type_owned),
-            ]
+            vec![Box::new(phase_owned), Box::new(max_successes), Box::new(agent_type_owned)]
         };
 
         let successes: Vec<PromptSample> = success_stmt
             .query_map(rusqlite::params_from_iter(success_params.iter()), |row| {
                 Ok(PromptSample {
-                    task_run_id: row.get(0)?,
-                    phase: row.get(1)?,
-                    agent_type: row.get(2)?,
-                    prompt_text: String::new(),
-                    outcome_score: row.get(3)?,
-                    outcome_status: row.get(4)?,
-                    iteration: row.get::<_, i64>(5)? as u32,
-                    cost_usd: row.get(6)?,
+                    task_run_id: row.get(0)?, phase: row.get(1)?, agent_type: row.get(2)?,
+                    prompt_text: String::new(), outcome_score: row.get(3)?,
+                    outcome_status: row.get(4)?, iteration: row.get::<_, i64>(5)? as u32, cost_usd: row.get(6)?,
                 })
             })
             .map_err(|e| format!("Failed to query successes: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .filter_map(|r| r.ok()).collect();
 
         Ok((failures, successes))
     })
+}
+
+// ─��� PG dual-write wrappers ────────────────────────────��─────────────────
+
+/// Extract prompt samples with PG-primary.
+pub fn extract_prompt_samples_with_pg(
+    _db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
+    limit: usize,
+) -> Result<Vec<PromptSample>, String> {
+    extract_prompt_samples_pg(pg_db, limit)
+}
+
+/// Compute group metrics with PG fallback (currently delegates to SQLite).
+pub fn compute_group_metrics_with_db_pg(
+    samples: &[PromptSample],
+    db: &CheckpointDb,
+    _pg_db: &Arc<PgDb>,
+) -> Vec<PromptGroupMetrics> {
+    compute_group_metrics_with_db(samples, db)
+}
+
+/// Collect evidence samples with PG-primary.
+pub fn collect_evidence_samples_with_pg(
+    _db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
+    phase: &str,
+    agent_type: &str,
+    max_failures: usize,
+    max_successes: usize,
+) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
+    collect_evidence_samples_pg(pg_db, phase, agent_type, max_failures, max_successes)
 }
 
 #[cfg(test)]

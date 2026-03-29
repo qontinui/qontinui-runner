@@ -1,6 +1,10 @@
 //! Types for the orchestration loop.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Unique identifier for a loop instance within the multi-loop manager.
+pub type LoopId = String;
 
 // --- Configuration ---
 
@@ -107,6 +111,9 @@ pub struct PipelineConfig {
     pub build: Option<BuildPhaseConfig>,
     /// Implement fixes via Claude CLI after reflection finds issues.
     pub implement_fixes: Option<ImplementFixesConfig>,
+    /// Diagnostic evaluation phase — runs after Execute, before Reflect.
+    /// Captures UI state via UI Bridge and classifies failure root causes.
+    pub diagnose: Option<DiagnosePhaseConfig>,
 }
 
 /// Configuration for the build (workflow generation) phase.
@@ -131,6 +138,69 @@ pub struct ImplementFixesConfig {
     pub additional_context: Option<String>,
 }
 
+/// Configuration for the diagnostic evaluation phase.
+/// Captures UI state after workflow execution and classifies failure root causes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosePhaseConfig {
+    /// Assertions to run against the UI after workflow execution.
+    /// Each assertion is a JSON object passed to POST /ui-bridge/control/assert.
+    #[serde(default)]
+    pub assertions: Vec<serde_json::Value>,
+    /// Whether to capture a full DOM snapshot for AI triage context.
+    #[serde(default = "default_capture_snapshot")]
+    pub capture_snapshot: bool,
+    /// Maximum characters to include from the snapshot in the AI triage prompt.
+    #[serde(default = "default_snapshot_max_chars")]
+    pub snapshot_max_chars: usize,
+    /// Model override for the triage AI call. If None, uses default routing.
+    pub model_override: Option<String>,
+}
+
+fn default_capture_snapshot() -> bool {
+    true
+}
+
+fn default_snapshot_max_chars() -> usize {
+    8000
+}
+
+/// Root cause classification for a diagnostic failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RootCauseCategory {
+    /// The UI itself rendered incorrectly (wrong components, broken layout).
+    BadUiRendering,
+    /// UI Bridge misread the page (element not found, wrong selector).
+    BadUiBridgeEvaluation,
+    /// The assertions/verification are wrong (testing the wrong thing).
+    BadVerificationSteps,
+    /// The workflow generation prompt was unclear or incomplete.
+    BadGenerationPrompt,
+    /// The generated state machine has logical errors (wrong transitions, missing states).
+    BadStateMachineLogic,
+    /// Network error, timeout, crashed app, or other infrastructure failure.
+    InfrastructureIssue,
+    /// Cannot determine.
+    Unknown,
+}
+
+/// Result of a single diagnostic evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticResult {
+    /// Whether all assertions passed and the page is healthy.
+    pub passed: bool,
+    /// Page health status from UI Bridge.
+    pub page_health: serde_json::Value,
+    /// Assertion results (each with pass/fail and details).
+    pub assertion_results: Vec<serde_json::Value>,
+    /// Classified root cause (only meaningful when passed == false).
+    pub root_cause: Option<RootCauseCategory>,
+    /// AI-generated explanation of the failure.
+    pub diagnosis: Option<String>,
+    /// AI-generated recommendation for the next iteration's prompt.
+    pub prompt_rewrite_suggestion: Option<String>,
+}
+
 /// How to evaluate whether the loop should exit.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -142,6 +212,8 @@ pub enum ExitStrategy {
     WorkflowVerification,
     /// Always run max_iterations times.
     FixedIterations,
+    /// Exit when diagnostic evaluation passes (all assertions pass + healthy page).
+    DiagnosticEvaluation,
 }
 
 /// Action to take between iterations.
@@ -187,6 +259,7 @@ pub enum LoopPhase {
     Idle,
     BuildingWorkflow,
     RunningWorkflow,
+    Diagnosing,
     Reflecting,
     ImplementingFixes,
     EvaluatingExit,
@@ -239,6 +312,9 @@ pub struct IterationResult {
     pub stall_detected: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_summarized: Option<bool>,
+    /// Diagnostic phase result (if diagnose phase is configured).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_result: Option<DiagnosticResult>,
 }
 
 /// Result of evaluating whether the loop should exit.
@@ -247,3 +323,62 @@ pub struct ExitCheckResult {
     pub should_exit: bool,
     pub reason: String,
 }
+
+// --- Multi-Loop Types ---
+
+/// Configuration for launching multiple loops at once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiLoopConfig {
+    /// Individual loop configurations, each targeting a different runner.
+    pub loops: Vec<MultiLoopEntry>,
+    /// Stop all loops if any single loop errors out.
+    #[serde(default)]
+    pub stop_all_on_error: bool,
+}
+
+/// A single entry in a multi-loop configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiLoopEntry {
+    /// Unique identifier for this loop instance.
+    pub loop_id: LoopId,
+    /// Human label (e.g., "Pages 1-10" or app section name).
+    pub label: Option<String>,
+    /// The loop configuration.
+    pub config: OrchestrationLoopConfig,
+}
+
+/// Aggregated status across all active loops.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiLoopStatus {
+    pub loops: Vec<LoopInstanceStatus>,
+    pub all_complete: bool,
+    pub any_error: bool,
+    pub stop_all_on_error: bool,
+}
+
+/// Status of a single loop instance within a multi-loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopInstanceStatus {
+    pub loop_id: LoopId,
+    pub label: Option<String>,
+    pub status: OrchestrationLoopStatus,
+}
+
+/// Metadata stored alongside each loop's state.
+#[derive(Debug, Clone)]
+pub struct LoopMetadata {
+    pub label: Option<String>,
+    pub stop_all_on_error: bool,
+}
+
+impl Default for LoopMetadata {
+    fn default() -> Self {
+        Self {
+            label: None,
+            stop_all_on_error: false,
+        }
+    }
+}
+
+/// Maps loop IDs to per-loop metadata.
+pub type LoopMetadataMap = HashMap<LoopId, LoopMetadata>;

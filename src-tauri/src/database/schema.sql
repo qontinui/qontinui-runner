@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 162
+-- Version: 167
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -3802,4 +3802,130 @@ CREATE INDEX IF NOT EXISTS idx_prompt_evolution_agent ON prompt_evolution(agent_
 CREATE INDEX IF NOT EXISTS idx_prompt_evolution_verdict ON prompt_evolution(agent_type, canary_verdict);
 CREATE INDEX IF NOT EXISTS idx_prompt_evolution_variant ON prompt_evolution(variant_id);
 
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (161, datetime('now'));
+-- PRM training data export tracking (v165)
+CREATE TABLE IF NOT EXISTS prm_training_exports (
+    id TEXT PRIMARY KEY,
+    export_format TEXT NOT NULL DEFAULT 'jsonl',
+    total_examples INTEGER NOT NULL DEFAULT 0,
+    passed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    fixed_count INTEGER NOT NULL DEFAULT 0,
+    runs_processed INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_prm_exports_created ON prm_training_exports(created_at);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (165, datetime('now'));
+
+-- =============================================================================
+-- Adaptive Learning Tables (Plan 15, migration 166)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS playbook_entries (
+    id TEXT PRIMARY KEY,
+    lesson TEXT NOT NULL,
+    category TEXT NOT NULL,
+    domain TEXT,
+    severity TEXT NOT NULL DEFAULT 'minor',
+    source_run_id TEXT NOT NULL,
+    source_step_id TEXT,
+    positive INTEGER NOT NULL DEFAULT 1,
+    times_applied INTEGER NOT NULL DEFAULT 0,
+    times_helped INTEGER NOT NULL DEFAULT 0,
+    embedding BLOB,
+    status TEXT NOT NULL DEFAULT 'staged',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_playbook_entries_domain ON playbook_entries(domain);
+CREATE INDEX IF NOT EXISTS idx_playbook_entries_status ON playbook_entries(status);
+CREATE INDEX IF NOT EXISTS idx_playbook_entries_severity ON playbook_entries(severity);
+
+CREATE TABLE IF NOT EXISTS curated_examples (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    criterion_description TEXT NOT NULL,
+    steps_json TEXT NOT NULL,
+    quality_score REAL NOT NULL DEFAULT 0.0,
+    execution_verified INTEGER NOT NULL DEFAULT 0,
+    times_used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_curated_examples_domain ON curated_examples(domain);
+CREATE INDEX IF NOT EXISTS idx_curated_examples_quality ON curated_examples(quality_score);
+
+CREATE TABLE IF NOT EXISTS template_performance (
+    template_id TEXT PRIMARY KEY,
+    template_name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    total_quality_score REAL NOT NULL DEFAULT 0.0,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS template_lifecycle_events (
+    id TEXT PRIMARY KEY,
+    template_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    old_source TEXT NOT NULL,
+    new_source TEXT NOT NULL,
+    confidence_at_transition REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_lifecycle_events_template ON template_lifecycle_events(template_id);
+
+CREATE TABLE IF NOT EXISTS gepa_optimization_runs (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    old_instructions TEXT NOT NULL,
+    new_instructions TEXT,
+    old_score REAL,
+    new_score REAL,
+    improvement REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_gepa_runs_domain ON gepa_optimization_runs(domain);
+CREATE INDEX IF NOT EXISTS idx_gepa_runs_created ON gepa_optimization_runs(created_at);
+
+-- Step Templates for exploration-based generation
+CREATE TABLE IF NOT EXISTS step_templates (
+    id TEXT PRIMARY KEY,
+    domain TEXT NOT NULL,
+    pattern_description TEXT NOT NULL,
+    template_steps_json TEXT NOT NULL,
+    parameters_json TEXT NOT NULL DEFAULT '[]',
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    confidence REAL NOT NULL DEFAULT 0.5,
+    source TEXT NOT NULL DEFAULT 'seeded',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_step_templates_domain ON step_templates(domain);
+
+-- Exploration statistics
+CREATE TABLE IF NOT EXISTS exploration_stats (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT,
+    task_run_id TEXT,
+    total_candidates INTEGER NOT NULL DEFAULT 0,
+    search_depth INTEGER NOT NULL DEFAULT 0,
+    search_duration_ms INTEGER NOT NULL DEFAULT 0,
+    best_score REAL,
+    strategy_used TEXT,
+    score_progression TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exploration_stats_workflow ON exploration_stats(workflow_id);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (167, datetime('now'));

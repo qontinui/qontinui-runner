@@ -5,12 +5,13 @@
 //! pass (no AI session needed) and appends results to the recommendation
 //! table alongside other optimizer outputs.
 
-use rusqlite::params;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::recommendations;
 use super::types::Recommendation;
 use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -26,6 +27,7 @@ use crate::database::CheckpointDb;
 /// last 7 days.
 pub fn generate_cost_recommendations(
     db: &CheckpointDb,
+    pg_db: &Arc<PgDb>,
     existing_recommendations: &[Recommendation],
 ) -> Vec<Recommendation> {
     let mut results: Vec<Recommendation> = Vec::new();
@@ -47,7 +49,7 @@ pub fn generate_cost_recommendations(
     let has_recent = |title: &str| recent_titles.iter().any(|t| t == title);
 
     // ── 1. Query per-agent token/cost averages (last 30 days) ────────────
-    let agent_stats = match query_agent_cost_stats(db) {
+    let agent_stats = match query_agent_cost_stats(db, pg_db) {
         Ok(stats) => stats,
         Err(e) => {
             warn!("Cost optimizer: failed to query agent stats: {}", e);
@@ -119,6 +121,7 @@ pub fn generate_cost_recommendations(
 
                 match recommendations::create_recommendation(
                     db,
+                    pg_db,
                     "pipeline_prompt",
                     "cost_optimization",
                     Some(&agent.agent_type),
@@ -179,6 +182,7 @@ pub fn generate_cost_recommendations(
 
                 match recommendations::create_recommendation(
                     db,
+                    pg_db,
                     "pipeline_prompt",
                     "cost_optimization",
                     Some(&agent.agent_type),
@@ -201,7 +205,7 @@ pub fn generate_cost_recommendations(
     }
 
     // ── 5. Check: Zero-token agents with AI calls ────────────────────────
-    let zero_token_agents = match query_zero_token_agents(db) {
+    let zero_token_agents = match query_zero_token_agents(pg_db) {
         Ok(agents) => agents,
         Err(e) => {
             warn!("Cost optimizer: failed to query zero-token agents: {}", e);
@@ -232,6 +236,7 @@ pub fn generate_cost_recommendations(
 
             match recommendations::create_recommendation(
                 db,
+                pg_db,
                 "pipeline_prompt",
                 "cost_optimization",
                 Some(agent_type),
@@ -308,6 +313,7 @@ pub fn generate_cost_recommendations(
 
             match recommendations::create_recommendation(
                 db,
+                pg_db,
                 "pipeline_prompt",
                 "cost_optimization",
                 Some(agent_type),
@@ -362,8 +368,8 @@ pub struct CostAnalysisSummary {
 }
 
 /// Build a full cost-analysis summary for the API endpoint.
-pub fn build_cost_analysis(db: &CheckpointDb) -> Result<CostAnalysisSummary, String> {
-    let agent_stats = query_agent_cost_stats(db)?;
+pub fn build_cost_analysis(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<CostAnalysisSummary, String> {
+    let agent_stats = query_agent_cost_stats(db, pg_db)?;
 
     let total_cost: f64 = agent_stats.iter().map(|a| a.total_cost).sum();
 
@@ -385,10 +391,10 @@ pub fn build_cost_analysis(db: &CheckpointDb) -> Result<CostAnalysisSummary, Str
         .collect();
 
     // Cost trend: compare last 15 days vs previous 15 days
-    let cost_trend = compute_cost_trend(db).unwrap_or_else(|_| "unknown".to_string());
+    let cost_trend = compute_cost_trend(pg_db).unwrap_or_else(|_| "unknown".to_string());
 
     // Active cost recommendations
-    let active_cost_recs = query_active_cost_recommendations(db).unwrap_or_default();
+    let active_cost_recs = query_active_cost_recommendations(db, pg_db).unwrap_or_default();
 
     Ok(CostAnalysisSummary {
         agents,
@@ -421,79 +427,39 @@ impl AgentCostStats {
 }
 
 /// Query per-agent token/cost averages over the last 30 days (non-zero tokens only).
-fn query_agent_cost_stats(db: &CheckpointDb) -> Result<Vec<AgentCostStats>, String> {
-    db.with_conn(|conn| {
-        let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT
-                    agent_type,
-                    COUNT(*) as run_count,
-                    ROUND(AVG(tokens_in), 0) as avg_tokens_in,
-                    ROUND(AVG(tokens_out), 0) as avg_tokens_out,
-                    ROUND(AVG(cost_usd), 6) as avg_cost,
-                    ROUND(SUM(cost_usd), 4) as total_cost
-                FROM pipeline_agent_traces
-                WHERE created_at > ?1
-                    AND (tokens_in > 0 OR tokens_out > 0)
-                GROUP BY agent_type
-                ORDER BY total_cost DESC"#,
-            )
-            .map_err(|e| format!("Failed to prepare agent cost query: {}", e))?;
-
-        let rows: Vec<AgentCostStats> = stmt
-            .query_map(params![since], |row| {
-                Ok(AgentCostStats {
-                    agent_type: row.get(0)?,
-                    run_count: row.get(1)?,
-                    avg_tokens_in: row.get::<_, f64>(2).unwrap_or(0.0),
-                    avg_tokens_out: row.get::<_, f64>(3).unwrap_or(0.0),
-                    avg_cost: row.get::<_, f64>(4).unwrap_or(0.0),
-                    total_cost: row.get::<_, f64>(5).unwrap_or(0.0),
-                })
-            })
-            .map_err(|e| format!("Failed to query agent costs: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
-    })
+fn query_agent_cost_stats(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<AgentCostStats>, String> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    let tuples = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.query_agent_cost_stats(&since))
+    })?;
+    Ok(tuples
+        .into_iter()
+        .map(|(agent_type, run_count, avg_tokens_in, avg_tokens_out, avg_cost, total_cost)| {
+            AgentCostStats {
+                agent_type,
+                run_count,
+                avg_tokens_in,
+                avg_tokens_out,
+                avg_cost,
+                total_cost,
+            }
+        })
+        .collect())
 }
 
 /// Query agents that have traces but zero tokens (instrumentation gap).
-fn query_zero_token_agents(db: &CheckpointDb) -> Result<Vec<(String, i64)>, String> {
-    db.with_conn(|conn| {
-        let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT agent_type, COUNT(*) as run_count
-                FROM pipeline_agent_traces
-                WHERE created_at > ?1
-                    AND tokens_in = 0 AND tokens_out = 0
-                GROUP BY agent_type
-                HAVING run_count >= 5
-                ORDER BY run_count DESC"#,
-            )
-            .map_err(|e| format!("Failed to prepare zero-token query: {}", e))?;
-
-        let rows: Vec<(String, i64)> = stmt
-            .query_map(params![since], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|e| format!("Failed to query zero-token agents: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+fn query_zero_token_agents(pg_db: &Arc<PgDb>) -> Result<Vec<(String, i64)>, String> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.query_zero_token_agents(&since))
     })
 }
 
 /// Detect agents that primarily use CLI sessions (expensive) vs API.
 ///
-/// Joins pipeline_agent_traces → task_runs to check if the run used CLI
+/// Joins pipeline_agent_traces → iteration_logs to check if the run used CLI
 /// provider. Returns (agent_type, cli_runs, total_runs, avg_cli_cost, avg_api_cost).
+/// Note: iteration_logs is SQLite-only, so this query stays in SQLite.
 fn query_cli_heavy_agents(db: &CheckpointDb) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
     db.with_conn(|conn| {
         let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
@@ -524,12 +490,12 @@ fn query_cli_heavy_agents(db: &CheckpointDb) -> Result<Vec<(String, i64, i64, f6
                 WHERE pat.created_at > ?1
                     AND (pat.tokens_in > 0 OR pat.tokens_out > 0)
                 GROUP BY pat.agent_type
-                HAVING total_runs >= 5"#,
+                HAVING COUNT(*) >= 5"#,
             )
             .map_err(|e| format!("Failed to prepare CLI agent query: {}", e))?;
 
         let rows: Vec<(String, i64, i64, f64, f64)> = stmt
-            .query_map(params![since], |row| {
+            .query_map(rusqlite::params![since], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1).unwrap_or(0),
@@ -547,48 +513,34 @@ fn query_cli_heavy_agents(db: &CheckpointDb) -> Result<Vec<(String, i64, i64, f6
 }
 
 /// Compare cost over recent vs previous 15-day window.
-fn compute_cost_trend(db: &CheckpointDb) -> Result<String, String> {
-    db.with_conn(|conn| {
-        let now = chrono::Utc::now();
-        let mid = (now - chrono::Duration::days(15)).to_rfc3339();
-        let start = (now - chrono::Duration::days(30)).to_rfc3339();
+fn compute_cost_trend(pg_db: &Arc<PgDb>) -> Result<String, String> {
+    let now = chrono::Utc::now();
+    let mid = (now - chrono::Duration::days(15)).to_rfc3339();
+    let start = (now - chrono::Duration::days(30)).to_rfc3339();
 
-        let recent_cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM pipeline_agent_traces WHERE created_at > ?1",
-                params![mid],
-                |row| row.get(0),
-            )
-            .unwrap_or(0.0);
+    let (recent_cost, previous_cost) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.compute_cost_trend(&mid, &start))
+    })?;
 
-        let previous_cost: f64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM pipeline_agent_traces WHERE created_at > ?1 AND created_at <= ?2",
-                params![start, mid],
-                |row| row.get(0),
-            )
-            .unwrap_or(0.0);
-
-        if previous_cost == 0.0 && recent_cost == 0.0 {
-            Ok("no_data".to_string())
-        } else if previous_cost == 0.0 {
+    if previous_cost == 0.0 && recent_cost == 0.0 {
+        Ok("no_data".to_string())
+    } else if previous_cost == 0.0 {
+        Ok("increasing".to_string())
+    } else {
+        let change_pct = (recent_cost - previous_cost) / previous_cost;
+        if change_pct > 0.10 {
             Ok("increasing".to_string())
+        } else if change_pct < -0.10 {
+            Ok("decreasing".to_string())
         } else {
-            let change_pct = (recent_cost - previous_cost) / previous_cost;
-            if change_pct > 0.10 {
-                Ok("increasing".to_string())
-            } else if change_pct < -0.10 {
-                Ok("decreasing".to_string())
-            } else {
-                Ok("stable".to_string())
-            }
+            Ok("stable".to_string())
         }
-    })
+    }
 }
 
 /// Fetch active (pending) cost_optimization recommendations.
-fn query_active_cost_recommendations(db: &CheckpointDb) -> Result<Vec<Recommendation>, String> {
-    super::recommendations::list_recommendations(db, Some("pipeline_prompt"), Some("pending")).map(
+fn query_active_cost_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<Recommendation>, String> {
+    super::recommendations::list_recommendations(db, pg_db, Some("pipeline_prompt"), Some("pending")).map(
         |recs| {
             recs.into_iter()
                 .filter(|r| r.recommendation_type == "cost_optimization")
@@ -613,25 +565,23 @@ fn compute_confidence(run_count: i64, min_samples: i64, max_samples: i64) -> f64
 
 // ── PG dual-write wrappers ─────────────────────────────────────────────
 
+/// Build cost analysis summary with PG fallback (currently delegates to SQLite).
+pub fn build_cost_analysis_with_pg(
+    db: &crate::database::CheckpointDb,
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> Result<CostAnalysisSummary, String> {
+    build_cost_analysis(db, pg_db)
+}
+
 /// Generate cost recommendations with PG dual-write (fire-and-forget).
+#[deprecated(note = "Use generate_cost_recommendations directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn generate_cost_recommendations_with_pg(
     db: &crate::database::CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     existing_recommendations: &[Recommendation],
 ) -> Vec<Recommendation> {
-    let recs = generate_cost_recommendations(db, existing_recommendations);
-    if !recs.is_empty() {
-        let pg = pg_db.clone();
-        let recs_clone: Vec<Recommendation> = recs.clone();
-        tokio::spawn(async move {
-            for r in &recs_clone {
-                let ch = super::recommendations::compute_content_hash(&r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), r.recommended_value.as_deref());
-                let _ = pg.create_recommendation(&r.id, &r.optimizer_type, &r.recommendation_type, r.target_agent.as_deref(), &r.title, &r.description, r.current_value.as_deref(), r.recommended_value.as_deref(), r.evidence.as_deref(), r.confidence, r.optimizer_run_id.as_deref(), &ch).await;
-            }
-        });
-    }
-    recs
+    generate_cost_recommendations(db, pg_db, existing_recommendations)
 }
 
 #[cfg(test)]

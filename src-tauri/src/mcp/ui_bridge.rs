@@ -6578,17 +6578,15 @@ pub async fn analytics_health_score_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<crate::database::ui_bridge_ops::AutomationHealthScore>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Uses SQLite-specific ui_bridge_ops analytics (no PG equivalent yet).
-    // Run on blocking thread to avoid blocking async runtime.
-    let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::compute_automation_health_score(c, since))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
-    }
+    let data = state.app_state.pg_db
+        .compute_automation_health_score(since)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    // Deserialize from serde_json::Value to the expected type
+    let typed: crate::database::ui_bridge_ops::AutomationHealthScore =
+        serde_json::from_value(data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("Deserialization error: {}", e)))))?;
+    Ok(Json(ApiResponse::success(typed)))
 }
 
 /// GET /ui-bridge/analytics/recommendations
@@ -6596,16 +6594,15 @@ pub async fn analytics_recommendations_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::Recommendation>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // NOTE: No PG equivalent for generate_recommendations; stays on SQLite
-    let db = state.app_state.checkpoint_db.clone();
     let since = days_to_epoch_ms(q.days);
-    match tokio::task::spawn_blocking(move || {
-        db.with_conn(|c| crate::database::ui_bridge_ops::generate_recommendations(c, since))
-    }).await {
-        Ok(Ok(data)) => Ok(Json(ApiResponse::success(data))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("{e}"))))),
-    }
+    let data = state.app_state.pg_db
+        .generate_recommendations(since)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    // Deserialize from serde_json::Value to the expected type
+    let typed: Vec<crate::database::ui_bridge_ops::Recommendation> =
+        data.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    Ok(Json(ApiResponse::success(typed)))
 }
 
 /// Create routes for this module.

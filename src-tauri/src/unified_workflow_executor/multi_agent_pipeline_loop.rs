@@ -552,6 +552,7 @@ impl LoopController {
         if let Some((_, ref rec_id)) = config.active_canary {
             match crate::meta_optimizer::canary::get_canary_prompt_overrides(
                 &self.checkpoint_db,
+                &self.app_state.pg_db,
                 rec_id,
             ) {
                 Ok(overrides) => {
@@ -1047,7 +1048,7 @@ Only output the JSON array, nothing else."#,
                         }
                     }
                     crate::meta_optimizer::canary::record_canary_outcome(
-                        &self.checkpoint_db, canary_id, *used_candidate, false, ac, al, at,
+                        &self.checkpoint_db, &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
                     );
                 }
                 // Canary config restoration is handled at the loop_controller::run() level.
@@ -1226,7 +1227,7 @@ Only output the JSON array, nothing else."#,
                         }
                     }
                     crate::meta_optimizer::canary::record_canary_outcome(
-                        &self.checkpoint_db, canary_id, *used_candidate, false, ac, al, at,
+                        &self.checkpoint_db, &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
                     );
                 }
                 // Canary config restoration is handled at the loop_controller::run() level.
@@ -1410,6 +1411,7 @@ Only output the JSON array, nothing else."#,
                 }
                 crate::meta_optimizer::canary::record_canary_outcome(
                     &self.checkpoint_db,
+                    &self.app_state.pg_db,
                     canary_id,
                     *used_candidate,
                     result.goal_achieved,
@@ -1453,6 +1455,7 @@ Only output the JSON array, nothing else."#,
             // Look up eval specs for this agent type
             let specs = match crate::meta_optimizer::eval_spec::list_eval_specs(
                 &self.checkpoint_db,
+                &self.app_state.pg_db,
                 Some(agent_type),
             ) {
                 Ok(specs) => specs,

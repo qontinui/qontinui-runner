@@ -181,6 +181,34 @@ type GqlOrchestrationLoopStatus {
 }
 
 """
+Single loop instance status within a multi-loop.
+"""
+type GqlLoopInstanceStatus {
+	loopId: String!
+	label: String
+	running: Boolean!
+	phase: String!
+	currentIteration: Int!
+	maxIterations: Int!
+	workflowId: String!
+	targetRunnerPort: Int!
+	targetRunnerId: String
+	isPipeline: Boolean!
+	startedAt: String
+	error: String
+}
+
+"""
+Aggregated status of all orchestration loops.
+"""
+type GqlMultiLoopStatus {
+	loops: [GqlLoopInstanceStatus!]!
+	allComplete: Boolean!
+	anyError: Boolean!
+	stopAllOnError: Boolean!
+}
+
+"""
 Overall runner status.
 """
 type GqlRunnerStatus {
@@ -544,6 +572,10 @@ type QueryRoot {
 	Get orchestration loop status.
 	"""
 	orchestrationLoopStatus: GqlOrchestrationLoopStatus!
+	"""
+	Get aggregated status of all orchestration loops.
+	"""
+	multiOrchestrationLoopStatus: GqlMultiLoopStatus!
 }
 
 """

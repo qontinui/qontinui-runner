@@ -1430,16 +1430,22 @@ fn record_flow_learning(
 
     // Record learning outcome + deterministic agentic metrics (sync, fast)
     let db_arc = db.clone();
+    let pg_db_clone = crate::database::pg::PgDb::global();
     let instance_id = state.instance_id.clone();
     let verification_passed = outcome.verification_passed;
     let was_stopped = outcome.was_stopped;
     tokio::spawn(async move {
-        // SQLite: complex function — learning outcome recording + deterministic metrics scoring
-        let db_inner = db_arc.clone();
-        let record_result = tokio::task::spawn_blocking(move || {
-            db_inner.with_conn(|conn| learning_recorder::record_workflow_learning(conn, &outcome))
-        }).await;
-        if let Err(e) = record_result.unwrap_or_else(|e| Err(format!("Task join error: {}", e)))
+        // Record learning outcome via PG
+        let outcome_json = serde_json::json!({
+            "id": outcome.task_run_id,
+            "workflow_name": outcome.workflow_name,
+            "status": if outcome.verification_passed { "success" } else { "failure" },
+            "iterations": outcome.iterations,
+            "duration_secs": outcome.duration_secs,
+        });
+        let pg_db_inner = pg_db_clone.clone();
+        let record_result = pg_db_inner.record_workflow_learning(&outcome_json).await;
+        if let Err(e) = record_result
         {
             warn!("Failed to record flow learning outcome: {}", e);
             return;

@@ -584,13 +584,9 @@ async fn build_compressed_iteration_history(
         if let Some(wf_name) = workflow_name {
             // Try relevance-scored knowledge first (v99 cognitive system model)
             let scored_knowledge = {
-                let db_c = checkpoint_db.clone();
                 let wf_c = wf_name.to_string();
-                tokio::task::spawn_blocking(move || {
-                    db_c.with_conn(|conn| {
-                        crate::reflection::prediction::score_knowledge_relevance(conn, &wf_c, 10)
-                    })
-                }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+                // PG-primary: async context, call PG directly
+                pg_db.score_knowledge_relevance(&wf_c, 10).await
             };
 
             if let Ok(scored) = scored_knowledge {
@@ -738,13 +734,9 @@ async fn build_compressed_iteration_history(
                     // Use the finding's actual signature_hash for fix prediction lookup
                     let sig = &finding.signature_hash;
                     let predicted_result = {
-                        let db_c = checkpoint_db.clone();
                         let sig_c = sig.clone();
-                        tokio::task::spawn_blocking(move || {
-                            db_c.with_conn(|conn| {
-                                crate::reflection::prediction::predict_fix_for_error(conn, &sig_c)
-                            })
-                        }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+                        // PG-primary: async context, call PG directly
+                        pg_db.predict_fix_for_error(&sig_c).await
                     };
                     if let Ok(Some(predicted)) = predicted_result {
                         if predicted.confidence >= 0.3 {
@@ -789,13 +781,9 @@ async fn build_compressed_iteration_history(
     if budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
             let causal_events = {
-                let db_c = checkpoint_db.clone();
                 let wf_c = wf_name.to_string();
-                tokio::task::spawn_blocking(move || {
-                    db_c.with_conn(|conn| {
-                        crate::reflection::causal::get_causal_events_for_workflow(conn, &wf_c, 10)
-                    })
-                }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string()))
+                // PG-primary: async context, call PG directly
+                pg_db.get_causal_events_for_workflow(&wf_c, 10).await
             };
 
             if let Ok(events) = causal_events {
@@ -852,25 +840,9 @@ async fn build_compressed_iteration_history(
             let query_embedding = compute_embedding_sync(&query_text);
 
             match query_embedding {
-                Ok(emb) => {
-                    let search_config = crate::database::hybrid_search::HybridSearchConfig {
-                        sql_weight: 0.3,
-                        vector_weight: 0.7,
-                        limit: 5,
-                        min_similarity: 0.3,
-                    };
-                    {
-                        let db_c = checkpoint_db.clone();
-                        tokio::task::spawn_blocking(move || {
-                            db_c.with_conn(|conn| {
-                                crate::database::hybrid_search::hybrid_search_universal_fixes(
-                                    conn,
-                                    &emb,
-                                    &search_config,
-                                )
-                            })
-                        }).await.ok().and_then(|r| r.ok())
-                    }
+                Ok(_emb) => {
+                    // PG-primary: use text-based fallback (embedding search requires vector extension)
+                    pg_db.get_universal_fixes_by_text(&query_text, 5).await.ok()
                 }
                 Err(_) => None,
             }
@@ -881,31 +853,7 @@ async fn build_compressed_iteration_history(
         // Fall back to SQL-only retrieval if hybrid search failed
         let fixes_to_inject: Vec<(String, String, Option<String>)> = match universal_fixes {
             Some(results) if !results.is_empty() => {
-                // Capture retrieval event for RAG metric evaluation
-                {
-                    let retrieval_event =
-                        crate::meta_optimizer::agentic_metrics::rag_judge::capture_retrieval_event(
-                            &query_text,
-                            "universal_fixes",
-                            &results,
-                            None,
-                            |fix| (fix.fix_type.clone(), fix.fix_description.clone()),
-                        );
-                    let _ = pg_db.persist_retrieval_event(
-                        execution_id,
-                        &retrieval_event,
-                    ).await;
-                }
                 results
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.item.fix_type.clone(),
-                            r.item.fix_description.clone(),
-                            r.item.applicability_context.clone(),
-                        )
-                    })
-                    .collect()
             }
             _ => {
                 // SQL-only fallback: get universal fixes by reuse_count
@@ -1235,14 +1183,11 @@ async fn build_impact_context(
 
     for file_path in changed_files.iter().take(5) {
         let impact = {
-            let db_c = checkpoint_db.clone();
             let wf_c = workflow_name.to_string();
             let fp_c = file_path.clone();
-            tokio::task::spawn_blocking(move || {
-                db_c.with_conn(|conn| {
-                    crate::reflection::architecture::get_impact_analysis(conn, &wf_c, &fp_c)
-                })
-            }).await.ok().and_then(|r| r.ok())
+            // PG-primary: async context, call PG directly via global
+            let pg = crate::database::pg::PgDb::global();
+            pg.get_impact_analysis(&wf_c, &fp_c).await.ok()
         };
 
         if let Some(analysis) = impact {

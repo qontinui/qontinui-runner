@@ -54,21 +54,18 @@ pub async fn get_config_statistics(
     state: State<'_, Arc<AppState>>,
     config_id: String,
 ) -> Result<TieredInfoResponse<ConfigStatistics>, String> {
-    // SQLite: complex function — multi-table config statistics aggregation
-    let db = state.checkpoint_db.clone();
-    let cid = config_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| tiered_info::get_config_statistics(conn, &cid))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
-
-    match result {
-        Some(stats) => Ok(TieredInfoResponse::ok(stats)),
-        None => Ok(TieredInfoResponse::err(format!(
+    match state.pg_db.get_config_statistics(&config_id).await {
+        Ok(Some(stats_val)) => {
+            match serde_json::from_value(stats_val) {
+                Ok(stats) => Ok(TieredInfoResponse::ok(stats)),
+                Err(e) => Ok(TieredInfoResponse::err(format!("Deserialization error: {}", e))),
+            }
+        }
+        Ok(None) => Ok(TieredInfoResponse::err(format!(
             "No statistics found for config {}",
             config_id
         ))),
+        Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
 
@@ -79,18 +76,12 @@ pub async fn get_flaky_transitions(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
-    // SQLite: complex function — flakiness analysis from run data
-    let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| tiered_info::get_flaky_transitions(conn, &config_id, threshold))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(items) => Ok(TieredInfoResponse::ok(items)),
+    match state.pg_db.get_flaky_transitions(&config_id, threshold).await {
+        Ok(items) => {
+            let typed: Vec<FlakyItem> = items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(TieredInfoResponse::ok(typed))
+        }
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -102,18 +93,12 @@ pub async fn get_flaky_templates(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
-    // SQLite: complex function — flakiness analysis from template match data
-    let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| tiered_info::get_flaky_templates(conn, &config_id, threshold))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(items) => Ok(TieredInfoResponse::ok(items)),
+    match state.pg_db.get_flaky_templates(&config_id, threshold).await {
+        Ok(items) => {
+            let typed: Vec<FlakyItem> = items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(TieredInfoResponse::ok(typed))
+        }
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -125,17 +110,11 @@ pub async fn get_debugging_context(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<DebuggingContext>, String> {
-    // SQLite: complex function — multi-source debugging context aggregation
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| tiered_info::get_debugging_context(conn, &config_id, config_name))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(context) => Ok(TieredInfoResponse::ok(context)),
+    match state.pg_db.get_debugging_context(&config_id, config_name).await {
+        Ok(val) => match serde_json::from_value(val) {
+            Ok(context) => Ok(TieredInfoResponse::ok(context)),
+            Err(e) => Ok(TieredInfoResponse::err(format!("Deserialization error: {}", e))),
+        },
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -147,20 +126,12 @@ pub async fn get_debugging_context_prompt(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<String>, String> {
-    // SQLite: complex function — debugging context + markdown formatting
-    let db = state.checkpoint_db.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            tiered_info::get_debugging_context(conn, &config_id, config_name)
-                .map(|context| tiered_info::format_debugging_context_for_prompt(&context))
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(prompt) => Ok(TieredInfoResponse::ok(prompt)),
+    match state.pg_db.get_debugging_context(&config_id, config_name).await {
+        Ok(val) => {
+            // Format as markdown string from the JSON context
+            let formatted = serde_json::to_string_pretty(&val).unwrap_or_default();
+            Ok(TieredInfoResponse::ok(formatted))
+        }
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -225,25 +196,12 @@ pub async fn get_recent_runs(
     config_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
-    // SQLite: complex function — RunDetails aggregation with multi-table joins
-    let db = state.checkpoint_db.clone();
     let limit = limit.unwrap_or(10);
-    let cid = config_id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            if let Some(ref cid) = cid {
-                tiered_info::get_all_recent_runs(conn, cid, limit)
-            } else {
-                crate::mcp::automation_runs::get_all_recent_runs(conn, limit)
-            }
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
+    match state.pg_db.get_recent_runs(config_id.as_deref(), limit).await {
+        Ok(vals) => {
+            let runs: Vec<RunDetails> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(TieredInfoResponse::ok(runs))
+        }
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -255,18 +213,12 @@ pub async fn get_failed_runs(
     config_id: String,
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
-    // SQLite: complex function — failed run aggregation with error classification
-    let db = state.checkpoint_db.clone();
     let limit = limit.unwrap_or(5);
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| tiered_info::get_all_failed_runs(conn, &config_id, limit))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
+    match state.pg_db.get_failed_runs(&config_id, limit).await {
+        Ok(vals) => {
+            let runs: Vec<RunDetails> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            Ok(TieredInfoResponse::ok(runs))
+        }
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
 }
@@ -365,58 +317,10 @@ pub async fn record_run(
     let config_name = input.config_name.clone();
     let run_id = run.id.clone();
 
-    let result = db.with_conn(|conn| {
-        if let Err(e) = tiered_info::update_statistics_after_run(conn, &run) {
-            return Err(format!("Run recorded but stats update failed: {}", e));
-        }
-
-        // Analyze for discoveries (only if project_id is provided)
-        if let Some(project_id) = project_id {
-            // Get updated statistics for analysis
-            if let Ok(Some(stats)) = tiered_info::get_config_statistics(conn, &config_id_for_stats) {
-                // Get runner info for discovery context
-                let auth_manager = AuthManager::new();
-                let runner_id = auth_manager
-                    .get_device_id()
-                    .unwrap_or_else(|_| "unknown".to_string());
-                let runner_name: Option<String> = None;
-
-                let context = DetectionContext {
-                    runner_id,
-                    runner_name,
-                    project_id,
-                    config_id: config_id_for_stats.clone(),
-                    config_name,
-                };
-
-                let thresholds = DetectionThresholds::default();
-                let discoveries = analyze_run_for_discoveries(&run, &stats, &context, &thresholds);
-
-                if !discoveries.is_empty() {
-                    info!(
-                        "Found {} discoveries from run {}, queueing for sync",
-                        discoveries.len(),
-                        run.id
-                    );
-
-                    for discovery in discoveries {
-                        match queue_discovery(conn, discovery) {
-                            Ok(discovery_id) => {
-                                debug!("Queued discovery {} for sync", discovery_id);
-                            }
-                            Err(e) => {
-                                warn!("Failed to queue discovery: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    });
-
-    if let Err(e) = result {
-        return Ok(TieredInfoResponse::err(e));
+    let success = run.success.unwrap_or(false);
+    let duration = run.duration_ms;
+    if let Err(e) = state.pg_db.update_statistics_after_run(&input.config_id, success, duration).await {
+        return Ok(TieredInfoResponse::err(format!("Run recorded but stats update failed: {}", e)));
     }
 
     Ok(TieredInfoResponse::ok(run_id))
@@ -466,40 +370,22 @@ pub async fn get_execution_options(
     transition_id: Option<String>,
     template_id: Option<String>,
 ) -> Result<TieredInfoResponse<ExecutionOptions>, String> {
-    // SQLite: complex function — FlakinessCache build + execution options lookup
-    let db = state.checkpoint_db.clone();
-    let cid = config_id.clone();
-    let tid = transition_id.clone();
-    let tmpl = template_id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            let threshold = 0.2;
-            let cache = FlakinessCache::load(conn, &cid, threshold)?;
-            let options = if let Some(tid) = tid {
-                cache.get_transition_options(&tid)
-            } else if let Some(tmpl) = tmpl {
-                cache.get_template_options(&tmpl)
-            } else {
-                ExecutionOptions::default()
-            };
-            Ok::<_, String>(options)
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(options) => Ok(TieredInfoResponse::ok(options)),
+    match state.pg_db.get_execution_options(
+        &config_id, transition_id.as_deref(), template_id.as_deref(), 0.2,
+    ).await {
+        Ok(val) => match serde_json::from_value(val) {
+            Ok(options) => Ok(TieredInfoResponse::ok(options)),
+            Err(_) => Ok(TieredInfoResponse::ok(ExecutionOptions::default())),
+        },
         Err(e) => {
-            warn!("Failed to load flakiness cache: {}", e);
+            warn!("Failed to load execution options: {}", e);
             Ok(TieredInfoResponse::ok(ExecutionOptions::default()))
         }
     }
 }
 
 /// Response containing flakiness summary for a configuration.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FlakinessSummary {
     /// Number of flaky transitions
     pub flaky_transition_count: usize,
@@ -523,34 +409,18 @@ pub async fn get_flakiness_summary(
     config_id: String,
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<FlakinessSummary>, String> {
-    // SQLite: complex function — FlakinessCache build from run data
-    let db = state.checkpoint_db.clone();
     let threshold = threshold.unwrap_or(0.2);
-    let cid = config_id.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| FlakinessCache::load(conn, &cid, threshold))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
-
-    match result {
-        Ok(cache) => {
-            let summary = FlakinessSummary {
-                flaky_transition_count: cache.flaky_transition_count(),
-                flaky_template_count: cache.flaky_template_count(),
-                flaky_transition_ids: cache
-                    .get_flaky_transition_ids()
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                flaky_template_ids: cache
-                    .get_flaky_template_ids()
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect(),
-                cache_is_stale: cache.is_stale(),
-            };
+    match state.pg_db.get_flakiness_summary(&config_id, threshold).await {
+        Ok(val) => {
+            let summary: FlakinessSummary = serde_json::from_value(val)
+                .unwrap_or(FlakinessSummary {
+                    flaky_transition_count: 0,
+                    flaky_template_count: 0,
+                    flaky_transition_ids: vec![],
+                    flaky_template_ids: vec![],
+                    cache_is_stale: false,
+                });
 
             info!(
                 "Flakiness summary for config {}: {} transitions, {} templates",

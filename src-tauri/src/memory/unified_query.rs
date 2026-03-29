@@ -335,6 +335,120 @@ async fn retrieve_pg_unified(
     }
 }
 
+/// Embedding-based semantic similarity search via PostgreSQL.
+///
+/// Searches knowledge (PG hybrid search with embeddings), findings (text fallback),
+/// and error events (text fallback) in PostgreSQL.
+/// Requires the local embedding service to be available.
+async fn retrieve_embeddings(
+    pg: &PgDb,
+    query: &str,
+    limit: usize,
+) -> Vec<MemoryResult> {
+    use crate::database::embedding_client::EmbeddingClient;
+    use crate::database::hybrid_search::HybridSearchConfig;
+
+    // 1. Create EmbeddingClient and check availability
+    let client = EmbeddingClient::new();
+    if !client.is_available().await {
+        return Vec::new();
+    }
+
+    // 2. Compute query embedding (async)
+    let embedding = match client.compute_text_embedding(query).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("Unified memory: embedding computation failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let config = HybridSearchConfig {
+        limit,
+        min_similarity: 0.4,
+        ..Default::default()
+    };
+
+    let mut all_results: Vec<MemoryResult> = Vec::new();
+
+    // Search knowledge via PG hybrid search (has embedding support)
+    match pg.hybrid_search_knowledge(&embedding, None, &config).await {
+        Ok(knowledge) => {
+            for sr in knowledge {
+                all_results.push(MemoryResult {
+                    id: sr.item.id,
+                    source: MemorySource::TaskKnowledge,
+                    title: format!("{} knowledge", sr.item.category),
+                    snippet: truncate_str(&sr.item.content, 500),
+                    source_score: sr.hybrid_score as f64,
+                    fused_score: 0.0,
+                    timestamp: chrono::DateTime::parse_from_rfc3339(&sr.item.created_at)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc)),
+                    memory_type: sr.item.category,
+                    found_by: vec![RetrievalStrategy::EmbeddingSimilarity],
+                });
+            }
+        }
+        Err(e) => warn!("Unified memory: PG knowledge hybrid search failed: {}", e),
+    }
+
+    // Search error events via PG query (returns JSON values)
+    match pg.query_error_events(None, None, None, None, None, Some(limit as u32)).await {
+        Ok(errors) => {
+            let query_lower = query.to_lowercase();
+            let total = errors.len().max(1) as f64;
+            for (i, e) in errors.into_iter().enumerate() {
+                // Filter by query text client-side
+                let message = e.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !query_lower.is_empty() && !message.to_lowercase().contains(&query_lower) {
+                    continue;
+                }
+                let score = 1.0 - (i as f64 / total);
+                let severity = e.get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let last_seen = e.get("last_seen_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let id = e.get("id")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                all_results.push(MemoryResult {
+                    id,
+                    source: MemorySource::Error,
+                    title: format!(
+                        "[{}] {}",
+                        severity,
+                        truncate_str(message, 80)
+                    ),
+                    snippet: truncate_str(message, 500),
+                    source_score: score * 0.7, // Discount text-only results vs embedding
+                    fused_score: 0.0,
+                    timestamp: chrono::DateTime::parse_from_rfc3339(last_seen)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc)),
+                    memory_type: "error_event".to_string(),
+                    found_by: vec![RetrievalStrategy::FullTextSearch],
+                });
+            }
+        }
+        Err(e) => warn!("Unified memory: PG error events search failed: {}", e),
+    }
+
+    // Sort by source_score descending and truncate
+    all_results.sort_by(|a, b| {
+        b.source_score
+            .partial_cmp(&a.source_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all_results.truncate(limit);
+    all_results
+}
+
 /// Graph node text search (uses existing KnowledgeGraph::search_nodes).
 fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<MemoryResult> {
     let nodes = graph.search_nodes(query, limit);
@@ -454,7 +568,7 @@ pub fn reciprocal_rank_fusion(
 pub async fn query_memory(
     params: &UnifiedMemoryQuery,
     pg: &PgDb,
-    db: Arc<CheckpointDb>,
+    _db: Arc<CheckpointDb>,
     graph: Option<&KnowledgeGraph>,
 ) -> Result<Vec<MemoryResult>, String> {
     let per_source_limit = (params.limit * 3) as i64;
@@ -477,6 +591,10 @@ pub async fn query_memory(
         || source_enabled(sources, MemorySource::TaskKnowledge)
         || source_enabled(sources, MemorySource::UiElement);
     let want_graph = source_enabled(sources, MemorySource::GraphNode);
+    let want_embeddings = source_enabled(sources, MemorySource::Finding)
+        || source_enabled(sources, MemorySource::TaskKnowledge)
+        || source_enabled(sources, MemorySource::Error)
+        || sources.is_none();
 
     // Fan out to all enabled sources in parallel.
     // PG queries are async; SQLite and graph are sync so we spawn_blocking.
@@ -485,6 +603,7 @@ pub async fn query_memory(
     let knowledge_query = query.to_string();
     let sqlite_query = query.to_string();
     let graph_query = query.to_string();
+    let embeddings_query = query.to_string();
 
     let obs_fut = async {
         if want_observations {
@@ -533,11 +652,21 @@ pub async fn query_memory(
         Vec::new()
     };
 
-    let (obs, timeline, knowledge, sqlite) =
-        tokio::join!(obs_fut, timeline_fut, knowledge_fut, sqlite_fut);
+    // Embedding-based semantic similarity (async, uses local embedding service + PG)
+    let embeddings_limit = params.limit * 3;
+    let embeddings_fut = async move {
+        if want_embeddings {
+            retrieve_embeddings(pg, &embeddings_query, embeddings_limit).await
+        } else {
+            Vec::new()
+        }
+    };
 
-    // Collect all result sets for fusion (5 sources)
-    let result_sets = vec![obs, timeline, knowledge, sqlite, graph_results];
+    let (obs, timeline, knowledge, sqlite, embeddings) =
+        tokio::join!(obs_fut, timeline_fut, knowledge_fut, sqlite_fut, embeddings_fut);
+
+    // Collect all result sets for fusion (6 sources)
+    let result_sets = vec![obs, timeline, knowledge, sqlite, graph_results, embeddings];
 
     // Fuse with RRF (k=60 is standard)
     let mut fused = reciprocal_rank_fusion(result_sets, 60.0);

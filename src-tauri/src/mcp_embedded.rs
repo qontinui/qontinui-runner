@@ -764,6 +764,34 @@ impl EmbeddedMcp {
                 }),
             },
             ToolInfo {
+                name: "query_memory".to_string(),
+                description: "Search all memory stores (observations, timeline, knowledge, findings, fixes, errors, rules, graph nodes) using Reciprocal Rank Fusion. Returns ranked, deduplicated results from all stores.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural language search query"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum results (default 10)",
+                            "default": 10
+                        },
+                        "sources": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Filter sources: observation, timeline, knowledge, finding, fix, error, rule, graph, workflow, ui_element"
+                        },
+                        "min_score": {
+                            "type": "number",
+                            "description": "Minimum fused score threshold (0.0-1.0)"
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolInfo {
                 name: "read_execution_spans".to_string(),
                 description: "Query execution spans from the database for performance analysis. Requires HTTP API.".to_string(),
                 input_schema: json!({
@@ -830,6 +858,7 @@ impl EmbeddedMcp {
                 | "execute_test"
                 | "pattern_find"
                 | "read_execution_spans"
+                | "query_memory"
         )
     }
 
@@ -856,6 +885,7 @@ impl EmbeddedMcp {
             "execute_test",
             "pattern_find",
             "read_execution_spans",
+            "query_memory",
         ]
     }
 }
