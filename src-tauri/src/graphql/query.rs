@@ -591,17 +591,162 @@ impl QueryRoot {
         ctx: &Context<'_>,
     ) -> Result<super::types::GqlOrchestrationLoopStatus> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let loop_state = state.app_state.orchestration_loop.lock().await;
+        let status = crate::orchestration_loop::loop_engine::get_status_compat(
+            state.app_state.orchestration_loops.clone(),
+        )
+        .await;
 
         Ok(super::types::GqlOrchestrationLoopStatus {
-            running: loop_state.running,
-            phase: format!("{:?}", loop_state.phase),
-            current_iteration: loop_state.current_iteration as i32,
-            started_at: loop_state
-                .started_at
-                .map(|t: chrono::DateTime<chrono::Utc>| t.to_rfc3339()),
-            error: loop_state.error.clone(),
+            running: status.running,
+            phase: format!("{:?}", status.phase),
+            current_iteration: status.current_iteration as i32,
+            started_at: status.started_at,
+            error: status.error,
         })
+    }
+
+    /// Get aggregated status of all orchestration loops.
+    async fn multi_orchestration_loop_status(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<super::types::GqlMultiLoopStatus> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let multi_status = crate::orchestration_loop::loop_engine::get_multi_status(
+            state.app_state.orchestration_loops.clone(),
+        )
+        .await;
+
+        let loops = multi_status
+            .loops
+            .into_iter()
+            .map(|ls| super::types::GqlLoopInstanceStatus {
+                loop_id: ls.loop_id,
+                label: ls.label,
+                running: ls.status.running,
+                phase: format!("{:?}", ls.status.phase),
+                current_iteration: ls.status.current_iteration as i32,
+                max_iterations: ls.status.max_iterations as i32,
+                workflow_id: ls.status.workflow_id,
+                target_runner_port: ls.status.target_runner_port as i32,
+                target_runner_id: ls.status.target_runner_id,
+                is_pipeline: ls.status.is_pipeline,
+                started_at: ls.status.started_at,
+                error: ls.status.error,
+            })
+            .collect();
+
+        Ok(super::types::GqlMultiLoopStatus {
+            loops,
+            all_complete: multi_status.all_complete,
+            any_error: multi_status.any_error,
+            stop_all_on_error: multi_status.stop_all_on_error,
+        })
+    }
+
+    // ======================================================================
+    // Error Monitor Queries
+    // ======================================================================
+
+    /// Get error events from the error monitor with optional filters.
+    async fn error_events(
+        &self,
+        ctx: &Context<'_>,
+        task_run_id: Option<String>,
+        status: Option<String>,
+        severity: Option<String>,
+        #[graphql(default = 100)] limit: i32,
+    ) -> Result<Vec<super::types::GqlErrorEvent>> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+
+        let status_strs: Option<Vec<String>> = status.map(|s| vec![s]);
+        let status_refs: Option<Vec<&str>> = status_strs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let severity_strs: Option<Vec<String>> = severity.map(|s| vec![s]);
+        let severity_refs: Option<Vec<&str>> = severity_strs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+
+        let pg_rows = state
+            .app_state
+            .pg_db
+            .query_error_events(
+                task_run_id.as_deref(),
+                status_refs.as_deref(),
+                severity_refs.as_deref(),
+                None, // log_source_name
+                None, // captured_after
+                Some(limit as u32),
+            )
+            .await
+            .map_err(|e| Error::new(format!("Failed to query error events: {}", e)))?;
+
+        let events: Vec<crate::error_monitor::types::StoredErrorEvent> = pg_rows
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect();
+
+        Ok(events
+            .into_iter()
+            .map(super::types::GqlErrorEvent::from_stored)
+            .collect())
+    }
+
+    /// Get error summary statistics, optionally scoped to a task run.
+    async fn error_summary(
+        &self,
+        ctx: &Context<'_>,
+        task_run_id: Option<String>,
+    ) -> Result<super::types::GqlErrorSummary> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+
+        let pg_summary = state
+            .app_state
+            .pg_db
+            .get_error_summary(task_run_id.as_deref())
+            .await
+            .map_err(|e| Error::new(format!("Failed to get error summary: {}", e)))?;
+
+        let summary: crate::error_monitor::types::ErrorSummary =
+            serde_json::from_value(pg_summary)
+                .map_err(|e| Error::new(format!("Failed to deserialize error summary: {}", e)))?;
+
+        Ok(super::types::GqlErrorSummary {
+            total_count: summary.total as i32,
+            unresolved_count: summary.unresolved_count as i32,
+            critical_count: summary.critical_count as i32,
+            error_count: summary.error_count as i32,
+            warning_count: summary.warning_count as i32,
+        })
+    }
+
+    /// Get detected error patterns, optionally scoped to a task run.
+    /// Delegates to the curator's pattern detection via SQLite (build_context).
+    async fn error_patterns(
+        &self,
+        ctx: &Context<'_>,
+        task_run_id: Option<String>,
+    ) -> Result<Vec<super::types::GqlErrorPattern>> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let db = state.app_state.checkpoint_db.clone();
+
+        let patterns = tokio::task::spawn_blocking(move || {
+            let conn = db.get_conn_string()?;
+            let curator = crate::error_monitor::curator::DebugContextCurator::new();
+            let context = curator.build_context(&conn, task_run_id.as_deref())?;
+            Ok::<_, String>(context.patterns)
+        })
+        .await
+        .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
+        .map_err(|e| Error::new(e))?;
+
+        Ok(patterns
+            .into_iter()
+            .map(|p| super::types::GqlErrorPattern {
+                pattern_type: format!("{:?}", p.pattern_type),
+                name: p.name,
+                description: p.suggested_cause,
+                frequency: p.frequency as i32,
+                error_ids: p.error_ids.into_iter().map(|id| id as i32).collect(),
+            })
+            .collect())
     }
 }
 

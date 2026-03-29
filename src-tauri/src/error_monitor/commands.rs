@@ -18,6 +18,17 @@ use crate::commands::AppState;
 use crate::error_monitor::curator::{CuratedError, DebugContext};
 use crate::error_monitor::types::{ErrorStatus, ErrorSummary, StoredErrorEvent};
 
+// Default limits for error monitor queries
+const DEFAULT_QUERY_LIMIT: usize = 100;
+const DEFAULT_SEARCH_LIMIT: usize = 50;
+const DEFAULT_RECENT_HOURS: u32 = 24;
+const DEFAULT_RECENT_LIMIT: u32 = 10;
+const DEFAULT_DEBUG_CONTEXT_MAX_ERRORS: usize = 50;
+const STACK_TRACE_EXCERPT_LINES: usize = 3;
+const PRIORITY_CRITICAL: i32 = 100;
+const PRIORITY_ERROR: i32 = 50;
+const PRIORITY_WARNING: i32 = 10;
+
 /// A single past resolution entry for recurrence history display.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,7 +115,7 @@ pub async fn get_unresolved_errors(
     task_run_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    let limit = limit.unwrap_or(100);
+    let limit = limit.unwrap_or(DEFAULT_QUERY_LIMIT);
 
     let pg_rows = app_state
         .pg_db
@@ -221,7 +232,7 @@ pub async fn search_errors(
     query: String,
     limit: Option<usize>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    let limit = limit.unwrap_or(50);
+    let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
 
     let pg_rows = app_state.pg_db.search_errors(&query, limit).await?;
 
@@ -257,8 +268,8 @@ pub async fn get_recent_errors(
     hours: Option<u32>,
     limit: Option<u32>,
 ) -> Result<Vec<StoredErrorEvent>, String> {
-    let hours = hours.unwrap_or(24);
-    let limit = limit.unwrap_or(10);
+    let hours = hours.unwrap_or(DEFAULT_RECENT_HOURS);
+    let limit = limit.unwrap_or(DEFAULT_RECENT_LIMIT);
 
     let captured_after = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
     let statuses = ["new", "acknowledged", "in_progress"];
@@ -313,7 +324,7 @@ pub async fn get_debug_context(
     max_errors: Option<usize>,
 ) -> Result<DebugContext, String> {
     let checkpoint_db = db.inner().clone();
-    let max_err = max_errors.unwrap_or(50);
+    let max_err = max_errors.unwrap_or(DEFAULT_DEBUG_CONTEXT_MAX_ERRORS);
 
     // PG-primary: build debug context from PG
     let pg = crate::database::pg::PgDb::global();
@@ -338,14 +349,14 @@ pub async fn get_debug_context(
             message: err["message"].as_str().unwrap_or("").to_string(),
             location,
             stack_excerpt: err["stack_trace"].as_str().map(|s| {
-                s.lines().take(3).collect::<Vec<_>>().join("\n")
+                s.lines().take(STACK_TRACE_EXCERPT_LINES).collect::<Vec<_>>().join("\n")
             }),
             occurrence_count: err["occurrence_count"].as_i64().unwrap_or(1) as u32,
             source: err["log_source_name"].as_str().unwrap_or("unknown").to_string(),
             priority_score: match severity {
-                "critical" => 100,
-                "error" => 50,
-                _ => 10,
+                "critical" => PRIORITY_CRITICAL,
+                "error" => PRIORITY_ERROR,
+                _ => PRIORITY_WARNING,
             },
             investigation_hints: Vec::new(),
             related_errors: Vec::new(),
@@ -415,7 +426,7 @@ pub async fn get_debug_context_for_ai(
     // PG-primary: build formatted debug context
     let pg = crate::database::pg::PgDb::global();
     let base_context = pg
-        .build_error_monitor_context(task_run_id.as_deref(), 50)
+        .build_error_monitor_context(task_run_id.as_deref(), DEFAULT_DEBUG_CONTEXT_MAX_ERRORS)
         .await?;
 
     match base_context {
@@ -502,12 +513,6 @@ pub async fn get_error_recurrence_history(
 macro_rules! error_monitor_commands {
     () => {
         [
-            $crate::error_monitor::commands::list_log_sources,
-            $crate::error_monitor::commands::get_log_source,
-            $crate::error_monitor::commands::add_log_source,
-            $crate::error_monitor::commands::update_log_source,
-            $crate::error_monitor::commands::delete_log_source,
-            $crate::error_monitor::commands::toggle_log_source,
             $crate::error_monitor::commands::query_error_events,
             $crate::error_monitor::commands::get_error_event,
             $crate::error_monitor::commands::get_unresolved_errors,

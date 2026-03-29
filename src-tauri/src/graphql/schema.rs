@@ -120,6 +120,16 @@ mod tests {
         assert!(sdl.contains("findingUpdates("), "Missing findingUpdates subscription");
         assert!(sdl.contains("orchestrationLoopStatusStream("), "Missing orchestrationLoopStatusStream subscription");
 
+        // Verify error monitor types
+        assert!(sdl.contains("type GqlErrorEvent"), "Missing GqlErrorEvent");
+        assert!(sdl.contains("type GqlErrorSummary"), "Missing GqlErrorSummary");
+        assert!(sdl.contains("type GqlErrorPattern"), "Missing GqlErrorPattern");
+
+        // Verify error monitor queries
+        assert!(sdl.contains("errorEvents("), "Missing errorEvents query");
+        assert!(sdl.contains("errorSummary("), "Missing errorSummary query");
+        assert!(sdl.contains("errorPatterns("), "Missing errorPatterns query");
+
         // Verify enums
         assert!(sdl.contains("enum GqlFindingCategory"), "Missing GqlFindingCategory enum");
         assert!(sdl.contains("enum GqlFindingSeverity"), "Missing GqlFindingSeverity enum");

@@ -657,6 +657,32 @@ pub struct GqlOrchestrationLoopStatus {
     pub error: Option<String>,
 }
 
+/// Multi-loop aggregated status.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlMultiLoopStatus {
+    pub loops: Vec<GqlLoopInstanceStatus>,
+    pub all_complete: bool,
+    pub any_error: bool,
+    pub stop_all_on_error: bool,
+}
+
+/// Single loop instance status within a multi-loop.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlLoopInstanceStatus {
+    pub loop_id: String,
+    pub label: Option<String>,
+    pub running: bool,
+    pub phase: String,
+    pub current_iteration: i32,
+    pub max_iterations: i32,
+    pub workflow_id: String,
+    pub target_runner_port: i32,
+    pub target_runner_id: Option<String>,
+    pub is_pipeline: bool,
+    pub started_at: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Workflow queue item.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct GqlQueueItem {
@@ -714,4 +740,71 @@ pub struct UpdateFindingStatusInput {
     pub finding_id: String,
     pub status: GqlFindingStatus,
     pub resolution: Option<String>,
+}
+
+// ==========================================================================
+// Error Monitor Types
+// ==========================================================================
+
+/// An error event captured from application logs.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlErrorEvent {
+    pub id: i32,
+    pub log_source_name: String,
+    pub task_run_id: Option<String>,
+    pub severity: String,
+    pub error_type: Option<String>,
+    pub error_code: Option<String>,
+    pub message: String,
+    pub stack_trace: Option<String>,
+    pub file_path: Option<String>,
+    pub line_number: Option<i32>,
+    pub status: String,
+    pub occurrence_count: i32,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub signature_hash: String,
+}
+
+impl GqlErrorEvent {
+    /// Convert from a StoredErrorEvent (deserialized from PG JSON).
+    pub fn from_stored(e: crate::error_monitor::types::StoredErrorEvent) -> Self {
+        Self {
+            id: e.id as i32,
+            log_source_name: e.log_source_name,
+            task_run_id: e.task_run_id,
+            severity: e.severity.as_str().to_string(),
+            error_type: e.error_type,
+            error_code: e.error_code,
+            message: e.message,
+            stack_trace: e.stack_trace,
+            file_path: e.location.as_ref().map(|l| l.file_path.clone()),
+            line_number: e.location.as_ref().and_then(|l| l.line_number.map(|n| n as i32)),
+            status: e.status.as_str().to_string(),
+            occurrence_count: e.occurrence_count as i32,
+            first_seen_at: e.first_seen_at,
+            last_seen_at: e.last_seen_at,
+            signature_hash: e.signature_hash,
+        }
+    }
+}
+
+/// Summary statistics for error events.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlErrorSummary {
+    pub total_count: i32,
+    pub unresolved_count: i32,
+    pub critical_count: i32,
+    pub error_count: i32,
+    pub warning_count: i32,
+}
+
+/// A detected pattern across multiple errors.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlErrorPattern {
+    pub pattern_type: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub frequency: i32,
+    pub error_ids: Vec<i32>,
 }

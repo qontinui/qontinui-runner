@@ -7,6 +7,12 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { errorMonitorService } from "../services/error-monitor-service";
+
+/** Default refresh interval for error monitor polling (ms) */
+export const ERROR_MONITOR_REFRESH_INTERVAL = 30_000;
+
+/** Default query limit for error event fetches */
+const DEFAULT_QUERY_LIMIT = 100;
 import type {
   StoredErrorEvent,
   ErrorQuery,
@@ -69,7 +75,7 @@ export function useErrorEvents(options: UseErrorEventsOptions = {}): UseErrorEve
         logSourceName: optionsRef.current.logSourceName,
         severity: optionsRef.current.severities,
         status: optionsRef.current.statuses,
-        limit: optionsRef.current.limit ?? 100,
+        limit: optionsRef.current.limit ?? DEFAULT_QUERY_LIMIT,
       };
       const result = await errorMonitorService.queryErrorEvents(query);
       setErrors(result);
@@ -405,7 +411,7 @@ export function useErrorBadge(taskRunId?: string): UseErrorBadgeReturn {
     fetchBadgeData();
 
     // Refresh every 30 seconds
-    const interval = setInterval(fetchBadgeData, 30000);
+    const interval = setInterval(fetchBadgeData, ERROR_MONITOR_REFRESH_INTERVAL);
 
     // Listen for new errors
     const unlisten = listen("error-event-detected", fetchBadgeData);

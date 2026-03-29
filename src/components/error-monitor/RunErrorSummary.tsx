@@ -7,7 +7,7 @@
 import { useCallback } from "react";
 import { AlertCircle, AlertTriangle, Bug, ArrowRight } from "lucide-react";
 import { cn } from "../../lib/utils";
-import { useErrorSummary } from "../../hooks/useErrorMonitor";
+import { useErrorSummary, ERROR_MONITOR_REFRESH_INTERVAL } from "../../hooks/useErrorMonitor";
 
 interface RunErrorSummaryProps {
   taskRunId: string;
@@ -17,7 +17,7 @@ interface RunErrorSummaryProps {
 }
 
 export function RunErrorSummary({ taskRunId, taskRunName, className }: RunErrorSummaryProps) {
-  const { summary } = useErrorSummary({ taskRunId, refreshInterval: 30000 });
+  const { summary } = useErrorSummary({ taskRunId, refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL });
 
   const handleClick = useCallback(() => {
     window.dispatchEvent(

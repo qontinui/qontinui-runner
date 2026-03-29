@@ -32,6 +32,13 @@ pub struct GenerateFixWorkflowRequest {
     max_iterations: Option<u32>,
 }
 
+/// Request body for updating error status
+#[derive(Debug, Deserialize)]
+pub struct UpdateStatusRequest {
+    status: String,
+    notes: Option<String>,
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -176,6 +183,79 @@ pub async fn generate_fix_workflow(
     Ok(Json(ApiResponse::success(workflow)))
 }
 
+/// Get recurrence history for a given error signature hash
+pub async fn get_recurrence_history(
+    State(state): State<Arc<ApiState>>,
+    Path(signature_hash): Path<String>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::error_monitor::commands::RecurrenceEntry>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let entries = state
+        .app_state
+        .pg_db
+        .get_error_recurrence_history(&signature_hash)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to get recurrence history: {}",
+                    e
+                ))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(entries)))
+}
+
+/// Get detected error patterns from the curator
+pub async fn get_error_patterns(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<
+    Json<ApiResponse<Vec<crate::error_monitor::curator::ErrorPattern>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let task_run_id = query.get("task_run_id").cloned();
+
+    let conn = state.app_state.checkpoint_db.get_conn().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get DB connection: {}", e))),
+        )
+    })?;
+
+    let curator = crate::error_monitor::DebugContextCurator::new();
+    let context = curator
+        .build_context(&conn, task_run_id.as_deref())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to build context: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(context.patterns)))
+}
+
+/// Update error status (generic status update)
+pub async fn update_error_status(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<i64>,
+    Json(request): Json<UpdateStatusRequest>,
+) -> Json<ApiResponse<()>> {
+    match state
+        .app_state
+        .pg_db
+        .update_error_status(id, &request.status, request.notes.as_deref())
+        .await
+    {
+        Ok(()) => Json(ApiResponse::success(())),
+        Err(e) => Json(api_error(format!("Failed to update error status: {}", e))),
+    }
+}
+
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
@@ -192,4 +272,13 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(acknowledge_error_monitor_error),
         )
         .route("/error-monitor/fix-workflow", post(generate_fix_workflow))
+        .route(
+            "/error-monitor/recurrence-history/{signature_hash}",
+            get(get_recurrence_history),
+        )
+        .route("/error-monitor/patterns", get(get_error_patterns))
+        .route(
+            "/error-monitor/errors/{id}/status",
+            post(update_error_status),
+        )
 }

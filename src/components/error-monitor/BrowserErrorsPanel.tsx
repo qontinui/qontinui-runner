@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useBrowserErrors } from "../../hooks/useBrowserErrors";
+import { ERROR_MONITOR_REFRESH_INTERVAL } from "../../hooks/useErrorMonitor";
 import type {
   BrowserHealthStatus,
   BrowserCapturedEvent,
@@ -334,7 +335,7 @@ export function BrowserErrorsPanel({ defaultCollapsed = false }: BrowserErrorsPa
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const { health, deduplicatedErrors, loading, error, noConnection, refresh } = useBrowserErrors({
-    refreshInterval: 30000,
+    refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL,
   });
 
   const errorCount = deduplicatedErrors.length;

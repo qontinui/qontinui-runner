@@ -27,7 +27,7 @@ import {
 import { cn } from "../../lib/utils";
 import { ScrollArea } from "../ui/ScrollArea";
 import { getStatusColors } from "@/design-system";
-import { useErrorEvents, useErrorSummary, useDebugContext } from "../../hooks/useErrorMonitor";
+import { useErrorEvents, useErrorSummary, useDebugContext, ERROR_MONITOR_REFRESH_INTERVAL } from "../../hooks/useErrorMonitor";
 import { errorMonitorService, formatErrorTime } from "../../services/error-monitor-service";
 import type { StoredErrorEvent, ErrorSeverity, ErrorStatus, RecurrenceEntry } from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
@@ -443,10 +443,10 @@ export function ErrorMonitorTab({
     taskRunId,
     severities: selectedSeverities.length > 0 ? selectedSeverities : undefined,
     statuses: selectedStatuses.length > 0 ? selectedStatuses : undefined,
-    refreshInterval: 30000, // Refresh every 30 seconds
+    refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL,
   });
 
-  const { summary } = useErrorSummary({ taskRunId, refreshInterval: 30000 });
+  const { summary } = useErrorSummary({ taskRunId, refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL });
 
   const { context: debugContext } = useDebugContext({ taskRunId });
   const patterns = debugContext?.patterns ?? [];

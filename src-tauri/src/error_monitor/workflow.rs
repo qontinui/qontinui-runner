@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::error_monitor::curator::{CuratedError, DebugContext, DebugContextCurator};
+
 use crate::error_monitor::storage::ErrorEventStorage;
 use crate::error_monitor::types::{ErrorQuery, ErrorStatus};
 use crate::str_utils::truncate_str;
 use rusqlite::Connection;
+
+/// Default maximum iterations for error fix workflows.
+const DEFAULT_FIX_MAX_ITERATIONS: u32 = 10;
 
 /// Configuration for generating an error fix workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,7 +37,7 @@ impl Default for ErrorFixWorkflowConfig {
     fn default() -> Self {
         Self {
             name: "Fix Application Errors".to_string(),
-            max_iterations: 10,
+            max_iterations: DEFAULT_FIX_MAX_ITERATIONS,
             include_warnings: false,
             error_ids: vec![],
             task_run_id: None,
