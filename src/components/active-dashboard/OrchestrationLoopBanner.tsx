@@ -60,8 +60,24 @@ const PHASE_LABELS: Record<string, string> = {
   error: "Error",
 };
 
+interface MultiLoopStatus {
+  loops: {
+    loop_id: string;
+    label: string | null;
+    status: {
+      running: boolean;
+      phase: string;
+      current_iteration: number;
+      max_iterations: number;
+    };
+  }[];
+  all_complete: boolean;
+  any_error: boolean;
+}
+
 export function OrchestrationLoopBanner() {
   const [status, setStatus] = useState<OrchestrationLoopStatus | null>(null);
+  const [multiStatus, setMultiStatus] = useState<MultiLoopStatus | null>(null);
   const lastPhaseRef = useRef<string>("");
 
   // GraphQL subscription for lightweight real-time phase/iteration updates (2s push)
@@ -71,6 +87,12 @@ export function OrchestrationLoopBanner() {
     try {
       const s = await invoke<OrchestrationLoopStatus>("get_orchestration_loop_status");
       setStatus(s);
+    } catch {
+      // Not available
+    }
+    try {
+      const ms = await invoke<MultiLoopStatus>("get_multi_orchestration_loop_status");
+      setMultiStatus(ms);
     } catch {
       // Not available
     }
@@ -96,7 +118,46 @@ export function OrchestrationLoopBanner() {
     }
   }, [subData, fetchStatus]);
 
-  // Only show when loop is running or just completed/errored
+  // Check for active multi-loops (excluding default)
+  const multiLoops = multiStatus?.loops.filter(
+    (l) => l.loop_id !== "default" && (l.status.running || l.status.phase !== "Idle"),
+  ) ?? [];
+  const multiRunning = multiLoops.filter((l) => l.status.running);
+
+  // Show multi-loop banner if there are active multi-loops
+  if (multiLoops.length > 0) {
+    const handleStopAll = async () => {
+      try { await invoke("stop_all_orchestration_loops"); } catch { /* ignore */ }
+    };
+    return (
+      <div className="px-3 py-1.5 border-b border-border bg-muted/30 flex items-center gap-3 text-xs">
+        <Repeat className="w-3.5 h-3.5 text-primary shrink-0" />
+        <span className="font-medium text-foreground">Multi-Loop</span>
+        <span className="text-muted-foreground">
+          {multiRunning.length}/{multiLoops.length} running
+        </span>
+        {multiStatus?.all_complete && (
+          <span className="text-green-400 font-mono font-semibold">Complete</span>
+        )}
+        {multiStatus?.any_error && (
+          <span className="text-red-400 font-mono font-semibold">Error</span>
+        )}
+        {multiRunning.length > 0 && (
+          <div className="ml-auto">
+            <button
+              onClick={handleStopAll}
+              className="px-1.5 py-0.5 rounded text-red-400 hover:bg-red-500/10"
+              title="Stop all loops"
+            >
+              <Square className="w-3 h-3" />
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Only show single-loop when loop is running or just completed/errored
   if (!status || (!status.running && status.phase === "idle")) {
     return null;
   }

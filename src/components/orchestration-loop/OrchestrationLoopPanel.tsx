@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../../lib/utils";
-import { Play, Square, Loader2, Zap, Save, Star, Trash2, FolderOpen } from "lucide-react";
+import { Play, Square, Loader2, Zap, Save, Star, Trash2, FolderOpen, Layers } from "lucide-react";
+import { MultiLoopPanel } from "./MultiLoopPanel";
 
 // --- Types matching the Rust backend ---
 
@@ -146,6 +147,7 @@ const textareaCls = cn(inputCls, "w-full resize-y font-sans");
 // --- Main component ---
 
 export function OrchestrationLoopPanel() {
+  const [panelMode, setPanelMode] = useState<"single" | "multi">("single");
   const [status, setStatus] = useState<OrchestrationLoopStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -441,6 +443,19 @@ export function OrchestrationLoopPanel() {
       <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold">Orchestration Loop</h2>
+          <button
+            onClick={() => setPanelMode(panelMode === "single" ? "multi" : "single")}
+            className={cn(
+              "px-2 py-0.5 text-[0.7rem] font-medium rounded flex items-center gap-1",
+              panelMode === "multi"
+                ? "bg-primary/15 text-primary"
+                : "bg-muted text-muted-foreground hover:text-foreground",
+            )}
+            title={panelMode === "single" ? "Switch to Multi-Runner mode" : "Switch to Single mode"}
+          >
+            <Layers className="w-3 h-3" />
+            Multi
+          </button>
           {running && (
             <>
               <PhaseBadge phase={phase} />
@@ -505,6 +520,10 @@ export function OrchestrationLoopPanel() {
       </div>
 
       <div className="flex-1 overflow-auto scrollbar-dark p-3 space-y-3">
+        {panelMode === "multi" ? (
+          <MultiLoopPanel />
+        ) : (
+        <>
         <p className="text-[0.78rem] text-muted-foreground -mt-1 mb-2">
           Iterative develop-rebuild-verify loop for testing changes to the runner itself.
         </p>
@@ -929,6 +948,8 @@ export function OrchestrationLoopPanel() {
             </table>
           </div>
         </div>
+        </>
+        )}
       </div>
     </div>
   );

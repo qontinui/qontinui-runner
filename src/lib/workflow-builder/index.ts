@@ -17,3 +17,15 @@ export type {
 } from "./buildPlanWorkflow";
 
 export { parsePlanMarkdown, summarizeParsedPlan } from "./parsePlanMarkdown";
+
+export { partitionSpecs } from "./partitionSpecs";
+export type { SpecPartition, PartitionStrategy } from "./partitionSpecs";
+
+export { buildMultiRunnerSpecWorkflow } from "./buildMultiRunnerSpecWorkflow";
+export type {
+  RunnerTarget,
+  MultiRunnerSpecWorkflowInput,
+  MultiRunnerSpecWorkflowResult,
+  MultiLoopConfig,
+  MultiLoopEntry,
+} from "./buildMultiRunnerSpecWorkflow";

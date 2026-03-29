@@ -1,6 +1,7 @@
 import * as Tabs from "@radix-ui/react-tabs";
 import {
   BarChart3,
+  Gauge,
   Microscope,
   PenLine,
   FlaskConical,
@@ -11,6 +12,7 @@ import {
 import { useState } from "react";
 import { DashboardTab } from "./generator-eval/DashboardTab";
 import { PipelineInspectorTab } from "./generator-eval/PipelineInspectorTab";
+import { StepEvaluationTab } from "./generator-eval/StepEvaluationTab";
 import { EditAnalysisTab } from "./generator-eval/EditAnalysisTab";
 import { BenchmarksTab } from "./generator-eval/BenchmarksTab";
 import { ExampleLibraryTab } from "./generator-eval/ExampleLibraryTab";
@@ -20,6 +22,7 @@ import { TrainingDataTab } from "./generator-eval/TrainingDataTab";
 const TABS = [
   { id: "dashboard", label: "Dashboard", icon: BarChart3 },
   { id: "inspector", label: "Pipeline Inspector", icon: Microscope },
+  { id: "evaluation", label: "Step Quality", icon: Gauge },
   { id: "edits", label: "Edit Analysis", icon: PenLine },
   { id: "benchmarks", label: "Benchmarks", icon: FlaskConical },
   { id: "examples", label: "Example Library", icon: BookOpen },
@@ -69,6 +72,9 @@ export function GeneratorEvalPage() {
         </Tabs.Content>
         <Tabs.Content value="inspector" className="flex-1 min-h-0 pt-4 overflow-auto">
           <PipelineInspectorTab />
+        </Tabs.Content>
+        <Tabs.Content value="evaluation" className="flex-1 min-h-0 pt-4 overflow-auto">
+          <StepEvaluationTab />
         </Tabs.Content>
         <Tabs.Content value="edits" className="flex-1 min-h-0 pt-4 overflow-auto">
           <EditAnalysisTab />

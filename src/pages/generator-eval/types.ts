@@ -184,6 +184,104 @@ export interface TrainingExample {
 }
 
 // ============================================================================
+// Step Quality Evaluation
+// ============================================================================
+
+export type EvaluationDimension =
+  | "determinism"
+  | "entailment"
+  | "specificity"
+  | "executability"
+  | "coverage"
+  | "robustness";
+
+export type ScoringTier = "deterministic" | "judge" | "prm";
+
+export interface DimensionScore {
+  dimension: EvaluationDimension;
+  score: number;
+  confidence: number;
+  tier: ScoringTier;
+  explanation?: string;
+  evidence: string[];
+}
+
+export interface EvaluationFlag {
+  flag_type: string;
+  message: string;
+  step_id?: string;
+}
+
+export interface StepEvaluation {
+  step_id: string;
+  step_name: string;
+  scores: DimensionScore[];
+  composite_score: number;
+  min_score: number;
+  flags: EvaluationFlag[];
+  criterion_id?: string;
+  criterion_priority?: string;
+}
+
+export interface CoverageEntry {
+  criterion_id: string;
+  criterion_description: string;
+  criterion_priority: string;
+  mapped_steps: {
+    step_id: string;
+    step_name: string;
+    entailment_score: number;
+    entailment_explanation?: string;
+    gaps: string[];
+  }[];
+  best_entailment: number;
+  coverage_adequate: boolean;
+}
+
+export interface UncoveredCriterion {
+  criterion_id: string;
+  criterion_description: string;
+  priority: string;
+  suggested_verification: string;
+}
+
+export interface SemanticCoverageMatrix {
+  entries: CoverageEntry[];
+  uncovered_criteria: UncoveredCriterion[];
+  unlinked_steps: string[];
+  overall_coverage_score: number;
+}
+
+export interface QualityGateResult {
+  passed: boolean;
+  gate_level: string;
+  failures: {
+    gate_level: string;
+    reason: string;
+    step_id?: string;
+    criterion_id?: string;
+  }[];
+}
+
+export interface WorkflowEvaluation {
+  step_evaluations: StepEvaluation[];
+  overall_score: number;
+  coverage_matrix: SemanticCoverageMatrix;
+  quality_gate: QualityGateResult;
+  scoring_strategy: string;
+  evaluation_duration_ms: number;
+}
+
+export interface RepairInstruction {
+  step_id: string;
+  step_name: string;
+  weakest_dimension: EvaluationDimension;
+  current_score: number;
+  explanation?: string;
+  suggested_fix: string;
+}
+
+// ============================================================================
 // API Response
 // ============================================================================
 
