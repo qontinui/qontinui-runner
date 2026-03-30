@@ -15,10 +15,9 @@ import { getApiBase, tracedFetch } from "../../lib/runner-api";
 import {
   buildMultiRunnerSpecWorkflow,
   type RunnerTarget,
-  type MultiLoopConfig,
   type MultiRunnerSpecWorkflowResult,
 } from "../../lib/workflow-builder";
-import { partitionSpecs, type PartitionStrategy, type SpecPartition } from "../../lib/workflow-builder";
+import { type PartitionStrategy } from "../../lib/workflow-builder";
 import type { DiscoveredSpec } from "../../lib/spec-prompt-builder";
 
 interface RunnerInstance {
@@ -58,7 +57,6 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   const [stopAllOnError, setStopAllOnError] = useState(false);
 
   // Preview
-  const [preview, setPreview] = useState<SpecPartition[] | null>(null);
   const [result, setResult] = useState<MultiRunnerSpecWorkflowResult | null>(null);
 
   // Load data on mount
@@ -82,22 +80,18 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
     });
   };
 
-  const buildBetween = () => {
+  const buildBetween = useCallback(() => {
     if (between === "restart_on_signal") return { type: "restart_on_signal" as const, rebuild: true };
     if (between === "restart_runner") return { type: "restart_runner" as const, rebuild: true };
     if (between === "wait_healthy") return { type: "wait_healthy" as const };
     return { type: "none" as const };
-  };
+  }, [between]);
 
   // Generate preview when moving to preview step
   const generatePreview = useCallback(() => {
     const runners: RunnerTarget[] = runnerInstances
       .filter((r) => selectedRunners.has(r.id))
       .map((r) => ({ runnerId: r.id, port: r.port, name: r.name }));
-
-    // Preview just the partition
-    const partitions = partitionSpecs(specs, runners.length, strategy);
-    setPreview(partitions);
 
     // Build the full result
     const buildResult = buildMultiRunnerSpecWorkflow({
@@ -112,7 +106,7 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
       stopAllOnError,
     });
     setResult(buildResult);
-  }, [specs, runnerInstances, selectedRunners, strategy, maxIter, specMaxIter, between, stopAllOnError]);
+  }, [specs, runnerInstances, selectedRunners, strategy, maxIter, specMaxIter, stopAllOnError, buildBetween]);
 
   // Launch the multi-loop
   const handleLaunch = async () => {

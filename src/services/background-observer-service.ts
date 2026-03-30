@@ -7,7 +7,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getGlobalRegistry } from "@qontinui/ui-bridge/core";
+import { getGlobalRegistry, UIBridgeRegistry } from "@qontinui/ui-bridge/core";
 import {
   BackgroundObserver,
   type BackgroundObserverDeps,
@@ -48,7 +48,7 @@ async function persistCapture(payload: TimelineCapturePayload): Promise<void> {
 export function startBackgroundObserver(): void {
   if (observer?.isRunning) return;
 
-  const registry = getGlobalRegistry();
+  const registry = getGlobalRegistry() as UIBridgeRegistry | null;
   if (!registry) {
     console.warn("[BackgroundObserverService] Registry not available yet");
     return;

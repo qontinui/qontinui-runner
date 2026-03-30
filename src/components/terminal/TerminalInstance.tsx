@@ -565,17 +565,18 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
       // eslint-disable-next-line react-hooks/exhaustive-deps -- uiBridge is stable context
     }, [terminalId, backendType, fitTerminal]);
 
-    // Re-fit and focus when visibility changes
-    useEffect(() => {
-      if (visible) {
-        // Delay slightly so the container is actually laid out
-        const id = setTimeout(() => {
-          fitTerminal();
-          backendRef.current?.focus();
-        }, 16);
-        return () => clearTimeout(id);
-      }
-    }, [visible, fitTerminal]);
+    // Re-fit and focus when visibility changes.
+    // Track previous visibility with a ref and trigger fit/focus on transition,
+    // avoiding a useEffect that merely simulates an event handler.
+    const prevVisibleRef = useRef(visible);
+    if (visible && !prevVisibleRef.current) {
+      // Schedule after layout so the container has actual dimensions
+      setTimeout(() => {
+        fitTerminal();
+        backendRef.current?.focus();
+      }, 16);
+    }
+    prevVisibleRef.current = visible;
 
     return (
       <div

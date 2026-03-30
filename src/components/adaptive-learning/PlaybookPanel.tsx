@@ -5,7 +5,7 @@
  * interactive status controls, expandable detail panels, and auto-refresh.
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useReducer } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -263,9 +263,33 @@ interface LessonRowProps {
   onDelete: (id: string) => Promise<void>;
 }
 
+type DetailState = {
+  detail: PlaybookEntryDetail | null;
+  loading: boolean;
+};
+
+type DetailAction =
+  | { type: "reset" }
+  | { type: "loading" }
+  | { type: "loaded"; detail: PlaybookEntryDetail }
+  | { type: "error" };
+
+function detailReducer(_state: DetailState, action: DetailAction): DetailState {
+  switch (action.type) {
+    case "reset":
+      return { detail: null, loading: false };
+    case "loading":
+      return { detail: null, loading: true };
+    case "loaded":
+      return { detail: action.detail, loading: false };
+    case "error":
+      return { detail: null, loading: false };
+  }
+}
+
 function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete }: LessonRowProps) {
-  const [detail, setDetail] = useState<PlaybookEntryDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailState, dispatchDetail] = useReducer(detailReducer, { detail: null, loading: false });
+  const { detail, loading: detailLoading } = detailState;
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -278,20 +302,19 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
   // Load detail when expanded
   useEffect(() => {
     if (!isExpanded) {
-      setDetail(null);
+      dispatchDetail({ type: "reset" });
       return;
     }
 
     let cancelled = false;
+    dispatchDetail({ type: "loading" });
     (async () => {
-      setDetailLoading(true);
       try {
         const result = await invoke<PlaybookEntryDetail>("get_playbook_entry_detail", { id: entry.id });
-        if (!cancelled) setDetail(result);
+        if (!cancelled) dispatchDetail({ type: "loaded", detail: result });
       } catch (err) {
         console.error("Failed to load entry detail:", err);
-      } finally {
-        if (!cancelled) setDetailLoading(false);
+        if (!cancelled) dispatchDetail({ type: "error" });
       }
     })();
 

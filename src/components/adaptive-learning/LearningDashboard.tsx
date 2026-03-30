@@ -127,7 +127,7 @@ function SimpleBarChart({
         const x = i * (barWidth + barPadding);
         const y = chartHeight - barH;
         return (
-          <g key={i}>
+          <g key={`${d.label}-${i}`}>
             <rect x={x} y={y} width={barWidth} height={barH} fill={d.color} rx={2} />
             {barWidth > 14 && (
               <text
@@ -178,7 +178,7 @@ function HorizontalBarChart({
         const barW = (d.value / maxVal) * barAreaWidth;
         const y = i * rowHeight;
         return (
-          <g key={i}>
+          <g key={`${d.label}-${i}`}>
             <text
               x={labelWidth - 4}
               y={y + rowHeight / 2 + 4}
@@ -277,7 +277,7 @@ function SimpleLineChart({
       <path d={pathD} fill="none" stroke="#3b82f6" strokeWidth={2} />
       {/* dots */}
       {points.map((p, i) => (
-        <g key={i}>
+        <g key={`${p.label}-${i}`}>
           <circle cx={p.x} cy={p.y} r={3} fill="#3b82f6" />
           <title>{`${p.label}: ${(p.value * 100).toFixed(0)}%`}</title>
         </g>
@@ -288,7 +288,7 @@ function SimpleLineChart({
           .filter((v, i, a) => a.indexOf(v) === i)
           .map((idx) => (
             <text
-              key={idx}
+              key={`axis-${points[idx].label}`}
               x={points[idx].x}
               y={height - 2}
               fill="#6b7280"
