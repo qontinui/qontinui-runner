@@ -961,83 +961,90 @@ impl CompletionExecutor {
         // Include unresolved errors so the completion AI can report on them.
         // This runs BEFORE the loop_controller marks completion, so workflow-scoped
         // errors are still visible here.
-        match self.checkpoint_db.get_conn() {
-            Ok(conn) => {
-                match crate::error_monitor::ErrorEventStorage::get_unresolved(&conn, None, 20) {
-                    Ok(errors) if !errors.is_empty() => {
-                        let mut workflow_errors = Vec::new();
-                        let mut pre_existing_errors = Vec::new();
+        // PG-primary via block_on since build_prior_phase_context is sync
+        let errors_result: Result<Vec<serde_json::Value>, String> =
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pg = self.app_state.pg_db.clone();
+            let pg_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.block_on(async move { pg.get_unresolved_errors(None, 20).await })
+            }));
+            match pg_res {
+                Ok(r) => r,
+                Err(_) => Err("block_on panicked".to_string()),
+            }
+        } else {
+            Err("No tokio runtime available".to_string())
+        };
+        match errors_result {
+            Ok(errors) if !errors.is_empty() => {
+                let mut workflow_errors = Vec::new();
+                let mut pre_existing_errors = Vec::new();
 
-                        for e in &errors {
-                            let is_workflow_scoped = e
-                                .task_run_id
-                                .as_deref()
-                                .is_some_and(|id| id == execution_id);
-                            if is_workflow_scoped {
-                                workflow_errors.push(e);
-                            } else {
-                                pre_existing_errors.push(e);
-                            }
-                        }
-
-                        let mut lines = vec!["### Unresolved Errors (Error Monitor)\n".to_string()];
-
-                        if !workflow_errors.is_empty() {
-                            lines.push(format!(
-                                "**Errors from this workflow run ({}):**",
-                                workflow_errors.len()
-                            ));
-                            for e in &workflow_errors {
-                                lines.push(format!(
-                                    "- [{}] {}",
-                                    e.severity.as_str(),
-                                    e.message.chars().take(200).collect::<String>()
-                                ));
-                            }
-                            lines.push(String::new());
-                        }
-
-                        if !pre_existing_errors.is_empty() {
-                            lines.push(format!(
-                                "**Pre-existing errors ({}):**",
-                                pre_existing_errors.len()
-                            ));
-                            for e in pre_existing_errors.iter().take(10) {
-                                lines.push(format!(
-                                    "- [{}] {}",
-                                    e.severity.as_str(),
-                                    e.message.chars().take(200).collect::<String>()
-                                ));
-                            }
-                            if pre_existing_errors.len() > 10 {
-                                lines.push(format!(
-                                    "... and {} more",
-                                    pre_existing_errors.len() - 10
-                                ));
-                            }
-                            lines.push(String::new());
-                        }
-
-                        lines.push(
-                            "Include any relevant errors in your completion summary. \
-                             Workflow-scoped errors will be auto-resolved if the workflow succeeded."
-                                .to_string(),
-                        );
-
-                        sections.push(lines.join("\n"));
-                    }
-                    Ok(_) => {} // No unresolved errors
-                    Err(e) => {
-                        warn!(
-                            "Failed to read unresolved errors for completion context: {}",
-                            e
-                        );
+                for e in &errors {
+                    let is_workflow_scoped = e["task_run_id"]
+                        .as_str()
+                        .is_some_and(|id| id == execution_id);
+                    if is_workflow_scoped {
+                        workflow_errors.push(e);
+                    } else {
+                        pre_existing_errors.push(e);
                     }
                 }
+
+                let mut lines = vec!["### Unresolved Errors (Error Monitor)\n".to_string()];
+
+                if !workflow_errors.is_empty() {
+                    lines.push(format!(
+                        "**Errors from this workflow run ({}):**",
+                        workflow_errors.len()
+                    ));
+                    for e in &workflow_errors {
+                        let severity = e["severity"].as_str().unwrap_or("error");
+                        let message = e["message"].as_str().unwrap_or("");
+                        lines.push(format!(
+                            "- [{}] {}",
+                            severity,
+                            message.chars().take(200).collect::<String>()
+                        ));
+                    }
+                    lines.push(String::new());
+                }
+
+                if !pre_existing_errors.is_empty() {
+                    lines.push(format!(
+                        "**Pre-existing errors ({}):**",
+                        pre_existing_errors.len()
+                    ));
+                    for e in pre_existing_errors.iter().take(10) {
+                        let severity = e["severity"].as_str().unwrap_or("error");
+                        let message = e["message"].as_str().unwrap_or("");
+                        lines.push(format!(
+                            "- [{}] {}",
+                            severity,
+                            message.chars().take(200).collect::<String>()
+                        ));
+                    }
+                    if pre_existing_errors.len() > 10 {
+                        lines.push(format!(
+                            "... and {} more",
+                            pre_existing_errors.len() - 10
+                        ));
+                    }
+                    lines.push(String::new());
+                }
+
+                lines.push(
+                    "Include any relevant errors in your completion summary. \
+                     Workflow-scoped errors will be auto-resolved if the workflow succeeded."
+                        .to_string(),
+                );
+
+                sections.push(lines.join("\n"));
             }
+            Ok(_) => {} // No unresolved errors
             Err(e) => {
                 warn!(
-                    "Failed to get DB connection for completion error context: {}",
+                    "Failed to read unresolved errors for completion context: {}",
                     e
                 );
             }

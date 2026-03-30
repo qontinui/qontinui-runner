@@ -23,6 +23,7 @@ import { activityTimelineTutorial } from "./activity-timeline";
 import { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
 import { proceduralSkillsTutorial } from "./procedural-skills";
 import { qLearningRouterTutorial } from "./q-learning-router";
+import { prmTrainingPipelineTutorial } from "./prm-training-pipeline";
 
 /**
  * All available tutorials
@@ -47,6 +48,7 @@ export const tutorials: Tutorial[] = [
   metaPromptOptimizerTutorial, // Featured - LLM-based prompt rewriting with canary A/B testing
   proceduralSkillsTutorial, // Featured - Hermes-agent-inspired self-improving procedural memory
   qLearningRouterTutorial, // Featured - Q-learning architecture routing for autoresearch
+  prmTrainingPipelineTutorial, // Featured - PRM training pipeline (Plan 14)
 ];
 
 /**
@@ -128,3 +130,4 @@ export { multimodalVisionTutorial } from "./multimodal-vision";
 export { traceAnalysisTutorial } from "./trace-analysis";
 export { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
 export { qLearningRouterTutorial } from "./q-learning-router";
+export { prmTrainingPipelineTutorial } from "./prm-training-pipeline";

@@ -4,6 +4,9 @@
 //! natural language descriptions using AI.
 
 pub mod benchmark;
+pub mod code_graph;
+pub mod consistency;
+pub mod constitution;
 pub mod complexity;
 pub mod decomposition;
 pub mod domain_generators;

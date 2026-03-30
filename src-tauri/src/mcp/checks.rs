@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::database::{
-    Check, CheckGroup, CheckpointDb, CreateCheckGroupInput, CreateCheckInput,
+    Check, CheckGroup, CreateCheckGroupInput, CreateCheckInput,
     UpdateCheckGroupInput, UpdateCheckInput,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -107,18 +107,11 @@ pub async fn generate_checks_handler(
 /// Checks are named with format "{group_name} - {tool_name}" (e.g., "multistate - Ruff Linting").
 /// This endpoint finds checks that match groups by this pattern and ensures they are linked.
 pub async fn repair_check_associations_handler(
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Repairing check-group associations via MCP API");
 
-    let db = CheckpointDb::new().map_err(|e| {
-        error!("Failed to open database: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to open database: {}", e))),
-        )
-    })?;
-
-    match db.repair_check_group_associations() {
+    match state.app_state.pg_db.repair_check_group_associations().await {
         Ok(count) => {
             let message = if count > 0 {
                 format!("Repaired {} check-group associations", count)
@@ -290,11 +283,7 @@ pub async fn list_check_groups_handler(
     Query(query): Query<ListCheckGroupsQuery>,
 ) -> Result<Json<ApiResponse<Vec<CheckGroup>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let enabled_only = query.enabled_only.unwrap_or(false);
-    match state
-        .app_state
-        .checkpoint_db
-        .list_check_groups(enabled_only)
-    {
+    match state.app_state.pg_db.list_check_groups(enabled_only).await {
         Ok(groups) => Ok(Json(ApiResponse::success(groups))),
         Err(e) => {
             error!("Failed to list check groups: {}", e);
@@ -355,11 +344,7 @@ pub async fn update_check_group_handler(
     Json(input): Json<UpdateCheckGroupInput>,
 ) -> Result<Json<ApiResponse<CheckGroup>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Updating check group: {}", id);
-    match state
-        .app_state
-        .checkpoint_db
-        .update_check_group(&id, &input)
-    {
+    match state.app_state.pg_db.update_check_group(&id, &input).await {
         Ok(group) => {
             info!("Updated check group: {} ({})", group.name, group.id);
             Ok(Json(ApiResponse::success(group)))
@@ -448,9 +433,7 @@ pub async fn run_check_handler(
         }
     };
 
-    let db = state.app_state.checkpoint_db.clone();
     let task_run_id = request.task_run_id.clone();
-    let task_run_id_pg = task_run_id.clone();
 
     // Execute in spawn_blocking since check execution is synchronous I/O
     let result = tokio::task::spawn_blocking(move || {
@@ -473,38 +456,7 @@ pub async fn run_check_handler(
         };
 
         // Execute the check
-        let result = execute_check(&check_def);
-
-        // Store result in database if task_run_id provided
-        if let Some(ref run_id) = task_run_id {
-            let status_str = serde_json::to_string(&result.status)
-                .unwrap_or("\"pending\"".to_string())
-                .trim_matches('"')
-                .to_string();
-            let structured = result
-                .structured_output
-                .as_ref()
-                .map(|o| serde_json::to_string(o).unwrap_or_default());
-
-            if let Err(e) = db.save_check_result(
-                &result.check_id,
-                &status_str,
-                Some(result.started_at.as_str()),
-                Some(result.completed_at.as_str()),
-                Some(result.duration_ms as i64),
-                Some(result.output.as_str()),
-                result.error.as_deref(),
-                result.issues_found as i32,
-                result.issues_fixed as i32,
-                result.files_checked as i32,
-                structured.as_deref(),
-                Some(run_id.as_str()),
-            ) {
-                tracing::error!("Failed to store check result: {}", e);
-            }
-        }
-
-        result
+        execute_check(&check_def)
     })
     .await
     .map_err(|e| {
@@ -515,8 +467,8 @@ pub async fn run_check_handler(
         )
     })?;
 
-    // Dual-write check result to PG
-    if let Some(ref run_id) = task_run_id_pg {
+    // Store check result in PG
+    if let Some(ref run_id) = task_run_id {
         let status_str = serde_json::to_string(&result.status)
             .unwrap_or("\"pending\"".to_string())
             .trim_matches('"')
@@ -631,8 +583,9 @@ pub async fn set_checks_in_group_handler(
 
     match state
         .app_state
-        .checkpoint_db
+        .pg_db
         .set_checks_in_group(&id, &request.check_ids)
+        .await
     {
         Ok(()) => {
             info!("Set {} checks in group {}", request.check_ids.len(), id);
@@ -699,7 +652,6 @@ pub async fn run_check_group_handler(
         }))));
     }
 
-    let _db = state.app_state.checkpoint_db.clone();
     let stop_on_failure = group.stop_on_failure;
 
     // Execute checks sequentially in a blocking task

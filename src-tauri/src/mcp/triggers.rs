@@ -27,7 +27,6 @@ fn default_history_limit() -> u32 {
 }
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::trigger_system::storage;
 use crate::trigger_system::types::*;
 
 // ============================================================================
@@ -58,9 +57,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
 async fn list_triggers(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<WorkflowTrigger>>> {
-    let db = &state.app_state.checkpoint_db;
-
-    match storage::get_all_triggers(db) {
+    match state.app_state.pg_db.get_all_triggers().await {
         Ok(triggers) => Json(ApiResponse::success(triggers)),
         Err(e) => Json(ApiResponse::error(format!(
             "Failed to list triggers: {}",
@@ -74,8 +71,6 @@ async fn create_trigger(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateTriggerRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<WorkflowTrigger>>), (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
-
     // Derive trigger_type from config
     let trigger_type = match &request.trigger_config {
         TriggerConfig::Webhook { .. } => "webhook",
@@ -109,7 +104,7 @@ async fn create_trigger(
         updated_at: now,
     };
 
-    storage::create_trigger(db, &trigger).map_err(|e| {
+    state.app_state.pg_db.create_trigger(&trigger).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to create trigger: {}", e))),
@@ -131,9 +126,7 @@ async fn get_trigger(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<WorkflowTrigger>> {
-    let db = &state.app_state.checkpoint_db;
-
-    match storage::get_trigger(db, &id) {
+    match state.app_state.pg_db.get_trigger(&id).await {
         Ok(Some(trigger)) => Json(ApiResponse::success(trigger)),
         Ok(None) => Json(ApiResponse::error(format!("Trigger not found: {}", id))),
         Err(e) => Json(ApiResponse::error(format!("Failed to get trigger: {}", e))),
@@ -146,9 +139,7 @@ async fn update_trigger(
     Path(id): Path<String>,
     Json(request): Json<UpdateTriggerRequest>,
 ) -> Json<ApiResponse<WorkflowTrigger>> {
-    let db = &state.app_state.checkpoint_db;
-
-    let mut trigger = match storage::get_trigger(db, &id) {
+    let mut trigger = match state.app_state.pg_db.get_trigger(&id).await {
         Ok(Some(t)) => t,
         Ok(None) => return Json(ApiResponse::error(format!("Trigger not found: {}", id))),
         Err(e) => return Json(ApiResponse::error(format!("Failed to get trigger: {}", e))),
@@ -199,7 +190,7 @@ async fn update_trigger(
 
     trigger.updated_at = chrono::Utc::now().to_rfc3339();
 
-    match storage::update_trigger(db, &trigger) {
+    match state.app_state.pg_db.update_trigger(&trigger).await {
         Ok(()) => {
             // Re-register watcher if trigger is enabled (config may have changed)
             if trigger.enabled {
@@ -223,14 +214,12 @@ async fn delete_trigger(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<()>> {
-    let db = &state.app_state.checkpoint_db;
-
     // Unregister the watcher first
     if let Some(service) = crate::trigger_system::get_trigger_service().await {
         service.unregister_watcher(&id).await;
     }
 
-    match storage::delete_trigger(db, &id) {
+    match state.app_state.pg_db.delete_trigger(&id).await {
         Ok(()) => Json(ApiResponse::success(())),
         Err(e) => Json(ApiResponse::error(format!(
             "Failed to delete trigger: {}",
@@ -245,9 +234,7 @@ async fn set_enabled(
     Path(id): Path<String>,
     Json(request): Json<SetEnabledRequest>,
 ) -> Json<ApiResponse<()>> {
-    let db = &state.app_state.checkpoint_db;
-
-    match storage::set_trigger_enabled(db, &id, request.enabled) {
+    match state.app_state.pg_db.set_trigger_enabled(&id, request.enabled).await {
         Ok(()) => {
             info!(
                 "Trigger {} {}",
@@ -263,7 +250,7 @@ async fn set_enabled(
             if let Some(service) = crate::trigger_system::get_trigger_service().await {
                 if request.enabled {
                     // Re-register the watcher
-                    if let Ok(Some(trigger)) = storage::get_trigger(db, &id) {
+                    if let Ok(Some(trigger)) = state.app_state.pg_db.get_trigger(&id).await {
                         if let Err(e) = service.register_watcher(&trigger).await {
                             warn!("Failed to register watcher after enable: {}", e);
                         }
@@ -288,9 +275,7 @@ async fn test_trigger(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    let db = &state.app_state.checkpoint_db;
-
-    let trigger = match storage::get_trigger(db, &id) {
+    let trigger = match state.app_state.pg_db.get_trigger(&id).await {
         Ok(Some(t)) => t,
         Ok(None) => return Json(ApiResponse::error(format!("Trigger not found: {}", id))),
         Err(e) => return Json(ApiResponse::error(e)),
@@ -331,16 +316,13 @@ async fn get_history(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<ApiResponse<Vec<TriggerHistoryEntry>>> {
-    let db = &state.app_state.checkpoint_db;
-
-    match storage::get_trigger_history_filtered(
-        db,
+    match state.app_state.pg_db.get_trigger_history_filtered(
         &id,
         query.limit,
         query.action.as_deref(),
         query.since.as_deref(),
         query.until.as_deref(),
-    ) {
+    ).await {
         Ok(entries) => Json(ApiResponse::success(entries)),
         Err(e) => Json(ApiResponse::error(format!("Failed to get history: {}", e))),
     }
@@ -355,10 +337,8 @@ async fn webhook_ingestion(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    let db = &state.app_state.checkpoint_db;
-
     // Load the trigger
-    let trigger = match storage::get_trigger(db, &id) {
+    let trigger = match state.app_state.pg_db.get_trigger(&id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             return (

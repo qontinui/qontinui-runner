@@ -43,14 +43,11 @@ pub struct PromptGroupMetrics {
 ///
 /// Returns samples ordered by outcome_score ascending (worst first).
 pub fn extract_prompt_samples(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     limit: usize,
 ) -> Result<Vec<PromptSample>, String> {
-    // Get pg_db from the app state via a thread-local or pass it through
-    // For backward compat, delegate to extract_prompt_samples_pg with a fallback
-    // This function is called from select_optimization_target which only has db
-    // We'll use the PG path via the _with_pg wrapper
-    extract_prompt_samples_sqlite(db, limit)
+    let pg = PgDb::global();
+    extract_prompt_samples_pg(&pg, limit)
 }
 
 /// Extract prompt samples using PG (primary path).
@@ -81,59 +78,6 @@ pub fn extract_prompt_samples_pg(
     Ok(samples)
 }
 
-/// SQLite fallback for extract_prompt_samples (kept for backward compat).
-fn extract_prompt_samples_sqlite(
-    db: &CheckpointDb,
-    limit: usize,
-) -> Result<Vec<PromptSample>, String> {
-    let limit = limit as i64;
-
-    db.with_conn(move |conn| {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT
-                       ptu.task_run_id,
-                       ptu.phase,
-                       COALESCE(tr.workflow_name, ptu.phase) AS agent_type,
-                       COALESCE(lo.composite_agentic_score, 0.0) AS outcome_score,
-                       COALESCE(lo.status, tr.status) AS outcome_status,
-                       COALESCE(ptu.iteration, 0) AS iteration,
-                       COALESCE(ptu.cost_cents, 0) / 100.0 AS cost_usd
-                   FROM phase_token_usage ptu
-                   INNER JOIN task_runs tr ON tr.id = ptu.task_run_id
-                   LEFT JOIN learning_outcomes lo ON lo.task_id = tr.id
-                   WHERE tr.status IN ('complete', 'failed')
-                     AND COALESCE(tr.is_meta_optimizer, 0) = 0
-                     AND COALESCE(tr.is_fixer, 0) = 0
-                     AND COALESCE(tr.is_reflection, 0) = 0
-                     AND COALESCE(tr.is_follow_up, 0) = 0
-                     AND ptu.phase IN ('generation', 'verification', 'agentic')
-                   ORDER BY outcome_score ASC
-                   LIMIT ?1"#,
-            )
-            .map_err(|e| format!("Failed to prepare prompt extraction query: {}", e))?;
-
-        let rows = stmt
-            .query_map(rusqlite::params![limit], |row| {
-                Ok(PromptSample {
-                    task_run_id: row.get(0)?,
-                    phase: row.get(1)?,
-                    agent_type: row.get(2)?,
-                    prompt_text: String::new(),
-                    outcome_score: row.get(3)?,
-                    outcome_status: row.get(4)?,
-                    iteration: row.get::<_, i64>(5)? as u32,
-                    cost_usd: row.get(6)?,
-                })
-            })
-            .map_err(|e| format!("Failed to execute prompt extraction query: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>();
-
-        debug!("Extracted {} prompt samples", rows.len());
-        Ok(rows)
-    })
-}
 
 /// Group prompt samples by (phase, agent_type) and compute per-group metrics.
 ///
@@ -143,7 +87,7 @@ fn extract_prompt_samples_sqlite(
 ///
 /// Returns groups sorted by mean_score ascending (worst-performing first).
 pub fn compute_group_metrics(samples: &[PromptSample]) -> Vec<PromptGroupMetrics> {
-    compute_group_metrics_inner(samples, None)
+    compute_group_metrics_inner(samples, None, None)
 }
 
 /// Like `compute_group_metrics` but enriches prompt text from the prompt registry.
@@ -151,12 +95,13 @@ pub fn compute_group_metrics_with_db(
     samples: &[PromptSample],
     db: &CheckpointDb,
 ) -> Vec<PromptGroupMetrics> {
-    compute_group_metrics_inner(samples, Some(db))
+    compute_group_metrics_inner(samples, Some(db), None)
 }
 
 fn compute_group_metrics_inner(
     samples: &[PromptSample],
-    db: Option<&CheckpointDb>,
+    _db: Option<&CheckpointDb>,
+    pg_db: Option<&Arc<PgDb>>,
 ) -> Vec<PromptGroupMetrics> {
     use std::collections::HashMap;
 
@@ -183,14 +128,16 @@ fn compute_group_metrics_inner(
             let sum_iterations: f64 = group_samples.iter().map(|s| s.iteration as f64).sum();
             let sum_cost: f64 = group_samples.iter().map(|s| s.cost_usd).sum();
 
-            // Try to get the active prompt variant text from the registry,
+            // Try to get the active prompt variant text from PG,
             // falling back to the hardcoded default for the agent type.
-            let latest_prompt = db
-                .and_then(|db| {
-                    super::prompt_registry::get_active_prompt_sqlite(db, &agent_type)
-                        .ok()
-                        .flatten()
-                        .map(|v| v.prompt_content)
+            let latest_prompt = pg_db
+                .and_then(|pg| {
+                    tokio::task::block_in_place(|| {
+                        Handle::current().block_on(pg.get_active_prompt(&agent_type))
+                    })
+                    .ok()
+                    .flatten()
+                    .map(|v| v.prompt_content)
                 })
                 .unwrap_or_else(|| get_default_agent_prompt(&agent_type));
 
@@ -305,14 +252,14 @@ Review the failure output carefully, identify the root cause, and make targeted 
 /// Collect failure and success samples for a specific prompt group.
 /// Returns (failures, successes) tuples.
 pub fn collect_evidence_samples(
-    db: &CheckpointDb,
+    _db: &CheckpointDb,
     phase: &str,
     agent_type: &str,
     max_failures: usize,
     max_successes: usize,
 ) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
-    // Kept as SQLite fallback for callers without pg_db
-    collect_evidence_samples_sqlite(db, phase, agent_type, max_failures, max_successes)
+    let pg = PgDb::global();
+    collect_evidence_samples_pg(&pg, phase, agent_type, max_failures, max_successes)
 }
 
 /// Collect evidence samples using PG (primary path).
@@ -342,115 +289,6 @@ pub fn collect_evidence_samples_pg(
     ))
 }
 
-/// SQLite fallback for collect_evidence_samples.
-fn collect_evidence_samples_sqlite(
-    db: &CheckpointDb,
-    phase: &str,
-    agent_type: &str,
-    max_failures: usize,
-    max_successes: usize,
-) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
-    let phase_owned = phase.to_string();
-    let agent_type_owned = agent_type.to_string();
-    let max_failures = max_failures as i64;
-    let max_successes = max_successes as i64;
-
-    db.with_conn(move |conn| {
-        let agent_filter = if agent_type_owned.is_empty() {
-            String::new()
-        } else {
-            " AND COALESCE(tr.workflow_name, ptu.phase) = ?3".to_string()
-        };
-
-        let fail_sql = format!(
-            r#"SELECT
-                   ptu.task_run_id,
-                   ptu.phase,
-                   COALESCE(tr.workflow_name, ptu.phase),
-                   COALESCE(lo.composite_agentic_score, 0.0),
-                   COALESCE(lo.status, tr.status),
-                   COALESCE(ptu.iteration, 0),
-                   COALESCE(ptu.cost_cents, 0) / 100.0
-               FROM phase_token_usage ptu
-               INNER JOIN task_runs tr ON tr.id = ptu.task_run_id
-               LEFT JOIN learning_outcomes lo ON lo.task_id = tr.id
-               WHERE ptu.phase = ?1
-                 AND tr.status IN ('complete', 'failed')
-                 AND COALESCE(tr.is_meta_optimizer, 0) = 0
-                 AND COALESCE(tr.is_fixer, 0) = 0
-                 AND COALESCE(lo.composite_agentic_score, 0.0) < 0.5
-                 {}
-               ORDER BY lo.created_at DESC
-               LIMIT ?2"#,
-            agent_filter
-        );
-
-        let mut fail_stmt = conn.prepare(&fail_sql)
-            .map_err(|e| format!("Failed to prepare failure query: {}", e))?;
-
-        let fail_params: Vec<Box<dyn rusqlite::types::ToSql>> = if agent_type_owned.is_empty() {
-            vec![Box::new(phase_owned.clone()), Box::new(max_failures)]
-        } else {
-            vec![Box::new(phase_owned.clone()), Box::new(max_failures), Box::new(agent_type_owned.clone())]
-        };
-
-        let failures: Vec<PromptSample> = fail_stmt
-            .query_map(rusqlite::params_from_iter(fail_params.iter()), |row| {
-                Ok(PromptSample {
-                    task_run_id: row.get(0)?, phase: row.get(1)?, agent_type: row.get(2)?,
-                    prompt_text: String::new(), outcome_score: row.get(3)?,
-                    outcome_status: row.get(4)?, iteration: row.get::<_, i64>(5)? as u32, cost_usd: row.get(6)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query failures: {}", e))?
-            .filter_map(|r| r.ok()).collect();
-
-        let success_sql = format!(
-            r#"SELECT
-                   ptu.task_run_id,
-                   ptu.phase,
-                   COALESCE(tr.workflow_name, ptu.phase),
-                   COALESCE(lo.composite_agentic_score, 0.0),
-                   COALESCE(lo.status, tr.status),
-                   COALESCE(ptu.iteration, 0),
-                   COALESCE(ptu.cost_cents, 0) / 100.0
-               FROM phase_token_usage ptu
-               INNER JOIN task_runs tr ON tr.id = ptu.task_run_id
-               LEFT JOIN learning_outcomes lo ON lo.task_id = tr.id
-               WHERE ptu.phase = ?1
-                 AND tr.status IN ('complete', 'failed')
-                 AND COALESCE(tr.is_meta_optimizer, 0) = 0
-                 AND COALESCE(tr.is_fixer, 0) = 0
-                 AND COALESCE(lo.composite_agentic_score, 0.0) > 0.8
-                 {}
-               ORDER BY lo.created_at DESC
-               LIMIT ?2"#,
-            agent_filter
-        );
-
-        let mut success_stmt = conn.prepare(&success_sql)
-            .map_err(|e| format!("Failed to prepare success query: {}", e))?;
-
-        let success_params: Vec<Box<dyn rusqlite::types::ToSql>> = if agent_type_owned.is_empty() {
-            vec![Box::new(phase_owned), Box::new(max_successes)]
-        } else {
-            vec![Box::new(phase_owned), Box::new(max_successes), Box::new(agent_type_owned)]
-        };
-
-        let successes: Vec<PromptSample> = success_stmt
-            .query_map(rusqlite::params_from_iter(success_params.iter()), |row| {
-                Ok(PromptSample {
-                    task_run_id: row.get(0)?, phase: row.get(1)?, agent_type: row.get(2)?,
-                    prompt_text: String::new(), outcome_score: row.get(3)?,
-                    outcome_status: row.get(4)?, iteration: row.get::<_, i64>(5)? as u32, cost_usd: row.get(6)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query successes: {}", e))?
-            .filter_map(|r| r.ok()).collect();
-
-        Ok((failures, successes))
-    })
-}
 
 // ─��� PG dual-write wrappers ────────────────────────────��─────────────────
 
@@ -463,13 +301,13 @@ pub fn extract_prompt_samples_with_pg(
     extract_prompt_samples_pg(pg_db, limit)
 }
 
-/// Compute group metrics with PG fallback (currently delegates to SQLite).
+/// Compute group metrics with PG-primary prompt registry lookup.
 pub fn compute_group_metrics_with_db_pg(
     samples: &[PromptSample],
     db: &CheckpointDb,
-    _pg_db: &Arc<PgDb>,
+    pg_db: &Arc<PgDb>,
 ) -> Vec<PromptGroupMetrics> {
-    compute_group_metrics_with_db(samples, db)
+    compute_group_metrics_inner(samples, Some(db), Some(pg_db))
 }
 
 /// Collect evidence samples with PG-primary.

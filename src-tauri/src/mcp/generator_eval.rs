@@ -413,6 +413,7 @@ async fn run_benchmark_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let db = state.app_state.checkpoint_db.clone();
     let pg_db = state.app_state.pg_db.clone();
+    let pg_clone = pg_db.clone();
     let doctor_handle = state.doctor_handle.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -433,7 +434,7 @@ async fn run_benchmark_handler(
         let (gen_response, artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
-            None,
+            Some(&pg_clone),
             None,
         );
         let duration_ms = start.elapsed().as_millis() as u64;

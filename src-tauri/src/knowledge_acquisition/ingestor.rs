@@ -170,7 +170,7 @@ pub enum IngestOutcome {
 pub async fn ingest_results(
     results: &[KnowledgeResult],
     task_run_id: &str,
-    db: &CheckpointDb,
+    db: Option<&Arc<CheckpointDb>>,
     pg: Option<&Arc<PgDb>>,
 ) -> Vec<IngestOutcome> {
     let embedding_client = EmbeddingClient::new();
@@ -198,7 +198,7 @@ pub async fn ingest_results(
 async fn ingest_single(
     result: &KnowledgeResult,
     task_run_id: &str,
-    db: &CheckpointDb,
+    db: Option<&Arc<CheckpointDb>>,
     pg: Option<&Arc<PgDb>>,
     embedding_client: &EmbeddingClient,
 ) -> IngestOutcome {
@@ -258,7 +258,7 @@ async fn ingest_single(
             &dedup_config,
         )
         .await
-    } else {
+    } else if let Some(db) = db {
         match db.get_conn() {
             Ok(conn) => hybrid_search_knowledge(
                 &conn,
@@ -271,6 +271,8 @@ async fn ingest_single(
                 Ok(vec![])
             }
         }
+    } else {
+        Ok(vec![])
     };
 
     if let Ok(existing) = dedup_result {
@@ -310,7 +312,7 @@ async fn ingest_single(
             related_files_json,
         )
         .await
-    } else {
+    } else if let Some(db) = db {
         db.create_task_knowledge(
             task_run_id,
             EXTERNAL_KNOWLEDGE_CATEGORY,
@@ -322,6 +324,8 @@ async fn ingest_single(
             &[],
         )
         .map(|stored| stored.id)
+    } else {
+        Err("No database backend available for knowledge storage".to_string())
     };
 
     let stored_id = match stored_id {
@@ -338,9 +342,11 @@ async fn ingest_single(
         if let Err(e) = pg.store_knowledge_embedding(&stored_id, &embedding).await {
             warn!(id = %stored_id, "Failed to store embedding in PG: {e}");
         }
-    } else if let Ok(conn) = db.get_conn() {
-        if let Err(e) = store_knowledge_embedding(&conn, &stored_id, &embedding) {
-            warn!(id = %stored_id, "Failed to store embedding: {e}");
+    } else if let Some(db) = db {
+        if let Ok(conn) = db.get_conn() {
+            if let Err(e) = store_knowledge_embedding(&conn, &stored_id, &embedding) {
+                warn!(id = %stored_id, "Failed to store embedding: {e}");
+            }
         }
     }
 

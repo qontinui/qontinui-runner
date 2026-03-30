@@ -634,37 +634,41 @@ impl AgenticExecutor {
         // Only inject when the workflow is specifically targeting errors (error-fix workflows),
         // otherwise it distracts the AI from its actual task.
         let error_monitor_summary = if !config.targeted_error_ids.is_empty() {
-            match self.app_state.checkpoint_db.get_conn() {
-                Ok(conn) => {
-                    match crate::error_monitor::ErrorEventStorage::get_unresolved(&conn, None, 20) {
-                        Ok(errors) if !errors.is_empty() => {
-                            let mut lines = vec!["## Recent Errors (Error Monitor)".to_string()];
-                            lines.push(format!(
-                                "The error monitor has detected {} unresolved error(s):",
-                                errors.len()
-                            ));
-                            for e in errors.iter().take(15) {
-                                let count_str = if e.occurrence_count > 1 {
-                                    format!(" ({} occurrences)", e.occurrence_count)
-                                } else {
-                                    String::new()
-                                };
-                                lines.push(format!(
-                                    "- [{}] {}{}",
-                                    e.log_source_name,
-                                    e.message.chars().take(200).collect::<String>(),
-                                    count_str
-                                ));
-                            }
-                            if errors.len() > 15 {
-                                lines.push(format!("... and {} more", errors.len() - 15));
-                            }
-                            Some(lines.join("\n"))
-                        }
-                        _ => None,
+            match self.app_state.pg_db.get_unresolved_errors(None, 20).await {
+                Ok(errors) if !errors.is_empty() => {
+                    let mut lines = vec!["## Recent Errors (Error Monitor)".to_string()];
+                    lines.push(format!(
+                        "The error monitor has detected {} unresolved error(s):",
+                        errors.len()
+                    ));
+                    for e in errors.iter().take(15) {
+                        let occurrence_count = e.get("occurrence_count")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(1);
+                        let count_str = if occurrence_count > 1 {
+                            format!(" ({} occurrences)", occurrence_count)
+                        } else {
+                            String::new()
+                        };
+                        let log_source_name = e.get("log_source_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let message = e.get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        lines.push(format!(
+                            "- [{}] {}{}",
+                            log_source_name,
+                            message.chars().take(200).collect::<String>(),
+                            count_str
+                        ));
                     }
+                    if errors.len() > 15 {
+                        lines.push(format!("... and {} more", errors.len() - 15));
+                    }
+                    Some(lines.join("\n"))
                 }
-                Err(_) => None,
+                _ => None,
             }
         } else {
             None

@@ -860,6 +860,7 @@ mod tests {
                     priority: CriterionPriority::Critical,
                     verification_hint: "Run `npx tsc --noEmit`".to_string(),
                     category: "compilation".to_string(),
+                    ..Default::default()
                 },
                 AcceptanceCriterion {
                     id: "api-health".to_string(),
@@ -868,6 +869,7 @@ mod tests {
                     priority: CriterionPriority::Important,
                     verification_hint: "curl http://localhost:8000/health".to_string(),
                     category: "runtime".to_string(),
+                    ..Default::default()
                 },
                 AcceptanceCriterion {
                     id: "visual-review".to_string(),
@@ -876,6 +878,7 @@ mod tests {
                     priority: CriterionPriority::Optional,
                     verification_hint: "Human review".to_string(),
                     category: "style".to_string(),
+                    ..Default::default()
                 },
                 AcceptanceCriterion {
                     id: "lint-clean".to_string(),
@@ -884,9 +887,11 @@ mod tests {
                     priority: CriterionPriority::Optional,
                     verification_hint: "Run `npx eslint .`".to_string(),
                     category: "code-quality".to_string(),
+                    ..Default::default()
                 },
             ],
             assumptions: vec!["TypeScript project".to_string()],
+            bugfix_context: None,
         }
     }
 

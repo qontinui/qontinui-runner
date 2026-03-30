@@ -72,6 +72,49 @@ type GenericRunnerEvent {
 }
 
 """
+An error event captured from application logs.
+"""
+type GqlErrorEvent {
+	id: Int!
+	logSourceName: String!
+	taskRunId: String
+	severity: String!
+	errorType: String
+	errorCode: String
+	message: String!
+	stackTrace: String
+	filePath: String
+	lineNumber: Int
+	status: String!
+	occurrenceCount: Int!
+	firstSeenAt: String!
+	lastSeenAt: String!
+	signatureHash: String!
+}
+
+"""
+A detected pattern across multiple errors.
+"""
+type GqlErrorPattern {
+	patternType: String!
+	name: String!
+	description: String
+	frequency: Int!
+	errorIds: [Int!]!
+}
+
+"""
+Summary statistics for error events.
+"""
+type GqlErrorSummary {
+	totalCount: Int!
+	unresolvedCount: Int!
+	criticalCount: Int!
+	errorCount: Int!
+	warningCount: Int!
+}
+
+"""
 A finding detected by AI analysis.
 """
 type GqlFinding {
@@ -170,17 +213,6 @@ type GqlFindingSummary {
 }
 
 """
-Orchestration loop status.
-"""
-type GqlOrchestrationLoopStatus {
-	running: Boolean!
-	phase: String!
-	currentIteration: Int!
-	startedAt: String
-	error: String
-}
-
-"""
 Single loop instance status within a multi-loop.
 """
 type GqlLoopInstanceStatus {
@@ -199,13 +231,24 @@ type GqlLoopInstanceStatus {
 }
 
 """
-Aggregated status of all orchestration loops.
+Multi-loop aggregated status.
 """
 type GqlMultiLoopStatus {
 	loops: [GqlLoopInstanceStatus!]!
 	allComplete: Boolean!
 	anyError: Boolean!
 	stopAllOnError: Boolean!
+}
+
+"""
+Orchestration loop status.
+"""
+type GqlOrchestrationLoopStatus {
+	running: Boolean!
+	phase: String!
+	currentIteration: Int!
+	startedAt: String
+	error: String
 }
 
 """
@@ -576,6 +619,19 @@ type QueryRoot {
 	Get aggregated status of all orchestration loops.
 	"""
 	multiOrchestrationLoopStatus: GqlMultiLoopStatus!
+	"""
+	Get error events from the error monitor with optional filters.
+	"""
+	errorEvents(taskRunId: String, status: String, severity: String, limit: Int! = 100): [GqlErrorEvent!]!
+	"""
+	Get error summary statistics, optionally scoped to a task run.
+	"""
+	errorSummary(taskRunId: String): GqlErrorSummary!
+	"""
+	Get detected error patterns, optionally scoped to a task run.
+	Delegates to the curator's pattern detection via SQLite (build_context).
+	"""
+	errorPatterns(taskRunId: String): [GqlErrorPattern!]!
 }
 
 """
@@ -638,12 +694,20 @@ type SubscriptionRoot {
 	"""
 	Finding updates stream — polls DB for finding changes on a task run.
 	Emits the full findings list whenever the count or statuses change.
+	Auto-closes when the task reaches a terminal status or after 30 minutes.
 	"""
 	findingUpdates(taskRunId: String!, intervalMs: Int! = 2000): [GqlFinding!]!
 	"""
 	Orchestration loop status stream — pushes loop state at a configurable interval.
+	Auto-closes after the loop reaches a terminal phase (Complete/Stopped/Error)
+	or after 2 hours.
 	"""
 	orchestrationLoopStatusStream(intervalMs: Int! = 2000): GqlOrchestrationLoopStatus!
+	"""
+	Multi-loop status stream — pushes aggregated status of all loops at a configurable interval.
+	Auto-closes after all loops complete/stop/error or after 2 hours.
+	"""
+	multiOrchestrationLoopStatusStream(intervalMs: Int! = 2000): GqlMultiLoopStatus!
 }
 
 type TaskRunUpdateEvent {

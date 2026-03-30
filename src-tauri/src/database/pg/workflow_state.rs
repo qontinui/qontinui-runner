@@ -170,6 +170,44 @@ impl PgDb {
         }
     }
 
+    /// Save a progress marker for a step checkpoint.
+    ///
+    /// Progress markers track intra-step progress, such as "analyzed 50/100 files".
+    /// Returns the generated marker ID.
+    pub async fn save_step_progress_marker(
+        &self,
+        checkpoint_id: &str,
+        marker_type: &str,
+        current_value: u64,
+        total_value: Option<u64>,
+        description: Option<&str>,
+        data_json: Option<&str>,
+    ) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let current_i64 = current_value as i64;
+        let total_i64: Option<i64> = total_value.map(|v| v as i64);
+
+        let row = conn
+            .query_one(
+                r#"INSERT INTO step_progress_markers
+                   (checkpoint_id, marker_type, current_value, total_value, description, data_json)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING id"#,
+                &[
+                    &checkpoint_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &marker_type as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &current_i64 as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &total_i64 as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &description as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &data_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG save_step_progress_marker: {}", e))?;
+
+        Ok(row.get::<_, i64>(0))
+    }
+
     /// Store (upsert) a verification phase result for a given task run and iteration.
     pub async fn store_verification_phase_result(
         &self,

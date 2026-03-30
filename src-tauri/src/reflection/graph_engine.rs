@@ -18,7 +18,7 @@ use super::graph_types::*;
 
 pub struct KnowledgeGraph {
     graph: DiGraph<GraphNode, GraphEdge>,
-    node_index: HashMap<NodeKey, NodeIndex>,
+    pub(crate) node_index: HashMap<NodeKey, NodeIndex>,
     pub built_at: String,
     pub workflow_scope: Option<String>,
 }
@@ -85,7 +85,7 @@ impl KnowledgeGraph {
     // -------------------------------------------------------------------------
 
     /// Insert a node if its key does not already exist; return the NodeIndex either way.
-    fn get_or_insert_node(&mut self, node: GraphNode) -> NodeIndex {
+    pub(crate) fn get_or_insert_node(&mut self, node: GraphNode) -> NodeIndex {
         if let Some(&idx) = self.node_index.get(&node.key) {
             return idx;
         }
@@ -97,7 +97,7 @@ impl KnowledgeGraph {
 
     /// Add an edge between two nodes looked up by their string keys.
     /// Returns `false` if either endpoint is missing from the graph.
-    fn add_edge_by_key(&mut self, from_key: &str, to_key: &str, edge: GraphEdge) -> bool {
+    pub(crate) fn add_edge_by_key(&mut self, from_key: &str, to_key: &str, edge: GraphEdge) -> bool {
         let from_idx = match self.node_index.get(from_key) {
             Some(&idx) => idx,
             None => return false,
@@ -1823,7 +1823,7 @@ impl KnowledgeGraph {
 
     /// Find a component node key by its path label (since component_relationships
     /// reference by path, not by DB id).
-    fn find_component_by_path(&self, path: &str) -> Option<String> {
+    pub(crate) fn find_component_by_path(&self, path: &str) -> Option<String> {
         for (key, &idx) in &self.node_index {
             if key.starts_with("component:") {
                 if let Some(node) = self.graph.node_weight(idx) {

@@ -260,7 +260,7 @@ pub fn generate_cost_recommendations(
     // ── 6. Check: CLI sessions where API would suffice ───────────────────
     // Join pipeline_agent_traces → task_runs → iteration_logs to detect
     // high-cost CLI provider usage.
-    let cli_agents = match query_cli_heavy_agents(db) {
+    let cli_agents = match query_cli_heavy_agents(pg_db) {
         Ok(agents) => agents,
         Err(e) => {
             debug!("Cost optimizer: CLI agent query skipped: {}", e);
@@ -459,56 +459,10 @@ fn query_zero_token_agents(pg_db: &Arc<PgDb>) -> Result<Vec<(String, i64)>, Stri
 ///
 /// Joins pipeline_agent_traces → iteration_logs to check if the run used CLI
 /// provider. Returns (agent_type, cli_runs, total_runs, avg_cli_cost, avg_api_cost).
-/// Note: iteration_logs is SQLite-only, so this query stays in SQLite.
-fn query_cli_heavy_agents(db: &CheckpointDb) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
-    db.with_conn(|conn| {
-        let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-
-        // Check if iteration_logs table exists and has provider_used
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='iteration_logs'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !table_exists {
-            return Ok(Vec::new());
-        }
-
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT
-                    pat.agent_type,
-                    SUM(CASE WHEN il.provider_used LIKE '%cli%' THEN 1 ELSE 0 END) as cli_runs,
-                    COUNT(*) as total_runs,
-                    COALESCE(AVG(CASE WHEN il.provider_used LIKE '%cli%' THEN pat.cost_usd END), 0) as avg_cli_cost,
-                    COALESCE(AVG(CASE WHEN il.provider_used NOT LIKE '%cli%' THEN pat.cost_usd END), 0) as avg_api_cost
-                FROM pipeline_agent_traces pat
-                LEFT JOIN iteration_logs il ON il.task_run_id = pat.task_run_id
-                WHERE pat.created_at > ?1
-                    AND (pat.tokens_in > 0 OR pat.tokens_out > 0)
-                GROUP BY pat.agent_type
-                HAVING COUNT(*) >= 5"#,
-            )
-            .map_err(|e| format!("Failed to prepare CLI agent query: {}", e))?;
-
-        let rows: Vec<(String, i64, i64, f64, f64)> = stmt
-            .query_map(rusqlite::params![since], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1).unwrap_or(0),
-                    row.get::<_, i64>(2).unwrap_or(0),
-                    row.get::<_, f64>(3).unwrap_or(0.0),
-                    row.get::<_, f64>(4).unwrap_or(0.0),
-                ))
-            })
-            .map_err(|e| format!("Failed to query CLI agents: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+fn query_cli_heavy_agents(pg_db: &Arc<PgDb>) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.query_cli_heavy_agents(&since))
     })
 }
 

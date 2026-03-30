@@ -31,34 +31,32 @@ static GLOBAL_INSTANCE: OnceLock<Arc<KnowledgeAcquisition>> = OnceLock::new();
 /// When provided, search() will check local knowledge first and store results after.
 /// Supports both SQLite (CheckpointDb) and PostgreSQL (PgDb) backends.
 pub struct SearchContext {
-    pub db: Arc<crate::database::CheckpointDb>,
+    pub db: Option<Arc<crate::database::CheckpointDb>>,
     pub pg: Option<Arc<crate::database::pg::PgDb>>,
     pub task_run_id: String,
 }
 
 impl SearchContext {
     /// Create a system-level context (for API routes without a specific task).
-    /// Attempts PG connection from DATABASE_URL env var; falls back to SQLite-only.
+    /// Uses PgDb::try_global() for PG; SQLite is optional fallback only.
     pub fn system() -> Option<Self> {
-        let db = crate::database::CheckpointDb::new().ok()?;
-        // Try PG — safe on both single- and multi-threaded tokio runtimes
-        let pg = std::env::var("DATABASE_URL").ok().and_then(|url| {
-            let handle = tokio::runtime::Handle::try_current().ok()?;
-            std::thread::spawn(move || handle.block_on(crate::database::pg::PgDb::try_new(&url)))
-                .join()
-                .ok()?
-                .map(Arc::new)
-        });
+        // PG is the primary DB — use global singleton
+        let pg = crate::database::pg::PgDb::try_global();
+        // Need at least one backend
+        if pg.is_none() {
+            return None;
+        }
         Some(Self {
-            db: Arc::new(db),
+            db: None,
             pg,
             task_run_id: "system".to_string(),
         })
     }
 
-    /// Create with an explicit PG reference (for callers that already have one)
+    /// Create with an explicit PG reference (for callers that already have one).
+    /// SQLite db is optional; pass None when PG is always available.
     pub fn with_pg(
-        db: Arc<crate::database::CheckpointDb>,
+        db: Option<Arc<crate::database::CheckpointDb>>,
         pg: Option<Arc<crate::database::pg::PgDb>>,
         task_run_id: String,
     ) -> Self {
@@ -339,7 +337,7 @@ impl KnowledgeAcquisition {
                     ingestor::ingest_results(
                         &all_results,
                         &ctx.task_run_id,
-                        &ctx.db,
+                        ctx.db.as_ref(),
                         ctx.pg.as_ref(),
                     )
                     .await;
@@ -415,15 +413,16 @@ impl KnowledgeAcquisition {
             pg.hybrid_search_knowledge(&embedding, None, &config)
                 .await
                 .map_err(|e| format!("PG hybrid search failed: {e}"))?
-        } else {
-            let conn = ctx
-                .db
+        } else if let Some(ref db) = ctx.db {
+            let conn = db
                 .get_conn()
                 .map_err(|e| format!("DB connection failed: {e}"))?;
             crate::database::hybrid_search::hybrid_search_knowledge(
                 &conn, &embedding, None, &config,
             )
             .map_err(|e| format!("Hybrid search failed: {e}"))?
+        } else {
+            return Err("No database backend available for hybrid search".to_string());
         };
 
         let mut knowledge_results: Vec<KnowledgeResult> = results

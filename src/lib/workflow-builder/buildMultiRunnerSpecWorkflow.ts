@@ -7,7 +7,7 @@
  */
 
 import type { DiscoveredSpec } from "../spec-prompt-builder";
-import { partitionSpecs, type PartitionStrategy } from "./partitionSpecs";
+import { partitionSpecs, countAssertions, type PartitionStrategy } from "./partitionSpecs";
 import { buildSpecWorkflow, type BuildSpecWorkflowInput } from "./buildSpecWorkflow";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 
@@ -108,14 +108,6 @@ function mergeSpecConfigs(specs: DiscoveredSpec[]): BuildSpecWorkflowInput["spec
       elementSource: specs[0]?.config.metadata?.elementSource ?? "control",
     },
   };
-}
-
-/** Count total enabled assertions in a spec. */
-function countAssertions(spec: DiscoveredSpec): number {
-  return spec.config.groups.reduce(
-    (sum, g) => sum + g.assertions.filter((a) => a.enabled !== false).length,
-    0,
-  );
 }
 
 /**

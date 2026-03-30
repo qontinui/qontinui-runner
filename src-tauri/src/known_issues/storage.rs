@@ -868,6 +868,29 @@ fn severity_order(severity: &IssueSeverity) -> u8 {
     }
 }
 
+/// Sort issues in-place by keyword relevance to the given task description.
+///
+/// Reusable sorting logic extracted from `find_relevant_issues_for_generation_with_context`
+/// so callers with pre-loaded issues (e.g., from PG) can apply the same ranking.
+pub fn sort_issues_by_relevance(issues: &mut Vec<KnownIssue>, task_description: &str) {
+    if issues.is_empty() || task_description.trim().is_empty() {
+        return;
+    }
+    let task_tokens = tokenize(task_description);
+    if task_tokens.is_empty() {
+        return;
+    }
+    issues.sort_by(|a, b| {
+        let score_a = compute_relevance_score(&task_tokens, a);
+        let score_b = compute_relevance_score(&task_tokens, b);
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| severity_order(&a.severity).cmp(&severity_order(&b.severity)))
+            .then_with(|| b.times_detected.cmp(&a.times_detected))
+    });
+}
+
 /// Find active known issues relevant for workflow generation, ranked by keyword
 /// relevance to the given task description.
 ///

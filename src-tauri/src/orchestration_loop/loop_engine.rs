@@ -237,11 +237,15 @@ pub async fn start_multi_loop(
     let loop_count = seen_ids.len();
     drop(seen_ids);
 
-    // Validate no duplicate target runner ports
+    // Validate no duplicate target runner ports (resolve None to actual port)
     let mut seen_ports = std::collections::HashSet::new();
+    let default_port: u16 = std::env::var("QONTINUI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9876);
     for entry in &multi_config.loops {
-        let port = entry.config.target_runner_port.unwrap_or(0);
-        if port > 0 && !seen_ports.insert(port) {
+        let port = entry.config.target_runner_port.unwrap_or(default_port);
+        if !seen_ports.insert(port) {
             return Err(format!(
                 "Multiple loops target the same runner port: {}",
                 port
@@ -279,34 +283,61 @@ pub async fn start_multi_loop(
         }
     }
 
-    // Launch each loop
+    // Clean up any finished loops before launching new ones
+    cleanup_finished_loops(states.clone()).await;
+
+    // Launch each loop, rolling back on failure
     let stop_all_on_error = multi_config.stop_all_on_error;
+    let mut started_ids: Vec<String> = Vec::new();
+
     for entry in multi_config.loops {
         let loop_state = Arc::new(Mutex::new(LoopState::new()));
-        let mut mgr = states.lock().await;
-        mgr.loops.insert(entry.loop_id.clone(), loop_state.clone());
-        mgr.metadata.insert(
-            entry.loop_id.clone(),
-            LoopMetadata {
-                label: entry.label.clone(),
-                stop_all_on_error,
-            },
-        );
-        mgr.stop_all_on_error = stop_all_on_error;
-        drop(mgr);
+        {
+            let mut mgr = states.lock().await;
+            mgr.loops.insert(entry.loop_id.clone(), loop_state.clone());
+            mgr.metadata.insert(
+                entry.loop_id.clone(),
+                LoopMetadata {
+                    label: entry.label.clone(),
+                    stop_all_on_error,
+                },
+            );
+            mgr.stop_all_on_error = stop_all_on_error;
+        }
 
-        start_loop(loop_state.clone(), entry.config).await.map_err(|e| {
-            format!("Failed to start loop '{}': {}", entry.loop_id, e)
-        })?;
+        match start_loop(loop_state.clone(), entry.config).await {
+            Ok(()) => {
+                started_ids.push(entry.loop_id.clone());
 
-        // If stop_all_on_error, spawn a watcher for this loop
-        if stop_all_on_error {
-            let states_clone = states.clone();
-            let loop_id = entry.loop_id.clone();
-            let loop_state_clone = loop_state.clone();
-            tokio::spawn(async move {
-                watch_loop_for_error(states_clone, loop_id, loop_state_clone).await;
-            });
+                // If stop_all_on_error, spawn a watcher for this loop
+                if stop_all_on_error {
+                    let states_clone = states.clone();
+                    let loop_id = entry.loop_id.clone();
+                    let loop_state_clone = loop_state.clone();
+                    tokio::spawn(async move {
+                        watch_loop_for_error(states_clone, loop_id, loop_state_clone).await;
+                    });
+                }
+            }
+            Err(e) => {
+                // Roll back: stop all already-started loops
+                warn!(
+                    "Loop '{}' failed to start, rolling back {} already-started loops: {}",
+                    entry.loop_id,
+                    started_ids.len(),
+                    e
+                );
+                for started_id in &started_ids {
+                    if let Err(stop_err) = stop_loop_by_id(states.clone(), started_id).await {
+                        error!("Failed to stop loop '{}' during rollback: {}", started_id, stop_err);
+                    }
+                }
+                // Remove the failed loop's state
+                let mut mgr = states.lock().await;
+                mgr.loops.remove(&entry.loop_id);
+                mgr.metadata.remove(&entry.loop_id);
+                return Err(format!("Failed to start loop '{}': {}", entry.loop_id, e));
+            }
         }
     }
 
@@ -375,13 +406,27 @@ pub async fn stop_all_loops(states: SharedLoopStates) -> Result<(), String> {
 }
 
 /// Get aggregated status of all loops.
+/// Collects Arc clones under the outer lock, then drops it before locking each inner state.
 pub async fn get_multi_status(states: SharedLoopStates) -> MultiLoopStatus {
-    let mgr = states.lock().await;
+    // Collect clones under outer lock, then release it
+    let (entries, metadata, stop_all_on_error, is_empty) = {
+        let mgr = states.lock().await;
+        let entries: Vec<(LoopId, SharedLoopState)> = mgr
+            .loops
+            .iter()
+            .map(|(id, ls)| (id.clone(), ls.clone()))
+            .collect();
+        let metadata = mgr.metadata.clone();
+        let stop_all = mgr.stop_all_on_error;
+        let empty = mgr.loops.is_empty();
+        (entries, metadata, stop_all, empty)
+    };
+
     let mut loop_statuses = Vec::new();
     let mut all_complete = true;
     let mut any_error = false;
 
-    for (loop_id, loop_state) in &mgr.loops {
+    for (loop_id, loop_state) in entries {
         let state = loop_state.lock().await;
         let status = state.to_status();
 
@@ -392,17 +437,16 @@ pub async fn get_multi_status(states: SharedLoopStates) -> MultiLoopStatus {
             any_error = true;
         }
 
-        let label = mgr.metadata.get(loop_id).and_then(|m| m.label.clone());
+        let label = metadata.get(&loop_id).and_then(|m| m.label.clone());
 
         loop_statuses.push(LoopInstanceStatus {
-            loop_id: loop_id.clone(),
+            loop_id,
             label,
             status,
         });
     }
 
-    // If no loops exist, all_complete is vacuously true but not meaningful
-    if mgr.loops.is_empty() {
+    if is_empty {
         all_complete = false;
     }
 
@@ -410,7 +454,7 @@ pub async fn get_multi_status(states: SharedLoopStates) -> MultiLoopStatus {
         loops: loop_statuses,
         all_complete,
         any_error,
-        stop_all_on_error: mgr.stop_all_on_error,
+        stop_all_on_error,
     }
 }
 
@@ -430,28 +474,34 @@ pub async fn signal_restart_by_id(
 }
 
 /// Remove completed/stopped/errored loops from the manager.
+/// Avoids nested locks by collecting under outer lock, checking without it, then re-acquiring.
 pub async fn cleanup_finished_loops(states: SharedLoopStates) {
-    let mut mgr = states.lock().await;
-    let finished_ids: Vec<LoopId> = {
-        let mut ids = Vec::new();
-        for (id, ls) in &mgr.loops {
-            let state = ls.lock().await;
-            if !state.running && state.phase != LoopPhase::Idle {
-                ids.push(id.clone());
-            }
-        }
-        ids
+    // Collect clones under outer lock
+    let entries: Vec<(LoopId, SharedLoopState)> = {
+        let mgr = states.lock().await;
+        mgr.loops
+            .iter()
+            .filter(|(id, _)| id.as_str() != DEFAULT_LOOP_ID)
+            .map(|(id, ls)| (id.clone(), ls.clone()))
+            .collect()
     };
 
-    for id in &finished_ids {
-        // Don't remove the default loop — just let it reset
-        if id != DEFAULT_LOOP_ID {
-            mgr.loops.remove(id);
-            mgr.metadata.remove(id);
+    // Check each loop's state without holding outer lock
+    let mut finished_ids: Vec<LoopId> = Vec::new();
+    for (id, ls) in entries {
+        let state = ls.lock().await;
+        if !state.running && state.phase != LoopPhase::Idle {
+            finished_ids.push(id);
         }
     }
 
+    // Re-acquire outer lock to remove finished entries
     if !finished_ids.is_empty() {
+        let mut mgr = states.lock().await;
+        for id in &finished_ids {
+            mgr.loops.remove(id);
+            mgr.metadata.remove(id);
+        }
         info!("Cleaned up {} finished loops", finished_ids.len());
     }
 }

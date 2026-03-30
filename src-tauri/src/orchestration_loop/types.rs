@@ -113,6 +113,7 @@ pub struct PipelineConfig {
     pub implement_fixes: Option<ImplementFixesConfig>,
     /// Diagnostic evaluation phase — runs after Execute, before Reflect.
     /// Captures UI state via UI Bridge and classifies failure root causes.
+    #[serde(default)]
     pub diagnose: Option<DiagnosePhaseConfig>,
 }
 
@@ -365,19 +366,10 @@ pub struct LoopInstanceStatus {
 }
 
 /// Metadata stored alongside each loop's state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoopMetadata {
     pub label: Option<String>,
     pub stop_all_on_error: bool,
-}
-
-impl Default for LoopMetadata {
-    fn default() -> Self {
-        Self {
-            label: None,
-            stop_all_on_error: false,
-        }
-    }
 }
 
 /// Maps loop IDs to per-loop metadata.

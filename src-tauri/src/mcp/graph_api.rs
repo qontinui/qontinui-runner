@@ -108,20 +108,11 @@ pub(crate) async fn get_or_build_graph(
         }
     }
 
-    // REMAINING SQLite: KnowledgeGraph::build_from_db traverses 25+ SQLite tables
-    // (workflows, task_runs, findings, fixes, errors, rules, patterns, knowledge,
-    // step_defs, ui_elements, skills, plus linking queries). A full PG migration
-    // requires creating a build_from_pg method on KnowledgeGraph.
-    let db = state.app_state.checkpoint_db.clone();
-    let wf = workflow_name.map(|s| s.to_string());
-    let graph = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| {
-            KnowledgeGraph::build_from_db(conn, wf.as_deref())
-                .map_err(|e| format!("{e}"))
-        })
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking: {e}"))??;
+    let graph = KnowledgeGraph::build_from_pg(
+        &state.app_state.pg_db,
+        workflow_name,
+    )
+    .await?;
 
     let graph = Arc::new(graph);
 
@@ -324,35 +315,24 @@ async fn summary_handler(
     // version so other handlers benefit.
     // If no observations, use the cached graph directly.
     if has_observations || workflow_name.is_some() {
-        // REMAINING SQLite: KnowledgeGraph::build_from_db (see get_or_build_graph comment)
-        let db = state.app_state.checkpoint_db.clone();
-        let wf = workflow_name.clone();
-        let (summary, maybe_graph) = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let mut graph =
-                    KnowledgeGraph::build_from_db(conn, wf.as_deref())?;
-                if has_observations {
-                    graph.load_observations_from_pg(&obs_previews);
-                    graph.link_observations(&obs_full);
-                }
-                let summary = graph.summary();
-                // Return the graph so we can cache the enriched version
-                Ok((summary, graph))
-            })
-        })
+        let mut graph = KnowledgeGraph::build_from_pg(
+            &state.app_state.pg_db,
+            workflow_name.as_deref(),
+        )
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("spawn_blocking: {}", e))),
-            )
-        })?
-        .map_err(|e: String| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to build graph summary: {}", e))),
+                Json(api_error(format!("Failed to build graph: {}", e))),
             )
         })?;
+
+        if has_observations {
+            graph.load_observations_from_pg(&obs_previews);
+            graph.link_observations(&obs_full);
+        }
+        let summary = graph.summary();
+        let maybe_graph = graph;
 
         // Cache the enriched graph for other handlers (only full graphs)
         if workflow_name.is_none() {
@@ -885,7 +865,7 @@ async fn memory_search_handler(
         None
     };
 
-    let results = unified_query::query_memory(&params, pg, db.clone(), graph.as_deref())
+    let results = unified_query::query_memory(&params, pg, Some(db.clone()), graph.as_deref())
         .await
         .map_err(|e| {
             (

@@ -37,6 +37,7 @@
     "dagre": "^0.8.5",
     "date-fns": "^4.1.0",
     "diff": "^8.0.2",
+    "ghostty-web": "^0.4.0",
     "graphql": "^16.13.2",
     "graphql-ws": "^6.0.7",
     "html2canvas": "^1.4.1",

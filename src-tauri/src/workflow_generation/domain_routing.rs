@@ -378,6 +378,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: hint.to_string(),
             category: category.to_string(),
+            ..Default::default()
         }
     }
 

@@ -14,6 +14,9 @@ import { RunHistoryTab } from "../components/meta-optimizer/RunHistoryTab";
 import { EvalSpecsTab } from "../components/meta-optimizer/EvalSpecsTab";
 import { RobustnessTab } from "../components/meta-optimizer/RobustnessTab";
 import { PromptOptimizationTab } from "../components/meta-optimizer/PromptOptimizationTab";
+import { PlaybookPanel } from "../components/adaptive-learning/PlaybookPanel";
+import { LearningDashboard } from "../components/adaptive-learning/LearningDashboard";
+import { PromptEvolutionPanel } from "../components/adaptive-learning/PromptEvolutionPanel";
 
 type SubTab =
   | "progress"
@@ -23,7 +26,10 @@ type SubTab =
   | "config"
   | "history"
   | "eval_specs"
-  | "robustness";
+  | "robustness"
+  | "learning"
+  | "playbook"
+  | "prompt_evolution";
 
 const TABS: { id: SubTab; label: string }[] = [
   { id: "progress", label: "Progress" },
@@ -34,6 +40,9 @@ const TABS: { id: SubTab; label: string }[] = [
   { id: "history", label: "Run History" },
   { id: "eval_specs", label: "Eval Specs" },
   { id: "robustness", label: "Robustness" },
+  { id: "learning", label: "Adaptive Learning" },
+  { id: "playbook", label: "Playbook" },
+  { id: "prompt_evolution", label: "Prompt Evolution" },
 ];
 
 export function MetaOptimizerPage() {
@@ -69,6 +78,9 @@ export function MetaOptimizerPage() {
         {tab === "history" && <RunHistoryTab />}
         {tab === "eval_specs" && <EvalSpecsTab />}
         {tab === "robustness" && <RobustnessTab />}
+        {tab === "learning" && <LearningDashboard />}
+        {tab === "playbook" && <PlaybookPanel />}
+        {tab === "prompt_evolution" && <PromptEvolutionPanel />}
       </div>
     </div>
   );

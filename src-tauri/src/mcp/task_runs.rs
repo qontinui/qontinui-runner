@@ -2284,6 +2284,7 @@ pub async fn generate_workflow_from_session(
         verification_depth: None,
         discover_ui_bridge_specs: None,
         simple_mode: None,
+        pipeline_depth: None,
         tool_tags: None,
         exploration_settings: None,
         target_runner_port: None,
@@ -2291,13 +2292,14 @@ pub async fn generate_workflow_from_session(
 
     let doctor_handle = state.doctor_handle.clone();
     let pg_db = state.app_state.pg_db.clone();
+    let pg_clone = pg_db.clone();
     let artifact_task_run_id = id.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
-            None,
+            Some(&pg_clone),
             None,
         );
         artifact.task_run_id = Some(artifact_task_run_id.clone());

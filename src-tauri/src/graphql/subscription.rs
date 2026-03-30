@@ -230,6 +230,75 @@ impl SubscriptionRoot {
             }
         })
     }
+
+    /// Multi-loop status stream — pushes aggregated status of all loops at a configurable interval.
+    /// Auto-closes after all loops complete/stop/error or after 2 hours.
+    async fn multi_orchestration_loop_status_stream(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 2000)] interval_ms: i32,
+    ) -> Result<impl futures_util::Stream<Item = GqlMultiLoopStatus>> {
+        let state = ctx.data::<Arc<ApiState>>()?.clone();
+        let interval = std::time::Duration::from_millis(interval_ms.max(500) as u64);
+
+        Ok(async_stream::stream! {
+            let mut ticker = tokio::time::interval(interval);
+            let started = std::time::Instant::now();
+            let max_duration = std::time::Duration::from_secs(2 * 60 * 60);
+            let mut terminal_ticks = 0u32;
+
+            loop {
+                ticker.tick().await;
+
+                if started.elapsed() > max_duration {
+                    break;
+                }
+
+                let multi_status = crate::orchestration_loop::loop_engine::get_multi_status(
+                    state.app_state.orchestration_loops.clone(),
+                )
+                .await;
+
+                let all_complete = multi_status.all_complete;
+                let any_error = multi_status.any_error;
+                let has_loops = !multi_status.loops.is_empty();
+
+                let loops: Vec<GqlLoopInstanceStatus> = multi_status
+                    .loops
+                    .into_iter()
+                    .map(|ls| GqlLoopInstanceStatus {
+                        loop_id: ls.loop_id,
+                        label: ls.label,
+                        running: ls.status.running,
+                        phase: format!("{:?}", ls.status.phase),
+                        current_iteration: ls.status.current_iteration as i32,
+                        max_iterations: ls.status.max_iterations as i32,
+                        workflow_id: ls.status.workflow_id,
+                        target_runner_port: ls.status.target_runner_port as i32,
+                        target_runner_id: ls.status.target_runner_id,
+                        is_pipeline: ls.status.is_pipeline,
+                        started_at: ls.status.started_at,
+                        error: ls.status.error,
+                    })
+                    .collect();
+
+                yield GqlMultiLoopStatus {
+                    loops,
+                    all_complete,
+                    any_error,
+                    stop_all_on_error: multi_status.stop_all_on_error,
+                };
+
+                // Auto-close when all loops are done
+                if has_loops && (all_complete || any_error) {
+                    terminal_ticks += 1;
+                    if terminal_ticks >= 2 {
+                        break;
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// Convert a raw broadcast event (serde_json::Value) to a typed RunnerEvent.

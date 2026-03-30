@@ -536,7 +536,7 @@ pub async fn sync_push(
     })))
 }
 
-/// POST /skills/sync/pull — Pull org skills from the web backend into local SQLite
+/// POST /skills/sync/pull — Pull org skills from the web backend into local PG
 pub async fn sync_pull(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<SyncPullRequest>,

@@ -21,8 +21,8 @@ impl PgDb {
                     checkpoint_data,
                     completed,
                     run_id,
-                    created_at,
-                    updated_at
+                    created_at::TEXT,
+                    updated_at::TEXT
                 FROM active_workflows
                 WHERE workflow_name = $1
                 "#,
@@ -143,8 +143,8 @@ impl PgDb {
                     checkpoint_data,
                     completed,
                     run_id,
-                    created_at,
-                    updated_at
+                    created_at::TEXT,
+                    updated_at::TEXT
                 FROM active_workflows
                 WHERE completed = false
                 ORDER BY updated_at DESC
@@ -233,7 +233,7 @@ impl PgDb {
 
         let query = format!(
             r#"
-            SELECT id, task_id, iteration, trigger, state, name, created_at
+            SELECT id, task_id, iteration, trigger, state, name, created_at::TEXT
             FROM orchestrator_checkpoints
             {}
             ORDER BY created_at DESC
@@ -320,7 +320,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                SELECT id, task_id, iteration, trigger, state, name, created_at
+                SELECT id, task_id, iteration, trigger, state, name, created_at::TEXT
                 FROM orchestrator_checkpoints
                 WHERE id = $1
                 "#,
@@ -353,7 +353,7 @@ impl PgDb {
         let rows = if let Some(tid) = task_id {
             conn.query(
                 r#"
-                SELECT id, task_id, iteration, trigger, state, name, created_at
+                SELECT id, task_id, iteration, trigger, state, name, created_at::TEXT
                 FROM orchestrator_checkpoints
                 WHERE task_id = $1
                 ORDER BY iteration ASC
@@ -364,7 +364,7 @@ impl PgDb {
         } else {
             conn.query(
                 r#"
-                SELECT id, task_id, iteration, trigger, state, name, created_at
+                SELECT id, task_id, iteration, trigger, state, name, created_at::TEXT
                 FROM orchestrator_checkpoints
                 ORDER BY created_at DESC
                 LIMIT 100

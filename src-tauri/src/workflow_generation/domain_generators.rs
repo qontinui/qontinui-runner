@@ -622,6 +622,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: "Run npx tsc --noEmit".to_string(),
             category: "compilation".to_string(),
+            ..Default::default()
         };
         let context = DomainContext {
             discovery_context: "Found package.json with typescript dep".to_string(),
@@ -646,6 +647,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: "curl /health".to_string(),
             category: "api".to_string(),
+            ..Default::default()
         };
         let context = DomainContext {
             discovery_context: String::new(),

@@ -44,8 +44,9 @@ use super::complexity::assess_complexity;
 use super::domain_routing::VerificationDomain;
 use super::explorer::{explore_candidates, ExplorationConfig, ExplorationResult};
 use super::template_library;
-use rusqlite::Connection;
+use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -168,6 +169,11 @@ pub struct GenerateWorkflowRequest {
     #[serde(default)]
     pub simple_mode: Option<bool>,
 
+    /// Pipeline depth override: "auto" (default), "trivial", "simple", "standard", "complex".
+    /// Controls which generation phases run. "auto" classifies from description text.
+    #[serde(default)]
+    pub pipeline_depth: Option<String>,
+
     /// Tags for per-execution tool whitelisting.
     /// When non-empty, only skills matching at least one tag are included
     /// in the generator's AI prompt context, reducing prompt bloat.
@@ -215,6 +221,7 @@ impl Default for GenerateWorkflowRequest {
             verification_depth: None,
             discover_ui_bridge_specs: None,
             simple_mode: None,
+            pipeline_depth: None,
             tool_tags: None,
             exploration_settings: None,
             target_runner_port: None,
@@ -470,7 +477,7 @@ fn find_undiscovered_references(
 fn inject_known_issue_steps(
     workflow: &mut UnifiedWorkflow,
     issues: &[crate::known_issues::KnownIssue],
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
 ) -> usize {
     let mut injected = 0;
 
@@ -480,8 +487,13 @@ fn inject_known_issue_steps(
             Some(tmpl) if !tmpl.is_null() => tmpl.clone(),
             _ => {
                 // Try to instantiate from the pattern template
-                if let (Some(template_id), Some(c)) = (&issue.pattern_template_id, conn) {
-                    match crate::known_issues::storage::get_pattern_template(c, template_id) {
+                if let (Some(template_id), Some(pg)) = (&issue.pattern_template_id, pg_db) {
+                    let pg_clone = pg.clone();
+                    let tid = template_id.clone();
+                    let result = tokio::runtime::Handle::current().block_on(async {
+                        pg_clone.get_pattern_template(&tid).await
+                    });
+                    match result {
                         Ok(Some(template)) => {
                             if let Some(ref step_tmpl) = template.step_template {
                                 instantiate_template(step_tmpl, &issue.detection_config)
@@ -558,12 +570,12 @@ fn instantiate_template(
 /// Generate a workflow from a natural language description using the
 /// builder → verification → fixer agentic pipeline.
 ///
-/// When `conn` and optionally `query_embedding` are provided, uses filtered
+/// When `pg_db` and optionally `query_embedding` are provided, uses filtered
 /// schema context with RAG examples for improved generation quality.
 pub fn generate_workflow(
     request: GenerateWorkflowRequest,
     doctor_handle: Option<&DoctorHandle>,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     query_embedding: Option<&[f32]>,
 ) -> (GenerateWorkflowResponse, PipelineArtifact) {
     info!(
@@ -582,12 +594,6 @@ pub fn generate_workflow(
     if effective_simple {
         info!("Simple mode enabled: skipping investigation and specification phases");
     }
-
-    let max_fix_iters = if effective_simple {
-        std::cmp::min(request.max_fix_iterations.unwrap_or(3), 1)
-    } else {
-        request.max_fix_iterations.unwrap_or(3)
-    };
 
     // ── Discovery Phase ──────────────────────────────────────────────────
     let discovery_start = Instant::now();
@@ -643,14 +649,67 @@ pub fn generate_workflow(
 
     artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
     artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
-        if let Some(c) = conn {
-            super::instrumentation::emit_pipeline_event(
-                c, "", None, "phase_end", "discovery",
-                None, None,
-                Some(discovery_start.elapsed().as_millis() as u64),
-                None, None, None,
+        // Instrumentation: skipped (requires PG instrumentation migration)
+
+    // ── Code Graph (tree-sitter AST analysis) ────────────────────────────
+    let code_graph = if discovery_mode != "disabled" {
+        let project_dir = std::env::current_dir().unwrap_or_default();
+        let graph = super::code_graph::CodeGraph::build(&project_dir);
+        if !graph.is_empty() {
+            let graph_context = graph.format_for_prompt(&request.description);
+            if !graph_context.is_empty() {
+                discovery_context.push_str("\n\n");
+                discovery_context.push_str(&graph_context);
+            }
+            info!(
+                "Code graph: {} files, {} functions, {} classes in {}ms",
+                graph.files.len(), graph.functions.len(), graph.classes.len(), graph.build_duration_ms
             );
+            artifact_builder.code_graph_stats = Some(serde_json::json!({
+                "files": graph.files.len(),
+                "functions": graph.functions.len(),
+                "classes": graph.classes.len(),
+                "imports": graph.imports.len(),
+                "exports": graph.exports.len(),
+                "build_duration_ms": graph.build_duration_ms,
+            }));
+            Some(graph)
+        } else {
+            debug!("Code graph is empty — no source files parsed");
+            None
         }
+    } else {
+        None
+    };
+
+    // ── Pipeline Depth Classification ────────────────────────────────────
+    let pipeline_depth = if let Some(ref depth_str) = request.pipeline_depth {
+        match depth_str.as_str() {
+            "trivial" => super::complexity::PipelineDepth::Trivial,
+            "simple" => super::complexity::PipelineDepth::Simple,
+            "standard" => super::complexity::PipelineDepth::Standard,
+            "complex" => super::complexity::PipelineDepth::Complex,
+            _ => super::complexity::classify_pipeline_depth_from_description(&request.description),
+        }
+    } else if effective_simple {
+        // Respect existing simple_mode flag
+        super::complexity::PipelineDepth::Simple
+    } else {
+        super::complexity::classify_pipeline_depth_from_description(&request.description)
+    };
+
+    info!("Pipeline depth: {} (from {})", pipeline_depth,
+          if request.pipeline_depth.is_some() { "user override" }
+          else if effective_simple { "simple_mode flag" }
+          else { "auto-classification" });
+
+    artifact_builder.pipeline_depth = Some(pipeline_depth.to_string());
+
+    let max_fix_iters = match pipeline_depth {
+        super::complexity::PipelineDepth::Trivial => 0,
+        super::complexity::PipelineDepth::Simple => std::cmp::min(request.max_fix_iterations.unwrap_or(3), 1),
+        _ => request.max_fix_iterations.unwrap_or(3),
+    };
 
     // ── Resolve per-phase model overrides for generation pipeline ────────
     let generation_model: Option<&str> = request
@@ -726,6 +785,7 @@ pub fn generate_workflow(
     };
 
     let effective_request = if !effective_simple
+        && !matches!(pipeline_depth, super::complexity::PipelineDepth::Trivial | super::complexity::PipelineDepth::Simple)
         && request.investigate_codebase.unwrap_or(true)
         && !discovery_context.is_empty()
     {
@@ -804,12 +864,17 @@ pub fn generate_workflow(
     };
 
     // ── Load self-improvement insights for prompt injection ─────────────
-    let self_improve_ctx = conn.and_then(|c| match self_improve::analyze_generation_patterns(c) {
-        Ok(ctx) if !ctx.is_empty() => Some(ctx),
-        Ok(_) => None,
-        Err(e) => {
-            warn!("Failed to load self-improvement context: {}", e);
-            None
+    let self_improve_ctx = pg_db.and_then(|pg| {
+        let pg_clone = pg.clone();
+        match tokio::runtime::Handle::current().block_on(async {
+            self_improve::analyze_generation_patterns_pg(&pg_clone).await
+        }) {
+            Ok(ctx) if !ctx.is_empty() => Some(ctx),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Failed to load self-improvement context: {}", e);
+                None
+            }
         }
     });
 
@@ -819,12 +884,12 @@ pub fn generate_workflow(
         verification_depth,
         "thorough" | "regression"
     ) {
-        if let Some(c) = conn {
-            match crate::known_issues::storage::find_relevant_issues_for_generation_with_context(
-                c,
-                verification_depth,
-                &request.description,
-            ) {
+        if let Some(pg) = pg_db {
+            let pg_clone = pg.clone();
+            let depth_str = verification_depth.to_string();
+            match tokio::runtime::Handle::current().block_on(async {
+                pg_clone.find_relevant_issues_for_generation(&depth_str).await
+            }) {
                 Ok(issues) => {
                     if !issues.is_empty() {
                         info!(
@@ -833,6 +898,12 @@ pub fn generate_workflow(
                             verification_depth
                         );
                     }
+                    // Apply relevance sorting based on task description
+                    let mut issues = issues;
+                    crate::known_issues::storage::sort_issues_by_relevance(
+                        &mut issues,
+                        &request.description,
+                    );
                     issues
                 }
                 Err(e) => {
@@ -847,8 +918,33 @@ pub fn generate_workflow(
         vec![]
     };
 
+    // ── Load Project Constitution ────────────────────────────────────────
+    let constitution = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| {
+            cwd.to_str()
+                .and_then(|s| super::constitution::load_constitution(s))
+        });
+    if constitution.is_some() {
+        info!("Project constitution loaded — will be injected into generation prompts");
+    }
+
+    // ── Blast Radius for Specification (Phase 4D) ──────────────────────
+    // If we have a code graph, compute blast radius and append regression
+    // hints so the specification agent auto-generates regression criteria.
+    if let Some(ref graph) = code_graph {
+        if let Some(br_context) = graph.format_blast_radius_for_specification(&request.description) {
+            discovery_context.push_str("\n\n");
+            discovery_context.push_str(&br_context);
+            info!("Blast radius context appended to discovery for specification phase");
+        }
+    }
+
     // ── Specification Phase ─────────────────────────────────────────────
-    let acceptance_criteria = if !effective_simple && request.generate_specification.unwrap_or(true)
+    let should_skip_specification = effective_simple
+        || matches!(pipeline_depth, super::complexity::PipelineDepth::Trivial)
+        || request.generate_specification == Some(false);
+    let acceptance_criteria = if !should_skip_specification && request.generate_specification.unwrap_or(true)
     {
         info!("Running specification agent...");
         let spec_insights = self_improve_ctx
@@ -864,6 +960,7 @@ pub fn generate_workflow(
             spec_insights.as_deref(),
             verification_depth,
             &relevant_issues,
+            constitution.as_deref(),
         );
 
         artifact_builder.specification_duration_ms = Some(spec_result.duration_ms);
@@ -919,8 +1016,8 @@ pub fn generate_workflow(
 
         if spec_result.success && !spec_result.criteria.criteria.is_empty() {
             // Write back verification_step_template to matched known issues
-            if let Some(c) = conn {
-                write_back_verification_templates(c, &relevant_issues, &spec_result.criteria);
+            if let Some(pg) = pg_db {
+                write_back_verification_templates(pg, &relevant_issues, &spec_result.criteria);
             }
 
             // Append acceptance criteria to matching page spec files so that
@@ -1003,61 +1100,15 @@ pub fn generate_workflow(
     }
 
     // ── Pattern Mining & Template Promotion: Enrich builder context ─────
-    let pattern_context = conn.and_then(|c| {
-        match super::pattern_mining::mine_patterns(c) {
-            Ok(report) if !report.patterns.is_empty() => {
-                info!(
-                    "Pattern mining: found {} patterns from {} workflows",
-                    report.patterns.len(),
-                    report.workflows_analyzed
-                );
-                // Also promote patterns to rules opportunistically
-                if let Err(e) = super::pattern_mining::patterns_to_rules(c, &report.patterns, 3) {
-                    warn!("Failed to promote patterns to rules: {}", e);
-                }
-                let formatted = super::pattern_mining::format_patterns_for_prompt(&report.patterns);
-                if formatted.is_empty() {
-                    None
-                } else {
-                    Some(formatted)
-                }
-            }
-            Ok(_) => None,
-            Err(e) => {
-                debug!("Pattern mining skipped: {}", e);
-                None
-            }
-        }
-    });
+    // Pattern mining: requires SQLite migration to PG (skipped for now)
+    let pattern_context: Option<String> = None;
 
-    let template_context = conn.and_then(|c| {
-        // Run template promotion opportunistically
-        if let Err(e) = super::template_promotion::evaluate_and_promote(c) {
-            debug!("Template promotion skipped: {}", e);
-        }
-        match super::template_promotion::find_relevant_templates(c, &effective_request.description)
-        {
-            Ok(templates) if !templates.is_empty() => {
-                info!("Found {} relevant promoted templates", templates.len());
-                let formatted = super::template_promotion::format_templates_for_prompt(&templates);
-                if formatted.is_empty() {
-                    None
-                } else {
-                    Some(formatted)
-                }
-            }
-            Ok(_) => None,
-            Err(e) => {
-                debug!("Template lookup skipped: {}", e);
-                None
-            }
-        }
-    });
+    // Template promotion: requires SQLite migration to PG (skipped for now)
+    let template_context: Option<String> = None;
 
     // ── Graph-informed context ─────────────────────────────────────────────
-    let graph_context = conn
-        .map(|c| super::instrumentation::build_graph_context(c, None))
-        .unwrap_or_default();
+    // Graph context: requires instrumentation PG migration (skipped for now)
+    let graph_context = String::new();
 
     // ── Exploration-Based Generation (when criteria available) ────────────
     let mut exploration_stats: Option<ExplorationStats> = None;
@@ -1117,7 +1168,7 @@ pub fn generate_workflow(
                     let templates = template_library::find_matching_templates_for_criteria(
                         &criteria.criteria,
                         &domain,
-                        conn,
+                        pg_db,
                     );
                     let template_refs: Vec<super::template_library::StepTemplate> =
                         templates.iter().map(|(t, _)| t.clone()).collect();
@@ -1184,7 +1235,7 @@ pub fn generate_workflow(
                         let domain_templates = template_library::find_matching_templates_for_criteria(
                             &phase_criteria_owned,
                             &phase.domain,
-                            conn,
+                            pg_db,
                         );
                         let template_refs: Vec<super::template_library::StepTemplate> =
                             domain_templates.iter().map(|(t, _)| t.clone()).collect();
@@ -1272,12 +1323,7 @@ pub fn generate_workflow(
         None
     };
 
-    // Seed template database (idempotent)
-    if let Some(c) = conn {
-        if let Err(e) = template_library::seed_database(c) {
-            debug!("Template seeding skipped: {}", e);
-        }
-    }
+    // Template seeding: requires SQLite migration to PG (skipped for now)
 
     // ── Step 1: Builder Agent ──────────────────────────────────────────────
     let builder_start = Instant::now();
@@ -1288,18 +1334,7 @@ pub fn generate_workflow(
     {
         builder_insights_parts.push(insights);
     }
-    // Inject adaptive learning context (playbook lessons + few-shot examples)
-    if let Some(c) = conn {
-        let learning_ctx = super::learning_orchestrator::build_learning_context(
-            None, // domain not yet known at builder stage
-            10,   // max lessons
-            3,    // max few-shot examples
-            c,
-        );
-        if !learning_ctx.is_empty() {
-            builder_insights_parts.push(learning_ctx);
-        }
-    }
+    // Adaptive learning context: requires SQLite migration to PG (skipped for now)
     if let Some(ref patterns) = pattern_context {
         builder_insights_parts.push(patterns.clone());
     }
@@ -1333,14 +1368,6 @@ pub fn generate_workflow(
                     artifact_builder.builder_duration_ms =
                         Some(builder_start.elapsed().as_millis() as u64);
                     artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
-                    if let Some(c) = conn {
-                        super::instrumentation::emit_pipeline_event(
-                            c, "", None, "phase_end", "builder",
-                            None, None,
-                            Some(builder_start.elapsed().as_millis() as u64),
-                            None, None, None,
-                        );
-                    }
                     w
                 }
                 None => {
@@ -1350,25 +1377,18 @@ pub fn generate_workflow(
                         &discovery_context,
                         acceptance_criteria.as_ref(),
                         doctor_handle,
-                        conn,
+                        pg_db,
                         query_embedding,
                         generation_model,
                         generation_provider,
                         builder_insights_section.as_deref(),
+                        constitution.as_deref(),
                     ) {
                         Ok((w, prompt)) => {
                             artifact_builder.builder_duration_ms =
                                 Some(builder_start.elapsed().as_millis() as u64);
                             artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
                             artifact_builder.builder_prompt = Some(prompt);
-                            if let Some(c) = conn {
-                                super::instrumentation::emit_pipeline_event(
-                                    c, "", None, "phase_end", "builder",
-                                    None, None,
-                                    Some(builder_start.elapsed().as_millis() as u64),
-                                    None, None, None,
-                                );
-                            }
                             w
                         }
                         Err(resp) => {
@@ -1390,25 +1410,18 @@ pub fn generate_workflow(
                 &discovery_context,
                 acceptance_criteria.as_ref(),
                 doctor_handle,
-                conn,
+                pg_db,
                 query_embedding,
                 generation_model,
                 generation_provider,
                 builder_insights_section.as_deref(),
+                constitution.as_deref(),
             ) {
                 Ok((w, prompt)) => {
                     artifact_builder.builder_duration_ms =
                         Some(builder_start.elapsed().as_millis() as u64);
                     artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
                     artifact_builder.builder_prompt = Some(prompt);
-                    if let Some(c) = conn {
-                        super::instrumentation::emit_pipeline_event(
-                            c, "", None, "phase_end", "builder",
-                            None, None,
-                            Some(builder_start.elapsed().as_millis() as u64),
-                            None, None, None,
-                        );
-                    }
                     w
                 }
                 Err(resp) => {
@@ -1429,25 +1442,18 @@ pub fn generate_workflow(
             &discovery_context,
             acceptance_criteria.as_ref(),
             doctor_handle,
-            conn,
+            pg_db,
             query_embedding,
             generation_model,
             generation_provider,
             builder_insights_section.as_deref(),
+            constitution.as_deref(),
         ) {
             Ok((w, prompt)) => {
                 artifact_builder.builder_duration_ms =
                     Some(builder_start.elapsed().as_millis() as u64);
                 artifact_builder.builder_parsed_json = serde_json::to_value(&w).ok();
                 artifact_builder.builder_prompt = Some(prompt);
-                if let Some(c) = conn {
-                    super::instrumentation::emit_pipeline_event(
-                        c, "", None, "phase_end", "builder",
-                        None, None,
-                        Some(builder_start.elapsed().as_millis() as u64),
-                        None, None, None,
-                    );
-                }
                 w
             }
             Err(resp) => {
@@ -1505,8 +1511,42 @@ pub fn generate_workflow(
         }
     }
 
+    // ── Cross-Artifact Consistency Check ────────────────────────────────
+    let consistency_context_for_fixer: Option<String> = if let Some(ref criteria) = acceptance_criteria {
+        if let Ok(workflow_json) = serde_json::to_value(&workflow) {
+            let consistency = super::consistency::check_consistency(
+                criteria,
+                &workflow_json,
+                constitution.as_deref(),
+            );
+            info!(
+                "Consistency check: score={:.2}, {}/{} criteria covered, {} issues",
+                consistency.score,
+                consistency.criteria_covered,
+                consistency.criteria_checked,
+                consistency.issues.len()
+            );
+            let result = if consistency.score < 0.5 {
+                let ctx = super::consistency::format_consistency_issues_for_fixer(&consistency);
+                if !ctx.is_empty() {
+                    info!("Low consistency score ({:.2}) — injecting issues into fixer context", consistency.score);
+                }
+                if ctx.is_empty() { None } else { Some(ctx) }
+            } else {
+                None
+            };
+            artifact_builder.consistency_report =
+                serde_json::to_value(&consistency).ok();
+            result
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // ── Load skill registry once (built-in + user skills from DB) ───────
-    let skill_registry = SkillRegistry::with_db(conn);
+    let skill_registry = SkillRegistry::with_pg(pg_db);
 
     // ── Step 2–3: Verification ↔ Fixer loop ────────────────────────────────
     let verification_start = Instant::now();
@@ -1529,11 +1569,12 @@ pub fn generate_workflow(
                 &discovery_context,
                 acceptance_criteria.as_ref(),
                 doctor_handle,
-                conn,
+                pg_db,
                 verification_model,
                 verification_provider,
                 &skill_registry,
                 verification_blind_spots.as_deref(),
+                constitution.as_deref(),
             );
             if !verification_prompt.is_empty() {
                 artifact_builder
@@ -1635,20 +1676,38 @@ pub fn generate_workflow(
                 doctor_handle,
                 generation_model,
                 generation_provider,
-                conn,
+                pg_db,
+                consistency_context_for_fixer.as_deref(),
             ) {
                 Ok(fixed) => {
-                    // Track which rules were violated by these issues.
-                    // increment_rule_failure_count auto-promotes to 'critical'
-                    // once failure_count reaches 5.
-                    if let Some(c) = conn {
+                    // Track which rules were violated by these issues via PG.
+                    if let Some(pg) = pg_db {
+                        let pg_clone = pg.clone();
                         let issues_text = issues.join(" ");
-                        let violated_ids =
-                            rules::identify_violated_rules(c, &issues_text, "schema_context");
-                        for rule_id in &violated_ids {
-                            if let Err(e) = rules::increment_rule_failure_count(c, rule_id) {
-                                warn!("Failed to increment failure_count: {}", e);
+                        let violated_ids = tokio::runtime::Handle::current().block_on(async {
+                            // Load all active rules for schema_context agent, check overlap
+                            match pg_clone.get_active_rules("schema_context", None).await {
+                                Ok(all_rules) => {
+                                    all_rules.iter()
+                                        .filter(|r| {
+                                            let t = r.title.to_lowercase();
+                                            let c = r.content.to_lowercase();
+                                            issues_text.to_lowercase().contains(&t)
+                                                || issues_text.to_lowercase().contains(&c)
+                                        })
+                                        .map(|r| r.id.clone())
+                                        .collect::<Vec<_>>()
+                                }
+                                Err(_) => vec![],
                             }
+                        });
+                        if !violated_ids.is_empty() {
+                            let pg_clone2 = pg.clone();
+                            tokio::runtime::Handle::current().block_on(async {
+                                for rule_id in &violated_ids {
+                                    let _ = pg_clone2.increment_rule_failure_count(rule_id).await;
+                                }
+                            });
                         }
                     }
 
@@ -1664,14 +1723,6 @@ pub fn generate_workflow(
                     // Capture fixer snapshot
                     if let Ok(snapshot) = serde_json::to_value(&workflow) {
                         artifact_builder.fixer_snapshots.push(snapshot);
-                    }
-                    if let Some(c) = conn {
-                        super::instrumentation::emit_pipeline_event(
-                            c, "", None, "phase_end", "fixer",
-                            Some(iter_num as i32), None,
-                            None, None,
-                            Some(issue_count as i32), None,
-                        );
                     }
                 }
                 Err(e) => {
@@ -1691,12 +1742,7 @@ pub fn generate_workflow(
         Some(verification_start.elapsed().as_millis() as u64);
     artifact_builder.verification_iterations = serde_json::to_value(&iterations).ok();
 
-    // ── Sync known issues → generation rules (idempotent) ─────────────
-    if let Some(c) = conn {
-        if let Err(e) = rules::sync_rules_from_known_issues(c) {
-            warn!("Failed to sync rules from known issues: {}", e);
-        }
-    }
+    // Sync known issues → generation rules: requires SQLite migration to PG (skipped for now)
 
     // ── Hardener Agent ───────────────────────────────────────────────────
     let hardener_start = Instant::now();
@@ -1707,12 +1753,13 @@ pub fn generate_workflow(
         &workflow,
         &request.description,
         doctor_handle,
-        conn,
+        pg_db,
         generation_model,
         generation_provider,
         &skill_registry,
         hardener_insights.as_deref(),
         request.tool_tags.as_deref(),
+        constitution.as_deref(),
     );
     artifact_builder.hardener_duration_ms = Some(hardener_start.elapsed().as_millis() as u64);
     artifact_builder.hardening_summary = serde_json::to_value(&hardening_summary).ok();
@@ -1947,7 +1994,7 @@ pub fn generate_workflow(
 
     // ── Inject deterministic known-issue regression steps (post-hardener) ──
     if !relevant_issues.is_empty() {
-        let injected = inject_known_issue_steps(&mut workflow, &relevant_issues, conn);
+        let injected = inject_known_issue_steps(&mut workflow, &relevant_issues, pg_db);
         if injected > 0 {
             info!(
                 "Injected {} deterministic known-issue regression steps",
@@ -2058,46 +2105,7 @@ pub fn generate_workflow(
         iterations.len(),
     );
 
-    // ── Auto-promote high-confidence insights to generation rules ─────
-    if let Some(c) = conn {
-        match prompt_analysis::analyze_all(c) {
-            Ok(insights) if !insights.is_empty() => {
-                match rules::promote_insights_to_rules(c, &insights) {
-                    Ok(count) if count > 0 => {
-                        info!("Promoted {} insights to auto-generated rules", count);
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!("Failed to promote insights to rules: {}", e),
-                }
-            }
-            Ok(_) => {}
-            Err(e) => warn!("Failed to analyze insights for rule promotion: {}", e),
-        }
-
-        // Record which generation rules were applied to this workflow
-        let active_rules = rules::list_rules(
-            c,
-            &rules::ListRulesQuery {
-                agent: None,
-                section: None,
-                status: Some("active".to_string()),
-                provenance: None,
-                severity: None,
-            },
-        );
-        if let Ok(active) = active_rules {
-            if !active.is_empty() {
-                rules::record_rule_applications(c, &active, Some(&workflow.id), None);
-                    let rule_tuples: Vec<(String, String, String)> = active
-                        .iter()
-                        .map(|r| (r.id.clone(), r.agent.clone(), r.section.clone()))
-                        .collect();
-                    super::instrumentation::record_rule_influences(
-                        c, &rule_tuples, "", Some(&workflow.id), "generation",
-                    );
-            }
-        }
-    }
+    // Auto-promote insights and record rule applications: requires SQLite migration to PG (skipped for now)
 
     let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
 
@@ -2137,16 +2145,7 @@ pub fn generate_workflow(
         }
     }
 
-    if let Some(c) = conn {
-        if let Ok(wf_json) = serde_json::to_value(&workflow) {
-            let version_id = super::instrumentation::create_workflow_version(
-                c, &workflow.id, None, &wf_json, "generation",
-            );
-            super::instrumentation::record_all_step_provenance(
-                c, &workflow.id, version_id.as_deref(), &wf_json, "builder", None,
-            );
-        }
-    }
+    // Workflow versioning & provenance: requires instrumentation PG migration (skipped for now)
 
     // ── Step Quality Evaluation Engine ────────────────────────────────────
     // Run Tier 1 (fast deterministic) evaluation on all verification steps.
@@ -2268,14 +2267,15 @@ fn run_builder_agent(
     discovery_context: &str,
     acceptance_criteria: Option<&specification::AcceptanceCriteria>,
     doctor_handle: Option<&DoctorHandle>,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     query_embedding: Option<&[f32]>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
     builder_insights: Option<&str>,
+    constitution: Option<&str>,
 ) -> Result<(UnifiedWorkflow, String), Box<GenerateWorkflowResponse>> {
-    let schema_context = if conn.is_some() || query_embedding.is_some() {
-        build_schema_context_full(&request.description, conn, query_embedding)
+    let schema_context = if pg_db.is_some() || query_embedding.is_some() {
+        build_schema_context_full(&request.description, pg_db, query_embedding)
     } else {
         build_schema_context()
     };
@@ -2364,7 +2364,7 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
 
     // Inject skill catalog context (built-in + user skills from DB)
     // When tool_tags are specified, only include matching skills to reduce prompt bloat.
-    let skill_registry = SkillRegistry::with_db(conn);
+    let skill_registry = SkillRegistry::with_pg(pg_db);
     let skills_section = match request.tool_tags.as_deref() {
         Some(tags) if !tags.is_empty() => {
             let tags_owned: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
@@ -2381,6 +2381,11 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
         if !insights.is_empty() {
             sections.push(insights.to_string());
         }
+    }
+
+    // Inject project constitution (before criteria so builder sees constraints first)
+    if let Some(constitution_text) = constitution {
+        sections.push(super::constitution::format_constitution_for_prompt(constitution_text));
     }
 
     // Inject acceptance criteria section (before user prompt so builder sees it)
@@ -2502,11 +2507,12 @@ fn run_verification_agent(
     discovery_context: &str,
     acceptance_criteria: Option<&specification::AcceptanceCriteria>,
     doctor_handle: Option<&DoctorHandle>,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
     skill_registry: &SkillRegistry,
     blind_spots_section: Option<&str>,
+    constitution: Option<&str>,
 ) -> (Vec<String>, String) {
     let workflow_json = match serde_json::to_string_pretty(workflow) {
         Ok(j) => j,
@@ -2527,10 +2533,11 @@ fn run_verification_agent(
         user_description,
         discovery_context,
         acceptance_criteria,
-        conn,
+        pg_db,
         skill_registry,
         blind_spots_section,
         None, // tool_tags not available in verification context
+        constitution,
     );
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
@@ -2571,14 +2578,18 @@ fn build_verification_prompt(
     user_description: &str,
     discovery_context: &str,
     acceptance_criteria: Option<&specification::AcceptanceCriteria>,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     skill_registry: &SkillRegistry,
     blind_spots_section: Option<&str>,
     tool_tags: Option<&[String]>,
+    constitution: Option<&str>,
 ) -> String {
-    // Load check rules from DB if available
-    let check_rules_section = if let Some(conn) = conn {
-        let check_rules = rules::load_rules(conn, "verification", "check_rules");
+    // Load check rules from PG if available
+    let check_rules_section = if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let check_rules = tokio::runtime::Handle::current().block_on(async {
+            pg_clone.get_active_rules("verification", Some("check_rules")).await.unwrap_or_default()
+        });
         if !check_rules.is_empty() {
             let mut s = String::from("## What to check\n\nFor EVERY step in setup_steps, verification_steps, and completion_steps, verify:\n\n");
             for rule in &check_rules {
@@ -2624,6 +2635,14 @@ fn build_verification_prompt(
 
     let blind_spots = blind_spots_section.unwrap_or("");
 
+    let constitution_section = constitution
+        .map(|c| {
+            let mut s = super::constitution::format_constitution_for_prompt(c);
+            s.push_str("\nFlag any step that violates the project constitution as an issue.\n\n");
+            s
+        })
+        .unwrap_or_default();
+
     format!(
         r#"You are a workflow verification agent for Qontinui Runner.
 Your job is to review a generated UnifiedWorkflow JSON and find semantic errors in the deterministic steps — WITHOUT running anything.
@@ -2631,7 +2650,7 @@ Your job is to review a generated UnifiedWorkflow JSON and find semantic errors 
 {checks}
 
 Steps match the user's original request: "{user_description}"
-{discovery_section}{skills_context}{criteria_section}{blind_spots}
+{discovery_section}{constitution_section}{skills_context}{criteria_section}{blind_spots}
 ## Output format
 
 If you find issues, return a JSON array of strings, one per issue. Each issue should identify the step by name/index and describe the problem clearly.
@@ -2650,6 +2669,7 @@ Examples:
         checks = checks,
         user_description = user_description,
         discovery_section = discovery_section,
+        constitution_section = constitution_section,
         skills_context = skills_context,
         criteria_section = criteria_section,
         workflow_json = workflow_json,
@@ -2984,12 +3004,13 @@ fn run_fixer_agent(
     doctor_handle: Option<&DoctorHandle>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
+    consistency_context: Option<&str>,
 ) -> Result<UnifiedWorkflow, String> {
     let workflow_json = serde_json::to_string_pretty(workflow)
         .map_err(|e| format!("Failed to serialize workflow: {}", e))?;
 
-    let prompt = build_fix_prompt(&workflow_json, issues, user_description, conn);
+    let prompt = build_fix_prompt(&workflow_json, issues, user_description, pg_db, consistency_context);
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
         &prompt,
@@ -3020,7 +3041,8 @@ fn build_fix_prompt(
     workflow_json: &str,
     issues: &[String],
     user_description: &str,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
+    consistency_context: Option<&str>,
 ) -> String {
     let issues_text = issues
         .iter()
@@ -3030,9 +3052,13 @@ fn build_fix_prompt(
         .join("\n");
 
     // Include gotchas so the fixer knows the critical schema constraints
-    let gotchas = build_gotchas_section(conn);
+    let gotchas = build_gotchas_section(pg_db);
     // Fixer gets Full tier rules (all severities) for complete guidance
-    let full_rules = build_rules_section_for_tier(conn, rules::RuleTier::Full);
+    let full_rules = build_rules_section_for_tier(pg_db, rules::RuleTier::Full);
+
+    let consistency_section = consistency_context
+        .map(|c| format!("\n{}\nAddress these consistency gaps in addition to the verification issues.\n", c))
+        .unwrap_or_default();
 
     format!(
         r#"You are a workflow fixer agent for Qontinui Runner.
@@ -3055,7 +3081,7 @@ A verification agent found issues in the workflow below. Fix ALL of them and ret
 
 ## The user's original request
 {user_description}
-
+{consistency_section}
 ## Issues to fix
 {issues_text}
 
@@ -3063,6 +3089,7 @@ A verification agent found issues in the workflow below. Fix ALL of them and ret
 {workflow_json}"#,
         gotchas = gotchas,
         user_description = user_description,
+        consistency_section = consistency_section,
         issues_text = issues_text,
         workflow_json = workflow_json,
     )
@@ -3193,11 +3220,11 @@ fn to_kebab_case(s: &str) -> String {
 ///   (a) doesn't already have one, and
 ///   (b) can be matched to a generated criterion.
 fn write_back_verification_templates(
-    conn: &Connection,
+    pg_db: &Arc<PgDb>,
     issues: &[crate::known_issues::KnownIssue],
     criteria: &specification::AcceptanceCriteria,
 ) {
-    use crate::known_issues::{storage::update_known_issue, UpdateKnownIssueRequest};
+    use crate::known_issues::UpdateKnownIssueRequest;
 
     for issue in issues {
         // Skip issues that already have a template
@@ -3268,7 +3295,11 @@ fn write_back_verification_templates(
             verification_step_template: Some(template),
         };
 
-        match update_known_issue(conn, &issue.id, &req) {
+        let pg_clone = pg_db.clone();
+        let issue_id = issue.id.clone();
+        match tokio::runtime::Handle::current().block_on(async {
+            pg_clone.update_known_issue(&issue_id, &req).await
+        }) {
             Ok(_) => info!(
                 "Wrote verification_step_template to known issue '{}' ({})",
                 issue.title, issue.id

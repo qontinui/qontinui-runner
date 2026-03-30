@@ -658,6 +658,7 @@ fn score_candidate(
                         goal_summary: String::new(),
                         criteria: criteria.to_vec(),
                         assumptions: Vec::new(),
+                        bugfix_context: None,
                     };
 
                     let eval = evaluate_workflow(
@@ -1190,6 +1191,7 @@ mod tests {
                 priority: super::super::specification::CriterionPriority::Critical,
                 verification_hint: "".to_string(),
                 category: "compilation".to_string(),
+                ..Default::default()
             },
             AcceptanceCriterion {
                 id: "c2".to_string(),
@@ -1198,6 +1200,7 @@ mod tests {
                 priority: super::super::specification::CriterionPriority::Critical,
                 verification_hint: "".to_string(),
                 category: "compilation".to_string(),
+                ..Default::default()
             },
         ];
 

@@ -15,7 +15,7 @@ use crate::AppState;
 
 use super::evaluator::TriggerEvaluator;
 use super::executor::{self, TriggerExecutorDeps};
-use super::storage;
+
 use super::types::{TriggerEvent, TriggerHistoryEntry, TriggerSystemStatus, WorkflowTrigger};
 use super::watchers;
 
@@ -94,7 +94,7 @@ impl TriggerService {
             let bus = crate::workflow_event_bus::get_workflow_event_bus();
             let mut event_rx = bus.subscribe_broadcast();
             let event_tx_clone = self.event_tx.clone();
-            let db = self.deps.app_state.checkpoint_db.clone();
+            let pg_db = self.deps.app_state.pg_db.clone();
             let stop = self.stop_signal.clone();
             tokio::spawn(async move {
                 loop {
@@ -134,7 +134,7 @@ impl TriggerService {
                                 // loads triggers from DB, filters by source_workflow_id
                                 // and on_status, and sends TriggerEvents through the channel.
                                 super::watchers::workflow_chain::check_workflow_chains(
-                                    &db,
+                                    &pg_db,
                                     &event_tx_clone,
                                     &workflow_id,
                                     &task_run_id,
@@ -258,8 +258,7 @@ impl TriggerService {
 
     /// Register watchers for all enabled triggers.
     async fn register_all_watchers(&self) -> Result<(), String> {
-        let db = &self.deps.app_state.checkpoint_db;
-        let triggers = storage::get_enabled_triggers(db)?;
+        let triggers = self.deps.app_state.pg_db.get_enabled_triggers().await?;
 
         info!(
             "Registering watchers for {} enabled triggers",
@@ -402,10 +401,8 @@ impl TriggerService {
 
     /// Handle an incoming trigger event.
     async fn handle_event(&self, event: TriggerEvent) {
-        let db = &self.deps.app_state.checkpoint_db;
-
         // Load the trigger definition
-        let trigger = match storage::get_trigger(db, &event.trigger_id) {
+        let trigger = match self.deps.app_state.pg_db.get_trigger(&event.trigger_id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
                 warn!("Trigger not found for event: {}", event.trigger_id);
@@ -462,7 +459,7 @@ impl TriggerService {
                     Ok(execution_id) => {
                         // Record success
                         if let Err(e) =
-                            storage::record_trigger_fired(db, &trigger.id, Some(&execution_id))
+                            self.deps.app_state.pg_db.record_trigger_fired(&trigger.id, Some(&execution_id)).await
                         {
                             error!("Failed to record trigger fired: {}", e);
                         }
@@ -482,7 +479,7 @@ impl TriggerService {
                             triggered_at: chrono::Utc::now().to_rfc3339(),
                         };
 
-                        if let Err(e) = storage::record_history(db, &history) {
+                        if let Err(e) = self.deps.app_state.pg_db.record_trigger_history(&history).await {
                             error!("Failed to record trigger history: {}", e);
                         }
 
@@ -534,7 +531,7 @@ impl TriggerService {
                         triggered_at: chrono::Utc::now().to_rfc3339(),
                     };
 
-                    if let Err(e) = storage::record_history(db, &history) {
+                    if let Err(e) = self.deps.app_state.pg_db.record_trigger_history(&history).await {
                         error!("Failed to record trigger history: {}", e);
                     }
                 }
@@ -554,7 +551,7 @@ impl TriggerService {
                 triggered_at: chrono::Utc::now().to_rfc3339(),
             };
 
-            if let Err(e) = storage::record_history(db, &history) {
+            if let Err(e) = self.deps.app_state.pg_db.record_trigger_history(&history).await {
                 error!("Failed to record trigger history: {}", e);
             }
         }
@@ -562,8 +559,7 @@ impl TriggerService {
 
     /// Get overall system status.
     pub async fn get_status(&self) -> TriggerSystemStatus {
-        let db = &self.deps.app_state.checkpoint_db;
-        let (total, enabled) = storage::get_trigger_stats(db).unwrap_or((0, 0));
+        let (total, enabled) = self.deps.app_state.pg_db.get_trigger_stats().await.unwrap_or((0, 0));
         let active_watchers = {
             let handles = self.watcher_handles.read().await;
             handles.len() as u64

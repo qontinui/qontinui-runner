@@ -4,9 +4,9 @@
 //! Documentation is auto-generated from the step type metadata registry
 //! rather than hardcoded static strings.
 
-use rusqlite::Connection;
+use crate::database::pg::PgDb;
+use std::sync::Arc;
 
-use super::example_workflows::{find_relevant_examples, format_examples_for_prompt};
 use super::relevance_filter::filter_relevant_step_types;
 use super::rules;
 use super::step_type_knowledge;
@@ -43,7 +43,7 @@ pub fn build_schema_context_for_description(description: &str) -> String {
 /// a query embedding are available.
 pub fn build_schema_context_full(
     description: &str,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     query_embedding: Option<&[f32]>,
 ) -> String {
     let all_types = get_all_step_type_metadata();
@@ -51,11 +51,25 @@ pub fn build_schema_context_full(
     let step_types_doc = generate_step_types_documentation(&filtered);
     let phase_table = generate_phase_constraint_table(&filtered);
 
-    // Retrieve RAG examples if DB is available
-    let examples_section = if let Some(conn) = conn {
-        let examples = find_relevant_examples(conn, query_embedding, None, 3);
+    // Retrieve RAG examples from PG if available
+    let examples_section = if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let desc = description.to_string();
+        let examples = tokio::runtime::Handle::current().block_on(async {
+            pg_clone.search_unified_workflows_for_examples(&desc, 3).await.unwrap_or_default()
+        });
         if !examples.is_empty() {
-            format_examples_for_prompt(&examples, 3)
+            // Format PG example workflows for prompt context
+            let mut s = String::new();
+            for (i, wf) in examples.iter().take(3).enumerate() {
+                s.push_str(&format!(
+                    "### Example {} — {}\n{}\n\n",
+                    i + 1,
+                    wf.name,
+                    wf.description
+                ));
+            }
+            s
         } else {
             String::new()
         }
@@ -63,10 +77,14 @@ pub fn build_schema_context_full(
         String::new()
     };
 
-    // Load step type knowledge filtered to relevant step types
-    let knowledge_section = if let Some(conn) = conn {
-        let step_type_names: Vec<&str> = filtered.iter().map(|m| m.step_type).collect();
-        let entries = step_type_knowledge::load_knowledge_for_step_types(conn, &step_type_names);
+    // Load step type knowledge filtered to relevant step types via PG
+    let knowledge_section = if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let step_type_names: Vec<String> = filtered.iter().map(|m| m.step_type.to_string()).collect();
+        let entries = tokio::runtime::Handle::current().block_on(async {
+            let refs: Vec<&str> = step_type_names.iter().map(|s| s.as_str()).collect();
+            pg_clone.load_knowledge_for_step_types(&refs).await.unwrap_or_default()
+        });
         if !entries.is_empty() {
             step_type_knowledge::format_knowledge_as_markdown(&entries)
         } else {
@@ -76,12 +94,8 @@ pub fn build_schema_context_full(
         String::new()
     };
 
-    // Compute generation confidence from convergence + effectiveness data
-    let confidence_section = if let Some(conn) = conn {
-        build_generation_confidence(conn)
-    } else {
-        String::new()
-    };
+    // Generation confidence: requires convergence_snapshots PG migration (skipped for now)
+    let confidence_section = String::new();
 
     assemble_prompt(
         &step_types_doc,
@@ -89,7 +103,7 @@ pub fn build_schema_context_full(
         &examples_section,
         &knowledge_section,
         &confidence_section,
-        conn,
+        pg_db,
     )
 }
 
@@ -199,7 +213,7 @@ fn assemble_prompt(
     examples: &str,
     knowledge: &str,
     confidence: &str,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
 ) -> String {
     let examples_section = if examples.is_empty() {
         String::new()
@@ -208,10 +222,10 @@ fn assemble_prompt(
     };
 
     // Build gotchas section (compact, high-signal warnings injected before rules)
-    let gotchas_section = build_gotchas_section(conn);
+    let gotchas_section = build_gotchas_section(pg_db);
 
     // Build rules from DB if available, otherwise use hardcoded fallback
-    let rules_section = build_rules_section(conn);
+    let rules_section = build_rules_section(pg_db);
 
     // Load and format playbooks from the default directory
     let playbooks_section = load_and_format_playbooks();
@@ -651,7 +665,8 @@ pub fn format_skills_for_generator_filtered(
 ///
 /// Uses the prediction engine's convergence score and effective fix rate to
 /// provide the AI generator with calibrated guidance about the project's maturity.
-fn build_generation_confidence(conn: &Connection) -> String {
+#[allow(dead_code)]
+fn build_generation_confidence(conn: &rusqlite::Connection) -> String {
     // Try to get a recent convergence snapshot for any workflow in this project
     let snapshot: Option<(f64, u32, u32)> = conn
         .query_row(
@@ -793,7 +808,7 @@ pub fn format_playbooks_for_context(
 /// Includes:
 /// - 3 static gotchas (step types, test_type, SDK grep)
 /// - Dynamic gotchas from rules with severity='critical' and failure_count > 0
-pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
+pub fn build_gotchas_section(pg_db: Option<&Arc<PgDb>>) -> String {
     let mut gotchas =
         String::from("## CRITICAL GOTCHAS (violating these causes immediate failure)\n\n");
 
@@ -802,25 +817,23 @@ pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
     gotchas.push_str("2. `test_type: \"playwright\"` is ONLY for Playwright code assertions, NOT shell commands. Use `test_type: \"repository\"` for shell-based tests.\n");
     gotchas.push_str("3. SDK verification MUST include `grep` or `python -c` assertion on response body — a 200 status alone is insufficient.\n");
 
-    // Dynamic gotchas from DB (rules with high failure_count)
+    // Dynamic gotchas from PG (rules with high failure_count and critical severity)
     let mut next_num = 4;
-    if let Some(conn) = conn {
-        let critical_rules = rules::load_rules_progressive(
-            conn,
-            "schema_context",
-            "important_rules",
-            rules::RuleTier::Critical,
-        );
-        let quality_rules = rules::load_rules_progressive(
-            conn,
-            "schema_context",
-            "verification_quality",
-            rules::RuleTier::Critical,
-        );
+    if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let critical_rules = tokio::runtime::Handle::current().block_on(async {
+            let mut rules = Vec::new();
+            if let Ok(r) = pg_clone.get_active_rules("schema_context", Some("important_rules")).await {
+                rules.extend(r.into_iter().filter(|r| r.severity == "critical"));
+            }
+            if let Ok(r) = pg_clone.get_active_rules("schema_context", Some("verification_quality")).await {
+                rules.extend(r.into_iter().filter(|r| r.severity == "critical"));
+            }
+            rules
+        });
 
-        for rule in critical_rules.iter().chain(quality_rules.iter()) {
+        for rule in &critical_rules {
             if rule.failure_count > 0 && next_num <= 6 {
-                // Keep it compact — title only, no full content
                 gotchas.push_str(&format!(
                     "{}. {} (failed {} times)\n",
                     next_num, rule.title, rule.failure_count
@@ -834,19 +847,32 @@ pub fn build_gotchas_section(conn: Option<&Connection>) -> String {
     gotchas
 }
 
-fn build_rules_section(conn: Option<&Connection>) -> String {
-    build_rules_section_for_tier(conn, rules::RuleTier::Important)
+fn build_rules_section(pg_db: Option<&Arc<PgDb>>) -> String {
+    build_rules_section_for_tier(pg_db, rules::RuleTier::Important)
 }
 
 /// Build rules section with progressive loading support.
 /// For initial generation, use `RuleTier::Important` (critical + important only).
 /// For fixer iterations, use `RuleTier::Full` (all rules).
-pub fn build_rules_section_for_tier(conn: Option<&Connection>, tier: rules::RuleTier) -> String {
-    if let Some(conn) = conn {
-        let important =
-            rules::load_rules_progressive(conn, "schema_context", "important_rules", tier);
-        let quality =
-            rules::load_rules_progressive(conn, "schema_context", "verification_quality", tier);
+pub fn build_rules_section_for_tier(pg_db: Option<&Arc<PgDb>>, tier: rules::RuleTier) -> String {
+    if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let severity_filter = match tier {
+            rules::RuleTier::Critical => vec!["critical"],
+            rules::RuleTier::Important => vec!["critical", "important"],
+            rules::RuleTier::Full => vec!["critical", "important", "normal", "hint"],
+        };
+        let (important, quality) = tokio::runtime::Handle::current().block_on(async {
+            let important = pg_clone.get_active_rules("schema_context", Some("important_rules")).await.unwrap_or_default();
+            let quality = pg_clone.get_active_rules("schema_context", Some("verification_quality")).await.unwrap_or_default();
+            let important: Vec<_> = important.into_iter().filter(|r| {
+                severity_filter.contains(&r.severity.as_str())
+            }).collect();
+            let quality: Vec<_> = quality.into_iter().filter(|r| {
+                severity_filter.contains(&r.severity.as_str())
+            }).collect();
+            (important, quality)
+        });
 
         // Only use DB rules if we actually got results (table might not be seeded yet)
         if !important.is_empty() || !quality.is_empty() {

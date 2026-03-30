@@ -307,6 +307,9 @@ impl CheckpointDb {
                 .get::<_, Option<f64>>(36)
                 .unwrap_or(None)
                 .map(|v| v as f32),
+            consistency_report: None, // Not stored in DB yet
+            pipeline_depth: None, // Not stored in DB yet
+            code_graph_stats: None, // Not stored in DB yet
         }
     }
 

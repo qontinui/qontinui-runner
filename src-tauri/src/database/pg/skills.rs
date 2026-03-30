@@ -96,6 +96,29 @@ impl PgDb {
         Ok(count as u64)
     }
 
+    /// Get approved auto-extracted skills for prompt injection.
+    /// Returns (name, slug, description, category) tuples ordered by usage_count DESC, limited to 10.
+    pub async fn get_approved_auto_skills(&self) -> Result<Vec<(String, String, String, String)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn.query(
+            r#"SELECT name, slug, description, category
+               FROM user_skills
+               WHERE approval_status = 'approved'
+               AND source = 'auto'
+               ORDER BY usage_count DESC
+               LIMIT 10"#,
+            &[],
+        ).await.map_err(|e| format!("PG get_approved_auto_skills: {}", e))?;
+
+        Ok(rows.iter().map(|row| {
+            let name: String = row.get(0);
+            let slug: String = row.get(1);
+            let description: String = row.try_get(2).unwrap_or_default();
+            let category: String = row.try_get(3).unwrap_or_else(|_| "custom".to_string());
+            (name, slug, description, category)
+        }).collect())
+    }
+
     /// Import skills from an export. Sets source to "community" and id to "community:<slug>".
     /// `conflict_mode` is "skip" or "overwrite".
     pub async fn import_skills(

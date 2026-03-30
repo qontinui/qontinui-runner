@@ -157,9 +157,9 @@ fn run_entailment_judge(
 
     let step_type = step_summary.lines().next().unwrap_or("unknown");
 
-    // Check entailment cache first
-    if let Ok(cache) = entailment_cache().lock() {
-        if let Some(cached) = cache.get(&criterion.description, step_summary, step_type) {
+    // Check entailment cache first (in-memory, then PG write-through)
+    if let Ok(mut cache) = entailment_cache().lock() {
+        if let Some(cached) = cache.get_with_pg(&criterion.description, step_summary, step_type) {
             debug!(
                 "Entailment cache hit for criterion '{}': score={:.2}",
                 criterion.id, cached.score
@@ -169,7 +169,7 @@ fn run_entailment_judge(
                 score: cached.score,
                 confidence: 0.85,
                 tier: cached.tier,
-                explanation: Some(cached.explanation.clone()),
+                explanation: Some(cached.explanation),
                 evidence: Vec::new(),
             });
         }

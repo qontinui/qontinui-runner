@@ -633,6 +633,7 @@ mod tests {
             goal_summary: "test".into(),
             criteria,
             assumptions: vec![],
+            bugfix_context: None,
         }
     }
 
@@ -1090,6 +1091,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: "curl the server".into(),
             category: "behavior".into(),
+            ..Default::default()
         };
         let criteria = make_criteria(vec![criterion]);
         // Command contains keywords from the criterion description:
@@ -1118,6 +1120,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: "run tsc".into(),
             category: "compilation".into(),
+            ..Default::default()
         };
         let criteria = make_criteria(vec![criterion]);
         // Command has no overlap with criterion keywords

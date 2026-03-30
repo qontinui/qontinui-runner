@@ -224,7 +224,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
-    // Initialize Checkpoint Database
+    // Initialize Checkpoint Database (SQLite).
+    // Still required: span logging, durable queue, JSON migration, seed rules,
+    // check-group repair, architecture spec cache, and many read paths that
+    // haven't been ported to PG yet. Remove once full PG migration is complete.
     let checkpoint_db =
         Arc::new(CheckpointDb::new().expect("Failed to initialize checkpoint database"));
     info!(
@@ -982,6 +985,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::adaptive_learning::get_template_performance,
             commands::adaptive_learning::get_gepa_runs,
             commands::adaptive_learning::get_template_lifecycle_history,
+            commands::adaptive_learning::update_playbook_entry_status,
+            commands::adaptive_learning::delete_playbook_entry,
+            commands::adaptive_learning::delete_curated_example,
+            commands::adaptive_learning::get_gepa_run_detail,
+            commands::adaptive_learning::get_playbook_entry_detail,
+            commands::adaptive_learning::get_learning_trends,
             commands::learning::analyze_learning_data,
             commands::learning::get_feedback_for_context,
             commands::learning::get_learning_dashboard_data,
@@ -1476,12 +1485,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Seed demo workflows on first launch (if no demo workflows exist)
             {
+                let seed_pg = app
+                    .state::<Arc<crate::commands::AppState>>()
+                    .pg_db
+                    .clone();
+                demo_workflows::seed_demo_workflows_if_needed(&seed_pg);
+
                 let seed_db = app
                     .state::<Arc<crate::database::CheckpointDb>>()
                     .inner()
                     .clone();
-                demo_workflows::seed_demo_workflows_if_needed(&seed_db);
-
                 // Sync slash commands from qontinui-claude-config
                 match slash_commands::sync_slash_commands(&seed_db) {
                     Ok(result) => {

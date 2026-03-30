@@ -69,7 +69,7 @@ impl PgDb {
             .query(
                 r#"SELECT id, workflow_id, task_run_id, feedback_type, edited_field,
                           old_value, new_value, delete_reason, rating, rating_comment,
-                          workflow_category, workflow_description, created_at
+                          workflow_category, workflow_description, created_at::TEXT
                    FROM workflow_generation_feedback
                    WHERE workflow_id = $1
                    ORDER BY created_at DESC"#,

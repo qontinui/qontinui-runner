@@ -42,7 +42,7 @@ const SELECT_ALL_COLUMNS: &str = r#"
     fix_type, fix_description, file_changed,
     old_value, new_value, confidence, content_hash,
     status, effectiveness, effectiveness_evidence,
-    applied_at, evaluated_at, created_at, source_agent,
+    applied_at::TEXT, evaluated_at::TEXT, created_at::TEXT, source_agent,
     reasoning, alternatives_considered,
     reflection_scope, project_path, applicability_context
 "#;
@@ -525,7 +525,7 @@ impl PgDb {
 
         let rows = conn
             .query(
-                r#"SELECT id, fix_id, task_run_id, error_signature_hash, outcome, applied_at, evaluated_at
+                r#"SELECT id, fix_id, task_run_id, error_signature_hash, outcome, applied_at::TEXT, evaluated_at::TEXT
                    FROM fix_applications
                    WHERE fix_id = $1
                    ORDER BY applied_at DESC"#,
@@ -566,7 +566,7 @@ impl PgDb {
                 r#"SELECT fa.fix_id,
                           rf.fix_description,
                           COALESCE(rf.reuse_count, 0) as reuse_count,
-                          rf.applied_at,
+                          rf.applied_at::TEXT,
                           COUNT(*) as resolved_count,
                           (SELECT COUNT(*) FROM fix_applications fa2
                            WHERE fa2.fix_id = fa.fix_id) as total_applications
@@ -1828,7 +1828,7 @@ impl PgDb {
             None => return Err(format!("Component not found: {}", path)),
         };
         let recent_fixes: Vec<FixSummary> = conn.query(
-            "SELECT id, fix_type, fix_description, effectiveness, applied_at FROM reflection_fixes WHERE file_changed = $1 ORDER BY created_at DESC LIMIT 10",
+            "SELECT id, fix_type, fix_description, effectiveness, applied_at::TEXT FROM reflection_fixes WHERE file_changed = $1 ORDER BY created_at DESC LIMIT 10",
             &[&norm_path],
         ).await.unwrap_or_default().iter().map(|r| FixSummary {
             id: r.get(0), fix_type: r.get(1), fix_description: r.get(2), effectiveness: r.get(3), applied_at: r.get(4),

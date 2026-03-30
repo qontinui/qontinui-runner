@@ -20,11 +20,32 @@ use super::specification::AcceptanceCriterion;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComplexityLevel {
+    /// 0-1 criteria — trivial one-liner fix, config tweak, typo correction.
+    Trivial,
     /// 1-4 criteria, 1-2 domains — straightforward single-pass generation.
     Simple,
     /// 5-7 criteria, 2-3 domains — still single-pass but more verification.
     Moderate,
     /// 8+ criteria, 3+ domains — benefits from decomposed generation.
+    Complex,
+}
+
+/// Pipeline depth controls which generation phases are executed.
+/// Derived from ComplexityLevel but can be overridden by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineDepth {
+    /// One-liner fixes, typos, config changes.
+    /// Pipeline: Discovery → Builder (template-based) → Autofix → Hardener → Validate
+    /// Skips: Investigation, Specification, Verification↔Fixer loop
+    Trivial,
+    /// Small bug fixes, single-file changes.
+    /// Pipeline: Discovery → Specification (lightweight) → Builder → Autofix → [Verify↔Fix max 1] → Hardener → Validate
+    /// Skips: Investigation
+    Simple,
+    /// Standard features, multi-file changes. Full pipeline as-is.
+    Standard,
+    /// Large features, multi-subsystem. Full pipeline + decomposition.
     Complex,
 }
 
@@ -105,7 +126,7 @@ pub fn assess_complexity(criteria: &[AcceptanceCriterion]) -> ComplexityAssessme
     );
 
     let recommendation = match level {
-        ComplexityLevel::Simple | ComplexityLevel::Moderate => {
+        ComplexityLevel::Trivial | ComplexityLevel::Simple | ComplexityLevel::Moderate => {
             debug!("Recommending single-pass generation");
             GenerationStrategy::SinglePass
         }
@@ -134,7 +155,9 @@ pub fn assess_complexity(criteria: &[AcceptanceCriterion]) -> ComplexityAssessme
 
 /// Determine the complexity level from criteria and domain counts.
 fn determine_level(criteria_count: usize, domain_count: usize) -> ComplexityLevel {
-    if criteria_count <= SIMPLE_MAX_CRITERIA && domain_count <= SIMPLE_MAX_DOMAINS {
+    if criteria_count <= 1 {
+        ComplexityLevel::Trivial
+    } else if criteria_count <= SIMPLE_MAX_CRITERIA && domain_count <= SIMPLE_MAX_DOMAINS {
         ComplexityLevel::Simple
     } else if criteria_count <= MODERATE_MAX_CRITERIA && domain_count <= MODERATE_MAX_DOMAINS {
         ComplexityLevel::Moderate
@@ -253,6 +276,101 @@ fn domain_display_name(domain: VerificationDomain) -> &'static str {
 }
 
 // ============================================================================
+// Pipeline Depth Classification
+// ============================================================================
+
+/// Classify pipeline depth from description text, BEFORE acceptance criteria exist.
+/// This runs early in the pipeline (before Specification) to decide which phases to skip.
+pub fn classify_pipeline_depth_from_description(description: &str) -> PipelineDepth {
+    let word_count = description.split_whitespace().count();
+    let desc_lower = description.to_lowercase();
+
+    // Complex indicators — check FIRST because short descriptions can still
+    // be complex ("refactor auth", "migrate DB to v2").
+    let complex_keywords = [
+        "refactor",
+        "migrate",
+        "redesign",
+        "rewrite",
+        "overhaul",
+        "multi-service",
+        "full-stack",
+        "end-to-end",
+        "architecture",
+    ];
+    let has_complex_keyword = complex_keywords.iter().any(|k| desc_lower.contains(k));
+
+    let multi_domain_keywords = [
+        ("frontend", "backend"),
+        ("ui", "api"),
+        ("database", "endpoint"),
+        ("server", "client"),
+        ("component", "route"),
+    ];
+    let has_multi_domain = multi_domain_keywords
+        .iter()
+        .any(|(a, b)| desc_lower.contains(a) && desc_lower.contains(b));
+
+    if has_complex_keyword || has_multi_domain {
+        return PipelineDepth::Complex;
+    }
+
+    // Trivial indicators: very short descriptions with single-action keywords
+    let trivial_keywords = [
+        "typo",
+        "rename",
+        "bump version",
+        "update dependency",
+        "fix import",
+        "remove unused",
+        "add comment",
+        "fix whitespace",
+    ];
+    let is_trivial_keyword = trivial_keywords.iter().any(|k| desc_lower.contains(k));
+
+    if word_count <= 15 && is_trivial_keyword {
+        return PipelineDepth::Trivial;
+    }
+    if word_count <= 10 {
+        return PipelineDepth::Trivial;
+    }
+
+    // Simple: short-ish descriptions without complex indicators
+    if word_count <= 30 {
+        return PipelineDepth::Simple;
+    }
+
+    PipelineDepth::Standard
+}
+
+/// Refine pipeline depth using criteria-based complexity assessment.
+/// Called after Specification phase produces criteria, can upgrade (but not downgrade) depth.
+pub fn refine_pipeline_depth(current: PipelineDepth, criteria_level: ComplexityLevel) -> PipelineDepth {
+    match (current, criteria_level) {
+        // If criteria-based assessment says Complex, upgrade regardless
+        (_, ComplexityLevel::Complex) => PipelineDepth::Complex,
+        // Never downgrade from what description-based assessment chose
+        (PipelineDepth::Complex, _) => PipelineDepth::Complex,
+        (PipelineDepth::Standard, _) => PipelineDepth::Standard,
+        // Allow upgrading Simple→Standard if criteria suggest Moderate
+        (PipelineDepth::Simple, ComplexityLevel::Moderate) => PipelineDepth::Standard,
+        // Keep as-is
+        (depth, _) => depth,
+    }
+}
+
+impl std::fmt::Display for PipelineDepth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trivial => write!(f, "trivial"),
+            Self::Simple => write!(f, "simple"),
+            Self::Standard => write!(f, "standard"),
+            Self::Complex => write!(f, "complex"),
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -269,6 +387,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: String::new(),
             category: category.to_string(),
+            ..Default::default()
         }
     }
 
@@ -290,20 +409,29 @@ mod tests {
 
     #[test]
     fn test_moderate_assessment() {
+        // Use neutral criterion IDs that don't accidentally match domain keywords.
+        // "make_criterion" generates description "Test criterion {id}", so IDs must
+        // avoid words like "api", "db", "migration", "status", "route", etc.
         let criteria = vec![
-            make_criterion("typecheck-passes", "compilation"),
-            make_criterion("api-returns-200", "behavior"),
-            make_criterion("api-returns-json", "behavior"),
-            make_criterion("db-migration-runs", "behavior"),
-            make_criterion("ui-shows-title", "ui-content"),
+            make_criterion("check-one", "compilation"),
+            make_criterion("check-two", "compilation"),
+            make_criterion("verify-alpha", "behavior"),
+            make_criterion("verify-beta", "behavior"),
+            make_criterion("verify-gamma", "ui-content"),
         ];
         let assessment = assess_complexity(&criteria);
 
-        // 5 criteria, likely 2-3 domains → Moderate
-        assert!(matches!(
+        // 5 criteria, 3 domains (compilation, general, ui-content) → Moderate
+        assert!(
+            matches!(
+                assessment.level,
+                ComplexityLevel::Moderate | ComplexityLevel::Simple
+            ),
+            "Expected Moderate or Simple, got {:?} (criteria={}, domains={})",
             assessment.level,
-            ComplexityLevel::Moderate | ComplexityLevel::Simple
-        ));
+            assessment.criteria_count,
+            assessment.domain_count,
+        );
         assert!(matches!(
             assessment.recommendation,
             GenerationStrategy::SinglePass
@@ -349,7 +477,7 @@ mod tests {
     #[test]
     fn test_empty_criteria() {
         let assessment = assess_complexity(&[]);
-        assert_eq!(assessment.level, ComplexityLevel::Simple);
+        assert_eq!(assessment.level, ComplexityLevel::Trivial);
         assert_eq!(assessment.criteria_count, 0);
         assert_eq!(assessment.domain_count, 0);
     }
@@ -362,6 +490,8 @@ mod tests {
 
     #[test]
     fn test_determine_level_boundaries() {
+        assert_eq!(determine_level(0, 0), ComplexityLevel::Trivial);
+        assert_eq!(determine_level(1, 1), ComplexityLevel::Trivial);
         assert_eq!(determine_level(4, 2), ComplexityLevel::Simple);
         assert_eq!(determine_level(5, 2), ComplexityLevel::Moderate);
         assert_eq!(determine_level(5, 3), ComplexityLevel::Moderate);
@@ -369,5 +499,152 @@ mod tests {
         assert_eq!(determine_level(8, 3), ComplexityLevel::Complex);
         assert_eq!(determine_level(5, 4), ComplexityLevel::Complex);
         assert_eq!(determine_level(8, 4), ComplexityLevel::Complex);
+    }
+
+    // ── Pipeline Depth Classification Tests ──────────────────────────────
+
+    #[test]
+    fn test_classify_trivial_short_description() {
+        assert_eq!(
+            classify_pipeline_depth_from_description("fix typo"),
+            PipelineDepth::Trivial,
+        );
+        assert_eq!(
+            classify_pipeline_depth_from_description("bump version"),
+            PipelineDepth::Trivial,
+        );
+        // Very short description (<=10 words) is always Trivial
+        assert_eq!(
+            classify_pipeline_depth_from_description("add a new field to the config"),
+            PipelineDepth::Trivial,
+        );
+    }
+
+    #[test]
+    fn test_classify_trivial_keyword_longer() {
+        // Under 15 words with a trivial keyword
+        assert_eq!(
+            classify_pipeline_depth_from_description(
+                "rename the function foo to bar in the utils module"
+            ),
+            PipelineDepth::Trivial,
+        );
+        assert_eq!(
+            classify_pipeline_depth_from_description(
+                "remove unused import of serde_json in the config module"
+            ),
+            PipelineDepth::Trivial,
+        );
+    }
+
+    #[test]
+    fn test_classify_simple_medium_description() {
+        // 11-30 words, no complex keywords or multi-domain pairs
+        assert_eq!(
+            classify_pipeline_depth_from_description(
+                "add a new handler that returns the list of users filtered by their active status"
+            ),
+            PipelineDepth::Simple,
+        );
+    }
+
+    #[test]
+    fn test_classify_standard_long_description() {
+        // >30 words, no complex keywords
+        let long_desc = "implement a caching layer for the user profile page that stores \
+            results in memory with a configurable TTL and invalidation strategy so that \
+            repeated requests do not hit the database every single time a page loads";
+        assert_eq!(
+            classify_pipeline_depth_from_description(long_desc),
+            PipelineDepth::Standard,
+        );
+    }
+
+    #[test]
+    fn test_classify_complex_keywords() {
+        assert_eq!(
+            classify_pipeline_depth_from_description("refactor the authentication module"),
+            PipelineDepth::Complex,
+        );
+        assert_eq!(
+            classify_pipeline_depth_from_description("migrate the database schema to v2"),
+            PipelineDepth::Complex,
+        );
+        assert_eq!(
+            classify_pipeline_depth_from_description("redesign the settings page layout"),
+            PipelineDepth::Complex,
+        );
+    }
+
+    #[test]
+    fn test_classify_complex_multi_domain() {
+        assert_eq!(
+            classify_pipeline_depth_from_description(
+                "update the frontend component and the backend API to support filtering"
+            ),
+            PipelineDepth::Complex,
+        );
+        assert_eq!(
+            classify_pipeline_depth_from_description(
+                "add a new UI form that writes to the database endpoint"
+            ),
+            PipelineDepth::Complex,
+        );
+    }
+
+    #[test]
+    fn test_refine_pipeline_depth_upgrade() {
+        // Complex criteria should upgrade any depth
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Trivial, ComplexityLevel::Complex),
+            PipelineDepth::Complex,
+        );
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Simple, ComplexityLevel::Complex),
+            PipelineDepth::Complex,
+        );
+    }
+
+    #[test]
+    fn test_refine_pipeline_depth_no_downgrade() {
+        // Never downgrade from Complex or Standard
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Complex, ComplexityLevel::Trivial),
+            PipelineDepth::Complex,
+        );
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Standard, ComplexityLevel::Simple),
+            PipelineDepth::Standard,
+        );
+    }
+
+    #[test]
+    fn test_refine_pipeline_depth_simple_to_standard() {
+        // Moderate criteria upgrade Simple to Standard
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Simple, ComplexityLevel::Moderate),
+            PipelineDepth::Standard,
+        );
+    }
+
+    #[test]
+    fn test_refine_pipeline_depth_keep_trivial() {
+        // Trivial stays Trivial when criteria agree
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Trivial, ComplexityLevel::Trivial),
+            PipelineDepth::Trivial,
+        );
+        assert_eq!(
+            refine_pipeline_depth(PipelineDepth::Trivial, ComplexityLevel::Simple),
+            PipelineDepth::Trivial,
+        );
+    }
+
+    #[test]
+    fn test_pipeline_depth_display() {
+        assert_eq!(PipelineDepth::Trivial.to_string(), "trivial");
+        assert_eq!(PipelineDepth::Simple.to_string(), "simple");
+        assert_eq!(PipelineDepth::Standard.to_string(), "standard");
+        assert_eq!(PipelineDepth::Complex.to_string(), "complex");
     }
 }

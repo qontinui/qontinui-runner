@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../../lib/utils";
-import { Play, Square, Loader2, Zap, AlertTriangle } from "lucide-react";
+import { Play, Square, Loader2, Zap, AlertTriangle, FileSearch } from "lucide-react";
+import { SpecPartitionWizard } from "./SpecPartitionWizard";
+import { MultiLoopResults } from "./MultiLoopResults";
 
 // --- Types matching the Rust multi-loop backend ---
 
@@ -59,6 +61,11 @@ interface IterationResult {
   task_run_id: string;
   fix_count: number | null;
   exit_check: { should_exit: boolean; reason: string };
+  diagnostic_result?: {
+    passed: boolean;
+    root_cause: string | null;
+    diagnosis: string | null;
+  } | null;
 }
 
 interface RunnerInstance {
@@ -131,6 +138,9 @@ export function MultiLoopPanel() {
 
   const [runnerInstances, setRunnerInstances] = useState<RunnerInstance[]>([]);
   const [workflows, setWorkflows] = useState<SavedWorkflow[]>([]);
+
+  // Spec partition wizard
+  const [showWizard, setShowWizard] = useState(false);
 
   // Form: assignment of runners to workflows
   const [assignments, setAssignments] = useState<LoopAssignment[]>([]);
@@ -288,7 +298,7 @@ export function MultiLoopPanel() {
   const anyRunning = activeLoops.length > 0;
   const allLoops = multiStatus?.loops ?? [];
   // Only show status grid if there are non-idle loops
-  const visibleLoops = allLoops.filter((l) => l.status.phase !== "Idle" || l.status.running);
+  const visibleLoops = allLoops.filter((l) => l.status.phase !== "idle" || l.status.running);
 
   if (loading) {
     return (
@@ -330,14 +340,28 @@ export function MultiLoopPanel() {
               Stop All
             </button>
           ) : (
-            <button
-              onClick={handleStartMulti}
-              disabled={assignments.length === 0}
-              className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40"
-            >
-              <Play className="w-3 h-3 inline mr-1" />
-              Start All
-            </button>
+            <>
+              <button
+                onClick={() => setShowWizard(!showWizard)}
+                className={cn(
+                  "px-2.5 py-1 text-xs font-medium rounded",
+                  showWizard
+                    ? "bg-primary/15 text-primary"
+                    : "bg-muted text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <FileSearch className="w-3 h-3 inline mr-1" />
+                From Specs
+              </button>
+              <button
+                onClick={handleStartMulti}
+                disabled={assignments.length === 0}
+                className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40"
+              >
+                <Play className="w-3 h-3 inline mr-1" />
+                Start All
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -384,7 +408,7 @@ export function MultiLoopPanel() {
                     <div
                       className={cn(
                         "h-1 rounded transition-all",
-                        s.phase === "Complete" ? "bg-green-500" : "bg-primary",
+                        s.phase === "complete" ? "bg-green-500" : "bg-primary",
                       )}
                       style={{ width: `${pct}%` }}
                     />
@@ -427,8 +451,38 @@ export function MultiLoopPanel() {
         </div>
       )}
 
+      {/* Aggregated results — show when all loops complete */}
+      {!anyRunning && multiStatus && (multiStatus.all_complete || multiStatus.any_error) && visibleLoops.length > 0 && (
+        <MultiLoopResults
+          loops={visibleLoops.map((l) => ({
+            loop_id: l.loop_id,
+            label: l.label,
+            running: l.status.running,
+            phase: l.status.phase,
+            current_iteration: l.status.current_iteration,
+            max_iterations: l.status.max_iterations,
+            workflow_id: l.status.workflow_id,
+            target_runner_port: l.status.target_runner_port,
+            target_runner_id: l.status.target_runner_id ?? null,
+            error: l.status.error,
+            iteration_results: l.status.iteration_results,
+          }))}
+        />
+      )}
+
+      {/* Spec partition wizard */}
+      {showWizard && !anyRunning && (
+        <SpecPartitionWizard
+          onClose={() => setShowWizard(false)}
+          onLaunched={() => {
+            setShowWizard(false);
+            fetchMultiStatus();
+          }}
+        />
+      )}
+
       {/* Config form — only when not running */}
-      {!anyRunning && (
+      {!anyRunning && !showWizard && (
         <div className="border border-border rounded p-3 space-y-3">
           {/* Runner assignments */}
           <div>

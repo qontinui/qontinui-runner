@@ -403,7 +403,284 @@ impl PgDb {
         Ok(affected > 0)
     }
 
+    /// Resolve a known issue (set status to resolved + resolved_at).
+    pub async fn resolve_known_issue(
+        &self,
+        id: &str,
+        resolution: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let affected = if let Some(note) = resolution {
+            conn.execute(
+                r#"
+                UPDATE known_issues
+                SET status = 'resolved',
+                    resolved_at = $2,
+                    description = description || E'\n\n' || 'Resolution: ' || $3,
+                    updated_at = $2
+                WHERE id = $1
+                "#,
+                &[&id, &now, &note],
+            )
+            .await
+            .map_err(|e| format!("PG resolve_known_issue: {}", e))?
+        } else {
+            conn.execute(
+                r#"
+                UPDATE known_issues
+                SET status = 'resolved',
+                    resolved_at = $2,
+                    updated_at = $2
+                WHERE id = $1
+                "#,
+                &[&id, &now],
+            )
+            .await
+            .map_err(|e| format!("PG resolve_known_issue: {}", e))?
+        };
+
+        if affected == 0 {
+            tracing::warn!("resolve_known_issue: no issue found with id '{}'", id);
+        } else {
+            tracing::info!("Resolved known issue '{}'", id);
+        }
+
+        Ok(())
+    }
+
+    /// Find issues relevant to a spec (by spec_id, URL, or global).
+    pub async fn find_issues_for_spec(
+        &self,
+        spec_id: &str,
+        page_url: Option<&str>,
+    ) -> Result<Vec<KnownIssue>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let url = page_url.unwrap_or("");
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, description, category, scope_type, scope_value,
+                       scope_tags, detection_method, detection_config, pattern_template_id,
+                       reproduction_context, trigger_conditions, severity, status,
+                       confidence, provenance, source_finding_ids, source_task_run_id,
+                       verification_hint, verification_step_template,
+                       times_detected, times_checked, last_detected_at, last_checked_at,
+                       resolved_at, created_at::TEXT, updated_at::TEXT
+                FROM known_issues
+                WHERE status = 'active'
+                  AND (
+                    (scope_type = 'spec' AND scope_value = $1)
+                    OR scope_type = 'global'
+                    OR (scope_type = 'url' AND scope_value = $2)
+                  )
+                ORDER BY
+                    CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END
+                "#,
+                &[&spec_id, &url],
+            )
+            .await
+            .map_err(|e| format!("PG find_issues_for_spec: {}", e))?;
+
+        Ok(rows.iter().map(|r| Self::ki_row_to_known_issue(r)).collect())
+    }
+
+    // ========================================================================
+    // Pattern Templates
+    // ========================================================================
+
+    /// List all pattern templates.
+    pub async fn list_pattern_templates(&self) -> Result<Vec<IssuePatternTemplate>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, name, description, category, detection_type,
+                       step_template, ai_prompt_template, parameters,
+                       built_in, status, created_at::TEXT, updated_at::TEXT
+                FROM issue_pattern_templates
+                ORDER BY name
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG list_pattern_templates: {}", e))?;
+
+        Ok(rows.iter().map(|r| Self::ki_row_to_pattern_template(r)).collect())
+    }
+
+    /// Insert a new pattern template.
+    pub async fn insert_pattern_template(
+        &self,
+        req: &CreatePatternTemplateRequest,
+    ) -> Result<IssuePatternTemplate, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        let parameters_json = req
+            .parameters
+            .as_deref()
+            .and_then(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                        .ok()
+                        .map(|_| trimmed.to_string())
+                }
+            })
+            .unwrap_or_else(|| "[]".to_string());
+        let built_in = false;
+        let status = "active".to_string();
+        let step_template: Option<String> = None;
+
+        conn.execute(
+            r#"
+            INSERT INTO issue_pattern_templates (
+                id, name, description, category, detection_type,
+                step_template, ai_prompt_template, parameters,
+                built_in, status, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8,
+                $9, $10, $11::TIMESTAMPTZ, $11::TIMESTAMPTZ
+            )
+            "#,
+            &[
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &req.name as &(dyn tokio_postgres::types::ToSql + Sync),
+                &req.description as &(dyn tokio_postgres::types::ToSql + Sync),
+                &req.category as &(dyn tokio_postgres::types::ToSql + Sync),
+                &req.detection_type as &(dyn tokio_postgres::types::ToSql + Sync),
+                &step_template as &(dyn tokio_postgres::types::ToSql + Sync),
+                &req.ai_prompt_template as &(dyn tokio_postgres::types::ToSql + Sync),
+                &parameters_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &built_in as &(dyn tokio_postgres::types::ToSql + Sync),
+                &status as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG insert_pattern_template: {}", e))?;
+
+        tracing::info!("Inserted pattern template '{}' (id={})", req.name, id);
+
+        // Re-query to return the inserted template
+        let row = conn
+            .query_one(
+                r#"
+                SELECT id, name, description, category, detection_type,
+                       step_template, ai_prompt_template, parameters,
+                       built_in, status, created_at::TEXT, updated_at::TEXT
+                FROM issue_pattern_templates
+                WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get pattern template after insert: {}", e))?;
+
+        Ok(Self::ki_row_to_pattern_template(&row))
+    }
+
+    /// Get a pattern template by ID.
+    pub async fn get_pattern_template(
+        &self,
+        id: &str,
+    ) -> Result<Option<IssuePatternTemplate>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, name, description, category, detection_type,
+                       step_template, ai_prompt_template, parameters,
+                       built_in, status, created_at::TEXT, updated_at::TEXT
+                FROM issue_pattern_templates
+                WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_pattern_template: {}", e))?;
+
+        Ok(rows.first().map(Self::ki_row_to_pattern_template))
+    }
+
+    /// Find active known issues relevant for workflow generation based on depth level.
+    /// - "thorough": only critical + high severity
+    /// - "regression": all active issues
+    pub async fn find_relevant_issues_for_generation(
+        &self,
+        depth: &str,
+    ) -> Result<Vec<KnownIssue>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let sql = match depth {
+            "thorough" => {
+                r#"SELECT id, title, description, category, scope_type, scope_value,
+                          scope_tags, detection_method, detection_config, pattern_template_id,
+                          reproduction_context, trigger_conditions, severity, status,
+                          confidence, provenance, source_finding_ids, source_task_run_id,
+                          verification_hint, verification_step_template,
+                          times_detected, times_checked, last_detected_at, last_checked_at,
+                          resolved_at, created_at::TEXT, updated_at::TEXT
+                   FROM known_issues
+                   WHERE status = 'active' AND severity IN ('critical', 'high')
+                   ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 END,
+                            times_detected DESC"#
+            }
+            _ => {
+                r#"SELECT id, title, description, category, scope_type, scope_value,
+                          scope_tags, detection_method, detection_config, pattern_template_id,
+                          reproduction_context, trigger_conditions, severity, status,
+                          confidence, provenance, source_finding_ids, source_task_run_id,
+                          verification_hint, verification_step_template,
+                          times_detected, times_checked, last_detected_at, last_checked_at,
+                          resolved_at, created_at::TEXT, updated_at::TEXT
+                   FROM known_issues
+                   WHERE status = 'active'
+                   ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END,
+                            times_detected DESC"#
+            }
+        };
+
+        let rows = conn
+            .query(sql, &[])
+            .await
+            .map_err(|e| format!("PG find_relevant_issues_for_generation: {}", e))?;
+
+        Ok(rows.iter().map(|r| Self::ki_row_to_known_issue(r)).collect())
+    }
+
     // -- helpers --
+
+    fn ki_row_to_pattern_template(row: &tokio_postgres::Row) -> IssuePatternTemplate {
+        let step_template_json: Option<String> = row.get(5);
+        let parameters_json: String = row.get::<_, Option<String>>(7).unwrap_or_else(|| "[]".to_string());
+        let built_in_val: bool = row.get(8);
+
+        IssuePatternTemplate {
+            id: row.get(0),
+            name: row.get(1),
+            description: row.get(2),
+            category: row.get(3),
+            detection_type: row.get(4),
+            step_template: step_template_json.and_then(|s| serde_json::from_str(&s).ok()),
+            ai_prompt_template: row.get(6),
+            parameters: serde_json::from_str(&parameters_json).unwrap_or_default(),
+            built_in: built_in_val,
+            status: row.get(9),
+            created_at: row.get(10),
+            updated_at: row.get(11),
+        }
+    }
 
     fn ki_row_to_known_issue(row: &tokio_postgres::Row) -> KnownIssue {
         let scope_tags_json: String = row.get::<_, Option<String>>(6).unwrap_or_else(|| "[]".to_string());

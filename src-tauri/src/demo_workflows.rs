@@ -4,9 +4,10 @@
 //! 1. Writes embedded Python setup scripts to the app data directory
 //! 2. Creates 3 demo workflows that showcase the verification-agentic loop
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use serde_json::json;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 // Embed the Python setup scripts at compile time
@@ -16,23 +17,36 @@ const SETUP_DATA_PIPELINE: &str =
     include_str!("../../examples/demo-workflows/setup_data_pipeline.py");
 
 /// Seed demo workflows if none with category "demo" exist.
-pub fn seed_demo_workflows_if_needed(db: &CheckpointDb) {
-    let conn = match db.get_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Cannot seed demo workflows: {}", e);
+/// Uses PostgreSQL via the global PgDb instance.
+pub fn seed_demo_workflows_if_needed(pg: &Arc<PgDb>) {
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h,
+        Err(_) => {
+            // Build a small runtime for the sync caller
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime for demo seed");
+            rt.block_on(seed_demo_workflows_pg(pg));
             return;
         }
     };
 
+    // We are inside an async runtime but called from sync context — use block_in_place.
+    tokio::task::block_in_place(|| {
+        rt.block_on(seed_demo_workflows_pg(pg));
+    });
+}
+
+async fn seed_demo_workflows_pg(pg: &Arc<PgDb>) {
     // Check if any demo workflows already exist
-    let demo_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM unified_workflows WHERE category = 'demo'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let demo_count = match pg.count_workflows_by_category("demo").await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Cannot check demo workflow count: {}", e);
+            return;
+        }
+    };
 
     if demo_count > 0 {
         info!(
@@ -70,7 +84,7 @@ pub fn seed_demo_workflows_if_needed(db: &CheckpointDb) {
 
     let mut created = 0;
     for request in &workflows {
-        match db.create_unified_workflow(request) {
+        match pg.create_unified_workflow(request).await {
             Ok(wf) => {
                 info!("Seeded demo workflow: {} ({})", wf.name, wf.id);
                 created += 1;

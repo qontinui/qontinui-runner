@@ -114,7 +114,7 @@ impl PgDb {
 
         let rows = conn
             .query(
-                r#"SELECT id, workflow_id, task_run_id, description, category, created_at,
+                r#"SELECT id, workflow_id, task_run_id, description, category, created_at::TEXT,
                           total_duration_ms, success, error_message, model_used,
                           confidence_score
                    FROM generation_pipeline_artifacts

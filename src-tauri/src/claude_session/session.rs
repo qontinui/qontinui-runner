@@ -16,7 +16,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
-use crate::database::CheckpointDb;
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, ProgressContext};
@@ -215,25 +214,30 @@ impl ClaudeSession {
                 .unwrap_or_default();
 
             thread::spawn(move || {
-                // Open DB connection once for the lifetime of this thread
-                let db = match CheckpointDb::new() {
-                    Ok(db) => db,
-                    Err(e) => {
-                        warn!("Failed to open DB for AI output persistence: {}", e);
-                        // Drain the channel so senders don't block
-                        while turn_persist_rx.recv().is_ok() {}
-                        return;
-                    }
-                };
+                // Create a tokio runtime for PG async calls
+                let pg_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                let pg = crate::database::pg::PgDb::try_global();
+
+                if pg.is_none() || pg_rt.is_none() {
+                    warn!("Failed to get PG connection for AI output persistence");
+                    // Drain the channel so senders don't block
+                    while turn_persist_rx.recv().is_ok() {}
+                    return;
+                }
+                let pg = pg.unwrap();
+                let pg_rt = pg_rt.unwrap();
 
                 while let Ok(delta) = turn_persist_rx.recv() {
                     if delta.is_empty() {
                         continue;
                     }
                     let formatted = format!("\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n", delta);
-                    if let Err(e) =
-                        db.append_task_output_ex(&persist_task_run_id, &formatted, false, false)
-                    {
+                    if let Err(e) = pg_rt.block_on(
+                        pg.append_task_output_ex(&persist_task_run_id, &formatted, false, false)
+                    ) {
                         warn!("Failed to persist AI response to output_log: {}", e);
                     } else {
                         debug!(
@@ -432,13 +436,7 @@ impl ClaudeSession {
             let mut detected_findings: Vec<Finding> = Vec::new();
 
             if let Some(ctx) = finding_ctx_for_processor {
-                let db = match CheckpointDb::new() {
-                    Ok(db) => Some(db),
-                    Err(e) => {
-                        warn!("Failed to open database for finding storage: {}", e);
-                        None
-                    }
-                };
+                let pg_available = crate::database::pg::PgDb::try_global().is_some();
 
                 while let Ok(parsed_finding) = finding_rx.recv() {
                     info!(
@@ -448,7 +446,7 @@ impl ClaudeSession {
                         parsed_finding.severity.as_str()
                     );
 
-                    if let Some(ref db) = db {
+                    if pg_available {
                         let is_resolved = parsed_finding.is_resolved;
 
                         // PG-primary: sync thread context, use block_in_place
@@ -527,14 +525,16 @@ impl ClaudeSession {
                                                 data.cve_ids.len(),
                                                 data.exploit_available
                                             );
-                                            // Store enrichment as task_knowledge for retrieval
-                                            if let Ok(db) = crate::database::CheckpointDb::new() {
+                                            // Store enrichment as task_knowledge via PG
+                                            if let Some(pg) = crate::database::pg::PgDb::try_global() {
                                                 let content = format!(
                                                     "## Vulnerability Enrichment: {}\n\n{}",
                                                     finding_title,
                                                     data.to_markdown()
                                                 );
-                                                if let Err(e) = db.create_task_knowledge(
+                                                let knowledge_id = uuid::Uuid::new_v4().to_string();
+                                                if let Err(e) = pg.create_task_knowledge(
+                                                    &knowledge_id,
                                                     &task_run_id,
                                                     "vulnerability_enrichment",
                                                     "system",
@@ -542,8 +542,8 @@ impl ClaudeSession {
                                                     &content,
                                                     None,
                                                     "high",
-                                                    &[],
-                                                ) {
+                                                    "[]",
+                                                ).await {
                                                     tracing::warn!("[knowledge_acquisition] Failed to store enrichment: {}", e);
                                                 }
                                             }
@@ -575,13 +575,12 @@ impl ClaudeSession {
             let mut progress_count: u32 = 0;
 
             if let Some(ctx) = progress_ctx_for_processor {
-                let db = match CheckpointDb::new() {
-                    Ok(db) => Some(db),
-                    Err(e) => {
-                        warn!("Failed to open database for progress storage: {}", e);
-                        None
-                    }
-                };
+                // Use PgDb for progress storage (async via thread-local runtime)
+                let pg_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                let pg = crate::database::pg::PgDb::try_global();
 
                 while let Ok(parsed_progress) = progress_rx.recv() {
                     debug!(
@@ -594,7 +593,7 @@ impl ClaudeSession {
                             .unwrap_or_else(|| "?".to_string())
                     );
 
-                    if let Some(ref db) = db {
+                    if let (Some(ref rt), Some(ref pg)) = (&pg_rt, &pg) {
                         let is_step_complete = parsed_progress.marker_type
                             == crate::workflow_state::progress_markers::STEP_COMPLETE;
                         let data_json = if is_step_complete {
@@ -606,14 +605,14 @@ impl ClaudeSession {
                             None
                         };
 
-                        match db.save_step_progress_marker(
+                        match rt.block_on(pg.save_step_progress_marker(
                             &ctx.checkpoint_id,
                             &parsed_progress.marker_type,
                             parsed_progress.current,
                             parsed_progress.total,
                             parsed_progress.description.as_deref(),
                             data_json.as_deref(),
-                        ) {
+                        )) {
                             Ok(_) => {
                                 progress_count += 1;
 

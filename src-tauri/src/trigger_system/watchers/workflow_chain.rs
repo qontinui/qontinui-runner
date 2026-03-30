@@ -9,23 +9,22 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
-use super::super::storage;
 use super::super::types::{TriggerConfig, TriggerEvent};
 
 /// Check all workflow chain triggers against a completed workflow.
 ///
 /// Called from the post-execution path when a workflow finishes.
 pub async fn check_workflow_chains(
-    db: &Arc<CheckpointDb>,
+    pg_db: &Arc<PgDb>,
     tx: &mpsc::Sender<TriggerEvent>,
     completed_workflow_id: &str,
     completed_task_run_id: &str,
     status: &str, // "completed" or "failed"
     output_summary: Option<&str>,
 ) {
-    let triggers = match storage::get_enabled_triggers(db) {
+    let triggers = match pg_db.get_enabled_triggers().await {
         Ok(t) => t,
         Err(e) => {
             warn!("Failed to load triggers for chain check: {}", e);

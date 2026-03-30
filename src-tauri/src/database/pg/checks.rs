@@ -260,6 +260,157 @@ impl PgDb {
             .ok_or_else(|| "Failed to retrieve created check group".to_string())
     }
 
+    /// List all check groups (optionally filtered to enabled only).
+    pub async fn list_check_groups(&self, enabled_only: bool) -> Result<Vec<CheckGroup>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let sql = if enabled_only {
+            r#"SELECT id, name, description, color, enabled, run_in_parallel,
+                      stop_on_failure, tags, created_at, updated_at
+               FROM check_groups WHERE enabled = true ORDER BY name ASC"#
+        } else {
+            r#"SELECT id, name, description, color, enabled, run_in_parallel,
+                      stop_on_failure, tags, created_at, updated_at
+               FROM check_groups ORDER BY name ASC"#
+        };
+
+        let rows = conn.query(sql, &[]).await
+            .map_err(|e| format!("PG list_check_groups: {}", e))?;
+
+        let mut groups = Vec::new();
+        for r in &rows {
+            let tags_str: String = r.get(7);
+            let created: chrono::DateTime<chrono::Utc> = r.get(8);
+            let updated: chrono::DateTime<chrono::Utc> = r.get(9);
+            let id: String = r.get(0);
+
+            let checks = self.get_checks_in_group(&id).await.unwrap_or_default();
+
+            groups.push(CheckGroup {
+                id,
+                name: r.get(1),
+                description: non_empty(r.get::<_, String>(2)),
+                color: non_empty(r.get::<_, String>(3)),
+                enabled: r.get(4),
+                run_in_parallel: r.get(5),
+                stop_on_failure: r.get(6),
+                tags: json_or_default(&tags_str),
+                checks,
+                created_at: created.to_rfc3339(),
+                updated_at: updated.to_rfc3339(),
+            });
+        }
+
+        Ok(groups)
+    }
+
+    /// Update a check group.
+    pub async fn update_check_group(&self, id: &str, input: &crate::database::types::UpdateCheckGroupInput) -> Result<CheckGroup, String> {
+        let existing = self.get_check_group(id).await?
+            .ok_or_else(|| format!("Check group not found: {}", id))?;
+
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let name = input.name.as_ref().unwrap_or(&existing.name);
+        let description = input.description.clone().or(existing.description);
+        let color = input.color.clone().or(existing.color);
+        let enabled = input.enabled.unwrap_or(existing.enabled);
+        let run_in_parallel = input.run_in_parallel.unwrap_or(existing.run_in_parallel);
+        let stop_on_failure = input.stop_on_failure.unwrap_or(existing.stop_on_failure);
+        let tags = input.tags.clone().unwrap_or(existing.tags);
+        let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
+
+        let rows = conn.execute(
+            r#"UPDATE check_groups SET
+                name = $1, description = $2, color = $3, enabled = $4,
+                run_in_parallel = $5, stop_on_failure = $6, tags = $7,
+                updated_at = NOW()
+            WHERE id = $8"#,
+            &[
+                &name as &(dyn tokio_postgres::types::ToSql + Sync),
+                &description as &(dyn tokio_postgres::types::ToSql + Sync),
+                &color as &(dyn tokio_postgres::types::ToSql + Sync),
+                &enabled as &(dyn tokio_postgres::types::ToSql + Sync),
+                &run_in_parallel as &(dyn tokio_postgres::types::ToSql + Sync),
+                &stop_on_failure as &(dyn tokio_postgres::types::ToSql + Sync),
+                &tags_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &id as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        ).await.map_err(|e| format!("PG update_check_group: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Check group not found: {}", id));
+        }
+
+        self.get_check_group(id).await?
+            .ok_or_else(|| "Failed to retrieve updated check group".to_string())
+    }
+
+    /// Set checks in a group (replace all existing assignments).
+    pub async fn set_checks_in_group(&self, group_id: &str, check_ids: &[String]) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Remove all existing members
+        conn.execute(
+            "DELETE FROM check_group_members WHERE group_id = $1",
+            &[&group_id],
+        ).await.map_err(|e| format!("PG set_checks_in_group (delete): {}", e))?;
+
+        // Add new members
+        for (index, check_id) in check_ids.iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let sort_order = index as i32;
+            conn.execute(
+                r#"INSERT INTO check_group_members (id, group_id, check_id, sort_order, created_at)
+                   VALUES ($1, $2, $3, $4, NOW())
+                   ON CONFLICT (group_id, check_id) DO UPDATE SET sort_order = EXCLUDED.sort_order"#,
+                &[
+                    &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &group_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &check_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &sort_order as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            ).await.map_err(|e| format!("PG set_checks_in_group (insert): {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Repair check-group associations based on naming convention.
+    ///
+    /// Checks named "{group_name} - {tool_name}" are linked to matching groups.
+    /// Returns the number of associations created.
+    pub async fn repair_check_group_associations(&self) -> Result<usize, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows_affected = conn.execute(
+            r#"INSERT INTO check_group_members (id, group_id, check_id, sort_order, created_at)
+               SELECT
+                   gen_random_uuid()::text,
+                   cg.id,
+                   c.id,
+                   COALESCE((SELECT MAX(sort_order) + 1 FROM check_group_members WHERE group_id = cg.id), 0),
+                   NOW()
+               FROM checks c
+               JOIN check_groups cg ON c.name LIKE cg.name || ' - %'
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM check_group_members cgm
+                   WHERE cgm.group_id = cg.id AND cgm.check_id = c.id
+               )
+               ON CONFLICT DO NOTHING"#,
+            &[],
+        ).await.map_err(|e| format!("PG repair_check_group_associations: {}", e))?;
+
+        if rows_affected > 0 {
+            tracing::info!(
+                "Repaired {} check-group associations based on naming convention",
+                rows_affected
+            );
+        }
+
+        Ok(rows_affected as usize)
+    }
+
     // ========================================================================
     // Check Results (raw SQL)
     // ========================================================================

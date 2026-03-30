@@ -318,6 +318,7 @@ pub async fn generate_workflow_standalone(
         verification_depth: None,
         discover_ui_bridge_specs: None,
         simple_mode: None,
+        pipeline_depth: None,
         tool_tags: None,
         exploration_settings: None,
         target_runner_port: None,
@@ -326,12 +327,13 @@ pub async fn generate_workflow_standalone(
     // Get doctor handle for health monitoring
     let doctor_handle = app_state.doctor_handle.lock().await.clone();
     let pg_db = app_state.pg_db.clone();
+    let pg_clone = pg_db.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let (response, artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
-            None,
+            Some(&pg_clone),
             None,
         );
         (response, artifact)

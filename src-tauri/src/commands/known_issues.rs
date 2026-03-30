@@ -8,7 +8,7 @@ use tauri::State;
 use tracing::info;
 
 use crate::commands::AppState;
-use crate::known_issues::{storage, templates, IssuePatternTemplate};
+use crate::known_issues::{templates, IssuePatternTemplate};
 use crate::known_issues::{
     CreateKnownIssueRequest, CreatePatternTemplateRequest, KnownIssue, ListKnownIssuesQuery,
     UpdateKnownIssueRequest,
@@ -110,8 +110,7 @@ pub async fn find_issues_for_spec(
     page_url: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<KnownIssue>, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    storage::find_issues_for_spec(&conn, &spec_id, page_url.as_deref())
+    app_state.pg_db.find_issues_for_spec(&spec_id, page_url.as_deref()).await
 }
 
 /// Create a new known issue.
@@ -157,8 +156,7 @@ pub async fn resolve_known_issue(
     resolution: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    storage::resolve_known_issue(&conn, &id, resolution.as_deref())?;
+    app_state.pg_db.resolve_known_issue(&id, resolution.as_deref()).await?;
     info!("Resolved known issue: {}", id);
     Ok(())
 }
@@ -168,8 +166,7 @@ pub async fn resolve_known_issue(
 pub async fn list_pattern_templates(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<IssuePatternTemplate>, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    storage::list_pattern_templates(&conn)
+    app_state.pg_db.list_pattern_templates().await
 }
 
 /// Export known issues as a portable JSON string.
@@ -183,15 +180,13 @@ pub async fn export_known_issues(
     category: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-
     let query = ListKnownIssuesQuery {
         status,
         category,
         ..Default::default()
     };
 
-    let issues = storage::list_known_issues(&conn, &query)?;
+    let issues = app_state.pg_db.list_known_issues(&query).await?;
 
     let export = KnownIssuesExport {
         version: "1.0".to_string(),
@@ -223,10 +218,8 @@ pub async fn import_known_issues(
         ));
     }
 
-    let conn = app_state.checkpoint_db.get_conn()?;
-
     // Collect existing titles for dedup.
-    let existing = storage::list_known_issues(&conn, &ListKnownIssuesQuery::default())?;
+    let existing = app_state.pg_db.list_known_issues(&ListKnownIssuesQuery::default()).await?;
     let existing_titles: std::collections::HashSet<String> =
         existing.iter().map(|i| i.title.clone()).collect();
 
@@ -262,7 +255,7 @@ pub async fn import_known_issues(
             verification_step_template: item.verification_step_template.clone(),
         };
 
-        match storage::insert_known_issue(&conn, &req) {
+        match app_state.pg_db.create_known_issue(&req).await {
             Ok(issue) => {
                 info!("Imported known issue: {} ({})", issue.title, issue.id);
                 imported += 1;
@@ -287,8 +280,7 @@ pub async fn create_pattern_template(
     request: CreatePatternTemplateRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<IssuePatternTemplate, String> {
-    let conn = app_state.checkpoint_db.get_conn()?;
-    let template = storage::insert_pattern_template(&conn, &request)?;
+    let template = app_state.pg_db.insert_pattern_template(&request).await?;
     info!(
         "Created pattern template: {} ({})",
         template.name, template.id

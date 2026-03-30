@@ -43,7 +43,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, agent, section, rule_number, title, content, condition, status,
                           provenance, source_fix_id, severity, failure_count, examples_json,
-                          created_at, updated_at
+                          created_at::TEXT, updated_at::TEXT
                    FROM generation_rules
                    WHERE agent = $1 AND section = $2 AND status = 'active'
                    ORDER BY rule_number"#,
@@ -54,7 +54,7 @@ impl PgDb {
             conn.query(
                 r#"SELECT id, agent, section, rule_number, title, content, condition, status,
                           provenance, source_fix_id, severity, failure_count, examples_json,
-                          created_at, updated_at
+                          created_at::TEXT, updated_at::TEXT
                    FROM generation_rules
                    WHERE agent = $1 AND status = 'active'
                    ORDER BY section, rule_number"#,
@@ -75,7 +75,7 @@ impl PgDb {
             .query(
                 r#"SELECT id, agent, section, rule_number, title, content, condition, status,
                           provenance, source_fix_id, severity, failure_count, examples_json,
-                          created_at, updated_at
+                          created_at::TEXT, updated_at::TEXT
                    FROM generation_rules WHERE id = $1"#,
                 &[&id],
             )
@@ -153,7 +153,7 @@ impl PgDb {
         let mut sql = String::from(
             r#"SELECT id, agent, section, rule_number, title, content, condition, status,
                       provenance, source_fix_id, severity, failure_count, examples_json,
-                      created_at, updated_at
+                      created_at::TEXT, updated_at::TEXT
                FROM generation_rules WHERE 1=1"#,
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -282,7 +282,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"SELECT id, workflow_id, total_candidates, search_depth, search_duration_ms,
-                          best_score, strategy_used, score_progression, created_at
+                          best_score, strategy_used, score_progression, created_at::TEXT
                    FROM exploration_stats
                    WHERE workflow_id = $1
                    ORDER BY created_at DESC LIMIT 1"#,
@@ -330,12 +330,12 @@ impl PgDb {
 
         let rows = if let Some(domain) = domain_filter {
             conn.query(
-                "SELECT id, name, domain, template_json, created_at FROM step_templates WHERE domain = $1 ORDER BY name",
+                "SELECT id, name, domain, template_json, created_at::TEXT FROM step_templates WHERE domain = $1 ORDER BY name",
                 &[&domain],
             ).await
         } else {
             conn.query(
-                "SELECT id, name, domain, template_json, created_at FROM step_templates ORDER BY name",
+                "SELECT id, name, domain, template_json, created_at::TEXT FROM step_templates ORDER BY name",
                 &[],
             ).await
         }.map_err(|e| format!("PG list_templates: {}", e))?;
@@ -415,5 +415,22 @@ impl PgDb {
             &[&source_fix_id],
         ).await.map_err(|e| format!("PG find_rule_by_source_fix_id: {}", e))?;
         Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Increment the failure_count for a rule and auto-promote to 'critical'
+    /// once failure_count reaches 5.
+    pub async fn increment_rule_failure_count(&self, rule_id: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            r#"UPDATE generation_rules
+               SET failure_count = failure_count + 1,
+                   severity = CASE WHEN failure_count + 1 >= 5 THEN 'critical' ELSE severity END,
+                   updated_at = NOW()
+               WHERE id = $1"#,
+            &[&rule_id],
+        )
+        .await
+        .map_err(|e| format!("PG increment_rule_failure_count: {}", e))?;
+        Ok(())
     }
 }

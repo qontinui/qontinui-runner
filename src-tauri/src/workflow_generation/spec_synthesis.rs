@@ -1051,6 +1051,7 @@ mod tests {
                     priority: CriterionPriority::Critical,
                     verification_hint: "Run `npx tsc --noEmit` in frontend/".to_string(),
                     category: "compilation".to_string(),
+                    ..Default::default()
                 },
                 AcceptanceCriterion {
                     id: "toggle-renders".to_string(),
@@ -1060,6 +1061,7 @@ mod tests {
                     verification_hint: "Assert element 'toggle-dark-mode' exists via UI Bridge"
                         .to_string(),
                     category: "ui-content".to_string(),
+                    ..Default::default()
                 },
                 AcceptanceCriterion {
                     id: "unit-tests-pass".to_string(),
@@ -1068,6 +1070,7 @@ mod tests {
                     priority: CriterionPriority::Important,
                     verification_hint: "Run unit tests for dark mode component".to_string(),
                     category: "behavior".to_string(),
+                    ..Default::default()
                 },
                 AcceptanceCriterion {
                     id: "manual-visual-review".to_string(),
@@ -1076,12 +1079,14 @@ mod tests {
                     priority: CriterionPriority::Optional,
                     verification_hint: "Visual inspection".to_string(),
                     category: "style".to_string(),
+                    ..Default::default()
                 },
             ],
             assumptions: vec![
                 "Project uses TypeScript".to_string(),
                 "Frontend runs on localhost:3001".to_string(),
             ],
+            bugfix_context: None,
         }
     }
 
@@ -1112,8 +1117,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Run `npx tsc --noEmit`".to_string(),
                 category: "compilation".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = synthesize_verification_steps(&criteria, "");
@@ -1138,8 +1145,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Assert button exists".to_string(),
                 category: "ui-content".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = synthesize_verification_steps(&criteria, "");
@@ -1159,8 +1168,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Run tests".to_string(),
                 category: "behavior".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         // With vitest context
@@ -1230,8 +1241,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Run `npm run build`".to_string(),
                 category: "compilation".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let synthesis = synthesize_verification_steps(&criteria, "");
@@ -1253,8 +1266,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "run something".to_string(),
                 category: "general".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let workflow = json!({
@@ -1293,6 +1308,7 @@ mod tests {
             goal_summary: "Nothing".to_string(),
             criteria: vec![],
             assumptions: vec![],
+            bugfix_context: None,
         };
         let workflow = json!({});
 
@@ -1313,8 +1329,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "run it".to_string(),
                 category: "general".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         // Use singular criterion_id field (as the builder might produce)
@@ -1334,6 +1352,7 @@ mod tests {
             goal_summary: "Nothing to do".to_string(),
             criteria: vec![],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = synthesize_verification_steps(&criteria, "");
@@ -1365,6 +1384,7 @@ mod tests {
             priority: CriterionPriority::Critical,
             verification_hint: "Assert element 'toggle-dark-mode' exists".to_string(),
             category: "ui-content".to_string(),
+            ..Default::default()
         };
 
         let assertion = criterion_to_spec_assertion(&criterion);
@@ -1473,8 +1493,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Check toggle exists".to_string(),
                 category: "ui-content".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = update_page_specs_from_criteria(
@@ -1527,8 +1549,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "run it".to_string(),
                 category: "compilation".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = update_page_specs_from_criteria(
@@ -1576,8 +1600,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "run auth test".to_string(),
                 category: "behavior".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         // "Fix authentication backend" has nothing to do with "dashboard"
@@ -1598,6 +1624,7 @@ mod tests {
             goal_summary: "".to_string(),
             criteria: vec![],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = update_page_specs_from_criteria(
@@ -1623,8 +1650,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "git push".to_string(),
                 category: "behavior".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         assert_eq!(
@@ -1644,8 +1673,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Assert exists".to_string(),
                 category: "ui-content".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         assert_eq!(
@@ -1665,8 +1696,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "Run checkpoint test".to_string(),
                 category: "data-integrity".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         assert_eq!(
@@ -1696,8 +1729,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "git push".to_string(),
                 category: "behavior".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = update_page_specs_from_criteria(
@@ -1734,8 +1769,10 @@ mod tests {
                 priority: CriterionPriority::Critical,
                 verification_hint: "run test".to_string(),
                 category: "data-integrity".to_string(),
+                ..Default::default()
             }],
             assumptions: vec![],
+            bugfix_context: None,
         };
 
         let result = update_page_specs_from_criteria(

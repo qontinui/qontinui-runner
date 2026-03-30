@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{NaiveDateTime, TimeZone, Utc};
 use rusqlite::{types::ValueRef, Connection};
 use tokio_postgres::{types::ToSql, NoTls};
 
@@ -51,6 +52,9 @@ const ORDERED_TABLES: &[&str] = &[
     "learning_outcomes",
     "unified_workflows",
     "stall_events",
+    "state_machine_configs",
+    "process_sessions",
+    "scheduled_tasks",
     // Tier 2: task_runs (self-referencing parent/root FK)
     "task_runs",
     // Tier 2b: Depends on task_runs
@@ -66,6 +70,11 @@ const ORDERED_TABLES: &[&str] = &[
     // Tier 3: Depends on tier 1 + tier 2
     "check_group_members",
     "step_progress_markers",
+    // Tier 4: Depends on tier 1 parent tables
+    "process_session_output",
+    "sm_capture_screenshots",
+    "sm_element_thumbnails",
+    "scheduler_history",
 ];
 
 /// SQLite columns that store booleans as INTEGER 0/1 but PG expects BOOLEAN.
@@ -349,28 +358,95 @@ fn should_skip(table: &str) -> bool {
 // PG column type lookup
 // ---------------------------------------------------------------------------
 
-async fn pg_column_types(
+/// Info about a PG column: data_type from information_schema + udt_name for USER-DEFINED.
+#[derive(Debug, Clone)]
+struct PgColInfo {
+    data_type: String,
+    udt_name: String,
+}
+
+async fn pg_column_info(
     pg: &tokio_postgres::Client,
     table: &str,
-) -> Result<HashMap<String, String>, String> {
+) -> Result<HashMap<String, PgColInfo>, String> {
+    // Prefer runner schema over public when the table exists in both.
+    // ORDER BY table_schema DESC puts 'runner' after 'public', so runner wins
+    // when inserted into the HashMap (last write wins).
     let rows = pg
         .query(
-            "SELECT column_name, data_type FROM information_schema.columns \
+            "SELECT column_name, data_type, udt_name FROM information_schema.columns \
              WHERE table_name = $1 AND table_schema IN ('runner', 'public') \
-             ORDER BY ordinal_position",
+             ORDER BY table_schema ASC, ordinal_position",
             &[&table],
         )
         .await
         .map_err(|e| format!("{}: pg column types: {}", table, e))?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
-        .collect())
+    // Build map: public columns inserted first, runner columns overwrite them.
+    let mut map = HashMap::new();
+    for r in &rows {
+        map.insert(
+            r.get::<_, String>(0),
+            PgColInfo {
+                data_type: r.get::<_, String>(1),
+                udt_name: r.get::<_, String>(2),
+            },
+        );
+    }
+    Ok(map)
 }
 
 // ---------------------------------------------------------------------------
 // Generic table migration
 // ---------------------------------------------------------------------------
+
+/// Classify a PG column into one of the coercion kinds we support.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColKind {
+    Text,
+    Bool,
+    Int32,
+    Int64,
+    Float64,
+    Timestamp,
+    Blob,
+    /// UUID, JSONB, USER-DEFINED enums, etc. — send as Text with SQL cast.
+    CastText,
+}
+
+fn classify_column(table: &str, col: &str, info: &PgColInfo, bool_cols: &HashSet<(&str, &str)>) -> ColKind {
+    // Explicit bool override from BOOL_COLUMNS list
+    if bool_cols.contains(&(table, col)) {
+        return ColKind::Bool;
+    }
+    let dt = info.data_type.as_str();
+    match dt {
+        "boolean" => ColKind::Bool,
+        "smallint" | "integer" => ColKind::Int32,
+        "bigint" => ColKind::Int64,
+        "double precision" | "real" | "numeric" => ColKind::Float64,
+        "bytea" => ColKind::Blob,
+        _ if dt.contains("timestamp") => ColKind::Timestamp,
+        // text, character varying — plain text, no cast needed
+        "text" | "character varying" | "character" => ColKind::Text,
+        // uuid, jsonb, json, USER-DEFINED (enums), ARRAY, etc. — need SQL cast
+        _ => ColKind::CastText,
+    }
+}
+
+/// Build the SQL placeholder for a column.
+/// For CastText columns, generates `$N::text::udt_name` — the double cast tells PG
+/// to accept the parameter as TEXT (matching the Rust String wire type) and then
+/// cast to the target type server-side.
+fn build_placeholder(idx: usize, kind: ColKind, info: &PgColInfo) -> String {
+    let n = idx + 1;
+    match kind {
+        ColKind::CastText => {
+            // Double cast: text (wire) -> target type (server-side)
+            format!("${}::text::{}", n, info.udt_name)
+        }
+        _ => format!("${}", n),
+    }
+}
 
 async fn migrate_table(
     sqlite: &Connection,
@@ -393,8 +469,8 @@ async fn migrate_table(
         return;
     }
 
-    // Get PG column types for type coercion
-    let pg_col_types = match pg_column_types(pg, table).await {
+    // Get PG column info for type coercion
+    let pg_col_info = match pg_column_info(pg, table).await {
         Ok(m) => m,
         Err(e) => {
             stats.errors.push(e);
@@ -402,10 +478,18 @@ async fn migrate_table(
         }
     };
 
-    // Only migrate columns that exist in both SQLite and PG
+    // Only migrate columns that exist in both SQLite and PG.
+    // Exclude columns that have forward FK references handled by backfill.
+    let skip_cols: &[(&str, &str)] = &[
+        // unified_workflows.generated_by_task_run_id → task_runs (backfilled after task_runs)
+        ("unified_workflows", "generated_by_task_run_id"),
+    ];
     let columns: Vec<String> = sqlite_cols
         .into_iter()
-        .filter(|c| pg_col_types.contains_key(c))
+        .filter(|c| {
+            pg_col_info.contains_key(c)
+                && !skip_cols.iter().any(|(t, col)| *t == table && *col == c.as_str())
+        })
         .collect();
 
     if columns.is_empty() {
@@ -413,6 +497,15 @@ async fn migrate_table(
         stats.tables_skipped += 1;
         return;
     }
+
+    // Classify each column
+    let col_kinds: Vec<ColKind> = columns
+        .iter()
+        .map(|col| {
+            let info = pg_col_info.get(col).unwrap();
+            classify_column(table, col, info, bool_cols)
+        })
+        .collect();
 
     // For task_runs: order by depth ASC, created_at ASC (parents before children)
     let order_clause = if table == "task_runs" {
@@ -448,18 +541,13 @@ async fn migrate_table(
         return;
     }
 
-    // Build INSERT statement with parameter placeholders
+    // Build INSERT statement with typed parameter placeholders
     let placeholders: Vec<String> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
-            let pg_type = pg_col_types.get(col).map(|s| s.as_str()).unwrap_or("");
-            let idx = i + 1;
-            if pg_type.contains("timestamp") {
-                format!("${}::timestamptz", idx)
-            } else {
-                format!("${}", idx)
-            }
+            let info = pg_col_info.get(col).unwrap();
+            build_placeholder(i, col_kinds[i], info)
         })
         .collect();
 
@@ -469,40 +557,6 @@ async fn migrate_table(
         columns.join(", "),
         placeholders.join(", "),
     );
-
-    // Determine which columns need bool coercion
-    let is_bool: Vec<bool> = columns
-        .iter()
-        .map(|col| {
-            bool_cols.contains(&(table, col.as_str()))
-                || pg_col_types
-                    .get(col)
-                    .map(|t| t == "boolean")
-                    .unwrap_or(false)
-        })
-        .collect();
-
-    // Determine which columns are PG integer types (need i64 coercion)
-    let is_int: Vec<bool> = columns
-        .iter()
-        .map(|col| {
-            pg_col_types
-                .get(col)
-                .map(|t| t == "integer" || t == "bigint" || t == "smallint")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    // Determine which columns are PG float types
-    let is_float: Vec<bool> = columns
-        .iter()
-        .map(|col| {
-            pg_col_types
-                .get(col)
-                .map(|t| t == "double precision" || t == "real" || t == "numeric")
-                .unwrap_or(false)
-        })
-        .collect();
 
     // Insert rows
     let mut count = 0u64;
@@ -514,7 +568,7 @@ async fn migrate_table(
         let params: Vec<PgParam> = row
             .iter()
             .enumerate()
-            .map(|(i, val)| to_pg_param(val, is_bool[i], is_int[i], is_float[i]))
+            .map(|(i, val)| to_pg_param(val, col_kinds[i]))
             .collect();
 
         let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref()).collect();
@@ -522,6 +576,32 @@ async fn migrate_table(
         match pg.execute(&insert_sql as &str, &param_refs).await {
             Ok(_) => count += 1,
             Err(e) => {
+                // On first error per table, print detailed debug info
+                if err_count == 0 {
+                    eprintln!("  DEBUG {}: ERROR = {:?}", table, e);
+                    eprintln!("  DEBUG {}: SQL = {}", table, insert_sql);
+                    for (i, (col, param)) in columns.iter().zip(params.iter()).enumerate() {
+                        let info = pg_col_info.get(col).unwrap();
+                        let val_desc = match param {
+                            PgParam::Null => "NULL".to_string(),
+                            PgParam::Text(s) => format!("Text(len={})", s.len()),
+                            PgParam::Timestamp(Some(dt)) => format!("Timestamp({dt})"),
+                            PgParam::Timestamp(None) => "Timestamp(NULL)".to_string(),
+                            PgParam::Int64(v) => format!("Int64({v})"),
+                            PgParam::Int32(v) => format!("Int32({v})"),
+                            PgParam::Bool(v) => format!("Bool({v})"),
+                            PgParam::Float64(v) => format!("Float64({v})"),
+                            PgParam::Blob(v) => format!("Blob(len={})", v.len()),
+                            PgParam::OptBool(v) => format!("OptBool({v:?})"),
+                            PgParam::OptInt32(v) => format!("OptInt32({v:?})"),
+                            PgParam::OptInt64(v) => format!("OptInt64({v:?})"),
+                            PgParam::OptFloat64(v) => format!("OptFloat64({v:?})"),
+                            PgParam::OptText(v) => format!("OptText({:?})", v.as_ref().map(|s| format!("len={}", s.len()))),
+                            PgParam::OptBlob(v) => format!("OptBlob({:?})", v.as_ref().map(|b| format!("len={}", b.len()))),
+                        };
+                        eprintln!("    ${}: {} (pg={}:{}, kind={:?}) = {}", i+1, col, info.data_type, info.udt_name, col_kinds[i], val_desc);
+                    }
+                }
                 err_count += 1;
                 if err_count <= 3 {
                     stats
@@ -665,17 +745,21 @@ fn read_sqlite_rows(
 /// A dynamically-typed PG parameter. We need to own the value and implement
 /// `ToSql + Sync` so it can be passed as `&[&(dyn ToSql + Sync)]`.
 enum PgParam {
-    Null,
     Bool(bool),
-    Int64(i64),
     Int32(i32),
+    Int64(i64),
     Float64(f64),
     Text(String),
     Blob(Vec<u8>),
+    Null,
     OptBool(Option<bool>),
+    OptInt32(Option<i32>),
     OptInt64(Option<i64>),
     OptFloat64(Option<f64>),
     OptText(Option<String>),
+    OptBlob(Option<Vec<u8>>),
+    /// Timestamp parsed from SQLite text into chrono DateTime for PG TIMESTAMPTZ
+    Timestamp(Option<chrono::DateTime<Utc>>),
 }
 
 impl PgParam {
@@ -683,41 +767,117 @@ impl PgParam {
         match self {
             PgParam::Null => &None::<String>,
             PgParam::Bool(v) => v,
-            PgParam::Int64(v) => v,
             PgParam::Int32(v) => v,
+            PgParam::Int64(v) => v,
             PgParam::Float64(v) => v,
             PgParam::Text(v) => v,
             PgParam::Blob(v) => v,
             PgParam::OptBool(v) => v,
+            PgParam::OptInt32(v) => v,
             PgParam::OptInt64(v) => v,
             PgParam::OptFloat64(v) => v,
             PgParam::OptText(v) => v,
+            PgParam::OptBlob(v) => v,
+            PgParam::Timestamp(v) => v,
         }
     }
 }
 
-fn to_pg_param(val: &SqliteValue, is_bool: bool, is_int: bool, is_float: bool) -> PgParam {
+/// Parse a SQLite timestamp string into a chrono DateTime<Utc>.
+/// Handles common formats: ISO-8601, with/without timezone, with/without fractional seconds.
+fn parse_timestamp(s: &str) -> Option<chrono::DateTime<Utc>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Try parsing as DateTime with timezone info (e.g. "2024-01-15T10:30:00Z",
+    // "2024-01-15 10:30:00+00:00", "2024-01-15T10:30:00.123Z")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // Try common SQLite formats (no timezone — assume UTC)
+    let naive_formats = [
+        "%Y-%m-%d %H:%M:%S%.f", // "2024-01-15 10:30:00.123"
+        "%Y-%m-%d %H:%M:%S",    // "2024-01-15 10:30:00"
+        "%Y-%m-%dT%H:%M:%S%.f", // "2024-01-15T10:30:00.123"
+        "%Y-%m-%dT%H:%M:%S",    // "2024-01-15T10:30:00"
+        "%Y-%m-%d",              // "2024-01-15"
+    ];
+
+    for fmt in &naive_formats {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(Utc.from_utc_datetime(&ndt));
+        }
+    }
+
+    // Last resort: try parsing with timezone offset like "+00:00" suffix
+    // e.g. "2024-01-15 10:30:00+00:00"
+    if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f%:z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%:z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    None
+}
+
+fn to_pg_param(val: &SqliteValue, kind: ColKind) -> PgParam {
     match val {
-        SqliteValue::Null => {
-            if is_bool {
-                PgParam::OptBool(None)
-            } else if is_int {
-                PgParam::OptInt64(None)
-            } else if is_float {
-                PgParam::OptFloat64(None)
-            } else {
-                PgParam::OptText(None)
+        SqliteValue::Null => match kind {
+            ColKind::Timestamp => PgParam::Timestamp(None),
+            ColKind::Bool => PgParam::OptBool(None),
+            ColKind::Int32 => PgParam::OptInt32(None),
+            ColKind::Int64 => PgParam::OptInt64(None),
+            ColKind::Float64 => PgParam::OptFloat64(None),
+            ColKind::Blob => PgParam::OptBlob(None),
+            ColKind::Text | ColKind::CastText => PgParam::OptText(None),
+        },
+        SqliteValue::Integer(v) => match kind {
+            ColKind::Bool => PgParam::Bool(*v != 0),
+            ColKind::Int32 => PgParam::Int32(*v as i32),
+            ColKind::Float64 => PgParam::Float64(*v as f64),
+            ColKind::Timestamp => {
+                let dt = Utc.timestamp_opt(*v, 0).single();
+                PgParam::Timestamp(dt)
             }
-        }
-        SqliteValue::Integer(v) => {
-            if is_bool {
-                PgParam::Bool(*v != 0)
-            } else {
-                PgParam::Int64(*v)
+            ColKind::CastText => PgParam::Text(v.to_string()),
+            // Int64, Text, Blob — default to Int64
+            _ => PgParam::Int64(*v),
+        },
+        SqliteValue::Real(v) => match kind {
+            ColKind::Timestamp => {
+                let secs = *v as i64;
+                let nsecs = ((*v - secs as f64) * 1_000_000_000.0) as u32;
+                let dt = Utc.timestamp_opt(secs, nsecs).single();
+                PgParam::Timestamp(dt)
             }
-        }
-        SqliteValue::Real(v) => PgParam::Float64(*v),
-        SqliteValue::Text(v) => PgParam::Text(v.clone()),
-        SqliteValue::Blob(v) => PgParam::Blob(v.clone()),
+            ColKind::Int32 => PgParam::Int32(*v as i32),
+            ColKind::Int64 => PgParam::Int64(*v as i64),
+            ColKind::CastText => PgParam::Text(v.to_string()),
+            _ => PgParam::Float64(*v),
+        },
+        SqliteValue::Text(v) => match kind {
+            ColKind::Timestamp => PgParam::Timestamp(parse_timestamp(v)),
+            ColKind::Bool => {
+                let b = v == "1" || v.eq_ignore_ascii_case("true");
+                PgParam::Bool(b)
+            }
+            ColKind::Int32 => PgParam::Int32(v.parse().unwrap_or(0)),
+            ColKind::Int64 => PgParam::Int64(v.parse().unwrap_or(0)),
+            ColKind::Float64 => PgParam::Float64(v.parse().unwrap_or(0.0)),
+            // Text, CastText, Blob — send as text
+            _ => PgParam::Text(v.clone()),
+        },
+        SqliteValue::Blob(v) => match kind {
+            ColKind::Blob => PgParam::Blob(v.clone()),
+            // If PG expects text but SQLite has blob, try to convert
+            _ => match String::from_utf8(v.clone()) {
+                Ok(s) => PgParam::Text(s),
+                Err(_) => PgParam::Blob(v.clone()),
+            },
+        },
     }
 }

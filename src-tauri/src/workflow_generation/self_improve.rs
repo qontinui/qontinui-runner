@@ -4,8 +4,10 @@
 //! rates, and user feedback to build context that improves future generations.
 //! This is the planned-but-never-created module referenced in the codebase.
 
+use crate::database::pg::PgDb;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::prompt_analysis;
@@ -503,4 +505,140 @@ mod tests {
         assert!(result.contains("Historical Generation Patterns"));
         assert!(result.contains("issue"));
     }
+}
+
+// ============================================================================
+// PG-based analysis (async, called from sync context via block_on)
+// ============================================================================
+
+/// Analyze historical generation patterns from PostgreSQL.
+///
+/// PG equivalent of `analyze_generation_patterns`. Queries the same tables
+/// (task_run_findings, learning_outcomes, workflow_generation_feedback) via raw SQL.
+pub async fn analyze_generation_patterns_pg(pg: &Arc<PgDb>) -> Result<SelfImprovementContext, String> {
+    let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+    // Common verifier issues
+    let common_verifier_issues: Vec<(String, i64)> = conn
+        .query(
+            r#"SELECT f.title, COUNT(*) as cnt
+               FROM task_run_findings f
+               JOIN task_runs tr ON tr.id = f.task_run_id
+               WHERE tr.workflow_name LIKE 'AI Generate:%'
+                 AND f.category IN ('verification_issue', 'code_bug', 'structural_issue')
+               GROUP BY f.title
+               ORDER BY cnt DESC
+               LIMIT 10"#,
+            &[],
+        )
+        .await
+        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        .unwrap_or_default();
+
+    // Fixer failures
+    let fixer_failures: Vec<(String, i64)> = conn
+        .query(
+            r#"SELECT lo.strategy, COUNT(*) as cnt
+               FROM learning_outcomes lo
+               WHERE lo.status = 'failure'
+               GROUP BY lo.strategy
+               ORDER BY cnt DESC
+               LIMIT 10"#,
+            &[],
+        )
+        .await
+        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        .unwrap_or_default();
+
+    // Success rates by category
+    let success_rates: Vec<(String, i64, i64)> = conn
+        .query(
+            r#"SELECT
+                COALESCE(
+                    CASE
+                        WHEN strategy LIKE '%cat=%' THEN
+                            SUBSTRING(strategy FROM 'cat=([^)]+)')
+                        ELSE 'unknown'
+                    END,
+                    'unknown'
+                ) as category,
+                SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
+                COUNT(*) as total_count
+               FROM learning_outcomes
+               GROUP BY category
+               HAVING COUNT(*) >= 2
+               ORDER BY total_count DESC
+               LIMIT 10"#,
+            &[],
+        )
+        .await
+        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1), r.get::<_, i64>(2))).collect())
+        .unwrap_or_default();
+
+    // Commonly edited fields
+    let commonly_edited_fields: Vec<(String, i64)> = conn
+        .query(
+            r#"SELECT edited_field, COUNT(*) as cnt
+               FROM workflow_generation_feedback
+               WHERE feedback_type = 'edit' AND edited_field IS NOT NULL
+               GROUP BY edited_field
+               ORDER BY cnt DESC
+               LIMIT 5"#,
+            &[],
+        )
+        .await
+        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        .unwrap_or_default();
+
+    // Delete rate
+    let generated: i64 = conn
+        .query_one(
+            "SELECT COUNT(DISTINCT workflow_id) FROM workflow_generation_feedback",
+            &[],
+        )
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or(0);
+
+    let deleted: i64 = conn
+        .query_one(
+            "SELECT COUNT(*) FROM workflow_generation_feedback WHERE feedback_type = 'delete'",
+            &[],
+        )
+        .await
+        .map(|r| r.get(0))
+        .unwrap_or(0);
+
+    // Average rating
+    let avg_rating: Option<f64> = conn
+        .query_one(
+            "SELECT AVG(rating) FROM workflow_generation_feedback WHERE feedback_type = 'rating' AND rating IS NOT NULL",
+            &[],
+        )
+        .await
+        .ok()
+        .and_then(|r| r.get(0));
+
+    let ctx = SelfImprovementContext {
+        common_verifier_issues,
+        fixer_failures,
+        success_rates,
+        commonly_edited_fields,
+        delete_rate: (generated, deleted),
+        avg_rating,
+        // Agent insights require prompt_analysis PG migration (skipped for now)
+        specification_insights: vec![],
+        verification_blind_spots: vec![],
+        hardener_patterns: vec![],
+        builder_insights: vec![],
+    };
+
+    debug!(
+        "Self-improvement context (PG): {} verifier issues, {} fixer failures, {} categories tracked",
+        ctx.common_verifier_issues.len(),
+        ctx.fixer_failures.len(),
+        ctx.success_rates.len(),
+    );
+
+    Ok(ctx)
 }

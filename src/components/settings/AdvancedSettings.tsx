@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, X, Wrench, Settings as SettingsIcon, Monitor, Copy, RefreshCw } from "lucide-react";
+import { Check, X, Wrench, Settings as SettingsIcon, Monitor, Copy, RefreshCw, FlaskConical } from "lucide-react";
+import { instanceStorage } from "@/lib/instance-storage";
 import { SectionHeader } from "./SectionHeader";
 import { getStatusColors } from "@/design-system";
 import type { DebugSettings, LogFunction } from "./types";
@@ -31,6 +32,11 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Experimental: terminal backend
+  const [terminalBackend, setTerminalBackend] = useState<"xterm" | "ghostty">(
+    () => (instanceStorage.getItem("terminal-backend") as "xterm" | "ghostty" | null) || "xterm",
+  );
 
   // Device info state
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
@@ -366,6 +372,55 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             issues to help identify your runner in the system.
           </div>
         </div>
+      </div>
+
+      {/* Experimental Section */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm flex items-center gap-2">
+          <FlaskConical className="w-4 h-4 text-yellow-500" />
+          Experimental
+        </h4>
+
+        <p className="text-xs text-muted-foreground">
+          These features are experimental and may be unstable. Changes take effect for new terminals only.
+        </p>
+
+        <div className="space-y-2 p-3 rounded-lg bg-muted/30">
+          <div className="text-sm font-medium">Terminal Backend</div>
+          <div className="text-xs text-muted-foreground mb-2">
+            Choose the terminal rendering engine. <strong>ghostty-web</strong> uses Ghostty&apos;s
+            WASM-compiled VT parser with better Unicode handling but Canvas 2D rendering (no WebGL).
+          </div>
+          <div className="flex gap-2">
+            {(["xterm", "ghostty"] as const).map((backend) => (
+              <button
+                key={backend}
+                onClick={() => {
+                  setTerminalBackend(backend);
+                  instanceStorage.setItem("terminal-backend", backend);
+                  onLog("info", `Terminal backend set to ${backend}. Open new terminals to see the change.`);
+                }}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  terminalBackend === backend
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                }`}
+              >
+                {backend === "xterm" ? "xterm.js (default)" : "ghostty-web (experimental)"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {terminalBackend === "ghostty" && (
+          <div className="p-3 bg-yellow-500/10 rounded-lg">
+            <div className="text-xs text-yellow-200/80">
+              <strong className="text-yellow-300">Warning:</strong> ghostty-web uses Canvas 2D
+              rendering (no WebGL acceleration) and may have different behavior for some escape
+              sequences. If you experience issues, switch back to xterm.js.
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

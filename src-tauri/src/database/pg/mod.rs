@@ -57,6 +57,8 @@ pub mod hooks;
 pub mod comparison;
 pub mod tiered_info;
 pub mod adaptive_learning;
+pub mod entailment_cache;
+pub mod triggers;
 
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
@@ -430,8 +432,8 @@ impl PgDb {
                 run_id          TEXT NOT NULL,
                 phase_field     TEXT NOT NULL DEFAULT 'current_phase',
                 completion_value INTEGER NOT NULL DEFAULT 1,
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 completed       BOOLEAN NOT NULL DEFAULT false
             )",
             // Orchestrator Flows
@@ -446,8 +448,8 @@ impl PgDb {
                 outputs         TEXT,
                 tags            TEXT DEFAULT '[]',
                 version         TEXT NOT NULL DEFAULT '1.0.0',
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_orch_flows_name ON orchestrator_flows(name)",
             // Flow Executions
@@ -459,8 +461,8 @@ impl PgDb {
                 context         TEXT,
                 history         TEXT,
                 error           TEXT,
-                started_at      TEXT NOT NULL,
-                completed_at    TEXT
+                started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at    TIMESTAMPTZ
             )",
             "CREATE INDEX IF NOT EXISTS idx_flow_exec_flow ON flow_executions(flow_id)",
             "CREATE INDEX IF NOT EXISTS idx_flow_exec_status ON flow_executions(status)",
@@ -472,7 +474,7 @@ impl PgDb {
                 definition      TEXT NOT NULL,
                 message         TEXT,
                 created_by      TEXT,
-                created_at      TEXT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(flow_id, version)
             )",
             "CREATE INDEX IF NOT EXISTS idx_flow_versions_flow_id ON flow_versions(flow_id)",
@@ -485,7 +487,7 @@ impl PgDb {
                 trigger         TEXT NOT NULL,
                 state           TEXT NOT NULL DEFAULT '{}',
                 name            TEXT,
-                created_at      TEXT NOT NULL
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task ON orchestrator_checkpoints(task_id)",
             "CREATE INDEX IF NOT EXISTS idx_orch_checkpoints_task_iter ON orchestrator_checkpoints(task_id, iteration)",
@@ -596,13 +598,13 @@ impl PgDb {
                 provenance      TEXT NOT NULL DEFAULT 'seed',
                 source_fix_id   TEXT,
                 confidence      DOUBLE PRECISION DEFAULT 1.0,
-                auto_generated_at TEXT,
+                auto_generated_at TIMESTAMPTZ,
                 evidence_count  INTEGER DEFAULT 0,
                 severity        TEXT NOT NULL DEFAULT 'normal',
                 failure_count   INTEGER NOT NULL DEFAULT 0,
                 examples_json   TEXT,
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT NOT NULL
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_generation_rules_agent ON generation_rules(agent)",
             "CREATE INDEX IF NOT EXISTS idx_generation_rules_status ON generation_rules(status)",
@@ -614,7 +616,7 @@ impl PgDb {
                 task_run_id     TEXT,
                 description     TEXT NOT NULL,
                 category        TEXT,
-                created_at      TEXT NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 investigation_duration_ms INTEGER,
                 investigation_enriched_description TEXT,
                 discovery_duration_ms INTEGER,
@@ -669,7 +671,7 @@ impl PgDb {
                 span_type       TEXT DEFAULT 'agent',
                 guardrail_results_json TEXT,
                 handoff_context_json TEXT,
-                created_at      TEXT NOT NULL
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id)",
             "CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_agent_type ON pipeline_agent_traces(agent_type)",
@@ -683,8 +685,8 @@ impl PgDb {
                 recommendations_produced INTEGER NOT NULL DEFAULT 0,
                 task_run_id     TEXT,
                 status          TEXT NOT NULL DEFAULT 'running',
-                created_at      TEXT NOT NULL,
-                completed_at    TEXT
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at    TIMESTAMPTZ
             )",
             "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_runs_type ON meta_optimizer_runs(optimizer_type)",
             // Meta-Optimizer Snapshots
@@ -697,7 +699,7 @@ impl PgDb {
                 breakdown_json  TEXT DEFAULT '{}',
                 recommendation_id TEXT,
                 runs_included   INTEGER NOT NULL DEFAULT 0,
-                created_at      TEXT NOT NULL
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_type ON meta_optimizer_snapshots(snapshot_type)",
             "CREATE INDEX IF NOT EXISTS idx_meta_optimizer_snapshots_rec ON meta_optimizer_snapshots(recommendation_id)",
@@ -718,9 +720,9 @@ impl PgDb {
                 status          TEXT NOT NULL DEFAULT 'applied',
                 effectiveness   TEXT,
                 effectiveness_evidence TEXT,
-                applied_at      TEXT NOT NULL,
-                evaluated_at    TEXT,
-                created_at      TEXT NOT NULL,
+                applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                evaluated_at    TIMESTAMPTZ,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 source_agent    TEXT,
                 reasoning       TEXT,
                 alternatives_considered TEXT,
@@ -743,8 +745,8 @@ impl PgDb {
                 task_run_id     TEXT NOT NULL,
                 error_signature_hash TEXT,
                 outcome         TEXT DEFAULT 'pending',
-                applied_at      TEXT NOT NULL,
-                evaluated_at    TEXT
+                applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                evaluated_at    TIMESTAMPTZ
             )",
             "CREATE INDEX IF NOT EXISTS idx_fix_applications_fix ON fix_applications(fix_id)",
             "CREATE INDEX IF NOT EXISTS idx_fix_applications_task ON fix_applications(task_run_id)",
@@ -762,11 +764,218 @@ impl PgDb {
                 rating_comment  TEXT,
                 workflow_category TEXT,
                 workflow_description TEXT,
-                created_at      TEXT NOT NULL
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_wgf_workflow_id ON workflow_generation_feedback(workflow_id)",
             "CREATE INDEX IF NOT EXISTS idx_wgf_feedback_type ON workflow_generation_feedback(feedback_type)",
             "CREATE INDEX IF NOT EXISTS idx_wgf_created_at ON workflow_generation_feedback(created_at)",
+            // Entailment Cache (PG persistence for evaluation entailment cache)
+            "CREATE TABLE IF NOT EXISTS entailment_cache (
+                criterion_hash  BIGINT NOT NULL,
+                step_hash       BIGINT NOT NULL,
+                score           FLOAT8 NOT NULL,
+                explanation     TEXT,
+                tier            TEXT,
+                cached_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (criterion_hash, step_hash)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_entailment_cache_cached_at ON entailment_cache(cached_at)",
+            // PRM Training Exports
+            "CREATE TABLE IF NOT EXISTS prm_training_exports (
+                id              TEXT PRIMARY KEY,
+                export_format   TEXT NOT NULL DEFAULT 'jsonl',
+                total_examples  INTEGER NOT NULL DEFAULT 0,
+                passed_count    INTEGER NOT NULL DEFAULT 0,
+                failed_count    INTEGER NOT NULL DEFAULT 0,
+                fixed_count     INTEGER NOT NULL DEFAULT 0,
+                runs_processed  INTEGER NOT NULL DEFAULT 0,
+                file_path       TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_prm_exports_created ON prm_training_exports(created_at)",
+            // Playbook Entries (Adaptive Learning)
+            "CREATE TABLE IF NOT EXISTS playbook_entries (
+                id              TEXT PRIMARY KEY,
+                lesson          TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                domain          TEXT,
+                severity        TEXT NOT NULL DEFAULT 'minor',
+                source_run_id   TEXT NOT NULL,
+                source_step_id  TEXT,
+                positive        INTEGER NOT NULL DEFAULT 1,
+                times_applied   INTEGER NOT NULL DEFAULT 0,
+                times_helped    INTEGER NOT NULL DEFAULT 0,
+                embedding       BYTEA,
+                status          TEXT NOT NULL DEFAULT 'staged',
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_playbook_entries_domain ON playbook_entries(domain)",
+            "CREATE INDEX IF NOT EXISTS idx_playbook_entries_status ON playbook_entries(status)",
+            "CREATE INDEX IF NOT EXISTS idx_playbook_entries_severity ON playbook_entries(severity)",
+            // Curated Examples (Adaptive Learning)
+            "CREATE TABLE IF NOT EXISTS curated_examples (
+                id                      TEXT PRIMARY KEY,
+                domain                  TEXT NOT NULL,
+                criterion_description   TEXT NOT NULL,
+                steps_json              TEXT NOT NULL,
+                quality_score           DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                execution_verified      INTEGER NOT NULL DEFAULT 0,
+                times_used              INTEGER NOT NULL DEFAULT 0,
+                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_curated_examples_domain ON curated_examples(domain)",
+            "CREATE INDEX IF NOT EXISTS idx_curated_examples_quality ON curated_examples(quality_score)",
+            // Template Performance
+            "CREATE TABLE IF NOT EXISTS template_performance (
+                template_id         TEXT PRIMARY KEY,
+                template_name       TEXT NOT NULL,
+                source              TEXT NOT NULL DEFAULT 'manual',
+                success_count       INTEGER NOT NULL DEFAULT 0,
+                failure_count       INTEGER NOT NULL DEFAULT 0,
+                total_quality_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                last_used_at        TIMESTAMPTZ,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            // Template Lifecycle Events
+            "CREATE TABLE IF NOT EXISTS template_lifecycle_events (
+                id                          TEXT PRIMARY KEY,
+                template_id                 TEXT NOT NULL,
+                action                      TEXT NOT NULL,
+                old_source                  TEXT NOT NULL,
+                new_source                  TEXT NOT NULL,
+                confidence_at_transition    DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_lifecycle_events_template ON template_lifecycle_events(template_id)",
+            // GEPA Optimization Runs
+            "CREATE TABLE IF NOT EXISTS gepa_optimization_runs (
+                id                  TEXT PRIMARY KEY,
+                domain              TEXT NOT NULL,
+                old_instructions    TEXT NOT NULL,
+                new_instructions    TEXT,
+                old_score           DOUBLE PRECISION,
+                new_score           DOUBLE PRECISION,
+                improvement         DOUBLE PRECISION,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_gepa_runs_domain ON gepa_optimization_runs(domain)",
+            "CREATE INDEX IF NOT EXISTS idx_gepa_runs_created ON gepa_optimization_runs(created_at)",
+            // Step Templates (exploration-based generation)
+            "CREATE TABLE IF NOT EXISTS step_templates (
+                id                      TEXT PRIMARY KEY,
+                domain                  TEXT NOT NULL,
+                pattern_description     TEXT NOT NULL,
+                template_steps_json     TEXT NOT NULL,
+                parameters_json         TEXT NOT NULL DEFAULT '[]',
+                success_count           INTEGER NOT NULL DEFAULT 0,
+                failure_count           INTEGER NOT NULL DEFAULT 0,
+                confidence              DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                source                  TEXT NOT NULL DEFAULT 'seeded',
+                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_step_templates_domain ON step_templates(domain)",
+            // Exploration Stats
+            "CREATE TABLE IF NOT EXISTS exploration_stats (
+                id                  TEXT PRIMARY KEY,
+                workflow_id         TEXT,
+                task_run_id         TEXT,
+                total_candidates    INTEGER NOT NULL DEFAULT 0,
+                search_depth        INTEGER NOT NULL DEFAULT 0,
+                search_duration_ms  INTEGER NOT NULL DEFAULT 0,
+                best_score          DOUBLE PRECISION,
+                strategy_used       TEXT,
+                score_progression   TEXT,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_exploration_stats_workflow ON exploration_stats(workflow_id)",
+            // Workflow Triggers
+            "CREATE TABLE IF NOT EXISTS workflow_triggers (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                description         TEXT,
+                trigger_type        TEXT NOT NULL,
+                trigger_config      TEXT NOT NULL,
+                workflow_id         TEXT NOT NULL,
+                workflow_overrides  TEXT,
+                conditions          TEXT NOT NULL DEFAULT '[]',
+                debounce_ms         BIGINT NOT NULL DEFAULT 1000,
+                cooldown_seconds    BIGINT NOT NULL DEFAULT 60,
+                max_concurrent      INTEGER NOT NULL DEFAULT 1,
+                retry_count         INTEGER NOT NULL DEFAULT 0,
+                retry_delay_seconds BIGINT NOT NULL DEFAULT 30,
+                enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+                last_triggered_at   TIMESTAMPTZ,
+                last_execution_id   TEXT,
+                trigger_count       BIGINT NOT NULL DEFAULT 0,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_wt_enabled ON workflow_triggers(enabled) WHERE enabled",
+            "CREATE INDEX IF NOT EXISTS idx_wt_workflow ON workflow_triggers(workflow_id)",
+            // Trigger History
+            "CREATE TABLE IF NOT EXISTS trigger_history (
+                id              TEXT PRIMARY KEY,
+                trigger_id      TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                event_data      TEXT,
+                action          TEXT NOT NULL,
+                task_run_id     TEXT,
+                error_message   TEXT,
+                triggered_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_th_trigger ON trigger_history(trigger_id)",
+            "CREATE INDEX IF NOT EXISTS idx_th_triggered_at ON trigger_history(triggered_at)",
+            // SM Element Thumbnails
+            "CREATE TABLE IF NOT EXISTS sm_element_thumbnails (
+                config_id           TEXT NOT NULL,
+                fingerprint_hash    TEXT NOT NULL,
+                thumbnail_base64    TEXT NOT NULL,
+                PRIMARY KEY (config_id, fingerprint_hash)
+            )",
+            // SM Capture Screenshots
+            "CREATE TABLE IF NOT EXISTS sm_capture_screenshots (
+                id                      TEXT PRIMARY KEY,
+                config_id               TEXT NOT NULL,
+                capture_index           INTEGER NOT NULL,
+                screenshot_webp         BYTEA NOT NULL,
+                width                   INTEGER NOT NULL,
+                height                  INTEGER NOT NULL,
+                element_bounds_json     TEXT NOT NULL DEFAULT '{}',
+                fingerprint_hashes_json TEXT NOT NULL DEFAULT '[]',
+                captured_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_scs_config ON sm_capture_screenshots(config_id)",
+            // Iteration Logs
+            "CREATE TABLE IF NOT EXISTS iteration_logs (
+                id              TEXT PRIMARY KEY,
+                task_run_id     TEXT NOT NULL,
+                iteration       INTEGER NOT NULL DEFAULT 0,
+                provider_used   TEXT,
+                model_used      TEXT,
+                duration_ms     INTEGER,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_iteration_logs_task_run ON iteration_logs(task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_iteration_logs_provider ON iteration_logs(provider_used) WHERE provider_used IS NOT NULL",
+            // Issue Pattern Templates
+            "CREATE TABLE IF NOT EXISTS issue_pattern_templates (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                description         TEXT NOT NULL,
+                category            TEXT NOT NULL,
+                detection_type      TEXT NOT NULL,
+                step_template       TEXT,
+                ai_prompt_template  TEXT,
+                parameters          TEXT NOT NULL DEFAULT '[]',
+                built_in            BOOLEAN NOT NULL DEFAULT FALSE,
+                status              TEXT NOT NULL DEFAULT 'active',
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
         ];
 
         for sql in &ddl {

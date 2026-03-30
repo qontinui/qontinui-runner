@@ -29,7 +29,8 @@ use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
     format_skills_for_generator, format_skills_for_generator_filtered,
 };
-use rusqlite::Connection;
+use crate::database::pg::PgDb;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -346,12 +347,13 @@ pub fn run_hardener_agent(
     workflow: &UnifiedWorkflow,
     description: &str,
     doctor_handle: Option<&DoctorHandle>,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
     skill_registry: &SkillRegistry,
     insights_section: Option<&str>,
     tool_tags: Option<&[String]>,
+    constitution: Option<&str>,
 ) -> (UnifiedWorkflow, Option<HardeningSummary>, Option<String>) {
     // Step 0: Apply deterministic fixups before AI hardening
     let mut workflow = fix_sdk_urls(workflow);
@@ -398,10 +400,11 @@ pub fn run_hardener_agent(
         &workflow_json,
         description,
         &app_context,
-        conn,
+        pg_db,
         skill_registry,
         insights_section,
         tool_tags,
+        constitution,
     );
     let task_context = TaskContext::from_prompt(&prompt);
 
@@ -1223,10 +1226,11 @@ fn build_hardener_prompt(
     workflow_json: &str,
     description: &str,
     app_context: &AppContext,
-    conn: Option<&Connection>,
+    pg_db: Option<&Arc<PgDb>>,
     skill_registry: &SkillRegistry,
     insights_section: Option<&str>,
     tool_tags: Option<&[String]>,
+    constitution: Option<&str>,
 ) -> String {
     let mut prompt = format!(
         r#"You are a verification hardener agent for Qontinui Runner.
@@ -1239,9 +1243,12 @@ approach. The workflow below was generated for this task: "{description}"
         description = description,
     );
 
-    // Load conversion rules from DB or use fallback
-    let conversion_rules = if let Some(conn) = conn {
-        let all = rules::load_rules(conn, "hardener", "conversion_rules");
+    // Load conversion rules from PG or use fallback
+    let conversion_rules = if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let all = tokio::runtime::Handle::current().block_on(async {
+            pg_clone.get_active_rules("hardener", Some("conversion_rules")).await.unwrap_or_default()
+        });
         if !all.is_empty() {
             // Filter by condition
             let filtered: Vec<_> = all
@@ -1456,9 +1463,12 @@ verify that the tab has spatial visualization content. Add content-specific chec
         ));
     }
 
-    // Load critical rules from DB or use fallback
-    let critical_section = if let Some(conn) = conn {
-        let critical = rules::load_rules(conn, "hardener", "critical_rules");
+    // Load critical rules from PG or use fallback
+    let critical_section = if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let critical = tokio::runtime::Handle::current().block_on(async {
+            pg_clone.get_active_rules("hardener", Some("critical_rules")).await.unwrap_or_default()
+        });
         if !critical.is_empty() {
             let mut s = String::from("\n## Critical Rules\n\n");
             s.push_str(&rules::format_rules_as_markdown(&critical));
@@ -1511,6 +1521,13 @@ verify that the tab has spatial visualization content. Add content-specific chec
             prompt.push_str("\n\n");
             prompt.push_str(insights);
         }
+    }
+
+    // Inject project constitution so hardened steps respect project constraints
+    if let Some(constitution_text) = constitution {
+        prompt.push_str("\n\n");
+        prompt.push_str(&crate::workflow_generation::constitution::format_constitution_for_prompt(constitution_text));
+        prompt.push_str("Hardened steps MUST comply with the constitution. Do NOT introduce commands or patterns that violate these constraints.\n");
     }
 
     prompt.push_str(&format!(
@@ -2146,7 +2163,7 @@ mod tests {
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
         let prompt =
-            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
+            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None, None);
         assert!(prompt.contains("Rule 4"));
         assert!(prompt.contains("page navigation"));
     }
@@ -2158,7 +2175,7 @@ mod tests {
         ]);
         let ctx = AppContext::from_workflow(&workflow, "test");
         let prompt =
-            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
+            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None, None);
         assert!(prompt.contains("ai/search"));
         assert!(prompt.contains("total"));
         assert!(prompt.contains("grep"));
@@ -2203,7 +2220,7 @@ mod tests {
             vec![json!({"id": "a1", "type": "prompt", "content": "Implement thumbnails"})];
         let ctx = AppContext::from_workflow(&workflow, "test");
         let prompt =
-            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None);
+            build_hardener_prompt("{}", "test", &ctx, None, &SkillRegistry::new(), None, None, None);
         assert!(prompt.contains("Rule 5"));
         assert!(prompt.contains("agentic step"));
         assert!(prompt.contains("verification coverage"));

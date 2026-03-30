@@ -232,13 +232,13 @@ impl LoopController {
         let service = crate::trigger_system::get_trigger_service().await;
         if let Some(service) = service {
             let tx = service.event_sender();
-            let db = self.checkpoint_db.clone();
+            let pg_db = self.app_state.pg_db.clone();
             let wf_id = workflow_id.to_string();
             let exec_id = execution_id.to_string();
             let status = status.to_string();
             tokio::spawn(async move {
                 crate::trigger_system::watchers::workflow_chain::check_workflow_chains(
-                    &db, &tx, &wf_id, &exec_id, &status, None,
+                    &pg_db, &tx, &wf_id, &exec_id, &status, None,
                 )
                 .await;
             });

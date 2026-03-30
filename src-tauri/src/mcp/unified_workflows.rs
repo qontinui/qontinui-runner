@@ -790,12 +790,13 @@ pub async fn generate_unified_workflow_handler(
     // Clone handles so they can be moved into the blocking closure
     let doctor_handle = state.doctor_handle.clone();
     let pg_db = state.app_state.pg_db.clone();
+    let pg_clone = pg_db.clone();
 
     let (result, artifact) = tokio::task::spawn_blocking(move || {
         let (response, artifact) = workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
-            None,
+            Some(&pg_clone),
             None,
         );
         (response, artifact)
@@ -886,7 +887,7 @@ pub async fn generate_unified_workflow_async_handler(
     let meta_workflow =
         build_meta_workflow_template(&request, &resolved_contexts, historical_context.as_ref());
 
-    // Save the meta-workflow to database
+    // Save the meta-workflow to database (SQLite + PG)
     let mut create_request =
         crate::unified_workflows::CreateUnifiedWorkflowRequest::from(&meta_workflow);
     create_request.generated_by_task_run_id = None; // Will be set after task run creation
@@ -906,6 +907,16 @@ pub async fn generate_unified_workflow_async_handler(
         }
     };
 
+    // Also persist to PostgreSQL so listing endpoints (which read from PG) can find it
+    if let Err(e) = state
+        .app_state
+        .pg_db
+        .create_unified_workflow_with_id(&saved_workflow.id, &create_request)
+        .await
+    {
+        warn!("Failed to save meta-workflow to PG (non-fatal): {}", e);
+    }
+
     // Create a task run for this workflow
     let task_run_id = uuid::Uuid::new_v4().to_string();
     let simple_prompt: String = saved_workflow
@@ -914,6 +925,10 @@ pub async fn generate_unified_workflow_async_handler(
         .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
+    let port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
     let task_run_input = CreateTaskRunInput::new(&task_run_id, &saved_workflow.name)
         .with_task_type("ai")
         .with_prompt(&simple_prompt)
@@ -921,7 +936,8 @@ pub async fn generate_unified_workflow_async_handler(
         .with_workflow_name(&saved_workflow.name)
         .with_workflow_id(&saved_workflow.id)
         .with_max_sessions(saved_workflow.max_iterations)
-        .with_auto_continue(true);
+        .with_auto_continue(true)
+        .with_runner_port(port);
 
     if let Err(e) = state
         .app_state
@@ -933,6 +949,16 @@ pub async fn generate_unified_workflow_async_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to create task run: {}", e))),
         ));
+    }
+
+    // Also persist to PostgreSQL so listing endpoints (which read from PG) can find it
+    if let Err(e) = state
+        .app_state
+        .pg_db
+        .create_task_run(&task_run_input)
+        .await
+    {
+        warn!("Failed to create task run in PG (non-fatal): {}", e);
     }
 
     info!(

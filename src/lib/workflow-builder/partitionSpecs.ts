@@ -24,7 +24,7 @@ export interface SpecPartition {
 export type PartitionStrategy = "round-robin" | "by-app" | "by-tag" | "balanced";
 
 /** Count total enabled assertions across all groups in a spec. */
-function countAssertions(spec: DiscoveredSpec): number {
+export function countAssertions(spec: DiscoveredSpec): number {
   return spec.config.groups.reduce((sum, group) => {
     return sum + group.assertions.filter((a) => a.enabled !== false).length;
   }, 0);

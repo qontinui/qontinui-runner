@@ -27,6 +27,12 @@ interface PipelineConfig {
     timeout_secs: number | null;
     additional_context: string | null;
   } | null;
+  diagnose: {
+    assertions: Record<string, unknown>[];
+    capture_snapshot: boolean;
+    snapshot_max_chars: number;
+    model_override: string | null;
+  } | null;
 }
 
 interface RunnerInstance {
@@ -63,6 +69,14 @@ interface IterationResult {
   generated_workflow_id?: string | null;
   fixes_implemented?: boolean | null;
   rebuild_triggered?: boolean | null;
+  diagnostic_result?: {
+    passed: boolean;
+    page_health: Record<string, unknown>;
+    assertion_results: Record<string, unknown>[];
+    root_cause: string | null;
+    diagnosis: string | null;
+    prompt_rewrite_suggestion: string | null;
+  } | null;
 }
 
 interface SavedOlConfig {
@@ -100,6 +114,7 @@ const PHASE_COLORS: Record<string, string> = {
   idle: "text-muted-foreground",
   running_workflow: "text-blue-400",
   building_workflow: "text-yellow-400",
+  diagnosing: "text-teal-400",
   evaluating_exit: "text-yellow-400",
   reflecting: "text-purple-400",
   implementing_fixes: "text-orange-400",
@@ -116,6 +131,7 @@ const PHASE_BG: Record<string, string> = {
   error: "bg-red-500/10",
   running_workflow: "bg-blue-500/10",
   building_workflow: "bg-yellow-500/10",
+  diagnosing: "bg-teal-500/10",
   reflecting: "bg-purple-500/10",
   implementing_fixes: "bg-orange-500/10",
   waiting_for_fixer: "bg-cyan-500/10",
@@ -372,6 +388,7 @@ export function OrchestrationLoopPanel() {
           implement_fixes: enableFixes
             ? { model: null, timeout_secs: 600, additional_context: fixContext || null }
             : null,
+          diagnose: null,
         },
       };
     } else {
@@ -808,6 +825,7 @@ export function OrchestrationLoopPanel() {
                     <option value="reflection">Reflection (0 fixes)</option>
                     <option value="workflow_verification">Verification</option>
                     <option value="fixed_iterations">Fixed Iterations</option>
+                    <option value="diagnostic_evaluation">Diagnostic Evaluation</option>
                   </select>
                 </div>
               </div>

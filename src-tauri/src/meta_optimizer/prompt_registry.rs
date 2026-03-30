@@ -4,7 +4,6 @@
 //! humans activate them from the UI.
 
 use std::sync::Arc;
-use rusqlite::params;
 use tokio::runtime::Handle;
 use tracing::info;
 
@@ -22,36 +21,6 @@ pub fn get_active_prompt(
     let _ = db;
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.get_active_prompt(agent_type))
-    })
-}
-
-/// Get the active prompt using SQLite only (for contexts without PG access).
-/// Retained for backward compatibility in compute_group_metrics_inner.
-#[allow(dead_code)]
-pub(crate) fn get_active_prompt_sqlite(
-    db: &CheckpointDb,
-    agent_type: &str,
-) -> Result<Option<PromptVariant>, String> {
-    let agent_type = agent_type.to_string();
-    db.with_conn(move |conn| {
-        let result = conn.query_row(
-            r#"SELECT id, agent_type, variant_name, prompt_content, version,
-                      is_active, source_recommendation_id, performance_metrics,
-                      created_at, updated_at
-               FROM prompt_registry WHERE agent_type = ?1 AND is_active = 1 LIMIT 1"#,
-            params![agent_type],
-            |row| Ok(PromptVariant {
-                id: row.get(0)?, agent_type: row.get(1)?, variant_name: row.get(2)?,
-                prompt_content: row.get(3)?, version: row.get(4)?, is_active: row.get::<_, i32>(5)? != 0,
-                source_recommendation_id: row.get(6)?, performance_metrics: row.get(7)?,
-                created_at: row.get(8)?, updated_at: row.get(9)?,
-            }),
-        );
-        match result {
-            Ok(variant) => Ok(Some(variant)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to get active prompt: {}", e)),
-        }
     })
 }
 

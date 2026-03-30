@@ -236,6 +236,10 @@ pub async fn resume_interrupted_workflows(
                         task_run.id, e
                     );
                 }
+                // PG: also mark completed in PostgreSQL
+                if let Err(e) = app_state.pg_db.complete_task_run(&task_run.id).await {
+                    error!("Failed to mark task {} as completed in PG: {}", task_run.id, e);
+                }
                 processed_count += 1;
                 continue;
             }
@@ -257,19 +261,18 @@ pub async fn resume_interrupted_workflows(
                 "Marking interrupted {} workflow '{}' (id: {}) as stopped — programmatic workflows cannot be resumed",
                 kind, task_run.task_name, task_run.id
             );
-            if let Err(e) = db.stop_task_run_with_reason(
-                &task_run.id,
-                &format!(
-                    "Interrupted by app restart ({} workflow — not resumable)",
-                    kind
-                ),
-            ) {
+            let reason = format!("Interrupted by app restart ({} workflow — not resumable)", kind);
+            if let Err(e) = db.stop_task_run_with_reason(&task_run.id, &reason) {
                 error!(
                     "Failed to mark {} workflow {} as stopped: {}",
                     kind, task_run.id, e
                 );
             } else {
                 processed_count += 1;
+            }
+            // PG: also mark stopped in PostgreSQL
+            if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
+                error!("Failed to mark task {} as stopped in PG: {}", task_run.id, e);
             }
             continue;
         }
@@ -454,17 +457,13 @@ pub async fn resume_interrupted_workflows(
                             "Workflow definition {} not found for task {} and task has been running for over {} seconds - marking as failed",
                             wf_id, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
-                        if let Err(e) = db.fail_task_run(
-                            &task_run.id,
-                            &format!(
-                                "Workflow definition '{}' not found and task exceeded stale timeout ({}s)",
-                                wf_id, STALE_RUNNING_TASK_TIMEOUT_SECS
-                            ),
-                        ) {
+                        let reason = format!("Workflow definition '{}' not found and task exceeded stale timeout ({}s)", wf_id, STALE_RUNNING_TASK_TIMEOUT_SECS);
+                        if let Err(e) = db.fail_task_run(&task_run.id, &reason) {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
                         } else {
                             processed_count += 1;
                         }
+                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
                     } else {
                         warn!(
                             "Workflow definition {} not found for task {} - preserving 'running' status (will auto-fail after {}s)",
@@ -479,17 +478,13 @@ pub async fn resume_interrupted_workflows(
                             "Task {} has been running for over {} seconds and workflow fetch failed - marking as failed",
                             task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
-                        if let Err(e2) = db.fail_task_run(
-                            &task_run.id,
-                            &format!(
-                                "Failed to fetch workflow definition and task exceeded stale timeout ({}s): {}",
-                                STALE_RUNNING_TASK_TIMEOUT_SECS, e
-                            ),
-                        ) {
+                        let reason2 = format!("Failed to fetch workflow definition and task exceeded stale timeout ({}s): {}", STALE_RUNNING_TASK_TIMEOUT_SECS, e);
+                        if let Err(e2) = db.fail_task_run(&task_run.id, &reason2) {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
                         } else {
                             processed_count += 1;
                         }
+                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason2).await;
                     }
                 }
             }
@@ -670,17 +665,13 @@ pub async fn resume_interrupted_workflows(
                             "Workflow definition not found by name '{}' for task {} and task has been running for over {} seconds - marking as failed",
                             wf_name, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
-                        if let Err(e) = db.fail_task_run(
-                            &task_run.id,
-                            &format!(
-                                "Workflow definition '{}' not found and task exceeded stale timeout ({}s)",
-                                wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS
-                            ),
-                        ) {
+                        let reason = format!("Workflow definition '{}' not found and task exceeded stale timeout ({}s)", wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS);
+                        if let Err(e) = db.fail_task_run(&task_run.id, &reason) {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
                         } else {
                             processed_count += 1;
                         }
+                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
                     } else {
                         warn!(
                             "Workflow definition not found by name '{}' for task {} - preserving 'running' status (will auto-fail after {}s)",
@@ -698,17 +689,13 @@ pub async fn resume_interrupted_workflows(
                             "Task {} has been running for over {} seconds and workflow name lookup failed - marking as failed",
                             task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
-                        if let Err(e2) = db.fail_task_run(
-                            &task_run.id,
-                            &format!(
-                                "Failed to look up workflow '{}' and task exceeded stale timeout ({}s): {}",
-                                wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS, e
-                            ),
-                        ) {
+                        let reason = format!("Failed to look up workflow '{}' and task exceeded stale timeout ({}s): {}", wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS, e);
+                        if let Err(e2) = db.fail_task_run(&task_run.id, &reason) {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
                         } else {
                             processed_count += 1;
                         }
+                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
                     }
                 }
             }
@@ -717,17 +704,13 @@ pub async fn resume_interrupted_workflows(
                 "Could not extract workflow ID from task_id '{}' and no workflow_name set - task has been running for over {} seconds, marking as failed",
                 task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
             );
-            if let Err(e) = db.fail_task_run(
-                &task_run.id,
-                &format!(
-                    "No workflow definition could be resolved and task exceeded stale timeout ({}s)",
-                    STALE_RUNNING_TASK_TIMEOUT_SECS
-                ),
-            ) {
+            let reason = format!("No workflow definition could be resolved and task exceeded stale timeout ({}s)", STALE_RUNNING_TASK_TIMEOUT_SECS);
+            if let Err(e) = db.fail_task_run(&task_run.id, &reason) {
                 error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
             } else {
                 processed_count += 1;
             }
+            let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
         } else {
             warn!(
                 "Could not extract workflow ID from task_id '{}' and no workflow_name set - preserving 'running' status (will auto-fail after {}s)",

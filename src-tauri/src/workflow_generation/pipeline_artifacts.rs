@@ -57,8 +57,17 @@ pub struct PipelineArtifact {
     pub quality_report: Option<serde_json::Value>,
     pub revision_cycles: Option<u32>,
 
+    // Consistency check
+    pub consistency_report: Option<serde_json::Value>,
+
     // Quality gate
     pub confidence_score: Option<f32>,
+
+    // Pipeline classification
+    pub pipeline_depth: Option<String>,
+
+    // Code graph stats
+    pub code_graph_stats: Option<serde_json::Value>,
 
     // Outcome
     pub success: bool,
@@ -119,7 +128,13 @@ pub struct PipelineArtifactBuilder {
     pub quality_report: Option<serde_json::Value>,
     pub revision_cycles: Option<u32>,
 
+    pub consistency_report: Option<serde_json::Value>,
+
     pub confidence_score: Option<f32>,
+
+    pub pipeline_depth: Option<String>,
+
+    pub code_graph_stats: Option<serde_json::Value>,
 
     pub success: bool,
     pub error_message: Option<String>,
@@ -184,7 +199,13 @@ impl PipelineArtifactBuilder {
             quality_report: self.quality_report,
             revision_cycles: self.revision_cycles,
 
+            consistency_report: self.consistency_report,
+
             confidence_score: self.confidence_score,
+
+            pipeline_depth: self.pipeline_depth,
+
+            code_graph_stats: self.code_graph_stats,
 
             success: self.success,
             error_message: self.error_message,

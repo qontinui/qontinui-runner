@@ -750,14 +750,8 @@ fn run_claude_session_inline(
 
         // Only process if we have a finding context
         if let Some(ctx) = finding_ctx_for_processor {
-            // Open a database connection for this thread
-            let db = match CheckpointDb::new() {
-                Ok(db) => Some(db),
-                Err(e) => {
-                    warn!("Failed to open database for finding storage: {}", e);
-                    None
-                }
-            };
+            // PG is the primary DB; check availability once.
+            let pg_available = pg_rt.is_some() && crate::database::pg::PgDb::try_global().is_some();
 
             // Process incoming findings from the channel.
             // Use recv_timeout + session_done check so we don't block forever
@@ -781,8 +775,8 @@ fn run_claude_session_inline(
                     parsed_finding.severity.as_str()
                 );
 
-                // Store in database if connection is available
-                if let Some(ref db) = db {
+                // Store in database if PG is available
+                if pg_available {
                     // Check if this is a resolved finding (marked via :resolved modifier)
                     let is_resolved = parsed_finding.is_resolved;
 
@@ -859,14 +853,16 @@ fn run_claude_session_inline(
                                             data.cve_ids.len(),
                                             data.exploit_available
                                         );
-                                        // Store enrichment as task_knowledge for retrieval
-                                        if let Ok(db) = crate::database::CheckpointDb::new() {
+                                        // Store enrichment as task_knowledge via PG
+                                        if let Some(pg) = crate::database::pg::PgDb::try_global() {
                                             let content = format!(
                                                 "## Vulnerability Enrichment: {}\n\n{}",
                                                 finding_title,
                                                 data.to_markdown()
                                             );
-                                            if let Err(e) = db.create_task_knowledge(
+                                            let knowledge_id = uuid::Uuid::new_v4().to_string();
+                                            if let Err(e) = pg.create_task_knowledge(
+                                                &knowledge_id,
                                                 &task_run_id,
                                                 "vulnerability_enrichment",
                                                 "system",
@@ -874,8 +870,8 @@ fn run_claude_session_inline(
                                                 &content,
                                                 None,
                                                 "high",
-                                                &[],
-                                            ) {
+                                                "[]",
+                                            ).await {
                                                 tracing::warn!("[knowledge_acquisition] Failed to store enrichment: {}", e);
                                             }
                                         }
@@ -919,14 +915,12 @@ fn run_claude_session_inline(
 
         // Only process if we have a progress context
         if let Some(ctx) = progress_ctx_for_processor {
-            // Open a database connection for this thread
-            let db = match CheckpointDb::new() {
-                Ok(db) => Some(db),
-                Err(e) => {
-                    warn!("Failed to open database for progress storage: {}", e);
-                    None
-                }
-            };
+            // Use PgDb for progress storage (async via thread-local runtime)
+            let pg_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
+            let pg = crate::database::pg::PgDb::try_global();
 
             // Process incoming progress markers from the channel.
             // Use recv_timeout + session_done check so we don't block forever
@@ -967,16 +961,16 @@ fn run_claude_session_inline(
                     None
                 };
 
-                // Store in database if connection is available
-                if let Some(ref db) = db {
-                    match db.save_step_progress_marker(
+                // Store in database via PG
+                if let (Some(ref rt), Some(ref pg)) = (&pg_rt, &pg) {
+                    match rt.block_on(pg.save_step_progress_marker(
                         &ctx.checkpoint_id,
                         &parsed_progress.marker_type,
                         parsed_progress.current,
                         parsed_progress.total,
                         parsed_progress.description.as_deref(),
                         data_json.as_deref(),
-                    ) {
+                    )) {
                         Ok(_marker_id) => {
                             progress_count += 1;
 
@@ -1104,14 +1098,6 @@ fn run_claude_session_inline(
                 .enable_all()
                 .build()
                 .ok();
-            let db = match CheckpointDb::new() {
-                Ok(db) => Some(db),
-                Err(e) => {
-                    warn!("Failed to open database for reflection fix storage: {}", e);
-                    None
-                }
-            };
-
             // Use recv_timeout + session_done check so we don't block forever
             // if the stdout thread is abandoned and never drops the sender.
             loop {
@@ -1130,7 +1116,7 @@ fn run_claude_session_inline(
                     parsed_fix.description, parsed_fix.fix_type, parsed_fix.confidence
                 );
 
-                if pg_rt.is_some() || db.is_some() {
+                if pg_rt.is_some() {
                     let input = CreateReflectionFixInput {
                         source_task_run_id: ctx.source_task_run_id.clone(),
                         reflection_task_run_id: ctx.reflection_task_run_id.clone(),
@@ -1474,17 +1460,6 @@ fn run_claude_session_inline(
 
             if let Some(ctx) = inferred_ctx {
                 // We successfully inferred the context — process fixes normally
-                let db = match CheckpointDb::new() {
-                    Ok(db) => Some(db),
-                    Err(e) => {
-                        warn!(
-                            "Failed to open database for reflection fix storage (inferred ctx): {}",
-                            e
-                        );
-                        None
-                    }
-                };
-
                 loop {
                     let parsed_fix = match reflection_fix_rx.recv_timeout(Duration::from_secs(2)) {
                         Ok(f) => f,

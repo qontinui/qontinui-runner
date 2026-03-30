@@ -82,7 +82,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
-                          task_run_id, status, created_at, completed_at
+                          task_run_id, status, created_at::TEXT, completed_at::TEXT
                    FROM meta_optimizer_runs
                    ORDER BY created_at DESC
                    LIMIT $1"#,
@@ -160,7 +160,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
+                          breakdown_json, recommendation_id, runs_included, created_at::TEXT
                    FROM meta_optimizer_snapshots
                    ORDER BY created_at DESC
                    LIMIT 1"#,
@@ -285,7 +285,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
+                          breakdown_json, recommendation_id, runs_included, created_at::TEXT
                    FROM meta_optimizer_snapshots
                    WHERE recommendation_id = $1
                    ORDER BY created_at DESC"#,
@@ -340,7 +340,7 @@ impl PgDb {
         let row = conn.query_opt(
             r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
                       current_value, recommended_value, evidence, confidence, status,
-                      applied_at, outcome_after_apply, optimizer_run_id, created_at,
+                      applied_at::TEXT, outcome_after_apply, optimizer_run_id, created_at::TEXT,
                       eval_result_id, eval_status
                FROM meta_optimizer_recommendations WHERE id = $1"#,
             &[&recommendation_id],
@@ -361,7 +361,7 @@ impl PgDb {
         let mut sql = String::from(
             r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
                       current_value, recommended_value, evidence, confidence, status,
-                      applied_at, outcome_after_apply, optimizer_run_id, created_at,
+                      applied_at::TEXT, outcome_after_apply, optimizer_run_id, created_at::TEXT,
                       eval_result_id, eval_status
                FROM meta_optimizer_recommendations WHERE 1=1"#,
         );
@@ -405,7 +405,7 @@ impl PgDb {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn.query(
             r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
-                      task_run_id, status, created_at, completed_at
+                      task_run_id, status, created_at::TEXT, completed_at::TEXT
                FROM meta_optimizer_runs ORDER BY created_at DESC LIMIT 100"#,
             &[],
         ).await.map_err(|e| format!("PG list_optimizer_runs: {}", e))?;
@@ -422,7 +422,7 @@ impl PgDb {
         let rows = if let Some(st) = snapshot_type {
             conn.query(
                 r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
+                          breakdown_json, recommendation_id, runs_included, created_at::TEXT
                    FROM meta_optimizer_snapshots WHERE snapshot_type = $1
                    ORDER BY created_at DESC LIMIT 100"#,
                 &[&st],
@@ -430,7 +430,7 @@ impl PgDb {
         } else {
             conn.query(
                 r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                          breakdown_json, recommendation_id, runs_included, created_at
+                          breakdown_json, recommendation_id, runs_included, created_at::TEXT
                    FROM meta_optimizer_snapshots ORDER BY created_at DESC LIMIT 100"#,
                 &[],
             ).await
@@ -447,7 +447,7 @@ impl PgDb {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                      breakdown_json, recommendation_id, runs_included, created_at
+                      breakdown_json, recommendation_id, runs_included, created_at::TEXT
                FROM meta_optimizer_snapshots WHERE snapshot_type = $1
                ORDER BY created_at DESC LIMIT 1"#,
             &[&snapshot_type],
@@ -1047,7 +1047,7 @@ impl PgDb {
                       fix_type, fix_description, file_changed,
                       old_value, new_value, confidence, status,
                       effectiveness, effectiveness_evidence,
-                      applied_at, evaluated_at, created_at,
+                      applied_at::TEXT, evaluated_at::TEXT, created_at::TEXT,
                       content_hash, source_agent, reflection_scope,
                       project_path, target_component, reuse_count,
                       reasoning, alternatives_considered,
@@ -1171,7 +1171,7 @@ impl PgDb {
         let runs = conn
             .query(
                 r#"SELECT id, optimizer_type, status, improvements_found,
-                          recommendations_count, duration_ms, created_at
+                          recommendations_count, duration_ms, created_at::TEXT
                    FROM meta_optimizer_runs
                    ORDER BY created_at DESC LIMIT 5"#,
                 &[],
@@ -1550,6 +1550,63 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG query_zero_token_agents: {}", e))?;
         Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+    }
+
+    /// Query agents that primarily use CLI sessions (expensive) vs API.
+    ///
+    /// Joins `pipeline_agent_traces` with `iteration_logs` to detect high-cost
+    /// CLI provider usage. Returns `(agent_type, cli_runs, total_runs, avg_cli_cost, avg_api_cost)`.
+    pub async fn query_cli_heavy_agents(
+        &self,
+        since: &str,
+    ) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Check if iteration_logs table exists (graceful if not yet migrated)
+        let exists: bool = conn
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'iteration_logs')",
+                &[],
+            )
+            .await
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+
+        if !exists {
+            return Ok(Vec::new());
+        }
+
+        let rows = conn
+            .query(
+                r#"SELECT
+                    pat.agent_type,
+                    SUM(CASE WHEN il.provider_used LIKE '%cli%' THEN 1 ELSE 0 END)::bigint AS cli_runs,
+                    COUNT(*)::bigint AS total_runs,
+                    COALESCE(AVG(CASE WHEN il.provider_used LIKE '%cli%' THEN pat.cost_usd END), 0)::double precision AS avg_cli_cost,
+                    COALESCE(AVG(CASE WHEN il.provider_used NOT LIKE '%cli%' THEN pat.cost_usd END), 0)::double precision AS avg_api_cost
+                FROM pipeline_agent_traces pat
+                LEFT JOIN iteration_logs il ON il.task_run_id = pat.task_run_id
+                WHERE pat.created_at > $1
+                    AND (pat.tokens_in > 0 OR pat.tokens_out > 0)
+                GROUP BY pat.agent_type
+                HAVING COUNT(*) >= 5"#,
+                &[&since],
+            )
+            .await
+            .map_err(|e| format!("PG query_cli_heavy_agents: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, i64>(1),
+                    r.get::<_, i64>(2),
+                    r.get::<_, f64>(3),
+                    r.get::<_, f64>(4),
+                )
+            })
+            .collect())
     }
 
     /// Compare cost over recent vs previous 15-day window.
@@ -2029,7 +2086,7 @@ impl PgDb {
     ) -> Result<(Option<String>, Option<String>), String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_one(
-            "SELECT target_agent, applied_at FROM meta_optimizer_recommendations WHERE id = $1",
+            "SELECT target_agent, applied_at::TEXT FROM meta_optimizer_recommendations WHERE id = $1",
             &[&recommendation_id],
         ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
         Ok((row.get(0), row.get(1)))
@@ -2043,7 +2100,7 @@ impl PgDb {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
-                      breakdown_json, recommendation_id, runs_included, created_at
+                      breakdown_json, recommendation_id, runs_included, created_at::TEXT
                FROM meta_optimizer_snapshots
                WHERE recommendation_id = $1 AND snapshot_type = 'post_apply'
                ORDER BY created_at DESC LIMIT 1"#,
@@ -2219,7 +2276,7 @@ impl PgDb {
 
         // Guard 3: Threshold check
         let last_run_row = conn.query_opt(
-            "SELECT MAX(created_at) FROM meta_optimizer_runs WHERE optimizer_type = $1 AND status = 'complete'",
+            "SELECT MAX(created_at)::TEXT FROM meta_optimizer_runs WHERE optimizer_type = $1 AND status = 'complete'",
             &[&optimizer_type],
         ).await.map_err(|e| format!("PG should_launch: {}", e))?;
         let last_optimizer_run_at: Option<String> = last_run_row.and_then(|r| r.get(0));

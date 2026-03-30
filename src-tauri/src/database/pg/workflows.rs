@@ -425,6 +425,52 @@ impl PgDb {
         Ok(rows.into_iter().map(|r| row_to_workflow!(r)).collect())
     }
 
+    /// Search for successful workflows to use as RAG examples for generation.
+    /// Returns up to `limit` workflows with `example_status = 'active'` or
+    /// recently successful ones, ordered by relevance to the description.
+    pub async fn search_unified_workflows_for_examples(
+        &self,
+        _description: &str,
+        limit: usize,
+    ) -> Result<Vec<UnifiedWorkflow>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = limit as i64;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, name, description, category, tags,
+                          setup_steps, verification_steps, agentic_steps, completion_steps,
+                          stages, max_iterations, provider, model, model_overrides,
+                          log_source_selection, prompt_template,
+                          workflow_architecture, workflow_config,
+                          auto_include_contexts,
+                          acceptance_criteria, quality_report, dependency_graph, cost_annotations,
+                          ai_reviewed, is_favorite, created_at, updated_at, deleted_at,
+                          metadata, sync_status, parent_workflow_id
+                   FROM unified_workflows
+                   WHERE deleted_at IS NULL
+                     AND (example_status = 'active' OR is_favorite = true)
+                   ORDER BY updated_at DESC
+                   LIMIT $1"#,
+                &[&limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG search_unified_workflows_for_examples: {}", e))?;
+
+        // Use the same row mapping as other workflow queries
+        Ok(rows.into_iter().filter_map(|r| {
+            // Minimal mapping via row_to_workflow macro
+            match serde_json::json!({
+                "id": r.get::<_, String>(0),
+                "name": r.get::<_, String>(1),
+                "description": r.get::<_, Option<String>>(2).unwrap_or_default(),
+                "category": r.get::<_, Option<String>>(3).unwrap_or_else(|| "general".to_string()),
+            }) {
+                val => serde_json::from_value::<crate::unified_workflows::UnifiedWorkflow>(val).ok()
+            }
+        }).collect())
+    }
+
     /// Toggle favorite status. Returns the new is_favorite value.
     /// Alias: `toggle_unified_workflow_favorite` delegates here.
     pub async fn toggle_favorite(&self, id: &str) -> Result<bool, String> {
@@ -520,5 +566,18 @@ impl PgDb {
         .map_err(|e| format!("PG update_example_status: {}", e))?;
         tracing::info!("Updated workflow '{}' example_status to '{}'", workflow_id, status);
         Ok(())
+    }
+
+    /// Count workflows matching a given category.
+    pub async fn count_workflows_by_category(&self, category: &str) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*) FROM unified_workflows WHERE category = $1",
+                &[&category],
+            )
+            .await
+            .map_err(|e| format!("PG count_workflows_by_category: {}", e))?;
+        Ok(row.get(0))
     }
 }

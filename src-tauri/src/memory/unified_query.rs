@@ -568,7 +568,7 @@ pub fn reciprocal_rank_fusion(
 pub async fn query_memory(
     params: &UnifiedMemoryQuery,
     pg: &PgDb,
-    _db: Arc<CheckpointDb>,
+    _db: Option<Arc<CheckpointDb>>,
     graph: Option<&KnowledgeGraph>,
 ) -> Result<Vec<MemoryResult>, String> {
     let per_source_limit = (params.limit * 3) as i64;

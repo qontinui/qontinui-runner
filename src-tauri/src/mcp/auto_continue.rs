@@ -7,7 +7,6 @@ use axum::response::Json;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use crate::mcp::types::ApiResponse;
 use crate::settings;
 
@@ -66,9 +65,10 @@ pub async fn set_auto_continue_setting(
 pub async fn get_workflow_auto_continue() -> Json<ApiResponse<WorkflowAutoContinueResponse>> {
     let enabled = settings::get_auto_continue_ai_workflow();
 
-    // Check if there are any running tasks
-    let workflow_name = if let Ok(db) = CheckpointDb::new() {
-        db.get_running_task_runs(None)
+    // Check if there are any running tasks (PG)
+    let workflow_name = if let Some(pg) = crate::database::pg::PgDb::try_global() {
+        pg.get_running_task_runs(None)
+            .await
             .ok()
             .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
     } else {
@@ -91,9 +91,10 @@ pub async fn set_workflow_auto_continue(
         Ok(_) => {
             info!("Auto-continue setting updated to: {}", body.enabled);
 
-            // Get the active workflow name if any
-            let workflow_name = if let Ok(db) = CheckpointDb::new() {
-                db.get_running_task_runs(None)
+            // Get the active workflow name if any (PG)
+            let workflow_name = if let Some(pg) = crate::database::pg::PgDb::try_global() {
+                pg.get_running_task_runs(None)
+                    .await
                     .ok()
                     .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
             } else {

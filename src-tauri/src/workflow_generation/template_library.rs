@@ -4,9 +4,11 @@
 //! Templates are matched to criteria via keyword similarity and injected
 //! into generation prompts to improve first-pass quality.
 
+use crate::database::pg::PgDb;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::domain_routing::VerificationDomain;
@@ -362,24 +364,13 @@ pub fn find_matching_templates(
 pub fn find_matching_templates_for_criteria(
     criteria: &[AcceptanceCriterion],
     domain: &VerificationDomain,
-    conn: Option<&Connection>,
+    _pg_db: Option<&Arc<PgDb>>,
 ) -> Vec<(StepTemplate, f64)> {
-    let templates = match conn {
-        Some(c) => {
-            let _ = ensure_table(c);
-            load_templates_for_domain(c, *domain).unwrap_or_else(|e| {
-                warn!(error = %e, "Failed to load templates from DB, falling back to seeds");
-                seed_templates()
-                    .into_iter()
-                    .filter(|t| t.domain == *domain)
-                    .collect()
-            })
-        }
-        None => seed_templates()
-            .into_iter()
-            .filter(|t| t.domain == *domain)
-            .collect(),
-    };
+    // Template library uses seed templates; PG template storage is not yet available
+    let templates: Vec<StepTemplate> = seed_templates()
+        .into_iter()
+        .filter(|t| t.domain == *domain)
+        .collect();
 
     // Also include seed templates if DB had none
     let all_templates = if templates.is_empty() {

@@ -216,19 +216,10 @@ pub async fn stop_ai_analysis(
         session_manager.close_all_sessions();
     }
 
-    // Get running tasks from the database
-    let db = match CheckpointDb::new() {
-        Ok(db) => db,
-        Err(e) => {
-            error!("MCP API: Failed to open database: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to open database: {}", e))),
-            ));
-        }
-    };
+    // Get running tasks from the database (PG)
+    let pg = &state.app_state.pg_db;
 
-    let running_tasks = match db.get_running_task_runs(None) {
+    let running_tasks = match pg.get_running_task_runs(None).await {
         Ok(tasks) => tasks,
         Err(e) => {
             error!("MCP API: Failed to get running tasks: {}", e);
@@ -247,7 +238,7 @@ pub async fn stop_ai_analysis(
     // Stop each running task
     for task in &running_tasks {
         // Mark as stopped in database
-        if let Err(e) = db.stop_task_run(&task.id) {
+        if let Err(e) = pg.stop_task_run(&task.id, "user_stopped").await {
             warn!("MCP API: Failed to stop task run {}: {}", task.id, e);
         }
 
@@ -1235,15 +1226,7 @@ If your task requires running visual automation, use the Runner API to execute w
         all_images.len()
     );
 
-    // Create TaskRun record in database
-    let db = CheckpointDb::new().map_err(|e| {
-        error!("MCP API: Failed to open database: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to open database: {}", e))),
-        )
-    })?;
-
+    // Create TaskRun record in database (PG)
     {
         let mut input = CreateTaskRunInput::new(&task_run_id, &prompt_name)
             .with_prompt(&enhanced_prompt)
@@ -1251,7 +1234,7 @@ If your task requires running visual automation, use the Runner API to execute w
         if let Some(ms) = max_sessions {
             input = input.with_max_sessions(ms);
         }
-        db.create_task_run(&input)
+        state.app_state.pg_db.create_task_run(&input).await
     }
     .map_err(|e| {
         error!("MCP API: Failed to create task run: {}", e);

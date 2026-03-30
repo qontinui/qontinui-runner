@@ -61,7 +61,7 @@ impl PgDb {
             .query_opt(
                 r#"
                 SELECT id, name, description, steps, start_step, timeout_secs,
-                       inputs, outputs, tags, version, created_at, updated_at
+                       inputs, outputs, tags, version, created_at::TEXT, updated_at::TEXT
                 FROM orchestrator_flows
                 WHERE id = $1
                 "#,
@@ -238,7 +238,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                SELECT instance_id, flow_id, current_step, status, context, history, error, started_at, completed_at
+                SELECT instance_id, flow_id, current_step, status, context, history, error, started_at::TEXT, completed_at::TEXT
                 FROM flow_executions
                 WHERE instance_id = $1
                 "#,
@@ -271,7 +271,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                SELECT instance_id, flow_id, current_step, status, started_at, completed_at
+                SELECT instance_id, flow_id, current_step, status, started_at::TEXT, completed_at::TEXT
                 FROM flow_executions
                 ORDER BY started_at DESC
                 LIMIT 50
@@ -358,7 +358,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                SELECT id, flow_id, version, definition, message, created_by, created_at
+                SELECT id, flow_id, version, definition, message, created_by, created_at::TEXT
                 FROM flow_versions
                 WHERE flow_id = $1 AND version = $2
                 "#,
@@ -405,7 +405,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                SELECT id, flow_id, version, message, created_by, created_at
+                SELECT id, flow_id, version, message, created_by, created_at::TEXT
                 FROM flow_versions
                 WHERE flow_id = $1
                 ORDER BY version DESC

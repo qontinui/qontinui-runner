@@ -120,7 +120,7 @@ export function OrchestrationLoopBanner() {
 
   // Check for active multi-loops (excluding default)
   const multiLoops = multiStatus?.loops.filter(
-    (l) => l.loop_id !== "default" && (l.status.running || l.status.phase !== "Idle"),
+    (l) => l.loop_id !== "default" && (l.status.running || l.status.phase !== "idle"),
   ) ?? [];
   const multiRunning = multiLoops.filter((l) => l.status.running);
 

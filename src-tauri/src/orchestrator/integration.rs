@@ -1673,29 +1673,33 @@ impl Orchestrator {
     /// Only skills with approval_status='approved' and source='auto' are included.
     /// Limited to 10 skills to avoid bloating the prompt.
     fn build_skill_context(&self, state: &OrchestratorState) -> String {
-        let conn = match self.db.get_conn() {
-            Ok(c) => c,
-            Err(_) => return String::new(),
-        };
-
-        // Query approved auto-extracted skills, ordered by usage (most-used first)
-        let mut stmt = match conn.prepare(
-            r#"SELECT name, slug, description, category
-               FROM user_skills
-               WHERE approval_status = 'approved'
-               AND source = 'auto'
-               ORDER BY usage_count DESC
-               LIMIT 10"#,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                debug!("Skills query unavailable: {}", e);
-                return String::new();
-            }
-        };
-
-        let skills: Vec<(String, String, String, String)> = stmt
-            .query_map([], |row| {
+        // Prefer PG path for approved auto-extracted skills (hot path, every workflow execution).
+        let skills: Vec<(String, String, String, String)> = if let Some(ref pg) = self.pg_db {
+            let pg = Arc::clone(pg);
+            tokio::runtime::Handle::current()
+                .block_on(async move { pg.get_approved_auto_skills().await })
+                .unwrap_or_default()
+        } else {
+            // Fallback to SQLite when PG is unavailable
+            let conn = match self.db.get_conn() {
+                Ok(c) => c,
+                Err(_) => return String::new(),
+            };
+            let mut stmt = match conn.prepare(
+                r#"SELECT name, slug, description, category
+                   FROM user_skills
+                   WHERE approval_status = 'approved'
+                   AND source = 'auto'
+                   ORDER BY usage_count DESC
+                   LIMIT 10"#,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Skills query unavailable: {}", e);
+                    return String::new();
+                }
+            };
+            stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1705,7 +1709,8 @@ impl Orchestrator {
             })
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
 
         if skills.is_empty() {
             return String::new();
@@ -2493,6 +2498,24 @@ impl Orchestrator {
                         actions.lessons_added,
                         actions.examples_extracted,
                     );
+                    // Emit event so frontend auto-refreshes adaptive learning panels
+                    if let Some(ref app_handle) = self.app_handle {
+                        let (status_str, _) = match result {
+                            TaskCompletionResult::Success { .. } => ("success", true),
+                            TaskCompletionResult::Failed { .. } => ("failure", false),
+                            TaskCompletionResult::Stopped { .. } => ("abandoned", false),
+                            TaskCompletionResult::Paused { .. } => ("partial", false),
+                        };
+                        emit_learning_update(
+                            app_handle,
+                            &state.task_run_id,
+                            status_str,
+                            state.total_duration_secs(),
+                            Some(iterations),
+                            None, // strategy
+                            vec![],
+                        );
+                    }
                 }
             }
             Err(e) => {

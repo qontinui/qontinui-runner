@@ -134,9 +134,9 @@ pub async fn send_user_message(
     }
 
     // Persist user message to output_log for recap/summary generation
-    if let Ok(db) = CheckpointDb::new() {
+    if let Some(pg) = crate::database::pg::PgDb::try_global() {
         let formatted = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", message);
-        if let Err(e) = db.append_task_output_ex(&task_run_id, &formatted, false, false) {
+        if let Err(e) = pg.append_task_output_ex(&task_run_id, &formatted, false, false).await {
             warn!("Failed to persist user message to output_log: {}", e);
         }
     }
@@ -608,6 +608,7 @@ pub async fn generate_workflow_from_session(
         verification_depth: None,
         discover_ui_bridge_specs: None,
         simple_mode: None,
+        pipeline_depth: None,
         tool_tags: None,
         exploration_settings: None,
         target_runner_port: None,
@@ -637,13 +638,14 @@ pub async fn generate_workflow_from_session(
 
     let doctor_handle = app_state.doctor_handle.lock().await.clone();
     let pg_db = app_state.pg_db.clone();
+    let pg_clone = pg_db.clone();
     let artifact_task_run_id = task_run_id.clone();
 
     let gen_result = tokio::task::spawn_blocking(move || {
         let (response, mut artifact) = crate::workflow_generation::generate_workflow(
             request,
             doctor_handle.as_ref(),
-            None,
+            Some(&pg_clone),
             None,
         );
         artifact.task_run_id = Some(artifact_task_run_id.clone());
@@ -791,12 +793,12 @@ pub async fn generate_workflow_from_session(
                         }
                     }
 
-                    // Persist to output_log
-                    if let Ok(db) = CheckpointDb::new() {
+                    // Persist to output_log via PG
+                    {
                         let formatted =
                             format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", system_note);
                         if let Err(e) =
-                            db.append_task_output_ex(&task_run_id, &formatted, false, false)
+                            app_state.pg_db.append_task_output_ex(&task_run_id, &formatted, false, false).await
                         {
                             warn!("Failed to persist system note to output_log: {}", e);
                         }
@@ -838,9 +840,9 @@ pub async fn generate_workflow_from_session(
                     warn!("Failed to emit generation-failed system note: {}", e);
                 }
 
-                if let Ok(db) = CheckpointDb::new() {
+                {
                     let formatted = format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", fail_note);
-                    if let Err(e) = db.append_task_output_ex(&task_run_id, &formatted, false, false)
+                    if let Err(e) = app_state.pg_db.append_task_output_ex(&task_run_id, &formatted, false, false).await
                     {
                         warn!("Failed to persist generation-failed system note: {}", e);
                     }
