@@ -58,7 +58,7 @@ impl LoopController {
         config.max_iterations = config.max_iterations.max(1);
 
         // Initialize loop context with all cross-iteration state
-        let mut ctx = LoopContext::new(config, self.checkpoint_db.clone(), initial_dynamic_steps);
+        let mut ctx = LoopContext::new(config, self.app_state.pg_db.clone(), initial_dynamic_steps);
 
         if !ctx.dynamic_steps.is_empty() {
             info!(

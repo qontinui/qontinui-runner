@@ -91,6 +91,50 @@ impl PgDb {
         Ok(results)
     }
 
+    /// Get composite score trend over time, grouped by date.
+    pub async fn get_composite_score_trend(
+        &self,
+        days: i64,
+    ) -> Result<Vec<crate::database::agentic_metrics_ops::CompositeScoreTrendPoint>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let interval = format!("{} days", days);
+        let rows = conn
+            .query(
+                r#"SELECT DATE(lo.created_at) as day,
+                          AVG(lo.composite_agentic_score) as avg_score,
+                          COUNT(*) as run_count,
+                          SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END) as success_count
+                   FROM learning_outcomes lo
+                   WHERE lo.created_at >= NOW() - $1::interval
+                     AND lo.composite_agentic_score IS NOT NULL
+                   GROUP BY DATE(lo.created_at)
+                   ORDER BY day ASC"#,
+                &[&interval],
+            )
+            .await
+            .map_err(|e| format!("PG get_composite_score_trend: {}", e))?;
+
+        let results = rows
+            .iter()
+            .map(|row| {
+                let date: chrono::NaiveDate = row.get(0);
+                crate::database::agentic_metrics_ops::CompositeScoreTrendPoint {
+                    date: date.to_string(),
+                    avg_composite_score: row.get(1),
+                    run_count: row.get(2),
+                    success_count: row.get(3),
+                }
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Get the latest task_run_id that has agentic scores.
     pub async fn get_latest_scored_task_run_id(&self) -> Result<Option<String>, String> {
         let conn = self

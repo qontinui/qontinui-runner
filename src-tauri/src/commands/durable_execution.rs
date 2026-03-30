@@ -12,8 +12,19 @@ use tauri::State;
 /// 1. Active worktree associated with the task run
 /// 2. Fallback: current working directory
 fn resolve_working_dir(app_state: &AppState, execution_id: &str) -> Result<String, String> {
-    // Check for a worktree associated with this task run
-    if let Ok(worktrees) = app_state.checkpoint_db.list_worktrees(None) {
+    // Check for a worktree associated with this task run (PG-primary via block_in_place)
+    let pg = app_state.pg_db.clone();
+    let worktrees_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move { pg.list_worktrees(None).await })
+            })
+        }))
+        .unwrap_or_else(|_| Err("block_in_place panicked".to_string()))
+    } else {
+        Err("No tokio runtime".to_string())
+    };
+    if let Ok(worktrees) = worktrees_result {
         for wt in &worktrees {
             if wt.task_run_id.as_deref() == Some(execution_id) {
                 return Ok(wt.worktree_path.clone());
@@ -42,7 +53,7 @@ pub async fn list_replay_points(
     app_state: State<'_, Arc<AppState>>,
     execution_id: String,
 ) -> Result<Vec<ReplayPoint>, String> {
-    let replay_manager = ReplayManager::new(app_state.checkpoint_db.clone());
+    let replay_manager = ReplayManager::new(app_state.pg_db.clone());
     replay_manager.list_replay_points(&execution_id)
 }
 
@@ -63,7 +74,7 @@ pub async fn replay_workflow(
     working_dir: Option<String>,
     target_phase: Option<String>,
 ) -> Result<String, String> {
-    let replay_manager = ReplayManager::new(app_state.checkpoint_db.clone());
+    let replay_manager = ReplayManager::new(app_state.pg_db.clone());
 
     let resolved_dir = match working_dir {
         Some(ref d) if !d.is_empty() && d != "." => d.clone(),
@@ -109,7 +120,7 @@ pub async fn rollback_workflow_to_iteration(
         _ => resolve_working_dir(&app_state, &execution_id)?,
     };
 
-    let compensation_manager = CompensationManager::new(app_state.checkpoint_db.clone());
+    let compensation_manager = CompensationManager::new(app_state.pg_db.clone());
 
     let commit = compensation_manager
         .rollback_to_iteration(

@@ -612,8 +612,7 @@ pub async fn start_server(
                 // Store the actual bound port in AppState
                 api_ready_flag.api_port.store(try_port, Ordering::Relaxed);
 
-                // Set the port on the database for instance-level task_run filtering
-                api_ready_flag.checkpoint_db.set_runner_port(try_port);
+                // Port stored in api_ready_flag.api_port above; PG queries accept runner_port as parameter.
 
                 // Signal that the API is ready for requests
                 api_ready_flag.api_ready.store(true, Ordering::Relaxed);

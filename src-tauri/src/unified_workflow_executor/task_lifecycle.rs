@@ -375,9 +375,7 @@ impl LoopController {
                             })
                         }));
                     }
-                    if let Err(e) = checkpoint_db.insert_worktree(&record) {
-                        warn!("WORKTREE: Failed to track worktree in database: {}", e);
-                    }
+                    // PG insert_worktree already done above; SQLite duplicate removed.
 
                     let original_path = project_path;
                     let update_steps = |steps: &mut Vec<ExecutionStepConfig>| {

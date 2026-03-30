@@ -88,7 +88,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     let ids = runs.into_iter().map(|r| r.id).collect();
                     (count, ids)
                 }
-                Err(_) => get_running_tasks(&app_state),
+                Err(_) => get_running_tasks_fallback(),
             };
 
             let payload = HeartbeatPayload {
@@ -126,14 +126,7 @@ fn get_local_ip() -> Option<String> {
     Some(addr.ip().to_string())
 }
 
-/// Get count and IDs of currently running tasks from the database.
-fn get_running_tasks(app_state: &AppState) -> (u32, Vec<String>) {
-    match app_state.checkpoint_db.get_running_task_runs(None) {
-        Ok(runs) => {
-            let count = runs.len() as u32;
-            let ids = runs.into_iter().map(|r| r.id).collect();
-            (count, ids)
-        }
-        Err(_) => (0, vec![]),
-    }
+/// Fallback when PG query fails — returns empty.
+fn get_running_tasks_fallback() -> (u32, Vec<String>) {
+    (0, vec![])
 }

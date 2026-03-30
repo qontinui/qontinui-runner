@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 use super::compensation::CompensationManager;
 use super::resume::ResumePoint;
@@ -26,15 +26,15 @@ pub enum ReplayTarget {
 
 /// Manages replay operations for completed or failed workflow executions.
 pub struct ReplayManager {
-    checkpoint_db: Arc<CheckpointDb>,
+    pg_db: Arc<PgDb>,
     compensation: CompensationManager,
 }
 
 impl ReplayManager {
-    pub fn new(checkpoint_db: Arc<CheckpointDb>) -> Self {
-        let compensation = CompensationManager::new(checkpoint_db.clone());
+    pub fn new(pg_db: Arc<PgDb>) -> Self {
+        let compensation = CompensationManager::new(pg_db.clone());
         Self {
-            checkpoint_db,
+            pg_db,
             compensation,
         }
     }
@@ -46,10 +46,24 @@ impl ReplayManager {
     pub fn list_replay_points(&self, execution_id: &str) -> Result<Vec<ReplayPoint>, String> {
         let commits = self.compensation.get_iteration_commits(execution_id)?;
 
-        // Get verification results from step checkpoints
-        let verification_results = self
-            .checkpoint_db
-            .get_workflow_verification_results(execution_id)?;
+        // Get verification results from PG via block_in_place
+        let pg = self.pg_db.clone();
+        let eid = execution_id.to_string();
+        let verification_results = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        pg.get_workflow_verification_results(&eid).await
+                    })
+                })
+            }));
+            match result {
+                Ok(inner) => inner?,
+                Err(_) => return Err("block_in_place panicked in list_replay_points".to_string()),
+            }
+        } else {
+            return Err("No tokio runtime available for list_replay_points".to_string());
+        };
 
         let mut points = Vec::new();
 
@@ -130,17 +144,20 @@ impl ReplayManager {
             }
         }
 
-        // 2. Clear checkpoints from target iteration onward
-        self.checkpoint_db
-            .clear_checkpoints_from_iteration(execution_id, target_iteration)?;
+        // 2. Clear checkpoints from target iteration onward (PG)
+        self.pg_db
+            .clear_checkpoints_from_iteration(execution_id, target_iteration)
+            .await?;
 
-        // 3. Clear iteration commits from target onward
-        self.checkpoint_db
-            .clear_iteration_commits_from(execution_id, target_iteration)?;
+        // 3. Clear iteration commits from target onward (PG)
+        self.pg_db
+            .clear_iteration_commits_from(execution_id, target_iteration)
+            .await?;
 
-        // 4. Clear iteration diffs from target onward
-        self.checkpoint_db
-            .clear_iteration_diffs_from(execution_id, target_iteration)?;
+        // 4. Clear iteration diffs from target onward (PG)
+        self.pg_db
+            .clear_iteration_diffs_from(execution_id, target_iteration)
+            .await?;
 
         // 5. Return appropriate ResumePoint
         let resume_point = match target {

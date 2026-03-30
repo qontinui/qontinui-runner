@@ -9,33 +9,36 @@ use tracing::{error, info, warn};
 
 /// Get all agentic metric scores for a specific task run.
 #[tauri::command]
-pub fn get_agentic_scores(
+pub async fn get_agentic_scores(
     state: State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::AgenticMetricScoreRow>, String> {
-    state.checkpoint_db.get_agentic_scores_for_run(&task_run_id)
+    state.pg_db.get_agentic_scores_for_run(&task_run_id).await
 }
 
 /// Get aggregate agentic metric stats over a time period.
 #[tauri::command]
-pub fn get_agentic_metric_aggregates(
+pub async fn get_agentic_metric_aggregates(
     state: State<'_, Arc<AppState>>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::AgenticMetricAggregate>, String> {
+    let interval = format!("{} days", days.unwrap_or(30));
     state
-        .checkpoint_db
-        .get_agentic_metric_aggregates(days.unwrap_or(30))
+        .pg_db
+        .get_agentic_metric_aggregates(&interval)
+        .await
 }
 
 /// Get composite agentic score trend over time, grouped by date.
 #[tauri::command]
-pub fn get_composite_score_trend(
+pub async fn get_composite_score_trend(
     state: State<'_, Arc<AppState>>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::CompositeScoreTrendPoint>, String> {
     state
-        .checkpoint_db
+        .pg_db
         .get_composite_score_trend(days.unwrap_or(30))
+        .await
 }
 
 /// Manually trigger baseline recomputation.

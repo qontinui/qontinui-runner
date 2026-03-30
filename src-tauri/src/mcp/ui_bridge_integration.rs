@@ -1813,19 +1813,15 @@ async fn handle_update(
 
     // Update tracker
     if success {
-        let now = chrono::Utc::now().timestamp();
         let integration_id = format!(
             "source-{}",
             req.project_path.replace(['/', '\\', ':', ' '], "-")
         );
-        // Update just the version and timestamp in the existing record
-        let conn = state.app_state.checkpoint_db.get_conn_string();
-        if let Ok(conn) = conn {
-            let _ = conn.execute(
-                "UPDATE ui_bridge_integrations SET sdk_version = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![new_version, now, integration_id],
-            );
-        }
+        // Update just the version and timestamp in the existing record (PG)
+        let pg = state.app_state.pg_db.clone();
+        let iid = integration_id.clone();
+        let ver = new_version.to_string();
+        let _ = pg.update_ui_bridge_integration_version(&iid, &ver).await;
     }
 
     // Auto-run package install after updating package.json

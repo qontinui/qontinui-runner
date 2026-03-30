@@ -358,10 +358,10 @@ pub async fn collect_step_outputs(
     };
 
     // Get events for this task run
-    // TODO: Wire to PG when Tauri commands go async
     let events = state
-        .checkpoint_db
+        .pg_db
         .get_task_run_events(&task_run_id, None, input.limit)
+        .await
         .map_err(|e| format!("Failed to get task run events: {}", e))?;
 
     let mut outputs: Vec<serde_json::Value> = Vec::new();
@@ -403,10 +403,10 @@ pub async fn collect_step_outputs(
     }
 
     // Also check for Playwright results
-    // TODO: Wire to PG when Tauri commands go async
     let playwright_results = state
-        .checkpoint_db
-        .get_task_run_playwright_results(&task_run_id, None)
+        .pg_db
+        .get_task_run_playwright_results(&task_run_id)
+        .await
         .unwrap_or_default();
 
     for result in playwright_results {

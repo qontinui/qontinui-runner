@@ -8,19 +8,19 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 use crate::str_utils::truncate_str;
 
 use super::types::{IterationCommit, IterationDiff, RollbackPolicy};
 
 /// Manages commit checkpoints and rollback operations for workflow executions.
 pub struct CompensationManager {
-    checkpoint_db: Arc<CheckpointDb>,
+    pg_db: Arc<PgDb>,
 }
 
 impl CompensationManager {
-    pub fn new(checkpoint_db: Arc<CheckpointDb>) -> Self {
-        Self { checkpoint_db }
+    pub fn new(pg_db: Arc<PgDb>) -> Self {
+        Self { pg_db }
     }
 
     /// Record a commit hash checkpoint after an agentic phase completes.
@@ -35,8 +35,23 @@ impl CompensationManager {
             commit_hash: commit_hash.to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
-        self.checkpoint_db
-            .append_iteration_commit(execution_id, &commit)
+        let pg = self.pg_db.clone();
+        let eid = execution_id.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        pg.append_iteration_commit(&eid, &commit).await
+                    })
+                })
+            }));
+            match result {
+                Ok(inner) => inner,
+                Err(_) => Err("block_in_place panicked in record_iteration_commit".to_string()),
+            }
+        } else {
+            Err("No tokio runtime available for record_iteration_commit".to_string())
+        }
     }
 
     /// Get all recorded iteration commits for an execution.
@@ -44,7 +59,23 @@ impl CompensationManager {
         &self,
         execution_id: &str,
     ) -> Result<Vec<IterationCommit>, String> {
-        self.checkpoint_db.get_iteration_commits(execution_id)
+        let pg = self.pg_db.clone();
+        let eid = execution_id.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        pg.get_iteration_commits(&eid).await
+                    })
+                })
+            }));
+            match result {
+                Ok(inner) => inner,
+                Err(_) => Err("block_in_place panicked in get_iteration_commits".to_string()),
+            }
+        } else {
+            Err("No tokio runtime available for get_iteration_commits".to_string())
+        }
     }
 
     /// Execute rollback based on policy. Returns the commit hash rolled back to, if any.
@@ -591,26 +622,20 @@ mod tests {
         assert_eq!(del, 0);
     }
 
-    // ── CompensationManager with in-memory DB ─────────────────────────
+    // ── CompensationManager with PG ─────────────────────────
 
     #[test]
+    #[ignore = "requires PG via DATABASE_URL"]
     fn compensation_manager_new_succeeds() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
+        let db = PgDb::new_blocking_for_test();
         let _mgr = CompensationManager::new(db);
     }
 
-    /// Helper to seed a task_run row so iteration commits can be stored.
-    fn seed_task_run(db: &CheckpointDb, id: &str) {
-        use crate::database::types::CreateTaskRunInput;
-        let input = CreateTaskRunInput::new(id, "test-task");
-        db.create_task_run(&input).unwrap();
-    }
-
     #[test]
+    #[ignore = "requires PG via DATABASE_URL"]
     fn record_and_get_iteration_commits() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
+        let db = PgDb::new_blocking_for_test();
         let exec_id = "test-exec-001";
-        seed_task_run(&db, exec_id);
         let mgr = CompensationManager::new(db);
 
         // Initially empty
@@ -630,10 +655,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires PG via DATABASE_URL"]
     fn get_commits_isolated_by_execution_id() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        seed_task_run(&db, "exec-A");
-        seed_task_run(&db, "exec-B");
+        let db = PgDb::new_blocking_for_test();
         let mgr = CompensationManager::new(db);
 
         mgr.record_iteration_commit("exec-A", 1, "aaa111").unwrap();

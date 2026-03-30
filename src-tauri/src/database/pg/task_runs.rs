@@ -429,6 +429,47 @@ impl PgDb {
         }
     }
 
+    /// Append a commit checkpoint for an iteration (read-modify-write on iteration_commits JSON column).
+    pub async fn append_iteration_commit(
+        &self,
+        id: &str,
+        commit: &crate::unified_workflow_executor::IterationCommit,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Read existing commits
+        let row = conn
+            .query_opt(
+                "SELECT iteration_commits FROM task_runs WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG append_iteration_commit read: {}", e))?;
+
+        let existing: Option<String> = row.and_then(|r| r.get(0));
+
+        let mut commits: Vec<serde_json::Value> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let commit_value = serde_json::to_value(commit)
+            .map_err(|e| format!("Failed to serialize iteration commit: {}", e))?;
+        commits.push(commit_value);
+
+        let json = serde_json::to_string(&commits)
+            .map_err(|e| format!("Failed to serialize iteration commits: {}", e))?;
+
+        conn.execute(
+            "UPDATE task_runs SET iteration_commits = $1, updated_at = NOW() WHERE id = $2",
+            &[&json, &id],
+        )
+        .await
+        .map_err(|e| format!("PG append_iteration_commit write: {}", e))?;
+
+        Ok(())
+    }
+
     /// Get the full output log (alias for get_task_output on PG where output is not chunked).
     pub async fn get_full_task_output(&self, id: &str) -> Result<String, String> {
         self.get_task_output(id).await
@@ -487,6 +528,86 @@ impl PgDb {
                 .map_err(|e| format!("Failed to parse iteration diffs: {}", e)),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Clear iteration diffs from a given iteration onward (for replay).
+    pub async fn clear_iteration_diffs_from(&self, id: &str, from_iteration: u32) -> Result<(), String> {
+        let diffs = self.get_iteration_diffs(id).await?;
+        let filtered: Vec<_> = diffs.into_iter().filter(|d| d.iteration < from_iteration).collect();
+        let json = serde_json::to_string(&filtered)
+            .map_err(|e| format!("Failed to serialize filtered diffs: {}", e))?;
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET iteration_diffs = $1, updated_at = NOW() WHERE id = $2",
+            &[&json, &id],
+        )
+        .await
+        .map_err(|e| format!("PG clear_iteration_diffs_from: {}", e))?;
+        Ok(())
+    }
+
+    /// Clear iteration commits from a given iteration onward (for replay).
+    pub async fn clear_iteration_commits_from(&self, id: &str, from_iteration: u32) -> Result<(), String> {
+        let commits = self.get_iteration_commits(id).await?;
+        let filtered: Vec<_> = commits.into_iter().filter(|c| c.iteration < from_iteration).collect();
+        let json = serde_json::to_string(&filtered)
+            .map_err(|e| format!("Failed to serialize filtered commits: {}", e))?;
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET iteration_commits = $1, updated_at = NOW() WHERE id = $2",
+            &[&json, &id],
+        )
+        .await
+        .map_err(|e| format!("PG clear_iteration_commits_from: {}", e))?;
+        Ok(())
+    }
+
+    /// Clear step checkpoints from a given iteration onward (for replay).
+    pub async fn clear_checkpoints_from_iteration(&self, execution_id: &str, from_iteration: u32) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let from_i32 = from_iteration as i32;
+        conn.execute(
+            "DELETE FROM workflow_step_checkpoints WHERE execution_id = $1 AND iteration >= $2",
+            &[&execution_id, &from_i32],
+        )
+        .await
+        .map_err(|e| format!("PG clear_checkpoints_from_iteration: {}", e))?;
+
+        // Also clear verification phase results
+        conn.execute(
+            "DELETE FROM workflow_verification_phase_results WHERE task_run_id = $1 AND iteration >= $2",
+            &[&execution_id, &from_i32],
+        )
+        .await
+        .map_err(|e| format!("PG clear_verification_results: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get verification phase results for replay point listing.
+    pub async fn get_workflow_verification_results(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<crate::database::types::VerificationPhaseSummary>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT iteration, all_passed, passed_steps, failed_steps, created_at::TEXT
+                   FROM workflow_verification_phase_results
+                   WHERE task_run_id = $1
+                   ORDER BY iteration ASC"#,
+                &[&execution_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_workflow_verification_results: {}", e))?;
+
+        Ok(rows.iter().map(|r| crate::database::types::VerificationPhaseSummary {
+            iteration: r.get(0),
+            all_passed: r.get(1),
+            passed_steps: r.get(2),
+            failed_steps: r.get(3),
+            created_at: r.get(4),
+        }).collect())
     }
 
     /// Get currently running task runs.

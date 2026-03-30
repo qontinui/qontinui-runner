@@ -152,7 +152,7 @@ pub(crate) struct LoopContext {
 impl LoopContext {
     pub fn new(
         config: &LoopConfig,
-        checkpoint_db: std::sync::Arc<crate::database::CheckpointDb>,
+        pg_db: std::sync::Arc<crate::database::pg::PgDb>,
         initial_dynamic_steps: Vec<ExecutionStepConfig>,
     ) -> Self {
         // Load constraint config
@@ -209,7 +209,7 @@ impl LoopContext {
             resource_tracker,
             dynamic_steps: initial_dynamic_steps,
             pending_health_regression: None,
-            compensation_manager: CompensationManager::new(checkpoint_db),
+            compensation_manager: CompensationManager::new(pg_db),
             accumulated_diffs: Vec::new(),
             initial_source_commit: None,
             current_passed_checks: 0,
@@ -371,9 +371,9 @@ mod tests {
             ),
             dynamic_steps: Vec::new(),
             pending_health_regression: None,
-            compensation_manager: CompensationManager::new(std::sync::Arc::new(
-                crate::database::CheckpointDb::new_in_memory().unwrap(),
-            )),
+            compensation_manager: CompensationManager::new(
+                crate::database::pg::PgDb::new_blocking_for_test(),
+            ),
             accumulated_diffs: Vec::new(),
             initial_source_commit: None,
             current_passed_checks: 0,

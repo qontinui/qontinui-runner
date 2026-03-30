@@ -136,6 +136,39 @@ fn extract_tool_activity_from_stream_json(json_line: &str) -> Option<String> {
     None
 }
 
+/// Extract structured tool call data from a stream-json assistant message.
+/// Returns all (tool_name, tool_id) pairs for tracing span emission.
+fn extract_tool_call_data(json_line: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let parsed: serde_json::Value = match serde_json::from_str(json_line) {
+        Ok(v) => v,
+        Err(_) => return results,
+    };
+    if parsed.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return results;
+    }
+    let content = match parsed.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+        Some(c) => c,
+        None => return results,
+    };
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+            let tool_name = item
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let tool_id = item
+                .get("id")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            results.push((tool_name, tool_id));
+        }
+    }
+    results
+}
+
 /// Extract token usage from a Claude CLI stream-json result message.
 /// The result message contains `usage.input_tokens` and `usage.output_tokens`.
 fn extract_usage_from_stream_json(json_line: &str) -> Option<(u64, u64)> {
@@ -616,6 +649,14 @@ fn run_claude_session_inline(
                 // Extract tool activity from assistant messages with tool_use blocks
                 // (needed because bypassPermissions mode doesn't send can_use_tool control requests)
                 if let Some(activity) = extract_tool_activity_from_stream_json(&line) {
+                    // Emit a tracing span for each tool call for observability
+                    for (tool_name, _tool_id) in extract_tool_call_data(&line) {
+                        let _tool_span = tracing::info_span!("qontinui.ai.tool_call",
+                            ai.tool_name = %tool_name,
+                        ).entered();
+                        // Span closes immediately — tool calls are point-in-time events
+                        // since we can't track when the tool finishes from the stream
+                    }
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         emit_ai_output(
                             &app_handle_stdout,

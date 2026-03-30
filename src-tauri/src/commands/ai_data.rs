@@ -1186,9 +1186,8 @@ pub struct TaskRunEventsResult {
     pub event_type_filter: Option<String>,
 }
 
-/// Get task run events from SQLite database.
+/// Get task run events from PG database.
 /// This replaces JSONL file reading for historical analysis.
-// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_events_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1199,8 +1198,9 @@ pub async fn get_task_run_events_from_db(
     let limit = limit.unwrap_or(1000);
 
     match state
-        .checkpoint_db
+        .pg_db
         .get_task_run_events(&task_run_id, event_type.as_deref(), Some(limit))
+        .await
     {
         Ok(events) => {
             let count = events.len();
@@ -1223,8 +1223,7 @@ pub struct TaskRunScreenshotsResult {
     pub count: usize,
 }
 
-/// Get task run screenshots from SQLite database.
-// TODO: Wire to PG when Tauri commands go async
+/// Get task run screenshots from PG database.
 #[tauri::command]
 pub async fn get_task_run_screenshots_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1232,8 +1231,9 @@ pub async fn get_task_run_screenshots_from_db(
     screenshot_type: Option<String>,
 ) -> Result<AiDataResponse<TaskRunScreenshotsResult>, String> {
     match state
-        .checkpoint_db
+        .pg_db
         .get_task_run_screenshots(&task_run_id, screenshot_type.as_deref())
+        .await
     {
         Ok(screenshots) => {
             let count = screenshots.len();
@@ -1257,16 +1257,16 @@ pub struct TaskRunPlaywrightResultsResult {
     pub failed: usize,
 }
 
-/// Get Playwright test results from SQLite database.
-// TODO: Wire to PG when Tauri commands go async
+/// Get Playwright test results from PG database.
 #[tauri::command]
 pub async fn get_task_run_playwright_results_from_db(
     state: State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<AiDataResponse<TaskRunPlaywrightResultsResult>, String> {
     match state
-        .checkpoint_db
-        .get_task_run_playwright_results(&task_run_id, None)
+        .pg_db
+        .get_task_run_playwright_results(&task_run_id)
+        .await
     {
         Ok(results) => {
             let count = results.len();
@@ -1295,7 +1295,6 @@ pub struct TaskRunMigratedLogsSummary {
 }
 
 /// Get summary of migrated logs for a task run.
-// TODO: Wire to PG when Tauri commands go async
 #[tauri::command]
 pub async fn get_task_run_migrated_logs_summary(
     state: State<'_, Arc<AppState>>,
@@ -1303,8 +1302,9 @@ pub async fn get_task_run_migrated_logs_summary(
 ) -> Result<AiDataResponse<TaskRunMigratedLogsSummary>, String> {
     // Get events
     let events = state
-        .checkpoint_db
+        .pg_db
         .get_task_run_events(&task_run_id, None, None)
+        .await
         .unwrap_or_default();
 
     // Count events by type
@@ -1315,14 +1315,16 @@ pub async fn get_task_run_migrated_logs_summary(
 
     // Get screenshots
     let screenshots = state
-        .checkpoint_db
+        .pg_db
         .get_task_run_screenshots(&task_run_id, None)
+        .await
         .unwrap_or_default();
 
     // Get Playwright results
     let playwright_results = state
-        .checkpoint_db
-        .get_task_run_playwright_results(&task_run_id, None)
+        .pg_db
+        .get_task_run_playwright_results(&task_run_id)
+        .await
         .unwrap_or_default();
 
     Ok(AiDataResponse::ok(TaskRunMigratedLogsSummary {
@@ -1344,8 +1346,7 @@ pub struct TaskRunApiRequestsResult {
     pub failed_count: usize,
 }
 
-/// Get API requests for a task run from SQLite database.
-// TODO: Wire to PG when Tauri commands go async
+/// Get API requests for a task run from PG database.
 #[tauri::command]
 pub async fn get_task_run_api_requests_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1353,10 +1354,16 @@ pub async fn get_task_run_api_requests_from_db(
     success_filter: Option<bool>,
 ) -> Result<AiDataResponse<TaskRunApiRequestsResult>, String> {
     match state
-        .checkpoint_db
-        .get_task_run_api_requests(&task_run_id, success_filter)
+        .pg_db
+        .get_task_run_api_requests(&task_run_id)
+        .await
     {
-        Ok(requests) => {
+        Ok(all_requests) => {
+            // Apply success_filter client-side (PG method returns all)
+            let requests: Vec<_> = match success_filter {
+                Some(filter) => all_requests.into_iter().filter(|r| r.success == filter).collect(),
+                None => all_requests,
+            };
             let count = requests.len();
             let success_count = requests.iter().filter(|r| r.success).count();
             let failed_count = requests.iter().filter(|r| !r.success).count();

@@ -59,10 +59,10 @@ pub async fn get_task_run_recap(
         });
 
     // Get events (limited for performance)
-    // TODO: Wire to PG when Tauri commands go async
     let events = state
-        .checkpoint_db
+        .pg_db
         .get_task_run_events(&task_run_id, None, Some(500))
+        .await
         .unwrap_or_else(|e| {
             warn!("Failed to get events for {}: {}", task_run_id, e);
             Vec::new()

@@ -17,7 +17,7 @@ use tracing::{error, info};
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::state_machine_configs::{
-    storage, CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig,
+    CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig,
     SmConfigFull, SmImportRequest, SmState, SmTransition,
 };
 
@@ -395,12 +395,11 @@ pub async fn get_available_transitions(
                 if loaded {
                     // State machine is loaded — get transitions from the database
                     // Use the most recent config that has transitions
-                    let checkpoint_db = app_state.checkpoint_db.clone();
-                    let db_transitions = tokio::task::spawn_blocking(move || {
-                        let conn = checkpoint_db.get_conn_string().ok()?;
-                        let configs = storage::list_configs(&conn).ok()?;
+                    let pg = app_state.pg_db.clone();
+                    let db_transitions = async move {
+                        let configs = pg.list_sm_configs().await.ok()?;
                         for config in configs.iter() {
-                            if let Ok(Some(full)) = storage::get_config_full(&conn, &config.id) {
+                            if let Ok(Some(full)) = pg.get_sm_config_full(&config.id).await {
                                 if !full.transitions.is_empty() {
                                     let transitions: Vec<serde_json::Value> = full
                                         .transitions
@@ -420,10 +419,8 @@ pub async fn get_available_transitions(
                             }
                         }
                         None
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                    }
+                    .await;
 
                     if let Some(transitions) = db_transitions {
                         return Ok(Json(ApiResponse::success(
@@ -496,31 +493,23 @@ pub async fn clear_state_machine(
 // CRUD Handlers — Config, State, Transition management via HTTP
 // ============================================================================
 
-/// Helper to get a DB connection and map errors to HTTP responses.
-fn db_conn(
+/// Helper to get PG DB reference and map errors to HTTP responses.
+fn pg_db(
     state: &Arc<ApiState>,
-) -> Result<
-    r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
-    state.app_state.checkpoint_db.get_conn().map_err(|e| {
-        error!("State Machine CRUD: DB connection error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Database error: {}", e))),
-        )
-    })
+) -> &std::sync::Arc<crate::database::pg::PgDb> {
+    &state.app_state.pg_db
+}
+
+fn pg_err(e: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    error!("State Machine CRUD: PG error: {}", e);
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
 }
 
 /// GET /state-machine/configs — List all state machine configs
 pub async fn list_configs(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<SmConfig>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let configs = storage::list_configs(&conn).map_err(|e| {
-        error!("State Machine CRUD: list_configs error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let configs = pg_db(&state).list_sm_configs().await.map_err(pg_err)?;
     Ok(Json(ApiResponse::success(configs)))
 }
 
@@ -529,11 +518,7 @@ pub async fn create_config(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateSmConfigRequest>,
 ) -> Result<Json<ApiResponse<SmConfig>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let config = storage::insert_config(&conn, &request).map_err(|e| {
-        error!("State Machine CRUD: create_config error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let config = pg_db(&state).insert_sm_config(&request).await.map_err(pg_err)?;
     info!(
         "State Machine CRUD: Created config '{}' ({})",
         config.name, config.id
@@ -546,11 +531,7 @@ pub async fn get_config(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<SmConfigFull>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let config = storage::get_config_full(&conn, &id).map_err(|e| {
-        error!("State Machine CRUD: get_config error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let config = pg_db(&state).get_sm_config_full(&id).await.map_err(pg_err)?;
     match config {
         Some(c) => Ok(Json(ApiResponse::success(c))),
         None => Err((
@@ -565,11 +546,7 @@ pub async fn delete_config(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let deleted = storage::delete_config(&conn, &id).map_err(|e| {
-        error!("State Machine CRUD: delete_config error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let deleted = pg_db(&state).delete_sm_config(&id).await.map_err(pg_err)?;
     if deleted {
         info!("State Machine CRUD: Deleted config {}", id);
         Ok(Json(ApiResponse::success(
@@ -589,11 +566,7 @@ pub async fn create_state(
     Path(config_id): Path<String>,
     Json(request): Json<CreateSmStateRequest>,
 ) -> Result<Json<ApiResponse<SmState>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let sm_state = storage::insert_state(&conn, &config_id, &request).map_err(|e| {
-        error!("State Machine CRUD: create_state error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let sm_state = pg_db(&state).insert_sm_state(&config_id, &request).await.map_err(pg_err)?;
     info!(
         "State Machine CRUD: Created state '{}' in config {}",
         sm_state.name, config_id
@@ -606,11 +579,7 @@ pub async fn delete_state(
     State(state): State<Arc<ApiState>>,
     Path((_config_id, id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let deleted = storage::delete_state(&conn, &id).map_err(|e| {
-        error!("State Machine CRUD: delete_state error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let deleted = pg_db(&state).delete_sm_state(&id).await.map_err(pg_err)?;
     if deleted {
         Ok(Json(ApiResponse::success(
             serde_json::json!({"deleted": true}),
@@ -629,11 +598,7 @@ pub async fn create_transition(
     Path(config_id): Path<String>,
     Json(request): Json<CreateSmTransitionRequest>,
 ) -> Result<Json<ApiResponse<SmTransition>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let transition = storage::insert_transition(&conn, &config_id, &request).map_err(|e| {
-        error!("State Machine CRUD: create_transition error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let transition = pg_db(&state).insert_sm_transition(&config_id, &request).await.map_err(pg_err)?;
     info!(
         "State Machine CRUD: Created transition '{}' in config {}",
         transition.name, config_id
@@ -646,11 +611,7 @@ pub async fn delete_transition(
     State(state): State<Arc<ApiState>>,
     Path((_config_id, id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let deleted = storage::delete_transition(&conn, &id).map_err(|e| {
-        error!("State Machine CRUD: delete_transition error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let deleted = pg_db(&state).delete_sm_transition(&id).await.map_err(pg_err)?;
     if deleted {
         Ok(Json(ApiResponse::success(
             serde_json::json!({"deleted": true}),
@@ -668,11 +629,7 @@ pub async fn import_config(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<SmImportRequest>,
 ) -> Result<Json<ApiResponse<SmConfigFull>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let conn = db_conn(&state)?;
-    let result = storage::import_config(&conn, &request).map_err(|e| {
-        error!("State Machine CRUD: import_config error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-    })?;
+    let result = pg_db(&state).import_sm_config(&request).await.map_err(pg_err)?;
     info!(
         "State Machine CRUD: Imported config '{}' ({} states, {} transitions)",
         result.config.name,

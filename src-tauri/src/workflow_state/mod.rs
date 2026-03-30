@@ -51,9 +51,9 @@ pub use transitions::{StateTransition, StateTransitionError};
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 
 /// Trait for workflow states that can be used with the generic StateMachine.
 ///
@@ -98,8 +98,8 @@ pub struct StateMachine<S: WorkflowState> {
     current_state: S,
     /// History of state transitions
     transition_history: Vec<StateTransition<S>>,
-    /// Database connection for persistence
-    checkpoint_db: Arc<CheckpointDb>,
+    /// PostgreSQL database for persistence
+    pg_db: Arc<PgDb>,
 }
 
 impl<S: WorkflowState> std::fmt::Debug for StateMachine<S> {
@@ -109,7 +109,7 @@ impl<S: WorkflowState> std::fmt::Debug for StateMachine<S> {
             .field("workflow_type", &self.workflow_type)
             .field("current_state", &self.current_state)
             .field("transition_history_len", &self.transition_history.len())
-            .field("checkpoint_db", &"<CheckpointDb>")
+            .field("pg_db", &"<PgDb>")
             .finish()
     }
 }
@@ -117,7 +117,7 @@ impl<S: WorkflowState> std::fmt::Debug for StateMachine<S> {
 impl<S: WorkflowState> StateMachine<S> {
     /// Create a new state machine with an initial state.
     pub fn new(
-        checkpoint_db: Arc<CheckpointDb>,
+        pg_db: Arc<PgDb>,
         execution_id: impl Into<String>,
         workflow_type: impl Into<String>,
         initial_state: S,
@@ -127,7 +127,7 @@ impl<S: WorkflowState> StateMachine<S> {
             workflow_type: workflow_type.into(),
             current_state: initial_state,
             transition_history: Vec::new(),
-            checkpoint_db,
+            pg_db,
         }
     }
 
@@ -211,33 +211,71 @@ impl<S: WorkflowState> StateMachine<S> {
         Ok(())
     }
 
-    /// Persist the current state to the database.
+    /// Persist the current state to the database (PG via block_in_place).
     pub fn persist(&self) -> Result<(), String> {
         let state_name = self.current_state.name();
         let state_data = serde_json::to_string(&self.current_state)
             .map_err(|e| format!("Failed to serialize state: {}", e))?;
 
-        self.checkpoint_db.save_workflow_execution_state(
-            &self.execution_id,
-            &self.workflow_type,
-            state_name,
-            Some(&state_data),
-            self.current_state.phase(),
-            self.current_state.iteration(),
-        )?;
+        let pg = self.pg_db.clone();
+        let exec_id = self.execution_id.clone();
+        let wf_type = self.workflow_type.clone();
+        let phase = self.current_state.phase().map(|s| s.to_string());
+        let iteration = self.current_state.iteration();
 
-        Ok(())
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        pg.save_workflow_execution_state(
+                            &exec_id,
+                            &wf_type,
+                            state_name,
+                            Some(&state_data),
+                            phase.as_deref(),
+                            iteration,
+                        )
+                        .await
+                    })
+                })
+            }));
+            match result {
+                Ok(inner) => inner,
+                Err(_) => Err("block_in_place panicked during persist".to_string()),
+            }
+        } else {
+            warn!("No tokio runtime available for persist — state not saved");
+            Err("No tokio runtime available".to_string())
+        }
     }
 
-    /// Restore a state machine from the database.
+    /// Restore a state machine from the database (PG via block_in_place).
     ///
     /// Returns None if no saved state exists for the given execution_id.
     pub fn restore(
-        checkpoint_db: Arc<CheckpointDb>,
+        pg_db: Arc<PgDb>,
         execution_id: &str,
         workflow_type: &str,
     ) -> Result<Option<Self>, String> {
-        let saved = checkpoint_db.get_workflow_execution_state(execution_id)?;
+        let saved = {
+            let pg = pg_db.clone();
+            let eid = execution_id.to_string();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async move {
+                            pg.get_workflow_execution_state(&eid).await
+                        })
+                    })
+                }));
+                match result {
+                    Ok(inner) => inner?,
+                    Err(_) => return Err("block_in_place panicked during restore".to_string()),
+                }
+            } else {
+                return Err("No tokio runtime available for restore".to_string());
+            }
+        };
 
         match saved {
             Some(state_record) => {
@@ -262,7 +300,7 @@ impl<S: WorkflowState> StateMachine<S> {
                     workflow_type: workflow_type.to_string(),
                     current_state: state,
                     transition_history: Vec::new(), // History not restored
-                    checkpoint_db,
+                    pg_db,
                 }))
             }
             None => Ok(None),
@@ -295,6 +333,7 @@ pub struct WorkflowExecutionStateRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::pg::PgDb;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -325,9 +364,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires PG via DATABASE_URL"]
     fn test_state_machine_transitions() {
-        let db = CheckpointDb::new_in_memory().expect("Failed to create in-memory db");
-        let mut sm = StateMachine::new(Arc::new(db), "test-exec-1", "test", TestState::Created);
+        let db = PgDb::new_blocking_for_test();
+        let mut sm = StateMachine::new(db, "test-exec-1", "test", TestState::Created);
 
         assert_eq!(sm.current_state().name(), "created");
         assert!(!sm.is_terminal());
@@ -345,9 +385,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires PG via DATABASE_URL"]
     fn test_state_machine_with_reason() {
-        let db = CheckpointDb::new_in_memory().expect("Failed to create in-memory db");
-        let mut sm = StateMachine::new(Arc::new(db), "test-exec-2", "test", TestState::Created);
+        let db = PgDb::new_blocking_for_test();
+        let mut sm = StateMachine::new(db, "test-exec-2", "test", TestState::Created);
 
         sm.transition_to_with_reason(
             TestState::Failed {

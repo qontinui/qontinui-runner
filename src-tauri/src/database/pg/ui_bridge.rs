@@ -372,4 +372,21 @@ impl PgDb {
             label: None,
         }).collect())
     }
+
+    /// Update the SDK version and timestamp for a UI Bridge integration.
+    pub async fn update_ui_bridge_integration_version(
+        &self,
+        integration_id: &str,
+        sdk_version: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "UPDATE ui_bridge_integrations SET sdk_version = $1, updated_at = $2 WHERE id = $3",
+            &[&sdk_version, &now, &integration_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_ui_bridge_integration_version: {}", e))?;
+        Ok(())
+    }
 }

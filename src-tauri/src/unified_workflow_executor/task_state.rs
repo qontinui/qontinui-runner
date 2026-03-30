@@ -165,7 +165,7 @@ impl LoopController {
         let persist_id = get_parent_task_id(execution_id);
 
         let state_machine = StateMachine::new(
-            self.checkpoint_db.clone(),
+            self.app_state.pg_db.clone(),
             &persist_id,
             "unified",
             state.clone(),

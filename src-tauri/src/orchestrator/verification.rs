@@ -292,7 +292,22 @@ impl DeterministicVerifier {
             }
         };
 
-        let test = match app_state.checkpoint_db.get_verification_test(script_id) {
+        // PG-primary via block_in_place
+        let pg = app_state.pg_db.clone();
+        let sid = script_id.to_string();
+        let test_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        pg.get_verification_test(&sid).await
+                    })
+                })
+            }))
+            .unwrap_or_else(|_| Err("block_in_place panicked".to_string()))
+        } else {
+            Err("No tokio runtime available".to_string())
+        };
+        let test = match test_result {
             Ok(Some(test)) => test,
             Ok(None) => {
                 error!("Playwright script not found in database: {}", script_id);
