@@ -52,8 +52,8 @@ pub use builtins::get_builtin_contexts;
 // Re-export project context operations
 pub use project_contexts::{
     add_project_context_to_config, create_project_context, delete_project_context_from_config,
-    get_project_context_from_config, get_project_contexts_from_config,
-    update_project_context_in_config,
+    get_project_context_from_config, get_project_contexts, get_project_contexts_from_config,
+    load_project_contexts_from_dir, update_project_context_in_config,
 };
 
 // Re-export special context handling

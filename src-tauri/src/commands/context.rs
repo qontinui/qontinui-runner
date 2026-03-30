@@ -60,7 +60,7 @@ pub struct AutoDetectResult {
 // Helper Functions
 // ============================================================================
 
-/// Combine user, project (TODO), and builtin contexts into a single list
+/// Combine user, project, and builtin contexts into a single list
 fn get_all_contexts_combined() -> Vec<ContextWithMetadata> {
     let library = context::load_user_context_library();
     let mut all_contexts = Vec::new();
@@ -90,7 +90,18 @@ fn get_all_contexts_combined() -> Vec<ContextWithMetadata> {
         });
     }
 
-    // TODO: Add project contexts when project context support is implemented
+    // Add project contexts from .qontinui/contexts/ in the working directory
+    for ctx in context::get_project_contexts() {
+        let metadata = library.metadata.iter().find(|m| m.context_id == ctx.id);
+        all_contexts.push(ContextWithMetadata {
+            context: ctx,
+            scope: ContextScope::Project,
+            enabled: metadata.map(|m| m.enabled).unwrap_or(true),
+            use_count: metadata.map(|m| m.use_count).unwrap_or(0),
+            last_used_at: metadata.and_then(|m| m.last_used_at.clone()),
+            web_sync_status: None,
+        });
+    }
 
     all_contexts
 }

@@ -763,8 +763,26 @@ pub fn generate_workflow(
 
     // ── Investigation Phase ────────────────────────────────────────────────
     // Resolve contexts once (shared between investigation and builder).
+    // This includes explicit context IDs, inline context, AND project contexts
+    // loaded from .qontinui/contexts/ in the working directory.
     let resolved_contexts = {
         let mut ctx = String::new();
+
+        // Load project contexts from .qontinui/contexts/ (always included for
+        // spec-based workflows — these define project-wide knowledge).
+        let project_contexts = context::get_project_contexts();
+        if !project_contexts.is_empty() {
+            info!(
+                "Including {} project context(s) from .qontinui/contexts/",
+                project_contexts.len()
+            );
+            for pc in &project_contexts {
+                ctx.push_str(&context::format_single_context(pc));
+                ctx.push_str("\n\n");
+            }
+        }
+
+        // Resolve explicitly selected context IDs (user + builtin + project)
         if let Some(ref ids) = request.context_ids {
             if !ids.is_empty() {
                 let resolved = context::resolve_contexts(ids, false, "", &[], &[]);
@@ -2280,8 +2298,16 @@ fn run_builder_agent(
         build_schema_context()
     };
 
-    // Resolve saved + inline context
+    // Resolve saved + inline + project context
     let mut context_section = String::new();
+
+    // Always include project contexts from .qontinui/contexts/
+    let project_contexts = context::get_project_contexts();
+    for pc in &project_contexts {
+        context_section.push_str(&context::format_single_context(pc));
+        context_section.push_str("\n\n");
+    }
+
     if let Some(ref ids) = request.context_ids {
         if !ids.is_empty() {
             let resolved = context::resolve_contexts(ids, false, "", &[], &[]);

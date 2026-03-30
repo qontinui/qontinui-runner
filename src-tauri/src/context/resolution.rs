@@ -4,6 +4,7 @@
 
 use super::builtins::get_builtin_contexts;
 use super::metadata::record_context_use;
+use super::project_contexts::get_project_contexts;
 use super::storage::load_user_context_library;
 use super::types::{AutoDetectReason, Context, ResolvedContexts};
 use super::user_contexts::get_all_user_contexts;
@@ -73,14 +74,16 @@ pub fn resolve_contexts(
     let mut result = ResolvedContexts::default();
     let mut included_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Gather all available contexts (user + builtin)
+    // Gather all available contexts (user + project + builtin)
     let user_contexts = get_all_user_contexts();
+    let project_contexts = get_project_contexts();
     let builtin_contexts = get_builtin_contexts();
     let library = load_user_context_library();
 
     // Create a lookup map
     let all_contexts: Vec<&Context> = user_contexts
         .iter()
+        .chain(project_contexts.iter())
         .chain(builtin_contexts.iter())
         .collect();
 
