@@ -819,154 +819,60 @@ async fn get_backup_summary(
 
 /// POST /settings/backup/export
 async fn export_all_data(
-    State(api_state): State<Arc<ApiState>>,
+    State(_api_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ComprehensiveExport>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = api_state.app_state.checkpoint_db.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let summary = db.get_export_summary()?;
-
-        let flows = db.export_all_flows()?;
-        let flow_executions = db.export_all_flow_executions()?;
-        let checkpoints = db.export_all_orchestrator_checkpoints()?;
-        let learning_outcomes = db.get_learning_outcomes(None)?;
-        let learning_patterns = db.get_learning_patterns()?;
-        let settings_data = db.export_all_settings()?;
-        let prompts = db.export_all_prompts()?;
-        let unified_workflows = db.export_all_unified_workflows()?;
-        let verification_tests = db.export_all_verification_tests()?;
-        let task_hooks = db.export_all_task_hooks()?;
-        let scheduled_tasks = db.export_all_scheduled_tasks()?;
-        let saved_api_requests = db.export_all_saved_api_requests()?;
-        let configs = db.export_all_configs()?;
-
-        Ok::<_, String>(ComprehensiveExport {
-            manifest: crate::commands::backup::ExportManifest {
-                version: "2.0.0".to_string(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            summary,
-            flows,
-            flow_executions,
-            checkpoints,
-            learning_outcomes,
-            learning_patterns,
-            settings: settings_data,
-            prompts,
-            unified_workflows,
-            verification_tests,
-            task_hooks,
-            scheduled_tasks,
-            saved_api_requests,
-            configs,
-        })
-    })
-    .await
-    .map_err(|e| {
-        error!("Failed to export data: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task failed: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(export) => {
-            info!("Data exported via HTTP");
-            Ok(Json(ApiResponse::success(export)))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    // checkpoint_db removed — export not yet migrated to PG
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Data export: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// POST /settings/backup/import
 async fn import_all_data(
-    State(api_state): State<Arc<ApiState>>,
-    Json(data): Json<ComprehensiveExport>,
+    State(_api_state): State<Arc<ApiState>>,
+    Json(_data): Json<ComprehensiveExport>,
 ) -> Result<Json<ApiResponse<ComprehensiveImportResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = api_state.app_state.checkpoint_db.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let conflict_mode = "skip";
+    // checkpoint_db removed — import not yet migrated to PG
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Data import: SQLite removed, not yet migrated to PG".to_string())),
+    ))
+}
 
-        let mut results: std::collections::HashMap<String, crate::database::ImportResult> =
-            std::collections::HashMap::new();
-        let mut total_imported = 0;
-        let mut total_skipped = 0;
-        let mut total_errors = 0;
+// ============================================================================
+// Accessibility Settings
+// ============================================================================
 
-        // Helper macro-like closure to reduce repetition
-        let mut do_import =
-            |name: &str,
-             data_vec: &[serde_json::Value],
-             import_fn: &dyn Fn(
-                &[serde_json::Value],
-                &str,
-            ) -> Result<crate::database::ImportResult, String>| {
-                if !data_vec.is_empty() {
-                    match import_fn(data_vec, conflict_mode) {
-                        Ok(r) => {
-                            total_imported += r.imported;
-                            total_skipped += r.skipped;
-                            total_errors += r.errors.len();
-                            results.insert(name.to_string(), r);
-                        }
-                        Err(e) => {
-                            results.insert(
-                                name.to_string(),
-                                crate::database::ImportResult {
-                                    imported: 0,
-                                    skipped: 0,
-                                    errors: vec![e],
-                                },
-                            );
-                        }
-                    }
-                }
-            };
+/// Response payload for GET /settings/accessibility
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessibilitySettingsPayload {
+    pub use_rust_accessibility: bool,
+    pub cdp_port: u16,
+    pub chrome_path: Option<String>,
+}
 
-        do_import("flows", &data.flows, &|d, m| db.import_flows(d, m));
-        do_import("prompts", &data.prompts, &|d, m| db.import_prompts(d, m));
-        do_import("settings", &data.settings, &|d, m| db.import_settings(d, m));
-        do_import("unified_workflows", &data.unified_workflows, &|d, m| {
-            db.import_unified_workflows(d, m)
-        });
-        do_import("learning_outcomes", &data.learning_outcomes, &|d, m| {
-            db.import_learning_outcomes(d, m)
-        });
-        do_import("learning_patterns", &data.learning_patterns, &|d, m| {
-            db.import_learning_patterns(d, m)
-        });
-
-        let success = total_errors == 0;
-        Ok::<_, String>(ComprehensiveImportResult {
-            success,
-            results,
-            total_imported,
-            total_skipped,
-            total_errors,
-        })
+/// GET /settings/accessibility
+async fn get_accessibility_settings(
+) -> Result<Json<ApiResponse<AccessibilitySettingsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result = tokio::task::spawn_blocking(|| {
+        let s = settings::get_accessibility_settings();
+        AccessibilitySettingsPayload {
+            use_rust_accessibility: s.use_rust_accessibility,
+            cdp_port: s.cdp_port,
+            chrome_path: s.chrome_path,
+        }
     })
     .await
     .map_err(|e| {
-        error!("Failed to import data: {}", e);
+        error!("Failed to get accessibility settings: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Task failed: {}", e))),
         )
     })?;
 
-    match result {
-        Ok(import_result) => {
-            info!(
-                "Data imported via HTTP: {} imported, {} skipped, {} errors",
-                import_result.total_imported,
-                import_result.total_skipped,
-                import_result.total_errors
-            );
-            Ok(Json(ApiResponse::success(import_result)))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
+    Ok(Json(ApiResponse::success(result)))
 }
 
 // ============================================================================
@@ -1033,6 +939,8 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/settings/mobile",
             get(get_mobile_settings).put(save_mobile_settings),
         )
+        // Accessibility settings
+        .route("/settings/accessibility", get(get_accessibility_settings))
         // Storage
         .route("/settings/storage", get(get_storage_info))
         .route("/settings/storage/cleanup", post(cleanup_storage))
