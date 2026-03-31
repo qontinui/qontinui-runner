@@ -1,7 +1,7 @@
-import React, { useMemo } from "react";
-import { List, type RowComponentProps } from "react-window";
-import type { TraceSpan, TraceTreeNode, CriticalPathInfo } from "./types";
-import { formatDuration } from "./trace-utils";
+import React, { useMemo, useCallback, useEffect } from "react";
+import { List, useListRef, type RowComponentProps } from "react-window";
+import type { TraceSpan, TraceTreeNode, CriticalPathInfo, TokenOverlayMode } from "./types";
+import { formatDuration, getTokenHeat, computeTokenInsights } from "./trace-utils";
 import { SpanRow } from "./SpanRow";
 
 interface TraceWaterfallProps {
@@ -12,6 +12,13 @@ interface TraceWaterfallProps {
   onSelectSpan: (span: TraceSpan) => void;
   height: number;
   criticalPath?: CriticalPathInfo | null;
+  tokenOverlay?: TokenOverlayMode;
+  tokenInsights?: ReturnType<typeof computeTokenInsights>;
+  highlightedSpanId?: string | null;
+  /** Reports visible viewport as fractions (0-1) when the waterfall scrolls. */
+  onViewportChange?: (start: number, end: number) => void;
+  /** Fraction (0-1) to scroll the waterfall to. */
+  scrollToFraction?: number;
 }
 
 interface TraceRowProps {
@@ -21,6 +28,9 @@ interface TraceRowProps {
   selectedSpanId: string | null;
   onSelectSpan: (span: TraceSpan) => void;
   criticalPath?: CriticalPathInfo | null;
+  tokenOverlay?: TokenOverlayMode;
+  tokenInsights?: ReturnType<typeof computeTokenInsights>;
+  highlightedSpanId?: string | null;
 }
 
 function TraceRow({
@@ -32,8 +42,17 @@ function TraceRow({
   selectedSpanId,
   onSelectSpan,
   criticalPath,
+  tokenOverlay,
+  tokenInsights,
+  highlightedSpanId,
 }: RowComponentProps<TraceRowProps>) {
   const node = filteredNodes[index];
+  const heat = tokenOverlay && tokenOverlay !== "none" && tokenInsights
+    ? getTokenHeat(node.span, tokenOverlay,
+        tokenOverlay === "input" ? tokenInsights.maxInputTokens
+          : tokenOverlay === "output" ? tokenInsights.maxOutputTokens
+          : tokenInsights.maxCostCents)
+    : 0;
   return (
     <div style={style}>
       <SpanRow
@@ -43,6 +62,8 @@ function TraceRow({
         isSelected={selectedSpanId === node.span.span_id}
         onClick={() => onSelectSpan(node.span)}
         criticalPath={criticalPath}
+        tokenHeat={heat}
+        isHighlighted={highlightedSpanId === node.span.span_id}
       />
     </div>
   );
@@ -55,7 +76,13 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
   onSelectSpan,
   height,
   criticalPath,
+  tokenOverlay,
+  tokenInsights,
+  highlightedSpanId,
+  onViewportChange,
+  scrollToFraction,
 }) => {
+  const listRef = useListRef(null);
   // Compute trace time bounds (uses all spans for the full timeline, not just filtered)
   const { traceStartMs, traceDurationMs } = useMemo(() => {
     if (spans.length === 0) return { traceStartMs: 0, traceDurationMs: 0 };
@@ -99,6 +126,27 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
 
   const listHeight = Math.max(height - 24, 100);
 
+  // Report viewport position when visible rows change
+  const handleRowsRendered = useCallback(
+    (_visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => {
+      if (!onViewportChange || filteredNodes.length === 0) return;
+      const start = allRows.startIndex / filteredNodes.length;
+      const end = Math.min(1, (allRows.stopIndex + 1) / filteredNodes.length);
+      onViewportChange(start, end);
+    },
+    [onViewportChange, filteredNodes.length],
+  );
+
+  // Scroll to a specific fraction when requested by the minimap
+  useEffect(() => {
+    if (scrollToFraction == null || filteredNodes.length === 0) return;
+    const ref = listRef as React.RefObject<{ scrollToRow: (config: { index: number; align?: string }) => void } | null>;
+    if (!ref?.current) return;
+    const targetIndex = Math.round(scrollToFraction * filteredNodes.length);
+    const clampedIndex = Math.max(0, Math.min(filteredNodes.length - 1, targetIndex));
+    ref.current.scrollToRow({ index: clampedIndex, align: "start" });
+  }, [scrollToFraction, filteredNodes.length, listRef]);
+
   // Timeline header
   const timeMarks = [0, 0.25, 0.5, 0.75, 1.0];
 
@@ -131,6 +179,8 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
       {/* Virtualized span list with critical path overlay */}
       <div className="relative" style={{ height: listHeight }}>
         <List
+          listRef={listRef}
+          onRowsRendered={handleRowsRendered}
           rowCount={filteredNodes.length}
           rowHeight={ROW_HEIGHT}
           rowComponent={TraceRow}
@@ -141,6 +191,9 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
             selectedSpanId,
             onSelectSpan,
             criticalPath,
+            tokenOverlay,
+            tokenInsights,
+            highlightedSpanId,
           }}
           style={{ width: "100%", height: listHeight }}
         />

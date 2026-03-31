@@ -8,6 +8,7 @@ import type {
   SpanMatch,
   ComparisonSummary,
   CriticalPathInfo,
+  TokenOverlayMode,
 } from "./types";
 
 /** Infer the workflow phase from a span name. */
@@ -451,4 +452,42 @@ export function computeCriticalPath(roots: TraceTreeNode[]): CriticalPathInfo {
   }
 
   return { spanIds, pathDurationMs, bottleneck, slackBySpanId };
+}
+
+// ---------------------------------------------------------------------------
+// Token insight utilities
+// ---------------------------------------------------------------------------
+
+/** Compute aggregate token insights across all spans. */
+export function computeTokenInsights(spans: TraceSpan[]): {
+  totalInputTokens: number; totalOutputTokens: number; totalCostCents: number;
+  maxInputTokens: number; maxOutputTokens: number; maxCostCents: number;
+  phaseTokens: Record<string, { input: number; output: number; cost: number }>;
+} {
+  let totalInputTokens = 0, totalOutputTokens = 0, totalCostCents = 0;
+  let maxInputTokens = 0, maxOutputTokens = 0, maxCostCents = 0;
+  const phaseTokens: Record<string, { input: number; output: number; cost: number }> = {};
+  for (const span of spans) {
+    const input = span.input_tokens ?? 0, output = span.output_tokens ?? 0, cost = span.cost_cents ?? 0;
+    totalInputTokens += input; totalOutputTokens += output; totalCostCents += cost;
+    if (input > maxInputTokens) maxInputTokens = input;
+    if (output > maxOutputTokens) maxOutputTokens = output;
+    if (cost > maxCostCents) maxCostCents = cost;
+    const phase = inferPhase(span.name);
+    if (!phaseTokens[phase]) phaseTokens[phase] = { input: 0, output: 0, cost: 0 };
+    phaseTokens[phase].input += input; phaseTokens[phase].output += output; phaseTokens[phase].cost += cost;
+  }
+  return { totalInputTokens, totalOutputTokens, totalCostCents, maxInputTokens, maxOutputTokens, maxCostCents, phaseTokens };
+}
+
+/** Get 0-1 heat intensity for a span given the overlay mode. */
+export function getTokenHeat(span: TraceSpan, mode: TokenOverlayMode, maxValue: number): number {
+  if (mode === "none" || maxValue === 0) return 0;
+  let value = 0;
+  switch (mode) {
+    case "input": value = span.input_tokens ?? 0; break;
+    case "output": value = span.output_tokens ?? 0; break;
+    case "cost": value = span.cost_cents ?? 0; break;
+  }
+  return Math.min(value / maxValue, 1);
 }

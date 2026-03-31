@@ -11,9 +11,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, info_span, warn};
 
 use crate::autoresearch::agentic_verification::*;
+use crate::orchestrator::contract_validator::ContractValidator;
+use crate::orchestrator::contracts::{
+    ImplementerOutput, LocatorOutput, SpecAnalystOutput, VerifierOutput,
+};
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
 
@@ -28,7 +32,7 @@ use super::types::{LoopConfig, LoopResult};
 /// - Type-safe data flow between agents
 /// - Richer context for downstream agents (e.g., locator results inform implementer)
 /// - Structured telemetry for per-agent optimization
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct PipelineContext {
     /// Structured acceptance criteria from the Spec Analyst phase.
     pub spec_results: Vec<PipelineAcceptanceCriterion>,
@@ -41,10 +45,30 @@ pub struct PipelineContext {
 
     /// Verification failures from Verifier agents.
     pub verifier_failures: Vec<VerifierFailure>,
+
+    // ── Typed contract outputs (Phase 5) ─────────────────────────────
+    // Optional typed versions of the above fields, populated by ContractValidator.
+    // Existing fields are preserved for backward compatibility.
+
+    /// Typed Spec Analyst output validated against the SpecAnalystOutput contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_contract_output: Option<crate::orchestrator::contracts::SpecAnalystOutput>,
+
+    /// Typed Locator output validated against the LocatorOutput contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator_contract_output: Option<crate::orchestrator::contracts::LocatorOutput>,
+
+    /// Typed Implementer output validated against the ImplementerOutput contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer_contract_output: Option<crate::orchestrator::contracts::ImplementerOutput>,
+
+    /// Typed Verifier output validated against the VerifierOutput contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_contract_output: Option<crate::orchestrator::contracts::VerifierOutput>,
 }
 
 /// A record of changes made by an implementer agent.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ImplementerChange {
     /// Subtree this change belongs to.
     pub subtree_id: String,
@@ -63,7 +87,7 @@ pub struct ImplementerChange {
 }
 
 /// A verification failure from a verifier agent.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct VerifierFailure {
     /// Criterion that failed verification.
     pub criterion_id: String,
@@ -82,6 +106,10 @@ impl PipelineContext {
             locator_results: Vec::new(),
             implementer_changes: Vec::new(),
             verifier_failures: Vec::new(),
+            spec_contract_output: None,
+            locator_contract_output: None,
+            implementer_contract_output: None,
+            verifier_contract_output: None,
         }
     }
 
@@ -161,7 +189,6 @@ struct SubtreeOutput {
 /// so that `buffer_unordered` can satisfy `Send + 'static` bounds.
 #[derive(Clone)]
 struct PipelineShared {
-    checkpoint_db: Arc<crate::database::CheckpointDb>,
     pg_db: Arc<crate::database::pg::PgDb>,
     agentic_executor: Arc<super::phases::AgenticExecutor>,
     verification_executor: Arc<super::phases::VerificationExecutor>,
@@ -170,14 +197,13 @@ struct PipelineShared {
 impl PipelineShared {
     fn from_controller(ctrl: &LoopController) -> Self {
         Self {
-            checkpoint_db: Arc::clone(&ctrl.checkpoint_db),
             pg_db: ctrl.app_state.pg_db.clone(),
             agentic_executor: Arc::clone(&ctrl.agentic_executor),
             verification_executor: Arc::clone(&ctrl.verification_executor),
         }
     }
 
-    /// Mirror of `LoopController::is_task_stopped` — only needs `checkpoint_db`.
+    /// Mirror of `LoopController::is_task_stopped`.
     fn is_task_stopped(&self, execution_id: &str) -> bool {
         let task_id_to_check = super::types::get_parent_task_id(execution_id);
         // PG-primary: use block_on to call async PG from sync context
@@ -435,15 +461,10 @@ fn build_dependency_dag(criteria: &[PipelineAcceptanceCriterion]) -> ExecutionDA
 ///
 /// Returns (input_tokens, output_tokens). Falls back to (0, 0) on error.
 pub(super) fn query_iteration_tokens(
-    db: &crate::database::CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     execution_id: &str,
     iteration: u32,
 ) -> (u64, u64) {
-    // Try PG first if available and we're in a tokio context.
-    // Uses catch_unwind because Handle::block_on panics if called from within
-    // an async context (which these sync helpers are called from). On panic,
-    // we silently fall through to the SQLite path.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let pg = pg_db.clone();
         let id = execution_id.to_string();
@@ -455,14 +476,7 @@ pub(super) fn query_iteration_tokens(
         }
     }
 
-    // SQLite fallback
-    match db.get_iteration_token_totals(execution_id, iteration) {
-        Ok(totals) => totals,
-        Err(e) => {
-            warn!("Failed to query iteration token totals: {}", e);
-            (0, 0)
-        }
-    }
+    (0, 0)
 }
 
 impl LoopController {
@@ -488,6 +502,13 @@ impl LoopController {
         _all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
         logger: &StepEventLogger,
     ) -> LoopResult {
+        // NOTE: We deliberately avoid .entered() here because this is an async context.
+        // EnteredSpan is !Send and cannot be held across .await points.
+        // The span is still recorded for correlation via tracing macros below.
+        let _pipeline_span = info_span!("qontinui.agent.pipeline",
+            execution_id = %config.execution_id,
+        );
+
         let pipeline_config = config
             .multi_agent_pipeline_config
             .clone()
@@ -551,7 +572,6 @@ impl LoopController {
         // (they target named agent roles like "implementer", "locator").
         if let Some((_, ref rec_id)) = config.active_canary {
             match crate::meta_optimizer::canary::get_canary_prompt_overrides(
-                &self.checkpoint_db,
                 &self.app_state.pg_db,
                 rec_id,
             ) {
@@ -584,7 +604,6 @@ impl LoopController {
 
         // ── Check for existing checkpoint (resume support) ────────────────
         let checkpoint = match crate::database::pipeline_traces::get_pipeline_checkpoint(
-            &self.checkpoint_db,
             &config.execution_id,
         ) {
             Ok(Some(cp)) => {
@@ -610,13 +629,28 @@ impl LoopController {
         let mut agent_traces: Vec<PipelineAgentTrace> = Vec::new();
         let mut pipeline_ctx = PipelineContext::new();
 
+        // Create ContractValidator for validating agent outputs at phase boundaries.
+        // If schema compilation fails (shouldn't happen), log and continue without validation.
+        let contract_validator: Option<ContractValidator> = match ContractValidator::new() {
+            Ok(cv) => {
+                debug!("MULTI-AGENT-PIPELINE: ContractValidator initialized");
+                Some(cv)
+            }
+            Err(e) => {
+                warn!(
+                    "MULTI-AGENT-PIPELINE: Failed to create ContractValidator: {}. Proceeding without contract validation.",
+                    e
+                );
+                None
+            }
+        };
+
         // If resuming from checkpoint, restore iteration count and reload persisted traces.
         if let Some(ref cp) = checkpoint {
             if cp.last_completed_phase >= 4 {
                 total_iterations = cp.total_iterations;
                 // Reload agent traces persisted during the previous (crashed) run
                 match crate::database::pipeline_traces::get_traces_for_task_run(
-                    &self.checkpoint_db,
                     &config.execution_id,
                 ) {
                     Ok(traces) => {
@@ -640,6 +674,11 @@ impl LoopController {
         // The Spec Analyst agent parses spec files into structured acceptance
         // criteria with dependency metadata. For now, we derive criteria from
         // the verification steps (which are already built from specs).
+        let _spec_phase_span = info_span!("qontinui.agent.phase",
+            agent.id = "spec_analyst",
+            agent.role = "spec_analyst",
+            execution_id = %config.execution_id,
+        ); // NOTE: not .entered() — EnteredSpan is !Send in async contexts
         info!("MULTI-AGENT-PIPELINE: Phase 1 — Spec Analysis");
 
         let analyst_start = std::time::Instant::now();
@@ -665,6 +704,34 @@ impl LoopController {
             .collect();
         let analyst_duration = analyst_start.elapsed().as_millis() as u64;
 
+        // Contract validation for spec_analyst output
+        let mut spec_schema_valid = None;
+        let mut spec_validation_errors: Option<String> = None;
+        if let Some(ref cv) = contract_validator {
+            let spec_output = SpecAnalystOutput::from_pipeline_data(
+                criteria.clone(),
+                crate::workflow_generation::complexity::ComplexityLevel::Moderate,
+            );
+            if let Ok(spec_json) = serde_json::to_value(&spec_output) {
+                let result = cv.validate_output("spec_analyst", &spec_json);
+                spec_schema_valid = Some(result.valid);
+                if result.valid {
+                    debug!("MULTI-AGENT-PIPELINE: Spec analyst output passed contract validation");
+                    pipeline_ctx.spec_contract_output = Some(spec_output);
+                } else {
+                    let errors = result.error_summary();
+                    warn!(
+                        "MULTI-AGENT-PIPELINE: Spec analyst output failed contract validation: {}",
+                        errors
+                    );
+                    spec_validation_errors = Some(
+                        serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+
         let spec_trace = PipelineAgentTrace {
             agent_type: "spec_analyst".to_string(),
             agent_id: "spec_analyst_0".to_string(),
@@ -686,10 +753,13 @@ impl LoopController {
             span_type: "agent".to_string(),
             guardrail_results: vec![],
             handoff_received: None,
+            schema_valid_first_attempt: spec_schema_valid,
+            validation_retries: Some(0),
+            coercions_applied: None,
+            validation_error_summary: spec_validation_errors,
         };
         // Persist incrementally so trace survives pipeline crashes
         if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-            &self.checkpoint_db,
             &config.execution_id,
             &spec_trace,
         ) {
@@ -722,6 +792,15 @@ impl LoopController {
             analyst_duration
         );
 
+        drop(_spec_phase_span);
+        {
+            let _msg = info_span!("qontinui.agent.message",
+                agent.source_id = "spec_analyst",
+                agent.target_id = "locator",
+                agent.message_type = "delegation",
+            ); // NOTE: not .entered() — EnteredSpan is !Send in async contexts
+        }
+
         // ── Phase 2: DAG Construction (deterministic) ───────────────────
         info!(
             "MULTI-AGENT-PIPELINE: Phase 2 — DAG Construction (strategy={})",
@@ -747,6 +826,12 @@ impl LoopController {
         info!("MULTI-AGENT-PIPELINE: Phase 3 — UI Snapshot (delegated to verification steps)");
 
         // ── Phase 4: Code Location ─────────────────────────────────────
+        // NOTE: Avoiding .entered() because EnteredSpan is !Send and this is async code.
+        let _locator_phase_span = info_span!("qontinui.agent.phase",
+            agent.id = "locator",
+            agent.role = "locator",
+            execution_id = %config.execution_id,
+        );
         info!("MULTI-AGENT-PIPELINE: Phase 4 — Code Location");
 
         // If we have a checkpoint with located_criteria from a previous run,
@@ -919,7 +1004,7 @@ Only output the JSON array, nothing else."#,
             // Query token usage recorded during the locator's run_agentic call (iteration=0).
             // Fall back to tokens carried on AgenticOutcome when DB has no records.
             let (mut locator_tokens_in, mut locator_tokens_out) =
-                query_iteration_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id, 0);
+                query_iteration_tokens(&self.app_state.pg_db, &config.execution_id, 0);
             if locator_tokens_in == 0 && locator_tokens_out == 0 {
                 let (ot_in, ot_out) = locator_outcome.token_usage();
                 locator_tokens_in = ot_in.unwrap_or(0);
@@ -938,6 +1023,31 @@ Only output the JSON array, nothing else."#,
                     "MULTI-AGENT-PIPELINE: Locator tokens: in={}, out={}, cost=${:.4}",
                     locator_tokens_in, locator_tokens_out, locator_cost
                 );
+            }
+
+            // Contract validation for locator output
+            let mut locator_schema_valid = None;
+            let mut locator_validation_errors: Option<String> = None;
+            if let Some(ref cv) = contract_validator {
+                let locator_output = LocatorOutput::from_pipeline_data(parsed.clone());
+                if let Ok(locator_json) = serde_json::to_value(&locator_output) {
+                    let result = cv.validate_output("locator", &locator_json);
+                    locator_schema_valid = Some(result.valid);
+                    if result.valid {
+                        debug!("MULTI-AGENT-PIPELINE: Locator output passed contract validation");
+                        pipeline_ctx.locator_contract_output = Some(locator_output);
+                    } else {
+                        let errors = result.error_summary();
+                        warn!(
+                            "MULTI-AGENT-PIPELINE: Locator output failed contract validation: {}",
+                            errors
+                        );
+                        locator_validation_errors = Some(
+                            serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
             }
 
             let locator_trace = PipelineAgentTrace {
@@ -963,9 +1073,12 @@ Only output the JSON array, nothing else."#,
                 span_type: "agent".to_string(),
                 guardrail_results: vec![],
                 handoff_received: None,
+                schema_valid_first_attempt: locator_schema_valid,
+                validation_retries: Some(0),
+                coercions_applied: None,
+                validation_error_summary: locator_validation_errors,
             };
             if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                &self.checkpoint_db,
                 &config.execution_id,
                 &locator_trace,
             ) {
@@ -1048,7 +1161,7 @@ Only output the JSON array, nothing else."#,
                         }
                     }
                     crate::meta_optimizer::canary::record_canary_outcome(
-                        &self.checkpoint_db, &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
+                        &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
                     );
                 }
                 // Canary config restoration is handled at the loop_controller::run() level.
@@ -1070,7 +1183,6 @@ Only output the JSON array, nothing else."#,
                 agent_trace_count: agent_traces.len(),
             };
             if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
-                &self.checkpoint_db,
                 &config.execution_id,
                 &cp,
             ) {
@@ -1083,7 +1195,21 @@ Only output the JSON array, nothing else."#,
             }
         }
 
+        drop(_locator_phase_span);
+        {
+            let _msg = info_span!("qontinui.agent.message",
+                agent.source_id = "locator",
+                agent.target_id = "implementer",
+                agent.message_type = "delegation",
+            ); // NOTE: not .entered() — EnteredSpan is !Send in async contexts
+        }
+
         // ── Phase 5: Implementation + Verification per subtree ──────────
+        let _impl_phase_span = info_span!("qontinui.agent.phase",
+            agent.id = "implementer",
+            agent.role = "implementer",
+            execution_id = %config.execution_id,
+        ); // NOTE: not .entered() — EnteredSpan is !Send in async contexts
         info!("MULTI-AGENT-PIPELINE: Phase 5 — Implementation + Verification");
 
         let mut subtree_results: Vec<SubtreeResult> = Vec::new();
@@ -1143,6 +1269,7 @@ Only output the JSON array, nothing else."#,
                         agentic_steps,
                         logger,
                         &pipeline_ctx,
+                        &contract_validator,
                     )
                     .await,
                 );
@@ -1170,7 +1297,6 @@ Only output the JSON array, nothing else."#,
                     agent_trace_count: agent_traces.len(),
                 };
                 if let Err(e) = crate::database::pipeline_traces::save_pipeline_checkpoint(
-                    &self.checkpoint_db,
                     &config.execution_id,
                     &cp,
                 ) {
@@ -1180,6 +1306,29 @@ Only output the JSON array, nothing else."#,
 
         }
 
+        // Build aggregated contract outputs for implementer and verifier after all subtrees.
+        if contract_validator.is_some() {
+            if !pipeline_ctx.implementer_changes.is_empty() {
+                pipeline_ctx.implementer_contract_output = Some(
+                    ImplementerOutput::from_pipeline_data(pipeline_ctx.implementer_changes.clone()),
+                );
+                debug!(
+                    "MULTI-AGENT-PIPELINE: Populated implementer_contract_output with {} changes",
+                    pipeline_ctx.implementer_changes.len()
+                );
+            }
+            if !pipeline_ctx.verifier_failures.is_empty() || !criteria.is_empty() {
+                let all_criteria_ids: Vec<String> = criteria.iter().map(|c| c.id.clone()).collect();
+                pipeline_ctx.verifier_contract_output = Some(
+                    VerifierOutput::from_pipeline_data(&pipeline_ctx.verifier_failures, &all_criteria_ids),
+                );
+                debug!(
+                    "MULTI-AGENT-PIPELINE: Populated verifier_contract_output ({} failures across {} criteria)",
+                    pipeline_ctx.verifier_failures.len(),
+                    criteria.len()
+                );
+            }
+        }
 
         // Check for user stop after all parallel subtrees complete.
         // In parallel mode, we can't break mid-stream, so check after collection.
@@ -1227,7 +1376,7 @@ Only output the JSON array, nothing else."#,
                         }
                     }
                     crate::meta_optimizer::canary::record_canary_outcome(
-                        &self.checkpoint_db, &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
+                        &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
                     );
                 }
                 // Canary config restoration is handled at the loop_controller::run() level.
@@ -1360,7 +1509,6 @@ Only output the JSON array, nothing else."#,
         // Traces were persisted incrementally after each agent phase.
         // Backfill downstream_success on all traces now that final outcome is known.
         if let Err(e) = crate::database::pipeline_traces::backfill_downstream_success(
-            &self.checkpoint_db,
             &config.execution_id,
             result.goal_achieved,
         ) {
@@ -1379,12 +1527,7 @@ Only output the JSON array, nothing else."#,
                 "pipeline_context": serde_json::to_value(&pipeline_ctx).unwrap_or_default(),
             });
             if let Ok(result_json) = serde_json::to_string(&result_with_context) {
-                if let Err(e) = self
-                    .checkpoint_db
-                    .update_task_run_result_data(&config.execution_id, &result_json)
-                {
-                    warn!("Failed to store pipeline result_data: {}", e);
-                }
+                // Pipeline result_data persistence removed — all persistence now via PgDb.
             }
         }
 
@@ -1410,7 +1553,6 @@ Only output the JSON array, nothing else."#,
                     }
                 }
                 crate::meta_optimizer::canary::record_canary_outcome(
-                    &self.checkpoint_db,
                     &self.app_state.pg_db,
                     canary_id,
                     *used_candidate,
@@ -1425,7 +1567,6 @@ Only output the JSON array, nothing else."#,
         // Clear the checkpoint now that the pipeline completed successfully.
         // This prevents stale checkpoint data from being used on a future re-run.
         if let Err(e) = crate::database::pipeline_traces::clear_pipeline_checkpoint(
-            &self.checkpoint_db,
             &config.execution_id,
         ) {
             warn!("Failed to clear pipeline checkpoint: {}", e);
@@ -1454,7 +1595,6 @@ Only output the JSON array, nothing else."#,
         for agent_type in agent_types {
             // Look up eval specs for this agent type
             let specs = match crate::meta_optimizer::eval_spec::list_eval_specs(
-                &self.checkpoint_db,
                 &self.app_state.pg_db,
                 Some(agent_type),
             ) {
@@ -1496,7 +1636,6 @@ Only output the JSON array, nothing else."#,
                 (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
             let period_end = chrono::Utc::now().to_rfc3339();
             let metrics = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-                &self.checkpoint_db,
                 agent_type,
                 &period_start,
                 &period_end,
@@ -1601,6 +1740,7 @@ impl PipelineShared {
         agentic_steps: &[ExecutionStepConfig],
         logger: &StepEventLogger,
         pipeline_ctx: &PipelineContext,
+        contract_validator: &Option<ContractValidator>,
     ) -> SubtreeOutput {
         // Check stop before starting this subtree
         if self.is_task_stopped(&config.execution_id) {
@@ -1745,7 +1885,6 @@ impl PipelineShared {
                 // PipelineShared doesn't carry pg_db — use SQLite only here.
                 // PG data is always available via dual-write.
                 let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
-                    &self.checkpoint_db,
                     &self.pg_db,
                     &config.execution_id,
                     local_iterations,
@@ -1768,6 +1907,39 @@ impl PipelineShared {
                         "MULTI-AGENT-PIPELINE: Implementer tokens: in={}, out={}, cost=${:.4}",
                         impl_tokens_in, impl_tokens_out, impl_cost
                     );
+                }
+
+                // Contract validation for implementer output
+                let mut impl_schema_valid = None;
+                let mut impl_validation_errors: Option<String> = None;
+                if let Some(ref cv) = contract_validator {
+                    let impl_change = ImplementerChange {
+                        subtree_id: subtree.id.clone(),
+                        level: level_idx,
+                        attempt: level_attempt,
+                        criteria_ids: level_criteria.iter().map(|s| s.to_string()).collect(),
+                        success: agentic_outcome.is_success(),
+                        tokens_in: impl_tokens_in,
+                        tokens_out: impl_tokens_out,
+                    };
+                    let impl_output = ImplementerOutput::from_pipeline_data(vec![impl_change]);
+                    if let Ok(impl_json) = serde_json::to_value(&impl_output) {
+                        let result = cv.validate_output("implementer", &impl_json);
+                        impl_schema_valid = Some(result.valid);
+                        if result.valid {
+                            debug!("MULTI-AGENT-PIPELINE: Implementer output passed contract validation");
+                        } else {
+                            let errors = result.error_summary();
+                            warn!(
+                                "MULTI-AGENT-PIPELINE: Implementer output failed contract validation: {}",
+                                errors
+                            );
+                            impl_validation_errors = Some(
+                                serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
                 }
 
                 let implementer_trace = PipelineAgentTrace {
@@ -1795,9 +1967,12 @@ impl PipelineShared {
                     span_type: "agent".to_string(),
                     guardrail_results: vec![],
                     handoff_received: Some(implementer_handoff.clone()),
+                    schema_valid_first_attempt: impl_schema_valid,
+                    validation_retries: Some(0),
+                    coercions_applied: None,
+                    validation_error_summary: impl_validation_errors,
                 };
                 if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                    &self.checkpoint_db,
                     &config.execution_id,
                     &implementer_trace,
                 ) {
@@ -1896,6 +2071,34 @@ impl PipelineShared {
                 }
                 verifier_guardrails.push(verdict_check);
 
+                // Contract validation for verifier output
+                let mut verifier_schema_valid = None;
+                let mut verifier_validation_errors: Option<String> = None;
+                if let Some(ref cv) = contract_validator {
+                    let all_criteria_ids: Vec<String> = level_criteria.iter().map(|s| s.to_string()).collect();
+                    let verifier_output = VerifierOutput::from_pipeline_data(
+                        &local_verifier_failures,
+                        &all_criteria_ids,
+                    );
+                    if let Ok(verifier_json) = serde_json::to_value(&verifier_output) {
+                        let result = cv.validate_output("verifier", &verifier_json);
+                        verifier_schema_valid = Some(result.valid);
+                        if result.valid {
+                            debug!("MULTI-AGENT-PIPELINE: Verifier output passed contract validation");
+                        } else {
+                            let errors = result.error_summary();
+                            warn!(
+                                "MULTI-AGENT-PIPELINE: Verifier output failed contract validation: {}",
+                                errors
+                            );
+                            verifier_validation_errors = Some(
+                                serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
+
                 let verifier_trace = PipelineAgentTrace {
                     agent_type: "verifier".to_string(),
                     agent_id: format!("verify_{}_{}_{}", subtree.id, level_idx, level_attempt),
@@ -1918,9 +2121,12 @@ impl PipelineShared {
                     span_type: "agent".to_string(),
                     guardrail_results: verifier_guardrails,
                     handoff_received: Some(verifier_handoff),
+                    schema_valid_first_attempt: verifier_schema_valid,
+                    validation_retries: Some(0),
+                    coercions_applied: None,
+                    validation_error_summary: verifier_validation_errors,
                 };
                 if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                    &self.checkpoint_db,
                     &config.execution_id,
                     &verifier_trace,
                 ) {
@@ -2051,6 +2257,10 @@ impl PipelineShared {
                     span_type: "agent".to_string(),
                     guardrail_results: vec![],
                     handoff_received: None,
+                    schema_valid_first_attempt: None,
+                    validation_retries: None,
+                    coercions_applied: None,
+                    validation_error_summary: None,
                 }),
                 verifier_trace: last_verifier_trace.unwrap_or_else(|| PipelineAgentTrace {
                     agent_type: "verifier".to_string(),
@@ -2069,6 +2279,10 @@ impl PipelineShared {
                     span_type: "agent".to_string(),
                     guardrail_results: vec![],
                     handoff_received: None,
+                    schema_valid_first_attempt: None,
+                    validation_retries: None,
+                    coercions_applied: None,
+                    validation_error_summary: None,
                 }),
                 retries: level_attempt.saturating_sub(1),
                 passed: level_passed,

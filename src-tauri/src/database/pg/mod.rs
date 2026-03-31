@@ -35,7 +35,6 @@ pub mod checkpoints;
 pub mod flows;
 pub mod worktrees;
 pub mod export;
-pub mod data_migration;
 pub mod decision_trail;
 pub mod generation;
 pub mod generation_artifacts;
@@ -59,6 +58,8 @@ pub mod tiered_info;
 pub mod adaptive_learning;
 pub mod entailment_cache;
 pub mod triggers;
+pub mod online_learning;
+pub mod security_audit;
 
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
@@ -976,6 +977,154 @@ impl PgDb {
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
+            // ── Online Learning: Drift Detection ──
+            "CREATE TABLE IF NOT EXISTS performance_drift_signals (
+                id              TEXT PRIMARY KEY,
+                detector_type   TEXT NOT NULL,
+                metric_name     TEXT NOT NULL,
+                context_key     TEXT NOT NULL DEFAULT '',
+                drift_level     TEXT NOT NULL,
+                pre_drift_mean  DOUBLE PRECISION,
+                post_drift_mean DOUBLE PRECISION,
+                window_size     BIGINT,
+                acknowledged    BOOLEAN NOT NULL DEFAULT false,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_drift_context
+                ON performance_drift_signals(context_key, metric_name)",
+            "CREATE INDEX IF NOT EXISTS idx_drift_unack
+                ON performance_drift_signals(acknowledged) WHERE acknowledged = false",
+            "CREATE TABLE IF NOT EXISTS drift_detector_state (
+                detector_id     TEXT PRIMARY KEY,
+                detector_type   TEXT NOT NULL,
+                state_json      TEXT NOT NULL,
+                last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            // ── Online Learning: Model Routing ──
+            "CREATE TABLE IF NOT EXISTS model_routing_table (
+                context_key     TEXT NOT NULL,
+                model_id        TEXT NOT NULL,
+                q_value         DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                visit_count     INTEGER NOT NULL DEFAULT 0,
+                sum_of_squares  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (context_key, model_id)
+            )",
+            "CREATE TABLE IF NOT EXISTS model_routing_overrides (
+                context_key     TEXT PRIMARY KEY,
+                forced_model    TEXT NOT NULL,
+                reason          TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE TABLE IF NOT EXISTS model_routing_decisions (
+                id              TEXT PRIMARY KEY,
+                task_run_id     TEXT NOT NULL,
+                context_key     TEXT NOT NULL,
+                model_selected  TEXT NOT NULL,
+                source          TEXT NOT NULL,
+                exploration     BOOLEAN NOT NULL DEFAULT false,
+                reward          DOUBLE PRECISION,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_mrd_task_run
+                ON model_routing_decisions(task_run_id)",
+            // ── Online Learning: Experience Summaries ──
+            "CREATE TABLE IF NOT EXISTS experience_summaries (
+                id                      TEXT PRIMARY KEY,
+                task_run_id             TEXT NOT NULL,
+                domain                  TEXT NOT NULL,
+                complexity_tier         TEXT NOT NULL,
+                outcome                 TEXT NOT NULL,
+                key_decisions_json      TEXT NOT NULL DEFAULT '[]',
+                failure_points_json     TEXT NOT NULL DEFAULT '[]',
+                effective_patterns_json TEXT NOT NULL DEFAULT '[]',
+                embedding               BYTEA,
+                similarity_cluster      TEXT,
+                created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_exp_domain
+                ON experience_summaries(domain)",
+            // ── Online Learning: Step Credit Assignments ──
+            "CREATE TABLE IF NOT EXISTS step_credit_assignments (
+                id                          TEXT PRIMARY KEY,
+                task_run_id                 TEXT NOT NULL,
+                step_index                  INTEGER NOT NULL,
+                step_type                   TEXT NOT NULL,
+                agent_type                  TEXT,
+                raw_credit                  DOUBLE PRECISION NOT NULL,
+                normalized_credit           DOUBLE PRECISION NOT NULL,
+                temporal_proximity          DOUBLE PRECISION,
+                output_utilization          DOUBLE PRECISION,
+                confidence_delta_signal     DOUBLE PRECISION,
+                downstream_success_signal   DOUBLE PRECISION,
+                created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_sca_task_run
+                ON step_credit_assignments(task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sca_step_type
+                ON step_credit_assignments(step_type)",
+            // ── Online Learning: Strategy Bank ──
+            "CREATE TABLE IF NOT EXISTS strategy_bank (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                description         TEXT NOT NULL,
+                applicability_json  TEXT NOT NULL,
+                components_json     TEXT NOT NULL,
+                stats_json          TEXT NOT NULL DEFAULT '{}',
+                provenance_json     TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'candidate',
+                parent_strategy_id  TEXT,
+                embedding           BYTEA,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_strategy_status
+                ON strategy_bank(status)",
+            // ── Online Learning: model_used column on learning_outcomes ──
+            "ALTER TABLE learning_outcomes ADD COLUMN IF NOT EXISTS model_used TEXT",
+            // Execution state snapshots for replay / observability
+            "CREATE TABLE IF NOT EXISTS execution_state_snapshots (
+                id              BIGSERIAL PRIMARY KEY,
+                execution_id    TEXT NOT NULL,
+                span_id         TEXT NOT NULL DEFAULT '',
+                snapshot_ts     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                state_type      TEXT NOT NULL,
+                summary         TEXT,
+                context_json    TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_ess_execution
+                ON execution_state_snapshots(execution_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ess_ts
+                ON execution_state_snapshots(snapshot_ts)",
+
+            // Security audit events
+            "CREATE TABLE IF NOT EXISTS security_audit_events (
+                id          TEXT PRIMARY KEY,
+                timestamp   TEXT NOT NULL,
+                task_run_id TEXT,
+                step_name   TEXT,
+                workflow_id TEXT,
+                event_type  TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                decision    TEXT NOT NULL,
+                reason      TEXT,
+                metadata    TEXT,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_sec_audit_task_run
+                ON security_audit_events(task_run_id) WHERE task_run_id IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_sec_audit_type
+                ON security_audit_events(event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_sec_audit_decision
+                ON security_audit_events(decision)",
+            "CREATE INDEX IF NOT EXISTS idx_sec_audit_created
+                ON security_audit_events(created_at)",
+            // Schema compliance tracking columns on pipeline_agent_traces (v172)
+            "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS schema_valid_first_attempt BOOLEAN",
+            "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS validation_retries INTEGER",
+            "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS coercions_applied TEXT",
+            "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS validation_error_summary TEXT",
         ];
 
         for sql in &ddl {
@@ -985,6 +1134,67 @@ impl PgDb {
         }
 
         info!("All managed PG tables ensured (activity_timeline, watchers, agentic_metric_scores, prompt_registry, canary_rollouts, canary_run_records, prompt_template_canaries, error_events, decisions, concept_summaries)");
+    }
+
+    // ========================================================================
+    // Execution State Snapshots
+    // ========================================================================
+
+    /// Record a state snapshot for replay / observability.
+    pub async fn record_state_snapshot(
+        &self,
+        execution_id: &str,
+        span_id: &str,
+        snapshot_ts: &str,
+        state_type: &str,
+        summary: Option<&str>,
+        context_json: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            r#"INSERT INTO execution_state_snapshots
+               (execution_id, span_id, snapshot_ts, state_type, summary, context_json)
+               VALUES ($1, $2, $3::timestamptz, $4, $5, $6)"#,
+            &[
+                &execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &span_id,
+                &snapshot_ts,
+                &state_type,
+                &summary as &(dyn tokio_postgres::types::ToSql + Sync),
+                &context_json as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG record_state_snapshot: {}", e))?;
+        Ok(())
+    }
+
+    /// Query execution state snapshots for replay.
+    pub async fn get_state_snapshots(&self, execution_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let client = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = client
+            .query(
+                "SELECT id, execution_id, span_id, snapshot_ts, state_type, summary, context_json, created_at
+                 FROM execution_state_snapshots
+                 WHERE execution_id = $1
+                 ORDER BY snapshot_ts ASC",
+                &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync)],
+            )
+            .await
+            .map_err(|e| format!("Failed to query snapshots: {}", e))?;
+
+        Ok(rows.iter().map(|row| {
+            serde_json::json!({
+                "id": row.get::<usize, i64>(0),
+                "execution_id": row.get::<usize, String>(1),
+                "span_id": row.get::<usize, String>(2),
+                "snapshot_ts": row.get::<usize, String>(3),
+                "state_type": row.get::<usize, String>(4),
+                "summary": row.get::<usize, Option<String>>(5),
+                "context_json": row.get::<usize, Option<String>>(6),
+                "created_at": row.get::<usize, String>(7),
+            })
+        }).collect())
     }
 
     /// Get a reference to the connection pool.

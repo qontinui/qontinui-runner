@@ -15,7 +15,6 @@ use tracing::{info, warn};
 
 use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 use crate::doctor::DoctorHandle;
 
 use crate::findings::{FindingParser, ParsedFinding};
@@ -44,7 +43,6 @@ pub(super) fn get_active_sdk_app_name(app_state: &crate::commands::AppState) -> 
 /// Uses PostgreSQL when available (non-blocking async write), falls back to SQLite.
 /// Silently ignores errors (best-effort tracking).
 pub(super) fn record_phase_token_usage(
-    db: &CheckpointDb,
     pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
     phase: &str,
@@ -57,7 +55,7 @@ pub(super) fn record_phase_token_usage(
     duration_ms: Option<u64>,
 ) {
     record_phase_token_usage_with_target(
-        db, pg_db, task_run_id, phase, stage_index, iteration,
+        pg_db, task_run_id, phase, stage_index, iteration,
         model_used, provider_used, input_tokens, output_tokens,
         duration_ms, None, None,
     );
@@ -65,7 +63,6 @@ pub(super) fn record_phase_token_usage(
 
 /// Record phase token usage with optional UI Bridge target app attribution.
 pub(super) fn record_phase_token_usage_with_target(
-    db: &CheckpointDb,
     pg_db: &std::sync::Arc<PgDb>,
     task_run_id: &str,
     phase: &str,
@@ -79,18 +76,63 @@ pub(super) fn record_phase_token_usage_with_target(
     target_app: Option<&str>,
     target_page_url: Option<&str>,
 ) {
+    record_phase_token_usage_with_cache(
+        pg_db, task_run_id, phase, stage_index, iteration,
+        model_used, provider_used, input_tokens, output_tokens,
+        duration_ms, None, None, target_app, target_page_url,
+    );
+}
+
+/// Record phase token usage including prompt cache metrics.
+///
+/// When `cache_creation_tokens` or `cache_read_tokens` are `Some`, the cost
+/// calculation uses `calculate_cost_cents_with_cache` for accurate pricing
+/// (cache writes at 1.25x, reads at 0.1x base input price).
+pub(super) fn record_phase_token_usage_with_cache(
+    pg_db: &std::sync::Arc<PgDb>,
+    task_run_id: &str,
+    phase: &str,
+    stage_index: Option<u32>,
+    iteration: Option<u32>,
+    model_used: Option<&str>,
+    provider_used: Option<&str>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    duration_ms: Option<u64>,
+    cache_creation_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    target_app: Option<&str>,
+    target_page_url: Option<&str>,
+) {
     let input = input_tokens.unwrap_or(0);
     let output = output_tokens.unwrap_or(0);
+    let cache_creation = cache_creation_tokens.unwrap_or(0);
+    let cache_read = cache_read_tokens.unwrap_or(0);
     // Only record if we have actual token data
     if input == 0 && output == 0 {
         return;
     }
-    // Simple cost estimation (cents): rough per-token pricing
-    // This is approximate — actual cost depends on model
-    let cost_cents = 0u64; // Cost calculation deferred to a pricing table
+    // Cost estimation: use cache-aware pricing when cache tokens are present
+    let cost_cents = if let (Some(input_t), Some(output_t)) = (input_tokens, output_tokens) {
+        if let Some(model) = model_used {
+            if cache_creation > 0 || cache_read > 0 {
+                crate::ai_pricing::calculate_cost_cents_with_cache(
+                    input_t, output_t, cache_creation, cache_read, model,
+                )
+                .unwrap_or(0) as u64
+            } else {
+                crate::ai_pricing::calculate_cost_cents(input_t, output_t, model)
+                    .unwrap_or(0) as u64
+            }
+        } else {
+            0u64
+        }
+    } else {
+        0u64
+    };
     info!(
-        "Recording phase token usage: task={}, phase={}, input={}, output={}{}",
-        task_run_id, phase, input, output,
+        "Recording phase token usage: task={}, phase={}, input={}, output={}, cache_create={}, cache_read={}{}",
+        task_run_id, phase, input, output, cache_creation, cache_read,
         target_app.map(|a| format!(", app={}", a)).unwrap_or_default()
     );
 
@@ -105,7 +147,7 @@ pub(super) fn record_phase_token_usage_with_target(
         let pg_page = target_page_url.map(|s| s.to_string());
         tokio::spawn(async move {
             if let Err(e) = pg
-                .create_phase_token_usage_with_target(
+                .create_phase_token_usage_with_cache(
                     &pg_task_run_id,
                     &pg_phase,
                     stage_index,
@@ -116,6 +158,8 @@ pub(super) fn record_phase_token_usage_with_target(
                     output,
                     cost_cents,
                     duration_ms,
+                    cache_creation,
+                    cache_read,
                     pg_app.as_deref(),
                     pg_page.as_deref(),
                 )
@@ -126,23 +170,7 @@ pub(super) fn record_phase_token_usage_with_target(
         });
     }
 
-    // Always write to SQLite (source of truth during migration)
-    if let Err(e) = db.create_phase_token_usage_with_target(
-        task_run_id,
-        phase,
-        stage_index,
-        iteration,
-        model_used,
-        provider_used,
-        input,
-        output,
-        cost_cents,
-        duration_ms,
-        target_app,
-        target_page_url,
-    ) {
-        warn!("Failed to record phase token usage: {}", e);
-    }
+    // SQLite write removed — all persistence now via PgDb.
 }
 
 /// Build LLM metrics for Opik integration from token usage data.
@@ -875,6 +903,10 @@ pub(super) struct PromptResponseResult {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (API providers only).
     pub output_tokens: Option<u64>,
+    /// Tokens written to Anthropic prompt cache (1.25x base input price).
+    pub cache_creation_tokens: Option<u64>,
+    /// Tokens read from Anthropic prompt cache (0.1x base input price).
+    pub cache_read_tokens: Option<u64>,
 }
 
 /// Execute a single prompt step in "response" mode.
@@ -887,7 +919,6 @@ pub(super) struct PromptResponseResult {
 /// to output_path so the saved artifact contains clean content.
 pub(super) async fn execute_prompt_response_mode(
     step: &ExecutionStepConfig,
-    db: &std::sync::Arc<CheckpointDb>,
     pg_db: &std::sync::Arc<PgDb>,
     task_run_id: Option<&str>,
     doctor_handle: Option<DoctorHandle>,
@@ -927,13 +958,23 @@ pub(super) async fn execute_prompt_response_mode(
         return Err("Prompt content is empty for response mode step".to_string());
     }
 
+    // NOTE: Context compaction is applied via the structured prompt middleware chain
+    // (run_structured_prompt_with_middleware) which only compacts dynamic content,
+    // preserving cached system blocks for Anthropic prompt caching.
+
     // Build task context for AI routing
     let task_context = TaskContext::from_prompt(&prompt);
 
-    // Run in blocking task since run_prompt_with_model_override is sync
+    // Run in blocking task using the structured prompt path.
+    // StructuredPrompt::uncached() has no cached blocks, so run_structured_prompt
+    // will flatten to the standard path for non-Claude providers. For Claude API
+    // it uses the standard (non-cache) path since has_cached_blocks() is false.
+    // This wires the structured path so that when cached blocks are eventually
+    // passed in, it will automatically use the cache-aware path.
     let result = tokio::task::spawn_blocking(move || {
-        crate::ai_provider::run_prompt_with_model_override(
-            &prompt,
+        let structured = crate::ai_provider::StructuredPrompt::uncached(prompt);
+        crate::ai_provider::run_structured_prompt(
+            &structured,
             &task_context,
             doctor_handle.as_ref(),
             model_override.as_deref(),
@@ -956,6 +997,8 @@ pub(super) async fn execute_prompt_response_mode(
 
     let input_tokens = result.input_tokens;
     let output_tokens = result.output_tokens;
+    let cache_creation_tokens = result.cache_creation_tokens;
+    let cache_read_tokens = result.cache_read_tokens;
     let output_text = result.output;
 
     // Detect empty AI response — Claude CLI can exit 0 with no output
@@ -1068,6 +1111,8 @@ pub(super) async fn execute_prompt_response_mode(
         output: output_text,
         input_tokens,
         output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
     })
 }
 

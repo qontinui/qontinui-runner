@@ -1,13 +1,18 @@
-import React, { useState, useMemo, useCallback } from "react";
-import type { TraceSpan, SpanFilter, TraceViewMode, CriticalPathInfo } from "./types";
+import React, { useState, useRef, useMemo, useCallback, useEffect } from "react";
+import type { TraceSpan, SpanFilter, TraceViewMode, CriticalPathInfo, TokenOverlayMode } from "./types";
 import { useTraceViewerData } from "./useTraceViewerData";
-import { buildTraceTree, flattenTree, filterSpans, computeInsights, computeCriticalPath } from "./trace-utils";
+import { buildTraceTree, flattenTree, filterSpans, computeInsights, computeCriticalPath, computeTokenInsights } from "./trace-utils";
 import { TraceToolbar } from "./TraceToolbar";
 import { TraceWaterfall } from "./TraceWaterfall";
 import { FlameChart } from "./FlameChart";
 import { TraceComparison } from "./TraceComparison";
+import { TraceMinimap } from "./TraceMinimap";
 import { SpanDetailPanel } from "./SpanDetailPanel";
 import { PerformanceInsights } from "./PerformanceInsights";
+import { AgentGraph } from "./AgentGraph";
+import { ReplayController } from "./ReplayController";
+import { ReplayPanel } from "./ReplayPanel";
+import { useReplayData } from "./useReplayData";
 
 interface TraceViewerWidgetProps {
   executionId: string | null;
@@ -29,7 +34,7 @@ const DEFAULT_FILTER: SpanFilter = {
   status: "all",
 };
 
-const VIEW_OPTIONS: { value: TraceViewMode; label: string }[] = [
+const BASE_VIEW_OPTIONS: { value: TraceViewMode; label: string }[] = [
   { value: "waterfall", label: "Waterfall" },
   { value: "flamechart", label: "Flamechart" },
   { value: "comparison", label: "Comparison" },
@@ -58,6 +63,13 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   const [selectedSpan, setSelectedSpan] = useState<TraceSpan | null>(null);
   const [viewMode, setViewMode] = useState<TraceViewMode>("waterfall");
   const [showCriticalPath, setShowCriticalPath] = useState(false);
+  const [minimapViewport, setMinimapViewport] = useState({ start: 0, end: 1 });
+  const [scrollToFraction, setScrollToFraction] = useState<number | undefined>(undefined);
+  const scrollSourceRef = useRef<"minimap" | "waterfall" | null>(null);
+
+  const [tokenOverlay, setTokenOverlay] = useState<TokenOverlayMode>("none");
+  const [replayMode, setReplayMode] = useState(false);
+  const [replayStep, setReplayStep] = useState(0);
 
   // Comparison run overrides (user can change via dropdowns)
   const [compRunA, setCompRunA] = useState<string | null>(null);
@@ -66,15 +78,52 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   const effectiveRunB = compRunB ?? executionId;
 
   const insights = useMemo(() => computeInsights(spans), [spans]);
+  const tokenInsights = useMemo(() => computeTokenInsights(spans), [spans]);
+
+  // Replay data
+  const { steps: replaySteps, totalSteps: replayTotalSteps } = useReplayData(spans);
+
+  // Reset replay when view mode changes
+  useEffect(() => {
+    setReplayMode(false);
+    setReplayStep(0);
+  }, [viewMode]);
+
+  // Check if there are agent spans for the Agent Graph tab
+  const hasAgentSpans = useMemo(
+    () => spans.some((s) => s.name.includes("agent.phase") || s.name.includes("agent.message")),
+    [spans],
+  );
+
+  // Build view options dynamically
+  const VIEW_OPTIONS = useMemo(() => {
+    const opts = [...BASE_VIEW_OPTIONS];
+    if (hasAgentSpans) {
+      opts.push({ value: "agent-graph" as TraceViewMode, label: "Agent Graph" });
+    }
+    return opts;
+  }, [hasAgentSpans]);
 
   // Build tree (shared across views)
   const tree = useMemo(() => buildTraceTree(spans), [spans]);
 
+  // Full flattened tree (unfiltered — used by minimap)
+  const flattenedNodes = useMemo(() => flattenTree(tree), [tree]);
+
   // Build tree, flatten, and filter — shared between toolbar count and waterfall
   const filteredNodes = useMemo(() => {
-    const flat = flattenTree(tree);
-    return filterSpans(flat, filter);
-  }, [tree, filter]);
+    return filterSpans(flattenedNodes, filter);
+  }, [flattenedNodes, filter]);
+
+  // Trace time bounds for minimap
+  const traceDurationMs = useMemo(() => {
+    if (spans.length === 0) return 0;
+    const times = spans.filter(s => s.start_ts).map(s => new Date(s.start_ts).getTime());
+    const endTimes = spans.filter(s => s.end_ts).map(s => new Date(s.end_ts!).getTime());
+    const start = Math.min(...times);
+    const end = Math.max(...endTimes, ...times);
+    return end - start;
+  }, [spans]);
 
   // Critical path (computed on demand)
   const criticalPath: CriticalPathInfo | null = useMemo(
@@ -132,7 +181,7 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
         </div>
 
         {/* Critical path toggle (waterfall & flamechart only) */}
-        {viewMode !== "comparison" && (
+        {viewMode !== "comparison" && viewMode !== "agent-graph" && (
           <label className="flex items-center gap-1.5 text-[11px] text-zinc-500 cursor-pointer select-none" data-tutorial-id="trace-critical-path-toggle">
             <input
               type="checkbox"
@@ -142,6 +191,37 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
             />
             Critical Path
           </label>
+        )}
+
+        {/* Token overlay dropdown */}
+        {viewMode !== "comparison" && viewMode !== "agent-graph" && (
+          <select
+            value={tokenOverlay}
+            onChange={(e) => setTokenOverlay(e.target.value as TokenOverlayMode)}
+            className="text-[11px] bg-zinc-800 border border-zinc-600 rounded px-1.5 py-0.5 text-zinc-400"
+          >
+            <option value="none">No token overlay</option>
+            <option value="input">Input tokens</option>
+            <option value="output">Output tokens</option>
+            <option value="cost">Cost</option>
+          </select>
+        )}
+
+        {/* Replay toggle */}
+        {viewMode === "waterfall" && replayTotalSteps > 0 && (
+          <button
+            onClick={() => {
+              setReplayMode((prev) => !prev);
+              setReplayStep(0);
+            }}
+            className={`text-[11px] px-2 py-0.5 rounded ${
+              replayMode
+                ? "bg-blue-600 text-white"
+                : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800"
+            }`}
+          >
+            {replayMode ? "Exit Replay" : "Replay"}
+          </button>
         )}
 
         <div className="flex-1" />
@@ -157,6 +237,35 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
         />
       )}
 
+      {/* Minimap overview (waterfall & flamechart, 10+ spans) */}
+      {(viewMode === "waterfall" || viewMode === "flamechart") && flattenedNodes.length > 10 && (
+        <TraceMinimap
+          nodes={flattenedNodes}
+          traceStartMs={0}
+          traceDurationMs={traceDurationMs}
+          viewportStart={minimapViewport.start}
+          viewportEnd={minimapViewport.end}
+          onViewportChange={(start, end) => {
+            setMinimapViewport({ start, end });
+            scrollSourceRef.current = "minimap";
+            setScrollToFraction(start);
+          }}
+        />
+      )}
+
+      {/* Replay controller */}
+      {replayMode && viewMode === "waterfall" && replayTotalSteps > 0 && (
+        <ReplayController
+          currentStep={replayStep}
+          totalSteps={replayTotalSteps}
+          onStepChange={setReplayStep}
+          onClose={() => {
+            setReplayMode(false);
+            setReplayStep(0);
+          }}
+        />
+      )}
+
       {/* Main content area */}
       <div className="flex flex-1 min-h-0" data-tutorial-id="trace-main-content">
         {viewMode === "waterfall" && (
@@ -167,6 +276,16 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
             onSelectSpan={handleSelectSpan}
             height={height - 64}
             criticalPath={criticalPath}
+            tokenOverlay={tokenOverlay}
+            tokenInsights={tokenInsights}
+            highlightedSpanId={replayMode && replaySteps[replayStep] ? replaySteps[replayStep].spanId : null}
+            onViewportChange={(start, end) => {
+              if (scrollSourceRef.current !== "minimap") {
+                setMinimapViewport({ start, end });
+              }
+              scrollSourceRef.current = null;
+            }}
+            scrollToFraction={scrollToFraction}
           />
         )}
 
@@ -177,6 +296,8 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
             selectedSpanId={selectedSpan?.span_id ?? null}
             criticalPath={criticalPath}
             height={height - 64}
+            tokenOverlay={tokenOverlay}
+            tokenInsights={tokenInsights}
           />
         )}
 
@@ -191,19 +312,37 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
           />
         )}
 
-        {/* Detail panel (shared, shown for waterfall & flamechart) */}
-        {viewMode !== "comparison" && (
+        {viewMode === "agent-graph" && (
+          <AgentGraph
+            spans={spans}
+            selectedSpanId={selectedSpan?.span_id}
+            onSelectSpan={(span) => setSelectedSpan(span)}
+            height={height - 64}
+          />
+        )}
+
+        {/* Detail panel (shared, shown for waterfall & flamechart & agent-graph) */}
+        {viewMode !== "comparison" && !replayMode && (
           <SpanDetailPanel
             span={selectedSpan}
             onClose={() => setSelectedSpan(null)}
             criticalPath={criticalPath}
+            allSpans={spans}
+          />
+        )}
+
+        {/* Replay panel (shown instead of SpanDetailPanel when in replay mode) */}
+        {replayMode && replaySteps[replayStep] && (
+          <ReplayPanel
+            step={replaySteps[replayStep]}
+            previousStep={replayStep > 0 ? replaySteps[replayStep - 1] : undefined}
           />
         )}
       </div>
 
       {/* Footer insights (not shown for comparison — it has its own summary) */}
       {viewMode !== "comparison" && (
-        <PerformanceInsights insights={insights} criticalPath={criticalPath} />
+        <PerformanceInsights insights={insights} criticalPath={criticalPath} tokenInsights={tokenInsights} />
       )}
     </div>
   );

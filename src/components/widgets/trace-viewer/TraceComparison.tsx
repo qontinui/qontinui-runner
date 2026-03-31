@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useMemo } from "react";
 import type { SpanMatch, ComparisonSummary } from "./types";
 import { PHASE_COLORS } from "./types";
 import { formatDuration, inferPhase } from "./trace-utils";
@@ -278,6 +278,9 @@ export const TraceComparison: React.FC<TraceComparisonProps> = ({
 }) => {
   const [selectedMatch, setSelectedMatch] = useState<SpanMatch | null>(null);
   const [statusFilter, setStatusFilter] = useState<SpanMatch["status"] | "all">("all");
+  const [nameFilter, setNameFilter] = useState("");
+  const [minDelta, setMinDelta] = useState<number | null>(null);
+  const [phaseFilter, setPhaseFilter] = useState<string>("all");
 
   const { matches, summary, isLoading, error } = useTraceComparisonData(
     baselineExecutionId,
@@ -292,9 +295,28 @@ export const TraceComparison: React.FC<TraceComparisonProps> = ({
     );
   }, []);
 
-  const filteredMatches = statusFilter === "all"
-    ? matches
-    : matches.filter((m) => m.status === statusFilter);
+  const filteredMatches = useMemo(() => {
+    let result = statusFilter === "all"
+      ? matches
+      : matches.filter((m) => m.status === statusFilter);
+    if (nameFilter) {
+      const lower = nameFilter.toLowerCase();
+      result = result.filter(m => {
+        const name = (m.spanA?.name || m.spanB?.name || "").toLowerCase();
+        return name.includes(lower);
+      });
+    }
+    if (minDelta != null) {
+      result = result.filter(m => Math.abs(m.durationDelta ?? 0) >= minDelta);
+    }
+    if (phaseFilter !== "all") {
+      result = result.filter(m => {
+        const span = m.spanA || m.spanB;
+        return span && inferPhase(span.name) === phaseFilter;
+      });
+    }
+    return result;
+  }, [matches, statusFilter, nameFilter, minDelta, phaseFilter]);
 
   // Run selector bar (always shown)
   const runSelectorBar = availableRuns && availableRuns.length > 0 ? (
@@ -382,6 +404,36 @@ export const TraceComparison: React.FC<TraceComparisonProps> = ({
             )}
           </button>
         ))}
+      </div>
+
+      {/* Filter bar */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-zinc-700 text-xs">
+        <input
+          type="text"
+          placeholder="Filter by name..."
+          value={nameFilter}
+          onChange={(e) => setNameFilter(e.target.value)}
+          className="flex-1 bg-zinc-800 border border-zinc-600 rounded px-2 py-0.5 text-xs"
+        />
+        <input
+          type="number"
+          placeholder="Min Δ (ms)"
+          value={minDelta ?? ""}
+          onChange={(e) => setMinDelta(e.target.value ? Number(e.target.value) : null)}
+          className="w-20 bg-zinc-800 border border-zinc-600 rounded px-2 py-0.5 text-xs"
+        />
+        <select
+          value={phaseFilter}
+          onChange={(e) => setPhaseFilter(e.target.value)}
+          className="bg-zinc-800 border border-zinc-600 rounded px-1.5 py-0.5 text-xs"
+        >
+          <option value="all">All phases</option>
+          <option value="setup">Setup</option>
+          <option value="verification">Verification</option>
+          <option value="agentic">Agentic</option>
+          <option value="completion">Completion</option>
+          <option value="ai">AI</option>
+        </select>
       </div>
 
       {/* Match list + detail */}

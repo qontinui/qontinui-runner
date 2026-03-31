@@ -6326,6 +6326,82 @@ impl CheckpointDb {
             info!("Successfully migrated to version 167 (step_templates + exploration_stats)");
         }
 
+        if current_version < 168 {
+            info!("Migrating to version 168 (execution_spans token columns)...");
+            conn.execute_batch(r#"
+                ALTER TABLE execution_spans ADD COLUMN input_tokens INTEGER;
+                ALTER TABLE execution_spans ADD COLUMN output_tokens INTEGER;
+                ALTER TABLE execution_spans ADD COLUMN cost_cents INTEGER;
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (168, datetime('now'));
+            "#).map_err(|e| format!("Migration 168 failed: {}", e))?;
+            info!("Successfully migrated to version 168");
+        }
+
+        if current_version < 169 {
+            info!("Migrating to version 169 (execution_state_snapshots)...");
+            conn.execute_batch(r#"
+                CREATE TABLE IF NOT EXISTS execution_state_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL,
+                    span_id TEXT NOT NULL,
+                    snapshot_ts TEXT NOT NULL,
+                    state_type TEXT NOT NULL,
+                    summary TEXT,
+                    context_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_state_snapshots_execution ON execution_state_snapshots(execution_id);
+                CREATE INDEX IF NOT EXISTS idx_state_snapshots_ts ON execution_state_snapshots(snapshot_ts);
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (169, datetime('now'));
+            "#).map_err(|e| format!("Migration 169 failed: {}", e))?;
+            info!("Successfully migrated to version 169");
+        }
+
+        // Migration 170: Add prompt cache metrics to phase_token_usage
+        if current_version < 170 {
+            info!("Migrating to version 170 (prompt cache metrics)...");
+            conn.execute_batch(r#"
+                ALTER TABLE phase_token_usage ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE phase_token_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (170, datetime('now'));
+            "#).map_err(|e| format!("Migration 170 failed: {}", e))?;
+            info!("Successfully migrated to version 170");
+        }
+
+        // Migration 171: Per-phase model Q-routing table
+        if current_version < 171 {
+            info!("Migrating to version 171 (phase_model_routing table)...");
+            conn.execute_batch(r#"
+                CREATE TABLE IF NOT EXISTS phase_model_routing (
+                    state_key TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    model_tier TEXT NOT NULL,
+                    q_value REAL NOT NULL DEFAULT 0.0,
+                    visit_count INTEGER NOT NULL DEFAULT 0,
+                    last_updated TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (state_key, phase, model_tier)
+                );
+                CREATE INDEX IF NOT EXISTS idx_phase_model_routing_state ON phase_model_routing(state_key);
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (171, datetime('now'));
+            "#).map_err(|e| format!("Migration 171 failed: {}", e))?;
+            info!("Successfully migrated to version 171");
+        }
+
+        // Migration 172: Schema compliance tracking columns on pipeline_agent_traces
+        if current_version < 172 {
+            info!("Migrating to version 172 (schema compliance columns on pipeline_agent_traces)...");
+            conn.execute_batch(r#"
+                ALTER TABLE pipeline_agent_traces ADD COLUMN schema_valid_first_attempt INTEGER;
+                ALTER TABLE pipeline_agent_traces ADD COLUMN validation_retries INTEGER;
+                ALTER TABLE pipeline_agent_traces ADD COLUMN coercions_applied TEXT;
+                ALTER TABLE pipeline_agent_traces ADD COLUMN validation_error_summary TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (172, datetime('now'));
+            "#).map_err(|e| format!("Migration 172 failed: {}", e))?;
+            info!("Successfully migrated to version 172 (schema compliance columns on pipeline_agent_traces)");
+        }
+
         Ok(())
     }
 }
@@ -6387,6 +6463,7 @@ mod tests {
             "generation_pipeline_artifacts",
             "step_templates",
             "exploration_stats",
+            "execution_state_snapshots",
         ];
         for table in &tables {
             assert!(
@@ -6398,7 +6475,7 @@ mod tests {
 
         // Verify version header is reasonably current
         assert!(
-            schema.contains("Version: 167") || schema.contains("Version: 16"),
+            schema.contains("Version: 169") || schema.contains("Version: 16"),
             "schema.sql version header may be stale"
         );
     }

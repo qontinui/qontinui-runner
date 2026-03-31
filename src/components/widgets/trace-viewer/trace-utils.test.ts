@@ -7,7 +7,10 @@ import {
   computeComparisonSummary,
   computeCriticalPath,
   buildTraceTree,
+  computeTokenInsights,
+  getTokenHeat,
 } from "./trace-utils";
+import { deriveReplaySteps } from "./useReplayData";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -31,6 +34,9 @@ function makeSpan(overrides: Partial<TraceSpan> & { name: string; span_id: strin
     attributes: overrides.attributes ?? {},
     success: overrides.success ?? true,
     error: overrides.error ?? null,
+    input_tokens: overrides.input_tokens,
+    output_tokens: overrides.output_tokens,
+    cost_cents: overrides.cost_cents,
   };
 }
 
@@ -448,5 +454,142 @@ describe("computeCriticalPath", () => {
     expect(result.slackBySpanId.get("short")).toBe(400);
     // "long" is on critical path, slack = 0
     expect(result.slackBySpanId.get("long")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeTokenInsights tests
+// ---------------------------------------------------------------------------
+
+describe("computeTokenInsights", () => {
+  it("should aggregate token counts across spans", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.ai.session", span_id: "t1", input_tokens: 100, output_tokens: 50, cost_cents: 10 }),
+      makeSpan({ name: "qontinui.ai.session", span_id: "t2", input_tokens: 200, output_tokens: 150, cost_cents: 25 }),
+    ];
+    const insights = computeTokenInsights(spans);
+    expect(insights.totalInputTokens).toBe(300);
+    expect(insights.totalOutputTokens).toBe(200);
+    expect(insights.totalCostCents).toBe(35);
+    expect(insights.maxInputTokens).toBe(200);
+    expect(insights.maxOutputTokens).toBe(150);
+  });
+
+  it("should handle spans without token data", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.workflow", span_id: "t3" }),
+      makeSpan({ name: "qontinui.ai.session", span_id: "t4", input_tokens: 100 }),
+    ];
+    const insights = computeTokenInsights(spans);
+    expect(insights.totalInputTokens).toBe(100);
+    expect(insights.totalOutputTokens).toBe(0);
+  });
+
+  it("should break down tokens by phase", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.workflow.phase.setup", span_id: "t5", input_tokens: 50 }),
+      makeSpan({ name: "qontinui.ai.session", span_id: "t6", input_tokens: 200 }),
+    ];
+    const insights = computeTokenInsights(spans);
+    expect(insights.phaseTokens["setup"]?.input).toBe(50);
+    expect(insights.phaseTokens["ai"]?.input).toBe(200);
+  });
+
+  it("should return zeros for empty spans array", () => {
+    const insights = computeTokenInsights([]);
+    expect(insights.totalInputTokens).toBe(0);
+    expect(insights.totalOutputTokens).toBe(0);
+    expect(insights.totalCostCents).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getTokenHeat tests
+// ---------------------------------------------------------------------------
+
+describe("getTokenHeat", () => {
+  it("should return 0 for 'none' mode", () => {
+    const span = makeSpan({ name: "test", span_id: "h1", input_tokens: 100 });
+    expect(getTokenHeat(span, "none", 100)).toBe(0);
+  });
+
+  it("should return correct heat for input mode", () => {
+    const span = makeSpan({ name: "test", span_id: "h2", input_tokens: 50 });
+    expect(getTokenHeat(span, "input", 100)).toBe(0.5);
+  });
+
+  it("should clamp at 1", () => {
+    const span = makeSpan({ name: "test", span_id: "h3", input_tokens: 200 });
+    expect(getTokenHeat(span, "input", 100)).toBe(1);
+  });
+
+  it("should return 0 when maxValue is 0", () => {
+    const span = makeSpan({ name: "test", span_id: "h4", input_tokens: 100 });
+    expect(getTokenHeat(span, "input", 0)).toBe(0);
+  });
+
+  it("should handle missing token fields", () => {
+    const span = makeSpan({ name: "test", span_id: "h5" });
+    expect(getTokenHeat(span, "input", 100)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveReplaySteps tests
+// ---------------------------------------------------------------------------
+
+describe("deriveReplaySteps", () => {
+  it("should categorize phase transition spans", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.workflow.phase.setup", span_id: "r1", start_ts: "2024-01-01T00:00:00Z" }),
+      makeSpan({ name: "qontinui.workflow.phase.verification", span_id: "r2", start_ts: "2024-01-01T00:01:00Z" }),
+    ];
+    const steps = deriveReplaySteps(spans);
+    expect(steps).toHaveLength(2);
+    expect(steps[0].type).toBe("phase_transition");
+    expect(steps[1].type).toBe("phase_transition");
+  });
+
+  it("should categorize AI session spans", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.ai.session", span_id: "r3", start_ts: "2024-01-01T00:00:00Z", input_tokens: 100 }),
+    ];
+    const steps = deriveReplaySteps(spans);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].type).toBe("ai_session");
+  });
+
+  it("should categorize tool call spans", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.ai.tool_call", span_id: "r4", start_ts: "2024-01-01T00:00:00Z", attributes: { "ai.tool_name": "Read" } }),
+    ];
+    const steps = deriveReplaySteps(spans);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].type).toBe("tool_call");
+    expect(steps[0].title).toBe("Read");
+  });
+
+  it("should sort steps by start_ts", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.ai.session", span_id: "r5", start_ts: "2024-01-01T00:02:00Z" }),
+      makeSpan({ name: "qontinui.workflow.phase.setup", span_id: "r6", start_ts: "2024-01-01T00:00:00Z" }),
+      makeSpan({ name: "qontinui.ai.tool_call", span_id: "r7", start_ts: "2024-01-01T00:01:00Z" }),
+    ];
+    const steps = deriveReplaySteps(spans);
+    expect(steps[0].type).toBe("phase_transition");
+    expect(steps[1].type).toBe("tool_call");
+    expect(steps[2].type).toBe("ai_session");
+  });
+
+  it("should return empty array for empty spans", () => {
+    expect(deriveReplaySteps([])).toHaveLength(0);
+  });
+
+  it("should skip unrecognized span names", () => {
+    const spans: TraceSpan[] = [
+      makeSpan({ name: "qontinui.python.startup", span_id: "r8", start_ts: "2024-01-01T00:00:00Z" }),
+    ];
+    const steps = deriveReplaySteps(spans);
+    expect(steps).toHaveLength(0);
   });
 });

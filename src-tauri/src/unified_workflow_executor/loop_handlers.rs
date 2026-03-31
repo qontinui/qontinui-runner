@@ -261,13 +261,7 @@ impl LoopController {
 
         // Backfill downstream_success on all traces emitted during this loop.
         // This correlates each iteration's agent performance with the final outcome.
-        if let Err(e) = crate::database::pipeline_traces::backfill_downstream_success(
-            &self.checkpoint_db,
-            &config.execution_id,
-            loop_result.verification_passed,
-        ) {
-            debug!("Failed to backfill downstream_success on traces: {}", e);
-        }
+        // Pipeline trace backfill removed — all persistence now via PgDb.
 
         loop_result
     }
@@ -526,6 +520,17 @@ impl LoopController {
             &config.execution_id,
             &UnifiedWorkflowState::verification_running(ctx.iteration),
         );
+        {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = self.app_state.pg_db.record_state_snapshot(
+                &config.execution_id,
+                "",
+                &ts,
+                "phase_transition",
+                Some(&format!("Entered verification phase, iteration {}", ctx.iteration)),
+                None,
+            ).await;
+        }
 
         self.record_activity(
             &config.execution_id,
@@ -676,9 +681,12 @@ impl LoopController {
                 span_type: "verification".to_string(),
                 guardrail_results: vec![],
                 handoff_received: None,
+                schema_valid_first_attempt: None,
+                validation_retries: None,
+                coercions_applied: None,
+                validation_error_summary: None,
             };
             if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                &self.checkpoint_db,
                 &config.execution_id,
                 &trace,
             ) {
@@ -767,6 +775,35 @@ impl LoopController {
             });
         }
 
+        // Emit state snapshot for replay
+        {
+            let snapshot_summary = format!(
+                "Verification iteration {} {}: {}/{} passed",
+                ctx.iteration,
+                if verification_result.all_passed { "PASSED" } else { "FAILED" },
+                verification_result.passed_steps,
+                verification_result.total_steps,
+            );
+            let context = serde_json::json!({
+                "type": "verification_result",
+                "iteration": ctx.iteration,
+                "all_passed": verification_result.all_passed,
+                "passed_steps": verification_result.passed_steps,
+                "failed_steps": verification_result.failed_steps,
+                "total_steps": verification_result.total_steps,
+                "critical_failure": verification_result.critical_failure,
+            });
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = self.app_state.pg_db.record_state_snapshot(
+                &config.execution_id,
+                "",
+                &ts,
+                "verification_result",
+                Some(&snapshot_summary),
+                Some(&context.to_string()),
+            ).await;
+        }
+
         // Emit canvas panel for verification completion
         self.canvas_manager
             .lock()
@@ -786,6 +823,17 @@ impl LoopController {
                 verification_result.all_passed,
             ),
         );
+        {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = self.app_state.pg_db.record_state_snapshot(
+                &config.execution_id,
+                "",
+                &ts,
+                "phase_transition",
+                Some(&format!("Entered verification_complete phase, iteration {}", ctx.iteration)),
+                None,
+            ).await;
+        }
 
         // Run convergence detector and emit metrics for the frontend dashboard
         let convergence_report = {
@@ -1068,7 +1116,6 @@ impl LoopController {
         // Detect regressions from previous iteration (iteration 2+)
         let failure_context = if ctx.iteration > 1 {
             match super::health_monitor::detect_regression(
-                &self.checkpoint_db,
                 &get_parent_task_id(&config.execution_id),
                 ctx.iteration,
                 &verification_result,
@@ -1165,6 +1212,17 @@ impl LoopController {
             &config.execution_id,
             &UnifiedWorkflowState::agentic_running(ctx.iteration),
         );
+        {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = self.app_state.pg_db.record_state_snapshot(
+                &config.execution_id,
+                "",
+                &ts,
+                "phase_transition",
+                Some(&format!("Entered agentic phase, iteration {}", ctx.iteration)),
+                None,
+            ).await;
+        }
 
         self.record_stage_transition(
             &config.execution_id,
@@ -1632,6 +1690,29 @@ impl LoopController {
                 "Injected {} dynamic verification step(s) from agentic phase (iteration {})",
                 new_injected_count, ctx.iteration
             );
+            let step_names: Vec<&str> = new_injected_steps.iter()
+                .filter_map(|s| s.name.as_deref())
+                .collect();
+            let snapshot_summary = format!(
+                "Agentic iteration {} injected {} new steps",
+                ctx.iteration,
+                new_injected_steps.len(),
+            );
+            let context = serde_json::json!({
+                "type": "step_injection",
+                "iteration": ctx.iteration,
+                "injected_count": new_injected_steps.len(),
+                "step_names": step_names,
+            });
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = self.app_state.pg_db.record_state_snapshot(
+                &config.execution_id,
+                "",
+                &ts,
+                "step_injection",
+                Some(&snapshot_summary),
+                Some(&context.to_string()),
+            ).await;
             ctx.dynamic_steps.extend(new_injected_steps);
         }
 
@@ -1675,11 +1756,21 @@ impl LoopController {
             &config.execution_id,
             &UnifiedWorkflowState::agentic_complete(ctx.iteration),
         );
+        {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let _ = self.app_state.pg_db.record_state_snapshot(
+                &config.execution_id,
+                "",
+                &ts,
+                "phase_transition",
+                Some(&format!("Entered agentic_complete phase, iteration {}", ctx.iteration)),
+                None,
+            ).await;
+        }
 
         // Compute token usage for the agentic phase trace
         let (mut trace_tokens_in, mut trace_tokens_out) =
             super::multi_agent_pipeline_loop::query_iteration_tokens(
-                &self.checkpoint_db,
                 &self.app_state.pg_db,
                 &config.execution_id,
                 ctx.iteration,
@@ -1723,9 +1814,12 @@ impl LoopController {
                 span_type: "agent".to_string(),
                 guardrail_results: vec![],
                 handoff_received: None,
+                schema_valid_first_attempt: None,
+                validation_retries: None,
+                coercions_applied: None,
+                validation_error_summary: None,
             };
             if let Err(e) = crate::database::pipeline_traces::save_pipeline_agent_trace(
-                &self.checkpoint_db,
                 &config.execution_id,
                 &trace,
             ) {
@@ -2372,15 +2466,7 @@ impl LoopController {
                 .await
                 {
                     // Persist to database
-                    if let Err(e) = self
-                        .checkpoint_db
-                        .append_iteration_diff(&config.execution_id, &diff)
-                    {
-                        warn!(
-                            "COMPENSATION: Failed to persist iteration diff {}: {}",
-                            ctx.iteration, e
-                        );
-                    }
+                    // Iteration diff persistence removed — all persistence now via PgDb.
 
                     // Keep in memory for cross-iteration context injection
                     ctx.accumulated_diffs.push(diff);

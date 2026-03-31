@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
-import type { TraceSpan, FlameNode, CriticalPathInfo, TraceTreeNode } from "./types";
-import { buildFlameData, flattenFlameNodes, formatDuration } from "./trace-utils";
+import type { TraceSpan, FlameNode, CriticalPathInfo, TraceTreeNode, TokenOverlayMode } from "./types";
+import { buildFlameData, flattenFlameNodes, formatDuration, getTokenHeat, computeTokenInsights } from "./trace-utils";
 
 // Canvas color mapping for phases (not Tailwind — raw hex for canvas)
 const PHASE_HEX: Record<string, { bg: string; text: string }> = {
@@ -17,12 +17,22 @@ const ROW_HEIGHT = 22;
 const ROW_GAP = 2;
 const NAME_MIN_WIDTH = 60;
 
+function blendHeatColor(baseColor: string, heat: number): string {
+  if (heat <= 0) return baseColor;
+  const r = Math.round(239 * heat + parseInt(baseColor.slice(1,3), 16) * (1-heat));
+  const g = Math.round(68 * heat + parseInt(baseColor.slice(3,5), 16) * (1-heat));
+  const b = Math.round(68 * heat + parseInt(baseColor.slice(5,7), 16) * (1-heat));
+  return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+}
+
 interface FlameChartProps {
   roots: TraceTreeNode[];
   onSelectSpan: (span: TraceSpan) => void;
   selectedSpanId: string | null;
   criticalPath: CriticalPathInfo | null;
   height: number;
+  tokenOverlay?: TokenOverlayMode;
+  tokenInsights?: ReturnType<typeof computeTokenInsights>;
 }
 
 interface ViewState {
@@ -38,6 +48,8 @@ export const FlameChart: React.FC<FlameChartProps> = ({
   selectedSpanId,
   criticalPath,
   height,
+  tokenOverlay,
+  tokenInsights,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -135,7 +147,15 @@ export const FlameChart: React.FC<FlameChartProps> = ({
 
       // Background
       const isSelected = node.span.span_id === selectedSpanId;
-      ctx.fillStyle = isSelected ? "#ffffff20" : colors.bg + "99";
+      let baseBg = colors.bg;
+      if (tokenOverlay && tokenOverlay !== "none" && tokenInsights) {
+        const maxVal = tokenOverlay === "input" ? tokenInsights.maxInputTokens
+          : tokenOverlay === "output" ? tokenInsights.maxOutputTokens
+          : tokenInsights.maxCostCents;
+        const heat = getTokenHeat(node.span, tokenOverlay, maxVal);
+        baseBg = blendHeatColor(colors.bg, heat);
+      }
+      ctx.fillStyle = isSelected ? "#ffffff20" : baseBg + "99";
       ctx.fillRect(x, y, w, ROW_HEIGHT);
 
       // Border
@@ -176,7 +196,7 @@ export const FlameChart: React.FC<FlameChartProps> = ({
 
       ctx.globalAlpha = 1;
     }
-  }, [displayNodes, canvasSize, view, maxDepth, selectedSpanId, criticalPath, displayRoot]);
+  }, [displayNodes, canvasSize, view, maxDepth, selectedSpanId, criticalPath, displayRoot, tokenOverlay, tokenInsights]);
 
   // Hit-test helper
   const hitTest = useCallback(

@@ -10,10 +10,12 @@ interface SpanRowProps {
   isSelected: boolean;
   onClick: () => void;
   criticalPath?: CriticalPathInfo | null;
+  tokenHeat?: number;
+  isHighlighted?: boolean;
 }
 
 export const SpanRow: React.FC<SpanRowProps> = React.memo(
-  ({ node, traceStartMs, traceDurationMs, isSelected, onClick, criticalPath }) => {
+  ({ node, traceStartMs, traceDurationMs, isSelected, onClick, criticalPath, tokenHeat, isHighlighted }) => {
     const { span, depth } = node;
     const phase = inferPhase(span.name);
     const colors = PHASE_COLORS[phase];
@@ -40,8 +42,11 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
       <div
         className={`flex items-center h-8 cursor-pointer hover:bg-zinc-800/50 border-b border-zinc-800/30 ${
           isSelected ? "bg-zinc-700/50" : ""
-        }`}
-        style={{ opacity: dimmed ? 0.4 : 1 }}
+        } ${isHighlighted ? "ring-1 ring-blue-500 animate-pulse" : ""}`}
+        style={{
+          opacity: dimmed ? 0.4 : 1,
+          ...(tokenHeat && tokenHeat > 0 ? { backgroundColor: `rgba(239, 68, 68, ${tokenHeat * 0.3})` } : {}),
+        }}
         onClick={onClick}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {

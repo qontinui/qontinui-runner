@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 167
+-- Version: 169
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -323,6 +323,8 @@ CREATE TABLE IF NOT EXISTS phase_token_usage (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost_cents INTEGER NOT NULL DEFAULT 0,  -- estimated cost in hundredths of cents (microdollars * 100)
     duration_ms INTEGER,           -- AI call wall-clock time
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,  -- Anthropic prompt cache: tokens written to cache
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,      -- Anthropic prompt cache: tokens read from cache
     target_app TEXT,               -- UI Bridge target app name (when step involves UI automation)
     target_page_url TEXT,          -- URL of the page being automated
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -2257,6 +2259,11 @@ CREATE TABLE IF NOT EXISTS execution_spans (
     iteration INTEGER,                      -- Loop iteration number
     workflow_id TEXT,                        -- Workflow that owns this span
 
+    -- Token usage columns (v168)
+    input_tokens INTEGER,                   -- AI input tokens consumed
+    output_tokens INTEGER,                  -- AI output tokens consumed
+    cost_cents INTEGER,                     -- Estimated cost in cents
+
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
@@ -3159,6 +3166,10 @@ CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
     span_type TEXT DEFAULT 'agent',        -- 'agent', 'tool', 'guardrail', 'handoff' (v132)
     guardrail_results_json TEXT,           -- JSON: guardrail evaluation results (v132)
     handoff_context_json TEXT,             -- JSON: context passed during agent handoffs (v132)
+    schema_valid_first_attempt INTEGER,   -- Whether output was valid on first attempt (v172)
+    validation_retries INTEGER,           -- Number of validation retries needed (v172)
+    coercions_applied TEXT,               -- JSON array: coercion summaries (v172)
+    validation_error_summary TEXT,        -- JSON array: validation error types (v172)
     created_at TEXT NOT NULL
 );
 
@@ -3929,3 +3940,40 @@ CREATE TABLE IF NOT EXISTS exploration_stats (
 CREATE INDEX IF NOT EXISTS idx_exploration_stats_workflow ON exploration_stats(workflow_id);
 
 INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (167, datetime('now'));
+
+-- Version 168: Token columns on execution_spans (already in CREATE TABLE above)
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (168, datetime('now'));
+
+-- Version 169: Execution state snapshots for span-level state tracking
+CREATE TABLE IF NOT EXISTS execution_state_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    snapshot_ts TEXT NOT NULL,
+    state_type TEXT NOT NULL,
+    summary TEXT,
+    context_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (execution_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_state_snapshots_execution ON execution_state_snapshots(execution_id);
+CREATE INDEX IF NOT EXISTS idx_state_snapshots_ts ON execution_state_snapshots(snapshot_ts);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (169, datetime('now'));
+
+-- Version 170: Prompt cache metrics on phase_token_usage
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (170, datetime('now'));
+
+-- Version 171: Per-phase model Q-routing table
+CREATE TABLE IF NOT EXISTS phase_model_routing (
+    state_key TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    model_tier TEXT NOT NULL,
+    q_value REAL NOT NULL DEFAULT 0.0,
+    visit_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (state_key, phase, model_tier)
+);
+CREATE INDEX IF NOT EXISTS idx_phase_model_routing_state ON phase_model_routing(state_key);
+
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (171, datetime('now'));

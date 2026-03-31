@@ -14,6 +14,9 @@ export interface TraceSpan {
   attributes: Record<string, unknown>;
   success: boolean;
   error: string | null;
+  input_tokens?: number;
+  output_tokens?: number;
+  cost_cents?: number;
 }
 
 /** A span with computed tree information. */
@@ -129,4 +132,7 @@ export interface CriticalPathInfo {
 }
 
 /** Active view mode for the trace viewer. */
-export type TraceViewMode = "waterfall" | "flamechart" | "comparison";
+export type TraceViewMode = "waterfall" | "flamechart" | "comparison" | "agent-graph";
+
+/** Token overlay mode for heatmap visualization. */
+export type TokenOverlayMode = "none" | "input" | "output" | "cost";

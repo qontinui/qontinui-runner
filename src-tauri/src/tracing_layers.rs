@@ -414,13 +414,18 @@ impl SqliteSpanLayer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let input_tokens: Option<i64> = entry.attributes.get("ai.input_tokens").and_then(|v| v.as_i64());
+        let output_tokens: Option<i64> = entry.attributes.get("ai.output_tokens").and_then(|v| v.as_i64());
+        let cost_cents: Option<i64> = entry.attributes.get("ai.cost_cents").and_then(|v| v.as_i64());
+
         let result = conn.execute(
             "INSERT INTO execution_spans (
                 execution_id, trace_id, span_id, parent_span_id, name,
                 start_ts, end_ts, duration_ms, attributes, success, error,
                 queue_wait_ms, retry_attempt, phase, iteration, workflow_id,
+                input_tokens, output_tokens, cost_cents,
                 created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime('now'))",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, datetime('now'))",
             rusqlite::params![
                 exec_id,
                 entry.trace_id,
@@ -438,6 +443,9 @@ impl SqliteSpanLayer {
                 phase,
                 iteration,
                 workflow_id,
+                input_tokens,
+                output_tokens,
+                cost_cents,
             ],
         );
 

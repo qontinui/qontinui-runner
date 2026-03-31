@@ -1,13 +1,14 @@
 import React from "react";
 import type { TraceInsights, CriticalPathInfo } from "./types";
-import { formatDuration } from "./trace-utils";
+import { formatDuration, computeTokenInsights } from "./trace-utils";
 
 interface PerformanceInsightsProps {
   insights: TraceInsights;
   criticalPath?: CriticalPathInfo | null;
+  tokenInsights?: ReturnType<typeof computeTokenInsights>;
 }
 
-export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insights, criticalPath }) => {
+export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insights, criticalPath, tokenInsights }) => {
   if (insights.spanCount === 0) return null;
 
   const parallelSlack =
@@ -62,6 +63,25 @@ export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insigh
           {parallelSlack !== null && parallelSlack > 0 && (
             <span>
               Parallel slack: <span className="text-zinc-300">{formatDuration(parallelSlack)}</span>
+            </span>
+          )}
+        </>
+      )}
+
+      {/* Token insights */}
+      {tokenInsights && tokenInsights.totalInputTokens + tokenInsights.totalOutputTokens > 0 && (
+        <>
+          <span className="text-zinc-600">|</span>
+          <span>
+            Tokens: <span className="text-zinc-300">{tokenInsights.totalInputTokens.toLocaleString()}</span>
+            <span className="text-zinc-500">&#8593;</span>
+            {' '}
+            <span className="text-zinc-300">{tokenInsights.totalOutputTokens.toLocaleString()}</span>
+            <span className="text-zinc-500">&#8595;</span>
+          </span>
+          {tokenInsights.totalCostCents > 0 && (
+            <span>
+              Cost: <span className="text-zinc-300">${(tokenInsights.totalCostCents / 100).toFixed(4)}</span>
             </span>
           )}
         </>

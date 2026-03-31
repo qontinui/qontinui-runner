@@ -541,7 +541,16 @@ impl UnifiedAiSessionExecutor {
             workflow_name = %config.workflow_name,
             phase = ?config.phase,
             iteration = config.iteration,
-            step_name = %config.step_name
+            step_name = %config.step_name,
+            ai.input_tokens = tracing::field::Empty,
+            ai.output_tokens = tracing::field::Empty,
+            ai.cost_cents = tracing::field::Empty,
+            gen_ai.system = "anthropic",
+            gen_ai.request.model = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.request.temperature = tracing::field::Empty,
+            gen_ai.request.max_tokens = tracing::field::Empty,
         )
     )]
     pub async fn execute(
@@ -627,7 +636,13 @@ impl UnifiedAiSessionExecutor {
         }
 
         // Transform prompt based on config flags
-        let transformed_prompt = self.transform_prompt(config, prompt);
+        let transformed_prompt = {
+            let _prompt_span = tracing::info_span!("qontinui.ai.prompt_build",
+                execution_id = %config.task_run_id,
+                step_name = %config.step_name,
+            ).entered();
+            self.transform_prompt(config, prompt)
+        };
 
         // Determine whether to use interactive mode.
         // Interactive requires BOTH a session manager AND the setting to be enabled.
@@ -741,6 +756,59 @@ impl UnifiedAiSessionExecutor {
                     cli_input_tokens,
                     cli_output_tokens,
                 );
+
+                // Record token usage on the tracing span for the SQLite/JSONL layers
+                if let Some(input_t) = cli_input_tokens {
+                    tracing::Span::current().record("ai.input_tokens", input_t as i64);
+                    tracing::Span::current().record("gen_ai.usage.input_tokens", input_t as i64);
+                }
+                if let Some(output_t) = cli_output_tokens {
+                    tracing::Span::current().record("ai.output_tokens", output_t as i64);
+                    tracing::Span::current().record("gen_ai.usage.output_tokens", output_t as i64);
+                }
+                // Cost computation
+                if let (Some(input_t), Some(output_t)) = (cli_input_tokens, cli_output_tokens) {
+                    let model_id = config.model_override.as_deref().unwrap_or("claude-sonnet-4-20250514");
+                    if let Some(cost) = crate::ai_pricing::calculate_cost_cents(input_t, output_t, model_id) {
+                        tracing::Span::current().record("ai.cost_cents", cost as i64);
+                    }
+                    tracing::Span::current().record("gen_ai.request.model", model_id);
+                }
+                if let Some(temp) = config.temperature_override {
+                    tracing::Span::current().record("gen_ai.request.temperature", temp as f64);
+                }
+                if let Some(max_tok) = config.max_tokens_override {
+                    tracing::Span::current().record("gen_ai.request.max_tokens", max_tok as i64);
+                }
+
+                // Emit state snapshot for replay enrichment
+                {
+                    let snapshot_summary = format!(
+                        "{} AI session: {} chars, {} injected steps",
+                        config.phase.as_str(),
+                        output.len(),
+                        injected_steps.len(),
+                    );
+                    let context = serde_json::json!({
+                        "phase": config.phase.as_str(),
+                        "step_name": &config.step_name,
+                        "success": success,
+                        "input_tokens": cli_input_tokens,
+                        "output_tokens": cli_output_tokens,
+                        "injected_steps_count": injected_steps.len(),
+                        "model": config.model_override.as_deref(),
+                    });
+                    let ts = chrono::Utc::now().to_rfc3339();
+                    let pg = self.app_state.pg_db.clone();
+                    let exec_id = config.task_run_id.clone();
+                    let ctx_str = context.to_string();
+                    tokio::spawn(async move {
+                        let _ = pg.record_state_snapshot(
+                            &exec_id, "", &ts, "ai_session",
+                            Some(&snapshot_summary), Some(&ctx_str),
+                        ).await;
+                    });
+                }
 
                 let details =
                     StepDetails::ai_session_complete(session_id.clone(), output.len(), duration_ms);
