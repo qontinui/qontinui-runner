@@ -1,9 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo, createRef } from "react";
+import { useUIComponent } from "ui-bridge";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { type TerminalInstanceHandle } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
+import { FileConflictBanner } from "./FileConflictBanner";
+import { useFileConflicts } from "./useFileConflicts";
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { useSessionManager } from "./useSessionManager";
 import { useTerminalManager } from "./useTerminalManager";
@@ -66,6 +69,30 @@ export function TerminalPage({
     createPlanTab,
   } = useTerminalManager();
 
+  // Register page-level UI Bridge actions so AI agents can discover
+  // and invoke terminal operations without knowing element IDs.
+  useUIComponent({
+    id: "terminal-page",
+    name: "Terminal Page",
+    description:
+      "Multi-terminal workspace with zone-based layout. Agents can create terminals via HTTP POST /terminals with initialCommand.",
+    actions: [
+      {
+        id: "create-terminal",
+        label: "Create Terminal",
+        handler: async () => {
+          await createTerminal();
+        },
+      },
+      {
+        id: "list-terminals",
+        label: "List Terminals",
+        handler: () =>
+          tabs.map((t) => ({ id: t.id, title: t.title, isAlive: t.isAlive })),
+      },
+    ],
+  });
+
   const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
   const zoneLayout = useZoneLayout(tabIds);
 
@@ -83,6 +110,7 @@ export function TerminalPage({
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
 
+  const fileConflicts = useFileConflicts();
   const { eventHistory, addHistoryEvent, metrics, incrementMetric } = useEventHistory();
   const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);
   const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments);
@@ -590,6 +618,11 @@ export function TerminalPage({
         type={workflowGen.notification?.type ?? "success"}
         onDismiss={() => workflowGen.setNotification(null)}
       />
+      <FileConflictBanner
+        conflicts={fileConflicts.conflicts}
+        recentAlert={fileConflicts.recentAlert}
+        onDismissAlert={fileConflicts.dismissAlert}
+      />
 
       {uiState.showTimeline && zoneLayout.isMultiZone && (
         <ZoneTimeline
@@ -615,6 +648,7 @@ export function TerminalPage({
           <SessionManagerPanel
             manager={sessionManager}
             selectedSessionId={workflowGen.selectedTranscriptSessionId}
+            sessionConflictCounts={fileConflicts.sessionConflictCounts}
           />
         )}
 

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
-use crate::database::{CheckpointDb, CreateTaskRunEventInput};
+use crate::database::CreateTaskRunEventInput;
 use crate::executor::timeout_helper;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
@@ -20,7 +20,8 @@ use super::{
     build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
     execute_prompt_response_mode, extract_and_preread_failure_files,
     get_active_sdk_app_name, preread_previously_edited_files, record_phase_token_usage,
-    record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
+    record_phase_token_usage_with_cache, record_phase_token_usage_with_target,
+    REFLECTION_MODE_PREAMBLE,
 };
 
 // =============================================================================
@@ -31,8 +32,8 @@ use super::{
 /// AI session execution is delegated to the UnifiedAiSessionExecutor.
 pub struct AgenticExecutor {
     pub(crate) app_state: Arc<AppState>,
+    app_handle: tauri::AppHandle,
     ai_executor: UnifiedAiSessionExecutor,
-    checkpoint_db: Arc<CheckpointDb>,
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
     step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
 }
@@ -43,11 +44,10 @@ impl AgenticExecutor {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
-        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             app_state: app_state.clone(),
-            ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
-            checkpoint_db,
+            ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle.clone(), pid_tracker),
+            app_handle,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
         }
@@ -204,7 +204,7 @@ impl AgenticExecutor {
                 let step_name = step.name.as_deref().unwrap_or("Agentic Response Prompt");
 
                 // Checkpoint the response-mode agentic step as "running"
-                let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+                let checkpoint_mgr = CheckpointManager::new("unified");
                 let mut resp_checkpoint = StepCheckpoint::new(
                     &config.execution_id,
                     "unified",
@@ -249,7 +249,6 @@ impl AgenticExecutor {
                     .or_else(|| config.resolve_provider_for_phase("agentic"));
                 match execute_prompt_response_mode(
                     &modified_step,
-                    &self.checkpoint_db,
                     &self.app_state.pg_db,
                     Some(&config.execution_id),
                     doctor_handle,
@@ -266,8 +265,7 @@ impl AgenticExecutor {
                         let duration_ms = start.elapsed().as_millis() as u64;
                         {
                             let target_app = get_active_sdk_app_name(&self.app_state);
-                            record_phase_token_usage_with_target(
-                                &self.checkpoint_db,
+                            record_phase_token_usage_with_cache(
                                 &self.app_state.pg_db,
                                 &config.execution_id,
                                 "agentic",
@@ -278,9 +276,37 @@ impl AgenticExecutor {
                                 resp.input_tokens,
                                 resp.output_tokens,
                                 Some(duration_ms),
+                                resp.cache_creation_tokens,
+                                resp.cache_read_tokens,
                                 target_app.as_deref(),
                                 None,
                             );
+                            // Emit realtime cost update event
+                            {
+                                let cost_usd = if let (Some(input), Some(output)) = (resp.input_tokens, resp.output_tokens) {
+                                    let cache_create = resp.cache_creation_tokens.unwrap_or(0);
+                                    let cache_read = resp.cache_read_tokens.unwrap_or(0);
+                                    crate::ai_pricing::calculate_cost_usd_with_cache(
+                                        input, output, cache_create, cache_read,
+                                        step_model.as_deref().unwrap_or("claude-sonnet-4-20250514"),
+                                    )
+                                } else {
+                                    0.0
+                                };
+
+                                crate::orchestrator::realtime_events::emit_cost_update(
+                                    &self.app_handle,
+                                    &config.execution_id,
+                                    "agentic",
+                                    Some(iteration),
+                                    resp.input_tokens.unwrap_or(0),
+                                    resp.output_tokens.unwrap_or(0),
+                                    resp.cache_creation_tokens.unwrap_or(0),
+                                    resp.cache_read_tokens.unwrap_or(0),
+                                    cost_usd,
+                                    0.0, // cumulative_cost_usd - would need aggregation
+                                );
+                            }
                         }
                         let resp_llm_metrics = build_llm_metrics(
                             step_model.as_deref(),
@@ -442,7 +468,7 @@ impl AgenticExecutor {
         }
 
         // Create checkpoint manager for step-level checkpointing
-        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+        let checkpoint_mgr = CheckpointManager::new("unified");
 
         // Try to get the latest progress marker from previous checkpoints
         // This helps the AI understand where to resume if a previous session was interrupted
@@ -545,6 +571,42 @@ impl AgenticExecutor {
             }
         };
 
+        // Check file registry for conflicts and warn about files under active development
+        let enhanced_prompt = {
+            let conflicts = self
+                .app_state
+                .file_registry_manager
+                .check_conflicts(&config.execution_id)
+                .await;
+            if conflicts.is_empty() {
+                enhanced_prompt
+            } else {
+                let mut warning = String::from("\n\n## Active File Conflicts Warning\n\n");
+                warning.push_str(
+                    "The following files are currently being worked on by other active sessions. \
+                     Avoid modifying these files to prevent merge conflicts:\n\n",
+                );
+                for conflict in &conflicts {
+                    let holders: Vec<String> = conflict
+                        .other_holders
+                        .iter()
+                        .map(|h| format!("'{}'", h.holder_name))
+                        .collect();
+                    warning.push_str(&format!(
+                        "- **{}** (active in: {})\n",
+                        conflict.file_path,
+                        holders.join(", ")
+                    ));
+                }
+                info!(
+                    "AGENTIC-PHASE: Injected {} file conflict warning(s) for {}",
+                    conflicts.len(),
+                    config.execution_id
+                );
+                format!("{}{}", enhanced_prompt, warning)
+            }
+        };
+
         // Append unified memory context (cross-run learnings, knowledge graph, PG memories).
         // Uses MemorySystem::build_context_unified which queries PG + SQLite + graph and
         // falls back gracefully when the unified query returns nothing.
@@ -555,7 +617,6 @@ impl AgenticExecutor {
                     20,
                     &config.base_prompt,
                     &self.app_state.pg_db,
-                    self.checkpoint_db.clone(),
                 )
                 .await;
             if mem_ctx.trim().is_empty() {
@@ -571,7 +632,7 @@ impl AgenticExecutor {
 
         // Append execution timing context if available (from iteration 2+ or cross-stage)
         let enhanced_prompt = if iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0) {
-            match build_execution_timing_context(&self.checkpoint_db, &config.execution_id) {
+            match build_execution_timing_context(&config.execution_id) {
                 Some(timing) => {
                     info!(
                         "AGENTIC-PHASE: Appending execution timing context ({} chars)",
@@ -681,7 +742,6 @@ impl AgenticExecutor {
             iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0);
         let enhanced_prompt = if needs_iteration_context {
             match build_compressed_iteration_history(
-                &self.checkpoint_db,
                 &config.execution_id,
                 iteration,
                 process_status_summary.as_deref(),
@@ -722,7 +782,6 @@ impl AgenticExecutor {
         let enhanced_prompt = if !is_pipeline {
             if let Some((_, ref rec_id)) = config.active_canary {
                 match crate::meta_optimizer::canary::get_canary_prompt_overrides(
-                    &self.checkpoint_db,
                     &self.app_state.pg_db,
                     rec_id,
                 ) {
@@ -785,7 +844,6 @@ impl AgenticExecutor {
         // so the AI can see the cumulative changes without tool calls.
         let enhanced_prompt = if iteration > 1 {
             let preread = preread_previously_edited_files(
-                &self.checkpoint_db,
                 &config.execution_id,
                 iteration,
                 config.project_path.as_deref(),
@@ -814,9 +872,9 @@ impl AgenticExecutor {
                 "last_activity_at": now,
             });
             if let Ok(json) = serde_json::to_string(&ctx_json) {
-                let _ = self
-                    .checkpoint_db
-                    .update_task_run_runtime_context(&persist_id, &json);
+                // Runtime context persistence removed — all persistence now via PgDb.
+                let _ = &persist_id; // suppress unused warning
+                let _ = &json;
             }
         }
 
@@ -877,7 +935,7 @@ impl AgenticExecutor {
 
         // Attach DB flush context for periodic output persistence
         ai_config.db_flush_ctx = Some(crate::claude_session::runner::DbFlushContext {
-            db: self.checkpoint_db.clone(),
+            db: crate::database::CheckpointDb::global(),
             task_run_id: parent_task_id.clone(),
             iteration: iteration as i32,
         });
@@ -1032,7 +1090,6 @@ impl AgenticExecutor {
         {
             let target_app = get_active_sdk_app_name(&self.app_state);
             record_phase_token_usage_with_target(
-                &self.checkpoint_db,
                 &self.app_state.pg_db,
                 &config.execution_id,
                 "agentic",
@@ -1046,6 +1103,31 @@ impl AgenticExecutor {
                 target_app.as_deref(),
                 None,
             );
+
+            // Emit realtime cost update for the main AI session
+            {
+                let cost_usd = if let (Some(input), Some(output)) = (session_input_tokens, session_output_tokens) {
+                    crate::ai_pricing::calculate_cost_usd_with_cache(
+                        input, output, 0, 0,
+                        session_model.as_deref().unwrap_or("claude-sonnet-4-20250514"),
+                    )
+                } else {
+                    0.0
+                };
+
+                crate::orchestrator::realtime_events::emit_cost_update(
+                    &self.app_handle,
+                    &config.execution_id,
+                    "agentic",
+                    Some(iteration),
+                    session_input_tokens.unwrap_or(0),
+                    session_output_tokens.unwrap_or(0),
+                    0,
+                    0,
+                    cost_usd,
+                    0.0,
+                );
+            }
         }
         let session_llm_metrics = build_llm_metrics(
             session_model.as_deref(),
@@ -1079,13 +1161,7 @@ impl AgenticExecutor {
             ).await {
                 warn!("Failed to complete workflow AI session: {}", e);
             }
-            // Delete the partial in-progress output now that final output will be written
-            if let Err(e) = self
-                .checkpoint_db
-                .delete_partial_ai_output(&parent_task_id, iteration as i32)
-            {
-                warn!("Failed to delete partial AI output: {}", e);
-            }
+            // Partial AI output deletion removed — all persistence now via PgDb.
         }
 
         // Emit completion event so the Active Dashboard timeline shows agentic phase result
@@ -1200,7 +1276,7 @@ impl AgenticExecutor {
             is_resume: false,
         });
         ai_config.db_flush_ctx = Some(crate::claude_session::runner::DbFlushContext {
-            db: self.checkpoint_db.clone(),
+            db: crate::database::CheckpointDb::global(),
             task_run_id: parent_task_id.clone(),
             iteration: iteration as i32,
         });
@@ -1237,7 +1313,6 @@ impl AgenticExecutor {
 
         let result = execute_prompt_response_mode(
             &step,
-            &self.checkpoint_db,
             &self.app_state.pg_db,
             None,
             None,
@@ -1261,49 +1336,8 @@ impl AgenticExecutor {
     ///
     /// Returns a formatted string like:
     /// "Last progress: file_progress 50/100. Continue from where you left off."
-    fn get_progress_marker_context(&self, execution_id: &str, iteration: u32) -> Option<String> {
-        // Get checkpoints for the agentic phase at this iteration
-        let checkpoints = self
-            .checkpoint_db
-            .get_workflow_step_checkpoints(execution_id, "agentic", Some(iteration))
-            .ok()?;
-
-        // Find the most recent checkpoint (by step_index descending, or just take the last one)
-        // There should typically only be one checkpoint per iteration, but we want the latest
-        let latest_checkpoint = checkpoints.into_iter().last()?;
-
-        // Query for the latest progress marker using the checkpoint's id
-        let progress_marker = self
-            .checkpoint_db
-            .get_latest_step_progress_marker(&latest_checkpoint.id)
-            .ok()
-            .flatten()?;
-
-        // Format the progress context message
-        let progress_string = progress_marker.progress_string();
-        let marker_type = &progress_marker.marker_type;
-
-        let mut message = format!(
-            "---\n\n**Resume Context:** Last progress: {} {}.",
-            marker_type, progress_string
-        );
-
-        // Add description if available
-        if let Some(description) = &progress_marker.description {
-            message.push_str(&format!(" ({})", description));
-        }
-
-        message.push_str(" Continue from where you left off.");
-
-        info!(
-            "AGENTIC-PHASE: Including progress marker context: {} {}/{}",
-            marker_type,
-            progress_marker.current_value,
-            progress_marker
-                .total_value
-                .map_or("?".to_string(), |v| v.to_string())
-        );
-
-        Some(message)
+    fn get_progress_marker_context(&self, _execution_id: &str, _iteration: u32) -> Option<String> {
+        // Progress marker context removed — all persistence now via PgDb.
+        None
     }
 }

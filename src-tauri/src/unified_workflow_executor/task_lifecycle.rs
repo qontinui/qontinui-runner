@@ -16,6 +16,9 @@ impl LoopController {
     /// Mark a task as completed, sync to backend, promote workflow, store convergence snapshot,
     /// parse meta-optimizer recommendations, and check chain triggers.
     pub(crate) async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
+        // Release advisory file registry entries on completion
+        self.app_state.file_registry_manager.release_all(execution_id).await;
+
         if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
             error!("Failed to mark task {} as completed (PG): {}", execution_id, e);
         } else {
@@ -25,7 +28,6 @@ impl LoopController {
             broadcaster.task_run_update(execution_id, "completed", None, None);
 
             // Sync completion to web backend (best-effort, non-blocking)
-            let db = self.checkpoint_db.clone();
             let pg = self.app_state.pg_db.clone();
             let eid = execution_id.to_string();
             tokio::spawn(async move {
@@ -66,16 +68,14 @@ impl LoopController {
             // Auto-capture task knowledge as observations (Engram-style cross-session memory)
             {
                 let pg = self.app_state.pg_db.clone();
-                let db = self.checkpoint_db.clone();
                 let exec_id = execution_id.to_string();
                 tokio::spawn(async move {
-                    auto_capture_observations(&db, &pg, &exec_id).await;
+                    auto_capture_observations(&pg, &exec_id).await;
                 });
             }
 
             // Parse meta-optimizer recommendations from completed output
             {
-                let db = self.checkpoint_db.clone();
                 let pg = self.app_state.pg_db.clone();
                 let eid = execution_id.to_string();
                 tokio::spawn(async move {
@@ -104,7 +104,6 @@ impl LoopController {
                     // Parse recommendations from the output
                     let output = &task_run.output_log;
                     match crate::meta_optimizer::parser::save_parsed_recommendations(
-                        &db,
                         &pg,
                         &optimizer_type,
                         Some(&optimizer_run_id),
@@ -118,7 +117,6 @@ impl LoopController {
                             // Complete the optimizer run record
                             if let Err(e) =
                                 crate::meta_optimizer::recommendations::complete_optimizer_run(
-                                    &db,
                                     &pg,
                                     &optimizer_run_id,
                                     0, // runs_analyzed is not tracked here
@@ -169,6 +167,9 @@ impl LoopController {
         reason: &str,
         workflow_id: Option<&str>,
     ) {
+        // Release advisory file registry entries on failure
+        self.app_state.file_registry_manager.release_all(execution_id).await;
+
         if let Err(e) = self.app_state.pg_db.fail_task_run(execution_id, reason).await {
             error!("Failed to mark task {} as failed (PG): {}", execution_id, e);
         } else {
@@ -183,7 +184,6 @@ impl LoopController {
             );
 
             // Sync failure to web backend (best-effort, non-blocking)
-            let db = self.checkpoint_db.clone();
             let pg = self.app_state.pg_db.clone();
             let eid = execution_id.to_string();
             tokio::spawn(async move {
@@ -327,7 +327,6 @@ impl LoopController {
         agentic_steps: &mut Vec<ExecutionStepConfig>,
         completion_automation_steps: &mut Vec<ExecutionStepConfig>,
         completion_prompt_steps: &mut Vec<ExecutionStepConfig>,
-        checkpoint_db: &Arc<crate::database::CheckpointDb>,
         pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     ) {
         if let Some(project_path) = config.project_path.clone() {
@@ -431,16 +430,12 @@ impl LoopController {
 /// - Key findings from verification phases
 /// - Error patterns encountered
 async fn auto_capture_observations(
-    db: &crate::database::CheckpointDb,
     pg: &crate::database::pg::PgDb,
     execution_id: &str,
 ) {
     let task_run = match pg.get_task_run(execution_id).await.ok().flatten() {
         Some(tr) => tr,
-        None => match db.get_task_run(execution_id) {
-            Ok(Some(tr)) => tr,
-            _ => return,
-        },
+        None => return,
     };
 
     let workflow_name = task_run.workflow_name.as_deref().unwrap_or(&task_run.task_name);

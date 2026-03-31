@@ -242,6 +242,10 @@ pub async fn stop_ai_analysis(
             warn!("MCP API: Failed to stop task run {}: {}", task.id, e);
         }
 
+        // Release URL locks and file registry entries
+        state.app_state.url_lock_manager.release_all(&task.id).await;
+        state.app_state.file_registry_manager.release_all(&task.id).await;
+
         info!("MCP API: Stopped task run: {}", task.id);
     }
 
@@ -1041,6 +1045,41 @@ pub async fn run_prompt(
         .await
         {
             enhanced_prompt = format!("{}{}", memory_section, enhanced_prompt);
+        }
+    }
+
+    // Check file registry for conflicts and warn this session about files under active development
+    {
+        let conflicts = state
+            .app_state
+            .file_registry_manager
+            .check_conflicts(&task_run_id)
+            .await;
+        if !conflicts.is_empty() {
+            let mut warning = String::from("## Active File Conflicts Warning\n\n");
+            warning.push_str(
+                "The following files are currently being worked on by other active sessions. \
+                 Avoid modifying these files to prevent merge conflicts:\n\n",
+            );
+            for conflict in &conflicts {
+                let holders: Vec<String> = conflict
+                    .other_holders
+                    .iter()
+                    .map(|h| format!("'{}'", h.holder_name))
+                    .collect();
+                warning.push_str(&format!(
+                    "- **{}** (active in: {})\n",
+                    conflict.file_path,
+                    holders.join(", ")
+                ));
+            }
+            warning.push_str("\nIf you must edit these files, coordinate with the other session(s) first.\n\n---\n\n");
+            enhanced_prompt = format!("{}{}", warning, enhanced_prompt);
+            info!(
+                "Injected {} file conflict warning(s) into session {} prompt",
+                conflicts.len(),
+                task_run_id
+            );
         }
     }
 

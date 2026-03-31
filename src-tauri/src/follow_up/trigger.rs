@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::CheckpointDb;
 use crate::AppState;
 
 /// Signal patterns that indicate unfixed issues in AI output.
@@ -219,8 +218,6 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
         return Ok("skipped".to_string());
     }
 
-    let db = &deps.app_state.checkpoint_db;
-
     // Get source task run details via block_in_place
     let workflow_name = {
         let pg = pg_db.clone();
@@ -256,7 +253,9 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
         .with_follow_up_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
 
-    db.create_task_run(&input)?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.create_task_run(&input))
+    })?;
 
     // Build the follow-up workflow
     let loop_config =
@@ -295,11 +294,12 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let exec_id = follow_up_id.clone();
     let wf_name = follow_up_name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
+    let file_registry = Some(deps.app_state.file_registry_manager.clone());
     crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-        deps.app_state.checkpoint_db.clone(),
         exec_id,
         wf_name,
         url_lock,
+        file_registry,
         deps.app_state.pg_db.clone(),
         Box::pin(async move {
             controller

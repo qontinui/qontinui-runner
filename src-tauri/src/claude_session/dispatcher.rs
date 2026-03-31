@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
+use tauri::{Emitter, Manager};
 use tracing::{debug, info, trace, warn};
 
 use crate::claude_protocol::codec::decode_message;
@@ -97,6 +98,8 @@ pub fn dispatch_line(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
         }));
+        // Auto-register files under active development when Edit/Write tools are used
+        auto_register_file(app_handle, session_ctx, tool_name, &data);
     }
 
     // Also extract tool activity from content_block_start messages.
@@ -107,6 +110,8 @@ pub fn dispatch_line(
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
         }));
+        // Auto-register files under active development when Edit/Write tools are used
+        auto_register_file(app_handle, session_ctx, &tool_name, &data);
     }
 
     // Handle control requests from CLI (auto-approve tool use in bypass mode)
@@ -336,6 +341,85 @@ pub(crate) fn format_tool_activity(
         "WebFetch" | "WebSearch" => "Searching the web...".to_string(),
         "Task" => "Running subagent...".to_string(),
         _ => format!("Using {}...", tool_name),
+    }
+}
+
+/// Auto-register a file in the file registry when an Edit or Write tool is used.
+///
+/// This enables automatic conflict detection — when one session edits a file,
+/// other sessions are warned about it on startup or via real-time events.
+fn auto_register_file(
+    app_handle: &tauri::AppHandle,
+    session_ctx: Option<&AiSessionContext>,
+    tool_name: &str,
+    data: &serde_json::Map<String, serde_json::Value>,
+) {
+    // Only register for file-modifying tools
+    match tool_name {
+        "Edit" | "edit" | "Write" | "write" => {}
+        _ => return,
+    }
+
+    let file_path = match data.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return,
+    };
+
+    let task_run_id = match session_ctx {
+        Some(ctx) => ctx.task_run_id().to_string(),
+        None => return,
+    };
+
+    let holder_name = session_ctx
+        .map(|ctx| ctx.session_name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Access file registry via Tauri managed state (non-blocking, fire-and-forget)
+    use crate::commands::AppState;
+    if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+        let registry = app_state.file_registry_manager.clone();
+        let event_broadcast = app_state.event_broadcast.clone();
+        let handle = app_handle.clone();
+        let file_path_clone = file_path.clone();
+
+        // Spawn async task to avoid blocking the synchronous dispatcher
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let conflicts = registry
+                    .register(&[file_path_clone.clone()], &task_run_id, &holder_name)
+                    .await;
+
+                // Emit real-time event if conflicts detected
+                if !conflicts.is_empty() {
+                    let conflict_data = serde_json::json!({
+                        "type": "file-conflict-detected",
+                        "file_path": file_path_clone,
+                        "task_run_id": task_run_id,
+                        "holder_name": holder_name,
+                        "conflicts": conflicts.iter().map(|c| serde_json::json!({
+                            "file_path": c.file_path,
+                            "other_holders": c.other_holders.iter().map(|h| serde_json::json!({
+                                "task_run_id": h.task_run_id,
+                                "holder_name": h.holder_name,
+                            })).collect::<Vec<_>>(),
+                        })).collect::<Vec<_>>(),
+                    });
+
+                    // Emit to Tauri frontend
+                    let _ = handle.emit("file-conflict-detected", &conflict_data);
+
+                    // Emit to WebSocket clients
+                    let _ = event_broadcast.send(conflict_data);
+
+                    info!(
+                        "File conflict detected: '{}' edited by '{}' but also held by {} other session(s)",
+                        file_path_clone,
+                        holder_name,
+                        conflicts[0].other_holders.len()
+                    );
+                }
+            });
+        }
     }
 }
 

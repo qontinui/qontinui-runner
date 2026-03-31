@@ -7,6 +7,8 @@ import type { UseSessionManagerReturn, UnifiedSession, SessionLiveStatus } from 
 interface SessionManagerPanelProps {
   manager: UseSessionManagerReturn;
   selectedSessionId: string | null;
+  /** Map of session task_run_id → number of conflicting files */
+  sessionConflictCounts?: Map<string, number>;
 }
 
 /** Human-readable status group labels. */
@@ -75,7 +77,7 @@ function formatDateGroupKey(iso: string): string {
   }
 }
 
-export function SessionManagerPanel({ manager, selectedSessionId }: SessionManagerPanelProps) {
+export function SessionManagerPanel({ manager, selectedSessionId, sessionConflictCounts }: SessionManagerPanelProps) {
   const {
     sessions,
     loading,
@@ -212,6 +214,7 @@ export function SessionManagerPanel({ manager, selectedSessionId }: SessionManag
                   selectionMode={selectionMode}
                   isPinned={pinnedIds.has(session.sessionId)}
                   sessionLabel={sessionLabels[session.sessionId] ?? null}
+                  fileConflictCount={sessionConflictCounts?.get(session.sessionId) ?? 0}
                   onResume={resumeSession}
                   onViewTranscript={viewTranscript}
                   onCopyId={copySessionId}

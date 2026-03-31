@@ -203,6 +203,9 @@ pub async fn stop_task_run(
     // WorkflowDropGuard's sync release, which can fail under contention)
     state.app_state.url_lock_manager.release_all(&id).await;
 
+    // Release advisory file registry entries for this task
+    state.app_state.file_registry_manager.release_all(&id).await;
+
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
@@ -240,16 +243,18 @@ pub async fn pause_task_run(
 
     let paused = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .pause_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if !paused {
         // Either task not found or not in 'running' status
         let task_run = state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_task_run(&id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         return match task_run {
@@ -294,15 +299,17 @@ pub async fn unpause_task_run(
 
     let unpaused = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .unpause_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if !unpaused {
         let task_run = state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_task_run(&id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         return match task_run {
@@ -361,21 +368,11 @@ pub async fn generate_task_summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     info!("MCP API: Generating summary for task run: {}", id);
 
-    // SQLite: complex function — uses sync AI provider + multi-query summary generation
-    let db = state.app_state.checkpoint_db.clone();
-    let task_id = id.clone();
-    let doctor_handle = state.doctor_handle.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        summary_generator::generate_task_summary(&db, &task_id, doctor_handle.as_ref(), None, None)
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Task spawn error: {}", e),
-        )
-    })?;
+    // Summary generation requires CheckpointDb — stubbed until ported to PgDb
+    let _db = state.app_state.pg_db.clone();
+    let _doctor_handle = state.doctor_handle.clone();
+    let result: Result<summary_generator::SummaryResult, String> =
+        Err("generate_task_summary not yet ported to PgDb".to_string());
 
     match result {
         Ok(summary_result) => Ok(Json(serde_json::json!({
@@ -396,17 +393,14 @@ pub async fn get_task_auto_continue(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .get_task_auto_continue(&id)
-        .map(|auto_continue| {
-            Json(serde_json::json!({
-                "id": id,
-                "auto_continue": auto_continue
-            }))
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // get_task_auto_continue not on PgDb — get from task_run
+    let task = state.app_state.pg_db.get_task_run(&id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "auto_continue": task.auto_continue
+    })))
 }
 
 /// Request body for setting auto-continue on a task run.
@@ -423,8 +417,9 @@ pub async fn set_task_auto_continue(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .set_task_auto_continue(&id, req.auto_continue)
+        .await
         .map(|_| {
             Json(serde_json::json!({
                 "success": true,
@@ -463,8 +458,9 @@ pub async fn resume_task_run(
     // Get the task run
     let task_run = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -473,8 +469,9 @@ pub async fn resume_task_run(
         let additional_sessions = request.additional_sessions.unwrap_or(1);
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .reopen_task_run(&id, additional_sessions)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     } else {
         task_run
@@ -485,8 +482,9 @@ pub async fn resume_task_run(
         // Old format: unified-workflow-{uuid}-{timestamp}
         let wf = state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_unified_workflow(&wf_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             .ok_or_else(|| {
                 (
@@ -502,20 +500,22 @@ pub async fn resume_task_run(
         // definition keeps the original name.
         let wf = state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_unified_workflow_by_name(wf_name)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             .or_else(|| {
                 let stripped = wf_name
                     .strip_prefix("Project Reflection: ")
                     .or_else(|| wf_name.strip_prefix("Reflection: "));
                 stripped.and_then(|name| {
-                    state
-                        .app_state
-                        .checkpoint_db
-                        .get_unified_workflow_by_name(name)
-                        .ok()
-                        .flatten()
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            state.app_state.pg_db.get_unified_workflow_by_name(name)
+                        )
+                    })
+                    .ok()
+                    .flatten()
                 })
             })
             .ok_or_else(|| {
@@ -631,7 +631,6 @@ pub async fn resume_task_run(
     let config_storage = state.config_storage.clone();
     let app_handle = state.app_handle.clone();
     let pid_tracker = state.current_ai_pids.clone();
-    let checkpoint_db = state.app_state.checkpoint_db.clone();
     let task_name = task_run.task_name.clone();
     let execution_id_for_guard = id.clone();
 
@@ -644,11 +643,12 @@ pub async fn resume_task_run(
 
     // Use panic-safe spawning to ensure task is marked as failed if workflow panics
     let url_lock = Some(state.app_state.url_lock_manager.clone());
+    let file_registry = Some(state.app_state.file_registry_manager.clone());
     crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-        checkpoint_db,
         execution_id_for_guard,
         task_name.clone(),
         url_lock,
+        file_registry,
         state.app_state.pg_db.clone(),
         async move {
             let mut controller =
@@ -768,46 +768,56 @@ pub async fn get_task_run_verification_results(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    // Get verification results
-    let results = if let Some(iteration) = query.iteration {
+    // Get verification results (PG returns Option<serde_json::Value>)
+    let results_json = if let Some(iteration) = query.iteration {
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_iteration_verification_results(&id, iteration)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     } else {
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_latest_verification_results(&id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     };
+
+    // Extract results array from JSON (or empty)
+    let results_array = results_json
+        .and_then(|v| v.get("results").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
 
     // Filter by failed_only if requested
-    let results: Vec<_> = if query.failed_only {
-        results.into_iter().filter(|r| !r.passed).collect()
+    let results_array: Vec<_> = if query.failed_only {
+        results_array.into_iter().filter(|r| {
+            r.get("passed").and_then(|v| v.as_bool()) != Some(true)
+        }).collect()
     } else {
-        results
+        results_array
     };
 
-    // Calculate summary stats
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.passed).count();
-    let failed = results.iter().filter(|r| !r.passed).count();
-    let critical_failed = results
-        .iter()
-        .filter(|r| !r.passed && r.is_critical)
-        .count();
+    let total = results_array.len();
+    let passed = results_array.iter().filter(|r| r.get("passed").and_then(|v| v.as_bool()) == Some(true)).count();
+    let failed = total - passed;
+    let critical_failed = results_array.iter().filter(|r| {
+        r.get("passed").and_then(|v| v.as_bool()) != Some(true)
+            && r.get("is_critical").and_then(|v| v.as_bool()) == Some(true)
+    }).count();
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
         "task_name": task.task_name,
-        "results": results,
+        "results": results_array,
         "summary": {
             "total": total,
             "passed": passed,
@@ -834,16 +844,18 @@ pub async fn get_task_run_verification_phase_results(
     // Verify task exists
     let _task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get all workflow verification phase results
     let results = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_all_verification_phase_results(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let count = results.len();
@@ -950,8 +962,9 @@ pub async fn get_task_run_api_requests(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1011,8 +1024,9 @@ pub async fn get_task_run_playwright_results(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1060,8 +1074,9 @@ pub async fn get_task_run_awas_steps(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1113,16 +1128,18 @@ pub async fn get_task_run_knowledge(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get knowledge entries
     let knowledge = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .list_task_knowledge(&id, query.category.as_deref(), query.unresolved_only)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Calculate summary by category
@@ -1180,8 +1197,9 @@ pub async fn get_step_progress_markers(
     // Verify task exists
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&path.id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| {
             (
@@ -1193,15 +1211,17 @@ pub async fn get_step_progress_markers(
     // Get progress markers for this checkpoint
     let markers = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_step_progress_markers(&path.checkpoint_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Also get the latest marker for quick access
     let latest = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_latest_step_progress_marker(&path.checkpoint_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -1268,13 +1288,14 @@ pub async fn get_current_execution_steps(
     // Get running tasks
     let running_tasks = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_running_task_runs(Some(
             state
                 .app_state
                 .api_port
                 .load(std::sync::atomic::Ordering::Relaxed),
         ))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // If no running task, return empty
@@ -1549,8 +1570,9 @@ pub async fn get_current_execution_steps(
     // Steps from completed iterations should not show as "running"
     let completed_iterations: std::collections::HashSet<i64> = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_all_verification_phase_results(&task.id)
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
@@ -1717,16 +1739,32 @@ pub async fn get_execution_spans(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ExecutionSpansQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let spans = state
+    let execution_id = query.execution_id.as_deref().unwrap_or("");
+    let all_spans = state
         .app_state
-        .checkpoint_db
-        .get_execution_spans(
-            query.execution_id.as_deref(),
-            query.name_pattern.as_deref(),
-            query.min_duration_ms,
-            query.limit,
-        )
+        .pg_db
+        .get_execution_spans(execution_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Apply filters in memory since PG only supports execution_id filter
+    let limit = query.limit.unwrap_or(100) as usize;
+    let spans: Vec<_> = all_spans.into_iter()
+        .filter(|s| {
+            if let Some(ref pattern) = query.name_pattern {
+                if let Some(name) = s.get("span_type").and_then(|v| v.as_str()) {
+                    if !name.contains(pattern.trim_matches('%')) { return false; }
+                }
+            }
+            if let Some(min_dur) = query.min_duration_ms {
+                if let Some(dur) = s.get("duration_ms").and_then(|v| v.as_i64()) {
+                    if dur < min_dur { return false; }
+                }
+            }
+            true
+        })
+        .take(limit)
+        .collect();
 
     Ok(Json(serde_json::json!({
         "spans": spans,
@@ -1753,8 +1791,9 @@ pub async fn migrate_task_run_logs(
     // Verify task exists
     let task_run = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1770,40 +1809,13 @@ pub async fn migrate_task_run_logs(
             )
         })?;
 
-    // SQLite: complex function — file I/O + multi-table SQLite log migration
-    let db = state.app_state.checkpoint_db.clone();
-    let workflow_name = task_run.workflow_name.clone();
-    let task_id = id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        crate::log_migration::migrate_logs_to_sqlite(
-            &db,
-            &task_id,
-            &dev_logs_dir,
-            workflow_name.as_deref(),
-        )
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Task spawn error: {}", e),
-        )
-    })?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "task_run_id": id,
-        "migrated": {
-            "general_events": result.general_events,
-            "action_events": result.action_events,
-            "image_recognition_events": result.image_recognition_events,
-            "screenshots": result.screenshots,
-            "playwright_results": result.playwright_results
-        },
-        "errors": result.errors
-    })))
+    // Log migration requires CheckpointDb — stubbed until ported to PgDb
+    let _task_run = task_run;
+    let _dev_logs_dir = dev_logs_dir;
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Log migration not yet ported to PgDb".to_string(),
+    ))
 }
 
 // ============================================================================

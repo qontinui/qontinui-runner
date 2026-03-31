@@ -29,11 +29,11 @@
 use crate::config::QontinuiConfig;
 use crate::container::isolated_executor::IsolatedExecutor;
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
+
 use crate::display::DisplayProcessor;
 use crate::doctor::DoctorHandle;
 use crate::error_monitor::ErrorMonitorHandle;
-use crate::executor::{BridgeManager, ExtractionExecutor, UrlLockManager};
+use crate::executor::{BridgeManager, ExtractionExecutor, FileRegistryManager, UrlLockManager};
 use crate::mcp_client::McpClientManager;
 use crate::process_capture::ProcessCaptureManager;
 use crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker;
@@ -64,6 +64,7 @@ pub mod comparison; // Side-by-side architecture comparison runs
 pub mod config;
 pub mod container_settings;
 pub mod context;
+pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns
 pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;
@@ -96,6 +97,7 @@ pub mod project_logs;
 pub mod rag;
 pub mod recap; // Session recap overview
 pub mod screenshot;
+pub mod security_settings;
 pub mod screenshots;
 pub mod self_healing_settings;
 pub mod setup_wizard; // First-launch setup wizard commands
@@ -131,7 +133,6 @@ pub mod websocket;
 /// - Local storage service
 /// - Video recording service
 /// - Event broadcast channel for WebSocket clients
-/// - Checkpoint database for persistent storage
 /// - Run recording handler for automatic run recording
 /// - Error monitor handle for application log monitoring
 pub struct AppState {
@@ -159,8 +160,6 @@ pub struct AppState {
     /// Broadcast channel for streaming execution events to WebSocket clients.
     /// Events include image recognition results, tree events, and state changes.
     pub event_broadcast: broadcast::Sender<serde_json::Value>,
-    /// SQLite database for checkpoints, sessions, settings, and scheduler state.
-    pub checkpoint_db: Arc<CheckpointDb>,
     /// PostgreSQL database (Clorinde-generated queries). Required — local docker-compose PG.
     pub pg_db: Arc<PgDb>,
     /// Run recording handler for automatic workflow execution recording.
@@ -179,6 +178,11 @@ pub struct AppState {
     /// Ensures only one workflow at a time interacts with a given UI Bridge URL.
     /// Workflows targeting different URLs run concurrently.
     pub url_lock_manager: Arc<UrlLockManager>,
+    /// Advisory file registry for tracking files under active development.
+    /// Sessions register files they're working on so other sessions can detect
+    /// potential conflicts. Non-blocking — multiple sessions can work on the
+    /// same file but are warned about overlaps.
+    pub file_registry_manager: Arc<FileRegistryManager>,
     /// Tracks consecutive UI Bridge failures per URL.
     /// After 3+ consecutive failures to the same URL, triggers an AI diagnostic.
     pub ui_bridge_failure_tracker: UiBridgeFailureTracker,

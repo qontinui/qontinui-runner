@@ -7,6 +7,7 @@ pub mod execution_helpers;
 pub mod executor_traits;
 pub mod extraction_executor;
 pub mod file_logger;
+pub mod file_registry;
 pub mod flakiness;
 pub mod gui_lock;
 pub mod health;
@@ -38,6 +39,7 @@ pub use state::ExecutorState;
 #[allow(unused_imports)]
 pub use url_lock::UrlLockInfo;
 pub use url_lock::UrlLockManager;
+pub use file_registry::FileRegistryManager;
 // Re-export unified execution utilities (primary integration point for executor traits)
 // Note: These are public API exports used by external consumers (e.g., MCP API)
 #[allow(unused_imports)]

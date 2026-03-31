@@ -70,7 +70,7 @@ mod loop_controller;
 mod loop_handlers;
 pub(crate) mod loop_state_machine;
 pub mod multi_agent_fixer;
-mod multi_agent_pipeline_loop;
+pub(crate) mod multi_agent_pipeline_loop;
 pub mod output_parser;
 mod phase_configs;
 mod phase_helpers;
@@ -146,12 +146,13 @@ pub use resume::{ResumeManager, ResumePoint};
 /// This guard uses `Drop` to detect that scenario. If the task exits without
 /// the `completed` flag being set, the guard marks the workflow as failed.
 struct WorkflowDropGuard {
-    checkpoint_db: Arc<crate::database::CheckpointDb>,
     execution_id: String,
     workflow_name: String,
     completed: Arc<AtomicBool>,
     /// URL lock manager for releasing per-URL reservations on drop.
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
+    /// File registry manager for releasing per-execution file registrations on drop.
+    file_registry_manager: Option<Arc<crate::executor::FileRegistryManager>>,
 }
 
 impl Drop for WorkflowDropGuard {
@@ -172,28 +173,25 @@ impl Drop for WorkflowDropGuard {
             }
         }
 
+        // Always release file registry entries on drop.
+        if let Some(ref mgr) = self.file_registry_manager {
+            let mgr = mgr.clone();
+            let id = self.execution_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    mgr.release_all(&id).await;
+                });
+            } else {
+                mgr.release_all_sync(&self.execution_id);
+            }
+        }
+
         if !self.completed.load(Ordering::SeqCst) {
             error!(
                 "Workflow task '{}' (id: {}) was dropped without completing — \
-                 marking as failed to prevent zombie state",
+                 zombie state possible (PG fail_task_run handled in panic guard)",
                 self.workflow_name, self.execution_id
             );
-            let error_message =
-                "Workflow task was unexpectedly terminated (possible task cancellation or runtime shutdown)";
-            if let Err(e) = self
-                .checkpoint_db
-                .fail_task_run(&self.execution_id, error_message)
-            {
-                error!(
-                    "Failed to mark dropped workflow {} as failed: {}",
-                    self.execution_id, e
-                );
-            } else {
-                warn!(
-                    "Marked dropped workflow '{}' as failed — Continue button should now be available",
-                    self.workflow_name
-                );
-            }
         }
     }
 }
@@ -213,7 +211,6 @@ impl Drop for WorkflowDropGuard {
 /// the task exits, the DB state is always cleaned up.
 ///
 /// # Arguments
-/// * `checkpoint_db` - Database for marking the task as failed on panic
 /// * `execution_id` - The task run ID to mark as failed if panic occurs
 /// * `workflow_name` - Name of the workflow (for logging)
 /// * `fut` - The async future that runs the workflow
@@ -221,7 +218,6 @@ impl Drop for WorkflowDropGuard {
 /// # Usage
 /// ```ignore
 /// spawn_workflow_with_panic_guard(
-///     checkpoint_db.clone(),
 ///     &execution_id,
 ///     &workflow_name,
 ///     async move {
@@ -230,19 +226,19 @@ impl Drop for WorkflowDropGuard {
 /// );
 /// ```
 pub fn spawn_workflow_with_panic_guard<F>(
-    checkpoint_db: Arc<crate::database::CheckpointDb>,
     execution_id: String,
     workflow_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
+    file_registry_manager: Option<Arc<crate::executor::FileRegistryManager>>,
     pg_db: Arc<crate::database::pg::PgDb>,
     fut: F,
 ) where
     F: std::future::Future<Output = loop_controller::WorkflowResult> + Send + 'static,
 {
-    let db_for_guard = checkpoint_db.clone();
     let id_for_guard = execution_id.clone();
     let name_for_guard = workflow_name.clone();
     let url_lock_for_guard = url_lock_manager.clone();
+    let file_registry_for_guard = file_registry_manager.clone();
 
     tokio::spawn(async move {
         // The drop guard ensures cleanup even if this task is cancelled/aborted.
@@ -250,11 +246,11 @@ pub fn spawn_workflow_with_panic_guard<F>(
         // task is dropped.
         let completed = Arc::new(AtomicBool::new(false));
         let _guard = WorkflowDropGuard {
-            checkpoint_db: db_for_guard,
             execution_id: id_for_guard,
             workflow_name: name_for_guard,
             completed: completed.clone(),
             url_lock_manager: url_lock_for_guard.clone(),
+            file_registry_manager: file_registry_for_guard.clone(),
         };
 
         // Wrap the future in AssertUnwindSafe and catch panics
@@ -266,6 +262,11 @@ pub fn spawn_workflow_with_panic_guard<F>(
 
         // Explicitly release URL locks (async path — more reliable than sync Drop)
         if let Some(ref mgr) = url_lock_manager {
+            mgr.release_all(&execution_id).await;
+        }
+
+        // Explicitly release file registry entries (async path)
+        if let Some(ref mgr) = file_registry_manager {
             mgr.release_all(&execution_id).await;
         }
 
@@ -316,33 +317,32 @@ pub fn spawn_workflow_with_panic_guard<F>(
 /// that don't return a WorkflowResult directly.
 ///
 /// # Arguments
-/// * `checkpoint_db` - Database for marking the task as failed on panic
 /// * `execution_id` - The task run ID to mark as failed if panic occurs
 /// * `sequence_name` - Name of the sequence (for logging)
 /// * `fut` - The async future that runs the sequence (returns ())
 pub fn spawn_sequence_with_panic_guard<F>(
-    checkpoint_db: Arc<crate::database::CheckpointDb>,
     execution_id: String,
     sequence_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
+    file_registry_manager: Option<Arc<crate::executor::FileRegistryManager>>,
     pg_db: Arc<crate::database::pg::PgDb>,
     fut: F,
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let db_for_guard = checkpoint_db.clone();
     let id_for_guard = execution_id.clone();
     let name_for_guard = sequence_name.clone();
     let url_lock_for_guard = url_lock_manager.clone();
+    let file_registry_for_guard = file_registry_manager.clone();
 
     tokio::spawn(async move {
         let completed = Arc::new(AtomicBool::new(false));
         let _guard = WorkflowDropGuard {
-            checkpoint_db: db_for_guard,
             execution_id: id_for_guard,
             workflow_name: name_for_guard,
             completed: completed.clone(),
             url_lock_manager: url_lock_for_guard.clone(),
+            file_registry_manager: file_registry_for_guard.clone(),
         };
 
         // Wrap the future in AssertUnwindSafe and catch panics
@@ -352,6 +352,11 @@ pub fn spawn_sequence_with_panic_guard<F>(
 
         // Explicitly release URL locks (async path — more reliable than sync Drop)
         if let Some(ref mgr) = url_lock_manager {
+            mgr.release_all(&execution_id).await;
+        }
+
+        // Explicitly release file registry entries (async path)
+        if let Some(ref mgr) = file_registry_manager {
             mgr.release_all(&execution_id).await;
         }
 

@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::CheckpointDb;
 use crate::AppState;
 
 /// Dependencies required to launch a fixer workflow.
@@ -233,16 +232,15 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         .with_is_fixer(true)
         .with_fixer_source_task_run_id(&source_task_run_id)
         .with_parent_task_run_id(&source_task_run_id);
-
-    let db = &deps.app_state.checkpoint_db;
-    db.create_task_run(&input)?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(pg_db.create_task_run(&input))
+    })?;
 
     // Spawn an async task that waits for children, then runs the fixer workflow
     let fixer_id_clone = fixer_id.clone();
     let fixer_name_clone = fixer_name.clone();
     let workflow_name_clone = workflow_name.clone();
     let source_id_clone = source_task_run_id.clone();
-    let db_clone = deps.app_state.checkpoint_db.clone();
     let pg_db_clone = deps.app_state.pg_db.clone();
 
     tokio::spawn(async move {
@@ -317,11 +315,12 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         let exec_id = fixer_id_clone.clone();
         let wf_name = fixer_name_clone.clone();
         let url_lock = Some(deps.app_state.url_lock_manager.clone());
+        let file_registry = Some(deps.app_state.file_registry_manager.clone());
         crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-            deps.app_state.checkpoint_db.clone(),
             exec_id,
             wf_name,
             url_lock,
+            file_registry,
             deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 controller

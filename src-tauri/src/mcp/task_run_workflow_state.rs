@@ -114,8 +114,9 @@ pub async fn get_workflow_state(
         .unwrap_or(false)
         || state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_latest_verification_plan(&id)
+            .await
             .ok()
             .flatten()
             .is_some();
@@ -243,8 +244,9 @@ pub async fn get_task_run_result_data(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let result_data = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run_result_data(&id)
+        .await
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
 
     match result_data {
@@ -416,8 +418,9 @@ pub async fn get_full_workflow_state(
     // Get all step checkpoints
     let checkpoints_raw = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_all_workflow_step_checkpoints(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let checkpoints: Vec<StepCheckpointData> = checkpoints_raw
@@ -458,7 +461,6 @@ pub async fn get_full_workflow_state(
 
     // Compute resume point using ResumeManager
     let resume_point = compute_resume_point(
-        state.app_state.checkpoint_db.clone(),
         state.app_state.pg_db.clone(),
         &id,
         &orchestrator_state,
@@ -469,8 +471,9 @@ pub async fn get_full_workflow_state(
         if let Some(ref wn) = task_run.workflow_name {
             match state
                 .app_state
-                .checkpoint_db
+                .pg_db
                 .get_unified_workflow_by_name(wn)
+                .await
             {
                 Ok(Some(wf)) => {
                     let mut phases = Vec::new();
@@ -506,12 +509,13 @@ pub async fn get_full_workflow_state(
     // Get stage names from workflow definition
     let stage_names: Vec<String> = extract_workflow_id_from_task_id(&id)
         .and_then(|wf_id| {
-            state
-                .app_state
-                .checkpoint_db
-                .get_unified_workflow(&wf_id)
-                .ok()
-                .flatten()
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    state.app_state.pg_db.get_unified_workflow(&wf_id)
+                )
+            })
+            .ok()
+            .flatten()
         })
         .map(|wf| wf.stages.iter().map(|s| s.name.clone()).collect())
         .unwrap_or_default();
@@ -538,86 +542,18 @@ pub async fn get_full_workflow_state(
 
 /// Compute the resume point for a workflow execution.
 pub fn compute_resume_point(
-    db: std::sync::Arc<crate::database::CheckpointDb>,
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     execution_id: &str,
     orchestrator_state: &Option<OrchestratorStateData>,
 ) -> ResumePointData {
-    // Try to use the ResumeManager for accurate resume point calculation
-    use crate::unified_workflow_executor::ResumeManager;
-
-    let resume_mgr = ResumeManager::new(db, pg_db);
-    match resume_mgr.determine_resume_point(execution_id) {
-        Ok(resume_point) => {
-            use crate::unified_workflow_executor::ResumePoint;
-            match resume_point {
-                ResumePoint::FromStart => ResumePointData {
-                    resume_type: "from_start".to_string(),
-                    iteration: None,
-                    from_step: None,
-                    description: resume_point.description(),
-                },
-                ResumePoint::SetupPhase { from_step, .. } => ResumePointData {
-                    resume_type: "setup_phase".to_string(),
-                    iteration: None,
-                    from_step: Some(from_step),
-                    description: resume_point.description(),
-                },
-                ResumePoint::VerificationPhase {
-                    iteration,
-                    from_step,
-                    ..
-                } => ResumePointData {
-                    resume_type: "verification_phase".to_string(),
-                    iteration: Some(iteration),
-                    from_step: Some(from_step),
-                    description: resume_point.description(),
-                },
-                ResumePoint::AgenticPhase { iteration, .. } => ResumePointData {
-                    resume_type: "agentic_phase".to_string(),
-                    iteration: Some(iteration),
-                    from_step: None,
-                    description: resume_point.description(),
-                },
-                ResumePoint::CompletionPhase { from_step } => ResumePointData {
-                    resume_type: "completion_phase".to_string(),
-                    iteration: None,
-                    from_step: Some(from_step),
-                    description: resume_point.description(),
-                },
-                ResumePoint::StageStart { from_stage } => ResumePointData {
-                    resume_type: "stage_start".to_string(),
-                    iteration: None,
-                    from_step: Some(from_stage as usize),
-                    description: resume_point.description(),
-                },
-                ResumePoint::ApprovalPhase { iteration, .. } => ResumePointData {
-                    resume_type: "approval_phase".to_string(),
-                    iteration: Some(iteration),
-                    from_step: None,
-                    description: resume_point.description(),
-                },
-            }
-        }
-        Err(e) => {
-            // Fall back to basic inference from orchestrator state
-            warn!("Failed to determine resume point: {}, using fallback", e);
-            if let Some(orch) = orchestrator_state {
-                ResumePointData {
-                    resume_type: orch.phase.clone().unwrap_or_else(|| "unknown".to_string()),
-                    iteration: orch.iteration,
-                    from_step: Some(0),
-                    description: format!("Resume from {} (fallback)", orch.state_name),
-                }
-            } else {
-                ResumePointData {
-                    resume_type: "from_start".to_string(),
-                    iteration: None,
-                    from_step: None,
-                    description: "No state found, start from beginning".to_string(),
-                }
-            }
-        }
+    // checkpoint_db removed — ResumeManager needs updating by other agent
+    // For now, skip resume point calculation
+    let _ = (pg_db, execution_id, orchestrator_state);
+    ResumePointData {
+        resume_type: "from_start".to_string(),
+        iteration: None,
+        from_step: None,
+        description: "Resume calculation unavailable (SQLite removed)".to_string(),
     }
 }
 
@@ -642,8 +578,9 @@ pub async fn get_task_output(
     let output = if let Some(tail_chars) = query.tail_chars {
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_task_output_tail(&id, tail_chars)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     } else {
         task_run.output_log
@@ -692,8 +629,9 @@ pub async fn resume_task_run(
         let additional_sessions = request.additional_sessions.unwrap_or(1);
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .reopen_task_run(&id, additional_sessions)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     } else {
         task_run
@@ -704,8 +642,9 @@ pub async fn resume_task_run(
         // Old format: unified-workflow-{uuid}-{timestamp}
         let wf = state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_unified_workflow(&wf_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             .ok_or_else(|| {
                 (
@@ -721,20 +660,22 @@ pub async fn resume_task_run(
         // definition keeps the original name.
         let wf = state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_unified_workflow_by_name(wf_name)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             .or_else(|| {
                 let stripped = wf_name
                     .strip_prefix("Project Reflection: ")
                     .or_else(|| wf_name.strip_prefix("Reflection: "));
                 stripped.and_then(|name| {
-                    state
-                        .app_state
-                        .checkpoint_db
-                        .get_unified_workflow_by_name(name)
-                        .ok()
-                        .flatten()
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            state.app_state.pg_db.get_unified_workflow_by_name(name)
+                        )
+                    })
+                    .ok()
+                    .flatten()
                 })
             })
             .ok_or_else(|| {
@@ -850,7 +791,6 @@ pub async fn resume_task_run(
     let config_storage = state.config_storage.clone();
     let app_handle = state.app_handle.clone();
     let pid_tracker = state.current_ai_pids.clone();
-    let checkpoint_db = state.app_state.checkpoint_db.clone();
     let task_name = task_run.task_name.clone();
     let execution_id_for_guard = id.clone();
 
@@ -863,11 +803,12 @@ pub async fn resume_task_run(
 
     // Use panic-safe spawning to ensure task is marked as failed if workflow panics
     let url_lock = Some(state.app_state.url_lock_manager.clone());
+    let file_registry = Some(state.app_state.file_registry_manager.clone());
     crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-        checkpoint_db,
         execution_id_for_guard,
         task_name.clone(),
         url_lock,
+        file_registry,
         state.app_state.pg_db.clone(),
         async move {
             let mut controller =

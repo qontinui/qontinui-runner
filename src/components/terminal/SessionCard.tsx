@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { TerminalSquare, Eye, Copy, AlertTriangle, Pin, Tag } from "lucide-react";
+import { TerminalSquare, Eye, Copy, AlertTriangle, FileWarning, Pin, Tag } from "lucide-react";
 import type { UnifiedSession, SessionLiveStatus } from "./useSessionManager";
 
 interface SessionCardProps {
@@ -9,6 +9,8 @@ interface SessionCardProps {
   selectionMode: boolean;
   isPinned: boolean;
   sessionLabel: string | null;
+  /** Number of files this session shares with other sessions (0 = no conflicts) */
+  fileConflictCount?: number;
   onResume: (session: UnifiedSession) => void;
   onViewTranscript: (session: UnifiedSession) => void;
   onCopyId: (session: UnifiedSession) => void;
@@ -70,6 +72,7 @@ export function SessionCard({
   selectionMode,
   isPinned,
   sessionLabel,
+  fileConflictCount = 0,
   onResume,
   onViewTranscript,
   onCopyId,
@@ -161,6 +164,15 @@ export function SessionCard({
           {!accountBadge && session.accountLabel !== "default" && (
             <span className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#565f89]/10 text-[#565f89]">
               {session.accountLabel}
+            </span>
+          )}
+          {fileConflictCount > 0 && (
+            <span
+              className="flex items-center gap-0.5 shrink-0"
+              title={`${fileConflictCount} file${fileConflictCount !== 1 ? "s" : ""} shared with other sessions`}
+            >
+              <FileWarning className="w-3 h-3 text-[#e0af68]" />
+              <span className="text-[9px] text-[#e0af68]/80">{fileConflictCount}</span>
             </span>
           )}
           {isPinned && (

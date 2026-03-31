@@ -34,7 +34,7 @@ impl Clone for TriggerExecutorDeps {
 /// Spawn a workflow in response to a trigger event.
 ///
 /// Returns the execution_id (task_run_id) on success.
-pub fn execute_triggered_workflow(
+pub async fn execute_triggered_workflow(
     deps: &TriggerExecutorDeps,
     workflow_id: &str,
     workflow_overrides: Option<&serde_json::Value>,
@@ -42,11 +42,12 @@ pub fn execute_triggered_workflow(
     trigger_name: &str,
     chain_depth: u32,
 ) -> Result<String, String> {
-    let db = &deps.app_state.checkpoint_db;
+    let db = &deps.app_state.pg_db;
 
     // 1. Load the workflow
     let workflow = db
         .get_unified_workflow(workflow_id)
+        .await
         .map_err(|e| format!("Failed to load workflow: {}", e))?
         .ok_or_else(|| format!("Workflow not found: {}", workflow_id))?;
 
@@ -80,7 +81,7 @@ pub fn execute_triggered_workflow(
         let raw_prompt = normalized_stages
             .iter()
             .flat_map(|stage| stage.agentic_steps.iter())
-            .filter_map(|step| step.get("content").and_then(|v| v.as_str()))
+            .filter_map(|step: &serde_json::Value| step.get("content").and_then(|v| v.as_str()))
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
 
@@ -135,6 +136,7 @@ pub fn execute_triggered_workflow(
         .with_workflow_type("unified");
 
     db.create_task_run(&input)
+        .await
         .map_err(|e| format!("Failed to create task run: {}", e))?;
 
     // 6. Build LoopConfig
@@ -189,17 +191,17 @@ pub fn execute_triggered_workflow(
     // 7. Spawn the workflow
     let wf_name = workflow.name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
-    let checkpoint_db = deps.app_state.checkpoint_db.clone();
+    let file_registry = Some(deps.app_state.file_registry_manager.clone());
     let app_state = deps.app_state.clone();
     let config_storage = deps.config_storage.clone();
     let app_handle = deps.app_handle.clone();
     let pid_tracker = deps.pid_tracker.clone();
 
     crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-        checkpoint_db,
         execution_id.clone(),
         wf_name,
         url_lock,
+        file_registry,
         deps.app_state.pg_db.clone(),
         Box::pin(async move {
             let mut controller = crate::unified_workflow_executor::LoopController::new(

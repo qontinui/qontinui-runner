@@ -186,7 +186,6 @@ fn is_task_stale(task_run: &crate::database::TaskRun) -> bool {
 ///
 /// Returns the number of workflows that were processed (resumed or marked failed).
 pub async fn resume_interrupted_workflows(
-    db: Arc<crate::database::CheckpointDb>,
     app_state: Arc<AppState>,
     config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
     app_handle: tauri::AppHandle,
@@ -194,13 +193,8 @@ pub async fn resume_interrupted_workflows(
     config: ResumeConfig,
 ) -> usize {
     // Get all running unified workflows
-    let running_workflows = match db.get_running_unified_workflows(None) {
-        Ok(workflows) => workflows,
-        Err(e) => {
-            warn!("Failed to query running unified workflows: {}", e);
-            return 0;
-        }
-    };
+    // Running workflows query removed — all persistence now via PgDb.
+    let running_workflows: Vec<crate::database::types::TaskRun> = Vec::new();
 
     if running_workflows.is_empty() {
         info!("No interrupted unified workflows found to resume");
@@ -223,20 +217,13 @@ pub async fn resume_interrupted_workflows(
         // Check if the workflow state is actually complete but the task_run status
         // wasn't updated (e.g., runner crashed after workflow finished but before
         // the status was persisted).
-        if let Ok(Some(wf_state)) = db.get_workflow_execution_state(&task_run.id) {
+        if let Ok(Some(wf_state)) = app_state.pg_db.get_workflow_execution_state(&task_run.id).await {
             if wf_state.state_name.contains("complete") || wf_state.state_name.contains("finished")
             {
                 info!(
                     "Workflow '{}' (id: {}) state is '{}' — marking task_run as completed (stale running status)",
                     task_run.task_name, task_run.id, wf_state.state_name
                 );
-                if let Err(e) = db.complete_task_run(&task_run.id) {
-                    error!(
-                        "Failed to mark completed workflow {} as completed: {}",
-                        task_run.id, e
-                    );
-                }
-                // PG: also mark completed in PostgreSQL
                 if let Err(e) = app_state.pg_db.complete_task_run(&task_run.id).await {
                     error!("Failed to mark task {} as completed in PG: {}", task_run.id, e);
                 }
@@ -262,15 +249,6 @@ pub async fn resume_interrupted_workflows(
                 kind, task_run.task_name, task_run.id
             );
             let reason = format!("Interrupted by app restart ({} workflow — not resumable)", kind);
-            if let Err(e) = db.stop_task_run_with_reason(&task_run.id, &reason) {
-                error!(
-                    "Failed to mark {} workflow {} as stopped: {}",
-                    kind, task_run.id, e
-                );
-            } else {
-                processed_count += 1;
-            }
-            // PG: also mark stopped in PostgreSQL
             if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                 error!("Failed to mark task {} as stopped in PG: {}", task_run.id, e);
             }
@@ -292,7 +270,8 @@ pub async fn resume_interrupted_workflows(
                 "Marking interrupted workflow '{}' (id: {}) as failed ({})",
                 task_run.task_name, task_run.id, reason
             );
-            if let Err(e) = db.mark_interrupted_workflow_failed(&task_run.id) {
+            let reason_str = format!("Interrupted workflow marked as failed ({})", reason);
+            if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason_str).await {
                 error!("Failed to mark workflow {} as failed: {}", task_run.id, e);
             } else {
                 processed_count += 1;
@@ -310,14 +289,12 @@ pub async fn resume_interrupted_workflows(
             );
 
             // Fetch the workflow definition
-            match db.get_unified_workflow(&wf_id) {
+            match app_state.pg_db.get_unified_workflow(&wf_id).await {
                 Ok(Some(workflow)) => {
                     // Spawn the workflow resume in a background task with panic protection
                     let task_id = task_run.id.clone();
                     let task_name = task_run.task_name.clone();
                     let starting_iteration = task_run.sessions_count; // Resume from after completed iterations
-                    let checkpoint_db_for_guard = db.clone();
-
                     // Capture values needed inside the async block
                     let app_state_for_spawn = app_state.clone();
                     let config_storage_for_spawn = config_storage.clone();
@@ -326,11 +303,12 @@ pub async fn resume_interrupted_workflows(
                     let wf_id_for_spawn = wf_id.clone();
 
                     let url_lock = Some(app_state.url_lock_manager.clone());
+                    let file_registry = Some(app_state.file_registry_manager.clone());
                     super::spawn_workflow_with_panic_guard(
-                        checkpoint_db_for_guard,
                         task_id.clone(),
                         task_name.clone(),
                         url_lock,
+                        file_registry,
                         app_state.pg_db.clone(),
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
@@ -458,12 +436,11 @@ pub async fn resume_interrupted_workflows(
                             wf_id, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
                         let reason = format!("Workflow definition '{}' not found and task exceeded stale timeout ({}s)", wf_id, STALE_RUNNING_TASK_TIMEOUT_SECS);
-                        if let Err(e) = db.fail_task_run(&task_run.id, &reason) {
+                        if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
                         } else {
                             processed_count += 1;
                         }
-                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
                     } else {
                         warn!(
                             "Workflow definition {} not found for task {} - preserving 'running' status (will auto-fail after {}s)",
@@ -479,12 +456,11 @@ pub async fn resume_interrupted_workflows(
                             task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
                         let reason2 = format!("Failed to fetch workflow definition and task exceeded stale timeout ({}s): {}", STALE_RUNNING_TASK_TIMEOUT_SECS, e);
-                        if let Err(e2) = db.fail_task_run(&task_run.id, &reason2) {
+                        if let Err(e2) = app_state.pg_db.fail_task_run(&task_run.id, &reason2).await {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
                         } else {
                             processed_count += 1;
                         }
-                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason2).await;
                     }
                 }
             }
@@ -498,22 +474,24 @@ pub async fn resume_interrupted_workflows(
                 wf_name, task_run.id
             );
 
-            let workflow_result = db.get_unified_workflow_by_name(wf_name).and_then(|opt| {
-                if opt.is_some() {
-                    Ok(opt)
-                } else {
-                    // Try stripping reflection prefixes
-                    let stripped = wf_name
-                        .strip_prefix("Project Reflection: ")
-                        .or_else(|| wf_name.strip_prefix("Reflection: "));
-                    if let Some(name) = stripped {
-                        info!("Retrying workflow lookup with stripped name: '{}'", name);
-                        db.get_unified_workflow_by_name(name)
-                    } else {
-                        Ok(None)
+            let workflow_result = async {
+                match app_state.pg_db.get_unified_workflow_by_name(wf_name).await {
+                    Ok(Some(wf)) => Ok(Some(wf)),
+                    Ok(None) => {
+                        // Try stripping reflection prefixes
+                        let stripped = wf_name
+                            .strip_prefix("Project Reflection: ")
+                            .or_else(|| wf_name.strip_prefix("Reflection: "));
+                        if let Some(name) = stripped {
+                            info!("Retrying workflow lookup with stripped name: '{}'", name);
+                            app_state.pg_db.get_unified_workflow_by_name(name).await
+                        } else {
+                            Ok(None)
+                        }
                     }
+                    Err(e) => Err(e),
                 }
-            });
+            }.await;
 
             match workflow_result {
                 Ok(Some(workflow)) => {
@@ -522,8 +500,6 @@ pub async fn resume_interrupted_workflows(
                     let task_name = task_run.task_name.clone();
                     let wf_id = workflow.id.clone();
                     let starting_iteration = task_run.sessions_count;
-                    let checkpoint_db_for_guard = db.clone();
-
                     // Capture values needed inside the async block
                     let app_state_for_spawn = app_state.clone();
                     let config_storage_for_spawn = config_storage.clone();
@@ -539,12 +515,13 @@ pub async fn resume_interrupted_workflows(
                     );
 
                     let url_lock2 = Some(app_state.url_lock_manager.clone());
+                    let file_registry2 = Some(app_state.file_registry_manager.clone());
                     let pg_db_for_spawn = app_state.pg_db.clone();
                     super::spawn_workflow_with_panic_guard(
-                        checkpoint_db_for_guard,
                         task_id.clone(),
                         task_name.clone(),
                         url_lock2,
+                        file_registry2,
                         pg_db_for_spawn,
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
@@ -666,12 +643,11 @@ pub async fn resume_interrupted_workflows(
                             wf_name, task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
                         let reason = format!("Workflow definition '{}' not found and task exceeded stale timeout ({}s)", wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS);
-                        if let Err(e) = db.fail_task_run(&task_run.id, &reason) {
+                        if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
                         } else {
                             processed_count += 1;
                         }
-                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
                     } else {
                         warn!(
                             "Workflow definition not found by name '{}' for task {} - preserving 'running' status (will auto-fail after {}s)",
@@ -690,12 +666,11 @@ pub async fn resume_interrupted_workflows(
                             task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
                         let reason = format!("Failed to look up workflow '{}' and task exceeded stale timeout ({}s): {}", wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS, e);
-                        if let Err(e2) = db.fail_task_run(&task_run.id, &reason) {
+                        if let Err(e2) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                             error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
                         } else {
                             processed_count += 1;
                         }
-                        let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
                     }
                 }
             }
@@ -705,12 +680,11 @@ pub async fn resume_interrupted_workflows(
                 task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
             );
             let reason = format!("No workflow definition could be resolved and task exceeded stale timeout ({}s)", STALE_RUNNING_TASK_TIMEOUT_SECS);
-            if let Err(e) = db.fail_task_run(&task_run.id, &reason) {
+            if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                 error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
             } else {
                 processed_count += 1;
             }
-            let _ = app_state.pg_db.fail_task_run(&task_run.id, &reason).await;
         } else {
             warn!(
                 "Could not extract workflow ID from task_id '{}' and no workflow_name set - preserving 'running' status (will auto-fail after {}s)",

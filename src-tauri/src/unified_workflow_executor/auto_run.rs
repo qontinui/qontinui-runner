@@ -35,13 +35,17 @@ pub fn launch_generated_workflow(
     deps: AutoRunDeps,
     meta_task_run_id: &str,
 ) -> Result<String, String> {
-    let db = &deps.app_state.checkpoint_db;
-
-    // 1. Get the meta-workflow's task run to read result_data
-    let task_run = db
-        .get_task_run(meta_task_run_id)
-        .map_err(|e| format!("Failed to get task run: {}", e))?
-        .ok_or_else(|| format!("Meta task run not found: {}", meta_task_run_id))?;
+    // 1. Get the meta-workflow's task run to read result_data — SQLite removed, use PG
+    let pg_db = &deps.app_state.pg_db;
+    let task_run = {
+        let pg = pg_db.clone();
+        let id = meta_task_run_id.to_string();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "No tokio runtime".to_string())?;
+        handle.block_on(async move { pg.get_task_run(&id).await })
+            .map_err(|e| format!("Failed to get task run: {}", e))?
+            .ok_or_else(|| format!("Meta task run not found: {}", meta_task_run_id))?
+    };
 
     // 2. Extract generated_workflow_id from result_data
     let result_data = task_run
@@ -63,11 +67,16 @@ pub fn launch_generated_workflow(
         generated_workflow_id, meta_task_run_id
     );
 
-    // 3. Load the generated workflow
-    let workflow = db
-        .get_unified_workflow(&generated_workflow_id)
-        .map_err(|e| format!("Failed to load generated workflow: {}", e))?
-        .ok_or_else(|| format!("Generated workflow not found: {}", generated_workflow_id))?;
+    // 3. Load the generated workflow (via PG)
+    let workflow = {
+        let pg = pg_db.clone();
+        let wf_id = generated_workflow_id.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "No tokio runtime".to_string())?;
+        handle.block_on(async move { pg.get_unified_workflow(&wf_id).await })
+            .map_err(|e| format!("Failed to load generated workflow: {}", e))?
+            .ok_or_else(|| format!("Generated workflow not found: {}", generated_workflow_id))?
+    };
 
     // 4. Normalize to stages and build config
     let normalized_stages = workflow.normalize_to_stages();
@@ -115,8 +124,14 @@ pub fn launch_generated_workflow(
         .with_workflow_type("unified")
         .with_parent_task_run_id(meta_task_run_id);
 
-    db.create_task_run(&input)
-        .map_err(|e| format!("Failed to create task run: {}", e))?;
+    {
+        let pg = pg_db.clone();
+        let input_clone = input.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "No tokio runtime".to_string())?;
+        handle.block_on(async move { pg.create_task_run(&input_clone).await })
+            .map_err(|e| format!("Failed to create task run: {}", e))?;
+    }
 
     let loop_config = LoopConfig {
         max_iterations: workflow.max_iterations,
@@ -169,19 +184,19 @@ pub fn launch_generated_workflow(
     // 6. Spawn the workflow
     let wf_name = workflow.name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
-    let checkpoint_db = deps.app_state.checkpoint_db.clone();
-    let pg_db = deps.app_state.pg_db.clone();
+    let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let pg_db_spawn = deps.app_state.pg_db.clone();
     let app_state = deps.app_state;
     let config_storage = deps.config_storage;
     let app_handle = deps.app_handle;
     let pid_tracker = deps.pid_tracker;
 
     super::spawn_workflow_with_panic_guard(
-        checkpoint_db,
         execution_id.clone(),
         wf_name,
         url_lock,
-        pg_db,
+        file_registry,
+        pg_db_spawn,
         Box::pin(async move {
             let mut controller = super::LoopController::new(
                 app_state,

@@ -313,6 +313,9 @@ impl MutationRoot {
         // Release URL locks
         state.app_state.url_lock_manager.release_all(&id).await;
 
+        // Release advisory file registry entries
+        state.app_state.file_registry_manager.release_all(&id).await;
+
         // Broadcast update
         let broadcaster =
             crate::event_system::EventBroadcaster::new(state.app_handle.clone());
