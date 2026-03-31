@@ -44,7 +44,15 @@ jobs:
             file \
             libssl-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      # macOS: The accessibility (AX) adapter links against system CoreFoundation
+      # frameworks which are always available. No additional brew packages needed.
+      # Note: AX integration tests require accessibility permissions at runtime,
+      # which CI environments typically do not grant. Compilation is unaffected.
 
       - name: Cache Rust dependencies
         uses: actions/cache@v3
@@ -78,6 +86,8 @@ jobs:
           cargo clippy -- -D warnings
 
       - name: Run Rust tests
+        # Accessibility integration tests that require a real desktop session are
+        # skipped in CI. Only pure unit tests (no system dependencies) run here.
         run: |
           cd qontinui-runner/src-tauri
           cargo test --verbose

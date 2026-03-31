@@ -31,6 +31,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 erased-serde = "0.4"
+schemars = "1"
+jsonschema = { version = "0.45", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -92,22 +94,10 @@ toml = "1"
 tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 portable-pty = "0.8"
 arboard = "3.4"
+dashmap = "6"
 xcap = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 # notify-rust removed — replaced by tauri-plugin-notification (session 15)
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Threading",
-    "Win32_System_Diagnostics_ToolHelp",
-] }
-walkdir = "2.5"
-glob-match = "0.2"
-jsonpath-rust = "1"
 
 # MCP (Model Context Protocol) client
 rmcp = "0.1"
@@ -121,13 +111,44 @@ streaming-iterator = "0.1"  # For iterating over tree-sitter query matches
 syn = { version = "2.0", features = ["full", "parsing", "visit"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.58"
+walkdir = "2.5"
+glob-match = "0.2"
+jsonpath-rust = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = "0.22"
+zbus = "4"
+
 [[bin]]
 name = "mock_claude_cli"
 path = "src/bin/mock_claude_cli.rs"
 
 [[bin]]
-name = "pg_migrate"
-path = "src/bin/pg_migrate.rs"
+name = "export_schemas"
+path = "src/bin/export_schemas.rs"
 
 [lints.rust]
 dead_code = "allow"

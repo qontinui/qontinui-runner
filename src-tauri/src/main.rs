@@ -31,6 +31,7 @@ mod config_storage;
 mod constraint_engine;
 mod container;
 mod context;
+mod cost_management;
 mod database;
 mod debug_lifecycle;
 mod demo_workflows;
@@ -70,6 +71,7 @@ mod mcp_client;
 mod mcp_embedded;
 mod meta_optimizer;
 mod middleware;
+mod online_learning;
 mod orchestration_loop;
 mod orchestration_loop_configs;
 mod orchestrator;
@@ -86,9 +88,11 @@ mod reflection;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
+mod schema_registry;
 mod scheduler;
 mod scheduler_service;
 mod secure_storage;
+mod security;
 mod semantic_conventions;
 mod settings;
 mod skills;
@@ -120,6 +124,7 @@ mod ui_bridge_plugin;
 mod unified_ai_session;
 mod unified_workflow_executor;
 mod unified_workflows;
+mod validation;
 mod video_recorder;
 mod workflow_event_bus;
 mod workflow_generation;
@@ -130,7 +135,6 @@ mod worktree;
 mod zombie_sweep;
 
 use commands::AppState;
-use database::CheckpointDb;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;
 use doctor::{start_doctor_async, DoctorConfig};
@@ -224,17 +228,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
-    // Initialize Checkpoint Database (SQLite).
-    // Still required: span logging, durable queue, JSON migration, seed rules,
-    // check-group repair, architecture spec cache, and many read paths that
-    // haven't been ported to PG yet. Remove once full PG migration is complete.
-    let checkpoint_db =
-        Arc::new(CheckpointDb::new().expect("Failed to initialize checkpoint database"));
-    info!(
-        "Checkpoint database initialized at {:?}",
-        checkpoint_db.path()
-    );
-
     // Initialize PostgreSQL connection (required — local docker-compose PG).
     // Uses RUNNER_DATABASE_URL env var, or defaults to the local docker-compose PostgreSQL.
     // Uses a dedicated tokio runtime for the one-shot async connection — cannot use
@@ -264,66 +257,28 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Connect the SQLite span layer to the database pool
-    if let Some(ref sqlite_layer) = logging_result.sqlite_span_layer {
-        sqlite_layer.set_db_pool(checkpoint_db.get_pool());
-        info!("SQLite span layer connected to database");
+    // SQLite span layer, queue recovery, JSON migration, seed rules, and
+    // check-group repair removed — all persistence now via PgDb.
+
+    // Initialize the global CheckpointDb (SQLite) for modules that still need it.
+    match crate::database::CheckpointDb::new() {
+        Ok(db) => {
+            crate::database::CheckpointDb::set_global(std::sync::Arc::new(db));
+            info!("CheckpointDb global instance initialized");
+        }
+        Err(e) => {
+            warn!("CheckpointDb initialization failed (non-fatal): {}", e);
+        }
     }
 
-    // Recover durable workflow queue from database (Inngest-inspired)
+    // Initialize online learning singletons (model router bandit + drift monitor)
     {
-        match checkpoint_db.queue_recover_crashed() {
-            Ok(count) if count > 0 => info!("Reset {} interrupted queue entries back to pending", count),
-            Err(e) => warn!("Queue crash recovery failed (non-fatal): {}", e),
-            _ => {}
-        }
-        match checkpoint_db.queue_load_pending() {
-            Ok(entries) if !entries.is_empty() => info!("Recovered {} pending workflows from durable queue", entries.len()),
-            Err(e) => warn!("Queue pending load failed (non-fatal): {}", e),
-            _ => {}
-        }
-    }
-
-    // Run one-time migration from JSON files (if any exist)
-    match checkpoint_db.migrate_from_json_files() {
-        Ok(result) => {
-            if result.total_migrated() > 0 {
-                info!(
-                    "Migrated {} items from JSON files to database (settings: {}, prompts: {}, scheduler: {})",
-                    result.total_migrated(),
-                    result.settings_migrated,
-                    result.prompts_migrated,
-                    result.scheduler_tasks_migrated
-                );
-            }
-            if !result.errors.is_empty() {
-                for err in &result.errors {
-                    warn!("Migration warning: {}", err);
-                }
-            }
-        }
-        Err(e) => {
-            warn!("JSON migration failed (non-fatal): {}", e);
-        }
-    }
-
-    // Ensure seed quality rules are present in the generation_rules table
-    if let Ok(conn) = checkpoint_db.get_conn_string() {
-        workflow_generation::rules::ensure_seed_rules(&conn);
-    }
-
-    // Repair check-group associations based on naming convention
-    // This ensures checks named "project - tool" are properly linked to groups named "project"
-    match checkpoint_db.repair_check_group_associations() {
-        Ok(count) if count > 0 => {
-            info!("Repaired {} check-group associations on startup", count);
-        }
-        Ok(_) => {
-            // No repairs needed
-        }
-        Err(e) => {
-            warn!("Check-group association repair failed (non-fatal): {}", e);
-        }
+        let ol_pg = pg_db.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime for online learning init");
+        rt.block_on(online_learning::initialize(&ol_pg));
     }
 
     // Migrate plaintext API keys to secure keychain storage
@@ -331,130 +286,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         warn!("API key migration to keychain failed (non-fatal): {}", e);
     }
 
-    // Auto-cache architecture specs from local .architecture.uibridge.json files
-    {
-        let db_for_arch = checkpoint_db.clone();
-        std::thread::spawn(move || {
-            let cwd = match std::env::current_dir() {
-                Ok(p) => p,
-                Err(e) => {
-                    info!(
-                        "Could not get working directory for architecture spec scan: {}",
-                        e
-                    );
-                    return;
-                }
-            };
-
-            let mut dirs_to_scan: Vec<std::path::PathBuf> = vec![cwd.clone()];
-
-            // Also scan parent directory (Tauri runs from src-tauri/, spec may be in project root)
-            if let Some(parent) = cwd.parent() {
-                dirs_to_scan.push(parent.to_path_buf());
-
-                // Also scan grandparent's immediate children (sibling projects)
-                // e.g. cwd = qontinui-runner/src-tauri → grandparent = qontinui-root
-                if let Some(grandparent) = parent.parent() {
-                    if let Ok(entries) = std::fs::read_dir(grandparent) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() && path != cwd && path != parent.to_path_buf() {
-                                dirs_to_scan.push(path);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut cached_count = 0;
-            for dir in &dirs_to_scan {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !file_name.ends_with(".architecture.uibridge.json") {
-                            continue;
-                        }
-
-                        // Check file size before reading (10MB limit)
-                        const MAX_SPEC_FILE_SIZE: u64 = 10 * 1024 * 1024;
-                        match std::fs::metadata(&path) {
-                            Ok(meta) => {
-                                if meta.len() > MAX_SPEC_FILE_SIZE {
-                                    warn!(
-                                        "Skipping architecture spec file {} — size {} bytes exceeds 10MB limit",
-                                        path.display(),
-                                        meta.len()
-                                    );
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to read metadata for {}: {}", path.display(), e);
-                                continue;
-                            }
-                        }
-
-                        let content = match std::fs::read_to_string(&path) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to read architecture spec file {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Validate it has techStack + features
-                        let parsed: serde_json::Value = match serde_json::from_str(&content) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to parse architecture spec file {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-                        if !crate::spec_utils::is_architecture_spec(&parsed) {
-                            continue;
-                        }
-
-                        let dir_name = dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown");
-                        let dir_path_str = dir.to_string_lossy().replace('\\', "/");
-                        let app_url = format!("file://{}", dir_path_str);
-                        let spec_id = format!("{}.architecture", dir_name);
-
-                        if let Err(e) = db_for_arch
-                            .upsert_cached_spec(&app_url, dir_name, &spec_id, &content, None)
-                        {
-                            warn!(
-                                "Failed to cache architecture spec from {}: {}",
-                                path.display(),
-                                e
-                            );
-                        } else {
-                            cached_count += 1;
-                        }
-                    }
-                }
-            }
-
-            if cached_count > 0 {
-                info!(
-                    "Auto-cached {} architecture spec(s) from local files",
-                    cached_count
-                );
-            }
-        });
-    }
-
+    // Architecture spec caching removed — all persistence now via PgDb.
     // Initialize RAGState (graceful degradation if dependencies missing)
     let rag_state = match commands::rag::RAGState::new() {
         Ok(state) => {
@@ -476,10 +308,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let (event_broadcast, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
     // Create run recording handler for automatic workflow execution recording
-    let run_recording_handler = Arc::new(RunRecordingHandler::new(checkpoint_db.clone()));
+    let run_recording_handler = Arc::new(RunRecordingHandler::new());
 
     // Create MCP client manager for calling external MCP servers
-    let mcp_client_manager = mcp_client::McpClientManager::new(checkpoint_db.clone());
+    let mcp_client_manager = mcp_client::McpClientManager::new();
 
     // Create instance manager for multi-instance dev workflows
     let instance_manager = Arc::new(instance_manager::InstanceManager::new());
@@ -506,13 +338,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         local_storage,
         video_recorder,
         event_broadcast,
-        checkpoint_db: checkpoint_db.clone(),
         pg_db,
         run_recording_handler,
         mcp_client_manager: tokio::sync::Mutex::new(mcp_client_manager),
         error_monitor_handle: TokioMutex::new(None), // Initialized in setup()
         doctor_handle: TokioMutex::new(None),        // Initialized in setup()
         url_lock_manager: Arc::new(crate::executor::UrlLockManager::new()),
+        file_registry_manager: Arc::new(crate::executor::FileRegistryManager::new()),
         ui_bridge_failure_tracker:
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()
@@ -532,7 +364,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let heartbeat_app_state = shared_app_state.clone();
 
     // Create error monitor config for later initialization
-    let error_monitor_db = checkpoint_db.clone();
     let error_monitor_pg = shared_app_state.pg_db.clone();
 
     // Secondary instances (spawned by InstanceManager) must NOT use single-instance
@@ -564,10 +395,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(instance_manager) // For multi-instance management (dev feature)
         .manage(session_manager) // For interactive AI session commands
         .manage(terminal_manager) // For embedded PTY terminal sessions
-        .manage(checkpoint_db.clone()) // For error_monitor commands that need direct db access
         .manage(std::sync::Arc::new(
             tokio::sync::Mutex::new(autoresearch::engine::ResearchEngine::new()),
         ) as autoresearch::commands::SharedResearchEngine) // Autoresearch experiment engine
+        .manage(tokio::sync::Mutex::new(
+            qontinui_runner_lib::accessibility::AccessibilityManager::default(),
+        )) // Native cross-platform accessibility API
         .invoke_handler(tauri::generate_handler![
             // Interactive AI session commands (send messages, interrupt, query state)
             commands::ai_session::list_ai_sessions,
@@ -744,6 +577,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::accessibility::save_accessibility_settings,
             commands::accessibility::launch_chrome_debug,
             commands::accessibility::check_chrome_available,
+            // Native accessibility API commands
+            commands::accessibility::a11y_connect,
+            commands::accessibility::a11y_capture,
+            commands::accessibility::a11y_query,
+            commands::accessibility::a11y_click,
+            commands::accessibility::a11y_type_text,
+            commands::accessibility::a11y_focus,
+            commands::accessibility::a11y_ai_context,
+            commands::accessibility::a11y_disconnect,
             // Playwright settings commands
             commands::playwright_settings::get_playwright_settings,
             commands::playwright_settings::save_playwright_settings,
@@ -1427,43 +1269,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::container_settings::get_container_settings,
             commands::container_settings::update_container_settings,
             commands::container_settings::check_docker_status,
+            // Security settings commands (sandbox policies, profiles)
+            commands::security_settings::get_security_settings,
+            commands::security_settings::update_security_settings,
+            commands::security_settings::get_security_profiles,
+            // Cost dashboard commands (unified token/cache/budget overview)
+            commands::cost_dashboard::get_cost_dashboard,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
 
-            // One-time SQLite→PG data migration (runs in its own thread+runtime)
-            {
-                let app_state = app.state::<Arc<crate::commands::AppState>>();
-                let sqlite = app_state.checkpoint_db.clone();
-                let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
-                    "host=localhost port=5432 user=qontinui_user password=qontinui_dev_password dbname=qontinui_db".to_string()
-                });
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Migration runtime");
-                    rt.block_on(async move {
-                        let pg = match crate::database::pg::PgDb::new(&pg_url).await {
-                            Ok(pg) => pg,
-                            Err(e) => { warn!("Migration PG connect failed: {}", e); return; }
-                        };
-                        info!("SQLite→PG migration: SQLite DB at {:?}", sqlite.path());
-                        match pg.migrate_all_from_sqlite(&sqlite).await {
-                        Ok(stats) => {
-                            info!(
-                                "SQLite→PG migration: {} tables migrated, {} skipped, {} rows, {} errors",
-                                stats.tables_migrated, stats.tables_skipped, stats.rows_migrated, stats.errors.len()
-                            );
-                            for (i, e) in stats.errors.iter().enumerate().take(10) {
-                                warn!("SQLite→PG migration error {}: {}", i + 1, e);
-                            }
-                        }
-                        Err(e) => warn!("SQLite→PG data migration failed: {}", e),
-                    }
-                    }); // block_on
-                }); // thread::spawn
-            }
+            // SQLite→PG data migration removed (migration complete, PG is primary)
 
             // Clear runner log files from previous session
             executor::FileLogger::clear_logs();
@@ -1491,28 +1307,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     .clone();
                 demo_workflows::seed_demo_workflows_if_needed(&seed_pg);
 
-                let seed_db = app
-                    .state::<Arc<crate::database::CheckpointDb>>()
-                    .inner()
-                    .clone();
-                // Sync slash commands from qontinui-claude-config
-                match slash_commands::sync_slash_commands(&seed_db) {
-                    Ok(result) => {
-                        info!(
-                            "Slash command sync: {} created, {} updated, {} deleted, {} unchanged",
-                            result.created, result.updated, result.deleted, result.unchanged
-                        );
-                        if !result.errors.is_empty() {
-                            warn!("Slash command sync had {} errors", result.errors.len());
-                        }
-                    }
-                    Err(e) => warn!("Slash command sync failed: {}", e),
-                }
-
-                // Seed built-in issue pattern templates
-                if let Ok(conn) = seed_db.get_conn() {
-                    commands::known_issues::seed_built_in_templates(&conn);
-                }
+                // Slash command sync and built-in issue pattern seeding removed — all persistence now via PgDb.
             }
 
             // Window starts maximized via tauri.conf.json
@@ -1593,12 +1388,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Secondary instance — skipping scheduler service");
             } else {
                 info!("Starting scheduler service");
-                let scheduler_db = app.state::<Arc<database::CheckpointDb>>().inner().clone();
                 let scheduler_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait briefly for MCP API server to bind
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    scheduler_service::start_scheduler_service(scheduler_db, scheduler_pg).await;
+                    scheduler_service::start_scheduler_service(scheduler_pg).await;
                 });
             }
 
@@ -1611,7 +1405,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             tauri::async_runtime::spawn(async move {
                 // Start the error monitor service (this spawns the service loop internally)
                 let error_monitor_handle =
-                    start_error_monitor_async(error_monitor_db, error_monitor_pg, error_monitor_config).await;
+                    start_error_monitor_async(error_monitor_pg, error_monitor_config).await;
 
                 // Store the handle
                 let mut handle_lock = app_state_for_error_monitor.error_monitor_handle.lock().await;
@@ -1634,11 +1428,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let error_monitor_arc =
                     Arc::new(tokio::sync::RwLock::new(error_monitor));
 
-                let pcm_db = app_state_for_pcm.checkpoint_db.clone();
                 let manager = Arc::new(process_capture::ProcessCaptureManager::new(
                     error_monitor_arc,
                     app_handle_for_pcm,
-                    pcm_db,
                 ));
 
                 // Load configs from settings and register them
@@ -1721,13 +1513,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            // Start embedding backfill job in background
-            info!("Starting embedding backfill job");
-            let embedding_db = app.state::<Arc<AppState>>().inner().checkpoint_db.clone();
-            database::embedding_jobs::start_embedding_job(
-                embedding_db,
-                database::embedding_jobs::EmbeddingJobConfig::default(),
-            );
+            // Embedding backfill job removed (SQLite embeddings deprecated, PG handles this)
 
             // Start memory consolidation scheduler in background
             info!("Starting memory consolidation scheduler");

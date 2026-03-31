@@ -12,6 +12,7 @@
 //! - `awas` - AWAS (Application Web Automation Specification) handlers
 //! - `awas_bridge` - Bridge between AWAS and ui-bridge systems
 
+pub mod accessibility;
 pub mod action_plan_cache;
 pub mod ai_generation;
 pub mod api_surface;
@@ -41,6 +42,7 @@ pub mod development_intelligence;
 pub mod dom_capture;
 pub mod error_monitor;
 pub mod extraction;
+pub mod file_registry;
 pub mod findings_api;
 pub mod generation_rules_api;
 pub mod generator_eval;
@@ -63,6 +65,7 @@ pub mod misc;
 pub mod models;
 pub mod monitors;
 pub mod observations_api;
+pub mod online_learning_api;
 pub mod orchestration_loop_api;
 pub mod otel_status;
 pub mod playwright;
@@ -80,6 +83,7 @@ pub mod reflection_api;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;
+pub mod security_audit;
 pub mod session_recap;
 pub mod server;
 pub mod settings;

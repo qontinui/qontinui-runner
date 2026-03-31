@@ -2,6 +2,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use std::fs;
 use tauri::Manager;
 
+pub mod accessibility;
+pub mod schema_export;
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {

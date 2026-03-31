@@ -79,6 +79,7 @@ pub(crate) mod shell_command;
 pub(super) mod test;
 // Active handlers
 mod command;
+mod native_accessibility;
 pub mod restart_process;
 mod save_workflow_artifact;
 pub(crate) mod ui_bridge;
@@ -89,6 +90,7 @@ mod workflow_ref;
 
 // Re-export handlers for registration
 use command::CommandHandler;
+use native_accessibility::NativeAccessibilityHandler;
 use restart_process::RestartProcessHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
 use ui_bridge::UiBridgeHandler;
@@ -225,6 +227,11 @@ pub struct HandlerContext {
     /// Path scope policy for working directory resolution.
     /// Controls whether steps can resolve paths outside the workspace boundary.
     pub path_scope_policy: crate::paths::PathScopePolicy,
+    /// Resolved security policy for this step execution.
+    /// Controls filesystem access, network, credentials, actions, and resources.
+    pub security_policy: crate::security::SecurityPolicy,
+    /// Security audit logger for recording policy decisions and security events.
+    pub audit_logger: crate::security::audit::AuditLogger,
 }
 
 impl HandlerContext {
@@ -256,6 +263,8 @@ impl HandlerContext {
             workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
             iteration: None,
             path_scope_policy: crate::paths::PathScopePolicy::default(),
+            security_policy: crate::security::SecurityPolicy::default(),
+            audit_logger: crate::security::audit::AuditLogger::noop(),
         }
     }
 
@@ -291,12 +300,26 @@ impl HandlerContext {
             workflow_recursion_stack: Arc::new(std::sync::Mutex::new(HashSet::new())),
             iteration: None,
             path_scope_policy: crate::paths::PathScopePolicy::default(),
+            security_policy: crate::security::SecurityPolicy::default(),
+            audit_logger: crate::security::audit::AuditLogger::noop(),
         }
     }
 
     /// Set the path scope policy for working directory resolution.
     pub fn with_path_scope_policy(mut self, policy: crate::paths::PathScopePolicy) -> Self {
         self.path_scope_policy = policy;
+        self
+    }
+
+    /// Set the security policy for this execution context.
+    pub fn with_security_policy(mut self, policy: crate::security::SecurityPolicy) -> Self {
+        self.security_policy = policy;
+        self
+    }
+
+    /// Set the audit logger for this execution context.
+    pub fn with_audit_logger(mut self, logger: crate::security::audit::AuditLogger) -> Self {
+        self.audit_logger = logger;
         self
     }
 
@@ -414,6 +437,7 @@ impl HandlerRegistry {
         let mut registry = Self::new();
 
         registry.register(CommandHandler);
+        registry.register(NativeAccessibilityHandler);
         registry.register(PromptStepHandler);
         registry.register(RestartProcessHandler);
         registry.register(SaveWorkflowArtifactHandler);

@@ -116,6 +116,9 @@ pub struct ApiState {
     /// Bumped by write handlers (findings, fixes, rules, observations, patterns)
     /// so the graph rebuilds on next access even if the TTL hasn't expired.
     pub graph_cache_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Shared accessibility manager for native a11y tree capture and interaction.
+    /// Used by MCP API accessibility endpoints and Tauri commands.
+    pub accessibility_manager: Arc<tokio::sync::Mutex<qontinui_runner_lib::accessibility::AccessibilityManager>>,
 }
 
 /// Response for API endpoints

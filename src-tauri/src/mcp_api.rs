@@ -191,6 +191,9 @@ pub fn create_router(
         ui_bridge_event_sequence: std::sync::atomic::AtomicI64::new(0),
         knowledge_graph_cache: Arc::new(tokio::sync::RwLock::new(None)),
         graph_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        accessibility_manager: Arc::new(tokio::sync::Mutex::new(
+            qontinui_runner_lib::accessibility::AccessibilityManager::new(),
+        )),
     });
 
     // Set up UI Bridge response listener
@@ -280,15 +283,8 @@ pub fn create_router(
         // Small delay to let the server fully start
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Mark any AI sessions from the previous runner instance as interrupted.
-        // This must happen before resume so the resume logic can detect interrupted sessions.
-        if let Err(e) = state_for_resume
-            .app_state
-            .checkpoint_db
-            .mark_running_ai_sessions_interrupted()
-        {
-            warn!("Failed to mark interrupted AI sessions on startup: {}", e);
-        }
+        // TODO: mark_running_ai_sessions_interrupted removed during PgDb migration
+        // Interrupted session detection now handled differently.
 
         // Note: We no longer use global_auto_continue here.
         // Each workflow's per-task auto_continue setting determines whether it gets resumed.
@@ -315,7 +311,6 @@ pub fn create_router(
         };
 
         let count = crate::unified_workflow_executor::resume_interrupted_workflows(
-            state_for_resume.app_state.checkpoint_db.clone(),
             state_for_resume.app_state.clone(),
             resume_config_storage,
             state_for_resume.app_handle.clone(),
@@ -334,7 +329,6 @@ pub fn create_router(
 
     // Resume interrupted chat sessions on startup
     {
-        let chat_db = api_state.app_state.checkpoint_db.clone();
         let chat_handle = app_handle.clone();
         // Access session manager from Tauri state (managed separately from AppState)
         let chat_sm: Arc<crate::claude_session::SessionManager> = app_handle
@@ -346,7 +340,7 @@ pub fn create_router(
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
             let count =
-                crate::commands::ai_session::resume_ai_sessions(chat_db, chat_sm, chat_handle)
+                crate::commands::ai_session::resume_ai_sessions(chat_sm, chat_handle)
                     .await;
 
             if count > 0 {
@@ -366,12 +360,12 @@ pub fn create_router(
 
     // Sync workflows from web backend on startup (background task)
     {
-        let db = api_state.app_state.checkpoint_db.clone();
+        let sync_pg_db = api_state.app_state.pg_db.clone();
         tokio::spawn(async move {
             // Wait for server to start and auth to be available
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&db).await {
+            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&*sync_pg_db).await {
                 Ok(count) => {
                     if count > 0 {
                         info!("Synced {} workflows from web backend", count);
@@ -386,13 +380,26 @@ pub fn create_router(
 
     // Start zombie task run sweep (detects and cleans up stale "running" tasks)
     {
-        let sweep_db = api_state.app_state.checkpoint_db.clone();
         let sweep_handle = app_handle.clone();
         let sweep_sm: Arc<crate::claude_session::SessionManager> = app_handle
             .state::<Arc<crate::claude_session::SessionManager>>()
             .inner()
             .clone();
-        crate::zombie_sweep::start_zombie_sweep(sweep_db, sweep_sm, sweep_handle);
+        crate::zombie_sweep::start_zombie_sweep(sweep_sm, sweep_handle);
+    }
+
+    // Periodic file registry cleanup (sweep stale entries every 60s)
+    {
+        let cleanup_registry = api_state.app_state.file_registry_manager.clone();
+        let cleanup_db = api_state.app_state.pg_db.clone();
+        tokio::spawn(async move {
+            // Wait for server to fully start
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            loop {
+                cleanup_registry.cleanup_stale(&cleanup_db).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
+        });
     }
 
     // Start trigger service (event-driven workflow automation)
@@ -456,6 +463,7 @@ pub fn create_router(
         .route("/awas/actions", get(awas_list_actions))
         .route("/awas/extract-elements", post(awas_extract_elements))
         // Module routes
+        .merge(crate::mcp::accessibility::routes())
         .merge(crate::mcp::canvas::routes())
         .merge(crate::mcp::cascade::routes())
         .merge(crate::mcp::ai_generation::routes())
@@ -472,6 +480,7 @@ pub fn create_router(
         .merge(crate::mcp::dom_capture::routes())
         .merge(crate::mcp::error_monitor::routes())
         .merge(crate::mcp::extraction::routes())
+        .merge(crate::mcp::file_registry::routes())
         .merge(crate::mcp::findings_api::routes())
         .merge(crate::mcp::generation_rules_api::routes())
         .merge(crate::mcp::meta_optimizer_api::routes())
@@ -503,6 +512,7 @@ pub fn create_router(
         .merge(crate::mcp::reflection_api::routes())
         .merge(crate::mcp::graph_api::routes())
         .merge(crate::mcp::observations_api::routes())
+        .merge(crate::mcp::online_learning_api::routes())
         .merge(crate::mcp::memory_consolidation_api::routes())
         .merge(crate::mcp::query_memory_tool::routes())
         .merge(crate::mcp::decision_trail_api::routes())
@@ -532,6 +542,7 @@ pub fn create_router(
         .merge(crate::mcp::token_analytics::routes())
         .merge(crate::mcp::otel_status::routes())
         .merge(crate::mcp::container_status::routes())
+        .merge(crate::mcp::security_audit::routes())
         .merge(crate::mcp::knowledge_acquisition_api::routes())
         .merge(crate::mcp::session_recap::routes())
         .merge(crate::mcp::api_surface::routes())

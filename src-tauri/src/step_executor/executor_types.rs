@@ -426,6 +426,53 @@ pub struct ExecutionStepConfig {
     pub restart_wait_for_health: Option<bool>,
 
     // ========================================================================
+    // Native Accessibility Step Fields
+    // ========================================================================
+    /// Accessibility action: "capture", "click", "type", "focus", "query", "ai_context"
+    #[serde(alias = "a11yAction", alias = "action")]
+    pub a11y_action: Option<String>,
+
+    /// Connection target: "Desktop", window title, or "pid:1234"
+    #[serde(alias = "a11yTarget", alias = "target")]
+    pub a11y_target: Option<String>,
+
+    /// Element ref ID for click/type/focus (e.g. "@e3")
+    #[serde(alias = "a11yRefId", alias = "ref_id")]
+    pub a11y_ref_id: Option<String>,
+
+    /// Text to type (for "type" action)
+    #[serde(alias = "a11yText", alias = "text")]
+    pub a11y_text: Option<String>,
+
+    /// Whether to clear existing text before typing (default: false)
+    #[serde(alias = "a11yClearFirst", alias = "clear_first", default)]
+    pub a11y_clear_first: Option<bool>,
+
+    /// Role filter for "query" action (e.g. "button", "textbox")
+    #[serde(alias = "a11yQueryRole", alias = "query_role")]
+    pub a11y_query_role: Option<String>,
+
+    /// Label filter for "query" action
+    #[serde(alias = "a11yQueryLabel", alias = "query_label")]
+    pub a11y_query_label: Option<String>,
+
+    /// Only include interactive elements (for "query" and "ai_context")
+    #[serde(alias = "a11yInteractiveOnly", alias = "interactive_only", default)]
+    pub a11y_interactive_only: Option<bool>,
+
+    /// Maximum elements for "ai_context" action (default: 50)
+    #[serde(alias = "a11yMaxElements", alias = "max_elements", default)]
+    pub a11y_max_elements: Option<u32>,
+
+    /// Include hidden elements in "capture" (default: false)
+    #[serde(alias = "a11yIncludeHidden", alias = "include_hidden", default)]
+    pub a11y_include_hidden: Option<bool>,
+
+    /// Maximum tree depth for "capture" (None = unlimited)
+    #[serde(alias = "a11yMaxDepth", alias = "max_depth", default)]
+    pub a11y_max_depth: Option<u32>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution

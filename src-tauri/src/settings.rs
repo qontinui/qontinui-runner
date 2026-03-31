@@ -319,10 +319,19 @@ pub struct AccessibilitySettings {
     /// Default CDP port for remote debugging (default: 9222)
     #[serde(default = "default_cdp_port")]
     pub cdp_port: u16,
+    /// Use Rust-native accessibility APIs (UIA/AT-SPI/AX) instead of Python HAL backends.
+    /// When enabled, the runner captures accessibility trees directly via platform APIs
+    /// without crossing the Python bridge, providing faster and more reliable automation.
+    #[serde(default = "default_use_rust_accessibility")]
+    pub use_rust_accessibility: bool,
 }
 
 fn default_cdp_port() -> u16 {
     9222
+}
+
+fn default_use_rust_accessibility() -> bool {
+    true
 }
 
 impl Default for AccessibilitySettings {
@@ -330,6 +339,7 @@ impl Default for AccessibilitySettings {
         Self {
             chrome_path: None, // Auto-detect
             cdp_port: default_cdp_port(),
+            use_rust_accessibility: default_use_rust_accessibility(),
         }
     }
 }
@@ -874,6 +884,9 @@ pub struct Settings {
     pub otel: crate::otel::OtelConfig,
     #[serde(default)]
     pub container: crate::container::container_config::ContainerConfig,
+    /// Security and sandbox configuration (profiles, policies, audit settings).
+    #[serde(default)]
+    pub security: crate::security::engine::SecuritySettings,
     /// Memory consolidation settings (importance decay, grouping, LLM model)
     #[serde(default)]
     pub memory_consolidation: MemoryConsolidationSettings,
@@ -974,6 +987,17 @@ pub fn get_container_settings() -> crate::container::container_config::Container
 pub fn save_container_settings(config: crate::container::container_config::ContainerConfig) -> Result<(), String> {
     let mut settings = load_settings();
     settings.container = config;
+    save_settings(&settings)
+}
+
+pub fn get_security_settings() -> crate::security::engine::SecuritySettings {
+    let settings = load_settings();
+    settings.security
+}
+
+pub fn save_security_settings(config: crate::security::engine::SecuritySettings) -> Result<(), String> {
+    let mut settings = load_settings();
+    settings.security = config;
     save_settings(&settings)
 }
 

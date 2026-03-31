@@ -58,6 +58,7 @@ impl std::fmt::Display for CommandMode {
 /// - **Command**: command (unified: shell command, check, check group, or test)
 /// - **AI**: prompt, ai_session
 /// - **Web Automation**: awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
+/// - **Accessibility**: native_accessibility
 /// - **Utility**: macro
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,6 +134,12 @@ pub enum StepType {
     Macro,
 
     // ========================================================================
+    // Accessibility Steps
+    // ========================================================================
+    /// Run a native accessibility audit using OS-level accessibility APIs.
+    NativeAccessibility,
+
+    // ========================================================================
     // Watcher Steps (screenpipe-inspired reactive agents)
     // ========================================================================
     /// Scheduled watcher: queries the activity timeline, reasons with AI,
@@ -163,6 +170,7 @@ impl StepType {
                 | StepType::Screenshot
                 | StepType::UiBridge
                 | StepType::UiBridgeDesignAudit
+                | StepType::NativeAccessibility
         )
     }
 
@@ -240,6 +248,9 @@ impl StepType {
             StepType::AwasListActions => Some(10_000), // 10 seconds
             StepType::AwasExtractElements => Some(10_000), // 10 seconds
 
+            // Accessibility
+            StepType::NativeAccessibility => Some(15_000), // 15 seconds
+
             // Artifact
             StepType::SaveWorkflowArtifact => Some(5_000), // 5 seconds (DB write)
 
@@ -305,6 +316,9 @@ impl StepType {
             "awas_list_actions" | "awaslistactions" => Some(StepType::AwasListActions),
             "awas_extract_elements" | "awasextractelements" => Some(StepType::AwasExtractElements),
 
+            // Accessibility
+            "native_accessibility" | "nativeaccessibility" => Some(StepType::NativeAccessibility),
+
             // Artifact
             "save_workflow_artifact" | "saveworkflowartifact" => {
                 Some(StepType::SaveWorkflowArtifact)
@@ -347,6 +361,7 @@ impl StepType {
             StepType::AwasCheckSupport => "awas_check_support",
             StepType::AwasListActions => "awas_list_actions",
             StepType::AwasExtractElements => "awas_extract_elements",
+            StepType::NativeAccessibility => "native_accessibility",
             StepType::SaveWorkflowArtifact => "save_workflow_artifact",
             StepType::Macro => "macro",
             StepType::Watcher => "watcher",
@@ -506,6 +521,7 @@ mod tests {
             StepType::AwasCheckSupport,
             StepType::AwasListActions,
             StepType::AwasExtractElements,
+            StepType::NativeAccessibility,
             StepType::Macro,
             StepType::Watcher,
         ];
