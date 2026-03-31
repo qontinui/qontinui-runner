@@ -237,6 +237,15 @@ impl CheckpointDb {
             let verification_passed = status == "success";
             let iterations_u32 = iterations.unwrap_or(0) as u32;
 
+            // Load pipeline traces to extract schema compliance data (if available).
+            let schema_compliance_inputs = {
+                use crate::meta_optimizer::agentic_metrics::schema_compliance::compliance_inputs_from_traces;
+                match crate::database::pipeline_traces::get_traces_for_task_run(task_id) {
+                    Ok(traces) => compliance_inputs_from_traces(&traces),
+                    Err(_) => vec![],
+                }
+            };
+
             let input = DeterministicInput {
                 task_run_id: task_id.clone(),
                 status: status.clone(),
@@ -251,6 +260,7 @@ impl CheckpointDb {
                 error_type: error_type.clone(),
                 tools_used,
                 agent_traces: vec![],
+                schema_compliance_inputs,
             };
 
             let scores = agentic_metrics::compute_deterministic(&input, &baselines);

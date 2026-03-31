@@ -11,7 +11,7 @@
 //! a composable, ordered middleware chain.
 
 use super::types::AiResponse;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ============================================================================
 // Middleware trait
@@ -26,6 +26,10 @@ pub struct MiddlewareContext {
     pub task_run_id: Option<String>,
     /// Current iteration number (if applicable)
     pub iteration: Option<u32>,
+    /// Expected JSON Schema name for structured output validation (if any).
+    pub expected_schema_name: Option<String>,
+    /// Structured output validation config.
+    pub validation_config: Option<crate::validation::StructuredOutputConfig>,
 }
 
 impl MiddlewareContext {
@@ -43,6 +47,16 @@ impl MiddlewareContext {
 
     pub fn with_iteration(mut self, iteration: u32) -> Self {
         self.iteration = Some(iteration);
+        self
+    }
+
+    pub fn with_structured_output(
+        mut self,
+        schema_name: &str,
+        config: crate::validation::StructuredOutputConfig,
+    ) -> Self {
+        self.expected_schema_name = Some(schema_name.to_string());
+        self.validation_config = Some(config);
         self
     }
 }
@@ -148,6 +162,145 @@ impl AiMiddlewareChain {
 impl Default for AiMiddlewareChain {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// Structured Output Middleware
+// ============================================================================
+
+/// Middleware that validates AI responses against an expected JSON Schema.
+///
+/// When `MiddlewareContext` has an `expected_schema_name` set, this middleware
+/// extracts JSON from the response, validates it against the schema, and marks
+/// the response as failed with validation error details if invalid. This allows
+/// the existing retry infrastructure to pick up schema validation failures.
+pub struct StructuredOutputMiddleware;
+
+impl AiMiddleware for StructuredOutputMiddleware {
+    fn name(&self) -> &'static str {
+        "structured_output_validator"
+    }
+
+    fn post_call(&self, response: &mut AiResponse, ctx: &MiddlewareContext) {
+        let schema_name = match &ctx.expected_schema_name {
+            Some(name) => name.clone(),
+            None => return,
+        };
+
+        let config = ctx
+            .validation_config
+            .clone()
+            .unwrap_or_default();
+
+        // Extract JSON from the response
+        let json_str =
+            match crate::validation::extract_json_from_output(&response.output) {
+                Some(json) => json,
+                None => {
+                    debug!(
+                        "StructuredOutputMiddleware: no JSON found in response for schema '{}'",
+                        schema_name
+                    );
+                    response.success = false;
+                    response.error = Some(format!(
+                        "schema_validation: No JSON block found in response (expected schema '{}')",
+                        schema_name
+                    ));
+                    return;
+                }
+            };
+
+        // Parse and validate the JSON
+        let raw_value: serde_json::Value = match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(
+                    "StructuredOutputMiddleware: JSON parse error for schema '{}': {}",
+                    schema_name, e
+                );
+                response.success = false;
+                response.error = Some(format!(
+                    "schema_validation: JSON parse error: {}",
+                    e
+                ));
+                return;
+            }
+        };
+
+        // Try to build a validator from the schema name in context.
+        // We validate using the raw schema value from the registry if available.
+        // Since we don't have the generic type T here, we use the schema name
+        // to look up the schema and validate with SchemaValidator::from_schema.
+        let schema_value = {
+            // The schema should already be cached in the registry from the call site.
+            // We look it up by trying to get it from the global cache.
+            crate::schema_registry::get_cached_schema(&schema_name)
+        };
+
+        let schema_value = match schema_value {
+            Some(sv) => sv,
+            None => {
+                warn!(
+                    "StructuredOutputMiddleware: no cached schema for '{}', skipping validation. \
+                     Ensure schema_as_json::<T>() was called before setting expected_schema_name.",
+                    schema_name
+                );
+                return;
+            }
+        };
+
+        let validator =
+            match crate::validation::SchemaValidator::from_schema(&schema_value, &schema_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(
+                        "StructuredOutputMiddleware: failed to compile schema '{}': {}",
+                        schema_name, e
+                    );
+                    return;
+                }
+            };
+
+        // Apply coercion before validation
+        let (value_to_validate, _coercion_records) =
+            crate::validation::coercion::apply_coercions(
+                &raw_value,
+                &schema_value,
+                config.coercion_policy,
+            );
+
+        let result = validator.validate(&value_to_validate);
+        if result.valid {
+            debug!(
+                "StructuredOutputMiddleware: response valid for schema '{}'",
+                schema_name
+            );
+            return;
+        }
+
+        // Validation failed — build error details for retry
+        let error_details: Vec<String> = result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+
+        let feedback =
+            crate::validation::validation_feedback_prompt(&result, &schema_name);
+
+        debug!(
+            "StructuredOutputMiddleware: validation failed for '{}' with {} errors",
+            schema_name,
+            error_details.len()
+        );
+
+        response.success = false;
+        response.error = Some(format!(
+            "schema_validation: {}\n\n{}",
+            error_details.join("; "),
+            feedback
+        ));
     }
 }
 

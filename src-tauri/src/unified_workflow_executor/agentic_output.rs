@@ -5,10 +5,11 @@
 //! to extract a JSON summary block first, then falls back to the existing marker
 //! parsers for backward compatibility.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Status of the agentic phase execution.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgenticStatus {
     /// All issues addressed successfully
@@ -22,14 +23,14 @@ pub enum AgenticStatus {
 }
 
 /// A file change made during the agentic phase.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FileChange {
     pub path: String,
     pub action: String, // "modified", "created", "deleted"
 }
 
 /// A finding reported by the AI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FindingOutput {
     pub category: String,
     pub severity: String,
@@ -43,7 +44,7 @@ pub struct FindingOutput {
 }
 
 /// A reflection fix reported by the AI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReflectionFixOutput {
     pub error_id: String,
     pub description: String,
@@ -54,7 +55,7 @@ pub struct ReflectionFixOutput {
 /// This type consolidates all the information previously extracted via fragile
 /// string markers ([UNFIXABLE_ERRORS], [INJECT_STEP], [REFLECTION_FIX], [FINDING])
 /// into a single structured type.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgenticPhaseOutput {
     /// Overall status of the agentic phase
     pub status: AgenticStatus,

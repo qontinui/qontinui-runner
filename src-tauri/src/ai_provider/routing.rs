@@ -1,9 +1,14 @@
 #![allow(dead_code)]
 
-use super::claude_api::{run_claude_api, run_claude_api_multimodal, run_claude_api_with_overrides};
+use super::cache_aware_builder::StructuredPrompt;
+use super::claude_api::{
+    run_claude_api, run_claude_api_cached, run_claude_api_multimodal,
+    run_claude_api_with_overrides, run_claude_api_with_structured_output,
+};
 use super::claude_cli::run_claude_cli;
 use super::gemini_api::{
     run_gemini_api, run_gemini_api_multimodal, run_gemini_api_with_overrides,
+    run_gemini_api_with_structured_output,
 };
 use super::gemini_cli::run_gemini_cli;
 use super::multimodal::MultimodalPrompt;
@@ -72,19 +77,30 @@ pub fn run_prompt_with_routing(
     let ai_settings = settings::get_ai_settings();
     let routing_config = &ai_settings.routing;
 
-    // Determine the model to use based on routing
+    // Determine the model to use based on routing (bandit + heuristic fallback)
     let model_override = if routing_config.enabled {
         let router = TaskRouter::new(routing_config.clone());
-        let assessment = router.assess_and_route(context);
-        let model = router.route_task(context);
 
-        info!(
-            "Task routing: complexity={:?}, confidence={:.2}, model={}",
-            assessment.complexity, assessment.confidence, model
-        );
-        for factor in &assessment.factors {
-            debug!("Routing factor: {}", factor);
-        }
+        // Try online learning bandit first, fall back to static heuristic
+        let model = if let Some(bandit_mtx) = crate::online_learning::model_router() {
+            if let Ok(mut bandit) = bandit_mtx.lock() {
+                let (model, decision) = router.route_task_with_bandit(context, &mut bandit);
+                info!(
+                    "Task routing: model={} source={:?} context={} explore={}",
+                    model, decision.source, decision.context_key, decision.exploration
+                );
+                model
+            } else {
+                router.route_task(context)
+            }
+        } else {
+            let assessment = router.assess_and_route(context);
+            info!(
+                "Task routing (heuristic): complexity={:?}, confidence={:.2}, model={}",
+                assessment.complexity, assessment.confidence, assessment.selected_model
+            );
+            router.route_task(context)
+        };
 
         Some(model)
     } else {
@@ -334,6 +350,163 @@ fn run_prompt_with_overrides_inner(
 }
 
 // =============================================================================
+// Structured Prompt Functions (with prompt caching support)
+// =============================================================================
+
+/// Run a structured prompt with cache-aware dispatch.
+///
+/// When the provider is `ClaudeApi` and the prompt has cached blocks,
+/// this uses `run_claude_api_cached()` which sends `cache_control` breakpoints
+/// on stable system blocks. For all other providers, the prompt is flattened
+/// to a string and dispatched through the normal path.
+pub fn run_structured_prompt(
+    prompt: &StructuredPrompt,
+    context: &TaskContext,
+    doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+    fallback_model: Option<&str>,
+    fallback_provider: Option<&str>,
+) -> AiResponse {
+    let ai_settings = settings::get_ai_settings();
+
+    let effective_provider = if let Some(prov) = provider_override {
+        match prov {
+            "claude_cli" => AiProvider::ClaudeCli,
+            "claude_api" => AiProvider::ClaudeApi,
+            "gemini_cli" => AiProvider::GeminiCli,
+            "gemini_api" => AiProvider::GeminiApi,
+            _ => ai_settings.provider,
+        }
+    } else {
+        ai_settings.provider
+    };
+
+    let effective_model = if let Some(model) = model_override {
+        Some(model.to_string())
+    } else if ai_settings.routing.enabled {
+        let router = TaskRouter::new(ai_settings.routing.clone());
+        let model = if let Some(bandit_mtx) = crate::online_learning::model_router() {
+            if let Ok(mut bandit) = bandit_mtx.lock() {
+                let (model, decision) = router.route_task_with_bandit(context, &mut bandit);
+                info!(
+                    "Structured prompt routing: model={} source={:?} explore={}",
+                    model, decision.source, decision.exploration
+                );
+                model
+            } else {
+                router.route_task(context)
+            }
+        } else {
+            router.route_task(context)
+        };
+        Some(model)
+    } else {
+        None
+    };
+
+    // Use cache-aware path for Claude API when we have cached blocks
+    if matches!(effective_provider, AiProvider::ClaudeApi) && prompt.has_cached_blocks() {
+        info!(
+            "Using cache-aware Claude API path ({} cached blocks, {} dynamic blocks)",
+            prompt.cached_system_blocks.len(),
+            prompt.dynamic_system_blocks.len(),
+        );
+
+        let primary = || {
+            run_claude_api_cached(
+                prompt,
+                &ai_settings.claude_api,
+                effective_model.as_deref(),
+                doctor_handle,
+                temperature_override,
+                max_tokens_override,
+            )
+        };
+
+        if fallback_model.is_some() || fallback_provider.is_some() {
+            let fallback_flat = prompt.to_flat_string();
+            let fallback = || {
+                run_prompt_with_overrides_inner(
+                    &fallback_flat,
+                    context,
+                    doctor_handle,
+                    fallback_model.or(model_override),
+                    fallback_provider.or(provider_override),
+                    temperature_override,
+                    max_tokens_override,
+                )
+            };
+            return retry_with_fallback("Claude API (cached)", primary, Some(fallback));
+        }
+
+        return retry_with_backoff("Claude API (cached)", primary);
+    }
+
+    // Non-Claude or no cached blocks: flatten and use standard path
+    let flat_prompt = prompt.to_flat_string();
+    run_prompt_with_model_override(
+        &flat_prompt,
+        context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        temperature_override,
+        max_tokens_override,
+        fallback_model,
+        fallback_provider,
+    )
+}
+
+/// Run a structured prompt with middleware chain support.
+pub fn run_structured_prompt_with_middleware(
+    prompt: &StructuredPrompt,
+    context: &TaskContext,
+    doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+    fallback_model: Option<&str>,
+    fallback_provider: Option<&str>,
+    middleware: &super::middleware::AiMiddlewareChain,
+    middleware_ctx: &super::middleware::MiddlewareContext,
+) -> AiResponse {
+    middleware.log_chain();
+
+    // Middleware only transforms the user message — cached system blocks
+    // must remain stable to benefit from caching.
+    let transformed_user_message =
+        middleware.run_pre_call(&prompt.user_message, middleware_ctx);
+
+    let transformed_prompt = StructuredPrompt {
+        cached_system_blocks: prompt.cached_system_blocks.clone(),
+        dynamic_system_blocks: prompt.dynamic_system_blocks.clone(),
+        user_message: transformed_user_message,
+    };
+
+    let mut response = run_structured_prompt(
+        &transformed_prompt,
+        context,
+        doctor_handle,
+        model_override,
+        provider_override,
+        temperature_override,
+        max_tokens_override,
+        fallback_model,
+        fallback_provider,
+    );
+
+    if response.success {
+        middleware.run_post_call(&mut response, middleware_ctx);
+    }
+
+    response
+}
+
+// =============================================================================
 // Multimodal Prompt Functions
 // =============================================================================
 
@@ -411,14 +584,20 @@ pub fn run_prompt_with_routing_multimodal(
 
     let model_override = if routing_config.enabled {
         let router = TaskRouter::new(routing_config.clone());
-        let assessment = router.assess_and_route(context);
-        let model = router.route_task(context);
-
-        info!(
-            "Multimodal task routing: complexity={:?}, confidence={:.2}, model={}",
-            assessment.complexity, assessment.confidence, model
-        );
-
+        let model = if let Some(bandit_mtx) = crate::online_learning::model_router() {
+            if let Ok(mut bandit) = bandit_mtx.lock() {
+                let (model, decision) = router.route_task_with_bandit(context, &mut bandit);
+                info!(
+                    "Multimodal routing: model={} source={:?} explore={}",
+                    model, decision.source, decision.exploration
+                );
+                model
+            } else {
+                router.route_task(context)
+            }
+        } else {
+            router.route_task(context)
+        };
         Some(model)
     } else {
         None
@@ -574,5 +753,90 @@ pub fn run_prompt_with_model_override_multimodal(
             temperature_override,
             max_tokens_override,
         ),
+    }
+}
+
+// =============================================================================
+// Structured Output Functions (server-side schema enforcement)
+// =============================================================================
+
+/// Run an AI prompt with server-side structured output enforcement.
+///
+/// When the current provider supports structured output (Claude API via tool_use,
+/// Gemini API via responseSchema), the JSON Schema is sent to the provider for
+/// server-side enforcement. For CLI providers or unsupported APIs, falls back to
+/// the standard prompt path (the caller should rely on the middleware
+/// retry-with-validation path for schema compliance).
+///
+/// # Arguments
+/// * `prompt` - The prompt to send to the AI
+/// * `schema` - JSON Schema to enforce on the response
+/// * `schema_name` - Human-readable name for the schema (used for logging and tool naming)
+/// * `model_override` - Optional model override
+/// * `provider_override` - Optional provider override
+/// * `temperature_override` - Optional temperature override
+/// * `max_tokens_override` - Optional max tokens override
+pub fn run_prompt_with_structured_output(
+    prompt: &str,
+    schema: &serde_json::Value,
+    schema_name: &str,
+    doctor_handle: Option<&DoctorHandle>,
+    model_override: Option<&str>,
+    provider_override: Option<&str>,
+    temperature_override: Option<f32>,
+    max_tokens_override: Option<u32>,
+) -> AiResponse {
+    let ai_settings = settings::get_ai_settings();
+
+    let effective_provider = if let Some(prov) = provider_override {
+        match prov {
+            "claude_cli" => AiProvider::ClaudeCli,
+            "claude_api" => AiProvider::ClaudeApi,
+            "gemini_cli" => AiProvider::GeminiCli,
+            "gemini_api" => AiProvider::GeminiApi,
+            _ => ai_settings.provider,
+        }
+    } else {
+        ai_settings.provider
+    };
+
+    info!(
+        "Running structured output prompt via {:?} (schema: {}, prompt_len: {})",
+        effective_provider,
+        schema_name,
+        prompt.len()
+    );
+
+    match effective_provider {
+        AiProvider::ClaudeApi => run_claude_api_with_structured_output(
+            prompt,
+            &ai_settings.claude_api,
+            model_override,
+            doctor_handle,
+            temperature_override,
+            max_tokens_override,
+            schema,
+            schema_name,
+        ),
+        AiProvider::GeminiApi => run_gemini_api_with_structured_output(
+            prompt,
+            &ai_settings.gemini_api,
+            model_override,
+            doctor_handle,
+            temperature_override,
+            max_tokens_override,
+            schema,
+            schema_name,
+        ),
+        // CLI providers don't support structured output — fall through to standard path.
+        // The StructuredOutputMiddleware will handle validation and retries.
+        AiProvider::ClaudeCli => {
+            debug!("Claude CLI does not support structured output; using standard path");
+            run_claude_cli(prompt, &ai_settings.claude_cli, model_override, doctor_handle)
+        }
+        AiProvider::GeminiCli => {
+            debug!("Gemini CLI does not support structured output; using standard path");
+            run_gemini_cli(prompt, &ai_settings.gemini_cli, model_override, doctor_handle)
+        }
     }
 }

@@ -36,11 +36,14 @@
 
 #![allow(dead_code)]
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::orchestrator::types::{Confidence, CriterionOverride, Finding, WorkerSignal};
 use crate::str_utils::truncate_str;
+use crate::validation::coercion::{apply_coercions, CoercionPolicy};
+use crate::validation::validator::SchemaValidator;
 
 // ============================================================================
 // Structured Worker Output
@@ -55,7 +58,7 @@ use crate::str_utils::truncate_str;
 /// - Findings discovered during work
 /// - Files that were modified
 /// - Confidence in the work quality
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkerOutput {
     /// Summary of work performed in this iteration.
     /// Should be concise (1-3 sentences).
@@ -228,7 +231,7 @@ impl WorkerOutput {
 // ============================================================================
 
 /// Structured signal for orchestrator control flow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StructuredSignal {
     /// Worker believes work is complete, ready for verification.
@@ -276,7 +279,7 @@ pub enum StructuredSignal {
 // ============================================================================
 
 /// Structured finding from worker analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StructuredFinding {
     /// Type of finding.
     #[serde(rename = "type")]
@@ -356,7 +359,7 @@ impl StructuredFinding {
 }
 
 /// Types of findings that workers can report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingType {
     /// A bug or defect in the code.
@@ -399,7 +402,7 @@ impl FindingType {
 // ============================================================================
 
 /// Structured criterion override.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StructuredOverride {
     /// The criterion ID being overridden.
     pub criterion_id: String,
@@ -441,7 +444,7 @@ impl StructuredOverride {
 // ============================================================================
 
 /// Confidence level for findings and work quality.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfidenceLevel {
     High,
@@ -478,6 +481,12 @@ pub struct ParsedWorkerOutput {
 
     /// Any parse errors encountered.
     pub parse_errors: Vec<String>,
+
+    /// Schema validation errors (if validation was attempted).
+    pub validation_errors: Vec<String>,
+
+    /// Whether type coercions were applied to make the output valid.
+    pub coercions_applied: bool,
 }
 
 impl ParsedWorkerOutput {
@@ -517,25 +526,88 @@ pub fn parse_worker_output(output: &str) -> ParsedWorkerOutput {
         raw_text: output.to_string(),
         used_json_format: false,
         parse_errors: Vec::new(),
+        validation_errors: Vec::new(),
+        coercions_applied: false,
     };
 
     // Try to find JSON block first
-    if let Some(json_output) = extract_json_block(output) {
-        match serde_json::from_str::<WorkerOutput>(&json_output) {
-            Ok(parsed) => {
-                debug!("Successfully parsed structured worker output");
-                result.structured = Some(parsed);
-                result.used_json_format = true;
-                return result;
+    let json_output = match extract_json_block(output) {
+        Some(json) => json,
+        None => return result,
+    };
+
+    // Step 1: Parse raw JSON
+    let raw_value: serde_json::Value = match serde_json::from_str(&json_output) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to parse worker output JSON: {}", e);
+            result.parse_errors.push(format!("JSON parse error: {}", e));
+            return result;
+        }
+    };
+
+    // Step 2: Schema validation + coercion
+    let (validated_value, coerced) = match SchemaValidator::for_type::<WorkerOutput>() {
+        Ok(validator) => {
+            // Try validation on raw value first
+            let raw_result = validator.validate(&raw_value);
+            if raw_result.valid {
+                (raw_value, false)
+            } else {
+                // Apply lenient coercion and re-validate
+                let schema = crate::schema_registry::schema_as_json::<WorkerOutput>();
+                let (coerced_value, coercion_records) =
+                    apply_coercions(&raw_value, &schema, CoercionPolicy::Lenient);
+
+                if !coercion_records.is_empty() {
+                    debug!(
+                        "Applied {} coercions to WorkerOutput",
+                        coercion_records.len()
+                    );
+                    let coerced_result = validator.validate(&coerced_value);
+                    if coerced_result.valid {
+                        (coerced_value, true)
+                    } else {
+                        // Still invalid after coercion — record errors
+                        result.validation_errors = coerced_result
+                            .errors
+                            .iter()
+                            .map(|e| e.to_string())
+                            .collect();
+                        (coerced_value, true)
+                    }
+                } else {
+                    // No coercions applicable — record original errors
+                    result.validation_errors =
+                        raw_result.errors.iter().map(|e| e.to_string()).collect();
+                    (raw_value, false)
+                }
             }
-            Err(e) => {
-                warn!("Failed to parse worker output JSON: {}", e);
-                result.parse_errors.push(format!("JSON parse error: {}", e));
-            }
+        }
+        Err(e) => {
+            // Schema compilation failed — fall through to serde parsing
+            warn!("Failed to compile WorkerOutput schema: {}", e);
+            (raw_value, false)
+        }
+    };
+
+    result.coercions_applied = coerced;
+
+    // Step 3: Deserialize (with or without validation having passed)
+    match serde_json::from_value::<WorkerOutput>(validated_value) {
+        Ok(parsed) => {
+            debug!("Successfully parsed structured worker output");
+            result.structured = Some(parsed);
+            result.used_json_format = true;
+        }
+        Err(e) => {
+            warn!("Failed to deserialize worker output: {}", e);
+            result
+                .parse_errors
+                .push(format!("Deserialization error: {}", e));
         }
     }
 
-    // No JSON found or parse failed - will fall back to legacy parsing later
     result
 }
 
@@ -753,24 +825,17 @@ fn generate_summary_from_output(output: &str) -> String {
 ///
 /// Include this in worker system prompts to instruct them on the
 /// expected output format.
-pub fn worker_output_instructions() -> &'static str {
-    r#"
-## Output Format
+///
+/// Delegates to `schema_registry::prompt_instructions_for::<WorkerOutput>()`
+/// for schema-derived field documentation, then appends a hand-written
+/// example block that the schema generator does not produce.
+pub fn worker_output_instructions() -> String {
+    let mut instructions = crate::schema_registry::prompt_instructions_for::<WorkerOutput>();
 
-At the end of your response, emit a structured output block:
-
-```json:worker_output
-{
-  "work_summary": "Brief summary of work done (1-3 sentences)",
-  "signals": [],
-  "findings": [],
-  "files_modified": [],
-  "criterion_overrides": [],
-  "confidence": "high|medium|low",
-  "progress_estimate": 0.0-1.0
-}
-```
-
+    // Append hand-written guidance and example that the schema generator
+    // does not produce — these give the AI concrete signal semantics and
+    // a full example to imitate.
+    instructions.push_str(r#"
 ### Signals
 
 Use signals to communicate with the orchestrator:
@@ -779,32 +844,6 @@ Use signals to communicate with the orchestrator:
 - **Need replan**: `{"type": "need_replan", "reason": "Why plan needs revision"}`
 
 If neither applies, leave `signals` empty to continue working.
-
-### Findings
-
-Record important discoveries:
-
-```json
-{
-  "type": "bug|root_cause|observation|hypothesis|solution",
-  "description": "What you found",
-  "evidence": "Supporting evidence (optional)",
-  "confidence": "high|medium|low",
-  "related_files": ["path/to/file.ts"]
-}
-```
-
-### Criterion Overrides
-
-If a criterion should be accepted despite failing, provide justification:
-
-```json
-{
-  "criterion_id": "criterion_name",
-  "item": "Specific item (e.g., class name)",
-  "justification": "Why this should be accepted"
-}
-```
 
 ### Example Complete Output
 
@@ -824,7 +863,9 @@ If a criterion should be accepted despite failing, provide justification:
   "progress_estimate": 1.0
 }
 ```
-"#
+"#);
+
+    instructions
 }
 
 // ============================================================================

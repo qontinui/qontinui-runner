@@ -21,6 +21,7 @@
 pub mod argument_correctness;
 pub mod llm_judge;
 pub mod rag_judge;
+pub mod schema_compliance;
 pub mod scoring;
 pub mod step_efficiency;
 pub mod task_completion;
@@ -40,6 +41,8 @@ pub enum AgenticMetric {
     PlanAdherence,
     GoalAccuracy,
     PlanQuality,
+    // --- Schema compliance metric (scored when validation data available) ---
+    SchemaCompliance,
     // --- RAG metrics (scored only for retrieval-involving runs) ---
     RagContextualPrecision,
     RagContextualRecall,
@@ -54,6 +57,7 @@ impl AgenticMetric {
             Self::StepEfficiency => "step_efficiency",
             Self::ToolCorrectness => "tool_correctness",
             Self::ArgumentCorrectness => "argument_correctness",
+            Self::SchemaCompliance => "schema_compliance",
             Self::PlanAdherence => "plan_adherence",
             Self::GoalAccuracy => "goal_accuracy",
             Self::PlanQuality => "plan_quality",
@@ -77,6 +81,7 @@ impl AgenticMetric {
             Self::PlanAdherence => 0.08,
             Self::PlanQuality => 0.04,
             Self::ArgumentCorrectness => 0.03,
+            Self::SchemaCompliance => 0.05,
             Self::RagContextualPrecision => 0.05,
             Self::RagContextualRecall => 0.05,
             Self::RagFaithfulness => 0.05,
@@ -150,6 +155,9 @@ pub struct DeterministicInput {
     /// Pipeline agent trace snapshots for argument correctness validation.
     /// Empty for traditional architecture runs (no traces).
     pub agent_traces: Vec<argument_correctness::TraceSnapshot>,
+    /// Schema compliance inputs per agent trace (populated when validation data available).
+    /// Empty when no structured output validation was performed.
+    pub schema_compliance_inputs: Vec<schema_compliance::SchemaComplianceInput>,
 }
 
 /// Optional learned baselines for deterministic scoring.
@@ -177,12 +185,19 @@ pub fn compute_deterministic(
         zero_iterations: input.iterations == 0,
     };
 
-    vec![
+    let mut scores = vec![
         task_completion::score(input),
         step_efficiency::score(input, baselines.step_baseline.as_ref()),
         tool_correctness::score(&tool_input, baselines.tool_baseline.as_ref()),
         argument_correctness::score(&arg_input),
-    ]
+    ];
+
+    // Only include schema compliance when there is data to score.
+    if !input.schema_compliance_inputs.is_empty() {
+        scores.push(schema_compliance::score(&input.schema_compliance_inputs));
+    }
+
+    scores
 }
 
 /// Compute a weighted composite score from a set of metric results.
@@ -229,6 +244,7 @@ mod tests {
             error_type: None,
             tools_used: vec!["read_file".to_string()],
             agent_traces: vec![],
+            schema_compliance_inputs: vec![],
         }
     }
 

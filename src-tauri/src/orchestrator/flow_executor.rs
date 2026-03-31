@@ -25,6 +25,7 @@ use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegi
 use crate::execution_core::unified_tools::{execute_unified_tool, UnifiedToolRegistry};
 use crate::mcp_embedded::EmbeddedMcp;
 use once_cell::sync::Lazy;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -136,7 +137,7 @@ impl StepResult {
 // ============================================================================
 
 /// Events emitted during flow execution for UI updates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FlowEvent {
     /// Flow execution started.

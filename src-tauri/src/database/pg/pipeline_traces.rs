@@ -40,14 +40,17 @@ impl PgDb {
             .as_ref()
             .and_then(|h| serde_json::to_string(h).ok());
 
+        let validation_retries_i32 = trace.validation_retries;
+
         conn.execute(
             r#"INSERT INTO pipeline_agent_traces
                (id, task_run_id, agent_type, agent_id, run_id,
                 input_snapshot, output_snapshot, config_json,
                 duration_ms, tokens_in, tokens_out, cost_usd,
                 downstream_success, output_quality_score, created_at,
-                parent_span_id, span_type, guardrail_results_json, handoff_context_json)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)"#,
+                parent_span_id, span_type, guardrail_results_json, handoff_context_json,
+                schema_valid_first_attempt, validation_retries, coercions_applied, validation_error_summary)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)"#,
             &[
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &task_run_id,
@@ -68,6 +71,10 @@ impl PgDb {
                 &trace.span_type,
                 &guardrail_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &handoff_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &trace.schema_valid_first_attempt as &(dyn tokio_postgres::types::ToSql + Sync),
+                &validation_retries_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &trace.coercions_applied as &(dyn tokio_postgres::types::ToSql + Sync),
+                &trace.validation_error_summary as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         )
         .await
@@ -105,7 +112,9 @@ impl PgDb {
                           duration_ms, tokens_in, tokens_out, cost_usd,
                           downstream_success, output_quality_score,
                           parent_span_id, span_type,
-                          guardrail_results_json, handoff_context_json
+                          guardrail_results_json, handoff_context_json,
+                          schema_valid_first_attempt, validation_retries,
+                          coercions_applied, validation_error_summary
                    FROM pipeline_agent_traces
                    WHERE task_run_id = $1
                    ORDER BY created_at ASC"#,
@@ -144,6 +153,10 @@ impl PgDb {
                         .unwrap_or_default(),
                     handoff_received: handoff_json
                         .and_then(|j| serde_json::from_str::<HandoffContext>(&j).ok()),
+                    schema_valid_first_attempt: row.get(16),
+                    validation_retries: row.get(17),
+                    coercions_applied: row.get(18),
+                    validation_error_summary: row.get(19),
                 }
             })
             .collect())

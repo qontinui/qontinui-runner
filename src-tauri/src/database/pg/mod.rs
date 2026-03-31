@@ -1057,6 +1057,7 @@ impl PgDb {
                 output_utilization          DOUBLE PRECISION,
                 confidence_delta_signal     DOUBLE PRECISION,
                 downstream_success_signal   DOUBLE PRECISION,
+                cost_efficiency_signal      DOUBLE PRECISION,
                 created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_sca_task_run

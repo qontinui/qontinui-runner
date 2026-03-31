@@ -102,6 +102,7 @@ fn default_retryable_errors() -> Vec<String> {
         "ECONNRESET".to_string(),
         "ECONNREFUSED".to_string(),
         "exited during initialization".to_string(),
+        "schema_validation".to_string(),
     ]
 }
 
@@ -403,6 +404,8 @@ impl RetryService {
             Some("Permission error. Check file/resource permissions.".to_string())
         } else if error_lower.contains("not found") || error_lower.contains("404") {
             Some("Resource not found. Verify the path or URL is correct.".to_string())
+        } else if error_lower.contains("schema_validation") {
+            Some("Your JSON output did not match the required schema. Review the validation errors above and fix the JSON structure.".to_string())
         } else {
             None
         }
@@ -442,6 +445,10 @@ fn truncate_error(error: &str, max_len: usize) -> String {
 // ============================================================================
 
 /// Error patterns that should never be retried (deterministic failures).
+///
+/// Note: "schema_validation" is intentionally NOT in this list. Schema
+/// validation errors are retryable with feedback injection — the LLM can
+/// fix its output when given structured validation error details.
 const NON_RETRIABLE_PATTERNS: &[&str] = &[
     "syntax error",
     "type error",
@@ -450,7 +457,6 @@ const NON_RETRIABLE_PATTERNS: &[&str] = &[
     "authentication failed",
     "permission denied",
     "resource not found",
-    "schema validation",
     "missing required field",
 ];
 
@@ -825,12 +831,22 @@ mod tests {
         assert!(is_non_retriable("Authentication failed: invalid token"));
         assert!(is_non_retriable("compilation failed with 3 errors"));
         assert!(is_non_retriable("Permission Denied for resource"));
-        assert!(is_non_retriable("schema validation: missing field 'name'"));
+
+        // Schema validation errors are retriable (with feedback injection)
+        assert!(!is_non_retriable("schema_validation: wrong type at /count"));
 
         // These ARE retriable
         assert!(!is_non_retriable("Connection timeout"));
         assert!(!is_non_retriable("Rate limit exceeded"));
         assert!(!is_non_retriable("Service unavailable"));
+    }
+
+    #[test]
+    fn test_schema_validation_is_retryable() {
+        let service = RetryService::with_defaults();
+        assert!(service.is_retryable_error(
+            "schema_validation: Missing required field at /name"
+        ));
     }
 
     #[test]

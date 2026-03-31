@@ -36,6 +36,8 @@ pub struct WorkflowOutcome {
     pub has_ui_bridge: bool,
     pub total_tokens: Option<u64>,
     pub total_cost_usd: Option<f64>,
+    /// Primary model used for this workflow execution (for online learning bandit).
+    pub model_used: Option<String>,
 }
 
 /// Infer technology tags from file paths based on file extensions.
@@ -717,6 +719,15 @@ fn score_and_persist_agentic_metrics(
     use crate::meta_optimizer::agentic_metrics::scoring;
     use crate::meta_optimizer::agentic_metrics::{self, DeterministicInput, LearnedBaselines};
 
+    // Load pipeline traces to extract schema compliance data (if available).
+    let schema_compliance_inputs = {
+        use crate::meta_optimizer::agentic_metrics::schema_compliance::compliance_inputs_from_traces;
+        match crate::database::pipeline_traces::get_traces_for_task_run(&outcome.task_run_id) {
+            Ok(traces) => compliance_inputs_from_traces(&traces),
+            Err(_) => vec![],
+        }
+    };
+
     let input = DeterministicInput {
         task_run_id: outcome.task_run_id.clone(),
         status: outcome.status.clone(),
@@ -731,6 +742,7 @@ fn score_and_persist_agentic_metrics(
         error_type: outcome.error_type.clone(),
         tools_used: outcome.tools_used.clone(),
         agent_traces: vec![], // Pipeline traces loaded separately in Phase 2 backfill
+        schema_compliance_inputs,
     };
 
     // Load learned baselines (falls back to defaults if none persisted yet)

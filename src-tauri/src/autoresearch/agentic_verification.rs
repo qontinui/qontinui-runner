@@ -41,6 +41,7 @@
 //! | Authoring effort     | High (craft each check)     | Low (describe the goal)   |
 //! | Convergence signal   | Binary (pass/fail)          | Rich (partial progress)   |
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// The workflow execution architecture to use.
@@ -892,7 +893,7 @@ impl Default for MultiAgentPipelineConfig {
 
 /// An acceptance criterion produced by the Spec Analyst agent.
 /// Extends the spec assertion with dependency and location metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PipelineAcceptanceCriterion {
     /// Unique ID: "{spec_group_id}::{assertion_id}"
     pub id: String,
@@ -920,7 +921,7 @@ pub struct PipelineAcceptanceCriterion {
 }
 
 /// A node in the execution DAG, produced by the DAG Builder (deterministic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DAGNode {
     /// The acceptance criterion at this node.
     pub criterion_id: String,
@@ -936,7 +937,7 @@ pub struct DAGNode {
 
 /// An independent subtree of the execution DAG.
 /// Each subtree can be assigned to a separate implementer agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DAGSubtree {
     /// Unique subtree identifier.
     pub id: String,
@@ -951,7 +952,7 @@ pub struct DAGSubtree {
 }
 
 /// The full execution DAG produced by the DAG Builder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecutionDAG {
     /// All nodes, keyed by criterion ID.
     pub nodes: std::collections::HashMap<String, DAGNode>,
@@ -964,7 +965,7 @@ pub struct ExecutionDAG {
 }
 
 /// A code location identified by the Locator agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CodeLocation {
     /// File path relative to project root.
     pub path: String,
@@ -977,7 +978,7 @@ pub struct CodeLocation {
 }
 
 /// A criterion with its located code targets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LocatedCriterion {
     /// The acceptance criterion.
     pub criterion: PipelineAcceptanceCriterion,
@@ -1033,6 +1034,20 @@ pub struct PipelineAgentTrace {
     /// Handoff context received (if this agent was handed off to).
     #[serde(default)]
     pub handoff_received: Option<HandoffContext>,
+
+    // ── Schema compliance tracking fields (Phase 6) ──
+    /// Whether the output was valid against its JSON Schema on first attempt.
+    #[serde(default)]
+    pub schema_valid_first_attempt: Option<bool>,
+    /// Number of validation retries needed before output was valid.
+    #[serde(default)]
+    pub validation_retries: Option<i32>,
+    /// JSON array of coercions applied (serialized CoercionRecord summaries).
+    #[serde(default)]
+    pub coercions_applied: Option<String>,
+    /// JSON array of validation error type summaries.
+    #[serde(default)]
+    pub validation_error_summary: Option<String>,
 }
 
 fn default_span_type_agent() -> String {

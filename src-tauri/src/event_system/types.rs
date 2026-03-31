@@ -3,6 +3,7 @@
 //! This module defines the unified event types that are emitted to the frontend
 //! and WebSocket clients.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // Re-export FlowEvent from the flow executor module
@@ -12,7 +13,7 @@ pub use crate::orchestrator::flow_executor::FlowEvent as FlowEventData;
 ///
 /// All events emitted to the Tauri frontend should go through this enum
 /// to ensure consistent handling and error management.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "event_type", content = "data")]
 pub enum AppEvent {
     // ========================================================================
@@ -826,7 +827,7 @@ impl AppEvent {
 }
 
 /// Payload structure for executor events (for serialization compatibility).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecutorEventPayload {
     pub event_type: String,
     pub event: String,
@@ -836,7 +837,7 @@ pub struct ExecutorEventPayload {
 }
 
 /// Payload structure for executor responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecutorResponsePayload {
     pub resp_type: String,
     pub id: String,

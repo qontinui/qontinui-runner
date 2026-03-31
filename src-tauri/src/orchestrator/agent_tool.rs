@@ -26,6 +26,7 @@
 
 #![allow(dead_code)]
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -34,9 +35,8 @@ use std::collections::HashMap;
 // ============================================================================
 
 /// Type of a tool input or output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
-#[derive(Default)]
 pub enum ToolInputType {
     /// String value.
     String,
@@ -60,7 +60,7 @@ pub enum ToolInputType {
 }
 
 /// Definition of a tool input parameter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInput {
     /// Parameter name.
     pub name: String,
@@ -121,7 +121,7 @@ impl ToolInput {
 }
 
 /// Definition of a tool output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutput {
     /// Output name.
     pub name: String,

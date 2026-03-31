@@ -17,7 +17,7 @@ use super::specification::AcceptanceCriterion;
 // ============================================================================
 
 /// Complexity level of the generation task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ComplexityLevel {
     /// 0-1 criteria — trivial one-liner fix, config tweak, typo correction.

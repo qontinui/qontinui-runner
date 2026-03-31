@@ -4,9 +4,11 @@
 //! with recognized keys), then falls back to the existing marker-based parsing
 //! for backward compatibility. The raw output is always preserved.
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::agentic_output::{AgenticPhaseOutput, AgenticStatus, FindingOutput};
+use crate::validation::coercion::{apply_coercions, CoercionPolicy};
+use crate::validation::validator::SchemaValidator;
 
 /// Parse raw AI output into a structured `AgenticPhaseOutput`.
 ///
@@ -77,7 +79,43 @@ fn try_parse_json_summary(raw_output: &str) -> Option<AgenticPhaseOutput> {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
                 // Must have a "status" field to be recognized as agentic output
                 if value.get("status").is_some() {
-                    match serde_json::from_value::<AgenticPhaseOutput>(value) {
+                    // Apply schema validation with coercion
+                    let deserialize_value =
+                        match SchemaValidator::for_type::<AgenticPhaseOutput>() {
+                            Ok(validator) => {
+                                let result = validator.validate(&value);
+                                if result.valid {
+                                    value
+                                } else {
+                                    // Try coercion
+                                    let schema = crate::schema_registry::schema_as_json::<
+                                        AgenticPhaseOutput,
+                                    >();
+                                    let (coerced, records) = apply_coercions(
+                                        &value,
+                                        &schema,
+                                        CoercionPolicy::Lenient,
+                                    );
+                                    if !records.is_empty() {
+                                        debug!(
+                                            "Applied {} coercions to AgenticPhaseOutput",
+                                            records.len()
+                                        );
+                                    }
+                                    let coerced_result = validator.validate(&coerced);
+                                    if !coerced_result.valid {
+                                        warn!(
+                                            "AgenticPhaseOutput schema validation failed with {} errors (proceeding with best-effort deserialization)",
+                                            coerced_result.errors.len()
+                                        );
+                                    }
+                                    coerced
+                                }
+                            }
+                            Err(_) => value, // Schema compilation failed — use raw value
+                        };
+
+                    match serde_json::from_value::<AgenticPhaseOutput>(deserialize_value) {
                         Ok(mut parsed) => {
                             parsed.raw_output = raw_output.to_string();
                             // Also check for unfixable markers in raw output as a safety net

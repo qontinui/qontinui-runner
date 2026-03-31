@@ -621,10 +621,15 @@ impl AiMiddleware for SdkUrlSanitizer {
 ///
 /// This chain is applied around the hardener AI call to catch issues
 /// both before sending to the AI and after receiving the response.
+///
+/// `StructuredOutputMiddleware` is added last so that its `post_call`
+/// (which runs first in reverse order) validates the response against
+/// the expected JSON schema before other post-processing transforms.
 pub fn build_hardener_middleware() -> AiMiddlewareChain {
     AiMiddlewareChain::new()
         .add(CommandSanitizer)
         .add(SdkUrlSanitizer)
+        .add(crate::ai_provider::middleware::StructuredOutputMiddleware)
 }
 
 /// Deterministic fixup: replace `/ui-bridge/control/` with `/ui-bridge/sdk/` in command steps
