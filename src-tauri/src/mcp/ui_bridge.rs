@@ -6776,6 +6776,34 @@ pub async fn ui_bridge_element_reliability_handler(
 // Convenience endpoints — app-agnostic DOM interaction helpers
 // =========================================================================
 
+/// Evaluate a JS expression, trying IPC first then direct WebView eval.
+/// Returns the raw string result from the evaluation.
+async fn evaluate_js_expression(
+    state: &Arc<ApiState>,
+    expression: &str,
+) -> Result<String, String> {
+    let payload = serde_json::json!({ "expression": expression });
+
+    // Try IPC path first (uses SDK event handlers, fastest)
+    match ui_bridge_request_sync(state, "page_evaluate", payload).await {
+        Ok(data) => {
+            // Extract the result value from the IPC response
+            if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
+                match result {
+                    serde_json::Value::String(s) => Ok(s.clone()),
+                    other => Ok(other.to_string()),
+                }
+            } else {
+                Ok(data.to_string())
+            }
+        }
+        Err(_ipc_err) => {
+            // Fallback to direct WebView evaluation
+            direct_webview_evaluate_with_result(state, expression).await
+        }
+    }
+}
+
 /// Find elements by visible text content.
 /// POST /ui-bridge/control/page/find-by-text
 /// Body: { "text": "Submit", "tag": "button", "exact": true }
@@ -6820,7 +6848,7 @@ pub async fn ui_bridge_find_by_text_handler(
         match_expr = match_expr
     );
 
-    match direct_webview_evaluate_with_result(&state, &js).await {
+    match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::Value::Array(vec![]));
@@ -6886,7 +6914,7 @@ pub async fn ui_bridge_click_by_text_handler(
         index = index
     );
 
-    match direct_webview_evaluate_with_result(&state, &js).await {
+    match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
@@ -6940,7 +6968,7 @@ pub async fn ui_bridge_click_by_selector_handler(
         index = index
     );
 
-    match direct_webview_evaluate_with_result(&state, &js).await {
+    match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
@@ -6996,7 +7024,7 @@ pub async fn ui_bridge_read_value_handler(
         index = index
     );
 
-    match direct_webview_evaluate_with_result(&state, &js).await {
+    match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
@@ -7073,7 +7101,7 @@ pub async fn ui_bridge_type_into_handler(
         text = escaped_text
     );
 
-    match direct_webview_evaluate_with_result(&state, &js).await {
+    match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::json!({"typed": false, "error": "Parse error"}));
@@ -7108,7 +7136,7 @@ pub async fn ui_bridge_page_summary_handler(
         }
     })"#;
 
-    match direct_webview_evaluate_with_result(&state, js).await {
+    match evaluate_js_expression(&state, js).await {
         Ok(result) => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&result).unwrap_or(serde_json::json!({"error": "Parse error"}));
