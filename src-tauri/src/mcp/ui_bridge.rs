@@ -7117,24 +7117,27 @@ pub async fn ui_bridge_page_summary_handler(
     State(state): State<Arc<ApiState>>,
     Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let js = r#"JSON.stringify({
-        title: document.title,
-        url: window.location.href,
-        headings: Array.from(document.querySelectorAll('h1, h2, h3')).filter(el => el.offsetParent !== null).map(el => ({ tag: el.tagName, text: el.textContent.trim().slice(0, 100) })).slice(0, 10),
-        buttons: Array.from(document.querySelectorAll('button')).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0).map(el => el.textContent.trim().slice(0, 40)).filter(t => t.length < 30).slice(0, 20),
-        inputs: Array.from(document.querySelectorAll('input, textarea, select')).filter(el => el.offsetParent !== null).map(el => ({ tag: el.tagName, type: el.type || null, placeholder: el.placeholder?.slice(0, 40) || null, hasValue: (el.value || '').length > 0 })).slice(0, 15),
-        links: Array.from(document.querySelectorAll('a[href]')).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0).map(el => ({ text: el.textContent.trim().slice(0, 40), href: el.getAttribute('href')?.slice(0, 60) })).slice(0, 15),
-        modals: Array.from(document.querySelectorAll('[role="dialog"], [class*="modal"]')).filter(el => el.offsetParent !== null).map(el => el.textContent.trim().slice(0, 100)).slice(0, 3),
-        errors: Array.from(document.querySelectorAll('[role="alert"], [class*="error"], [class*="Error"]')).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0).map(el => el.textContent.trim().slice(0, 100)).slice(0, 5),
-        elementCounts: {
-            buttons: document.querySelectorAll('button').length,
-            inputs: document.querySelectorAll('input').length,
-            textareas: document.querySelectorAll('textarea').length,
-            selects: document.querySelectorAll('select').length,
-            links: document.querySelectorAll('a').length,
-            images: document.querySelectorAll('img').length
-        }
-    })"#;
+    let js = r#"(() => {
+        var vis = function(sel) { return Array.from(document.querySelectorAll(sel)).filter(function(el) { return el.offsetParent !== null; }); };
+        return JSON.stringify({
+            title: document.title,
+            url: window.location.href,
+            headings: vis('h1, h2, h3').map(function(el) { return { tag: el.tagName, text: el.textContent.trim().slice(0, 100) }; }).slice(0, 10),
+            buttons: vis('button').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return el.textContent.trim().slice(0, 40); }).filter(function(t) { return t.length < 30; }).slice(0, 20),
+            inputs: vis('input, textarea, select').map(function(el) { return { tag: el.tagName, type: el.type || null, placeholder: (el.placeholder || '').slice(0, 40) || null, hasValue: (el.value || '').length > 0 }; }).slice(0, 15),
+            links: vis('a[href]').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return { text: el.textContent.trim().slice(0, 40), href: (el.getAttribute('href') || '').slice(0, 60) }; }).slice(0, 15),
+            modals: vis('[role="dialog"]').map(function(el) { return el.textContent.trim().slice(0, 100); }).slice(0, 3),
+            errors: vis('[role="alert"]').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return el.textContent.trim().slice(0, 100); }).slice(0, 5),
+            elementCounts: {
+                buttons: document.querySelectorAll('button').length,
+                inputs: document.querySelectorAll('input').length,
+                textareas: document.querySelectorAll('textarea').length,
+                selects: document.querySelectorAll('select').length,
+                links: document.querySelectorAll('a').length,
+                images: document.querySelectorAll('img').length
+            }
+        });
+    })()"#;
 
     match evaluate_js_expression(&state, js).await {
         Ok(result) => {
