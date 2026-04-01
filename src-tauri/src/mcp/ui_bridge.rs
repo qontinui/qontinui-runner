@@ -6787,6 +6787,13 @@ async fn evaluate_js_expression(
     // Try IPC path first (uses SDK event handlers, fastest)
     match ui_bridge_request_sync(state, "page_evaluate", payload).await {
         Ok(data) => {
+            // Check for inner error (e.g., "Expression rejected: contains prohibited pattern")
+            if data.get("success") == Some(&serde_json::Value::Bool(false))
+                || data.get("error").is_some()
+            {
+                // IPC returned an error — fall back to direct eval
+                return direct_webview_evaluate_with_result(state, expression).await;
+            }
             // Extract the result value from the IPC response
             if let Some(result) = data.get("result").and_then(|r| r.get("value")) {
                 match result {
@@ -7121,7 +7128,7 @@ pub async fn ui_bridge_page_summary_handler(
         var vis = function(sel) { return Array.from(document.querySelectorAll(sel)).filter(function(el) { return el.offsetParent !== null; }); };
         return JSON.stringify({
             title: document.title,
-            url: window.location.href,
+            url: document.URL,
             headings: vis('h1, h2, h3').map(function(el) { return { tag: el.tagName, text: el.textContent.trim().slice(0, 100) }; }).slice(0, 10),
             buttons: vis('button').filter(function(el) { return el.textContent.trim().length > 0; }).map(function(el) { return el.textContent.trim().slice(0, 40); }).filter(function(t) { return t.length < 30; }).slice(0, 20),
             inputs: vis('input, textarea, select').map(function(el) { return { tag: el.tagName, type: el.type || null, placeholder: (el.placeholder || '').slice(0, 40) || null, hasValue: (el.value || '').length > 0 }; }).slice(0, 15),
