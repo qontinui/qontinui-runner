@@ -168,7 +168,7 @@ impl StepExecutor {
     ///
     /// This shares the executor's state (runtime_context, shared_variables)
     /// with the handlers to maintain consistency during step execution.
-    pub(crate) fn create_handler_context(&self) -> HandlerContext {
+    pub(crate) async fn create_handler_context(&self) -> HandlerContext {
         // Resolve the security policy from settings (workflow overrides will be added later)
         let security_settings = crate::settings::get_security_settings();
         let security_policy =
@@ -208,6 +208,26 @@ impl StepExecutor {
             let cred_proxy =
                 crate::security::credential_proxy::CredentialProxy::new(&cred_names);
             ctx = ctx.with_credential_placeholders(cred_proxy.placeholder_env_vars());
+        }
+
+        // Start network mediation proxy when enabled
+        if security_settings.network_proxy_enabled {
+            match crate::security::network_proxy::NetworkMediator::start(
+                security_policy.clone(),
+                crate::security::audit::AuditLogger::new(security_settings.audit_enabled),
+                None,
+            )
+            .await
+            {
+                Ok(mediator) => {
+                    let proxy_url = mediator.proxy_url_for_container();
+                    info!("Network mediation proxy started at {}", proxy_url);
+                    ctx = ctx.with_network_proxy_url(proxy_url);
+                }
+                Err(e) => {
+                    warn!("Failed to start network mediation proxy: {}", e);
+                }
+            }
         }
 
         ctx
@@ -1079,7 +1099,7 @@ impl StepExecutor {
             &step.step_type
         };
         if let Some(handler) = self.handler_registry.get(lookup_type) {
-            let context = self.create_handler_context();
+            let context = self.create_handler_context().await;
             let result = handler.execute(step, &context).await;
             return (
                 result.success,

@@ -399,6 +399,31 @@ pub fn create_router(
         });
     }
 
+    // One-time audit event cleanup based on audit_retention_days setting
+    {
+        let pg_db = api_state.app_state.pg_db.clone();
+        tokio::spawn(async move {
+            // Wait for server startup to settle
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            let settings = crate::settings::get_security_settings();
+            if settings.audit_retention_days > 0 {
+                match pg_db.cleanup_old_audit_events(settings.audit_retention_days).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!(
+                            "Cleaned up {} old audit events (retention: {} days)",
+                            n,
+                            settings.audit_retention_days
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Audit event cleanup failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Start trigger service (event-driven workflow automation)
     {
         let trigger_app_state = api_state.app_state.clone();

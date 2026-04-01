@@ -375,7 +375,7 @@ impl StepExecutor {
                         }
                         "prompt" => {
                             // AI Review verification step — dispatch via handler with iteration context
-                            let mut handler_ctx = self.create_handler_context();
+                            let mut handler_ctx = self.create_handler_context().await;
                             handler_ctx.iteration = Some(iteration);
                             let handler = super::handlers::PromptStepHandler;
                             let result = handler.execute(step, &handler_ctx).await;
