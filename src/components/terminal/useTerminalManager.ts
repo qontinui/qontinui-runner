@@ -89,9 +89,7 @@ export function useTerminalManager(pageId: string = "default") {
       if (!terminals || terminals.length === 0) return null;
 
       // Filter to terminals belonging to this page
-      const pageTerminals = terminals.filter(
-        (t) => (t.page_id || "default") === pageId,
-      );
+      const pageTerminals = terminals.filter((t) => (t.page_id || "default") === pageId);
 
       // Only reconnect to alive sessions; silently close dead ones
       const dead = pageTerminals.filter((t) => !t.is_alive);

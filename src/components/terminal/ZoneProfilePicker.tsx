@@ -212,10 +212,12 @@ export function ZoneProfilePicker({
                       <div className="text-[11px] text-[#c0caf5] truncate">{name}</div>
                       <div className="text-[9px] text-[#565f89]">
                         {p.layoutId} · {labelCount} label{labelCount !== 1 ? "s" : ""}
-                        {p.pins.length > 0 && ` · ${p.pins.length} pin${p.pins.length !== 1 ? "s" : ""}`}
+                        {p.pins.length > 0 &&
+                          ` · ${p.pins.length} pin${p.pins.length !== 1 ? "s" : ""}`}
                         {p.sessions && p.sessions.length > 0 && (
                           <span className="text-[#7aa2f7]">
-                            {" "}· {p.sessions.length} session{p.sessions.length !== 1 ? "s" : ""}
+                            {" "}
+                            · {p.sessions.length} session{p.sessions.length !== 1 ? "s" : ""}
                           </span>
                         )}
                       </div>

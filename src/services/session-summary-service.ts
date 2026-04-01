@@ -178,9 +178,7 @@ class SessionSummaryService {
   /**
    * Fetch a summary of task run events for the given action ID.
    */
-  private async fetchEventSummary(
-    actionId: string,
-  ): Promise<{
+  private async fetchEventSummary(actionId: string): Promise<{
     errorCount: number;
     actionCount: number;
     stateChanges: number;

@@ -110,7 +110,9 @@ const BASE_WORKSPACES_STORAGE_KEY = "qontinui-workspaces";
 const MAX_WORKSPACES = 10;
 
 function workspacesStorageKey(pageId: string): string {
-  return pageId === "default" ? BASE_WORKSPACES_STORAGE_KEY : `page:${pageId}:${BASE_WORKSPACES_STORAGE_KEY}`;
+  return pageId === "default"
+    ? BASE_WORKSPACES_STORAGE_KEY
+    : `page:${pageId}:${BASE_WORKSPACES_STORAGE_KEY}`;
 }
 
 // ---------------------------------------------------------------------------

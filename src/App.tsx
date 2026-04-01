@@ -402,7 +402,9 @@ function AppContent() {
                 errorMonitorScope={errorMonitorScope}
                 clearErrorMonitorScope={clearErrorMonitorScope}
               />
-              <div className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}>
+              <div
+                className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}
+              >
                 <TerminalPageTabBar
                   pages={terminalPages.pages}
                   activePageId={terminalPages.activePageId}

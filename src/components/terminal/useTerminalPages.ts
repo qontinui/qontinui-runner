@@ -54,9 +54,10 @@ export function useTerminalPages() {
 
       // Close all PTYs belonging to this page
       try {
-        const result = await invoke<{ success: boolean; data?: { terminals: Array<{ id: string; page_id: string }> } }>(
-          "terminal_list",
-        );
+        const result = await invoke<{
+          success: boolean;
+          data?: { terminals: Array<{ id: string; page_id: string }> };
+        }>("terminal_list");
         if (result.success && result.data) {
           const pageTerminals = result.data.terminals.filter(
             (t) => (t.page_id || "default") === id,

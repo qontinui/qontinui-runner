@@ -840,8 +840,6 @@ export function HookGenerationPanel({
           chainToDemoScript(page.route, signal);
         }
       }
-
-       
     },
     [projectPath, analysis.framework, isRegenSpec, includeArchSpec],
   );
