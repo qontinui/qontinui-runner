@@ -13,6 +13,13 @@ function isValidSessionId(id: string): boolean {
   return SESSION_ID_RE.test(id);
 }
 
+/** Validate config dir paths — reject shell metacharacters. */
+const SAFE_PATH_RE = /^[a-zA-Z0-9_\-./\\: ]+$/;
+function sanitizeConfigDir(dir: string | undefined): string | undefined {
+  if (!dir) return undefined;
+  return SAFE_PATH_RE.test(dir) ? dir : undefined;
+}
+
 interface UseTerminalInitializationParams {
   tabs: TerminalTab[];
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
@@ -159,15 +166,16 @@ export function useTerminalInitialization({
 
             // Merge Claude session ID into the reconnected tab and queue resume
             if (tabId && session.claudeSessionId && isValidSessionId(session.claudeSessionId)) {
+              const safeConfigDir = sanitizeConfigDir(session.claudeConfigDir);
               updateTab(tabId, {
                 claudeSessionId: session.claudeSessionId,
-                claudeConfigDir: session.claudeConfigDir,
+                claudeConfigDir: safeConfigDir,
               });
               pendingRestoresRef.current.push({
                 tabId,
                 isClaudeSession: true,
                 claudeSessionId: session.claudeSessionId,
-                claudeConfigDir: session.claudeConfigDir,
+                claudeConfigDir: safeConfigDir,
               });
             }
           }
@@ -255,13 +263,13 @@ export function useTerminalInitialization({
                 scrollbackPath: session.scrollbackPath,
                 isClaudeSession: session.isClaudeSession,
                 claudeSessionId: session.claudeSessionId,
-                claudeConfigDir: session.claudeConfigDir,
+                claudeConfigDir: sanitizeConfigDir(session.claudeConfigDir),
               });
             }
             if (tabId && session.claudeSessionId) {
               updateTab(tabId, {
                 claudeSessionId: session.claudeSessionId,
-                claudeConfigDir: session.claudeConfigDir,
+                claudeConfigDir: sanitizeConfigDir(session.claudeConfigDir),
               });
             }
           }
@@ -278,13 +286,13 @@ export function useTerminalInitialization({
                 scrollbackPath: session.scrollbackPath,
                 isClaudeSession: session.isClaudeSession,
                 claudeSessionId: session.claudeSessionId,
-                claudeConfigDir: session.claudeConfigDir,
+                claudeConfigDir: sanitizeConfigDir(session.claudeConfigDir),
               });
             }
             if (tabId && session.claudeSessionId) {
               updateTab(tabId, {
                 claudeSessionId: session.claudeSessionId,
-                claudeConfigDir: session.claudeConfigDir,
+                claudeConfigDir: sanitizeConfigDir(session.claudeConfigDir),
               });
             }
           }

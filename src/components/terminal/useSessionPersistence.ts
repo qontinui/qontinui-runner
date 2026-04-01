@@ -94,73 +94,76 @@ export function useSessionPersistence(pageId: string = "default") {
     };
   }, []);
 
-  const saveSessionLayout = useCallback((params: SaveSessionLayoutParams) => {
-    if (debounceTimer.current !== null) {
-      clearTimeout(debounceTimer.current);
-    }
+  const saveSessionLayout = useCallback(
+    (params: SaveSessionLayoutParams) => {
+      if (debounceTimer.current !== null) {
+        clearTimeout(debounceTimer.current);
+      }
 
-    debounceTimer.current = setTimeout(() => {
-      const { layoutId, tabs, assignments, zoneLabels, zoneNotes, pinnedZones, focusedZone } =
-        params;
+      debounceTimer.current = setTimeout(() => {
+        const { layoutId, tabs, assignments, zoneLabels, zoneNotes, pinnedZones, focusedZone } =
+          params;
 
-      const now = Date.now();
-      const tabsById = new Map(tabs.map((t) => [t.id, t]));
-      const assignedTabIds = new Set<string>();
-      const sessions: SavedSessionConfig[] = [];
+        const now = Date.now();
+        const tabsById = new Map(tabs.map((t) => [t.id, t]));
+        const assignedTabIds = new Set<string>();
+        const sessions: SavedSessionConfig[] = [];
 
-      // Build configs for assigned zones
-      for (const [zoneIndexStr, tabId] of Object.entries(assignments)) {
-        const zoneIndex = Number(zoneIndexStr);
-        const tab = tabsById.get(tabId);
-        if (!tab) continue;
+        // Build configs for assigned zones
+        for (const [zoneIndexStr, tabId] of Object.entries(assignments)) {
+          const zoneIndex = Number(zoneIndexStr);
+          const tab = tabsById.get(tabId);
+          if (!tab) continue;
 
-        assignedTabIds.add(tabId);
-        sessions.push({
-          title: tab.title,
-          workingDir: tab.workingDir,
-          zoneIndex,
-          label: zoneLabels[zoneIndex] || undefined,
-          notes: zoneNotes[zoneIndex] || undefined,
-          pinned: pinnedZones.has(zoneIndex) || undefined,
+          assignedTabIds.add(tabId);
+          sessions.push({
+            title: tab.title,
+            workingDir: tab.workingDir,
+            zoneIndex,
+            label: zoneLabels[zoneIndex] || undefined,
+            notes: zoneNotes[zoneIndex] || undefined,
+            pinned: pinnedZones.has(zoneIndex) || undefined,
+            savedAt: now,
+            isClaudeSession: !!tab.claudeSessionId,
+            claudeSessionId: tab.claudeSessionId,
+            claudeConfigDir: tab.claudeConfigDir,
+            type: tab.type,
+            planFilePath: tab.planFilePath,
+          });
+        }
+
+        // Include unassigned tabs at the end with zoneIndex: -1
+        for (const tab of tabs) {
+          if (assignedTabIds.has(tab.id)) continue;
+          sessions.push({
+            title: tab.title,
+            workingDir: tab.workingDir,
+            zoneIndex: -1,
+            savedAt: now,
+            isClaudeSession: !!tab.claudeSessionId,
+            claudeSessionId: tab.claudeSessionId,
+            claudeConfigDir: tab.claudeConfigDir,
+            type: tab.type,
+            planFilePath: tab.planFilePath,
+          });
+        }
+
+        const layout: SavedSessionLayout = {
+          layoutId,
+          sessions,
           savedAt: now,
-          isClaudeSession: !!tab.claudeSessionId,
-          claudeSessionId: tab.claudeSessionId,
-          claudeConfigDir: tab.claudeConfigDir,
-          type: tab.type,
-          planFilePath: tab.planFilePath,
-        });
-      }
+          focusedZone,
+        };
 
-      // Include unassigned tabs at the end with zoneIndex: -1
-      for (const tab of tabs) {
-        if (assignedTabIds.has(tab.id)) continue;
-        sessions.push({
-          title: tab.title,
-          workingDir: tab.workingDir,
-          zoneIndex: -1,
-          savedAt: now,
-          isClaudeSession: !!tab.claudeSessionId,
-          claudeSessionId: tab.claudeSessionId,
-          claudeConfigDir: tab.claudeConfigDir,
-          type: tab.type,
-          planFilePath: tab.planFilePath,
-        });
-      }
-
-      const layout: SavedSessionLayout = {
-        layoutId,
-        sessions,
-        savedAt: now,
-        focusedZone,
-      };
-
-      try {
-        instanceStorage.setJSON(key, layout);
-      } catch {
-        // storage may be full or unavailable — silently ignore
-      }
-    }, DEBOUNCE_MS);
-  }, []);
+        try {
+          instanceStorage.setJSON(key, layout);
+        } catch {
+          // storage may be full or unavailable — silently ignore
+        }
+      }, DEBOUNCE_MS);
+    },
+    [key],
+  );
 
   /**
    * Save scrollback buffers for all active terminals to disk.
@@ -223,16 +226,16 @@ export function useSessionPersistence(pageId: string = "default") {
         // Best-effort
       }
     },
-    [],
+    [key],
   );
 
   const getSavedLayout = useCallback((): SavedSessionLayout | null => {
     return instanceStorage.getJSON<SavedSessionLayout | null>(key, null);
-  }, []);
+  }, [key]);
 
   const clearSavedLayout = useCallback(() => {
     instanceStorage.removeItem(key);
-  }, []);
+  }, [key]);
 
   const hasSavedLayout = useCallback((): boolean => {
     const layout = getSavedLayout();
