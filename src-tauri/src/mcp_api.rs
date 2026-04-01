@@ -283,9 +283,6 @@ pub fn create_router(
         // Small delay to let the server fully start
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // TODO: mark_running_ai_sessions_interrupted removed during PgDb migration
-        // Interrupted session detection now handled differently.
-
         // Note: We no longer use global_auto_continue here.
         // Each workflow's per-task auto_continue setting determines whether it gets resumed.
         // The global setting is now only used for the UI toggle, not startup resume logic.

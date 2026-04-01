@@ -393,5 +393,3 @@ export function InlineProgressBar({
     </div>
   );
 }
-
-export default ProgressBar;
