@@ -1,4 +1,3 @@
-import type { TraceSpan } from "./types";
 import type { TraceImportAdapter } from "./trace-import-adapter";
 
 /**

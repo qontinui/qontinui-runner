@@ -187,7 +187,7 @@ export interface TestFileInfo {
  * Count test assertions in file content.
  */
 export function countTestAssertions(content: string): number {
-  const patterns = [/\bexpect\s*\(/g, /\bassert\s*[\.(]/g, /\bit\s*\(/g, /\btest\s*\(/g];
+  const patterns = [/\bexpect\s*\(/g, /\bassert\s*[.(]/g, /\bit\s*\(/g, /\btest\s*\(/g];
   return patterns.reduce((count, pattern) => {
     const matches = content.match(pattern);
     return count + (matches?.length ?? 0);

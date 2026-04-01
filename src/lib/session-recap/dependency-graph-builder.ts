@@ -30,17 +30,6 @@ const LANGUAGE_COLORS: Record<string, string> = {
   other: "#9CA3AF",
 };
 
-const CATEGORY_LAYER: Record<string, number> = {
-  frontend: 0,
-  backend: 1,
-  database: 2,
-  python: 3,
-  test: 1,
-  config: 1,
-  spec: 0,
-  other: 1,
-};
-
 const NODE_WIDTH = 220;
 const NODE_HEIGHT = 50;
 const TYPE_NODE_WIDTH = 160;
