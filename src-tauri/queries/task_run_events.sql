@@ -9,22 +9,31 @@ VALUES (:task_run_id, :event_type, :event_subtype, :message, :data,
 RETURNING id;
 
 --! get_task_run_events_all
-SELECT id, task_run_id, event_type, event_subtype, message, data,
-       workflow_name, state_name, action_id, timestamp, duration_ms
+SELECT id, task_run_id, COALESCE(event_type, '') as event_type,
+       COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message,
+       COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name,
+       COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id,
+       COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms
 FROM task_run_events
 WHERE task_run_id = :task_run_id
 ORDER BY timestamp ASC;
 
 --! get_task_run_events_by_type
-SELECT id, task_run_id, event_type, event_subtype, message, data,
-       workflow_name, state_name, action_id, timestamp, duration_ms
+SELECT id, task_run_id, COALESCE(event_type, '') as event_type,
+       COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message,
+       COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name,
+       COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id,
+       COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms
 FROM task_run_events
 WHERE task_run_id = :task_run_id AND event_type = :event_type
 ORDER BY timestamp ASC;
 
 --! get_task_run_events_limited
-SELECT id, task_run_id, event_type, event_subtype, message, data,
-       workflow_name, state_name, action_id, timestamp, duration_ms
+SELECT id, task_run_id, COALESCE(event_type, '') as event_type,
+       COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message,
+       COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name,
+       COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id,
+       COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms
 FROM task_run_events
 WHERE task_run_id = :task_run_id
 ORDER BY timestamp ASC

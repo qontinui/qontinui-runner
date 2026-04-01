@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo, type ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { List, useListRef, type RowComponentProps } from "react-window";
 import { cn } from "../../lib/utils";
 import { Search, ArrowDown, Trash2, Wand2, Hammer } from "lucide-react";
 
@@ -8,6 +9,28 @@ interface OutputLine {
   timestamp: string;
   stream: "stdout" | "stderr";
   line: string;
+}
+
+interface OutputRowProps {
+  lines: OutputLine[];
+}
+
+function OutputRow({ index, style, lines }: RowComponentProps<OutputRowProps>): ReactElement {
+  const line = lines[index];
+  return (
+    <div
+      style={style}
+      className={cn(
+        "whitespace-nowrap overflow-hidden text-ellipsis px-2",
+        line.stream === "stderr" ? "text-red-400/80" : "text-zinc-300",
+      )}
+    >
+      <span className="text-zinc-600 select-none mr-2">
+        {new Date(line.timestamp).toLocaleTimeString()}
+      </span>
+      {line.line}
+    </div>
+  );
 }
 
 interface ProcessOutputViewerProps {
@@ -36,8 +59,10 @@ export function ProcessOutputViewer({
   const [lines, setLines] = useState<OutputLine[]>([]);
   const [searchText, setSearchText] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const listRef = useListRef(null);
+  const scrollableRef = listRef as React.RefObject<{ scrollToRow: (config: { index: number; align?: string }) => void } | null>;
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const LINE_HEIGHT = 20;
 
   // Load initial output
   useEffect(() => {
@@ -77,37 +102,46 @@ export function ProcessOutputViewer({
     };
   }, [processId]);
 
-  // Auto-scroll to bottom
-  useEffect(() => {
-    if (autoScroll && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [lines, autoScroll]);
+  const filteredLines = useMemo(
+    () =>
+      searchText
+        ? lines.filter((l) => l.line.toLowerCase().includes(searchText.toLowerCase()))
+        : lines,
+    [lines, searchText],
+  );
 
-  const handleScroll = useCallback(() => {
-    if (!scrollRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
-    const isNearBottom = scrollHeight - scrollTop - clientHeight < 50;
-    setAutoScroll(isNearBottom);
-  }, []);
+  // Auto-scroll to bottom using react-window
+  useEffect(() => {
+    if (autoScroll && filteredLines.length > 0) {
+      scrollableRef.current?.scrollToRow({ index: filteredLines.length - 1, align: "end" });
+    }
+  }, [filteredLines.length, autoScroll, scrollableRef]);
+
+  const handleRowsRendered = useCallback(
+    (
+      _visibleRows: { startIndex: number; stopIndex: number },
+      allRows: { startIndex: number; stopIndex: number },
+    ) => {
+      // If the last rendered row is the last item, we're at the bottom
+      const isAtBottom = allRows.stopIndex >= filteredLines.length - 1;
+      setAutoScroll(isAtBottom);
+    },
+    [filteredLines.length],
+  );
 
   const clearOutput = useCallback(() => {
     setLines([]);
   }, []);
 
   const scrollToBottom = useCallback(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-      setAutoScroll(true);
+    if (filteredLines.length > 0) {
+      scrollableRef.current?.scrollToRow({ index: filteredLines.length - 1, align: "end" });
     }
-  }, []);
-
-  const filteredLines = searchText
-    ? lines.filter((l) => l.line.toLowerCase().includes(searchText.toLowerCase()))
-    : lines;
+    setAutoScroll(true);
+  }, [filteredLines.length, scrollableRef]);
 
   return (
-    <div className={cn("flex flex-col h-full", className)}>
+    <div className={cn("flex flex-col h-full relative", className)}>
       {/* Toolbar */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-white/10">
         <div className="relative flex-1">
@@ -169,12 +203,8 @@ export function ProcessOutputViewer({
         <span className="text-xs text-zinc-600">{lines.length} lines</span>
       </div>
 
-      {/* Output area */}
-      <div
-        ref={scrollRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-auto font-mono text-xs leading-5 p-2 bg-zinc-950"
-      >
+      {/* Virtualized output area */}
+      <div className="flex-1 font-mono text-xs leading-5 bg-zinc-950">
         {filteredLines.length === 0 ? (
           <div className="flex items-center justify-center h-full text-zinc-600">
             {lines.length === 0
@@ -182,20 +212,16 @@ export function ProcessOutputViewer({
               : "No matching lines."}
           </div>
         ) : (
-          filteredLines.map((line, i) => (
-            <div
-              key={`${line.timestamp}-${i}`}
-              className={cn(
-                "whitespace-pre-wrap break-all",
-                line.stream === "stderr" ? "text-red-400/80" : "text-zinc-300",
-              )}
-            >
-              <span className="text-zinc-600 select-none mr-2">
-                {new Date(line.timestamp).toLocaleTimeString()}
-              </span>
-              {line.line}
-            </div>
-          ))
+          <List
+            listRef={listRef}
+            rowCount={filteredLines.length}
+            rowHeight={LINE_HEIGHT}
+            rowComponent={OutputRow}
+            rowProps={{ lines: filteredLines }}
+            overscanCount={20}
+            onRowsRendered={handleRowsRendered}
+            style={{ width: "100%", height: "100%" }}
+          />
         )}
       </div>
 

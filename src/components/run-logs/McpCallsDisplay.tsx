@@ -1,12 +1,19 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { Loader2, AlertCircle, ChevronDown, ChevronRight, Wifi } from "lucide-react";
 import { useTaskRunMcpCalls } from "../../hooks/useAiData";
 import type { TaskRunMcpCallDb } from "../../types/mcp-config";
 import { parseJson } from "./ai-data-viewer-utils";
 
+const PAGE_SIZE = 50;
+
 export function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
-  const { data: mcpData, isLoading, error } = useTaskRunMcpCalls(taskRunId);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const { data: mcpData, isLoading, error } = useTaskRunMcpCalls(taskRunId, undefined, pageSize);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const loadMore = useCallback(() => {
+    setPageSize((prev) => prev + PAGE_SIZE);
+  }, []);
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -151,6 +158,15 @@ export function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
             </div>
           );
         })}
+        {mcpData.has_more && (
+          <button
+            onClick={loadMore}
+            className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+          >
+            <ChevronDown className="w-3 h-3" />
+            Show more ({mcpData.count - mcpData.calls.length} remaining)
+          </button>
+        )}
       </div>
     </div>
   );

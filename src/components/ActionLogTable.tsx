@@ -21,9 +21,12 @@
  * has been moved to the backend DisplayProfile system.
  */
 
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import { ActionLogEntry } from "../types/displayProfile";
 import { getAccentColors, getStatusColors } from "@/design-system";
+
+const ROWS_PAGE_SIZE = 500;
+const MAX_VISIBLE_ROWS = 2000;
 
 /**
  * Props for the ActionLogTable component
@@ -622,6 +625,12 @@ export default function ActionLogTable({
   // Maximum level to display (default: 2)
   const [maxLevel, setMaxLevel] = useState<number>(2);
 
+  // Hard cap on visible rows to prevent OOM
+  const [rowLimit, setRowLimit] = useState(ROWS_PAGE_SIZE);
+  const loadMoreRows = useCallback(() => {
+    setRowLimit((prev) => Math.min(prev + ROWS_PAGE_SIZE, MAX_VISIBLE_ROWS));
+  }, []);
+
   // Toggle expand/collapse for an action
   const toggleExpand = (actionId: string) => {
     setCollapsedActions((prev) => {
@@ -817,7 +826,7 @@ export default function ActionLogTable({
 
         {/* Table Body */}
         <tbody>
-          {visibleActions.map((action, index) => {
+          {visibleActions.slice(0, rowLimit).map((action, index) => {
             const level = getNestingLevel(action);
             const levelColors = getLevelColor(level);
             const isEven = index % 2 === 0;
@@ -959,6 +968,22 @@ export default function ActionLogTable({
           })}
         </tbody>
       </table>
+      {rowLimit < visibleActions.length && (
+        <div className="mt-2 flex items-center justify-center">
+          {rowLimit >= MAX_VISIBLE_ROWS ? (
+            <span className="px-4 py-2 text-xs text-muted-foreground">
+              Showing {rowLimit} of {visibleActions.length} rows (max cap reached)
+            </span>
+          ) : (
+            <button
+              onClick={loadMoreRows}
+              className="px-4 py-2 text-xs text-muted-foreground hover:text-foreground border border-border rounded hover:bg-muted/50 transition-colors"
+            >
+              Show more rows ({visibleActions.length - rowLimit} remaining)
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

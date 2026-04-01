@@ -3,10 +3,17 @@
  *
  * Displays a chronological timeline of pipeline events for a task run,
  * showing event types, phases, durations, and token usage.
+ *
+ * Virtualized with react-window to handle large event lists efficiently.
  */
 
-import { Clock, Zap } from "lucide-react";
+import { useState, useCallback, type ReactElement } from "react";
+import { Clock, Zap, ChevronDown } from "lucide-react";
+import { List, useListRef, type RowComponentProps } from "react-window";
 import type { PipelineEvent } from "../../hooks/useGraphAnalytics";
+
+const EVENT_ROW_HEIGHT = 56;
+const EVENTS_PER_PAGE = 50;
 
 interface PipelineEventsTimelineProps {
   events?: PipelineEvent[];
@@ -30,7 +37,12 @@ function getPhaseColor(phase: string | null): string {
   return "bg-muted-foreground";
 }
 
-function EventRow({ event }: { event: PipelineEvent }) {
+interface EventRowProps {
+  events: PipelineEvent[];
+}
+
+function EventRow({ index, style, events }: RowComponentProps<EventRowProps>): ReactElement {
+  const event = events[index];
   const created = new Date(event.created_at).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
@@ -38,7 +50,7 @@ function EventRow({ event }: { event: PipelineEvent }) {
   });
 
   return (
-    <div className="flex items-start gap-3 py-2">
+    <div style={style} className="flex items-start gap-3 py-2 px-1">
       <div className="flex flex-col items-center mt-1">
         <div className={`w-2.5 h-2.5 rounded-full ${getPhaseColor(event.phase)}`} />
         <div className="w-px h-full bg-border" />
@@ -81,11 +93,28 @@ function EventRow({ event }: { event: PipelineEvent }) {
 }
 
 export function PipelineEventsTimeline({ events = [], isLoading }: PipelineEventsTimelineProps) {
+  const [visibleCount, setVisibleCount] = useState(EVENTS_PER_PAGE);
+  const listRef = useListRef(null);
+
+  const displayEvents = events.slice(0, visibleCount);
+  const hasMore = visibleCount < events.length;
+
+  const loadMore = useCallback(() => {
+    setVisibleCount((prev) => Math.min(prev + EVENTS_PER_PAGE, events.length));
+  }, [events.length]);
+
+  const listHeight = Math.min(displayEvents.length * EVENT_ROW_HEIGHT, 384);
+
   return (
     <div className="bg-card rounded-lg border border-border p-4">
       <h3 className="font-semibold mb-4 flex items-center gap-2">
         <Zap className="w-4 h-4" />
         Pipeline Events
+        {events.length > 0 && (
+          <span className="text-xs font-normal text-muted-foreground">
+            ({displayEvents.length} of {events.length})
+          </span>
+        )}
       </h3>
 
       {isLoading && <div className="text-center text-muted-foreground py-8">Loading events...</div>}
@@ -94,12 +123,29 @@ export function PipelineEventsTimeline({ events = [], isLoading }: PipelineEvent
         <div className="text-center text-muted-foreground py-8">No pipeline events recorded</div>
       )}
 
-      {events.length > 0 && (
-        <div className="max-h-96 overflow-y-auto">
-          {events.map((event) => (
-            <EventRow key={event.id} event={event} />
-          ))}
-        </div>
+      {displayEvents.length > 0 && (
+        <>
+          <div style={{ height: listHeight }}>
+            <List
+              listRef={listRef}
+              rowCount={displayEvents.length}
+              rowHeight={EVENT_ROW_HEIGHT}
+              rowComponent={EventRow}
+              rowProps={{ events: displayEvents }}
+              overscanCount={10}
+              style={{ width: "100%", height: listHeight }}
+            />
+          </div>
+          {hasMore && (
+            <button
+              onClick={loadMore}
+              className="w-full mt-2 py-1.5 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+            >
+              <ChevronDown className="w-3 h-3" />
+              Load more ({events.length - visibleCount} remaining)
+            </button>
+          )}
+        </>
       )}
     </div>
   );

@@ -115,7 +115,7 @@ export function TerminalPage({
   const fileConflicts = useFileConflicts();
   const { eventHistory, addHistoryEvent, metrics, incrementMetric } = useEventHistory();
   const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);
-  const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments);
+  const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
 
   const processOutputRef = useRef<((tabId: string, text: string) => void) | undefined>(undefined);
 
@@ -742,6 +742,7 @@ export function TerminalPage({
               onExportZone={handleExportZone}
               pendingRestarts={transitionEffects.pendingRestarts}
               onCancelRestart={transitionEffects.cancelPendingRestart}
+              pageId={pageId}
             />
           ) : (
             <div className="h-full flex flex-col items-center justify-center text-[#565f89] gap-2">

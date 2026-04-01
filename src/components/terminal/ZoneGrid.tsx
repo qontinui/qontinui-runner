@@ -1,5 +1,6 @@
 import { useCallback, useReducer, useRef, useEffect, type RefObject } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
+import { pageKey } from "./TerminalPageContext";
 import { Terminal, Filter, RefreshCw } from "lucide-react";
 import {
   TerminalInstance,
@@ -64,6 +65,8 @@ interface ZoneGridProps {
   onExportZone?: (zoneIndex: number, format: "text" | "markdown" | "json") => void;
   pendingRestarts?: Record<number, number>;
   onCancelRestart?: (zoneIndex: number) => void;
+  /** Terminal page ID for storage namespacing */
+  pageId?: string;
 }
 
 interface GridState {
@@ -117,6 +120,8 @@ function gridReducer(state: GridState, action: GridAction): GridState {
 }
 
 function createInitialGridState(layout: LayoutPreset): GridState {
+  // Uses un-namespaced keys for initial state (covers the "default" page).
+  // Non-default pages get corrected immediately by the layout-change effect.
   const parsedCols = instanceStorage.getJSON<number[]>(`zone-col-ratios-${layout.id}`, []);
   const parsedRows = instanceStorage.getJSON<number[]>(`zone-row-ratios-${layout.id}`, []);
   return {
@@ -170,27 +175,47 @@ export function ZoneGrid({
   onExportZone,
   pendingRestarts,
   onCancelRestart,
+  pageId = "default",
 }: ZoneGridProps) {
+  const pk = (key: string) => pageKey(pageId, key);
   const [gridState, dispatch] = useReducer(gridReducer, layout, createInitialGridState);
   const gridRef = useRef<HTMLDivElement>(null);
   const prevLayoutIdRef = useRef(layout.id);
 
   useEffect(() => {
-    instanceStorage.setJSON(`zone-col-ratios-${layout.id}`, gridState.colRatios);
+    instanceStorage.setJSON(pk(`zone-col-ratios-${layout.id}`), gridState.colRatios);
   }, [gridState.colRatios, layout.id]);
   useEffect(() => {
-    instanceStorage.setJSON(`zone-row-ratios-${layout.id}`, gridState.rowRatios);
+    instanceStorage.setJSON(pk(`zone-row-ratios-${layout.id}`), gridState.rowRatios);
   }, [gridState.rowRatios, layout.id]);
+
+  // Load namespaced ratios on mount for non-default pages
+  // (createInitialGridState uses un-namespaced keys for backward compat)
+  const didMountLoadRef = useRef(false);
+  useEffect(() => {
+    if (didMountLoadRef.current || pageId === "default") return;
+    didMountLoadRef.current = true;
+    const parsedCols = instanceStorage.getJSON<number[]>(pk(`zone-col-ratios-${layout.id}`), []);
+    dispatch({
+      type: "SET_COL_RATIOS",
+      ratios: parsedCols.length === layout.columns ? parsedCols : Array(layout.columns).fill(1),
+    });
+    const parsedRows = instanceStorage.getJSON<number[]>(pk(`zone-row-ratios-${layout.id}`), []);
+    dispatch({
+      type: "SET_ROW_RATIOS",
+      ratios: parsedRows.length === layout.rows ? parsedRows : Array(layout.rows).fill(1),
+    });
+  }, [pageId, layout.id, layout.columns, layout.rows, pk]);
 
   useEffect(() => {
     if (prevLayoutIdRef.current !== layout.id) {
       prevLayoutIdRef.current = layout.id;
-      const parsedCols = instanceStorage.getJSON<number[]>(`zone-col-ratios-${layout.id}`, []);
+      const parsedCols = instanceStorage.getJSON<number[]>(pk(`zone-col-ratios-${layout.id}`), []);
       dispatch({
         type: "SET_COL_RATIOS",
         ratios: parsedCols.length === layout.columns ? parsedCols : Array(layout.columns).fill(1),
       });
-      const parsedRows = instanceStorage.getJSON<number[]>(`zone-row-ratios-${layout.id}`, []);
+      const parsedRows = instanceStorage.getJSON<number[]>(pk(`zone-row-ratios-${layout.id}`), []);
       dispatch({
         type: "SET_ROW_RATIOS",
         ratios: parsedRows.length === layout.rows ? parsedRows : Array(layout.rows).fill(1),

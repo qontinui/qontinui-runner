@@ -165,8 +165,10 @@ export interface TaskRunMcpCallsDbResult {
   task_run_id: string;
   calls: TaskRunMcpCallDb[];
   count: number;
+  total_count?: number;
   success_count: number;
   failed_count: number;
+  has_more?: boolean;
 }
 
 // =============================================================================

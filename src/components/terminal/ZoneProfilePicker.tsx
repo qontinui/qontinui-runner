@@ -158,6 +158,7 @@ export function ZoneProfilePicker({
             {showSaveInput ? (
               <div className="flex items-center gap-1">
                 <input
+                  id="zone-profile-name-input"
                   autoFocus
                   value={saveName}
                   onChange={(e) => setSaveName(e.target.value)}
@@ -174,15 +175,18 @@ export function ZoneProfilePicker({
                   maxLength={30}
                 />
                 <button
+                  id="zone-profile-save-btn"
                   onClick={handleSave}
                   disabled={!saveName.trim()}
                   className="p-0.5 rounded text-[#9ece6a] hover:bg-[#9ece6a]/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  title="Save profile"
                 >
                   <Save className="w-3 h-3" />
                 </button>
               </div>
             ) : (
               <button
+                id="zone-profile-save-current"
                 onClick={() => setShowSaveInput(true)}
                 disabled={profileNames.length >= MAX_PROFILES}
                 className="flex items-center gap-1.5 w-full text-left px-1 py-0.5 text-[10px] text-[#9ece6a] hover:bg-[#9ece6a]/10 rounded transition-colors disabled:opacity-30 disabled:cursor-not-allowed"

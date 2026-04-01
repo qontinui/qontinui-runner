@@ -219,6 +219,10 @@ pub struct McpCallsResult {
     pub task_run_id: String,
     pub calls: Vec<McpCallRecord>,
     pub count: usize,
+    #[serde(default)]
+    pub total_count: usize,
     pub success_count: usize,
     pub failed_count: usize,
+    #[serde(default)]
+    pub has_more: bool,
 }

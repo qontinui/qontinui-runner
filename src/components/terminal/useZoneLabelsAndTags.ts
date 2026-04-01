@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
+import { pageKey } from "./TerminalPageContext";
 
 const GROUP_COLORS = ["#bb9af7", "#7aa2f7", "#9ece6a", "#e0af68", "#f7768e", "#7dcfff"];
 
@@ -23,19 +24,21 @@ export interface UseZoneLabelsAndTagsReturn {
 export function useZoneLabelsAndTags(
   layoutId: string,
   assignments: Record<number, string>,
+  pageId: string = "default",
 ): UseZoneLabelsAndTagsReturn {
+  const pk = (key: string) => pageKey(pageId, key);
   // ── State ─────────────────────────────────────────────────────────────────
 
   const [zoneLabels, setZoneLabels] = useState<Record<number, string>>(() =>
-    instanceStorage.getJSON<Record<number, string>>(`zone-labels-${layoutId}`, {}),
+    instanceStorage.getJSON<Record<number, string>>(pk(`zone-labels-${layoutId}`), {}),
   );
 
   const [zoneNotes, setZoneNotes] = useState<Record<number, string>>(() =>
-    instanceStorage.getJSON<Record<number, string>>(`zone-notes-${layoutId}`, {}),
+    instanceStorage.getJSON<Record<number, string>>(pk(`zone-notes-${layoutId}`), {}),
   );
 
   const [pinnedZones, setPinnedZones] = useState<Set<number>>(() => {
-    const stored = instanceStorage.getJSON<number[]>(`zone-pinned-${layoutId}`, []);
+    const stored = instanceStorage.getJSON<number[]>(pk(`zone-pinned-${layoutId}`), []);
     return new Set(stored);
   });
 
@@ -77,15 +80,15 @@ export function useZoneLabelsAndTags(
   // ── Persist to localStorage ───────────────────────────────────────────────
 
   useEffect(() => {
-    instanceStorage.setJSON(`zone-labels-${layoutId}`, zoneLabels);
+    instanceStorage.setJSON(pk(`zone-labels-${layoutId}`), zoneLabels);
   }, [zoneLabels, layoutId]);
 
   useEffect(() => {
-    instanceStorage.setJSON(`zone-notes-${layoutId}`, zoneNotes);
+    instanceStorage.setJSON(pk(`zone-notes-${layoutId}`), zoneNotes);
   }, [zoneNotes, layoutId]);
 
   useEffect(() => {
-    instanceStorage.setJSON(`zone-pinned-${layoutId}`, [...pinnedZones]);
+    instanceStorage.setJSON(pk(`zone-pinned-${layoutId}`), [...pinnedZones]);
   }, [pinnedZones, layoutId]);
 
   // ── Reload labels/pins when layout changes, with pin migration ────────────
@@ -106,11 +109,11 @@ export function useZoneLabelsAndTags(
       prevAssignmentsRef.current = assignments;
 
       /* eslint-disable react-hooks/set-state-in-effect -- layout change migration */
-      setZoneLabels(instanceStorage.getJSON<Record<number, string>>(`zone-labels-${layoutId}`, {}));
+      setZoneLabels(instanceStorage.getJSON<Record<number, string>>(pk(`zone-labels-${layoutId}`), {}));
 
       // Restore pins: merge stored pins with migrated tab-based pins
       let newPins = new Set<number>(
-        instanceStorage.getJSON<number[]>(`zone-pinned-${layoutId}`, []),
+        instanceStorage.getJSON<number[]>(pk(`zone-pinned-${layoutId}`), []),
       );
       // Add pins for tabs that were pinned in the previous layout
       for (const [zoneStr, tabId] of Object.entries(assignments)) {
@@ -120,7 +123,7 @@ export function useZoneLabelsAndTags(
       }
       setPinnedZones(newPins);
 
-      setZoneNotes(instanceStorage.getJSON<Record<number, string>>(`zone-notes-${layoutId}`, {}));
+      setZoneNotes(instanceStorage.getJSON<Record<number, string>>(pk(`zone-notes-${layoutId}`), {}));
       /* eslint-enable react-hooks/set-state-in-effect */
     } else {
       // Keep assignments ref in sync for non-layout-change updates (e.g., tab swaps)

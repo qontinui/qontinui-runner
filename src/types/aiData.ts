@@ -644,6 +644,7 @@ export interface TaskRunPlaywrightResultsDbResult {
   count: number;
   passed: number;
   failed: number;
+  has_more?: boolean;
 }
 
 /**
@@ -701,8 +702,10 @@ export interface TaskRunApiRequestsDbResult {
   task_run_id: string;
   requests: TaskRunApiRequestDb[];
   count: number;
+  total_count?: number;
   success_count: number;
   failed_count: number;
+  has_more?: boolean;
 }
 
 // =============================================================================
@@ -743,64 +746,10 @@ export interface TaskRunAwasStepsDbResult {
   task_run_id: string;
   steps: TaskRunAwasStepDb[];
   count: number;
+  total_count?: number;
   success_count: number;
   failed_count: number;
-}
-
-// =============================================================================
-// MCP Call Types
-// =============================================================================
-
-/**
- * MCP call record from SQLite database.
- * Stores MCP tool call execution results.
- */
-export interface TaskRunMcpCallDb {
-  id: string;
-  task_run_id: string;
-
-  /** Step identification */
-  step_id: string;
-  step_name?: string | null;
-
-  /** Server identification */
-  server_id: string;
-  server_name?: string | null;
-
-  /** Tool call details */
-  tool_name: string;
-  /** JSON: tool arguments */
-  arguments?: string | null;
-  /** JSON: resolved arguments after variable substitution */
-  resolved_arguments?: string | null;
-
-  /** Response details */
-  /** JSON: tool response content */
-  response?: string | null;
-  response_type: string; // 'text', 'json', 'error'
-  duration_ms: number;
-
-  /** Variable extractions (JSON array of extraction results) */
-  extractions?: string | null;
-  /** Assertion results (JSON array of assertion results) */
-  assertions?: string | null;
-
-  /** Overall result */
-  success: boolean;
-  error_message?: string | null;
-
-  created_at: string;
-}
-
-/**
- * Result of querying MCP calls from SQLite.
- */
-export interface TaskRunMcpCallsDbResult {
-  task_run_id: string;
-  calls: TaskRunMcpCallDb[];
-  count: number;
-  success_count: number;
-  failed_count: number;
+  has_more?: boolean;
 }
 
 // =============================================================================

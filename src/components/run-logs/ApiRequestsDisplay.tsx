@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import {
   Loader2,
   AlertCircle,
@@ -8,6 +8,8 @@ import {
   CheckCircle,
   XCircle,
 } from "lucide-react";
+
+const PAGE_SIZE = 50;
 import { useTaskRunApiRequests } from "../../hooks/useAiData";
 import type { TaskRunApiRequestDb } from "../../types/aiData";
 import { getStatusColors, getAccentColors } from "@/design-system";
@@ -69,8 +71,13 @@ function getStatusCodeStyle(statusCode: number) {
 }
 
 export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
-  const { data: apiData, isLoading, error } = useTaskRunApiRequests(taskRunId);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const { data: apiData, isLoading, error } = useTaskRunApiRequests(taskRunId, undefined, pageSize);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const loadMore = useCallback(() => {
+    setPageSize((prev) => prev + PAGE_SIZE);
+  }, []);
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -328,6 +335,15 @@ export function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
             </div>
           );
         })}
+        {apiData.has_more && (
+          <button
+            onClick={loadMore}
+            className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+          >
+            <ChevronDown className="w-3 h-3" />
+            Show more ({apiData.count - apiData.requests.length} remaining)
+          </button>
+        )}
       </div>
     </div>
   );

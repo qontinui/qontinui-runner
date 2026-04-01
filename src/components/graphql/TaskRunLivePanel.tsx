@@ -11,6 +11,7 @@
  *   <TaskRunLivePanel taskRunId="abc-123" />
  */
 
+import { useMemo, type ReactElement } from "react";
 import { useTaskRunLive, useTaskRunControls } from "@/hooks/graphql";
 import {
   Loader2,
@@ -21,9 +22,25 @@ import {
   AlertCircle,
   CheckCircle2,
   Clock,
+  ArrowUp,
 } from "lucide-react";
+import { List, useListRef, type RowComponentProps } from "react-window";
 import { cn } from "@/lib/utils";
 import { RunErrorSummary } from "../error-monitor/RunErrorSummary";
+
+const OUTPUT_LINE_HEIGHT = 18;
+
+interface OutputLineRowProps {
+  lines: string[];
+}
+
+function OutputLineRow({ index, style, lines }: RowComponentProps<OutputLineRowProps>): ReactElement {
+  return (
+    <div style={style} className="whitespace-nowrap overflow-hidden text-ellipsis">
+      {lines[index]}
+    </div>
+  );
+}
 
 interface TaskRunLivePanelProps {
   taskRunId: string;
@@ -75,7 +92,17 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
     loading,
     error,
     fetchMoreOutput,
-  } = useTaskRunLive(taskRunId);
+  } = useTaskRunLive(taskRunId, { outputLimit: 4000 });
+  const outputListRef = useListRef(null);
+
+  // Split output content into lines for virtualized rendering
+  const outputContent = output?.content;
+  const outputLines = useMemo(() => {
+    if (!outputContent) return [];
+    // Show only the tail (last 2000 chars) split into lines
+    const tail = outputContent.slice(-2000);
+    return tail.split("\n");
+  }, [outputContent]);
 
   const controls = useTaskRunControls();
 
@@ -267,18 +294,29 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
                 <span className="text-xs font-medium">
                   Output ({(output.totalLength / 1024).toFixed(1)}KB)
                 </span>
-                {output.hasMore && (
-                  <button
-                    onClick={() => fetchMoreOutput(output.offset + output.content.length)}
-                    className="text-xs text-primary hover:underline"
-                  >
-                    Load more
-                  </button>
-                )}
+                <div className="flex items-center gap-2">
+                  {output.hasMore && (
+                    <button
+                      onClick={() => fetchMoreOutput(output.offset + output.content.length)}
+                      className="text-xs text-primary hover:underline flex items-center gap-1"
+                    >
+                      <ArrowUp className="w-3 h-3" />
+                      Load more
+                    </button>
+                  )}
+                </div>
               </div>
-              <pre className="text-xs text-muted-foreground bg-muted/30 rounded p-2 max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono">
-                {output.content.slice(-2000)}
-              </pre>
+              <div className="text-xs text-muted-foreground bg-muted/30 rounded font-mono" style={{ height: Math.min(outputLines.length * OUTPUT_LINE_HEIGHT, 128) }}>
+                <List
+                  listRef={outputListRef}
+                  rowCount={outputLines.length}
+                  rowHeight={OUTPUT_LINE_HEIGHT}
+                  rowComponent={OutputLineRow}
+                  rowProps={{ lines: outputLines }}
+                  overscanCount={5}
+                  style={{ width: "100%", height: Math.min(outputLines.length * OUTPUT_LINE_HEIGHT, 128) }}
+                />
+              </div>
             </div>
           )}
         </>

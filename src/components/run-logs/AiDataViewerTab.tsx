@@ -11,7 +11,7 @@
  * This helps users see exactly what data the AI receives.
  */
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import {
   Loader2,
   AlertCircle,
@@ -41,6 +41,8 @@ import {
   Timer,
   Clock,
 } from "lucide-react";
+
+const EVENTS_PAGE_SIZE = 50;
 import { isDevelopmentMode } from "qontinui-navigation";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import {
@@ -441,6 +443,11 @@ function _getEventTypeForLogType(logType: JsonlLogType): string | undefined {
 
 function EventsDisplay({ events }: { events: TaskRunEvent[] }) {
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+  const [visibleCount, setVisibleCount] = useState(EVENTS_PAGE_SIZE);
+
+  const loadMore = useCallback(() => {
+    setVisibleCount((prev) => prev + EVENTS_PAGE_SIZE);
+  }, []);
 
   const toggleExpanded = (id: number) => {
     setExpandedIds((prev) => {
@@ -456,7 +463,7 @@ function EventsDisplay({ events }: { events: TaskRunEvent[] }) {
 
   return (
     <div className="space-y-2">
-      {events.map((event) => (
+      {events.slice(0, visibleCount).map((event) => (
         <div key={event.id} className="border border-border rounded-lg overflow-hidden">
           <button
             onClick={() => toggleExpanded(event.id)}
@@ -526,6 +533,15 @@ function EventsDisplay({ events }: { events: TaskRunEvent[] }) {
           )}
         </div>
       ))}
+      {visibleCount < events.length && (
+        <button
+          onClick={loadMore}
+          className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+        >
+          <ChevronDown className="w-3 h-3" />
+          Show more ({events.length - visibleCount} remaining)
+        </button>
+      )}
     </div>
   );
 }

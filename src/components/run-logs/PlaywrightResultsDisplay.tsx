@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   Loader2,
@@ -12,6 +12,8 @@ import {
   SkipForward,
   Timer,
 } from "lucide-react";
+
+const PAGE_SIZE = 50;
 import { useTaskRunPlaywrightResults } from "../../hooks/useAiData";
 import type { TaskRunPlaywrightResultDb } from "../../types/aiData";
 import { getStatusColors, getAccentColors } from "@/design-system";
@@ -52,8 +54,13 @@ function getTestStatusStyle(status: string) {
 }
 
 export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
-  const { data: playwrightData, isLoading, error } = useTaskRunPlaywrightResults(taskRunId);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const { data: playwrightData, isLoading, error } = useTaskRunPlaywrightResults(taskRunId, pageSize);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const loadMore = useCallback(() => {
+    setPageSize((prev) => prev + PAGE_SIZE);
+  }, []);
 
   const getImageSrc = useMemo(() => {
     return (path: string) => {
@@ -278,6 +285,15 @@ export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
             </div>
           );
         })}
+        {playwrightData.has_more && (
+          <button
+            onClick={loadMore}
+            className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+          >
+            <ChevronDown className="w-3 h-3" />
+            Show more ({playwrightData.count - playwrightData.results.length} remaining)
+          </button>
+        )}
       </div>
     </div>
   );

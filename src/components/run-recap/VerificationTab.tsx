@@ -5,7 +5,7 @@
  * Shows each iteration's test/check results with pass/fail status and details.
  */
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import {
   CheckCircle2,
   XCircle,
@@ -20,6 +20,8 @@ import {
   AlertCircle,
   Globe,
 } from "lucide-react";
+
+const ITERATIONS_PAGE_SIZE = 20;
 import { useTaskRunVerificationResults } from "../../hooks/useAiData";
 import type {
   ConsoleError,
@@ -419,6 +421,11 @@ function IterationCard({
 
 export function VerificationTab({ taskRunId }: VerificationTabProps) {
   const { data, isLoading, error } = useTaskRunVerificationResults(taskRunId);
+  const [visibleCount, setVisibleCount] = useState(ITERATIONS_PAGE_SIZE);
+
+  const loadMore = useCallback(() => {
+    setVisibleCount((prev) => prev + ITERATIONS_PAGE_SIZE);
+  }, []);
 
   // Loading state
   if (isLoading) {
@@ -501,13 +508,25 @@ export function VerificationTab({ taskRunId }: VerificationTabProps) {
 
       {/* Iteration Results */}
       <div className="space-y-3">
-        {data.results.map((result, index) => (
-          <IterationCard
-            key={result.iteration}
-            result={result}
-            defaultExpanded={index === data.results.length - 1} // Expand the latest iteration
-          />
-        ))}
+        {data.results.slice(0, visibleCount).map((result, index) => {
+          const slicedLength = Math.min(visibleCount, data.results.length);
+          return (
+            <IterationCard
+              key={result.iteration}
+              result={result}
+              defaultExpanded={index === slicedLength - 1} // Expand the latest visible iteration
+            />
+          );
+        })}
+        {visibleCount < data.results.length && (
+          <button
+            onClick={loadMore}
+            className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+          >
+            <ChevronDown className="w-3 h-3" />
+            Show more ({data.results.length - visibleCount} remaining)
+          </button>
+        )}
       </div>
     </div>
   );

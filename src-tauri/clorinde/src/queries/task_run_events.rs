@@ -1413,7 +1413,7 @@ impl<
 pub struct GetTaskRunEventsAllStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_events_all() -> GetTaskRunEventsAllStmt {
     GetTaskRunEventsAllStmt(
-        "SELECT id, task_run_id, event_type, event_subtype, message, data, workflow_name, state_name, action_id, timestamp, duration_ms FROM task_run_events WHERE task_run_id = $1 ORDER BY timestamp ASC",
+        "SELECT id, task_run_id, COALESCE(event_type, '') as event_type, COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message, COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name, COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id, COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms FROM task_run_events WHERE task_run_id = $1 ORDER BY timestamp ASC",
         None,
     )
 }
@@ -1459,7 +1459,7 @@ impl GetTaskRunEventsAllStmt {
 pub struct GetTaskRunEventsByTypeStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_events_by_type() -> GetTaskRunEventsByTypeStmt {
     GetTaskRunEventsByTypeStmt(
-        "SELECT id, task_run_id, event_type, event_subtype, message, data, workflow_name, state_name, action_id, timestamp, duration_ms FROM task_run_events WHERE task_run_id = $1 AND event_type = $2 ORDER BY timestamp ASC",
+        "SELECT id, task_run_id, COALESCE(event_type, '') as event_type, COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message, COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name, COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id, COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms FROM task_run_events WHERE task_run_id = $1 AND event_type = $2 ORDER BY timestamp ASC",
         None,
     )
 }
@@ -1524,7 +1524,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
 pub struct GetTaskRunEventsLimitedStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_events_limited() -> GetTaskRunEventsLimitedStmt {
     GetTaskRunEventsLimitedStmt(
-        "SELECT id, task_run_id, event_type, event_subtype, message, data, workflow_name, state_name, action_id, timestamp, duration_ms FROM task_run_events WHERE task_run_id = $1 ORDER BY timestamp ASC LIMIT $2",
+        "SELECT id, task_run_id, COALESCE(event_type, '') as event_type, COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message, COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name, COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id, COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms FROM task_run_events WHERE task_run_id = $1 ORDER BY timestamp ASC LIMIT $2",
         None,
     )
 }

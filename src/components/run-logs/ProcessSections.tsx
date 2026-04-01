@@ -1,4 +1,4 @@
-import { useState, useMemo, Fragment } from "react";
+import { useState, useMemo, useCallback, useEffect, Fragment, type ReactElement } from "react";
 import {
   Loader2,
   AlertCircle,
@@ -11,11 +11,35 @@ import {
   Timer,
   Terminal,
   Search,
+  ArrowDown,
 } from "lucide-react";
+import { List, useListRef, type RowComponentProps } from "react-window";
 import { useProcessSessions, useProcessSessionOutput } from "../../hooks/useAiData";
-import type { ProcessSession } from "../../types/aiData";
+import type { ProcessSession, ProcessSessionOutputLine } from "../../types/aiData";
 import { getAccentColors } from "@/design-system";
 import { formatTimestamp, formatSessionDuration } from "./ai-data-viewer-utils";
+
+const OUTPUT_PAGE_SIZE = 500;
+const OUTPUT_LINE_HEIGHT = 20;
+
+interface OutputLineRowProps {
+  lines: ProcessSessionOutputLine[];
+}
+
+function OutputLineRow({ index, style, lines }: RowComponentProps<OutputLineRowProps>): ReactElement {
+  const line = lines[index];
+  return (
+    <div
+      style={style}
+      className={`whitespace-nowrap overflow-hidden text-ellipsis ${line.stream === "stderr" ? "text-red-400" : ""}`}
+    >
+      <span className="text-muted-foreground select-none">
+        {new Date(line.timestamp).toLocaleTimeString()}{" "}
+      </span>
+      {line.line}
+    </div>
+  );
+}
 
 function ProcessSessionDetailPanel({ session }: { session: ProcessSession }) {
   const stateIcon =
@@ -232,9 +256,13 @@ export function ProcessSessionOutputSection({
   sessionId: string | null;
   compact?: boolean;
 }) {
-  const { data: lines, isLoading, error } = useProcessSessionOutput(sessionId);
+  const [pageSize, setPageSize] = useState(OUTPUT_PAGE_SIZE);
+  const { data: lines, isLoading, error } = useProcessSessionOutput(sessionId, pageSize, 0);
   const [streamFilter, setStreamFilter] = useState<"all" | "stdout" | "stderr">("all");
   const [searchText, setSearchText] = useState("");
+  const [autoScroll, setAutoScroll] = useState(true);
+  const listRef = useListRef(null);
+  const scrollableRef = listRef as React.RefObject<{ scrollToRow: (config: { index: number; align?: string }) => void } | null>;
 
   const filteredLines = useMemo(() => {
     if (!lines) return [];
@@ -254,6 +282,36 @@ export function ProcessSessionOutputSection({
     [lines],
   );
 
+  const hasMore = lines && lines.length >= pageSize;
+
+  const loadMore = useCallback(() => {
+    setPageSize((prev) => prev + OUTPUT_PAGE_SIZE);
+  }, []);
+
+  const handleRowsRendered = useCallback(
+    (
+      _visibleRows: { startIndex: number; stopIndex: number },
+      allRows: { startIndex: number; stopIndex: number },
+    ) => {
+      setAutoScroll(allRows.stopIndex >= filteredLines.length - 1);
+    },
+    [filteredLines.length],
+  );
+
+  const scrollToBottom = useCallback(() => {
+    if (filteredLines.length > 0) {
+      scrollableRef.current?.scrollToRow({ index: filteredLines.length - 1, align: "end" });
+    }
+    setAutoScroll(true);
+  }, [filteredLines.length, scrollableRef]);
+
+  // Auto-scroll when new lines arrive
+  useEffect(() => {
+    if (autoScroll && filteredLines.length > 0) {
+      scrollableRef.current?.scrollToRow({ index: filteredLines.length - 1, align: "end" });
+    }
+  }, [filteredLines.length, autoScroll, scrollableRef]);
+
   if (!sessionId) {
     return (
       <div className={`${compact ? "p-2" : "p-4"} text-muted-foreground`}>
@@ -261,7 +319,7 @@ export function ProcessSessionOutputSection({
       </div>
     );
   }
-  if (isLoading) {
+  if (isLoading && !lines) {
     return (
       <div className={`${compact ? "p-2" : "p-4"} text-muted-foreground flex items-center gap-2`}>
         <Loader2 className="w-3 h-3 animate-spin" />
@@ -281,6 +339,7 @@ export function ProcessSessionOutputSection({
   }
 
   const isFiltered = streamFilter !== "all" || searchText.length > 0;
+  const listHeight = compact ? 300 : 500;
 
   return (
     <div className={compact ? "flex flex-col" : "flex flex-col h-full"}>
@@ -290,6 +349,14 @@ export function ProcessSessionOutputSection({
           {isFiltered
             ? ` \u2014 Showing ${filteredLines.length} of ${lines.length} lines`
             : ` (${lines.length} lines)`}
+          {hasMore && (
+            <button
+              onClick={loadMore}
+              className="ml-2 text-xs text-primary hover:underline"
+            >
+              Load more...
+            </button>
+          )}
         </h3>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -345,29 +412,38 @@ export function ProcessSessionOutputSection({
               </button>
             )}
           </div>
+
+          <button
+            onClick={scrollToBottom}
+            className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+            title="Scroll to bottom"
+          >
+            <ArrowDown className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
 
-      <div className={compact ? "overflow-auto" : "flex-1 overflow-auto px-4 pb-4"}>
+      <div className={compact ? "" : "flex-1 px-4 pb-4"}>
         {filteredLines.length === 0 ? (
           <div className="text-sm text-muted-foreground py-4">
             No lines match the current filters.
           </div>
         ) : (
-          <pre
-            className={`text-xs font-mono bg-black/80 text-green-400 rounded-lg overflow-auto ${
-              compact ? "p-2 max-h-[40vh]" : "p-4 max-h-[70vh]"
-            }`}
+          <div
+            className={`text-xs font-mono bg-black/80 text-green-400 rounded-lg`}
+            style={{ height: listHeight }}
           >
-            {filteredLines.map((line) => (
-              <div key={line.id} className={line.stream === "stderr" ? "text-red-400" : ""}>
-                <span className="text-muted-foreground select-none">
-                  {new Date(line.timestamp).toLocaleTimeString()}{" "}
-                </span>
-                {line.line}
-              </div>
-            ))}
-          </pre>
+            <List
+              listRef={listRef}
+              rowCount={filteredLines.length}
+              rowHeight={OUTPUT_LINE_HEIGHT}
+              rowComponent={OutputLineRow}
+              rowProps={{ lines: filteredLines }}
+              overscanCount={20}
+              onRowsRendered={handleRowsRendered}
+              style={{ width: "100%", height: listHeight }}
+            />
+          </div>
         )}
       </div>
     </div>

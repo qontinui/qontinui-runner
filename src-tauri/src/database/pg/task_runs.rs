@@ -1016,12 +1016,15 @@ impl PgDb {
         let success_count = calls.iter().filter(|c| c.success).count();
         let failed_count = calls.iter().filter(|c| !c.success).count();
 
+        let total = calls.len();
         Ok(crate::mcp_client::McpCallsResult {
             task_run_id: task_run_id.to_string(),
-            calls: calls.clone(),
-            count: calls.len(),
+            calls,
+            count: total,
+            total_count: total,
             success_count,
             failed_count,
+            has_more: false,
         })
     }
 

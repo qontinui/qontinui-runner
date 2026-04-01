@@ -309,13 +309,26 @@ pub async fn get_task_run_mcp_calls(
     state: State<'_, Arc<AppState>>,
     task_run_id: String,
     success_filter: Option<bool>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<McpResponse<McpCallsResult>, String> {
     match state
         .pg_db
         .get_task_run_mcp_calls(&task_run_id, success_filter)
         .await
     {
-        Ok(result) => Ok(McpResponse::ok(result)),
+        Ok(mut result) => {
+            // Apply offset/limit pagination to prevent large IPC payloads
+            let total_count = result.calls.len();
+            let off = offset.unwrap_or(0);
+            let lim = limit.unwrap_or(200);
+            let paginated: Vec<_> = result.calls.into_iter().skip(off).take(lim).collect();
+            let has_more = off + paginated.len() < total_count;
+            result.calls = paginated;
+            result.total_count = total_count;
+            result.has_more = has_more;
+            Ok(McpResponse::ok(result))
+        }
         Err(e) => {
             error!("Failed to get task run MCP calls: {}", e);
             Ok(McpResponse::err(e))

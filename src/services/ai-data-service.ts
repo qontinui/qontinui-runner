@@ -252,8 +252,10 @@ export const aiDataService = {
    */
   async getTaskRunPlaywrightResults(
     taskRunId: string,
+    limit?: number,
+    offset?: number,
   ): Promise<AiDataResponse<TaskRunPlaywrightResultsDbResult>> {
-    return invoke("get_task_run_playwright_results_from_db", { taskRunId });
+    return invoke("get_task_run_playwright_results_from_db", { taskRunId, limit, offset });
   },
 
   /**
@@ -274,8 +276,10 @@ export const aiDataService = {
   async getTaskRunApiRequests(
     taskRunId: string,
     successFilter?: boolean,
+    limit?: number,
+    offset?: number,
   ): Promise<AiDataResponse<TaskRunApiRequestsDbResult>> {
-    return invoke("get_task_run_api_requests_from_db", { taskRunId, successFilter });
+    return invoke("get_task_run_api_requests_from_db", { taskRunId, successFilter, limit, offset });
   },
 
   /**
@@ -286,8 +290,10 @@ export const aiDataService = {
   async getTaskRunAwasSteps(
     taskRunId: string,
     stepType?: string,
+    limit?: number,
+    offset?: number,
   ): Promise<AiDataResponse<TaskRunAwasStepsDbResult>> {
-    return invoke("get_task_run_awas_steps_from_db", { taskRunId, stepType });
+    return invoke("get_task_run_awas_steps_from_db", { taskRunId, stepType, limit, offset });
   },
 
   /**
@@ -298,8 +304,10 @@ export const aiDataService = {
   async getTaskRunMcpCalls(
     taskRunId: string,
     successFilter?: boolean,
+    limit?: number,
+    offset?: number,
   ): Promise<AiDataResponse<TaskRunMcpCallsDbResult>> {
-    return invoke("get_task_run_mcp_calls", { taskRunId, successFilter });
+    return invoke("get_task_run_mcp_calls", { taskRunId, successFilter, limit, offset });
   },
 
   /**

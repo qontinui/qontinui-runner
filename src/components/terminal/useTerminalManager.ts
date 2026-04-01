@@ -131,7 +131,7 @@ export function useTerminalManager(pageId: string = "default") {
       console.error("[TerminalManager] Failed to reconnect:", err);
       return null;
     }
-  }, []);
+  }, [pageId]);
 
   /** Mark a tab as having completed reconnection (buffer replayed). */
   const markReconnected = useCallback((id: string) => {
@@ -169,7 +169,7 @@ export function useTerminalManager(pageId: string = "default") {
         return null;
       }
     },
-    [],
+    [pageId],
   );
 
   const createPlanTab = useCallback((filePath: string): string => {

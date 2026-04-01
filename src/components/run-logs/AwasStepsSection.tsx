@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import {
   Loader2,
   AlertCircle,
@@ -8,6 +8,8 @@ import {
   XCircle,
   Bot,
 } from "lucide-react";
+
+const PAGE_SIZE = 50;
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import { useTaskRunAwasSteps } from "../../hooks/useAiData";
 import type { TaskRunAwasStepDb } from "../../types/aiData";
@@ -58,8 +60,13 @@ function getStepTypeStyle(stepType: string) {
 
 export function AwasStepsSection() {
   const { selectedRunId, selectedRun: _selectedRun } = useRunSelection();
-  const { data: awasData, isLoading, error } = useTaskRunAwasSteps(selectedRunId);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
+  const { data: awasData, isLoading, error } = useTaskRunAwasSteps(selectedRunId, undefined, pageSize);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const loadMore = useCallback(() => {
+    setPageSize((prev) => prev + PAGE_SIZE);
+  }, []);
 
   const toggleExpanded = (id: string) => {
     setExpandedIds((prev) => {
@@ -221,6 +228,15 @@ export function AwasStepsSection() {
             </div>
           );
         })}
+        {awasData.has_more && (
+          <button
+            onClick={loadMore}
+            className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+          >
+            <ChevronDown className="w-3 h-3" />
+            Show more ({awasData.count - awasData.steps.length} remaining)
+          </button>
+        )}
       </div>
     </div>
   );

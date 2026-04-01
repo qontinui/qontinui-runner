@@ -54,18 +54,16 @@ export function TerminalPageTabBar({
         const isActive = page.id === activePageId;
         const isEditing = editingId === page.id;
 
-        return (
-          <div
-            key={page.id}
-            className={`group flex items-center gap-1 px-2.5 py-1 rounded text-[11px] cursor-pointer transition-colors ${
-              isActive
-                ? "bg-[#2a2d3d] text-[#c0caf5]"
-                : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1e1f2e]"
-            }`}
-            onClick={() => !isEditing && onSelectPage(page.id)}
-            onDoubleClick={() => startRename(page.id, page.name)}
-          >
-            {isEditing ? (
+        const tabClasses = `group flex items-center gap-1 px-2.5 py-1 rounded text-[11px] cursor-pointer transition-colors ${
+          isActive
+            ? "bg-[#2a2d3d] text-[#c0caf5]"
+            : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1e1f2e]"
+        }`;
+
+        // Render a <div> when editing (input inside button is invalid HTML)
+        if (isEditing) {
+          return (
+            <div key={page.id} className={tabClasses}>
               <input
                 ref={inputRef}
                 value={editValue}
@@ -82,22 +80,42 @@ export function TerminalPageTabBar({
                 className="bg-[#13141f] border border-[#7aa2f7] rounded px-1 py-0 text-[11px] text-[#c0caf5] outline-hidden w-24"
                 maxLength={30}
               />
-            ) : (
-              <span className="truncate max-w-[120px]">{page.name}</span>
-            )}
-            {pages.length > 1 && !isEditing && (
-              <button
+            </div>
+          );
+        }
+
+        return (
+          <button
+            key={page.id}
+            role="tab"
+            aria-selected={isActive}
+            className={tabClasses}
+            onClick={() => onSelectPage(page.id)}
+            onDoubleClick={() => startRename(page.id, page.name)}
+            title={`Switch to ${page.name}`}
+          >
+            <span className="truncate max-w-[120px]">{page.name}</span>
+            {pages.length > 1 && (
+              <span
+                role="button"
+                tabIndex={0}
                 onClick={(e) => {
                   e.stopPropagation();
                   onRemovePage(page.id);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    onRemovePage(page.id);
+                  }
                 }}
                 className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-all"
                 title="Close page"
               >
                 <X className="w-3 h-3" />
-              </button>
+              </span>
             )}
-          </div>
+          </button>
         );
       })}
       <button
