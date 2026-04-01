@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useCallback, useEffect } from "react";
+import React, { useState, useRef, useMemo, useCallback } from "react";
 import type {
   TraceSpan,
   SpanFilter,
@@ -96,12 +96,6 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   // Replay data
   const { steps: replaySteps, totalSteps: replayTotalSteps } = useReplayData(spans);
 
-  // Reset replay when view mode changes
-  useEffect(() => {
-    setReplayMode(false);
-    setReplayStep(0);
-  }, [viewMode]);
-
   // Check if there are agent spans for the Agent Graph tab
   const hasAgentSpans = useMemo(
     () => spans.some((s) => s.name.includes("agent.phase") || s.name.includes("agent.message")),
@@ -187,7 +181,11 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
           {VIEW_OPTIONS.map((opt) => (
             <button
               key={opt.value}
-              onClick={() => setViewMode(opt.value)}
+              onClick={() => {
+                setViewMode(opt.value);
+                setReplayMode(false);
+                setReplayStep(0);
+              }}
               className={`px-2.5 py-1 text-xs rounded transition-colors ${
                 viewMode === opt.value
                   ? "bg-zinc-700 text-zinc-200"
