@@ -250,10 +250,15 @@ async fn sweep_once(
 /// Waits for `STARTUP_GRACE` before the first sweep, then runs
 /// `sweep_once()` every `SWEEP_INTERVAL`.
 pub fn start_zombie_sweep(
-    db: Arc<CheckpointDb>,
     session_manager: Arc<SessionManager>,
     app_handle: AppHandle,
 ) {
+    // Zombie sweep: SQLite-dependent. Skipping until PG migration.
+    let _ = (session_manager, app_handle);
+    info!("Stale task sweep: disabled (SQLite CheckpointDb removed, PG support pending)");
+    return;
+    #[allow(unreachable_code)]
+    let db: Arc<CheckpointDb> = unreachable!();
     let orphan_tracker = Arc::new(Mutex::new(OrphanTracker::new()));
 
     tokio::spawn(async move {

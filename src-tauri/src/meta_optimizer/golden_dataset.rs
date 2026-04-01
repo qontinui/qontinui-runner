@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 // =============================================================================
@@ -54,7 +53,7 @@ pub struct GoldenEntryMetrics {
 // =============================================================================
 
 /// Save or update a golden dataset.
-pub fn save_golden_dataset(db: &CheckpointDb, pg_db: &Arc<PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
+pub fn save_golden_dataset(pg_db: &Arc<PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
     let id = dataset.id.clone();
     let agent_type = dataset.agent_type.clone();
     let name = dataset.name.clone();
@@ -71,7 +70,6 @@ pub fn save_golden_dataset(db: &CheckpointDb, pg_db: &Arc<PgDb>, dataset: &Golde
 
 /// List golden datasets, optionally filtered by agent type.
 pub fn list_golden_datasets(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<GoldenDataset>, String> {
@@ -86,7 +84,7 @@ pub fn list_golden_datasets(
 }
 
 /// Delete a golden dataset.
-pub fn delete_golden_dataset(db: &CheckpointDb, pg_db: &Arc<PgDb>, dataset_id: &str) -> Result<(), String> {
+pub fn delete_golden_dataset(pg_db: &Arc<PgDb>, dataset_id: &str) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.delete_golden_dataset(dataset_id))
     })
@@ -97,7 +95,6 @@ pub fn delete_golden_dataset(db: &CheckpointDb, pg_db: &Arc<PgDb>, dataset_id: &
 /// Selects up to `max_entries` successful runs from the last 30 days and captures
 /// their task summaries and metrics as golden entries.
 pub fn build_from_history(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     max_entries: usize,
@@ -143,7 +140,7 @@ pub fn build_from_history(
     };
 
     // Save to PG (primary storage for golden datasets)
-    save_golden_dataset(db, pg_db, &dataset)?;
+    save_golden_dataset(pg_db, &dataset)?;
 
     Ok(dataset)
 }
@@ -153,22 +150,22 @@ pub fn build_from_history(
 /// Save a golden dataset with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use save_golden_dataset directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn save_golden_dataset_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
-    save_golden_dataset(db, pg_db, dataset)
+pub fn save_golden_dataset_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
+    save_golden_dataset(pg_db, dataset)
 }
 
 /// Delete a golden dataset with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use delete_golden_dataset directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn delete_golden_dataset_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset_id: &str) -> Result<(), String> {
-    delete_golden_dataset(db, pg_db, dataset_id)
+pub fn delete_golden_dataset_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset_id: &str) -> Result<(), String> {
+    delete_golden_dataset(pg_db, dataset_id)
 }
 
 /// Build a golden dataset from history with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use build_from_history directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn build_from_history_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, max_entries: usize) -> Result<GoldenDataset, String> {
-    build_from_history(db, pg_db, agent_type, max_entries)
+pub fn build_from_history_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, max_entries: usize) -> Result<GoldenDataset, String> {
+    build_from_history(pg_db, agent_type, max_entries)
 }
 
 // ── PG-primary read wrappers ─────────────────────────────────────────────
@@ -177,11 +174,10 @@ pub fn build_from_history_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crat
 #[deprecated(note = "Use list_golden_datasets directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_golden_datasets_with_pg(
-    db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<GoldenDataset>, String> {
-    list_golden_datasets(db, pg_db, agent_type)
+    list_golden_datasets(pg_db, agent_type)
 }
 
 /// Simple string hash for deduplication (not cryptographic).

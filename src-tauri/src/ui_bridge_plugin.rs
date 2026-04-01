@@ -155,95 +155,10 @@ async fn db_assert(
         warn!("db_assert: connection_ref '{cref}' ignored – using runner's checkpoint DB");
     }
 
-    let db = state.checkpoint_db.clone();
-
-    // Run the query on a blocking thread to avoid blocking the async runtime
-    tokio::task::spawn_blocking(move || {
-        let conn = db.get_conn_string()?;
-
-        let mut stmt = conn
-            .prepare(&query)
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-        let column_count = stmt.column_count();
-        let column_names: Vec<String> = (0..column_count)
-            .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
-            .collect();
-
-        let rows_result: Vec<serde_json::Value> = {
-            let mapped = stmt
-                .query_map([], |row| {
-                    let mut map = serde_json::Map::new();
-                    for (i, col_name) in column_names.iter().enumerate() {
-                        let val: rusqlite::types::Value = row.get(i)?;
-                        let json_val = match val {
-                            rusqlite::types::Value::Null => serde_json::Value::Null,
-                            rusqlite::types::Value::Integer(n) => serde_json::json!(n),
-                            rusqlite::types::Value::Real(f) => serde_json::json!(f),
-                            rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-                            rusqlite::types::Value::Blob(b) => {
-                                serde_json::Value::String(format!("<blob {} bytes>", b.len()))
-                            }
-                        };
-                        map.insert(col_name.clone(), json_val);
-                    }
-                    Ok(serde_json::Value::Object(map))
-                })
-                .map_err(|e| format!("Query execution failed: {e}"))?;
-            mapped
-                .collect::<Result<Vec<serde_json::Value>, rusqlite::Error>>()
-                .map_err(|e| format!("Failed to collect rows: {e}"))?
-        };
-
-        let row_count = rows_result.len() as i64;
-
-        // Determine pass/fail
-        let mut passed = true;
-
-        if let Some(expected) = expected_rows {
-            if row_count != expected {
-                passed = false;
-            }
-        }
-
-        if let Some(ref expected_vals) = expected_values {
-            // Compare each expected value object against the actual rows.
-            // Each entry in expected_values should match the corresponding row.
-            for (i, expected_row) in expected_vals.iter().enumerate() {
-                if i >= rows_result.len() {
-                    passed = false;
-                    break;
-                }
-                let actual_row = &rows_result[i];
-                if let (Some(expected_obj), Some(actual_obj)) =
-                    (expected_row.as_object(), actual_row.as_object())
-                {
-                    for (key, expected_val) in expected_obj {
-                        if let Some(actual_val) = actual_obj.get(key.as_str()) {
-                            if actual_val != expected_val {
-                                passed = false;
-                            }
-                        } else {
-                            passed = false;
-                        }
-                    }
-                } else {
-                    // Fall back to direct equality
-                    if actual_row != expected_row {
-                        passed = false;
-                    }
-                }
-            }
-        }
-
-        Ok(DbAssertResult {
-            passed,
-            row_count,
-            rows: Some(rows_result),
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    // db_assert: SQLite-based assertions removed. Return an error indicating
+    // this feature needs PG migration.
+    let _ = (state, expected_rows, expected_values);
+    Err(format!("db_assert not supported: SQLite checkpoint DB removed. Query: {}", query))
 }
 
 // ---------------------------------------------------------------------------
@@ -261,14 +176,8 @@ async fn save_artifact(
         "ui-bridge plugin: save_artifact id={}",
         artifact.artifact_id
     );
-
-    let db = state.checkpoint_db.clone();
-    tokio::task::spawn_blocking(move || {
-        db.save_artifact(&artifact)?;
-        Ok(serde_json::json!({ "saved": true }))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    state.pg_db.save_artifact(&artifact).await.map_err(|e| format!("Failed to save artifact: {e}"))?;
+    Ok(serde_json::json!({ "saved": true }))
 }
 
 /// Get a single artifact by ID, deserializing JSON fields.
@@ -278,19 +187,11 @@ async fn get_artifact(
     artifact_id: String,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: get_artifact id={artifact_id}");
-
-    let db = state.checkpoint_db.clone();
-    tokio::task::spawn_blocking(move || {
-        let artifact = db.get_artifact(&artifact_id)?;
-        match artifact {
-            Some(a) => {
-                serde_json::to_value(&a).map_err(|e| format!("Failed to serialize artifact: {e}"))
-            }
-            None => Err(format!("Artifact '{artifact_id}' not found")),
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    let artifact = state.pg_db.get_artifact(&artifact_id).await.map_err(|e| format!("Failed to get artifact: {e}"))?;
+    match artifact {
+        Some(a) => serde_json::to_value(&a).map_err(|e| format!("Failed to serialize artifact: {e}")),
+        None => Err(format!("Artifact '{artifact_id}' not found")),
+    }
 }
 
 /// Query artifacts with optional filters (specId, dateRange, passedOnly/failedOnly, limit/offset).
@@ -301,14 +202,8 @@ async fn query_artifacts(
     query: ArtifactQuery,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: query_artifacts");
-
-    let db = state.checkpoint_db.clone();
-    tokio::task::spawn_blocking(move || {
-        let artifacts = db.query_artifacts(&query)?;
-        serde_json::to_value(&artifacts).map_err(|e| format!("Failed to serialize artifacts: {e}"))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    let artifacts = state.pg_db.query_artifacts(&query).await.map_err(|e| format!("Failed to query artifacts: {e}"))?;
+    serde_json::to_value(&artifacts).map_err(|e| format!("Failed to serialize artifacts: {e}"))
 }
 
 /// Verify an artifact's integrity by recomputing the SHA-256 hash of the canonical
@@ -319,42 +214,35 @@ async fn verify_artifact(
     artifact_id: String,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: verify_artifact id={artifact_id}");
+    let artifact = state.pg_db.get_artifact(&artifact_id).await.map_err(|e| format!("Failed to get artifact: {e}"))?;
+    match artifact {
+        Some(a) => {
+            let canonical = serde_json::json!({
+                "result": serde_json::from_str::<serde_json::Value>(&a.result_json)
+                    .unwrap_or(serde_json::Value::Null),
+                "source": serde_json::from_str::<serde_json::Value>(&a.source_json)
+                    .unwrap_or(serde_json::Value::Null),
+                "environment": serde_json::from_str::<serde_json::Value>(&a.environment_json)
+                    .unwrap_or(serde_json::Value::Null),
+            });
 
-    let db = state.checkpoint_db.clone();
-    tokio::task::spawn_blocking(move || {
-        let artifact = db.get_artifact(&artifact_id)?;
-        match artifact {
-            Some(a) => {
-                // Build canonical JSON in a deterministic order: result, source, environment
-                let canonical = serde_json::json!({
-                    "result": serde_json::from_str::<serde_json::Value>(&a.result_json)
-                        .unwrap_or(serde_json::Value::Null),
-                    "source": serde_json::from_str::<serde_json::Value>(&a.source_json)
-                        .unwrap_or(serde_json::Value::Null),
-                    "environment": serde_json::from_str::<serde_json::Value>(&a.environment_json)
-                        .unwrap_or(serde_json::Value::Null),
-                });
+            let canonical_str = serde_json::to_string(&canonical)
+                .map_err(|e| format!("Failed to serialize canonical JSON: {e}"))?;
 
-                let canonical_str = serde_json::to_string(&canonical)
-                    .map_err(|e| format!("Failed to serialize canonical JSON: {e}"))?;
+            let mut hasher = Sha256::new();
+            hasher.update(canonical_str.as_bytes());
+            let hash = hex::encode(hasher.finalize());
 
-                let mut hasher = Sha256::new();
-                hasher.update(canonical_str.as_bytes());
-                let hash = hex::encode(hasher.finalize());
+            let valid = hash == artifact_id;
 
-                let valid = hash == artifact_id;
-
-                Ok(serde_json::json!({
-                    "valid": valid,
-                    "computedHash": hash,
-                    "artifactId": artifact_id,
-                }))
-            }
-            None => Err(format!("Artifact '{artifact_id}' not found")),
+            Ok(serde_json::json!({
+                "valid": valid,
+                "computedHash": hash,
+                "artifactId": artifact_id,
+            }))
         }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+        None => Err(format!("Artifact '{artifact_id}' not found")),
+    }
 }
 
 /// Count artifacts with optional filters.
@@ -364,21 +252,15 @@ async fn count_artifacts(
     query: Option<ArtifactCountQuery>,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: count_artifacts");
-
-    let db = state.checkpoint_db.clone();
-    tokio::task::spawn_blocking(move || {
-        let q = query.unwrap_or(ArtifactCountQuery {
-            spec_id: None,
-            date_from: None,
-            date_to: None,
-            passed_only: None,
-            failed_only: None,
-        });
-        let count = db.count_artifacts(&q)?;
-        Ok(serde_json::json!({ "count": count }))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    let q = query.unwrap_or(ArtifactCountQuery {
+        spec_id: None,
+        date_from: None,
+        date_to: None,
+        passed_only: None,
+        failed_only: None,
+    });
+    let count = state.pg_db.count_artifacts(&q).await.map_err(|e| format!("Failed to count artifacts: {e}"))?;
+    Ok(serde_json::json!({ "count": count }))
 }
 
 // ---------------------------------------------------------------------------

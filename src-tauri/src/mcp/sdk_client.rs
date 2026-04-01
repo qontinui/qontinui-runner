@@ -3764,6 +3764,58 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Heartbeat
         .route("/ui-bridge/sdk/heartbeat", post(handle_heartbeat))
+        // App-agnostic convenience endpoints
+        .route(
+            "/ui-bridge/sdk/page/click-by-text",
+            post(handle_click_by_text),
+        )
+        .route(
+            "/ui-bridge/sdk/page/click-by-selector",
+            post(handle_click_by_selector),
+        )
+        .route("/ui-bridge/sdk/page/type-into", post(handle_type_into))
+        .route("/ui-bridge/sdk/page/read-value", post(handle_read_value))
+        .route(
+            "/ui-bridge/sdk/page/find-by-text",
+            post(handle_find_by_text),
+        )
+        // Diagnostics
+        .route("/ui-bridge/sdk/diagnostics", get(handle_diagnostics))
+        // Navigation adapter
+        .route("/ui-bridge/sdk/page/routes", get(handle_page_routes))
+        .route(
+            "/ui-bridge/sdk/page/navigate-to",
+            post(handle_navigate_by_adapter),
+        )
+        // /control/-prefixed aliases for convenience endpoints
+        .route(
+            "/ui-bridge/sdk/control/page/click-by-text",
+            post(handle_click_by_text),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/click-by-selector",
+            post(handle_click_by_selector),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/type-into",
+            post(handle_type_into),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/read-value",
+            post(handle_read_value),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/find-by-text",
+            post(handle_find_by_text),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/routes",
+            get(handle_page_routes),
+        )
+        .route(
+            "/ui-bridge/sdk/control/page/navigate-to",
+            post(handle_navigate_by_adapter),
+        )
         // Query selector & page evaluate (IPC relay)
         .route(
             "/ui-bridge/sdk/control/query-selector",
@@ -3798,6 +3850,192 @@ async fn handle_page_evaluate(
     match ui_bridge_request_sync(&state, "page_evaluate", body).await {
         Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+// =============================================================================
+// App-Agnostic Convenience Endpoints
+// =============================================================================
+
+/// POST /ui-bridge/sdk/page/click-by-text — Click an element by visible text
+async fn handle_click_by_text(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/click-by-text",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(_) => {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "click_by_text", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
+    }
+}
+
+/// POST /ui-bridge/sdk/page/click-by-selector — Click an element by CSS selector
+async fn handle_click_by_selector(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/click-by-selector",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(_) => {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "click_by_selector", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
+    }
+}
+
+/// POST /ui-bridge/sdk/page/type-into — Type text into an input field
+async fn handle_type_into(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/type-into",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(_) => {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "type_into", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
+    }
+}
+
+/// POST /ui-bridge/sdk/page/read-value — Read a form element's value
+async fn handle_read_value(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/read-value",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(_) => {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "read_value", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
+    }
+}
+
+/// POST /ui-bridge/sdk/page/find-by-text — Find elements by visible text
+async fn handle_find_by_text(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/find-by-text",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(_) => {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "find_by_text", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
+    }
+}
+
+/// GET /ui-bridge/sdk/diagnostics — SDK diagnostic information
+async fn handle_diagnostics(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/diagnostics", None).await {
+        Ok(data) => Json(data),
+        Err(_) => match ui_bridge_request_sync(
+            &state,
+            "get_diagnostics",
+            serde_json::json!({}),
+        )
+        .await
+        {
+            Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        },
+    }
+}
+
+/// GET /ui-bridge/sdk/page/routes — List available routes
+async fn handle_page_routes(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    match sdk_request(&state, Method::GET, "/control/page/routes", None).await {
+        Ok(data) => Json(data),
+        Err(_) => match ui_bridge_request_sync(
+            &state,
+            "get_routes",
+            serde_json::json!({}),
+        )
+        .await
+        {
+            Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        },
+    }
+}
+
+/// POST /ui-bridge/sdk/page/navigate-to — Navigate using the navigation adapter
+async fn handle_navigate_by_adapter(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        &state,
+        Method::POST,
+        "/control/page/navigate-to",
+        Some(body.clone()),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(_) => {
+            let payload = serde_json::json!({ "params": body });
+            match ui_bridge_request_sync(&state, "navigate_by_adapter", payload).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 

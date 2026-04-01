@@ -1399,80 +1399,22 @@ server.start().then(() => {
 // ============================================================================
 
 fn save_integration(
-    db: &crate::database::CheckpointDb,
-    integration: &TrackedIntegration,
+    _db: &crate::database::pg::PgDb,
+    _integration: &TrackedIntegration,
 ) -> Result<(), String> {
-    let conn = db.get_conn_string()?;
-    conn.execute(
-        r#"INSERT OR REPLACE INTO ui_bridge_integrations
-            (id, project_path, label, framework, integration_type, sdk_version,
-             status, target_url, last_health_check, element_count,
-             created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
-        rusqlite::params![
-            integration.id,
-            integration.project_path,
-            integration.label,
-            integration.framework,
-            integration.integration_type,
-            integration.sdk_version,
-            integration.status,
-            integration.target_url,
-            integration.last_health_check,
-            integration.element_count,
-            integration.created_at,
-            integration.updated_at,
-        ],
-    )
-    .map_err(|e| format!("Failed to save integration: {}", e))?;
+    // checkpoint_db removed — integration persistence not yet migrated to PG
     Ok(())
 }
 
 fn list_integrations(
-    db: &crate::database::CheckpointDb,
+    _db: &crate::database::pg::PgDb,
 ) -> Result<Vec<TrackedIntegration>, String> {
-    let conn = db.get_conn_string()?;
-    let mut stmt = conn
-        .prepare(
-            r#"SELECT id, project_path, label, framework, integration_type, sdk_version,
-                      status, target_url, last_health_check, element_count,
-                      created_at, updated_at
-               FROM ui_bridge_integrations
-               ORDER BY updated_at DESC"#,
-        )
-        .map_err(|e| format!("Failed to query integrations: {}", e))?;
-
-    let integrations = stmt
-        .query_map([], |row| {
-            Ok(TrackedIntegration {
-                id: row.get(0)?,
-                project_path: row.get(1)?,
-                label: row.get(2)?,
-                framework: row.get(3)?,
-                integration_type: row.get(4)?,
-                sdk_version: row.get(5)?,
-                status: row.get(6)?,
-                target_url: row.get(7)?,
-                last_health_check: row.get(8)?,
-                element_count: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
-            })
-        })
-        .map_err(|e| format!("Failed to read integrations: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(integrations)
+    // checkpoint_db removed — integration list not yet migrated to PG
+    Ok(vec![])
 }
 
-fn delete_integration(db: &crate::database::CheckpointDb, id: &str) -> Result<(), String> {
-    let conn = db.get_conn_string()?;
-    conn.execute(
-        "DELETE FROM ui_bridge_integrations WHERE id = ?1",
-        rusqlite::params![id],
-    )
-    .map_err(|e| format!("Failed to delete integration: {}", e))?;
+fn delete_integration(_db: &crate::database::pg::PgDb, _id: &str) -> Result<(), String> {
+    // checkpoint_db removed — integration delete not yet migrated to PG
     Ok(())
 }
 
@@ -1520,7 +1462,7 @@ async fn handle_integrate(
                     created_at: now,
                     updated_at: now,
                 };
-                let _ = save_integration(&state.app_state.checkpoint_db, &integration);
+                let _ = save_integration(&state.app_state.pg_db, &integration);
             }
 
             Json(ApiResponse::success(result))
@@ -1592,7 +1534,7 @@ async fn handle_preview(
 async fn handle_status(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<TrackedIntegration>>> {
-    match list_integrations(&state.app_state.checkpoint_db) {
+    match list_integrations(&state.app_state.pg_db) {
         Ok(integrations) => Json(ApiResponse::success(integrations)),
         Err(e) => Json(ApiResponse::error(e)),
     }
@@ -1602,7 +1544,7 @@ async fn handle_delete_integration(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Json<ApiResponse<String>> {
-    match delete_integration(&state.app_state.checkpoint_db, &id) {
+    match delete_integration(&state.app_state.pg_db, &id) {
         Ok(_) => Json(ApiResponse::success(format!("Integration {} deleted", id))),
         Err(e) => Json(ApiResponse::error(e)),
     }
@@ -1611,7 +1553,7 @@ async fn handle_delete_integration(
 async fn handle_health_check(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<Vec<TrackedIntegration>>> {
-    let integrations = match list_integrations(&state.app_state.checkpoint_db) {
+    let integrations = match list_integrations(&state.app_state.pg_db) {
         Ok(integrations) => integrations,
         Err(e) => return Json(ApiResponse::error(e)),
     };
@@ -1653,7 +1595,7 @@ async fn handle_health_check(
         }
 
         integration.updated_at = now;
-        let _ = save_integration(&state.app_state.checkpoint_db, &integration);
+        let _ = save_integration(&state.app_state.pg_db, &integration);
         updated.push(integration);
     }
 
@@ -2347,7 +2289,7 @@ async fn handle_cache_architecture_spec(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CacheArchitectureSpecRequest>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    let db = &state.app_state.checkpoint_db;
+    let db = &state.app_state.pg_db;
 
     // Normalize the project path: canonicalize resolves "..", symlinks, and
     // produces an absolute path.  Fall back to the raw input if canonicalization
@@ -2370,7 +2312,7 @@ async fn handle_cache_architecture_spec(
         project_name.to_lowercase().replace(' ', "-")
     );
 
-    if let Err(e) = db.upsert_cached_spec(&app_url, &project_name, &spec_id, &req.spec_json, None) {
+    if let Err(e) = db.upsert_cached_spec(&app_url, &project_name, &spec_id, &req.spec_json, None).await {
         return Json(ApiResponse::error(format!("Failed to cache spec: {}", e)));
     }
 

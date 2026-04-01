@@ -34,6 +34,7 @@ pub mod commands;
 pub mod engine;
 pub mod metrics;
 pub mod model_profiles;
+pub mod model_q_router;
 pub mod mutations;
 pub mod q_router;
 pub mod types;

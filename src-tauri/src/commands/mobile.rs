@@ -627,8 +627,9 @@ pub async fn get_mobile_states(
     info!("Getting mobile states for task run: {}", task_run_id);
 
     let states = state
-        .checkpoint_db
+        .pg_db
         .get_mobile_states(&task_run_id, limit)
+        .await
         .map_err(|e| format!("Failed to get mobile states: {}", e))?;
 
     Ok(CommandResponse {
@@ -653,8 +654,9 @@ pub async fn get_latest_mobile_state(
     info!("Getting latest mobile state for task run: {}", task_run_id);
 
     let mobile_state = state
-        .checkpoint_db
+        .pg_db
         .get_latest_mobile_state(&task_run_id)
+        .await
         .map_err(|e| format!("Failed to get mobile state: {}", e))?;
 
     Ok(CommandResponse {
@@ -700,8 +702,9 @@ pub async fn create_mobile_state(
     };
 
     let mobile_state = state
-        .checkpoint_db
+        .pg_db
         .create_mobile_state(&db_input)
+        .await
         .map_err(|e| format!("Failed to create mobile state: {}", e))?;
 
     Ok(CommandResponse {
@@ -739,13 +742,14 @@ pub async fn get_mobile_logs(
     );
 
     let logs = state
-        .checkpoint_db
+        .pg_db
         .get_mobile_logs(
             &task_run_id,
             log_source.as_deref(),
             errors_only.unwrap_or(false),
             limit,
         )
+        .await
         .map_err(|e| format!("Failed to get mobile logs: {}", e))?;
 
     Ok(CommandResponse {
@@ -771,8 +775,9 @@ pub async fn get_mobile_errors(
     info!("Getting mobile errors for task run: {}", task_run_id);
 
     let errors = state
-        .checkpoint_db
+        .pg_db
         .get_mobile_errors(&task_run_id, limit)
+        .await
         .map_err(|e| format!("Failed to get mobile errors: {}", e))?;
 
     Ok(CommandResponse {
@@ -818,8 +823,9 @@ pub async fn create_mobile_log(
     };
 
     let log = state
-        .checkpoint_db
+        .pg_db
         .create_mobile_log(&db_input)
+        .await
         .map_err(|e| format!("Failed to create mobile log: {}", e))?;
 
     Ok(CommandResponse {
@@ -934,8 +940,9 @@ pub async fn capture_mobile_feedback(
     };
 
     let mobile_state = state
-        .checkpoint_db
+        .pg_db
         .create_mobile_state(&input)
+        .await
         .map_err(|e| format!("Failed to create mobile state: {}", e))?;
 
     Ok(CommandResponse {
@@ -962,20 +969,17 @@ pub async fn delete_mobile_data(
 ) -> Result<CommandResponse, String> {
     info!("Deleting mobile data for task run: {}", task_run_id);
 
-    let (states_deleted, logs_deleted) = state
-        .checkpoint_db
+    state
+        .pg_db
         .delete_mobile_data_for_task(&task_run_id)
+        .await
         .map_err(|e| format!("Failed to delete mobile data: {}", e))?;
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!(
-            "Deleted {} mobile states and {} logs",
-            states_deleted, logs_deleted
-        )),
+        message: Some("Deleted mobile data".to_string()),
         data: Some(serde_json::json!({
-            "states_deleted": states_deleted,
-            "logs_deleted": logs_deleted,
+            "deleted": true,
         })),
     })
 }

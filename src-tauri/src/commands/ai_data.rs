@@ -567,13 +567,9 @@ pub async fn reopen_task_run(
         ));
     }
 
-    match state
-        .checkpoint_db
-        .reopen_task_run(&task_id, additional_sessions)
-    {
-        Ok(run) => Ok(AiDataResponse::ok(run)),
-        Err(e) => Ok(AiDataResponse::err(e)),
-    }
+    // checkpoint_db removed — reopen_task_run was SQLite-only, no-op
+    let _ = (&task_id, additional_sessions);
+    Ok(AiDataResponse::err("reopen_task_run: checkpoint_db has been removed".to_string()))
 }
 
 // =============================================================================
@@ -1449,32 +1445,14 @@ pub async fn get_task_run_verification_results_from_db(
     state: State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<AiDataResponse<TaskRunVerificationResultsDbResult>, String> {
-    match state
-        .checkpoint_db
-        .get_all_verification_phase_results(&task_run_id)
-    {
-        Ok(results) => {
-            let count = results.len();
-            let passed_iterations = results
-                .iter()
-                .filter(|r| {
-                    r.get("all_passed")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                })
-                .count();
-            let failed_iterations = count - passed_iterations;
-
-            Ok(AiDataResponse::ok(TaskRunVerificationResultsDbResult {
-                task_run_id,
-                results,
-                count,
-                passed_iterations,
-                failed_iterations,
-            }))
-        }
-        Err(e) => Ok(AiDataResponse::err(e)),
-    }
+    // checkpoint_db removed — verification phase results was SQLite-only
+    Ok(AiDataResponse::ok(TaskRunVerificationResultsDbResult {
+        task_run_id,
+        results: Vec::new(),
+        count: 0,
+        passed_iterations: 0,
+        failed_iterations: 0,
+    }))
 }
 
 /// Response type for runtime context query.
@@ -1503,9 +1481,9 @@ pub async fn get_task_run_context(
     state: State<'_, Arc<AppState>>,
     task_run_id: String,
 ) -> Result<AiDataResponse<RuntimeContextResult>, String> {
-    let context_json = state
-        .checkpoint_db
-        .get_task_run_runtime_context(&task_run_id)?;
+    // checkpoint_db removed — runtime context was SQLite-only
+    let context_json: Option<String> = None;
+    let _ = &task_run_id;
 
     let mut variables = Vec::new();
 

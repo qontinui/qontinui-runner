@@ -10,7 +10,8 @@
 //! The "AI" prefix was removed since task runs can now be pure automation or mixed.
 
 use crate::auth::AuthManager;
-use crate::database::{CheckpointDb, TaskRun};
+use crate::database::TaskRun;
+use crate::database::pg::PgDb;
 use crate::findings::types::{Finding, FindingStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -773,7 +774,7 @@ impl AITaskSyncService {
     /// This is useful for syncing a completed task that was created while offline.
     pub async fn full_sync_task(
         &self,
-        db: &Arc<CheckpointDb>,
+        db: &Arc<PgDb>,
         task_id: &str,
         project_id: Option<&str>,
     ) -> Result<(), String> {
@@ -781,35 +782,19 @@ impl AITaskSyncService {
 
         // Get task from local database
         let task = db
-            .get_task_run(task_id)?
+            .get_task_run(task_id).await?
             .ok_or_else(|| format!("Task {} not found in local database", task_id))?;
 
         // 1. Create or update task in backend
         let _task_response = self.sync_task_created(&task, project_id).await?;
 
         // 2. Sync all findings
-        let findings = db.get_findings_for_task(task_id)?;
+        let findings = db.get_findings_for_task(task_id).await?;
         if !findings.is_empty() {
             self.sync_findings(task_id, &findings).await?;
         }
 
-        // 3. Sync all verification results
-        let verification_results = db.get_all_verification_phase_results(task_id);
-        if let Ok(results) = verification_results {
-            for result in &results {
-                if let Some(iteration) = result.get("iteration").and_then(|v| v.as_u64()) {
-                    if let Err(e) = self
-                        .sync_verification_result(task_id, iteration as u32, result)
-                        .await
-                    {
-                        warn!(
-                            "Failed to sync verification result iter {} for task {}: {}",
-                            iteration, task_id, e
-                        );
-                    }
-                }
-            }
-        }
+        // 3. Verification results sync removed — was checkpoint_db-only
 
         // 4. If task is complete, sync completion status
         if task.status != "running" {
@@ -918,7 +903,7 @@ pub async fn full_sync_ai_task(
 ) -> Result<(), String> {
     let service = AITaskSyncService::new();
     service
-        .full_sync_task(&app_state.checkpoint_db, &task_id, project_id.as_deref())
+        .full_sync_task(&app_state.pg_db, &task_id, project_id.as_deref())
         .await
 }
 
@@ -945,7 +930,7 @@ pub async fn sync_all_pending_ai_tasks(
 
     for task in tasks {
         match service
-            .full_sync_task(&app_state.checkpoint_db, &task.id, project_id.as_deref())
+            .full_sync_task(&app_state.pg_db, &task.id, project_id.as_deref())
             .await
         {
             Ok(_) => {

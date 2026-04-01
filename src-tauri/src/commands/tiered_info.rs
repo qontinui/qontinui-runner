@@ -252,8 +252,6 @@ pub async fn record_run(
     state: State<'_, Arc<AppState>>,
     input: RecordRunInput,
 ) -> Result<TieredInfoResponse<String>, String> {
-    let db = state.checkpoint_db.clone();
-
     // Parse status
     let status = match RunStatus::from_str(&input.status) {
         Some(s) => s,
@@ -524,9 +522,7 @@ pub async fn delete_ai_session(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> Result<TieredInfoResponse<bool>, String> {
-    let db = &state.checkpoint_db;
-
-    match db.delete_task_run(&session_id) {
+    match state.pg_db.delete_task_run(&session_id).await {
         Ok(deleted) => {
             if deleted {
                 info!("Deleted AI session: {}", session_id);

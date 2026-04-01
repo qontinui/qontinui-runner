@@ -573,7 +573,8 @@ pub async fn run_workflow(
 
     // Create a TaskRun for this automation execution
     // This ensures ALL automation runs go through the unified TaskRun system
-    let task_recorder = TaskRecorder::new(state.app_state.checkpoint_db.clone());
+    // TODO: TaskRecorder needs PG migration — checkpoint_db removed
+    let task_recorder = TaskRecorder::new();
     let task_config = TaskConfig::automation_task(
         &format!("Workflow: {}", request.workflow_name),
         config_id.as_deref().unwrap_or("unknown"),

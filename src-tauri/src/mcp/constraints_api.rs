@@ -156,11 +156,9 @@ pub async fn get_constraint_results(
         task_run_id, iteration
     );
 
-    let results = state
-        .app_state
-        .checkpoint_db
-        .get_constraint_results(&task_run_id, iteration)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // checkpoint_db removed — constraint results not yet migrated to PG
+    let _ = iteration;
+    let results: Vec<serde_json::Value> = vec![];
 
     info!(
         "CONSTRAINTS-API: Returning {} constraint result(s)",

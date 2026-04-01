@@ -138,9 +138,53 @@ impl DockerManager {
             host_config.nano_cpus = Some((cpu * 1_000_000_000.0) as i64);
         }
 
+        // PID limit
+        if let Some(pids) = config.pids_limit {
+            host_config.pids_limit = Some(pids);
+        }
+
         // Network
         if !config.network_enabled {
             host_config.network_mode = Some("none".to_string());
+        }
+
+        // Security hardening: capabilities
+        if !config.cap_drop.is_empty() {
+            host_config.cap_drop = Some(config.cap_drop.clone());
+        }
+        if !config.cap_add.is_empty() {
+            host_config.cap_add = Some(config.cap_add.clone());
+        }
+
+        // Security options (no-new-privileges, seccomp profiles)
+        if !config.security_opt.is_empty() {
+            host_config.security_opt = Some(config.security_opt.clone());
+        }
+
+        // Read-only root filesystem
+        if config.read_only_rootfs {
+            host_config.readonly_rootfs = Some(true);
+
+            // Add tmpfs mounts for writable temp directories
+            let mut tmpfs_map = std::collections::HashMap::new();
+            if config.tmpfs_mounts.is_empty() {
+                // Default tmpfs mounts when read-only rootfs is enabled
+                tmpfs_map.insert("/tmp".to_string(), "rw,noexec,nosuid,size=64m".to_string());
+                tmpfs_map.insert(
+                    "/var/tmp".to_string(),
+                    "rw,noexec,nosuid,size=64m".to_string(),
+                );
+            } else {
+                for mount_spec in &config.tmpfs_mounts {
+                    // Parse "path:options" format
+                    if let Some((path, opts)) = mount_spec.split_once(':') {
+                        tmpfs_map.insert(path.to_string(), opts.to_string());
+                    } else {
+                        tmpfs_map.insert(mount_spec.to_string(), "rw,noexec,nosuid".to_string());
+                    }
+                }
+            }
+            host_config.tmpfs = Some(tmpfs_map);
         }
 
         // Create container
@@ -152,6 +196,13 @@ impl DockerManager {
                 .next()
                 .unwrap_or("tmp")
         );
+
+        // Build environment variables
+        let env = if config.extra_env.is_empty() {
+            None
+        } else {
+            Some(config.extra_env.clone())
+        };
 
         let container_config = Config {
             image: Some(config.base_image.clone()),
@@ -165,6 +216,8 @@ impl DockerManager {
             } else {
                 None
             },
+            user: config.user.clone(),
+            env,
             host_config: Some(host_config),
             ..Default::default()
         };

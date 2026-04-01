@@ -79,29 +79,12 @@ pub async fn create_saved_api_request(
         "Creating saved API request: {} {}",
         request.method, request.url
     );
-    match state
-        .app_state
-        .checkpoint_db
-        .create_saved_api_request(&request)
-    {
-        Ok(created) => {
-            info!(
-                "Created saved API request: {} ({})",
-                created.name, created.id
-            );
-            Ok(Json(ApiResponse::success(created)))
-        }
-        Err(e) => {
-            error!("Failed to create saved API request: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to create saved API request: {}",
-                    e
-                ))),
-            ))
-        }
-    }
+    // checkpoint_db removed — create not yet migrated to PG
+    let _ = request;
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Create saved API request: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// Update a saved API request
@@ -114,33 +97,12 @@ pub async fn update_saved_api_request(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     info!("Updating saved API request: {}", id);
-    match state
-        .app_state
-        .checkpoint_db
-        .update_saved_api_request(&id, &request)
-    {
-        Ok(updated) => {
-            info!(
-                "Updated saved API request: {} ({})",
-                updated.name, updated.id
-            );
-            Ok(Json(ApiResponse::success(updated)))
-        }
-        Err(e) if e.contains("not found") => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Saved API request not found: {}", id))),
-        )),
-        Err(e) => {
-            error!("Failed to update saved API request: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to update saved API request: {}",
-                    e
-                ))),
-            ))
-        }
-    }
+    // checkpoint_db removed — update not yet migrated to PG
+    let _ = (id, request);
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Update saved API request: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// Delete a saved API request
@@ -179,43 +141,17 @@ pub async fn search_saved_api_requests(
     Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state
-        .app_state
-        .checkpoint_db
-        .search_saved_api_requests(&query)
-    {
-        Ok(requests) => Ok(Json(ApiResponse::success(requests))),
-        Err(e) => {
-            error!("Failed to search saved API requests: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to search saved API requests: {}",
-                    e
-                ))),
-            ))
-        }
-    }
+    // checkpoint_db removed — search not yet migrated to PG
+    let _ = query;
+    Ok(Json(ApiResponse::success(vec![])))
 }
 
 /// Get all categories from saved API requests
 pub async fn get_saved_api_request_categories(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state
-        .app_state
-        .checkpoint_db
-        .get_saved_api_request_categories()
-    {
-        Ok(categories) => Ok(Json(ApiResponse::success(categories))),
-        Err(e) => {
-            error!("Failed to get saved API request categories: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get categories: {}", e))),
-            ))
-        }
-    }
+    // checkpoint_db removed — categories not yet migrated to PG
+    Ok(Json(ApiResponse::success(vec![])))
 }
 
 /// Get all tags from saved API requests
@@ -243,30 +179,12 @@ pub async fn duplicate_saved_api_request(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     info!("Duplicating saved API request: {}", id);
-    match state
-        .app_state
-        .checkpoint_db
-        .duplicate_saved_api_request(&id)
-    {
-        Ok(duplicated) => {
-            info!("Duplicated saved API request: {} -> {}", id, duplicated.id);
-            Ok(Json(ApiResponse::success(duplicated)))
-        }
-        Err(e) if e.contains("not found") => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Saved API request not found: {}", id))),
-        )),
-        Err(e) => {
-            error!("Failed to duplicate saved API request: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to duplicate saved API request: {}",
-                    e
-                ))),
-            ))
-        }
-    }
+    // checkpoint_db removed — duplicate not yet migrated to PG
+    let _ = id;
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Duplicate saved API request: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// Create routes for this module.

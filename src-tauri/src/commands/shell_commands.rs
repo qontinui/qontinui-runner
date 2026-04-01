@@ -486,16 +486,22 @@ pub async fn execute_shell_command(
         name, command, timeout_seconds, working_directory
     );
 
-    // ── Container isolation path ──────────────────────────────────────
-    // If container isolation is enabled and Docker is available, try to
-    // execute the command inside an isolated container first. On failure
-    // or unavailability, fall through to host execution.
+    // ── Container isolation path (with security policy) ────────────
+    // Resolve security policy and enforce command restrictions
+    let security_settings = crate::settings::get_security_settings();
+    let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
+
+    if let Err(denial) = crate::security::PolicyEngine::evaluate_command(&security_policy, &command) {
+        warn!("Shell command '{}' blocked by security policy: {}", name, denial);
+        return Err(format!("Security policy violation: {}", denial.reason));
+    }
+
     let container_result = {
         let executor_guard = state.container_executor.lock().await;
         if let Some(ref executor) = *executor_guard {
             debug!("Container executor present, attempting container execution for '{}'", name);
             match executor
-                .try_execute(&command, working_directory.as_deref())
+                .try_execute_with_policy(&command, working_directory.as_deref(), Some(&security_policy))
                 .await
             {
                 Ok(Some(cr)) => {

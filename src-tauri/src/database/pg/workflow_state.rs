@@ -361,4 +361,243 @@ impl PgDb {
         );
         Ok(())
     }
+
+    // =========================================================================
+    // Sync wrappers (block_in_place) for CheckpointManager
+    // =========================================================================
+
+    /// Save a workflow step checkpoint (sync wrapper).
+    pub fn save_workflow_step_checkpoint_sync(
+        &self,
+        checkpoint: &StepCheckpoint,
+    ) -> Result<(), String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                self.save_workflow_step_checkpoint_async(checkpoint),
+            )
+        })
+    }
+
+    /// Save a workflow step checkpoint (async).
+    pub async fn save_workflow_step_checkpoint_async(
+        &self,
+        checkpoint: &StepCheckpoint,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let iter_i32: Option<i32> = checkpoint.iteration.map(|i| i as i32);
+        let step_index_i32 = checkpoint.step_index as i32;
+        let stage_index_i32: Option<i32> = checkpoint.stage_index.map(|i| i as i32);
+        let duration_ms_i64: Option<i64> = checkpoint.duration_ms;
+        let status_str = checkpoint.status.to_string();
+
+        conn.execute(
+            r#"INSERT INTO workflow_step_checkpoints (
+                id, execution_id, workflow_type, phase, iteration, step_index,
+                stage_index, step_type, step_name, status, result_json, step_config_json,
+                started_at, completed_at, duration_ms, error
+            ) VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, 0), $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            ON CONFLICT(execution_id, phase, iteration, step_index, stage_index) DO UPDATE SET
+                status = $10,
+                result_json = $11,
+                step_config_json = COALESCE($12, workflow_step_checkpoints.step_config_json),
+                started_at = COALESCE($13, workflow_step_checkpoints.started_at),
+                completed_at = $14,
+                duration_ms = $15,
+                error = $16"#,
+            &[
+                &checkpoint.id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.workflow_type as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.phase as &(dyn tokio_postgres::types::ToSql + Sync),
+                &iter_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &step_index_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &stage_index_i32 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.step_type as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.step_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                &status_str as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.result_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.step_config_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.started_at as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.completed_at as &(dyn tokio_postgres::types::ToSql + Sync),
+                &duration_ms_i64 as &(dyn tokio_postgres::types::ToSql + Sync),
+                &checkpoint.error as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG save_workflow_step_checkpoint: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get workflow step checkpoints by phase/iteration (sync wrapper).
+    pub fn get_workflow_step_checkpoints_sync(
+        &self,
+        execution_id: &str,
+        phase: &str,
+        iteration: Option<u32>,
+    ) -> Result<Vec<StepCheckpoint>, String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                self.get_workflow_step_checkpoints_by_phase(execution_id, phase, iteration),
+            )
+        })
+    }
+
+    /// Get workflow step checkpoints by phase and iteration (async).
+    pub async fn get_workflow_step_checkpoints_by_phase(
+        &self,
+        execution_id: &str,
+        phase: &str,
+        iteration: Option<u32>,
+    ) -> Result<Vec<StepCheckpoint>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let iter_i32: Option<i32> = iteration.map(|i| i as i32);
+
+        let rows = if let Some(iter_val) = iter_i32 {
+            conn.query(
+                r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                          stage_index, step_type, step_name, status, result_json, step_config_json,
+                          started_at, completed_at, duration_ms, error
+                   FROM workflow_step_checkpoints
+                   WHERE execution_id = $1 AND phase = $2 AND iteration = $3
+                   ORDER BY step_index ASC"#,
+                &[&execution_id, &phase, &iter_val],
+            ).await
+        } else {
+            conn.query(
+                r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                          stage_index, step_type, step_name, status, result_json, step_config_json,
+                          started_at, completed_at, duration_ms, error
+                   FROM workflow_step_checkpoints
+                   WHERE execution_id = $1 AND phase = $2 AND iteration IS NULL
+                   ORDER BY step_index ASC"#,
+                &[&execution_id, &phase],
+            ).await
+        }.map_err(|e| format!("PG get_workflow_step_checkpoints_by_phase: {}", e))?;
+
+        Ok(rows.into_iter().map(|r| {
+            let status_str: String = r.get(9);
+            let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
+            let iter_raw: Option<i32> = r.get(4);
+            let step_idx: i32 = r.get(5);
+            let stage_idx: Option<i32> = r.get(6);
+            let dur: Option<i64> = r.get(14);
+
+            StepCheckpoint {
+                id: r.get(0),
+                execution_id: r.get(1),
+                workflow_type: r.get(2),
+                phase: r.get(3),
+                iteration: iter_raw.map(|i| i as u32),
+                step_index: step_idx as usize,
+                stage_index: stage_idx.map(|i| i as u32),
+                step_type: r.get(7),
+                step_name: r.get(8),
+                status,
+                result_json: r.get(10),
+                step_config_json: r.get(11),
+                started_at: r.get(12),
+                completed_at: r.get(13),
+                duration_ms: dur,
+                error: r.get(15),
+            }
+        }).collect())
+    }
+
+    /// Get all workflow step checkpoints for an execution (async).
+    pub async fn get_all_workflow_step_checkpoints(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<StepCheckpoint>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn.query(
+            r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+                      stage_index, step_type, step_name, status, result_json, step_config_json,
+                      started_at, completed_at, duration_ms, error
+               FROM workflow_step_checkpoints
+               WHERE execution_id = $1
+               ORDER BY step_index ASC"#,
+            &[&execution_id],
+        ).await.map_err(|e| format!("PG get_all_workflow_step_checkpoints: {}", e))?;
+
+        Ok(rows.into_iter().map(|r| {
+            let status_str: String = r.get(9);
+            let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
+            let iter_raw: Option<i32> = r.get(4);
+            let step_idx: i32 = r.get(5);
+            let stage_idx: Option<i32> = r.get(6);
+            let dur: Option<i64> = r.get(14);
+
+            StepCheckpoint {
+                id: r.get(0),
+                execution_id: r.get(1),
+                workflow_type: r.get(2),
+                phase: r.get(3),
+                iteration: iter_raw.map(|i| i as u32),
+                step_index: step_idx as usize,
+                stage_index: stage_idx.map(|i| i as u32),
+                step_type: r.get(7),
+                step_name: r.get(8),
+                status,
+                result_json: r.get(10),
+                step_config_json: r.get(11),
+                started_at: r.get(12),
+                completed_at: r.get(13),
+                duration_ms: dur,
+                error: r.get(15),
+            }
+        }).collect())
+    }
+
+    /// Delete workflow step checkpoints (sync wrapper).
+    pub fn delete_workflow_step_checkpoints_sync(
+        &self,
+        execution_id: &str,
+        phase: Option<&str>,
+        iteration: Option<u32>,
+    ) -> Result<(), String> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                self.delete_workflow_step_checkpoints_async(execution_id, phase, iteration),
+            )
+        })
+    }
+
+    /// Delete workflow step checkpoints (async).
+    pub async fn delete_workflow_step_checkpoints_async(
+        &self,
+        execution_id: &str,
+        phase: Option<&str>,
+        iteration: Option<u32>,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let iter_i32: Option<i32> = iteration.map(|i| i as i32);
+
+        match (phase, iter_i32) {
+            (Some(p), Some(i)) => {
+                conn.execute(
+                    "DELETE FROM workflow_step_checkpoints WHERE execution_id = $1 AND phase = $2 AND iteration = $3",
+                    &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                      &p as &(dyn tokio_postgres::types::ToSql + Sync),
+                      &i as &(dyn tokio_postgres::types::ToSql + Sync)],
+                ).await
+            }
+            (Some(p), None) => {
+                conn.execute(
+                    "DELETE FROM workflow_step_checkpoints WHERE execution_id = $1 AND phase = $2",
+                    &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                      &p as &(dyn tokio_postgres::types::ToSql + Sync)],
+                ).await
+            }
+            (None, _) => {
+                conn.execute(
+                    "DELETE FROM workflow_step_checkpoints WHERE execution_id = $1",
+                    &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync)],
+                ).await
+            }
+        }
+        .map_err(|e| format!("PG delete_workflow_step_checkpoints: {}", e))?;
+
+        Ok(())
+    }
 }

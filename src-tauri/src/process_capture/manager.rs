@@ -22,21 +22,23 @@ pub struct ProcessCaptureManager {
     processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
     error_monitor: Arc<RwLock<Option<ErrorMonitorHandle>>>,
     app_handle: tauri::AppHandle,
-    db: Arc<CheckpointDb>,
 }
 
 impl ProcessCaptureManager {
     pub fn new(
         error_monitor: Arc<RwLock<Option<ErrorMonitorHandle>>>,
         app_handle: tauri::AppHandle,
-        db: Arc<CheckpointDb>,
     ) -> Self {
         Self {
             processes: Arc::new(RwLock::new(HashMap::new())),
             error_monitor,
             app_handle,
-            db,
         }
+    }
+
+    /// Get the database handle.
+    fn db(&self) -> Arc<CheckpointDb> {
+        CheckpointDb::global()
     }
 
     /// Register a process config without starting it.
@@ -65,13 +67,13 @@ impl ProcessCaptureManager {
         // Create a database session record
         let session_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = self
-            .db
+            .db()
             .create_process_session(&session_id, &config_id, &process_name)
         {
             warn!("Failed to create process session record: {}", e);
         }
         // Prune old sessions (keep 10)
-        if let Err(e) = self.db.prune_old_process_sessions(&config_id, 10) {
+        if let Err(e) = self.db().prune_old_process_sessions(&config_id, 10) {
             warn!("Failed to prune old sessions: {}", e);
         }
         process.runtime.session_id = Some(session_id.clone());
@@ -80,7 +82,7 @@ impl ProcessCaptureManager {
         let processes_ref = self.processes.clone();
         let error_monitor = self.error_monitor.clone();
         let app_handle = self.app_handle.clone();
-        let db = self.db.clone();
+        let db = self.db();
 
         // Spawn the event loop for this process
         tokio::spawn(async move {

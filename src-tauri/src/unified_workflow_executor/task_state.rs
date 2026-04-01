@@ -124,28 +124,8 @@ impl LoopController {
 
     /// Record a workflow activity heartbeat for debugging stuck workflows.
     /// Updates runtime_context_json with the current phase and timestamp.
-    pub(crate) fn record_activity(&self, execution_id: &str, activity: &str) {
-        let persist_id = get_parent_task_id(execution_id);
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // Merge into existing runtime context or create new
-        let existing = self
-            .checkpoint_db
-            .get_task_run_runtime_context(&persist_id)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "{}".to_string());
-
-        let mut ctx: serde_json::Value =
-            serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
-        ctx["last_activity"] = serde_json::json!(activity);
-        ctx["last_activity_at"] = serde_json::json!(now);
-
-        if let Ok(json) = serde_json::to_string(&ctx) {
-            let _ = self
-                .checkpoint_db
-                .update_task_run_runtime_context(&persist_id, &json);
-        }
+    pub(crate) fn record_activity(&self, _execution_id: &str, _activity: &str) {
+        // Activity recording removed — all persistence now via PgDb.
     }
 
     /// Persist the workflow state to the database and broadcast a state change event.
@@ -220,16 +200,7 @@ impl LoopController {
             transitions.push(transition);
             *current_stage = to_stage.to_string();
 
-            // Persist to database (use parent ID for sequence children)
-            let persist_id = get_parent_task_id(execution_id);
-            if let Ok(json) = serde_json::to_string(&transitions) {
-                if let Err(e) = self
-                    .checkpoint_db
-                    .update_task_run_transition_history(&persist_id, &json)
-                {
-                    warn!("Failed to persist transition history: {}", e);
-                }
-            }
+            // Transition history persistence removed — all persistence now via PgDb.
         }
     }
 }

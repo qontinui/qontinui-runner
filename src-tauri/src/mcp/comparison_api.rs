@@ -93,11 +93,12 @@ pub async fn start_comparison(
         req.workflow_id, req.variation_type
     );
 
-    // Verify workflow exists
+    // Verify workflow exists (PG)
     match state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_unified_workflow(&req.workflow_id)
+        .await
     {
         Ok(Some(_)) => {}
         Ok(None) => {

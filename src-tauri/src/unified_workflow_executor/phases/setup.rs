@@ -9,7 +9,6 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::CheckpointDb;
 use crate::executor::{prompt_builder, timeout_helper, ExecutionOutcome, IntoOutcome};
 use crate::step_executor::{ExecutionStepConfig, StepExecutionResult, StepExecutor};
 use crate::step_metadata::{StepDetails, StepMetadata};
@@ -30,7 +29,6 @@ pub struct SetupExecutor {
     pub(crate) app_state: Arc<AppState>,
     executor: StepExecutor,
     ai_executor: UnifiedAiSessionExecutor,
-    checkpoint_db: Arc<CheckpointDb>,
 }
 
 impl SetupExecutor {
@@ -40,7 +38,6 @@ impl SetupExecutor {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
-        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             app_state: app_state.clone(),
             executor: StepExecutor::with_app_handle(
@@ -49,7 +46,6 @@ impl SetupExecutor {
                 app_handle.clone(),
             ),
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
-            checkpoint_db,
         }
     }
 
@@ -136,7 +132,7 @@ impl SetupExecutor {
         let automation_steps = automation_steps.as_slice();
 
         // Create checkpoint manager for step-level checkpointing
-        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+        let checkpoint_mgr = CheckpointManager::new("unified");
 
         // Run automation setup steps first
         if !automation_steps.is_empty() {
@@ -285,7 +281,6 @@ impl SetupExecutor {
                         let start = std::time::Instant::now();
                         match execute_prompt_response_mode(
                             step,
-                            &self.checkpoint_db,
                             &self.app_state.pg_db,
                             Some(execution_id),
                             doctor_handle,
@@ -323,7 +318,6 @@ impl SetupExecutor {
                         Ok((resp, start)) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             record_phase_token_usage(
-                                &self.checkpoint_db,
                                 &self.app_state.pg_db,
                                 execution_id,
                                 "setup",

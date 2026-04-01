@@ -10,7 +10,6 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -114,7 +113,7 @@ pub async fn get_agent_trace_aggregates_handler(
     match tier {
         ContextTier::L0 => {
             let summaries =
-                pipeline_traces::get_trace_summaries_l0(&state.app_state.checkpoint_db, limit)
+                pipeline_traces::get_trace_summaries_l0(limit)
                     .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(summaries).unwrap_or_default(),
@@ -122,7 +121,6 @@ pub async fn get_agent_trace_aggregates_handler(
         }
         ContextTier::L1 => {
             let details = pipeline_traces::get_trace_details_l1(
-                &state.app_state.checkpoint_db,
                 query.agent_type.as_deref(),
                 limit,
             )
@@ -135,14 +133,13 @@ pub async fn get_agent_trace_aggregates_handler(
             // If trace_id is provided, return a single full trace record
             if let Some(ref trace_id) = query.trace_id {
                 let trace =
-                    pipeline_traces::get_trace_full_l2(&state.app_state.checkpoint_db, trace_id)
+                    pipeline_traces::get_trace_full_l2(trace_id)
                         .map_err(make_err)?;
                 Ok(Json(ApiResponse::success(
                     serde_json::to_value(trace).unwrap_or_default(),
                 )))
             } else {
                 let aggregates = pipeline_traces::get_agent_trace_aggregates(
-                    &state.app_state.checkpoint_db,
                     limit,
                 )
                 .map_err(make_err)?;
@@ -162,7 +159,7 @@ pub async fn get_prompt_variants_handler(
     Query(query): Query<PromptVariantQuery>,
 ) -> Result<Json<ApiResponse<Vec<PromptVariant>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let variants =
-        prompt_registry::list_variants(&state.app_state.checkpoint_db, &state.app_state.pg_db, query.agent_type.as_deref())
+        prompt_registry::list_variants(&state.app_state.pg_db, query.agent_type.as_deref())
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -181,7 +178,6 @@ pub async fn get_recommendations_handler(
     Query(query): Query<RecommendationQuery>,
 ) -> Result<Json<ApiResponse<Vec<Recommendation>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let recs = recommendations::list_recommendations(
-        &state.app_state.checkpoint_db,
         &state.app_state.pg_db,
         query.optimizer_type.as_deref(),
         query.status.as_deref(),
@@ -692,7 +688,7 @@ pub async fn get_cost_analysis_handler(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     let summary =
-        crate::meta_optimizer::cost_optimizer::build_cost_analysis(&state.app_state.checkpoint_db, &state.app_state.pg_db)
+        crate::meta_optimizer::cost_optimizer::build_cost_analysis(&state.app_state.pg_db)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -905,7 +901,7 @@ pub async fn apply_recommendation_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    recommendations::apply_recommendation_with_side_effects(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id)
+    recommendations::apply_recommendation_with_side_effects(&state.app_state.pg_db, &id)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -922,7 +918,7 @@ pub async fn reject_recommendation_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    recommendations::reject_recommendation(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id).map_err(|e| {
+    recommendations::reject_recommendation(&state.app_state.pg_db, &id).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error(format!("Failed to reject recommendation: {}", e))),
@@ -1032,7 +1028,6 @@ async fn get_eval_specs_handler(
     };
 
     let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
-        &state.app_state.checkpoint_db,
         &state.app_state.pg_db,
         q.target_agent.as_deref(),
     )
@@ -1054,7 +1049,7 @@ async fn create_eval_spec_handler(
         )
     };
 
-    crate::meta_optimizer::eval_spec::save_eval_spec(&state.app_state.checkpoint_db, &state.app_state.pg_db, &spec)
+    crate::meta_optimizer::eval_spec::save_eval_spec(&state.app_state.pg_db, &spec)
         .map_err(make_err)?;
 
     Ok(Json(ApiResponse::success(serde_json::json!({
@@ -1075,7 +1070,6 @@ async fn get_eval_results_handler(
     };
 
     let results = crate::meta_optimizer::eval_spec::list_eval_results(
-        &state.app_state.checkpoint_db,
         &state.app_state.pg_db,
         q.spec_id.as_deref(),
         q.recommendation_id.as_deref(),
@@ -1102,7 +1096,6 @@ async fn evaluate_recommendation_handler(
     };
 
     let result = crate::meta_optimizer::eval_runner::validate_recommendation(
-        &state.app_state.checkpoint_db,
         &state.app_state.pg_db,
         &id,
     )
@@ -1150,7 +1143,6 @@ async fn evaluate_with_io_handler(
         if let Some(spec_id) = body.eval_spec.get("spec_id").and_then(|v| v.as_str()) {
             // Look up by ID
             let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
-                &state.app_state.checkpoint_db,
                 &state.app_state.pg_db,
                 None,
             )
@@ -1170,7 +1162,6 @@ async fn evaluate_with_io_handler(
         let period_end = chrono::Utc::now().to_rfc3339();
 
         crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            &state.app_state.checkpoint_db,
             agent,
             &period_start,
             &period_end,
@@ -1247,7 +1238,7 @@ pub async fn get_canaries_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let canaries =
-        crate::meta_optimizer::canary::get_active_canaries(&state.app_state.checkpoint_db, &state.app_state.pg_db)
+        crate::meta_optimizer::canary::get_active_canaries(&state.app_state.pg_db)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1302,7 +1293,7 @@ pub async fn get_canary_history_handler(
         .unwrap_or(20u32);
 
     let history =
-        crate::meta_optimizer::canary::get_canary_history(&state.app_state.checkpoint_db, &state.app_state.pg_db, limit)
+        crate::meta_optimizer::canary::get_canary_history(&state.app_state.pg_db, limit)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1320,7 +1311,7 @@ pub async fn promote_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::meta_optimizer::canary::promote_canary(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id).map_err(
+    crate::meta_optimizer::canary::promote_canary(&state.app_state.pg_db, &id).map_err(
         |e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1336,7 +1327,7 @@ pub async fn rollback_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::meta_optimizer::canary::rollback_canary(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id).map_err(
+    crate::meta_optimizer::canary::rollback_canary(&state.app_state.pg_db, &id).map_err(
         |e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1352,7 +1343,7 @@ pub async fn evaluate_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let eval = crate::meta_optimizer::canary::evaluate_canary(&state.app_state.checkpoint_db, &state.app_state.pg_db, &id)
+    let eval = crate::meta_optimizer::canary::evaluate_canary(&state.app_state.pg_db, &id)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1385,15 +1376,14 @@ pub struct PromptEvidenceQuery {
 async fn get_prompt_optimization_status_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
     let pg_db = &state.app_state.pg_db;
 
     let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, db, pg_db);
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
     let evolution =
-        crate::meta_optimizer::prompt_evolution::get_evolution_history(db, pg_db, None, 50)
+        crate::meta_optimizer::prompt_evolution::get_evolution_history(pg_db, None, 50)
             .unwrap_or_default();
 
     let active_canaries: Vec<_> = evolution
@@ -1417,13 +1407,12 @@ async fn get_prompt_optimization_status_handler(
 async fn get_prompt_group_metrics_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
     let pg_db = &state.app_state.pg_db;
 
     let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, db, pg_db);
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
 
     Ok(Json(ApiResponse {
         success: true,
@@ -1437,15 +1426,14 @@ async fn get_prompt_optimization_evidence_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PromptEvidenceQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
     let pg_db = &state.app_state.pg_db;
     let phase = query.phase.as_deref().unwrap_or("generation");
     let max_failures = query.max_failures.unwrap_or(5);
     let max_successes = query.max_successes.unwrap_or(2);
 
     let (failures, successes) =
-        crate::meta_optimizer::prompt_extractor::collect_evidence_samples(
-            db,
+        crate::meta_optimizer::prompt_extractor::collect_evidence_samples_pg(
+            pg_db,
             phase,
             "",
             max_failures,
@@ -1468,12 +1456,10 @@ async fn get_prompt_evolution_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<PromptEvolutionQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let db = &state.app_state.checkpoint_db;
     let pg_db = &state.app_state.pg_db;
     let limit = query.limit.unwrap_or(50) as usize;
 
     let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(
-        db,
         pg_db,
         query.agent_type.as_deref(),
         limit,

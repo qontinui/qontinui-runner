@@ -27,10 +27,15 @@ pub async fn plan_test_orchestration(
     );
 
     // Get saved API requests from database
-    let saved_requests = state
-        .checkpoint_db
+    let saved_requests_json = state
+        .pg_db
         .list_saved_api_requests()
+        .await
         .map_err(|e| format!("Failed to list saved requests: {}", e))?;
+    let saved_requests: Vec<crate::saved_api_requests::SavedApiRequest> = saved_requests_json
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
 
     // Extract DoctorHandle for AI health monitoring
     let doctor_handle = state.doctor_handle.lock().await.clone();
@@ -67,10 +72,15 @@ pub async fn execute_test_orchestration(
     info!("Executing orchestration plan: {}", plan.id);
 
     // Get saved API requests from database
-    let saved_requests = state
-        .checkpoint_db
+    let saved_requests_json = state
+        .pg_db
         .list_saved_api_requests()
+        .await
         .map_err(|e| format!("Failed to list saved requests: {}", e))?;
+    let saved_requests: Vec<crate::saved_api_requests::SavedApiRequest> = saved_requests_json
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
 
     // Create orchestrator and execute
     let mut orchestrator = TestOrchestrator::new();

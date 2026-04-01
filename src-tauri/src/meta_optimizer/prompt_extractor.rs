@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::debug;
 
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 /// A single prompt sample from a completed run.
@@ -43,7 +42,6 @@ pub struct PromptGroupMetrics {
 ///
 /// Returns samples ordered by outcome_score ascending (worst first).
 pub fn extract_prompt_samples(
-    _db: &CheckpointDb,
     limit: usize,
 ) -> Result<Vec<PromptSample>, String> {
     let pg = PgDb::global();
@@ -87,20 +85,18 @@ pub fn extract_prompt_samples_pg(
 ///
 /// Returns groups sorted by mean_score ascending (worst-performing first).
 pub fn compute_group_metrics(samples: &[PromptSample]) -> Vec<PromptGroupMetrics> {
-    compute_group_metrics_inner(samples, None, None)
+    compute_group_metrics_inner(samples, None)
 }
 
 /// Like `compute_group_metrics` but enriches prompt text from the prompt registry.
 pub fn compute_group_metrics_with_db(
     samples: &[PromptSample],
-    db: &CheckpointDb,
 ) -> Vec<PromptGroupMetrics> {
-    compute_group_metrics_inner(samples, Some(db), None)
+    compute_group_metrics_inner(samples, None)
 }
 
 fn compute_group_metrics_inner(
     samples: &[PromptSample],
-    _db: Option<&CheckpointDb>,
     pg_db: Option<&Arc<PgDb>>,
 ) -> Vec<PromptGroupMetrics> {
     use std::collections::HashMap;
@@ -179,12 +175,11 @@ fn compute_group_metrics_inner(
 /// Returns None if no group has enough samples or if all groups exceed the
 /// failure rate threshold (meaning they're doing well).
 pub fn select_optimization_target(
-    db: &CheckpointDb,
     min_samples: usize,
     min_failure_rate: f64,
 ) -> Result<Option<PromptGroupMetrics>, String> {
-    let samples = extract_prompt_samples(db, 500)?;
-    let groups = compute_group_metrics_with_db(&samples, db);
+    let samples = extract_prompt_samples(500)?;
+    let groups = compute_group_metrics_with_db(&samples);
 
     let target = groups
         .into_iter()
@@ -252,7 +247,6 @@ Review the failure output carefully, identify the root cause, and make targeted 
 /// Collect failure and success samples for a specific prompt group.
 /// Returns (failures, successes) tuples.
 pub fn collect_evidence_samples(
-    _db: &CheckpointDb,
     phase: &str,
     agent_type: &str,
     max_failures: usize,
@@ -294,7 +288,6 @@ pub fn collect_evidence_samples_pg(
 
 /// Extract prompt samples with PG-primary.
 pub fn extract_prompt_samples_with_pg(
-    _db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     limit: usize,
 ) -> Result<Vec<PromptSample>, String> {
@@ -304,15 +297,13 @@ pub fn extract_prompt_samples_with_pg(
 /// Compute group metrics with PG-primary prompt registry lookup.
 pub fn compute_group_metrics_with_db_pg(
     samples: &[PromptSample],
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
 ) -> Vec<PromptGroupMetrics> {
-    compute_group_metrics_inner(samples, Some(db), Some(pg_db))
+    compute_group_metrics_inner(samples, Some(pg_db))
 }
 
 /// Collect evidence samples with PG-primary.
 pub fn collect_evidence_samples_with_pg(
-    _db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     phase: &str,
     agent_type: &str,

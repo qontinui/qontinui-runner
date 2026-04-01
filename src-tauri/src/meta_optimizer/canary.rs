@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +69,6 @@ pub struct CanaryEvaluation {
 
 /// Start a canary rollout for a recommendation.
 pub fn start_canary(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     percentage: i64,
@@ -83,19 +81,8 @@ pub fn start_canary(
     })
 }
 
-/// Start a canary rollout with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use start_canary directly — it is now PG-primary")]
-pub fn start_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-    percentage: i64,
-) -> Result<String, String> {
-    start_canary(db, pg_db, recommendation_id, percentage)
-}
-
 /// Get all active canary rollouts.
-pub fn get_active_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<CanaryRollout>, String> {
+pub fn get_active_canaries(pg_db: &Arc<PgDb>) -> Result<Vec<CanaryRollout>, String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.get_active_canaries())
     })
@@ -106,7 +93,6 @@ pub fn get_active_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<C
 /// Used to extend canary evaluation by increasing traffic when results are
 /// inconclusive after many runs.
 pub fn update_canary_percentage(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
     new_percentage: i64,
@@ -119,7 +105,7 @@ pub fn update_canary_percentage(
 }
 
 /// Get completed canary rollouts (promoted or rolled back) for history display.
-pub fn get_canary_history(db: &CheckpointDb, pg_db: &Arc<PgDb>, limit: u32) -> Result<Vec<serde_json::Value>, String> {
+pub fn get_canary_history(pg_db: &Arc<PgDb>, limit: u32) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.min(100) as i64;
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.get_canary_history(limit))
@@ -130,7 +116,6 @@ pub fn get_canary_history(db: &CheckpointDb, pg_db: &Arc<PgDb>, limit: u32) -> R
 /// Returns a map of agent_type → prompt_content if the recommendation is a prompt_rewrite,
 /// or an empty map otherwise. This is used to inject the canary prompt during pipeline execution.
 pub fn get_canary_prompt_overrides(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
@@ -142,7 +127,6 @@ pub fn get_canary_prompt_overrides(
 /// Get config overrides for a canary rollout of a config_change recommendation.
 /// Returns a vec of (key, serde_json::Value) pairs to apply as temporary settings during canary runs.
 pub fn get_canary_config_overrides(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Vec<(String, serde_json::Value)>, String> {
@@ -152,7 +136,7 @@ pub fn get_canary_config_overrides(
 }
 
 /// Probabilistic check: should this run use the canary config?
-pub fn should_apply_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> bool {
+pub fn should_apply_canary(pg_db: &Arc<PgDb>, recommendation_id: &str) -> bool {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.should_apply_canary(recommendation_id))
     })
@@ -161,7 +145,6 @@ pub fn should_apply_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_
 
 /// Record a completed run as either baseline or canary.
 pub fn record_canary_run(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
     is_canary: bool,
@@ -192,32 +175,18 @@ pub fn record_canary_run(
     pg_result
 }
 
-/// Record a canary run with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use record_canary_run directly — it is now PG-primary")]
-pub fn record_canary_run_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-    is_canary: bool,
-    success: bool,
-    cost: f64,
-    duration_ms: f64,
-) -> Result<(), String> {
-    record_canary_run(db, pg_db, canary_id, is_canary, success, cost, duration_ms)
-}
-
 /// Evaluate a canary: should it be promoted, rolled back, or continue?
 ///
 /// Uses statistical tests (proportion z-test, confidence intervals, effect size)
 /// instead of simple threshold-based verdicts.
-pub fn evaluate_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> Result<CanaryEvaluation, String> {
+pub fn evaluate_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<CanaryEvaluation, String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.evaluate_canary(canary_id))
     })
 }
 
 /// Promote a canary: apply the recommendation globally.
-pub fn promote_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
+pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
     let canary_id_str = canary_id.to_string();
 
     // Get recommendation_id from PG
@@ -233,7 +202,7 @@ pub fn promote_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> 
     })?;
 
     // Apply the recommendation fully
-    super::recommendations::apply_recommendation_with_side_effects(db, pg_db, &rec_id)?;
+    super::recommendations::apply_recommendation_with_side_effects(pg_db, &rec_id)?;
 
     // Update canary status
     tokio::task::block_in_place(|| {
@@ -241,7 +210,7 @@ pub fn promote_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> 
     })?;
 
     // Update prompt evolution verdict if this was a meta-prompt rewrite canary
-    if let Err(e) = update_evolution_for_recommendation(db, pg_db, &rec_id, "adopt", None) {
+    if let Err(e) = update_evolution_for_recommendation(pg_db, &rec_id, "adopt", None) {
         debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
     }
 
@@ -249,24 +218,13 @@ pub fn promote_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> 
     Ok(())
 }
 
-/// Promote a canary with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use promote_canary directly — it is now PG-primary")]
-pub fn promote_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-) -> Result<(), String> {
-    promote_canary(db, pg_db, canary_id)
-}
-
 /// Roll back a canary: mark recommendation as rolled_back and record evaluation metrics.
-pub fn rollback_canary(db: &CheckpointDb, pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
-    rollback_canary_with_eval(db, pg_db, canary_id, None)
+pub fn rollback_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
+    rollback_canary_with_eval(pg_db, canary_id, None)
 }
 
 /// Roll back a canary with optional evaluation metrics to record on the recommendation.
 pub fn rollback_canary_with_eval(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
     eval: Option<&CanaryEvaluation>,
@@ -307,21 +265,11 @@ pub fn rollback_canary_with_eval(
     let score_after = eval.map(|e| e.canary_success_rate / 100.0);
 
     // Update prompt evolution verdict if this was a meta-prompt rewrite canary
-    if let Err(e) = update_evolution_for_recommendation(db, pg_db, &rec_id, "reject", score_after) {
+    if let Err(e) = update_evolution_for_recommendation(pg_db, &rec_id, "reject", score_after) {
         debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
     }
 
     Ok(())
-}
-
-/// Roll back a canary with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use rollback_canary directly — it is now PG-primary")]
-pub fn rollback_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-) -> Result<(), String> {
-    rollback_canary(db, pg_db, canary_id)
 }
 
 /// Update the prompt evolution verdict for a recommendation.
@@ -330,7 +278,6 @@ pub fn rollback_canary_with_pg(
 /// canary_verdict and score_after. This closes the feedback loop for the
 /// meta-prompt optimizer.
 fn update_evolution_for_recommendation(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     verdict: &str,
@@ -354,8 +301,8 @@ fn update_evolution_for_recommendation(
 /// Auto-rollback canary rollouts that have been active for more than 30 days
 /// without reaching a promote/rollback verdict. Stale canaries block the optimizer
 /// from generating fresh recommendations for the same target.
-pub fn auto_rollback_stale_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usize {
-    let canaries = match get_active_canaries(db, pg_db) {
+pub fn auto_rollback_stale_canaries(pg_db: &Arc<PgDb>) -> usize {
+    let canaries = match get_active_canaries(pg_db) {
         Ok(c) => c,
         Err(_) => return 0,
     };
@@ -377,7 +324,7 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usi
             "Auto-rolling-back stale canary {} (active since {}, {} canary runs)",
             canary.id, started, canary.canary_run_count
         );
-        if let Err(e) = rollback_canary(db, pg_db, &canary.id) {
+        if let Err(e) = rollback_canary(pg_db, &canary.id) {
             warn!("Failed to auto-rollback stale canary {}: {}", canary.id, e);
         } else {
             rolled_back += 1;
@@ -395,30 +342,6 @@ pub fn auto_rollback_stale_canaries(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usi
 }
 
 // ── Prompt Template A/B Testing ──────────────────────────────────────────
-
-// ── PG-primary read wrappers (prompt/config overrides) ──────────────────
-
-/// Get canary prompt overrides from PG (falls back to SQLite).
-#[deprecated(note = "Use get_canary_prompt_overrides directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn get_canary_prompt_overrides_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<std::collections::HashMap<String, String>, String> {
-    get_canary_prompt_overrides(db, pg_db, recommendation_id)
-}
-
-/// Get canary config overrides from PG (falls back to SQLite).
-#[deprecated(note = "Use get_canary_config_overrides directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn get_canary_config_overrides_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<Vec<(String, serde_json::Value)>, String> {
-    get_canary_config_overrides(db, pg_db, recommendation_id)
-}
 
 /// Per-version metrics for prompt template canary testing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -575,7 +498,6 @@ pub fn evaluate_prompt_canary(canary: &PromptTemplateCanary) -> CanaryEvaluation
 
 /// Create a new prompt template canary and persist it to the database.
 pub fn create_prompt_template_canary(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     template_id: &str,
     baseline_version: i32,
@@ -587,22 +509,8 @@ pub fn create_prompt_template_canary(
     })
 }
 
-/// Create a prompt template canary with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use create_prompt_template_canary directly — it is now PG-primary")]
-pub fn create_prompt_template_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    template_id: &str,
-    baseline_version: i32,
-    candidate_version: i32,
-    traffic_pct: f64,
-) -> Result<String, String> {
-    create_prompt_template_canary(db, pg_db, template_id, baseline_version, candidate_version, traffic_pct)
-}
-
 /// Load a prompt template canary from the database by id.
 pub fn get_prompt_template_canary(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<PromptTemplateCanary, String> {
@@ -614,7 +522,6 @@ pub fn get_prompt_template_canary(
 
 /// Record a result for a prompt template canary and persist updated metrics.
 pub fn record_prompt_canary_run(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
     used_candidate: bool,
@@ -644,28 +551,12 @@ pub fn record_prompt_canary_run(
     pg_result
 }
 
-/// Record a prompt canary run with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use record_prompt_canary_run directly — it is now PG-primary")]
-pub fn record_prompt_canary_run_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-    used_candidate: bool,
-    success: bool,
-    cost: f64,
-    latency_ms: f64,
-    tokens: i64,
-) -> Result<(), String> {
-    record_prompt_canary_run(db, pg_db, canary_id, used_candidate, success, cost, latency_ms, tokens)
-}
-
 /// Evaluate a prompt template canary from persisted DB state.
 pub fn evaluate_prompt_canary_from_db(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
 ) -> Result<CanaryEvaluation, String> {
-    let canary = get_prompt_template_canary(db, pg_db, canary_id)?;
+    let canary = get_prompt_template_canary(pg_db, canary_id)?;
     Ok(evaluate_prompt_canary(&canary))
 }
 
@@ -690,7 +581,6 @@ pub struct CanaryResolvedPrompt {
 /// If a canary is active, uses `should_use_candidate()` to pick baseline vs candidate,
 /// loads the chosen version from the prompt registry, and returns it.
 pub fn resolve_prompt_with_canary(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     template_id: &str,
     default_content: &str,
@@ -718,7 +608,6 @@ pub fn resolve_prompt_with_canary(
 
     // Load the prompt content for the selected version from the registry
     let content = match super::prompt_registry::get_prompt_by_version(
-        db,
         pg_db,
         &canary.template_id,
         version,
@@ -761,8 +650,6 @@ pub fn resolve_prompt_with_canary(
 /// If no active canary exists, returns the `default_content` as-is.
 /// If a canary is active, uses `should_use_candidate()` to pick baseline vs candidate,
 /// loads the chosen version from the PG prompt registry, and returns it.
-///
-/// The original SQLite version is kept for fallback when PG is unavailable.
 pub async fn resolve_prompt_with_canary_pg(
     pg: &crate::database::pg::PgDb,
     template_id: &str,
@@ -837,7 +724,6 @@ pub async fn resolve_prompt_with_canary_pg(
 /// This is a convenience wrapper around `record_prompt_canary_run` that handles
 /// the case where no canary was active (canary_id is None — silently no-ops).
 pub fn record_canary_outcome(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     canary_id: &str,
     used_candidate: bool,
@@ -847,7 +733,6 @@ pub fn record_canary_outcome(
     tokens: i64,
 ) {
     if let Err(e) = record_prompt_canary_run(
-        db,
         pg_db,
         canary_id,
         used_candidate,
@@ -861,136 +746,4 @@ pub fn record_canary_outcome(
             canary_id, e
         );
     }
-}
-
-// ── Additional PG dual-write wrappers ───────────────────────────────────
-
-/// Update canary traffic percentage with PG dual-write (fire-and-forget).
-#[allow(dead_code)]
-pub fn update_canary_percentage_with_pg(
-    db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-    canary_id: &str,
-    new_percentage: i64,
-) -> Result<(), String> {
-    update_canary_percentage(db, pg_db, canary_id, new_percentage)
-}
-
-/// Roll back a canary with evaluation metrics and PG dual-write (fire-and-forget).
-#[allow(dead_code)]
-pub fn rollback_canary_with_eval_pg(
-    db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-    canary_id: &str,
-    eval: Option<&CanaryEvaluation>,
-) -> Result<(), String> {
-    rollback_canary_with_eval(db, pg_db, canary_id, eval)
-}
-
-/// Auto-rollback stale canaries with PG dual-write.
-#[deprecated(note = "Use auto_rollback_stale_canaries directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn auto_rollback_stale_canaries_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) -> usize {
-    auto_rollback_stale_canaries(db, pg_db)
-}
-
-/// Record canary outcome with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use record_prompt_canary_run directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn record_canary_outcome_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-    used_candidate: bool,
-    success: bool,
-    cost_usd: f64,
-    latency_ms: f64,
-    tokens: i64,
-) {
-    #[allow(deprecated)]
-    if let Err(e) = record_prompt_canary_run_with_pg(db, pg_db, canary_id, used_candidate, success, cost_usd, latency_ms, tokens) {
-        warn!("Failed to record canary outcome for {}: {}", canary_id, e);
-    }
-}
-
-// ── PG-primary read wrappers (now just delegate to PG-primary originals) ──
-
-/// Get all active canary rollouts with PG-primary read.
-#[deprecated(note = "Use get_active_canaries directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn get_active_canaries_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) -> Result<Vec<CanaryRollout>, String> {
-    get_active_canaries(db, pg_db)
-}
-
-/// Get canary history with PG-primary read.
-#[deprecated(note = "Use get_canary_history directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn get_canary_history_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    limit: u32,
-) -> Result<Vec<serde_json::Value>, String> {
-    get_canary_history(db, pg_db, limit)
-}
-
-/// Probabilistic check with PG-primary read: should this run use the canary config?
-#[deprecated(note = "Use should_apply_canary directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn should_apply_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> bool {
-    should_apply_canary(db, pg_db, recommendation_id)
-}
-
-/// Evaluate a canary with PG-primary read for metrics.
-#[deprecated(note = "Use evaluate_canary directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn evaluate_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-) -> Result<CanaryEvaluation, String> {
-    evaluate_canary(db, pg_db, canary_id)
-}
-
-/// Get prompt template canary with PG-primary read.
-#[deprecated(note = "Use get_prompt_template_canary directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn get_prompt_template_canary_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-) -> Result<PromptTemplateCanary, String> {
-    get_prompt_template_canary(db, pg_db, canary_id)
-}
-
-/// Promote a canary with PG dual-write including evolution verdict.
-#[deprecated(note = "Use promote_canary directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn promote_canary_with_evolution_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-) -> Result<(), String> {
-    promote_canary(db, pg_db, canary_id)
-}
-
-/// Rollback canary with eval and PG dual-write including evolution verdict.
-#[deprecated(note = "Use rollback_canary_with_eval directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn rollback_canary_with_eval_and_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    canary_id: &str,
-    eval: Option<&CanaryEvaluation>,
-) -> Result<(), String> {
-    rollback_canary_with_eval(db, pg_db, canary_id, eval)
 }

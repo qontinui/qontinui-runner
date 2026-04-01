@@ -138,12 +138,8 @@ impl SubscriptionRoot {
                     task_status.as_deref(),
                     Some("complete") | Some("failed") | Some("stopped")
                 );
-
-                let db = state.app_state.checkpoint_db.clone();
-                let findings = match tokio::task::spawn_blocking(move || {
-                    db.get_findings_for_task(&trid)
-                }).await {
-                    Ok(Ok(f)) => f,
+                let findings = match state.app_state.pg_db.get_findings_for_task(&trid).await {
+                    Ok(f) => f,
                     _ => continue,
                 };
 

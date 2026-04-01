@@ -170,8 +170,6 @@ impl TaskConfig {
 pub struct TaskRunHandle {
     /// Task run ID
     pub id: String,
-    /// Database reference
-    db: Arc<CheckpointDb>,
 }
 
 impl std::fmt::Debug for TaskRunHandle {
@@ -183,6 +181,11 @@ impl std::fmt::Debug for TaskRunHandle {
 }
 
 impl TaskRunHandle {
+    /// Get the database handle.
+    fn db(&self) -> Arc<CheckpointDb> {
+        CheckpointDb::global()
+    }
+
     /// Get the task run ID.
     pub fn id(&self) -> &str {
         &self.id
@@ -192,29 +195,29 @@ impl TaskRunHandle {
     ///
     /// Returns true if [TASK_COMPLETE] was detected in the output.
     pub fn append_output(&self, output: &str) -> Result<bool, String> {
-        self.db.append_task_output(&self.id, output, false)
+        self.db().append_task_output(&self.id, output, false)
     }
 
     /// Append output to the task log and increment the session count.
     ///
     /// Returns true if [TASK_COMPLETE] was detected in the output.
     pub fn append_output_with_session_increment(&self, output: &str) -> Result<bool, String> {
-        self.db.append_task_output(&self.id, output, true)
+        self.db().append_task_output(&self.id, output, true)
     }
 
     /// Complete the task with success.
     pub fn complete(&self) -> Result<(), String> {
-        self.db.complete_task_run(&self.id)
+        self.db().complete_task_run(&self.id)
     }
 
     /// Complete the task with failure.
     pub fn fail(&self, error_message: &str) -> Result<(), String> {
-        self.db.fail_task_run(&self.id, error_message)
+        self.db().fail_task_run(&self.id, error_message)
     }
 
     /// Stop the task.
     pub fn stop(&self) -> Result<(), String> {
-        self.db.stop_task_run(&self.id)
+        self.db().stop_task_run(&self.id)
     }
 
     /// Update the task summary.
@@ -224,7 +227,7 @@ impl TaskRunHandle {
         goal_achieved: bool,
         remaining_work: Option<&str>,
     ) -> Result<(), String> {
-        self.db
+        self.db()
             .update_task_summary(&self.id, summary, goal_achieved, remaining_work)
     }
 }
@@ -234,15 +237,17 @@ impl TaskRunHandle {
 /// This is the main entry point for creating and managing task runs.
 /// All task execution should go through TaskRecorder to ensure consistent
 /// recording and tracking.
-pub struct TaskRecorder {
-    /// Database for storing task data
-    db: Arc<CheckpointDb>,
-}
+pub struct TaskRecorder;
 
 impl TaskRecorder {
     /// Create a new TaskRecorder.
-    pub fn new(db: Arc<CheckpointDb>) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Get the database handle.
+    fn db(&self) -> Arc<CheckpointDb> {
+        CheckpointDb::global()
     }
 
     /// Start a new task run.
@@ -297,13 +302,12 @@ impl TaskRecorder {
         if let Some(ref bid) = config.bridge_id {
             input = input.with_bridge_id(bid);
         }
-        self.db.create_task_run(&input)?;
+        self.db().create_task_run(&input)?;
 
         debug!("Created task run in database: {}", id);
 
         Ok(TaskRunHandle {
             id: id.to_string(),
-            db: self.db.clone(),
         })
     }
 
@@ -312,13 +316,12 @@ impl TaskRecorder {
     /// Use this to resume interacting with a task that was previously started.
     pub fn get_task_handle(&self, id: &str) -> Result<TaskRunHandle, String> {
         // Verify the task exists
-        if self.db.get_task_run(id)?.is_none() {
+        if self.db().get_task_run(id)?.is_none() {
             return Err(format!("Task run not found: {}", id));
         }
 
         Ok(TaskRunHandle {
             id: id.to_string(),
-            db: self.db.clone(),
         })
     }
 
@@ -326,8 +329,8 @@ impl TaskRecorder {
     ///
     /// This is useful for operations that need direct database access,
     /// such as reading task run data for display.
-    pub fn db(&self) -> &Arc<CheckpointDb> {
-        &self.db
+    pub fn checkpoint_db(&self) -> Arc<CheckpointDb> {
+        CheckpointDb::global()
     }
 }
 

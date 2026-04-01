@@ -79,8 +79,8 @@ impl TestHandler {
             .await;
 
         // Fetch test definition from database
-        let db = &context.app_state.checkpoint_db;
-        let verification_test = match db.get_verification_test(test_id) {
+        let db = &context.app_state.pg_db;
+        let verification_test = match db.get_verification_test(test_id).await {
             Ok(Some(test)) => test,
             Ok(None) => {
                 let error = format!("Test not found: {}", test_id);

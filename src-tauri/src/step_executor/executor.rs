@@ -169,7 +169,14 @@ impl StepExecutor {
     /// This shares the executor's state (runtime_context, shared_variables)
     /// with the handlers to maintain consistency during step execution.
     pub(crate) fn create_handler_context(&self) -> HandlerContext {
-        HandlerContext::with_shared_state(
+        // Resolve the security policy from settings (workflow overrides will be added later)
+        let security_settings = crate::settings::get_security_settings();
+        let security_policy =
+            crate::security::PolicyEngine::resolve(None, &security_settings);
+        let audit_logger =
+            crate::security::audit::AuditLogger::new(security_settings.audit_enabled);
+
+        let mut ctx = HandlerContext::with_shared_state(
             self.app_state.clone(),
             self.config_storage.clone(),
             self.app_handle.clone(),
@@ -179,6 +186,31 @@ impl StepExecutor {
             self.pid_tracker.clone(),
         )
         .with_path_scope_policy(self.path_scope_policy.clone())
+        .with_security_policy(security_policy.clone())
+        .with_audit_logger(audit_logger);
+
+        // Set up credential placeholders when proxy mode is active
+        if security_settings.credential_proxy_enabled
+            && security_policy.credentials.mode == crate::security::policy::CredentialMode::Proxy
+        {
+            let cred_names: Vec<&str> = if security_policy.credentials.allowed_credentials.is_empty()
+            {
+                // Default credentials when no explicit list
+                vec!["claude_api", "openai", "gemini"]
+            } else {
+                security_policy
+                    .credentials
+                    .allowed_credentials
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
+            let cred_proxy =
+                crate::security::credential_proxy::CredentialProxy::new(&cred_names);
+            ctx = ctx.with_credential_placeholders(cred_proxy.placeholder_env_vars());
+        }
+
+        ctx
     }
 
     /// Expand shared variables in a string.
@@ -230,13 +262,9 @@ impl StepExecutor {
         // Remap to parent ID for workflow sequence children
         let task_run_id = get_parent_task_id(execution_id);
 
-        if let Err(e) = self
-            .app_state
-            .checkpoint_db
-            .update_task_run_runtime_context(&task_run_id, &context_json.to_string())
-        {
-            warn!("Failed to persist runtime context: {}", e);
-        }
+        // Runtime context persistence removed — all persistence now via PgDb.
+        let _ = task_run_id;
+        let _ = context_json;
     }
 
     /// Log a step execution event to the database
@@ -309,13 +337,7 @@ impl StepExecutor {
                 }
             });
         }
-        if let Err(e) = self
-            .app_state
-            .checkpoint_db
-            .create_task_run_event(&event_input)
-        {
-            warn!("Failed to log step event: {}", e);
-        }
+        // SQLite step event logging removed — all persistence now via PgDb.
     }
 
     /// Emit a tree event to the Tauri frontend (if app_handle is available)

@@ -120,10 +120,10 @@ pub async fn execute_check_by_id(
 ) -> Result<CommandResponse, String> {
     info!("Executing check by ID: {}", check_id);
 
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     // Get the check from database
-    let check = match db.get_check(&check_id) {
+    let check = match db.get_check(&check_id).await {
         Ok(Some(c)) => c,
         Ok(None) => {
             return Ok(CommandResponse {
@@ -158,7 +158,6 @@ pub async fn execute_check_by_id(
             .as_ref()
             .map(|o| serde_json::to_string(o).unwrap_or_default());
 
-        // Write to PG (primary)
         if let Err(e) = state.pg_db.save_check_result(
             &result.check_id,
             &status_str,
@@ -174,23 +173,6 @@ pub async fn execute_check_by_id(
             Some(run_id.as_str()),
         ).await {
             error!("Failed to store check result in PG: {}", e);
-        }
-        // Write to SQLite (dual-write for migration)
-        if let Err(e) = db.save_check_result(
-            &result.check_id,
-            &status_str,
-            Some(result.started_at.as_str()),
-            Some(result.completed_at.as_str()),
-            Some(result.duration_ms as i64),
-            Some(result.output.as_str()),
-            result.error.as_deref(),
-            result.issues_found as i32,
-            result.issues_fixed as i32,
-            result.files_checked as i32,
-            structured.as_deref(),
-            Some(run_id.as_str()),
-        ) {
-            error!("Failed to store check result in SQLite: {}", e);
         }
     }
 
@@ -216,18 +198,28 @@ pub async fn list_checks(
     tool: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
-    match db.list_checks(
-        enabled_only.unwrap_or(false),
-        check_type.as_deref(),
-        tool.as_deref(),
-    ) {
-        Ok(checks) => Ok(CommandResponse {
-            success: true,
-            message: Some(format!("Found {} checks", checks.len())),
-            data: Some(serde_json::to_value(checks).unwrap_or_default()),
-        }),
+    match db.list_checks().await {
+        Ok(checks) => {
+            // Apply filters in memory since PG list_checks has no filter params
+            let enabled_filter = enabled_only.unwrap_or(false);
+            let checks: Vec<_> = checks.into_iter().filter(|c| {
+                if enabled_filter && !c.enabled { return false; }
+                if let Some(ref ct) = check_type {
+                    if c.check_type != *ct { return false; }
+                }
+                if let Some(ref t) = tool {
+                    if c.tool != *t { return false; }
+                }
+                true
+            }).collect();
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Found {} checks", checks.len())),
+                data: Some(serde_json::to_value(checks).unwrap_or_default()),
+            })
+        }
         Err(e) => Ok(CommandResponse {
             success: false,
             message: Some(format!("Failed to list checks: {}", e)),
@@ -242,9 +234,9 @@ pub async fn get_check(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
-    match db.get_check(&id) {
+    match db.get_check(&id).await {
         Ok(Some(check)) => Ok(CommandResponse {
             success: true,
             message: None,
@@ -269,14 +261,14 @@ pub async fn create_check(
     input: CreateCheckInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!(
         "Creating check: {} (type: {})",
         input.name, input.check_type
     );
 
-    match db.create_check(&input) {
+    match db.create_check(&input).await {
         Ok(check) => {
             info!("Created check: {} ({})", check.name, check.id);
             Ok(CommandResponse {
@@ -300,11 +292,11 @@ pub async fn update_check(
     input: UpdateCheckInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Updating check: {}", id);
 
-    match db.update_check(&id, &input) {
+    match db.update_check(&id, &input).await {
         Ok(check) => {
             info!("Updated check: {} ({})", check.name, check.id);
             Ok(CommandResponse {
@@ -327,11 +319,11 @@ pub async fn delete_check(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Deleting check: {}", id);
 
-    match db.delete_check(&id) {
+    match db.delete_check(&id).await {
         Ok(true) => {
             info!("Deleted check: {}", id);
             Ok(CommandResponse {
@@ -414,7 +406,6 @@ pub async fn get_check_results(
     limit: Option<u32>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
     let limit = limit.unwrap_or(10);
 
     match state.pg_db.get_check_results(&check_id, limit).await {
@@ -465,9 +456,9 @@ pub async fn list_check_groups(
     enabled_only: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
-    match db.list_check_groups(enabled_only.unwrap_or(false)) {
+    match db.list_check_groups(enabled_only.unwrap_or(false)).await {
         Ok(groups) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Found {} check groups", groups.len())),
@@ -487,9 +478,9 @@ pub async fn get_check_group(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
-    match db.get_check_group(&id) {
+    match db.get_check_group(&id).await {
         Ok(Some(group)) => Ok(CommandResponse {
             success: true,
             message: None,
@@ -514,11 +505,11 @@ pub async fn create_check_group(
     input: CreateCheckGroupInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Creating check group: {}", input.name);
 
-    match db.create_check_group(&input) {
+    match db.create_check_group(&input).await {
         Ok(group) => {
             info!("Created check group: {} ({})", group.name, group.id);
             Ok(CommandResponse {
@@ -542,11 +533,11 @@ pub async fn update_check_group(
     input: UpdateCheckGroupInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Updating check group: {}", id);
 
-    match db.update_check_group(&id, &input) {
+    match db.update_check_group(&id, &input).await {
         Ok(group) => {
             info!("Updated check group: {} ({})", group.name, group.id);
             Ok(CommandResponse {
@@ -569,11 +560,11 @@ pub async fn delete_check_group(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Deleting check group: {}", id);
 
-    match db.delete_check_group(&id) {
+    match db.delete_check_group(&id).await {
         Ok(true) => {
             info!("Deleted check group: {}", id);
             Ok(CommandResponse {
@@ -601,9 +592,9 @@ pub async fn get_checks_in_group(
     group_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
-    match db.get_checks_in_group(&group_id) {
+    match db.get_checks_in_group(&group_id).await {
         Ok(checks) => Ok(CommandResponse {
             success: true,
             message: Some(format!("Found {} checks in group", checks.len())),
@@ -624,11 +615,11 @@ pub async fn set_checks_in_group(
     check_ids: Vec<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Setting {} checks in group: {}", check_ids.len(), group_id);
 
-    match db.set_checks_in_group(&group_id, &check_ids) {
+    match db.set_checks_in_group(&group_id, &check_ids).await {
         Ok(()) => {
             info!("Updated checks in group: {}", group_id);
             Ok(CommandResponse {
@@ -652,12 +643,12 @@ pub async fn execute_check_group(
     task_run_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Executing check group: {}", group_id);
 
     // Get the group
-    let group = match db.get_check_group(&group_id) {
+    let group = match db.get_check_group(&group_id).await {
         Ok(Some(g)) => g,
         Ok(None) => {
             return Ok(CommandResponse {
@@ -676,7 +667,7 @@ pub async fn execute_check_group(
     };
 
     // Get checks in the group
-    let checks = match db.get_checks_in_group(&group_id) {
+    let checks = match db.get_checks_in_group(&group_id).await {
         Ok(c) => c,
         Err(e) => {
             return Ok(CommandResponse {
@@ -724,7 +715,6 @@ pub async fn execute_check_group(
                 .as_ref()
                 .map(|o| serde_json::to_string(o).unwrap_or_default());
 
-            // Write to PG (primary)
             if let Err(e) = state.pg_db.save_check_result(
                 &result.check_id,
                 &status_str,
@@ -740,23 +730,6 @@ pub async fn execute_check_group(
                 Some(run_id.as_str()),
             ).await {
                 error!("Failed to store check result in PG: {}", e);
-            }
-            // Write to SQLite (dual-write for migration)
-            if let Err(e) = db.save_check_result(
-                &result.check_id,
-                &status_str,
-                Some(result.started_at.as_str()),
-                Some(result.completed_at.as_str()),
-                Some(result.duration_ms as i64),
-                Some(result.output.as_str()),
-                result.error.as_deref(),
-                result.issues_found as i32,
-                result.issues_fixed as i32,
-                result.files_checked as i32,
-                structured.as_deref(),
-                Some(run_id.as_str()),
-            ) {
-                error!("Failed to store check result in SQLite: {}", e);
             }
         }
     }
@@ -796,11 +769,11 @@ pub async fn execute_check_group(
 pub async fn repair_check_group_associations(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let db = &state.checkpoint_db;
+    let db = &state.pg_db;
 
     info!("Repairing check-group associations based on naming convention");
 
-    match db.repair_check_group_associations() {
+    match db.repair_check_group_associations().await {
         Ok(count) => {
             let message = if count > 0 {
                 format!("Repaired {} check-group associations", count)

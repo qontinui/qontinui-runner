@@ -573,6 +573,7 @@ fn run_ai_semantic_analysis(
         file_count: None,
         criteria_count: None,
         file_paths: vec![],
+        phase: None,
     };
 
     info!("Running AI semantic analysis (counter-example prompting)");
@@ -733,6 +734,7 @@ pub fn run_revision_agent(
         file_count: None,
         criteria_count: Some(report.findings.len()),
         file_paths: vec![],
+        phase: None,
     };
 
     info!(

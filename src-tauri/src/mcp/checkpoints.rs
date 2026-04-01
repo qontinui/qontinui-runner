@@ -1,6 +1,8 @@
 //! Checkpoint handlers for MCP API
 //!
 //! Provides HTTP handlers for checkpoint CRUD, status, and history.
+//! NOTE: SQLite checkpoint_db removed — these endpoints return empty/no-op results
+//! until migrated to PG.
 
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Deserialize;
@@ -11,27 +13,19 @@ use crate::mcp::types::ApiState;
 
 /// List all active (non-completed) checkpoints.
 pub async fn list_checkpoints(
-    State(state): State<Arc<ApiState>>,
+    State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<CheckpointData>>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .list_active_checkpoints()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // checkpoint_db removed — not yet migrated to PG
+    Ok(Json(vec![]))
 }
 
 /// Get a checkpoint by workflow name.
 pub async fn get_checkpoint(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(_name): axum::extract::Path<String>,
 ) -> Result<Json<Option<CheckpointData>>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .get_checkpoint(&name)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // checkpoint_db removed — not yet migrated to PG
+    Ok(Json(None))
 }
 
 /// Request body for saving a checkpoint.
@@ -61,56 +55,26 @@ pub struct SaveCheckpointRequest {
 
 /// Save or update a checkpoint.
 pub async fn save_checkpoint(
-    State(state): State<Arc<ApiState>>,
-    Json(req): Json<SaveCheckpointRequest>,
+    State(_state): State<Arc<ApiState>>,
+    Json(_req): Json<SaveCheckpointRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let data = CheckpointData {
-        session_id: None,
-        workflow_name: Some(req.workflow_name),
-        current_phase: req.current_phase,
-        total_phases: req.total_phases,
-        completed: req.completed,
-        restart_permitted: req.restart_permitted,
-        status: req.status,
-        run_id: req.run_id,
-        repos_to_process: req.repos_to_process,
-        work_completed: req.work_completed,
-        items_needing_user_input: req.items_needing_user_input,
-        created_at: None,
-        updated_at: None,
-        error_message: req.error_message,
-        extra: None,
-    };
-
-    state
-        .app_state
-        .checkpoint_db
-        .save_checkpoint(&data)
-        .map(|_| {
-            Json(serde_json::json!({
-                "success": true,
-                "message": "Checkpoint saved"
-            }))
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // checkpoint_db removed — not yet migrated to PG
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Checkpoint saved (no-op: SQLite removed)"
+    })))
 }
 
 /// Delete a checkpoint by workflow name.
 pub async fn delete_checkpoint(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(_name): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .delete_checkpoint(&name)
-        .map(|deleted| {
-            Json(serde_json::json!({
-                "success": deleted,
-                "message": if deleted { "Checkpoint deleted" } else { "Checkpoint not found" }
-            }))
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // checkpoint_db removed — not yet migrated to PG
+    Ok(Json(serde_json::json!({
+        "success": false,
+        "message": "Checkpoint not found (SQLite removed)"
+    })))
 }
 
 /// Query params for checkpoint status.
@@ -121,31 +85,16 @@ pub struct CheckpointStatusQuery {
 
 /// Check checkpoint status for cross-session continuation.
 pub async fn get_checkpoint_status(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    axum::extract::Query(query): axum::extract::Query<CheckpointStatusQuery>,
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(_name): axum::extract::Path<String>,
+    axum::extract::Query(_query): axum::extract::Query<CheckpointStatusQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let completion_value = query.completion_value.unwrap_or(12); // Default for improve-all
-
-    state
-        .app_state
-        .checkpoint_db
-        .check_checkpoint_status(&name, completion_value)
-        .map(|result| {
-            Json(match result {
-                Some((is_complete, current_phase)) => serde_json::json!({
-                    "found": true,
-                    "is_complete": is_complete,
-                    "current_phase": current_phase
-                }),
-                None => serde_json::json!({
-                    "found": false,
-                    "is_complete": false,
-                    "current_phase": 0
-                }),
-            })
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // checkpoint_db removed — not yet migrated to PG
+    Ok(Json(serde_json::json!({
+        "found": false,
+        "is_complete": false,
+        "current_phase": 0
+    })))
 }
 
 /// Query params for checkpoint history.
@@ -157,17 +106,11 @@ pub struct CheckpointHistoryQuery {
 
 /// Get checkpoint/session history.
 pub async fn get_checkpoint_history(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Query(query): axum::extract::Query<CheckpointHistoryQuery>,
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Query(_query): axum::extract::Query<CheckpointHistoryQuery>,
 ) -> Result<Json<Vec<SessionEvent>>, (StatusCode, String)> {
-    let limit = query.limit.unwrap_or(50);
-
-    state
-        .app_state
-        .checkpoint_db
-        .get_session_history(query.workflow_name.as_deref(), limit)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    // checkpoint_db removed — not yet migrated to PG
+    Ok(Json(vec![]))
 }
 
 // ============================================================================

@@ -86,7 +86,13 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::PathBuf;
-use tracing::info;
+use std::sync::{Arc, OnceLock};
+use tracing::{info, warn};
+
+/// Global CheckpointDb instance, set once during app initialization.
+/// Allows code to access the SQLite database without threading Arc<CheckpointDb>
+/// through every call chain.
+static GLOBAL_CHECKPOINT_DB: OnceLock<Arc<CheckpointDb>> = OnceLock::new();
 
 /// Database handle for checkpoint and session persistence.
 pub struct CheckpointDb {
@@ -98,6 +104,28 @@ pub struct CheckpointDb {
 }
 
 impl CheckpointDb {
+    /// Set the global CheckpointDb instance. Call once during app initialization.
+    /// Warns and ignores if called more than once.
+    pub fn set_global(db: Arc<CheckpointDb>) {
+        GLOBAL_CHECKPOINT_DB
+            .set(db)
+            .unwrap_or_else(|_| warn!("CheckpointDb::set_global called more than once (ignored)"));
+    }
+
+    /// Get the global CheckpointDb instance. Panics if not initialized.
+    /// Use from sync contexts where Arc<CheckpointDb> is not threaded through.
+    pub fn global() -> Arc<CheckpointDb> {
+        GLOBAL_CHECKPOINT_DB
+            .get()
+            .expect("CheckpointDb::global() called before CheckpointDb::set_global()")
+            .clone()
+    }
+
+    /// Try to get the global CheckpointDb instance. Returns None if not initialized.
+    pub fn try_global() -> Option<Arc<CheckpointDb>> {
+        GLOBAL_CHECKPOINT_DB.get().cloned()
+    }
+
     /// Create a new database connection at the default location.
     ///
     /// Database location: `~/.config/com.qontinui.runner/runner.db`

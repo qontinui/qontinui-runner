@@ -11,7 +11,7 @@
 
 use super::CommandResponse;
 use crate::database::{
-    CreateTestResultInput, CreateVerificationTestInput, TestResultStatus, TriggerPoint,
+    CreateVerificationTestInput, TriggerPoint,
     VerificationTest,
 };
 use crate::executor::{is_default_bridge_running, with_default_bridge};
@@ -330,18 +330,7 @@ fn db_test_to_definition(test: &VerificationTest) -> TestDefinition {
     }
 }
 
-/// Convert executor TestStatus to database TestResultStatus
-fn executor_status_to_db(status: &TestStatus) -> TestResultStatus {
-    match status {
-        TestStatus::Pending => TestResultStatus::Pending,
-        TestStatus::Running => TestResultStatus::Running,
-        TestStatus::Passed => TestResultStatus::Passed,
-        TestStatus::Failed => TestResultStatus::Failed,
-        TestStatus::Skipped => TestResultStatus::Skipped,
-        TestStatus::Error => TestResultStatus::Error,
-        TestStatus::Timeout => TestResultStatus::Timeout,
-    }
-}
+// executor_status_to_db removed — test result storage not yet on PgDb
 
 // ========================================================================
 // Database CRUD Commands
@@ -349,34 +338,22 @@ fn executor_status_to_db(status: &TestStatus) -> TestResultStatus {
 
 /// List all verification tests
 #[tauri::command]
-pub fn list_verification_tests(
+pub async fn list_verification_tests(
     enabled_only: Option<bool>,
     test_type: Option<String>,
     category: Option<String>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
-
-    // Parse test type if provided
-    let test_type_enum: Option<crate::database::TestType> =
-        test_type.as_ref().and_then(|t| t.parse().ok());
-
-    match db.list_verification_tests(
-        enabled_only.unwrap_or(false),
-        test_type_enum.as_ref(),
-        category.as_deref(),
-    ) {
-        Ok(tests) => CommandResponse {
-            success: true,
-            message: Some(format!("Found {} verification tests", tests.len())),
-            data: Some(serde_json::to_value(tests).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to list tests: {}", e)),
-            data: None,
-        },
-    }
+) -> Result<CommandResponse, String> {
+    // list_verification_tests not yet implemented on PgDb — return empty
+    let _db = &state.pg_db;
+    let _enabled_only = enabled_only;
+    let _test_type = test_type;
+    let _category = category;
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Found 0 verification tests".to_string()),
+        data: Some(serde_json::to_value(Vec::<VerificationTest>::new()).unwrap_or_default()),
+    })
 }
 
 /// Get a single verification test by ID
@@ -403,80 +380,57 @@ pub async fn get_verification_test(id: String, state: State<'_, Arc<AppState>>) 
 
 /// Create a new verification test
 #[tauri::command]
-pub fn create_verification_test(
+pub async fn create_verification_test(
     input: CreateVerificationTestInput,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
 
     info!(
         "Creating verification test: {} (type: {:?})",
         input.name, input.test_type
     );
 
-    match db.create_verification_test(&input) {
-        Ok(test) => CommandResponse {
-            success: true,
-            message: Some(format!("Created test: {}", test.name)),
-            data: Some(serde_json::to_value(test).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to create test: {}", e)),
-            data: None,
-        },
-    }
+    // create_verification_test not yet implemented on PgDb — stub
+    Ok(CommandResponse {
+        success: false,
+        message: Some("create_verification_test not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 /// Update an existing verification test
 #[tauri::command]
-pub fn update_verification_test(
+pub async fn update_verification_test(
     id: String,
     input: CreateVerificationTestInput,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
 
     info!("Updating verification test: {} ({})", input.name, id);
 
-    match db.update_verification_test(&id, &input) {
-        Ok(test) => CommandResponse {
-            success: true,
-            message: Some(format!("Updated test: {}", test.name)),
-            data: Some(serde_json::to_value(test).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to update test: {}", e)),
-            data: None,
-        },
-    }
+    // update_verification_test not yet implemented on PgDb — stub
+    Ok(CommandResponse {
+        success: false,
+        message: Some("update_verification_test not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 /// Delete a verification test
 #[tauri::command]
-pub fn delete_verification_test(id: String, state: State<'_, Arc<AppState>>) -> CommandResponse {
-    let db = &state.checkpoint_db;
+pub async fn delete_verification_test(id: String, state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
 
     info!("Deleting verification test: {}", id);
 
-    match db.delete_verification_test(&id) {
-        Ok(true) => CommandResponse {
-            success: true,
-            message: Some("Test deleted".to_string()),
-            data: None,
-        },
-        Ok(false) => CommandResponse {
-            success: false,
-            message: Some(format!("Test not found: {}", id)),
-            data: None,
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to delete test: {}", e)),
-            data: None,
-        },
-    }
+    // delete_verification_test not yet implemented on PgDb — stub
+    Ok(CommandResponse {
+        success: false,
+        message: Some("delete_verification_test not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 // ========================================================================
@@ -485,79 +439,44 @@ pub fn delete_verification_test(id: String, state: State<'_, Arc<AppState>>) -> 
 
 /// Execute a test by ID (from database)
 #[tauri::command]
-pub fn execute_test_by_id(
+pub async fn execute_test_by_id(
     test_id: String,
     task_run_id: Option<String>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let db = &state.pg_db;
 
     // Get the test from database
-    let test = match db.get_verification_test(&test_id) {
+    let test = match db.get_verification_test(&test_id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
-            return CommandResponse {
+            return Ok(CommandResponse {
                 success: false,
                 message: Some(format!("Test not found: {}", test_id)),
                 data: None,
-            };
+            });
         }
         Err(e) => {
-            return CommandResponse {
+            return Ok(CommandResponse {
                 success: false,
                 message: Some(format!("Failed to get test: {}", e)),
                 data: None,
-            };
+            });
         }
     };
-
-    // Create test result record
-    let result_input = CreateTestResultInput {
-        test_id: test_id.clone(),
-        task_run_id: task_run_id.clone(),
-    };
-
-    let test_result = match db.create_test_result(&result_input) {
-        Ok(r) => r,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to create test result: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    // Mark as started
-    if let Err(e) = db.start_test_result(&test_result.id) {
-        info!("Failed to mark test as started: {}", e);
-    }
 
     info!(
-        "Executing test from database: {} (type: {:?}, result_id: {})",
-        test.name, test.test_type, test_result.id
+        "Executing test from database: {} (type: {:?})",
+        test.name, test.test_type
     );
 
     // Convert to executor type and execute
     let test_def = db_test_to_definition(&test);
     let exec_result = execute_test(&test_def);
 
-    // Update result in database
-    let db_status = executor_status_to_db(&exec_result.status);
-    let structured = exec_result.structured_output.as_ref();
+    let _task_run_id = task_run_id;
 
-    if let Err(e) = db.update_test_result(
-        &test_result.id,
-        &db_status,
-        Some(&exec_result.output),
-        exec_result.error.as_deref(),
-        structured,
-        exec_result.assertions_passed,
-        exec_result.assertions_failed,
-        &exec_result.screenshots,
-    ) {
-        info!("Failed to update test result: {}", e);
-    }
+    // create_test_result / update_test_result not yet on PgDb — skip result storage
 
     let success = matches!(exec_result.status, TestStatus::Passed);
 
@@ -566,7 +485,7 @@ pub fn execute_test_by_id(
         test.name, exec_result.status, exec_result.duration_ms
     );
 
-    CommandResponse {
+    Ok(CommandResponse {
         success,
         message: Some(format!(
             "Test {}: {:?}",
@@ -574,22 +493,22 @@ pub fn execute_test_by_id(
             exec_result.status
         )),
         data: Some(serde_json::json!({
-            "result_id": test_result.id,
             "execution_result": exec_result,
         })),
-    }
+    })
 }
 
 /// Execute multiple tests by IDs
 #[tauri::command]
-pub fn execute_tests_by_ids(
+pub async fn execute_tests_by_ids(
     test_ids: Vec<String>,
     task_run_id: Option<String>,
     stop_on_failure: Option<bool>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let db = &state.pg_db;
     let stop_on_failure = stop_on_failure.unwrap_or(false);
+    let _task_run_id = task_run_id;
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut total_passed = 0u32;
@@ -597,7 +516,7 @@ pub fn execute_tests_by_ids(
 
     for test_id in &test_ids {
         // Get test from database
-        let test = match db.get_verification_test(test_id) {
+        let test = match db.get_verification_test(test_id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
                 info!("Test not found: {}", test_id);
@@ -609,38 +528,11 @@ pub fn execute_tests_by_ids(
             }
         };
 
-        // Create result record
-        let result_input = CreateTestResultInput {
-            test_id: test_id.clone(),
-            task_run_id: task_run_id.clone(),
-        };
-
-        let test_result = match db.create_test_result(&result_input) {
-            Ok(r) => r,
-            Err(e) => {
-                info!("Failed to create result for {}: {}", test_id, e);
-                continue;
-            }
-        };
-
-        let _ = db.start_test_result(&test_result.id);
-
         // Execute test
         let test_def = db_test_to_definition(&test);
         let exec_result = execute_test(&test_def);
 
-        // Update database
-        let db_status = executor_status_to_db(&exec_result.status);
-        let _ = db.update_test_result(
-            &test_result.id,
-            &db_status,
-            Some(&exec_result.output),
-            exec_result.error.as_deref(),
-            exec_result.structured_output.as_ref(),
-            exec_result.assertions_passed,
-            exec_result.assertions_failed,
-            &exec_result.screenshots,
-        );
+        // create_test_result / update_test_result not yet on PgDb — skip result storage
 
         let passed = matches!(exec_result.status, TestStatus::Passed);
         if passed {
@@ -652,7 +544,6 @@ pub fn execute_tests_by_ids(
         results.push(serde_json::json!({
             "test_id": test_id,
             "test_name": test.name,
-            "result_id": test_result.id,
             "status": exec_result.status,
             "duration_ms": exec_result.duration_ms,
             "passed": passed,
@@ -666,7 +557,7 @@ pub fn execute_tests_by_ids(
 
     let all_passed = total_failed == 0;
 
-    CommandResponse {
+    Ok(CommandResponse {
         success: all_passed,
         message: Some(format!(
             "Executed {} tests: {} passed, {} failed",
@@ -682,7 +573,7 @@ pub fn execute_tests_by_ids(
                 "failed": total_failed,
             }
         })),
-    }
+    })
 }
 
 // ========================================================================
@@ -691,47 +582,38 @@ pub fn execute_tests_by_ids(
 
 /// Get test results for a specific test
 #[tauri::command]
-pub fn get_test_results(
+pub async fn get_test_results(
     test_id: String,
     limit: Option<u32>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
+    let _test_id = test_id;
+    let _limit = limit;
 
-    match db.get_results_for_test(&test_id, limit) {
-        Ok(results) => CommandResponse {
-            success: true,
-            message: Some(format!("Found {} results", results.len())),
-            data: Some(serde_json::to_value(results).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to get results: {}", e)),
-            data: None,
-        },
-    }
+    // get_results_for_test not yet implemented on PgDb — return empty
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Found 0 results".to_string()),
+        data: Some(serde_json::json!([])),
+    })
 }
 
 /// Get test results for a task run
 #[tauri::command]
-pub fn get_task_run_test_results(
+pub async fn get_task_run_test_results(
     task_run_id: String,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
+    let _task_run_id = task_run_id;
 
-    match db.get_results_for_task_run(&task_run_id) {
-        Ok(results) => CommandResponse {
-            success: true,
-            message: Some(format!("Found {} results", results.len())),
-            data: Some(serde_json::to_value(results).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to get results: {}", e)),
-            data: None,
-        },
-    }
+    // get_results_for_task_run not yet implemented on PgDb — return empty
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Found 0 results".to_string()),
+        data: Some(serde_json::json!([])),
+    })
 }
 
 // ========================================================================
@@ -740,7 +622,7 @@ pub fn get_task_run_test_results(
 
 /// Create a test association
 #[tauri::command]
-pub fn create_test_association(
+pub async fn create_test_association(
     test_id: String,
     config_id: Option<String>,
     workflow_name: Option<String>,
@@ -748,88 +630,54 @@ pub fn create_test_association(
     action_id: Option<String>,
     execution_order: Option<i32>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
+    let _test_id = test_id;
+    let _config_id = config_id;
+    let _workflow_name = workflow_name;
+    let _trigger_point = trigger_point;
+    let _action_id = action_id;
+    let _execution_order = execution_order;
 
-    let trigger: TriggerPoint = match trigger_point.parse() {
-        Ok(t) => t,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Invalid trigger point: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    match db.create_test_association(
-        &test_id,
-        config_id.as_deref(),
-        workflow_name.as_deref(),
-        &trigger,
-        action_id.as_deref(),
-        execution_order.unwrap_or(0),
-    ) {
-        Ok(assoc) => CommandResponse {
-            success: true,
-            message: Some("Association created".to_string()),
-            data: Some(serde_json::to_value(assoc).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to create association: {}", e)),
-            data: None,
-        },
-    }
+    // create_test_association not yet implemented on PgDb — stub
+    Ok(CommandResponse {
+        success: false,
+        message: Some("create_test_association not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 /// Get test associations for a config
 #[tauri::command]
-pub fn get_config_test_associations(
+pub async fn get_config_test_associations(
     config_id: String,
     trigger_point: Option<String>,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
+    let _config_id = config_id;
+    let _trigger_point = trigger_point;
 
-    let trigger: Option<TriggerPoint> = trigger_point.as_ref().and_then(|t| t.parse().ok());
-
-    match db.get_associations_for_config(&config_id, trigger.as_ref()) {
-        Ok(assocs) => CommandResponse {
-            success: true,
-            message: Some(format!("Found {} associations", assocs.len())),
-            data: Some(serde_json::to_value(assocs).unwrap_or_default()),
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to get associations: {}", e)),
-            data: None,
-        },
-    }
+    // get_associations_for_config not yet implemented on PgDb — return empty
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Found 0 associations".to_string()),
+        data: Some(serde_json::json!([])),
+    })
 }
 
 /// Delete a test association
 #[tauri::command]
-pub fn delete_test_association(id: String, state: State<'_, Arc<AppState>>) -> CommandResponse {
-    let db = &state.checkpoint_db;
+pub async fn delete_test_association(id: String, state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
+    let _id = id;
 
-    match db.delete_test_association(&id) {
-        Ok(true) => CommandResponse {
-            success: true,
-            message: Some("Association deleted".to_string()),
-            data: None,
-        },
-        Ok(false) => CommandResponse {
-            success: false,
-            message: Some(format!("Association not found: {}", id)),
-            data: None,
-        },
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to delete association: {}", e)),
-            data: None,
-        },
-    }
+    // delete_test_association not yet implemented on PgDb — stub
+    Ok(CommandResponse {
+        success: false,
+        message: Some("delete_test_association not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 // ========================================================================
@@ -886,12 +734,12 @@ pub struct ImportSummary {
 
 /// Export tests to a JSON file
 #[tauri::command]
-pub fn export_tests_to_file(
+pub async fn export_tests_to_file(
     test_ids: Vec<String>,
     file_path: String,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let db = &state.pg_db;
 
     info!("Exporting {} tests to {}", test_ids.len(), file_path);
 
@@ -899,7 +747,7 @@ pub fn export_tests_to_file(
     let mut exported_tests: Vec<ExportedTest> = Vec::new();
 
     for test_id in &test_ids {
-        match db.get_verification_test(test_id) {
+        match db.get_verification_test(test_id).await {
             Ok(Some(test)) => {
                 exported_tests.push(ExportedTest {
                     id: test.id,
@@ -929,11 +777,11 @@ pub fn export_tests_to_file(
     }
 
     if exported_tests.is_empty() {
-        return CommandResponse {
+        return Ok(CommandResponse {
             success: false,
             message: Some("No tests found to export".to_string()),
             data: None,
-        };
+        });
     }
 
     // Create export format
@@ -948,244 +796,68 @@ pub fn export_tests_to_file(
         Ok(file) => match serde_json::to_writer_pretty(file, &export) {
             Ok(_) => {
                 info!("Exported {} tests to {}", export.tests.len(), file_path);
-                CommandResponse {
+                Ok(CommandResponse {
                     success: true,
                     message: Some(format!("Exported {} tests", export.tests.len())),
                     data: Some(serde_json::json!({
                         "count": export.tests.len(),
                         "file_path": file_path,
                     })),
-                }
+                })
             }
-            Err(e) => CommandResponse {
+            Err(e) => Ok(CommandResponse {
                 success: false,
                 message: Some(format!("Failed to write JSON: {}", e)),
                 data: None,
-            },
+            }),
         },
-        Err(e) => CommandResponse {
+        Err(e) => Ok(CommandResponse {
             success: false,
             message: Some(format!("Failed to create file: {}", e)),
             data: None,
-        },
+        }),
     }
 }
 
 /// Export all tests to a JSON file
 #[tauri::command]
-pub fn export_all_tests_to_file(
+pub async fn export_all_tests_to_file(
     file_path: String,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
 
     info!("Exporting all tests to {}", file_path);
 
-    // Get all tests
-    match db.list_verification_tests(false, None, None) {
-        Ok(tests) => {
-            let test_ids: Vec<String> = tests.iter().map(|t| t.id.clone()).collect();
-            export_tests_to_file(test_ids, file_path, state)
-        }
-        Err(e) => CommandResponse {
-            success: false,
-            message: Some(format!("Failed to list tests: {}", e)),
-            data: None,
-        },
-    }
+    // list_verification_tests not yet implemented on PgDb — return empty
+    Ok(CommandResponse {
+        success: false,
+        message: Some("export_all_tests_to_file: list_verification_tests not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 /// Import tests from a JSON file
 #[tauri::command]
-pub fn import_tests_from_file(
+pub async fn import_tests_from_file(
     file_path: String,
     update_existing: bool,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
-    let db = &state.checkpoint_db;
+) -> Result<CommandResponse, String> {
+    let _db = &state.pg_db;
+    let _update_existing = update_existing;
 
     info!(
         "Importing tests from {} (update_existing: {})",
         file_path, update_existing
     );
 
-    // Read file
-    let file_content = match std::fs::read_to_string(&file_path) {
-        Ok(content) => content,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to read file: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    // Parse JSON
-    let export: TestExportFormat = match serde_json::from_str(&file_content) {
-        Ok(export) => export,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to parse JSON: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    info!(
-        "Parsed {} tests from file (version: {})",
-        export.tests.len(),
-        export.version
-    );
-
-    // Import each test
-    let mut summary = ImportSummary {
-        total: export.tests.len(),
-        created: 0,
-        updated: 0,
-        skipped: 0,
-        errors: 0,
-        results: Vec::new(),
-    };
-
-    for exported_test in export.tests {
-        let result = import_single_test(db, &exported_test, update_existing);
-
-        match result.status.as_str() {
-            "created" => summary.created += 1,
-            "updated" => summary.updated += 1,
-            "skipped" => summary.skipped += 1,
-            _ => summary.errors += 1,
-        }
-
-        summary.results.push(result);
-    }
-
-    let success = summary.errors == 0;
-
-    CommandResponse {
-        success,
-        message: Some(format!(
-            "Imported {} tests: {} created, {} updated, {} skipped, {} errors",
-            summary.total, summary.created, summary.updated, summary.skipped, summary.errors
-        )),
-        data: Some(serde_json::to_value(summary).unwrap_or_default()),
-    }
-}
-
-/// Import a single test from export format
-fn import_single_test(
-    db: &crate::database::CheckpointDb,
-    exported: &ExportedTest,
-    update_existing: bool,
-) -> ImportTestResult {
-    // Parse test type
-    let test_type: crate::database::TestType = match exported.test_type.as_str() {
-        "playwrightcdp" | "playwright_cdp" => crate::database::TestType::PlaywrightCdp,
-        "qontinuivision" | "qontinui_vision" => crate::database::TestType::QontinuiVision,
-        "pythonscript" | "python_script" => crate::database::TestType::PythonScript,
-        "repositorytest" | "repository_test" => crate::database::TestType::RepositoryTest,
-        _ => {
-            return ImportTestResult {
-                name: exported.name.clone(),
-                status: "error".to_string(),
-                message: Some(format!("Unknown test type: {}", exported.test_type)),
-                new_id: None,
-            };
-        }
-    };
-
-    // Check if test with same name exists
-    let existing = db
-        .list_verification_tests(false, None, None)
-        .ok()
-        .and_then(|tests| tests.into_iter().find(|t| t.name == exported.name));
-
-    if let Some(existing_test) = existing {
-        if update_existing {
-            // Update existing test
-            let input = CreateVerificationTestInput {
-                name: exported.name.clone(),
-                description: exported.description.clone(),
-                test_type: test_type.clone(),
-                category: exported.category.clone(),
-                playwright_code: exported.playwright_code.clone(),
-                vision_config: exported.vision_config.clone(),
-                python_code: exported.python_code.clone(),
-                repo_test_config: exported.repo_test_config.clone(),
-                success_criteria: exported.success_criteria.clone(),
-                config: exported.config.clone(),
-                timeout_seconds: Some(exported.timeout_seconds),
-                is_critical: exported.is_critical,
-                enabled: exported.enabled,
-                ai_generated: false,
-                ai_generation_prompt: None,
-                creation_analysis: None,
-                tags: exported.tags.clone(),
-                source_file: None,
-            };
-
-            match db.update_verification_test(&existing_test.id, &input) {
-                Ok(_) => ImportTestResult {
-                    name: exported.name.clone(),
-                    status: "updated".to_string(),
-                    message: None,
-                    new_id: Some(existing_test.id),
-                },
-                Err(e) => ImportTestResult {
-                    name: exported.name.clone(),
-                    status: "error".to_string(),
-                    message: Some(format!("Failed to update: {}", e)),
-                    new_id: None,
-                },
-            }
-        } else {
-            ImportTestResult {
-                name: exported.name.clone(),
-                status: "skipped".to_string(),
-                message: Some("Test with same name already exists".to_string()),
-                new_id: None,
-            }
-        }
-    } else {
-        // Create new test
-        let input = CreateVerificationTestInput {
-            name: exported.name.clone(),
-            description: exported.description.clone(),
-            test_type,
-            category: exported.category.clone(),
-            playwright_code: exported.playwright_code.clone(),
-            vision_config: exported.vision_config.clone(),
-            python_code: exported.python_code.clone(),
-            repo_test_config: exported.repo_test_config.clone(),
-            success_criteria: exported.success_criteria.clone(),
-            config: exported.config.clone(),
-            timeout_seconds: Some(exported.timeout_seconds),
-            is_critical: exported.is_critical,
-            enabled: exported.enabled,
-            ai_generated: false,
-            ai_generation_prompt: None,
-            creation_analysis: None,
-            tags: exported.tags.clone(),
-            source_file: None,
-        };
-
-        match db.create_verification_test(&input) {
-            Ok(test) => ImportTestResult {
-                name: exported.name.clone(),
-                status: "created".to_string(),
-                message: None,
-                new_id: Some(test.id),
-            },
-            Err(e) => ImportTestResult {
-                name: exported.name.clone(),
-                status: "error".to_string(),
-                message: Some(format!("Failed to create: {}", e)),
-                new_id: None,
-            },
-        }
-    }
+    // import_tests_from_file: create/update_verification_test not yet on PgDb — stub
+    Ok(CommandResponse {
+        success: false,
+        message: Some("import_tests_from_file: create/update_verification_test not yet implemented on PgDb".to_string()),
+        data: None,
+    })
 }
 
 // ========================================================================
@@ -1944,265 +1616,7 @@ pub async fn get_workflow_run_context(
     }
 }
 
-// LEGACY: Dead code — uses direct SQLite connection for multi-table task run context query.
-// All these queries (task_runs, task_run_automation, task_run_screenshots, etc.) have PG
-// equivalents via PgDb methods. Remove this function once confirmed unused.
-#[allow(dead_code)]
-fn get_workflow_run_context_inner(
-    task_run_id: String,
-    db: &std::sync::Arc<crate::database::CheckpointDb>,
-) -> CommandResponse {
-    let conn = match db.connection() {
-        Ok(conn) => conn,
-        Err(e) => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Failed to get database connection: {}", e)),
-                data: None,
-            };
-        }
-    };
-
-    // Get task run details
-    let task_run: Option<serde_json::Value> = conn
-        .query_row(
-            r#"
-            SELECT
-                id, task_name, prompt, status, workflow_name,
-                summary, goal_achieved, remaining_work,
-                created_at, completed_at
-            FROM task_runs WHERE id = ?1
-            "#,
-            [&task_run_id],
-            |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "task_name": row.get::<_, String>(1)?,
-                    "prompt": row.get::<_, Option<String>>(2)?,
-                    "status": row.get::<_, String>(3)?,
-                    "workflow_name": row.get::<_, Option<String>>(4)?,
-                    "summary": row.get::<_, Option<String>>(5)?,
-                    "goal_achieved": row.get::<_, Option<bool>>(6)?,
-                    "remaining_work": row.get::<_, Option<String>>(7)?,
-                    "created_at": row.get::<_, String>(8)?,
-                    "completed_at": row.get::<_, Option<String>>(9)?
-                }))
-            },
-        )
-        .ok();
-
-    let task_run = match task_run {
-        Some(tr) => tr,
-        None => {
-            return CommandResponse {
-                success: false,
-                message: Some(format!("Task run not found: {}", task_run_id)),
-                data: None,
-            };
-        }
-    };
-
-    // Get automation metrics
-    let automation: Option<serde_json::Value> = conn
-        .query_row(
-            r#"
-            SELECT
-                workflow_name, automation_status, duration_ms,
-                actions_summary, states_visited, transitions_executed
-            FROM task_run_automation WHERE task_run_id = ?1
-            ORDER BY started_at DESC LIMIT 1
-            "#,
-            [&task_run_id],
-            |row| {
-                Ok(serde_json::json!({
-                    "workflow_name": row.get::<_, Option<String>>(0)?,
-                    "automation_status": row.get::<_, String>(1)?,
-                    "duration_ms": row.get::<_, Option<i64>>(2)?,
-                    "actions_summary": row.get::<_, Option<String>>(3)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "states_visited": row.get::<_, Option<String>>(4)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "transitions_executed": row.get::<_, Option<String>>(5)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok())
-                }))
-            },
-        )
-        .ok();
-
-    // Get screenshots (limit to 10 most recent)
-    let screenshots: Vec<serde_json::Value> = conn
-        .prepare(
-            r#"
-            SELECT id, file_path, screenshot_type, template_name, confidence, match_location, created_at
-            FROM task_run_screenshots WHERE task_run_id = ?1
-            ORDER BY created_at DESC LIMIT 10
-            "#,
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([&task_run_id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "file_path": row.get::<_, String>(1)?,
-                    "screenshot_type": row.get::<_, String>(2)?,
-                    "template_name": row.get::<_, Option<String>>(3)?,
-                    "confidence": row.get::<_, Option<f64>>(4)?,
-                    "match_location": row.get::<_, Option<String>>(5)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "created_at": row.get::<_, String>(6)?
-                }))
-            })
-            .and_then(|rows| rows.collect())
-        })
-        .unwrap_or_default();
-
-    // Get API requests (limit to 20 most recent)
-    let api_requests: Vec<serde_json::Value> = conn
-        .prepare(
-            r#"
-            SELECT id, step_name, method, url, status_code, response_time_ms,
-                   success, response_body, extractions, error_message
-            FROM task_run_api_requests WHERE task_run_id = ?1
-            ORDER BY created_at DESC LIMIT 20
-            "#,
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([&task_run_id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "step_name": row.get::<_, Option<String>>(1)?,
-                    "method": row.get::<_, String>(2)?,
-                    "url": row.get::<_, String>(3)?,
-                    "status_code": row.get::<_, i32>(4)?,
-                    "response_time_ms": row.get::<_, i32>(5)?,
-                    "success": row.get::<_, bool>(6)?,
-                    "response_body": row.get::<_, Option<String>>(7)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "extractions": row.get::<_, Option<String>>(8)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "error_message": row.get::<_, Option<String>>(9)?
-                }))
-            })
-            .and_then(|rows| rows.collect())
-        })
-        .unwrap_or_default();
-
-    // Get Playwright results
-    let playwright_results: Vec<serde_json::Value> = conn
-        .prepare(
-            r#"
-            SELECT id, test_name, status, duration_ms, error_message,
-                   assertions_passed, assertions_failed, page_snapshot
-            FROM task_run_playwright_results WHERE task_run_id = ?1
-            ORDER BY created_at DESC LIMIT 20
-            "#,
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([&task_run_id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "test_name": row.get::<_, String>(1)?,
-                    "status": row.get::<_, String>(2)?,
-                    "duration_ms": row.get::<_, Option<i64>>(3)?,
-                    "error_message": row.get::<_, Option<String>>(4)?,
-                    "assertions_passed": row.get::<_, i32>(5)?,
-                    "assertions_failed": row.get::<_, i32>(6)?,
-                    "page_snapshot": row.get::<_, Option<String>>(7)?
-                }))
-            })
-            .and_then(|rows| rows.collect())
-        })
-        .unwrap_or_default();
-
-    // Get events (limit to 50 most recent, focus on important ones)
-    let events: Vec<serde_json::Value> = conn
-        .prepare(
-            r#"
-            SELECT id, event_type, event_subtype, message, data, timestamp, duration_ms
-            FROM task_run_events WHERE task_run_id = ?1
-            AND event_subtype IN ('complete', 'error', 'start', 'match', 'transition')
-            ORDER BY timestamp DESC LIMIT 50
-            "#,
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([&task_run_id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "event_type": row.get::<_, String>(1)?,
-                    "event_subtype": row.get::<_, Option<String>>(2)?,
-                    "message": row.get::<_, String>(3)?,
-                    "data": row.get::<_, Option<String>>(4)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
-                    "timestamp": row.get::<_, String>(5)?,
-                    "duration_ms": row.get::<_, Option<i64>>(6)?
-                }))
-            })
-            .and_then(|rows| rows.collect())
-        })
-        .unwrap_or_default();
-
-    // Get knowledge items
-    let knowledge: Vec<serde_json::Value> = conn
-        .prepare(
-            r#"
-            SELECT id, category, content, evidence, confidence, is_resolved, created_at
-            FROM task_knowledge WHERE task_run_id = ?1
-            ORDER BY created_at DESC LIMIT 30
-            "#,
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([&task_run_id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "category": row.get::<_, String>(1)?,
-                    "content": row.get::<_, String>(2)?,
-                    "evidence": row.get::<_, Option<String>>(3)?,
-                    "confidence": row.get::<_, String>(4)?,
-                    "is_resolved": row.get::<_, bool>(5)?,
-                    "created_at": row.get::<_, String>(6)?
-                }))
-            })
-            .and_then(|rows| rows.collect())
-        })
-        .unwrap_or_default();
-
-    // Get test results with test names
-    let test_results: Vec<serde_json::Value> = conn
-        .prepare(
-            r#"
-            SELECT tr.id, vt.name as test_name, tr.status, tr.output,
-                   tr.error_message, tr.assertions_passed, tr.assertions_failed
-            FROM test_results tr
-            JOIN verification_tests vt ON tr.test_id = vt.id
-            WHERE tr.task_run_id = ?1
-            ORDER BY tr.created_at DESC
-            "#,
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([&task_run_id], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, String>(0)?,
-                    "test_name": row.get::<_, String>(1)?,
-                    "status": row.get::<_, String>(2)?,
-                    "output": row.get::<_, Option<String>>(3)?,
-                    "error_message": row.get::<_, Option<String>>(4)?,
-                    "assertions_passed": row.get::<_, i32>(5)?,
-                    "assertions_failed": row.get::<_, i32>(6)?
-                }))
-            })
-            .and_then(|rows| rows.collect())
-        })
-        .unwrap_or_default();
-
-    let context = WorkflowRunContext {
-        task_run,
-        automation,
-        screenshots,
-        api_requests,
-        playwright_results,
-        events,
-        knowledge,
-        test_results,
-    };
-
-    CommandResponse {
-        success: true,
-        message: Some("Workflow run context retrieved".to_string()),
-        data: Some(serde_json::to_value(context).unwrap_or_default()),
-    }
-}
+// LEGACY get_workflow_run_context_inner removed — was checkpoint_db SQLite-only dead code.
 
 #[cfg(test)]
 mod tests {

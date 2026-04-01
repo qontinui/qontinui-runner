@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 // =============================================================================
@@ -177,7 +176,7 @@ pub struct EvalComparison {
 // =============================================================================
 
 /// Create or update an eval spec.
-pub fn save_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec: &EvalSpec) -> Result<(), String> {
+pub fn save_eval_spec(pg_db: &Arc<PgDb>, spec: &EvalSpec) -> Result<(), String> {
     let id = spec.id.clone();
     let name = spec.name.clone();
     let target_agent = spec.target_agent.clone();
@@ -193,7 +192,6 @@ pub fn save_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec: &EvalSpec) -> 
 
 /// List all eval specs, optionally filtered by target agent.
 pub fn list_eval_specs(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     target_agent: Option<&str>,
 ) -> Result<Vec<EvalSpec>, String> {
@@ -205,7 +203,7 @@ pub fn list_eval_specs(
 }
 
 /// Get a single eval spec by ID.
-pub fn get_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec_id: &str) -> Result<Option<EvalSpec>, String> {
+pub fn get_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<Option<EvalSpec>, String> {
     let result = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.get_eval_spec(spec_id))
     })?;
@@ -216,14 +214,14 @@ pub fn get_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec_id: &str) -> Res
 }
 
 /// Delete an eval spec.
-pub fn delete_eval_spec(db: &CheckpointDb, pg_db: &Arc<PgDb>, spec_id: &str) -> Result<(), String> {
+pub fn delete_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.delete_eval_spec(spec_id))
     })
 }
 
 /// Save an eval result.
-pub fn save_eval_result(db: &CheckpointDb, pg_db: &Arc<PgDb>, result: &EvalResult) -> Result<(), String> {
+pub fn save_eval_result(pg_db: &Arc<PgDb>, result: &EvalResult) -> Result<(), String> {
     let id = result.id.clone();
     let spec_id = result.spec_id.clone();
     let recommendation_id = result.recommendation_id.clone();
@@ -242,7 +240,6 @@ pub fn save_eval_result(db: &CheckpointDb, pg_db: &Arc<PgDb>, result: &EvalResul
 
 /// List eval results, optionally filtered by spec or recommendation.
 pub fn list_eval_results(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     spec_id: Option<&str>,
     recommendation_id: Option<&str>,
@@ -256,7 +253,6 @@ pub fn list_eval_results(
 
 /// Update the eval_status and eval_result_id on a recommendation.
 pub fn attach_eval_result(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     eval_result_id: &str,
@@ -277,12 +273,11 @@ pub fn attach_eval_result(
 ///
 /// Uses recent learning outcomes to derive sensible assertion thresholds
 /// (e.g., "success rate must be at least 80% of historical average").
-pub fn generate_default_spec(db: &CheckpointDb, target_agent: &str) -> Result<EvalSpec, String> {
+pub fn generate_default_spec(target_agent: &str) -> Result<EvalSpec, String> {
     let agent = target_agent.to_string();
 
     // Get historical performance baseline
     let baseline = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-        db,
         &agent,
         &(chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
         &chrono::Utc::now().to_rfc3339(),
@@ -342,77 +337,4 @@ pub fn generate_default_spec(db: &CheckpointDb, target_agent: &str) -> Result<Ev
     })
 }
 
-// ── PG dual-write wrappers ─────────────────────────────────────────────
-
-/// Generate default eval spec with PG fallback (currently delegates to SQLite).
-pub fn generate_default_spec_with_pg(
-    db: &CheckpointDb,
-    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-    target_agent: &str,
-) -> Result<EvalSpec, String> {
-    generate_default_spec(db, target_agent)
-}
-
-/// Save an eval spec with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use save_eval_spec directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn save_eval_spec_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, spec: &EvalSpec) -> Result<(), String> {
-    save_eval_spec(db, pg_db, spec)
-}
-
-/// Delete an eval spec with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use delete_eval_spec directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn delete_eval_spec_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, spec_id: &str) -> Result<(), String> {
-    delete_eval_spec(db, pg_db, spec_id)
-}
-
-/// Save an eval result with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use save_eval_result directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn save_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, result: &EvalResult) -> Result<(), String> {
-    save_eval_result(db, pg_db, result)
-}
-
-/// Attach eval result to recommendation with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use attach_eval_result directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn attach_eval_result_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, recommendation_id: &str, eval_result_id: &str, eval_status: &str) -> Result<(), String> {
-    attach_eval_result(db, pg_db, recommendation_id, eval_result_id, eval_status)
-}
-
-// ── PG-primary read wrappers ─────────────────────────────────────────────
-
-/// List eval specs with PG-primary read.
-#[deprecated(note = "Use list_eval_specs directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn list_eval_specs_with_pg(
-    db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-    target_agent: Option<&str>,
-) -> Result<Vec<EvalSpec>, String> {
-    list_eval_specs(db, pg_db, target_agent)
-}
-
-/// Get a single eval spec with PG-primary read.
-#[deprecated(note = "Use get_eval_spec directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn get_eval_spec_with_pg(
-    db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-    spec_id: &str,
-) -> Result<Option<EvalSpec>, String> {
-    get_eval_spec(db, pg_db, spec_id)
-}
-
-/// List eval results with PG-primary read.
-#[deprecated(note = "Use list_eval_results directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn list_eval_results_with_pg(
-    db: &CheckpointDb,
-    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-    spec_id: Option<&str>,
-    recommendation_id: Option<&str>,
-) -> Result<Vec<EvalResult>, String> {
-    list_eval_results(db, pg_db, spec_id, recommendation_id)
-}
+// Deprecated wrappers removed — all functions are now PG-primary.

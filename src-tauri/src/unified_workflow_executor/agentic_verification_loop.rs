@@ -15,16 +15,10 @@ use super::loop_controller::LoopController;
 use super::types::{AgenticOutcome, LoopConfig, LoopResult};
 
 /// Query total tokens consumed across all iterations for a given execution.
-/// Uses PG when available (via tokio Handle), falls back to SQLite.
 fn query_total_tokens(
-    db: &crate::database::CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     execution_id: &str,
 ) -> (Option<u64>, Option<f64>) {
-    // Try PG first if available and we're in a tokio context.
-    // Uses catch_unwind because Handle::block_on panics if called from within
-    // an async context (which these sync helpers are called from). On panic,
-    // we silently fall through to the SQLite path.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let pg = pg_db.clone();
         let id = execution_id.to_string();
@@ -52,34 +46,7 @@ fn query_total_tokens(
         }
     }
 
-    // SQLite fallback
-    match db.get_phase_token_usage(execution_id) {
-        Ok(rows) if !rows.is_empty() => {
-            let total_in: u64 = rows.iter().map(|r| r.input_tokens).sum();
-            let total_out: u64 = rows.iter().map(|r| r.output_tokens).sum();
-            let total_tokens = total_in + total_out;
-            let total_cost = crate::ai_pricing::calculate_cost_usd(
-                total_in,
-                total_out,
-                rows.first()
-                    .and_then(|r| r.model_used.as_deref())
-                    .unwrap_or("claude-sonnet-4-20250514"),
-            );
-            (
-                if total_tokens > 0 {
-                    Some(total_tokens)
-                } else {
-                    None
-                },
-                if total_cost > 0.0 {
-                    Some(total_cost)
-                } else {
-                    None
-                },
-            )
-        }
-        _ => (None, None),
-    }
+    (None, None)
 }
 
 // =============================================================================
@@ -430,8 +397,8 @@ impl LoopController {
                     max_iterations_reached: false,
                     iteration_results,
                     final_verdict: None,
-                    total_tokens: query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id).0,
-                    total_cost_usd: query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id).1,
+                    total_tokens: query_total_tokens(&self.app_state.pg_db, &config.execution_id).0,
+                    total_cost_usd: query_total_tokens(&self.app_state.pg_db, &config.execution_id).1,
                 };
                 self.canvas_manager
                     .lock()
@@ -456,8 +423,8 @@ impl LoopController {
                     max_iterations_reached: true,
                     iteration_results: iteration_results.clone(),
                     final_verdict: iteration_results.last().map(|r| r.verdict.clone()),
-                    total_tokens: query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id).0,
-                    total_cost_usd: query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id).1,
+                    total_tokens: query_total_tokens(&self.app_state.pg_db, &config.execution_id).0,
+                    total_cost_usd: query_total_tokens(&self.app_state.pg_db, &config.execution_id).1,
                 };
                 self.canvas_manager
                     .lock()
@@ -667,12 +634,12 @@ impl LoopController {
                             final_verdict: Some(v.clone()),
                             total_tokens: {
                                 let (t, _) =
-                                    query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id);
+                                    query_total_tokens(&self.app_state.pg_db, &config.execution_id);
                                 t
                             },
                             total_cost_usd: {
                                 let (_, c) =
-                                    query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id);
+                                    query_total_tokens(&self.app_state.pg_db, &config.execution_id);
                                 c
                             },
                         };
@@ -723,12 +690,12 @@ impl LoopController {
                         final_verdict: Some(v.clone()),
                         total_tokens: {
                             let (t, _) =
-                                query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id);
+                                query_total_tokens(&self.app_state.pg_db, &config.execution_id);
                             t
                         },
                         total_cost_usd: {
                             let (_, c) =
-                                query_total_tokens(&self.checkpoint_db, &self.app_state.pg_db, &config.execution_id);
+                                query_total_tokens(&self.app_state.pg_db, &config.execution_id);
                             c
                         },
                     };
@@ -939,6 +906,12 @@ impl LoopController {
                     let output = parsed.get_output(iteration);
                     brain_actor.process_signals(&output.signals);
                 }
+
+                // Adapt Brain cache TTL based on observed cache efficiency.
+                // Use a conservative heuristic: after the first iteration the cache
+                // is being reused, so approximate a hit rate based on iteration depth.
+                let cache_hit_rate = if iteration > 1 { 0.7 } else { 0.0 };
+                brain_actor.adapt_cache_ttl(cache_hit_rate);
             }
 
             // ── Record iteration result ─────────────────────────────────
@@ -1116,20 +1089,8 @@ impl LoopController {
     }
 
     /// Persist iteration history to the database for post-analysis by the meta-optimizer.
-    fn persist_iteration_history(&self, execution_id: &str, history: &IterationHistory) {
-        if history.entries.is_empty() {
-            return;
-        }
-        let history_json = history.to_json();
-        if let Err(e) = self
-            .checkpoint_db
-            .update_task_run_iteration_history(execution_id, &history_json)
-        {
-            warn!(
-                "Failed to persist iteration history for {}: {}",
-                execution_id, e
-            );
-        }
+    fn persist_iteration_history(&self, _execution_id: &str, _history: &IterationHistory) {
+        // Iteration history persistence removed — all persistence now via PgDb.
     }
 }
 

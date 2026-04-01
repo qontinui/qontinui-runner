@@ -33,6 +33,9 @@ pub struct CreateTerminalRequest {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Optional command to execute immediately after shell initialization.
+    #[serde(default)]
+    pub initial_command: Option<String>,
 }
 
 /// Request body for writing data to a terminal.
@@ -100,6 +103,20 @@ pub async fn create_terminal_handler(
     ) {
         Ok(info) => {
             info!("HTTP: Created terminal session: {}", info.id);
+
+            // Send initial command after a short delay for shell initialization
+            if let Some(cmd) = request.initial_command {
+                let mgr = terminal_manager.clone();
+                let tid = info.id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    if let Some(session) = mgr.get(&tid) {
+                        let cmd = format!("{}\r\n", cmd);
+                        let _ = session.write(cmd.as_bytes());
+                    }
+                });
+            }
+
             Ok(Json(ApiResponse::success(serde_json::json!(info))))
         }
         Err(e) => {

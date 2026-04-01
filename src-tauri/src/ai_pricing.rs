@@ -258,12 +258,100 @@ pub fn calculate_cost_usd(input_tokens: u64, output_tokens: u64, model_id: &str)
 }
 
 // ============================================================================
+// Cache-Aware Pricing
+// ============================================================================
+
+/// Calculate cost in USD accounting for Anthropic prompt cache pricing.
+///
+/// Cache write: 1.25x base input price; Cache read: 0.1x base input price.
+pub fn calculate_cost_usd_with_cache(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    model_id: &str,
+) -> f64 {
+    let pricing = match get_pricing(model_id) {
+        Some(p) => p,
+        None => {
+            let has_tokens = input_tokens > 0
+                || output_tokens > 0
+                || cache_creation_tokens > 0
+                || cache_read_tokens > 0;
+            if has_tokens {
+                CLAUDE_3_5_SONNET_PRICING
+            } else {
+                return 0.0;
+            }
+        }
+    };
+
+    let base_input_per_token = pricing.input_per_million / 1_000_000.0;
+    let output_per_token = pricing.output_per_million / 1_000_000.0;
+
+    let input_cost = input_tokens as f64 * base_input_per_token;
+    let cache_write_cost = cache_creation_tokens as f64 * base_input_per_token * 1.25;
+    let cache_read_cost = cache_read_tokens as f64 * base_input_per_token * 0.1;
+    let output_cost = output_tokens as f64 * output_per_token;
+
+    input_cost + cache_write_cost + cache_read_cost + output_cost
+}
+
+/// Calculate how much was saved by cache reads vs full input pricing.
+pub fn calculate_cache_savings_usd(cache_read_tokens: u64, model_id: &str) -> f64 {
+    if cache_read_tokens == 0 {
+        return 0.0;
+    }
+    let pricing = match get_pricing(model_id) {
+        Some(p) => p,
+        None => CLAUDE_3_5_SONNET_PRICING,
+    };
+    let base_input_per_token = pricing.input_per_million / 1_000_000.0;
+    cache_read_tokens as f64 * base_input_per_token * 0.9
+}
+
+/// Calculate cost in cents (rounded) with cache awareness.
+pub fn calculate_cost_cents_with_cache(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    model_id: &str,
+) -> Option<u32> {
+    let _ = get_pricing(model_id)?;
+    let cost_usd = calculate_cost_usd_with_cache(
+        input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, model_id,
+    );
+    Some((cost_usd * 100.0).round() as u32)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_calculate_cost_usd_with_cache() {
+        let cost = calculate_cost_usd_with_cache(
+            100_000, 10_000, 50_000, 200_000, "claude-sonnet-4-20250514",
+        );
+        assert!((cost - 0.6975).abs() < 0.001, "Expected ~0.6975, got {}", cost);
+
+        let cost = calculate_cost_usd_with_cache(0, 0, 0, 0, "claude-sonnet-4-20250514");
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn test_calculate_cache_savings() {
+        let savings = calculate_cache_savings_usd(200_000, "claude-sonnet-4-20250514");
+        assert!((savings - 0.54).abs() < 0.001, "Expected ~0.54, got {}", savings);
+
+        let savings = calculate_cache_savings_usd(0, "claude-sonnet-4-20250514");
+        assert_eq!(savings, 0.0);
+    }
 
     #[test]
     fn test_get_pricing_claude_models() {

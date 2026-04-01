@@ -77,20 +77,22 @@ pub async fn get_task_run_recap(
 
     // Get orchestrator verification results for this task run (criterion-based)
     let verification_results = state
-        .checkpoint_db
+        .pg_db
         .get_latest_verification_results(&task_run_id)
+        .await
         .unwrap_or_else(|e| {
             warn!(
                 "Failed to get verification results for {}: {}",
                 task_run_id, e
             );
-            Vec::new()
+            None
         });
 
     // Get workflow verification phase results (step-based, from execute_verification_steps)
     let workflow_verification_results = state
-        .checkpoint_db
+        .pg_db
         .get_all_verification_phase_results(&task_run_id)
+        .await
         .unwrap_or_else(|e| {
             warn!(
                 "Failed to get workflow verification phase results for {}: {}",
@@ -101,8 +103,9 @@ pub async fn get_task_run_recap(
 
     // Get workflow step checkpoints (from unified workflow executor)
     let step_checkpoints = state
-        .checkpoint_db
+        .pg_db
         .get_all_workflow_step_checkpoints(&task_run_id)
+        .await
         .unwrap_or_else(|e| {
             warn!(
                 "Failed to get workflow step checkpoints for {}: {}",
@@ -116,18 +119,25 @@ pub async fn get_task_run_recap(
         step_checkpoints.len()
     );
 
+    // Try to parse stored verification results from JSON value
+    let parsed_verification_results: Vec<crate::database::types::StoredVerificationResult> =
+        verification_results
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
     // Build steps - include workflow verification results and step checkpoints for richer step data
     let steps = step_builder::build_steps(
         &task_run,
         &automations,
         &events,
-        &verification_results,
+        &parsed_verification_results,
         &workflow_verification_results,
         &step_checkpoints,
     );
 
     // Build stages from transition history or heuristically
-    let stages = stage_builder::build_stages(&task_run, &steps, &verification_results);
+    let stages = stage_builder::build_stages(&task_run, &steps, &parsed_verification_results);
 
     // Extract failure info
     let failure_info = extractors::extract_failure_info(&task_run, &automations);

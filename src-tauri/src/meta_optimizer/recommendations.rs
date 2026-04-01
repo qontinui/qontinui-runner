@@ -3,14 +3,12 @@
 //! All optimizer outputs go here with status `pending`. Human reviews from UI.
 
 use std::sync::Arc;
-use rusqlite::params;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
 use super::types::{MetaOptimizerRun, Recommendation};
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 /// Compute a content hash for deduplication based on semantic identity fields.
@@ -35,8 +33,7 @@ pub fn compute_content_hash(
 
 /// Check if a recommendation with the same content hash already exists
 /// in a non-terminal state (pending, canary, applied).
-pub fn is_content_duplicate(db: &CheckpointDb, pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
-    let _ = db;
+pub fn is_content_duplicate(pg_db: &Arc<PgDb>, content_hash: &str) -> bool {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.is_content_duplicate(content_hash))
     })
@@ -81,7 +78,6 @@ struct RulePayload {
 
 /// Create a new recommendation.
 pub fn create_recommendation(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     recommendation_type: &str,
@@ -137,7 +133,6 @@ pub fn create_recommendation(
 
 /// List recommendations with optional filters.
 pub fn list_recommendations(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     optimizer_type: Option<&str>,
     status: Option<&str>,
@@ -149,7 +144,7 @@ pub fn list_recommendations(
 
 /// Apply a recommendation (updates status to 'applied').
 /// This is the simple status-only flip — prefer `apply_recommendation_with_side_effects`.
-pub fn apply_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
+pub fn apply_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "applied"))
     })?;
@@ -159,7 +154,6 @@ pub fn apply_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation
 
 /// Fetch a single recommendation by ID.
 fn get_recommendation(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<Recommendation, String> {
@@ -172,7 +166,6 @@ fn get_recommendation(
 /// Apply a recommendation **and** perform the appropriate side-effect based on
 /// `recommendation_type`. If the side-effect fails the status is NOT updated.
 pub fn apply_recommendation_with_side_effects(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<(), String> {
@@ -195,10 +188,10 @@ pub fn apply_recommendation_with_side_effects(
         .ok_or_else(|| format!("Recommendation {} has no recommended_value", rec.id))?;
 
     match rec.recommendation_type.as_str() {
-        "prompt_rewrite" => apply_prompt_rewrite(db, pg_db, &rec.id, recommended_value)?,
-        "config_change" => apply_config_change(db, recommended_value)?,
-        "rule_create" => apply_rule_create(db, pg_db, &rec.id, recommended_value)?,
-        "rule_update" => apply_rule_update(db, pg_db, recommended_value)?,
+        "prompt_rewrite" => apply_prompt_rewrite(pg_db, &rec.id, recommended_value)?,
+        "config_change" => apply_config_change(pg_db, recommended_value)?,
+        "rule_create" => apply_rule_create(pg_db, &rec.id, recommended_value)?,
+        "rule_update" => apply_rule_update(pg_db, recommended_value)?,
         other => {
             warn!(
                 "Unknown recommendation_type '{}' for {}; applying status-only",
@@ -214,7 +207,6 @@ pub fn apply_recommendation_with_side_effects(
 
     // Capture a snapshot to measure impact of this recommendation
     if let Err(e) = super::snapshots::capture_post_apply(
-        db,
         pg_db,
         recommendation_id,
         super::types::WorkflowCategory::Main,
@@ -223,7 +215,7 @@ pub fn apply_recommendation_with_side_effects(
     }
 
     // Evaluate outcome immediately (will likely be "insufficient_data" initially)
-    if let Err(e) = super::snapshots::evaluate_recommendation_outcome(db, pg_db, recommendation_id) {
+    if let Err(e) = super::snapshots::evaluate_recommendation_outcome(pg_db, recommendation_id) {
         warn!("Failed to evaluate recommendation outcome: {}", e);
     }
 
@@ -233,7 +225,6 @@ pub fn apply_recommendation_with_side_effects(
 // ── Side-effect helpers ──────────────────────────────────────────────
 
 fn apply_prompt_rewrite(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     recommended_value: &str,
@@ -242,7 +233,6 @@ fn apply_prompt_rewrite(
         .map_err(|e| format!("Invalid prompt_rewrite payload: {}", e))?;
 
     let variant = super::prompt_registry::create_variant(
-        db,
         pg_db,
         &payload.agent_type,
         &payload.variant_name,
@@ -250,7 +240,7 @@ fn apply_prompt_rewrite(
         Some(recommendation_id),
     )?;
 
-    super::prompt_registry::activate_variant(db, pg_db, &variant.id)?;
+    super::prompt_registry::activate_variant(pg_db, &variant.id)?;
 
     info!(
         "Applied prompt_rewrite recommendation {}: created and activated variant {}",
@@ -259,11 +249,14 @@ fn apply_prompt_rewrite(
     Ok(())
 }
 
-fn apply_config_change(db: &CheckpointDb, recommended_value: &str) -> Result<(), String> {
+fn apply_config_change(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), String> {
     let payload: ConfigChangePayload = serde_json::from_str(recommended_value)
         .map_err(|e| format!("Invalid config_change payload: {}", e))?;
 
-    db.set_setting(&payload.key, &payload.value)?;
+    // Config changes now go through PG settings
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.set_setting(&payload.key, &payload.value))
+    })?;
 
     info!(
         "Applied config_change: set '{}' to {}",
@@ -273,7 +266,6 @@ fn apply_config_change(db: &CheckpointDb, recommended_value: &str) -> Result<(),
 }
 
 fn apply_rule_create(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     recommended_value: &str,
@@ -313,7 +305,7 @@ fn apply_rule_create(
     Ok(())
 }
 
-fn apply_rule_update(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), String> {
+fn apply_rule_update(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), String> {
     let payload: RulePayload = serde_json::from_str(recommended_value)
         .map_err(|e| format!("Invalid rule_update payload: {}", e))?;
 
@@ -342,7 +334,7 @@ fn apply_rule_update(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommended_value: &s
 }
 
 /// Reject a recommendation.
-pub fn reject_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
+pub fn reject_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "rejected"))
     })?;
@@ -356,7 +348,7 @@ pub fn reject_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendatio
 /// and supersedes newer pending duplicates. Canary and applied recs are not touched
 /// (they represent active rollouts or already-applied changes). Also backfills
 /// content_hash for older rows that lack it.
-pub fn dedup_pending_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usize {
+pub fn dedup_pending_recommendations(pg_db: &Arc<PgDb>) -> usize {
     let superseded = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
             let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
@@ -391,7 +383,7 @@ pub fn dedup_pending_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> us
 ///
 /// Stale recs block the optimizer from regenerating fresh suggestions for the
 /// same targets. Rejecting them frees those slots while preserving history.
-pub fn auto_reject_stale_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> usize {
+pub fn auto_reject_stale_recommendations(pg_db: &Arc<PgDb>) -> usize {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
 
     let rejected = tokio::task::block_in_place(|| {
@@ -413,8 +405,8 @@ pub fn auto_reject_stale_recommendations(db: &CheckpointDb, pg_db: &Arc<PgDb>) -
 }
 
 /// Roll back an applied recommendation, undoing side-effects where possible.
-pub fn rollback_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
-    let rec = get_recommendation(db, pg_db, recommendation_id)?;
+pub fn rollback_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
+    let rec = get_recommendation(pg_db, recommendation_id)?;
 
     if rec.status != "applied" {
         return Err(format!(
@@ -429,13 +421,13 @@ pub fn rollback_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendat
     if let Some(ref recommended_value) = rec.recommended_value {
         match rec.recommendation_type.as_str() {
             "rule_create" | "rule_update" => {
-                if let Err(e) = rollback_rule(db, pg_db, &rec.id, recommended_value) {
+                if let Err(e) = rollback_rule(pg_db, &rec.id, recommended_value) {
                     warn!("Failed to rollback rule side-effect for {}: {}", rec.id, e);
                 }
             }
             "config_change" => {
                 if let Some(ref current_value) = rec.current_value {
-                    if let Err(e) = rollback_config_change(db, current_value) {
+                    if let Err(e) = rollback_config_change(pg_db, current_value) {
                         warn!(
                             "Failed to rollback config side-effect for {}: {}",
                             rec.id, e
@@ -465,7 +457,6 @@ pub fn rollback_recommendation(db: &CheckpointDb, pg_db: &Arc<PgDb>, recommendat
 
 /// Undo a rule side-effect by disabling the rule that was created/updated.
 fn rollback_rule(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     recommended_value: &str,
@@ -509,11 +500,13 @@ fn rollback_rule(
 }
 
 /// Undo a config change by restoring the `current_value`.
-fn rollback_config_change(db: &CheckpointDb, current_value: &str) -> Result<(), String> {
+fn rollback_config_change(pg_db: &Arc<PgDb>, current_value: &str) -> Result<(), String> {
     let payload: ConfigChangePayload = serde_json::from_str(current_value)
         .map_err(|e| format!("Invalid current_value payload for config rollback: {}", e))?;
 
-    db.set_setting(&payload.key, &payload.value)?;
+    tokio::task::block_in_place(|| {
+        Handle::current().block_on(pg_db.set_setting(&payload.key, &payload.value))
+    })?;
     info!(
         "Rollback: restored config '{}' to {}",
         payload.key, payload.value
@@ -525,7 +518,6 @@ fn rollback_config_change(db: &CheckpointDb, current_value: &str) -> Result<(), 
 
 /// Create a new optimizer run record.
 pub fn create_optimizer_run(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     optimizer_type: &str,
     trigger_type: &str,
@@ -536,21 +528,8 @@ pub fn create_optimizer_run(
     })
 }
 
-/// Create an optimizer run with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use create_optimizer_run directly — it is now PG-primary")]
-pub fn create_optimizer_run_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    optimizer_type: &str,
-    trigger_type: &str,
-    task_run_id: Option<&str>,
-) -> Result<String, String> {
-    create_optimizer_run(db, pg_db, optimizer_type, trigger_type, task_run_id)
-}
-
 /// Complete an optimizer run, recording how many runs were analyzed and recommendations produced.
 pub fn complete_optimizer_run(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     run_id: &str,
     runs_analyzed: i64,
@@ -561,21 +540,8 @@ pub fn complete_optimizer_run(
     })
 }
 
-/// Complete an optimizer run with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use complete_optimizer_run directly — it is now PG-primary")]
-pub fn complete_optimizer_run_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    run_id: &str,
-    runs_analyzed: i64,
-    recommendations_produced: i64,
-) -> Result<(), String> {
-    complete_optimizer_run(db, pg_db, run_id, runs_analyzed, recommendations_produced)
-}
-
 /// List optimizer runs.
-pub fn list_optimizer_runs(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
-    let _ = db;
+pub fn list_optimizer_runs(pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.list_optimizer_runs())
     })
@@ -588,8 +554,8 @@ pub fn list_optimizer_runs(db: &CheckpointDb, pg_db: &Arc<PgDb>) -> Result<Vec<M
 /// outcome_after_apply with the evidence. If negative, flags for rollback.
 ///
 /// Called from the maintenance block in trigger.rs.
-pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb, pg_db: &Arc<PgDb>) {
-    let recs = match list_recommendations(db, pg_db, None, Some("applied")) {
+pub fn auto_evaluate_with_agentic_scores(pg_db: &Arc<PgDb>) {
+    let recs = match list_recommendations(pg_db, None, Some("applied")) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -659,159 +625,4 @@ pub fn auto_evaluate_with_agentic_scores(db: &CheckpointDb, pg_db: &Arc<PgDb>) {
             }
         }
     }
-}
-
-// ── PG dual-write wrappers (now just delegate to PG-primary originals) ───
-
-/// Create a recommendation with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use create_recommendation directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn create_recommendation_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    optimizer_type: &str,
-    recommendation_type: &str,
-    target_agent: Option<&str>,
-    title: &str,
-    description: &str,
-    current_value: Option<&str>,
-    recommended_value: Option<&str>,
-    evidence: Option<&str>,
-    confidence: f64,
-    optimizer_run_id: Option<&str>,
-) -> Result<Recommendation, String> {
-    create_recommendation(
-        db, pg_db, optimizer_type, recommendation_type, target_agent, title,
-        description, current_value, recommended_value, evidence, confidence, optimizer_run_id,
-    )
-}
-
-/// Apply a recommendation with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use apply_recommendation directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn apply_recommendation_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<(), String> {
-    apply_recommendation(db, pg_db, recommendation_id)
-}
-
-/// Reject a recommendation with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use reject_recommendation directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn reject_recommendation_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<(), String> {
-    reject_recommendation(db, pg_db, recommendation_id)
-}
-
-/// Rollback a recommendation with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use rollback_recommendation directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn rollback_recommendation_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<(), String> {
-    rollback_recommendation(db, pg_db, recommendation_id)
-}
-
-/// Dedup pending recommendations with PG dual-write.
-#[deprecated(note = "Use dedup_pending_recommendations directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn dedup_pending_recommendations_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) -> usize {
-    dedup_pending_recommendations(db, pg_db)
-}
-
-/// Auto-reject stale recommendations with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use auto_reject_stale_recommendations directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn auto_reject_stale_recommendations_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) -> usize {
-    auto_reject_stale_recommendations(db, pg_db)
-}
-
-// ── PG-primary read wrappers (now just delegate to PG-primary originals) ──
-
-/// Check content duplicate with PG-primary read.
-#[deprecated(note = "Use is_content_duplicate directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn is_content_duplicate_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    content_hash: &str,
-) -> bool {
-    is_content_duplicate(db, pg_db, content_hash)
-}
-
-/// List recommendations with PG-primary read.
-#[deprecated(note = "Use list_recommendations directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn list_recommendations_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    optimizer_type: Option<&str>,
-    status: Option<&str>,
-) -> Result<Vec<Recommendation>, String> {
-    list_recommendations(db, pg_db, optimizer_type, status)
-}
-
-/// List optimizer runs with PG-primary read.
-#[deprecated(note = "Use list_optimizer_runs directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn list_optimizer_runs_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) -> Result<Vec<MetaOptimizerRun>, String> {
-    list_optimizer_runs(db, pg_db)
-}
-
-/// Get a single recommendation by ID from PG (falls back to SQLite).
-#[deprecated(note = "Use get_recommendation (private) or list_recommendations instead")]
-#[allow(dead_code)]
-pub fn get_recommendation_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<Recommendation, String> {
-    get_recommendation(db, pg_db, recommendation_id)
-}
-
-/// Apply a recommendation with side effects and PG dual-write.
-#[deprecated(note = "Use apply_recommendation_with_side_effects directly")]
-#[allow(dead_code)]
-pub fn apply_recommendation_with_side_effects_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-) -> Result<(), String> {
-    apply_recommendation_with_side_effects(db, pg_db, recommendation_id)
-}
-
-/// Dedup pending recommendations with PG dual-write (fire-and-forget).
-#[deprecated(note = "Use dedup_pending_recommendations directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn dedup_pending_recommendations_with_pg_sync(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) -> usize {
-    dedup_pending_recommendations(db, pg_db)
-}
-
-/// Auto-evaluate applied recommendations with agentic scores, with PG dual-write.
-#[deprecated(note = "Use auto_evaluate_with_agentic_scores directly — it is now PG-primary")]
-#[allow(dead_code)]
-pub fn auto_evaluate_with_agentic_scores_with_pg(
-    db: &CheckpointDb,
-    pg_db: &Arc<PgDb>,
-) {
-    auto_evaluate_with_agentic_scores(db, pg_db);
 }

@@ -861,7 +861,6 @@ impl MemorySystem {
         max_items: usize,
         task_description: &str,
         pg: &PgDb,
-        db: Arc<CheckpointDb>,
     ) -> String {
         let mut context = self.build_context(max_items);
 
@@ -874,7 +873,7 @@ impl MemorySystem {
             min_score: Some(0.3),
         };
 
-        match unified_query::query_memory(&params, pg, Some(db), None).await {
+        match unified_query::query_memory(&params, pg, None, None).await {
             Ok(results) if !results.is_empty() => {
                 context.push_str("\n## Unified Memory\n");
                 for r in results.iter().take(10) {

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use crate::mcp::types::MCP_API_PORT;
 use crate::str_utils::truncate_str;
 use crate::vision::annotator::{AnnotatedElement, AnnotationResult};
@@ -525,7 +524,6 @@ pub async fn detect_health_regression(baseline: &Option<HealthBaseline>) -> Opti
 /// Returns a warning string if regressions are found (steps that were passing before
 /// but now fail), or None if no regressions detected.
 pub fn detect_regression(
-    checkpoint_db: &CheckpointDb,
     execution_id: &str,
     current_iteration: u32,
     current_result: &crate::step_executor::VerificationPhaseResult,
@@ -654,7 +652,6 @@ pub fn detect_regression(
 /// 2. Step checkpoints from database (step names + error messages)
 /// 3. Fallback generic message
 pub fn build_resume_agentic_context(
-    checkpoint_db: &Arc<CheckpointDb>,
     execution_id: &str,
     iteration: u32,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
@@ -692,7 +689,7 @@ pub fn build_resume_agentic_context(
 
     // Strategy 2: Build context from step checkpoints (which remap to parent ID).
     let checkpoint_mgr =
-        crate::workflow_state::CheckpointManager::new(checkpoint_db.clone(), "unified");
+        crate::workflow_state::CheckpointManager::new("unified");
     if let Ok(checkpoints) =
         checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration))
     {

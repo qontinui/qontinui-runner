@@ -5,7 +5,6 @@
 //! execution infrastructure.
 
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 use crate::scheduler::{
     compute_next_run, ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus,
     ScheduledTaskType, TaskExecutionRecord,
@@ -22,8 +21,6 @@ use walkdir::WalkDir;
 
 /// Background scheduler service that executes tasks at their scheduled times
 pub struct SchedulerService {
-    /// Database handle for scheduler persistence
-    db: Arc<CheckpointDb>,
     /// PostgreSQL database for activity timeline and watchers (optional)
     pg_db: Option<Arc<PgDb>>,
     /// Flag to stop the service
@@ -36,9 +33,8 @@ pub struct SchedulerService {
 
 impl SchedulerService {
     /// Create a new scheduler service
-    pub fn new(db: Arc<CheckpointDb>, pg_db: impl Into<Option<Arc<PgDb>>>) -> Self {
+    pub fn new(pg_db: impl Into<Option<Arc<PgDb>>>) -> Self {
         Self {
-            db,
             pg_db: pg_db.into(),
             stop_signal: Arc::new(AtomicBool::new(false)),
             running_tasks: Arc::new(RwLock::new(Vec::new())),
@@ -1080,7 +1076,7 @@ static SCHEDULER_SERVICE: Lazy<Mutex<Option<Arc<SchedulerService>>>> =
     Lazy::new(|| Mutex::new(None));
 
 /// Start the global scheduler service
-pub async fn start_scheduler_service(db: Arc<CheckpointDb>, pg_db: Arc<PgDb>) {
+pub async fn start_scheduler_service(pg_db: Arc<PgDb>) {
     let mut service_guard = SCHEDULER_SERVICE.lock().await;
 
     if service_guard.is_some() {
@@ -1088,7 +1084,7 @@ pub async fn start_scheduler_service(db: Arc<CheckpointDb>, pg_db: Arc<PgDb>) {
         return;
     }
 
-    let service = Arc::new(SchedulerService::new(db, pg_db));
+    let service = Arc::new(SchedulerService::new(pg_db));
     *service_guard = Some(service.clone());
     drop(service_guard);
 
@@ -1154,23 +1150,15 @@ pub async fn run_task_now(task_id: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn make_test_db() -> Arc<CheckpointDb> {
-        // Use a temp DB for testing
-        let tmp = std::env::temp_dir().join(format!("scheduler_test_{}.db", uuid::Uuid::new_v4()));
-        Arc::new(CheckpointDb::new_at_path(tmp).expect("test db"))
-    }
-
     #[tokio::test]
     async fn test_scheduler_service_creation() {
-        let db = make_test_db();
-        let service = SchedulerService::new(db, None);
+        let service = SchedulerService::new(None);
         assert_eq!(service.check_interval_secs, 60);
     }
 
     #[tokio::test]
     async fn test_running_tasks_tracking() {
-        let db = make_test_db();
-        let service = SchedulerService::new(db, None);
+        let service = SchedulerService::new(None);
 
         // Initially empty
         let running = service.get_running_tasks().await;

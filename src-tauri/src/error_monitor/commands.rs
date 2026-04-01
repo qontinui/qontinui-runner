@@ -319,11 +319,9 @@ pub async fn acknowledge_all_errors(
 #[tauri::command]
 pub async fn get_debug_context(
     app_state: State<'_, Arc<AppState>>,
-    db: State<'_, Arc<crate::database::CheckpointDb>>,
     task_run_id: Option<String>,
     max_errors: Option<usize>,
 ) -> Result<DebugContext, String> {
-    let checkpoint_db = db.inner().clone();
     let max_err = max_errors.unwrap_or(DEFAULT_DEBUG_CONTEXT_MAX_ERRORS);
 
     // PG-primary: build debug context from PG
@@ -382,7 +380,6 @@ pub async fn get_debug_context(
                 5,
                 &summary,
                 &app_state.pg_db,
-                checkpoint_db,
             )
             .await;
 
@@ -418,10 +415,8 @@ pub async fn get_debug_context(
 #[tauri::command]
 pub async fn get_debug_context_for_ai(
     app_state: State<'_, Arc<AppState>>,
-    db: State<'_, Arc<crate::database::CheckpointDb>>,
     task_run_id: Option<String>,
 ) -> Result<String, String> {
-    let checkpoint_db = db.inner().clone();
 
     // PG-primary: build formatted debug context
     let pg = crate::database::pg::PgDb::global();
@@ -440,7 +435,6 @@ pub async fn get_debug_context_for_ai(
                     5,
                     &search_query,
                     &app_state.pg_db,
-                    checkpoint_db,
                 )
                 .await;
 

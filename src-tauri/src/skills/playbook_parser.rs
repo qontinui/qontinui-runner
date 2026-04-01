@@ -46,6 +46,25 @@ struct PlaybookFrontmatter {
     triggers: Vec<TriggerEntry>,
     #[serde(default)]
     context: Option<String>, // "ui-bridge", "black-box", or "both"
+    /// Optional parameters for recorded/generated playbooks.
+    #[serde(default)]
+    parameters: Vec<ParameterEntry>,
+}
+
+/// A parameter entry in the playbook frontmatter.
+#[derive(Debug, Deserialize)]
+struct ParameterEntry {
+    name: String,
+    #[serde(rename = "type", default = "default_param_type")]
+    param_type: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+fn default_param_type() -> String {
+    "string".to_string()
 }
 
 fn default_category() -> String {
@@ -111,12 +130,33 @@ pub fn parse_playbook_content(content: &str, source_path: &Path) -> Result<Skill
         tags.push(format!("context:{}", ctx));
     }
 
+    // Convert parameters
+    let parameters: Vec<super::SkillParameter> = frontmatter
+        .parameters
+        .into_iter()
+        .map(|p| super::SkillParameter {
+            name: p.name.clone(),
+            param_type: p.param_type,
+            label: p.name.clone(),
+            description: p.description.unwrap_or_default(),
+            required: false,
+            default: p.default.map(|v| serde_json::Value::String(v)),
+            options: None,
+            placeholder: None,
+            min: None,
+            max: None,
+            pattern: None,
+            depends_on: None,
+        })
+        .collect();
+
     debug!(
-        "Parsed playbook '{}' from {} ({} triggers, {} tags)",
+        "Parsed playbook '{}' from {} ({} triggers, {} tags, {} parameters)",
         frontmatter.name,
         source_path.display(),
         triggers.len(),
-        tags.len()
+        tags.len(),
+        parameters.len()
     );
 
     Ok(SkillDefinition {
@@ -132,7 +172,7 @@ pub fn parse_playbook_content(content: &str, source_path: &Path) -> Result<Skill
             "setup".to_string(),
             "agentic".to_string(),
         ],
-        parameters: vec![],
+        parameters,
         template: SkillTemplate::Playbook {
             content: body.to_string(),
             triggers,

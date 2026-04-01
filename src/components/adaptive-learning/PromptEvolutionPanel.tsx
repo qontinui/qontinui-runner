@@ -63,7 +63,7 @@ export function PromptEvolutionPanel() {
     };
   }, [loadRuns]);
 
-  // Listen for learning_update events
+  // Listen for learning-update events
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     listen("learning-update", () => {

@@ -8,7 +8,7 @@
 
 use crate::auth::AuthManager;
 use crate::context;
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 use crate::macros as macro_lib;
 use crate::prompt_snippets;
 use serde::{Deserialize, Serialize};
@@ -246,7 +246,7 @@ impl LibrarySyncService {
     }
 
     /// Sync all checks from the runner's SQLite database.
-    pub async fn sync_checks(&self, db: &Arc<CheckpointDb>) -> LibrarySyncResult {
+    pub async fn sync_checks(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "checks".to_string(),
             synced: 0,
@@ -263,7 +263,7 @@ impl LibrarySyncService {
             }
         };
 
-        let checks = match db.list_checks(false, None, None) {
+        let checks = match db.list_checks().await {
             Ok(c) => c,
             Err(e) => {
                 result
@@ -311,7 +311,7 @@ impl LibrarySyncService {
     }
 
     /// Sync all check groups from the runner's SQLite database.
-    pub async fn sync_check_groups(&self, db: &Arc<CheckpointDb>) -> LibrarySyncResult {
+    pub async fn sync_check_groups(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "check_groups".to_string(),
             synced: 0,
@@ -328,7 +328,7 @@ impl LibrarySyncService {
             }
         };
 
-        let groups = match db.list_check_groups(false) {
+        let groups = match db.list_check_groups(false).await {
             Ok(g) => g,
             Err(e) => {
                 result
@@ -377,7 +377,7 @@ impl LibrarySyncService {
     }
 
     /// Sync all shell commands from the runner's SQLite database.
-    pub async fn sync_shell_commands(&self, db: &Arc<CheckpointDb>) -> LibrarySyncResult {
+    pub async fn sync_shell_commands(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "shell_commands".to_string(),
             synced: 0,
@@ -394,7 +394,7 @@ impl LibrarySyncService {
             }
         };
 
-        let commands = match db.list_shell_commands(false, None) {
+        let commands = match db.list_shell_commands_filtered(false, None).await {
             Ok(c) => c,
             Err(e) => {
                 result
@@ -407,7 +407,18 @@ impl LibrarySyncService {
 
         info!("Syncing {} shell commands to backend", commands.len());
 
-        for cmd in &commands {
+        for cmd_val in &commands {
+            let cmd_name = cmd_val.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            // Deserialize the JSON value into a typed struct for the sync request
+            let cmd: crate::database::types::ShellCommand = match serde_json::from_value(cmd_val.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to parse shell command '{}': {}", cmd_name, e);
+                    result.failed += 1;
+                    result.errors.push(format!("ShellCommand '{}': parse error: {}", cmd_name, e));
+                    continue;
+                }
+            };
             let payload = ShellCommandSyncRequest {
                 name: cmd.name.clone(),
                 description: cmd.description.clone(),
@@ -442,7 +453,7 @@ impl LibrarySyncService {
     }
 
     /// Sync all saved API requests from the runner's SQLite database.
-    pub async fn sync_saved_api_requests(&self, db: &Arc<CheckpointDb>) -> LibrarySyncResult {
+    pub async fn sync_saved_api_requests(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "saved_api_requests".to_string(),
             synced: 0,
@@ -459,7 +470,7 @@ impl LibrarySyncService {
             }
         };
 
-        let requests = match db.list_saved_api_requests() {
+        let requests = match db.list_saved_api_requests().await {
             Ok(r) => r,
             Err(e) => {
                 result
@@ -472,20 +483,18 @@ impl LibrarySyncService {
 
         info!("Syncing {} saved API requests to backend", requests.len());
 
-        for req in &requests {
+        for req_val in &requests {
+            let req_name = req_val.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            // Deserialize and sync - send the raw JSON value directly
             let payload = SavedApiRequestSyncRequest {
-                name: req.name.clone(),
-                description: if req.description.is_empty() {
-                    None
-                } else {
-                    Some(req.description.clone())
-                },
-                method: format!("{:?}", req.method).to_uppercase(),
-                url: req.url.clone(),
-                headers: req.headers.clone(),
-                body: req.body.clone(),
-                timeout_ms: req.timeout_ms,
-                tags: req.tags.clone(),
+                name: req_name.clone(),
+                description: req_val.get("description").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string()),
+                method: req_val.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase(),
+                url: req_val.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                headers: req_val.get("headers").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
+                body: req_val.get("body").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                timeout_ms: req_val.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30000),
+                tags: req_val.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
             };
 
             match self
@@ -494,11 +503,11 @@ impl LibrarySyncService {
             {
                 Ok(()) => result.synced += 1,
                 Err(e) => {
-                    warn!("Failed to sync API request '{}': {}", req.name, e);
+                    warn!("Failed to sync API request '{}': {}", req_name, e);
                     result.failed += 1;
                     result
                         .errors
-                        .push(format!("ApiRequest '{}': {}", req.name, e));
+                        .push(format!("ApiRequest '{}': {}", req_name, e));
                 }
             }
         }
@@ -688,7 +697,7 @@ impl LibrarySyncService {
     }
 
     /// Full sync: sync all library item types to the backend.
-    pub async fn full_sync(&self, db: &Arc<CheckpointDb>) -> FullLibrarySyncResult {
+    pub async fn full_sync(&self, db: &Arc<PgDb>) -> FullLibrarySyncResult {
         info!("Starting full library sync to backend");
 
         let mut results = Vec::new();
@@ -744,7 +753,7 @@ pub async fn sync_library_to_backend(
         return Err("Not authenticated. Please log in to sync library items.".to_string());
     }
 
-    Ok(service.full_sync(&app_state.checkpoint_db).await)
+    Ok(service.full_sync(&app_state.pg_db).await)
 }
 
 /// Sync only checks to the backend.
@@ -753,7 +762,7 @@ pub async fn sync_checks_to_backend(
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_checks(&app_state.checkpoint_db).await)
+    Ok(service.sync_checks(&app_state.pg_db).await)
 }
 
 /// Sync only check groups to the backend.
@@ -762,7 +771,7 @@ pub async fn sync_check_groups_to_backend(
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_check_groups(&app_state.checkpoint_db).await)
+    Ok(service.sync_check_groups(&app_state.pg_db).await)
 }
 
 /// Sync only shell commands to the backend.
@@ -771,7 +780,7 @@ pub async fn sync_shell_commands_to_backend(
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service.sync_shell_commands(&app_state.checkpoint_db).await)
+    Ok(service.sync_shell_commands(&app_state.pg_db).await)
 }
 
 /// Sync only saved API requests to the backend.
@@ -781,7 +790,7 @@ pub async fn sync_api_requests_to_backend(
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
     Ok(service
-        .sync_saved_api_requests(&app_state.checkpoint_db)
+        .sync_saved_api_requests(&app_state.pg_db)
         .await)
 }
 

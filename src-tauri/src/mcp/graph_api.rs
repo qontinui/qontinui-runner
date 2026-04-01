@@ -850,7 +850,6 @@ async fn memory_search_handler(
     };
 
     let pg = &state.app_state.pg_db;
-    let db = &state.app_state.checkpoint_db;
 
     // Graph is expensive to build — only include if caller asks for graph_node source
     // or requests all sources (default).
@@ -865,7 +864,7 @@ async fn memory_search_handler(
         None
     };
 
-    let results = unified_query::query_memory(&params, pg, Some(db.clone()), graph.as_deref())
+    let results = unified_query::query_memory(&params, pg, None, graph.as_deref())
         .await
         .map_err(|e| {
             (

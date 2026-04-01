@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tracing::info;
 
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 // =============================================================================
@@ -117,7 +116,6 @@ pub struct RobustnessFailure {
 ///
 /// Combines synthetic adversarial inputs with golden regression cases from history.
 pub fn generate_test_cases(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     categories: &[RobustnessCategory],
@@ -139,7 +137,7 @@ pub fn generate_test_cases(
                 cases.extend(generate_adversarial_format_cases(agent_type));
             }
             RobustnessCategory::RegressionSuite => {
-                cases.extend(generate_regression_cases(db, pg_db, agent_type)?);
+                cases.extend(generate_regression_cases(pg_db, agent_type)?);
             }
         }
     }
@@ -280,7 +278,6 @@ fn generate_adversarial_format_cases(agent_type: &str) -> Vec<RobustnessTestCase
 
 /// Generate regression test cases from golden datasets.
 fn generate_regression_cases(
-    _db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Vec<RobustnessTestCase>, String> {
@@ -388,7 +385,7 @@ pub fn evaluate_robustness(
 // =============================================================================
 
 /// Save a robustness report.
-pub fn save_robustness_report(db: &CheckpointDb, pg_db: &Arc<PgDb>, report: &RobustnessReport) -> Result<(), String> {
+pub fn save_robustness_report(pg_db: &Arc<PgDb>, report: &RobustnessReport) -> Result<(), String> {
     let id = report.id.clone();
     let variant_id = report.prompt_variant_id.clone();
     let rec_id = report.recommendation_id.clone();
@@ -416,7 +413,6 @@ pub fn save_robustness_report(db: &CheckpointDb, pg_db: &Arc<PgDb>, report: &Rob
 
 /// List robustness reports, optionally filtered.
 pub fn list_robustness_reports(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
@@ -434,18 +430,17 @@ pub fn list_robustness_reports(
 
 /// Run a full robustness test suite for an agent and save the report.
 pub fn run_robustness_test(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<RobustnessReport, String> {
     let categories = RobustnessCategory::all();
-    let test_cases = generate_test_cases(db, pg_db, agent_type, categories)?;
+    let test_cases = generate_test_cases(pg_db, agent_type, categories)?;
 
     let report = evaluate_robustness(&test_cases, prompt_variant_id, recommendation_id);
 
-    save_robustness_report(db, pg_db, &report)?;
+    save_robustness_report(pg_db, &report)?;
 
     info!(
         "Robustness test for {}: {}/{} passed across {} categories",
@@ -463,15 +458,15 @@ pub fn run_robustness_test(
 /// Save a robustness report with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use save_robustness_report directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn save_robustness_report_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, report: &RobustnessReport) -> Result<(), String> {
-    save_robustness_report(db, pg_db, report)
+pub fn save_robustness_report_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, report: &RobustnessReport) -> Result<(), String> {
+    save_robustness_report(pg_db, report)
 }
 
 /// Run a full robustness test with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use run_robustness_test directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn run_robustness_test_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>) -> Result<RobustnessReport, String> {
-    run_robustness_test(db, pg_db, agent_type, prompt_variant_id, recommendation_id)
+pub fn run_robustness_test_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>) -> Result<RobustnessReport, String> {
+    run_robustness_test(pg_db, agent_type, prompt_variant_id, recommendation_id)
 }
 
 // ── PG-primary read wrappers ─────────────────────────────────────────────
@@ -480,12 +475,11 @@ pub fn run_robustness_test_with_pg(db: &CheckpointDb, pg_db: &std::sync::Arc<cra
 #[deprecated(note = "Use list_robustness_reports directly — it is now PG-primary")]
 #[allow(dead_code)]
 pub fn list_robustness_reports_with_pg(
-    db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     prompt_variant_id: Option<&str>,
     recommendation_id: Option<&str>,
 ) -> Result<Vec<RobustnessReport>, String> {
-    list_robustness_reports(db, pg_db, prompt_variant_id, recommendation_id)
+    list_robustness_reports(pg_db, prompt_variant_id, recommendation_id)
 }
 
 #[cfg(test)]

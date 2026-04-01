@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::database::CheckpointDb;
 use crate::workflow_state::{CheckpointManager, StepCheckpointStatus};
 
 /// Resume point in a unified workflow.
@@ -149,7 +148,6 @@ impl ResumePoint {
 /// way to continue execution without re-running completed steps.
 #[derive(Clone)]
 pub struct ResumeManager {
-    checkpoint_db: Arc<CheckpointDb>,
     checkpoint_mgr: CheckpointManager,
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
 }
@@ -157,7 +155,6 @@ pub struct ResumeManager {
 impl std::fmt::Debug for ResumeManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResumeManager")
-            .field("checkpoint_db", &"<CheckpointDb>")
             .field("checkpoint_mgr", &self.checkpoint_mgr)
             .finish()
     }
@@ -165,10 +162,9 @@ impl std::fmt::Debug for ResumeManager {
 
 impl ResumeManager {
     /// Create a new ResumeManager.
-    pub fn new(checkpoint_db: Arc<CheckpointDb>, pg_db: std::sync::Arc<crate::database::pg::PgDb>) -> Self {
-        let checkpoint_mgr = CheckpointManager::new(checkpoint_db.clone(), "unified");
+    pub fn new(pg_db: std::sync::Arc<crate::database::pg::PgDb>) -> Self {
+        let checkpoint_mgr = CheckpointManager::new("unified");
         Self {
-            checkpoint_db,
             checkpoint_mgr,
             pg_db,
         }
@@ -185,39 +181,14 @@ impl ResumeManager {
         );
 
         // 1. Try to load explicit workflow state
-        let state = self
-            .checkpoint_db
-            .get_workflow_execution_state(execution_id)?;
-
-        match state {
-            Some(s) => {
-                debug!(
-                    execution_id = %execution_id,
-                    state_name = %s.state_name,
-                    phase = ?s.phase,
-                    iteration = ?s.iteration,
-                    state_data = ?s.state_data,
-                    "Found saved workflow state"
-                );
-
-                // Determine resume point from explicit state + step checkpoints
-                self.resume_point_from_state(
-                    &s.state_name,
-                    s.phase.as_deref(),
-                    s.iteration,
-                    execution_id,
-                    s.state_data.as_deref(),
-                )
-            }
-            None => {
-                // No explicit state saved - try legacy heuristic
-                debug!(
-                    execution_id = %execution_id,
-                    "No explicit workflow state found, using legacy heuristic"
-                );
-                self.legacy_resume_point(execution_id)
-            }
-        }
+        // Workflow execution state removed — all persistence now via PgDb.
+        // Workflow execution state removed — all persistence now via PgDb.
+        // Always use legacy heuristic.
+        debug!(
+            execution_id = %execution_id,
+            "No explicit workflow state found, using legacy heuristic"
+        );
+        self.legacy_resume_point(execution_id)
     }
 
     /// Determine resume point from explicit workflow state.

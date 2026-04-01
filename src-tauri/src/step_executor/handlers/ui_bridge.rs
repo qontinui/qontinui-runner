@@ -698,7 +698,7 @@ impl StepHandler for UiBridgeHandler {
             context
                 .app_state
                 .url_lock_manager
-                .cleanup_stale_locks(&context.app_state.checkpoint_db)
+                .cleanup_stale_locks(&crate::database::CheckpointDb::global())
                 .await;
 
             // Acquire per-URL lock if running inside a workflow (has task_run_id).
@@ -712,7 +712,7 @@ impl StepHandler for UiBridgeHandler {
                     base_url,
                     task_run_id,
                     workflow_name,
-                    Some(&context.app_state.checkpoint_db),
+                    None,
                 )
                 .await;
         }

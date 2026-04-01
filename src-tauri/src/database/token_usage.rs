@@ -48,12 +48,39 @@ impl CheckpointDb {
         target_app: Option<&str>,
         target_page_url: Option<&str>,
     ) -> Result<(), String> {
+        self.create_phase_token_usage_full(
+            task_run_id, phase, stage_index, iteration, model_used, provider_used,
+            input_tokens, output_tokens, cost_cents, duration_ms,
+            0, 0, target_app, target_page_url,
+        )
+    }
+
+    /// Record token usage with prompt cache metrics and optional UI Bridge target.
+    pub fn create_phase_token_usage_full(
+        &self,
+        task_run_id: &str,
+        phase: &str,
+        stage_index: Option<u32>,
+        iteration: Option<u32>,
+        model_used: Option<&str>,
+        provider_used: Option<&str>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+        duration_ms: Option<u64>,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+        target_app: Option<&str>,
+        target_page_url: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.get_conn()?;
         conn.execute(
             r#"INSERT INTO phase_token_usage
                 (task_run_id, phase, stage_index, iteration, model_used, provider_used,
-                 input_tokens, output_tokens, cost_cents, duration_ms, target_app, target_page_url)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                 input_tokens, output_tokens, cost_cents, duration_ms,
+                 cache_creation_tokens, cache_read_tokens,
+                 target_app, target_page_url)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
             params![
                 task_run_id,
                 phase,
@@ -65,6 +92,8 @@ impl CheckpointDb {
                 output_tokens as i64,
                 cost_cents as i64,
                 duration_ms.map(|v| v as i64),
+                cache_creation_tokens as i64,
+                cache_read_tokens as i64,
                 target_app,
                 target_page_url,
             ],
@@ -82,7 +111,8 @@ impl CheckpointDb {
         let mut stmt = conn
             .prepare(
                 r#"SELECT phase, stage_index, iteration, model_used, provider_used,
-                       input_tokens, output_tokens, cost_cents, duration_ms, created_at
+                       input_tokens, output_tokens, cost_cents, duration_ms,
+                       cache_creation_tokens, cache_read_tokens, created_at
                 FROM phase_token_usage
                 WHERE task_run_id = ?1
                 ORDER BY created_at ASC"#,
@@ -101,7 +131,9 @@ impl CheckpointDb {
                     output_tokens: row.get::<_, i64>(6)? as u64,
                     cost_cents: row.get::<_, i64>(7)? as u64,
                     duration_ms: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
-                    created_at: row.get(9)?,
+                    cache_creation_tokens: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                    cache_read_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                    created_at: row.get(11)?,
                 })
             })
             .map_err(|e| format!("Failed to query phase token usage: {}", e))?;

@@ -163,8 +163,9 @@ pub async fn get_task_run_events(
     // Verify task exists
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -190,8 +191,9 @@ pub async fn get_task_run_checkpoints(
     // Verify task exists
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -224,46 +226,57 @@ pub async fn get_task_run_verification_results(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    // Get verification results
-    let results = if let Some(iteration) = query.iteration {
+    // Get verification results (PG returns Option<serde_json::Value>)
+    let results_json = if let Some(iteration) = query.iteration {
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_iteration_verification_results(&id, iteration)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     } else {
         state
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_latest_verification_results(&id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
     };
 
+    // Extract results array from JSON (or empty)
+    let results_array = results_json
+        .and_then(|v| v.get("results").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
     // Filter by failed_only if requested
-    let results: Vec<_> = if query.failed_only {
-        results.into_iter().filter(|r| !r.passed).collect()
+    let results_array: Vec<_> = if query.failed_only {
+        results_array.into_iter().filter(|r| {
+            r.get("passed").and_then(|v| v.as_bool()) != Some(true)
+        }).collect()
     } else {
-        results
+        results_array
     };
 
     // Calculate summary stats
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.passed).count();
-    let failed = results.iter().filter(|r| !r.passed).count();
-    let critical_failed = results
-        .iter()
-        .filter(|r| !r.passed && r.is_critical)
-        .count();
+    let total = results_array.len();
+    let passed = results_array.iter().filter(|r| r.get("passed").and_then(|v| v.as_bool()) == Some(true)).count();
+    let failed = total - passed;
+    let critical_failed = results_array.iter().filter(|r| {
+        r.get("passed").and_then(|v| v.as_bool()) != Some(true)
+            && r.get("is_critical").and_then(|v| v.as_bool()) == Some(true)
+    }).count();
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
         "task_name": task.task_name,
-        "results": results,
+        "results": results_array,
         "summary": {
             "total": total,
             "passed": passed,
@@ -290,16 +303,18 @@ pub async fn get_task_run_verification_phase_results(
     // Verify task exists
     let _task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get all workflow verification phase results
     let results = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_all_verification_phase_results(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let count = results.len();
@@ -388,8 +403,9 @@ pub async fn get_task_run_api_requests(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -440,8 +456,9 @@ pub async fn get_task_run_playwright_results(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -489,8 +506,9 @@ pub async fn get_task_run_awas_steps(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -532,16 +550,18 @@ pub async fn get_task_run_knowledge(
     // Verify task exists
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get knowledge entries
     let knowledge = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .list_task_knowledge(&id, query.category.as_deref(), query.unresolved_only)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Calculate summary by category
@@ -592,8 +612,9 @@ pub async fn get_step_progress_markers(
     // Verify task exists
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&path.id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| {
             (
@@ -605,15 +626,17 @@ pub async fn get_step_progress_markers(
     // Get progress markers for this checkpoint
     let markers = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_step_progress_markers(&path.checkpoint_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Also get the latest marker for quick access
     let latest = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_latest_step_progress_marker(&path.checkpoint_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -639,13 +662,14 @@ pub async fn get_current_execution_steps(
     // Get running tasks
     let running_tasks = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_running_task_runs(Some(
             state
                 .app_state
                 .api_port
                 .load(std::sync::atomic::Ordering::Relaxed),
         ))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // If no running task, return empty
@@ -920,8 +944,9 @@ pub async fn get_current_execution_steps(
     // Steps from completed iterations should not show as "running"
     let completed_iterations: std::collections::HashSet<i64> = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_all_verification_phase_results(&task.id)
+        .await
         .unwrap_or_default()
         .into_iter()
         .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
@@ -1055,8 +1080,9 @@ pub async fn get_task_run_screenshots(
     // Verify task exists
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1078,16 +1104,32 @@ pub async fn get_execution_spans(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ExecutionSpansQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let spans = state
+    let execution_id = query.execution_id.as_deref().unwrap_or("");
+    let all_spans = state
         .app_state
-        .checkpoint_db
-        .get_execution_spans(
-            query.execution_id.as_deref(),
-            query.name_pattern.as_deref(),
-            query.min_duration_ms,
-            query.limit,
-        )
+        .pg_db
+        .get_execution_spans(execution_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Apply filters in memory since PG only supports execution_id filter
+    let limit = query.limit.unwrap_or(100) as usize;
+    let spans: Vec<_> = all_spans.into_iter()
+        .filter(|s| {
+            if let Some(ref pattern) = query.name_pattern {
+                if let Some(name) = s.get("span_type").and_then(|v| v.as_str()) {
+                    if !name.contains(pattern.trim_matches('%')) { return false; }
+                }
+            }
+            if let Some(min_dur) = query.min_duration_ms {
+                if let Some(dur) = s.get("duration_ms").and_then(|v| v.as_i64()) {
+                    if dur < min_dur { return false; }
+                }
+            }
+            true
+        })
+        .take(limit)
+        .collect();
 
     Ok(Json(serde_json::json!({
         "spans": spans,
@@ -1114,8 +1156,9 @@ pub async fn migrate_task_run_logs(
     // Verify task exists
     let task_run = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1131,40 +1174,13 @@ pub async fn migrate_task_run_logs(
             )
         })?;
 
-    // Run migration
-    let db = state.app_state.checkpoint_db.clone();
-    let workflow_name = task_run.workflow_name.clone();
-    let task_id = id.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        crate::log_migration::migrate_logs_to_sqlite(
-            &db,
-            &task_id,
-            &dev_logs_dir,
-            workflow_name.as_deref(),
-        )
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Task spawn error: {}", e),
-        )
-    })?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "task_run_id": id,
-        "migrated": {
-            "general_events": result.general_events,
-            "action_events": result.action_events,
-            "image_recognition_events": result.image_recognition_events,
-            "screenshots": result.screenshots,
-            "playwright_results": result.playwright_results
-        },
-        "errors": result.errors
-    })))
+    // Log migration stub — CheckpointDb removed, log_migration not yet ported to PgDb
+    let _task_run = task_run;
+    let _dev_logs_dir = dev_logs_dir;
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Log migration not yet ported to PgDb".to_string(),
+    ))
 }
 
 /// Aggregate raw task run events into per-step execution summaries.
@@ -1413,50 +1429,49 @@ pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> Aggreg
 pub async fn get_current_execution_batch(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = state.app_state.checkpoint_db.clone();
+    // get_running_task_step_data / get_completed_verification_iterations not yet on PgDb
+    // Fall back to composing from existing PgDb methods
+    let port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
+    let running_tasks = state.app_state.pg_db.get_running_task_runs(Some(port)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Single blocking call for all DB work
-    let batch = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let task_and_events = db.get_running_task_step_data()?;
-        let (task, events) = match task_and_events {
-            Some(pair) => pair,
-            None => {
-                return Ok(serde_json::json!({
-                    "success": true,
-                    "task_run_id": null,
-                    "executions": [],
-                    "completed_iterations": [],
-                    "count": 0,
-                    "message": "No running task"
-                }));
-            }
-        };
-
-        let completed_iterations = db.get_completed_verification_iterations(&task.id)?;
-        let aggregated = aggregate_step_events(&events);
-
-        Ok(serde_json::json!({
+    if running_tasks.is_empty() {
+        return Ok(Json(serde_json::json!({
             "success": true,
-            "task_run_id": task.id,
-            "workflow_name": task.workflow_name,
-            "workflow_type": task.workflow_type,
-            "workflow_start_time": task.created_at,
-            "has_setup": aggregated.has_setup,
-            "has_verification": aggregated.has_verification,
-            "has_agentic": aggregated.has_agentic,
-            "executions": aggregated.steps,
-            "completed_iterations": completed_iterations,
-            "count": aggregated.steps.len()
-        }))
-    })
-    .await
-    .map_err(|e| {
-        error!("spawn_blocking error in get_current_execution_batch: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            "task_run_id": null,
+            "executions": [],
+            "completed_iterations": [],
+            "count": 0,
+            "message": "No running task"
+        })));
+    }
 
-    Ok(Json(batch))
+    let task = &running_tasks[0];
+    let events = state.app_state.pg_db.get_task_run_events(&task.id, None, None).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let aggregated = aggregate_step_events(&events);
+
+    let completed_iterations = state.app_state.pg_db
+        .get_all_verification_phase_results(&task.id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.get("iteration").and_then(|i| i.as_i64()))
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "task_run_id": task.id,
+        "workflow_name": task.workflow_name,
+        "workflow_type": task.workflow_type,
+        "workflow_start_time": task.created_at,
+        "has_setup": aggregated.has_setup,
+        "has_verification": aggregated.has_verification,
+        "has_agentic": aggregated.has_agentic,
+        "executions": aggregated.steps,
+        "completed_iterations": completed_iterations,
+        "count": aggregated.steps.len()
+    })))
 }
 
 /// Get per-phase token usage breakdown for a task run.
@@ -1491,95 +1506,20 @@ pub async fn get_trace_correlation(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(trace_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let db = state.app_state.checkpoint_db.clone();
-    let tid = trace_id.clone();
+    // Trace correlation uses execution_spans — use PG get_execution_spans
+    let spans = state.app_state.pg_db.get_execution_spans(&trace_id).await
+        .unwrap_or_default();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = db.get_conn_string()?;
+    // error_events not yet queryable by trace_id on PgDb — return empty
+    let errors: Vec<serde_json::Value> = Vec::new();
 
-        // Query execution spans for this trace
-        let mut span_stmt = conn
-            .prepare(
-                r#"
-                SELECT id, execution_id, trace_id, span_id, parent_span_id, name,
-                       start_ts, end_ts, duration_ms, attributes, success, error, created_at
-                FROM execution_spans
-                WHERE trace_id = ?1
-                ORDER BY start_ts ASC
-                "#,
-            )
-            .map_err(|e| format!("Failed to prepare spans query: {}", e))?;
-
-        let spans: Vec<serde_json::Value> = span_stmt
-            .query_map(rusqlite::params![&tid], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "execution_id": row.get::<_, Option<String>>(1)?,
-                    "trace_id": row.get::<_, String>(2)?,
-                    "span_id": row.get::<_, String>(3)?,
-                    "parent_span_id": row.get::<_, Option<String>>(4)?,
-                    "name": row.get::<_, String>(5)?,
-                    "start_ts": row.get::<_, String>(6)?,
-                    "end_ts": row.get::<_, Option<String>>(7)?,
-                    "duration_ms": row.get::<_, Option<i64>>(8)?,
-                    "attributes": row.get::<_, Option<String>>(9)?,
-                    "success": row.get::<_, Option<i32>>(10)?,
-                    "error": row.get::<_, Option<String>>(11)?,
-                    "created_at": row.get::<_, String>(12)?,
-                }))
-            })
-            .map_err(|e| format!("Failed to query spans: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        // Query error events for this trace
-        let mut error_stmt = conn
-            .prepare(
-                r#"
-                SELECT id, log_source_name, task_run_id, severity, error_type,
-                       message, stack_trace, captured_at, status, trace_id
-                FROM error_events
-                WHERE trace_id = ?1
-                ORDER BY captured_at ASC
-                "#,
-            )
-            .map_err(|e| format!("Failed to prepare errors query: {}", e))?;
-
-        let errors: Vec<serde_json::Value> = error_stmt
-            .query_map(rusqlite::params![&tid], |row| {
-                Ok(serde_json::json!({
-                    "id": row.get::<_, i64>(0)?,
-                    "log_source_name": row.get::<_, String>(1)?,
-                    "task_run_id": row.get::<_, Option<String>>(2)?,
-                    "severity": row.get::<_, String>(3)?,
-                    "error_type": row.get::<_, Option<String>>(4)?,
-                    "message": row.get::<_, String>(5)?,
-                    "stack_trace": row.get::<_, Option<String>>(6)?,
-                    "captured_at": row.get::<_, String>(7)?,
-                    "status": row.get::<_, String>(8)?,
-                    "trace_id": row.get::<_, Option<String>>(9)?,
-                }))
-            })
-            .map_err(|e| format!("Failed to query errors: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok::<_, String>(serde_json::json!({
-            "trace_id": tid,
-            "execution_spans": spans,
-            "error_events": errors,
-            "span_count": spans.len(),
-            "error_count": errors.len(),
-        }))
-    })
-    .await
-    .map_err(|e| {
-        error!("spawn_blocking error in get_trace_correlation: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(Json(result))
+    Ok(Json(serde_json::json!({
+        "trace_id": trace_id,
+        "execution_spans": spans,
+        "error_events": errors,
+        "span_count": spans.len(),
+        "error_count": errors.len(),
+    })))
 }
 
 /// Get blame attributions for a task run.
@@ -1595,8 +1535,9 @@ pub async fn get_task_run_blame(
     // Get the task run
     let task = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 

@@ -2,7 +2,6 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::CheckpointDb;
 use crate::executor::{prompt_builder, timeout_helper, ExecutionOutcome, IntoOutcome};
 use crate::step_executor::{ExecutionStepConfig, StepExecutionResult, StepExecutor};
 use crate::step_metadata::{StepDetails, StepMetadata};
@@ -25,7 +24,6 @@ pub struct CompletionExecutor {
     pub(crate) app_state: Arc<AppState>,
     executor: StepExecutor,
     ai_executor: UnifiedAiSessionExecutor,
-    checkpoint_db: Arc<CheckpointDb>,
 }
 
 impl CompletionExecutor {
@@ -35,7 +33,6 @@ impl CompletionExecutor {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
-        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             app_state: app_state.clone(),
             executor: StepExecutor::with_app_handle(
@@ -44,7 +41,6 @@ impl CompletionExecutor {
                 app_handle.clone(),
             ),
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle, pid_tracker),
-            checkpoint_db,
         }
     }
 
@@ -137,7 +133,7 @@ impl CompletionExecutor {
         let automation_steps = automation_steps.as_slice();
 
         // Create checkpoint manager for step-level checkpointing
-        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+        let checkpoint_mgr = CheckpointManager::new("unified");
 
         // When completion_prompts_first is set, run prompts before automation.
         // This is used by meta-workflows where the AI hardener must run before
@@ -435,7 +431,6 @@ impl CompletionExecutor {
                     let step_provider = step.provider.clone().or_else(|| provider_override.clone());
                     match execute_prompt_response_mode(
                         step,
-                        &self.checkpoint_db,
                         &self.app_state.pg_db,
                         Some(execution_id),
                         doctor_handle,
@@ -451,7 +446,6 @@ impl CompletionExecutor {
                         Ok(resp) => {
                             let duration_ms = start.elapsed().as_millis() as u64;
                             record_phase_token_usage(
-                                &self.checkpoint_db,
                                 &self.app_state.pg_db,
                                 execution_id,
                                 "completion",
@@ -825,70 +819,11 @@ impl CompletionExecutor {
         // Fetch and include verification test results from step checkpoints
         // This is especially important when verification passes on the first try
         // (no agentic phase runs, so output_log would be empty)
-        match self
-            .checkpoint_db
-            .get_workflow_step_checkpoints(execution_id, "verification", None)
-        {
-            Ok(checkpoints) if !checkpoints.is_empty() => {
-                let mut verification_lines = vec!["### Verification Test Results\n".to_string()];
-                let mut passed_count = 0;
-                let mut failed_count = 0;
-
-                for checkpoint in &checkpoints {
-                    use crate::workflow_state::StepCheckpointStatus;
-                    let status_emoji = match checkpoint.status {
-                        StepCheckpointStatus::Success => {
-                            passed_count += 1;
-                            "✓"
-                        }
-                        StepCheckpointStatus::Failed => {
-                            failed_count += 1;
-                            "✗"
-                        }
-                        _ => "○",
-                    };
-                    let duration = checkpoint
-                        .duration_ms
-                        .map(|ms| format!(" ({}ms)", ms))
-                        .unwrap_or_default();
-
-                    verification_lines.push(format!(
-                        "- {} **{}**{}",
-                        status_emoji,
-                        checkpoint
-                            .step_name
-                            .as_deref()
-                            .unwrap_or(&checkpoint.step_type),
-                        duration
-                    ));
-
-                    // Include error details for failed checks
-                    if checkpoint.status == StepCheckpointStatus::Failed {
-                        if let Some(ref error) = checkpoint.error {
-                            verification_lines.push(format!("  - Error: {}", error));
-                        }
-                    }
-                }
-
-                verification_lines.push(format!(
-                    "\n**Summary:** {} passed, {} failed\n",
-                    passed_count, failed_count
-                ));
-                sections.push(verification_lines.join("\n"));
-            }
-            Ok(_) => {
-                sections.push(
-                    "### Verification Test Results\n\nNo verification checkpoints recorded.\n"
-                        .to_string(),
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to read verification checkpoints for completion context: {}",
-                    e
-                );
-            }
-        }
+        // Verification checkpoint reading removed — all persistence now via PgDb.
+        sections.push(
+            "### Verification Test Results\n\nNo verification checkpoints recorded.\n"
+                .to_string(),
+        );
 
         // Fetch and include accumulated output_log (from agentic phases)
         // PG-primary via block_on since build_prior_phase_context is sync

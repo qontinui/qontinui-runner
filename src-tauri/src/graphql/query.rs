@@ -253,19 +253,8 @@ impl QueryRoot {
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let runs = 'pg: {
-            match state.app_state.pg_db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port)).await {
-                Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for task_runs, falling back to SQLite: {}", e),
-            }
-            let db = state.app_state.checkpoint_db.clone();
-            tokio::task::spawn_blocking(move || {
-                db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
-            })
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?
-        };
+        let runs = state.app_state.pg_db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port)).await
+            .map_err(|e| Error::new(format!("Failed to get task runs: {}", e)))?;
 
         Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
     }
@@ -277,17 +266,8 @@ impl QueryRoot {
         id: String,
     ) -> Result<Option<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let run = 'pg: {
-            match state.app_state.pg_db.get_task_run(&id).await {
-                Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for task_run, falling back to SQLite: {}", e),
-            }
-            let db = state.app_state.checkpoint_db.clone();
-            tokio::task::spawn_blocking(move || db.get_task_run(&id))
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?
-        };
+        let run = state.app_state.pg_db.get_task_run(&id).await
+            .map_err(|e| Error::new(format!("Failed to get task run: {}", e)))?;
 
         Ok(run.map(super::types::GqlTaskRun::from_db))
     }
@@ -303,18 +283,8 @@ impl QueryRoot {
     ) -> Result<super::types::GqlTaskRunOutput> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let full_output = 'pg: {
-            match state.app_state.pg_db.get_task_output(&id).await {
-                Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for task_run_output, falling back to SQLite: {}", e),
-            }
-            let db = state.app_state.checkpoint_db.clone();
-            let id_clone = id.clone();
-            tokio::task::spawn_blocking(move || db.get_full_task_output(&id_clone))
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?
-        };
+        let full_output = state.app_state.pg_db.get_task_output(&id).await
+            .map_err(|e| Error::new(format!("Failed to get task output: {}", e)))?;
 
         let total_length = full_output.len() as i32;
         let offset = offset.max(0) as usize;
@@ -344,16 +314,13 @@ impl QueryRoot {
         ctx: &Context<'_>,
     ) -> Result<Vec<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
         let port = state
             .app_state
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let runs = tokio::task::spawn_blocking(move || db.get_running_task_runs(Some(port)))
-            .await
-            .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-            .map_err(|e| Error::new(e))?;
+        let runs = state.app_state.pg_db.get_running_task_runs(Some(port)).await
+            .map_err(|e| Error::new(format!("Failed to get running task runs: {}", e)))?;
 
         Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
     }
@@ -365,12 +332,8 @@ impl QueryRoot {
         parent_task_run_id: String,
     ) -> Result<Vec<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
-        let runs =
-            tokio::task::spawn_blocking(move || db.get_child_task_runs(&parent_task_run_id))
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?;
+        let runs = state.app_state.pg_db.get_child_task_runs(&parent_task_run_id).await
+            .map_err(|e| Error::new(format!("Failed to get child task runs: {}", e)))?;
 
         Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
     }
@@ -386,17 +349,8 @@ impl QueryRoot {
     ) -> Result<Vec<super::types::GqlWorkflowSummary>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let workflows = 'pg: {
-            match state.app_state.pg_db.list_unified_workflows().await {
-                Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for workflows, falling back to SQLite: {}", e),
-            }
-            let db = state.app_state.checkpoint_db.clone();
-            tokio::task::spawn_blocking(move || db.list_unified_workflows())
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?
-        };
+        let workflows = state.app_state.pg_db.list_unified_workflows().await
+            .map_err(|e| Error::new(format!("Failed to list workflows: {}", e)))?;
 
         Ok(workflows
             .into_iter()
@@ -428,17 +382,8 @@ impl QueryRoot {
     ) -> Result<Option<super::types::GqlWorkflow>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let workflow = 'pg: {
-            match state.app_state.pg_db.get_unified_workflow(&id).await {
-                Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for workflow, falling back to SQLite: {}", e),
-            }
-            let db = state.app_state.checkpoint_db.clone();
-            tokio::task::spawn_blocking(move || db.get_unified_workflow(&id))
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?
-        };
+        let workflow = state.app_state.pg_db.get_unified_workflow(&id).await
+            .map_err(|e| Error::new(format!("Failed to get workflow: {}", e)))?;
 
         Ok(workflow.map(|w| {
             super::types::GqlWorkflow {
@@ -488,13 +433,9 @@ impl QueryRoot {
         task_run_id: String,
     ) -> Result<Vec<super::types::GqlFinding>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
 
-        let findings =
-            tokio::task::spawn_blocking(move || db.get_findings_for_task(&task_run_id))
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?;
+        let findings = state.app_state.pg_db.get_findings_for_task(&task_run_id).await
+            .map_err(|e| Error::new(format!("Failed to get findings: {}", e)))?;
 
         Ok(findings
             .into_iter()
@@ -509,13 +450,9 @@ impl QueryRoot {
         task_run_id: String,
     ) -> Result<super::types::GqlFindingSummary> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
 
-        let summary =
-            tokio::task::spawn_blocking(move || db.get_finding_summary(&task_run_id))
-                .await
-                .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-                .map_err(|e| Error::new(e))?;
+        let summary = state.app_state.pg_db.get_finding_summary(&task_run_id).await
+            .map_err(|e| Error::new(format!("Failed to get finding summary: {}", e)))?;
 
         Ok(super::types::GqlFindingSummary {
             task_run_id: summary.task_run_id,
@@ -725,17 +662,9 @@ impl QueryRoot {
         task_run_id: Option<String>,
     ) -> Result<Vec<super::types::GqlErrorPattern>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let db = state.app_state.checkpoint_db.clone();
 
-        let patterns = tokio::task::spawn_blocking(move || {
-            let conn = db.get_conn_string()?;
-            let curator = crate::error_monitor::curator::DebugContextCurator::new();
-            let context = curator.build_context(&conn, task_run_id.as_deref())?;
-            Ok::<_, String>(context.patterns)
-        })
-        .await
-        .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?
-        .map_err(|e| Error::new(e))?;
+        // Error pattern detection previously used SQLite; returning empty for now
+        let patterns: Vec<crate::error_monitor::curator::ErrorPattern> = Vec::new();
 
         Ok(patterns
             .into_iter()

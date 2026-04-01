@@ -657,8 +657,8 @@ pub async fn get_status(
         )
     })?;
 
-    // Check AI analysis status using async version to avoid blocking
-    let ai_running = has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await;
+    // Check AI analysis status via PG
+    let ai_running = !state.app_state.pg_db.get_running_task_runs(None).await.unwrap_or_default().is_empty();
 
     let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
     let api_port = state
@@ -759,15 +759,8 @@ pub async fn get_tool_version(
         .and_then(|guard| guard.clone())
         .unwrap_or_else(|| "none".to_string());
 
-    // Get test count from database using list_verification_tests
-    let db = state.app_state.checkpoint_db.clone();
-    let test_count = tokio::task::spawn_blocking(move || {
-        db.list_verification_tests(false, None, None)
-            .map(|tests| tests.len())
-            .unwrap_or(0)
-    })
-    .await
-    .unwrap_or(0);
+    // checkpoint_db removed — verification tests not yet migrated to PG
+    let test_count = 0usize;
 
     // Base tool count (from qontinui-mcp server.py TOOLS list)
     // This should be kept in sync with the actual tool count
@@ -1282,7 +1275,7 @@ pub async fn get_screenshot_monitors_ipc(
 
 // AI session management handlers moved to crate::mcp::ai_session
 use crate::mcp::ai_session::{
-    has_running_ai_tasks_async, InlinePythonRequest, InlinePythonResponse,
+    InlinePythonRequest, InlinePythonResponse,
 };
 
 // ============================================================================

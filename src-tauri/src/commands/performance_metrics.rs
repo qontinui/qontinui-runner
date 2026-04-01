@@ -225,8 +225,6 @@ pub async fn get_performance_dashboard(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<PerformanceDashboardData>, String> {
-    let db = state.checkpoint_db.clone();
-
     let range = time_range
         .map(|s| TimeRange::from_str(&s))
         .unwrap_or(TimeRange::SevenDays);

@@ -186,6 +186,52 @@ impl PgDb {
             .collect())
     }
 
+    /// Get per-phase cost breakdown with cache metrics for the cost dashboard.
+    ///
+    /// Returns (phase, input_tokens, output_tokens, cache_creation, cache_read, cost_cents).
+    pub async fn get_phase_cost_with_cache(
+        &self,
+        days: u32,
+    ) -> Result<Vec<(String, i64, i64, i64, i64, i64)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let since = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let rows = conn
+            .query(
+                r#"SELECT
+                    phase,
+                    COALESCE(SUM(input_tokens), 0)::bigint as input_tokens,
+                    COALESCE(SUM(output_tokens), 0)::bigint as output_tokens,
+                    COALESCE(SUM(cache_creation_tokens), 0)::bigint as cache_creation,
+                    COALESCE(SUM(cache_read_tokens), 0)::bigint as cache_read,
+                    COALESCE(SUM(cost_cents), 0)::bigint as cost_cents
+                FROM phase_token_usage
+                WHERE created_at > $1::timestamptz
+                GROUP BY phase
+                ORDER BY cost_cents DESC"#,
+                &[&since],
+            )
+            .await
+            .map_err(|e| format!("PG query phase cost with cache: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, i64>(1),
+                    r.get::<_, i64>(2),
+                    r.get::<_, i64>(3),
+                    r.get::<_, i64>(4),
+                    r.get::<_, i64>(5),
+                )
+            })
+            .collect())
+    }
+
     /// Get cost breakdown by target page for the last N days.
     pub async fn get_cost_by_target_page(&self, days: u32) -> Result<Vec<TargetPageCostRow>, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
@@ -206,5 +252,49 @@ impl PgDb {
                 call_count: r.call_count as u64,
             })
             .collect())
+    }
+
+    /// Get cache hit rate and estimated savings for a specific model since a given date.
+    ///
+    /// Returns `(avg_cache_hit_rate, avg_cache_savings_usd)`.
+    pub async fn get_model_cache_stats(
+        &self,
+        model_id: &str,
+        period_start: &str,
+    ) -> Result<(f64, f64), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT
+                    COALESCE(SUM(cache_read_tokens), 0)::float8 as total_cache_read,
+                    COALESCE(SUM(cache_creation_tokens), 0)::float8 as total_cache_create,
+                    COALESCE(SUM(input_tokens), 0)::float8 as total_input
+                FROM phase_token_usage
+                WHERE model_used = $1 AND created_at >= $2::timestamptz",
+                &[&model_id, &period_start],
+            )
+            .await
+            .map_err(|e| format!("Failed to query model cache stats: {}", e))?;
+
+        let (cache_read, cache_create, input): (f64, f64, f64) = match row {
+            Some(r) => (r.get(0), r.get(1), r.get(2)),
+            None => return Ok((0.0, 0.0)),
+        };
+
+        let total = cache_read + cache_create + input;
+        let hit_rate = if total > 0.0 {
+            cache_read / total
+        } else {
+            0.0
+        };
+        // Savings estimate: cache reads avoid ~90% of input cost.
+        // Using ~$3/MTok Sonnet baseline => cache read saves $2.70/MTok.
+        let savings = cache_read * 2.70 / 1_000_000.0;
+
+        Ok((hit_rate, savings))
     }
 }

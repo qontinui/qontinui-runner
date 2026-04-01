@@ -463,7 +463,6 @@ async fn run_campaign_loop(
                     continue;
                 }
                 if let Ok(traces) = crate::database::pipeline_traces::get_traces_for_task_run(
-                    &db,
                     &trial.task_run_id,
                 ) {
                     all_traces.extend(traces);
@@ -850,6 +849,7 @@ fn record_learning(
         has_ui_bridge: false,
         total_tokens: None,
         total_cost_usd: None,
+        model_used: None,
     };
 
     if let Err(e) =

@@ -1,17 +1,22 @@
 --- Phase token usage CRUD operations.
 
---: PhaseTokenUsageRow(stage_index?, iteration?, model_used?, provider_used?, duration_ms?)
+--: PhaseTokenUsageRow(stage_index?, iteration?, model_used?, provider_used?, duration_ms?, cache_creation_tokens?, cache_read_tokens?)
 
---! create_phase_token_usage (stage_index?, iteration?, model_used?, provider_used?, duration_ms?, target_app?, target_page_url?)
+--! create_phase_token_usage (stage_index?, iteration?, model_used?, provider_used?, duration_ms?, cache_creation_tokens?, cache_read_tokens?, target_app?, target_page_url?)
 INSERT INTO phase_token_usage
     (task_run_id, phase, stage_index, iteration, model_used, provider_used,
-     input_tokens, output_tokens, cost_cents, duration_ms, target_app, target_page_url)
+     input_tokens, output_tokens, cost_cents, duration_ms,
+     cache_creation_tokens, cache_read_tokens,
+     target_app, target_page_url)
 VALUES (:task_run_id, :phase, :stage_index, :iteration, :model_used, :provider_used,
-        :input_tokens, :output_tokens, :cost_cents, :duration_ms, :target_app, :target_page_url);
+        :input_tokens, :output_tokens, :cost_cents, :duration_ms,
+        :cache_creation_tokens, :cache_read_tokens,
+        :target_app, :target_page_url);
 
 --! get_phase_token_usage : PhaseTokenUsageRow
 SELECT phase, stage_index, iteration, model_used, provider_used,
-       input_tokens, output_tokens, cost_cents, duration_ms, created_at
+       input_tokens, output_tokens, cost_cents, duration_ms,
+       cache_creation_tokens, cache_read_tokens, created_at
 FROM phase_token_usage
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;

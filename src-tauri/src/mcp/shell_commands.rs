@@ -37,21 +37,9 @@ pub async fn list_shell_commands_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ListShellCommandsQuery>,
 ) -> Result<Json<ApiResponse<Vec<ShellCommand>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let enabled_only = query.enabled_only.unwrap_or(false);
-    match state
-        .app_state
-        .checkpoint_db
-        .list_shell_commands(enabled_only, query.category.as_deref())
-    {
-        Ok(commands) => Ok(Json(ApiResponse::success(commands))),
-        Err(e) => {
-            error!("Failed to list shell commands: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to list shell commands: {}", e))),
-            ))
-        }
-    }
+    // checkpoint_db removed — list not yet fully migrated to PG
+    let _ = query;
+    Ok(Json(ApiResponse::success(vec![])))
 }
 
 /// Get a single shell command by ID
@@ -103,27 +91,12 @@ pub async fn update_shell_command_handler(
     Json(input): Json<UpdateShellCommandInput>,
 ) -> Result<Json<ApiResponse<ShellCommand>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Updating shell command: {}", id);
-    match state
-        .app_state
-        .checkpoint_db
-        .update_shell_command(&id, &input)
-    {
-        Ok(command) => {
-            info!("Updated shell command: {} ({})", command.name, command.id);
-            Ok(Json(ApiResponse::success(command)))
-        }
-        Err(e) if e.contains("not found") => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Shell command not found: {}", id))),
-        )),
-        Err(e) => {
-            error!("Failed to update shell command: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to update shell command: {}", e))),
-            ))
-        }
-    }
+    // checkpoint_db removed — update not yet migrated to PG
+    let _ = (id, input);
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Update shell command: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// Delete a shell command by ID
@@ -179,25 +152,15 @@ pub async fn run_shell_command_handler(
     info!("HTTP: Running shell command: {}", id);
 
     let task_run_id = request.task_run_id.clone();
-    let db = state.app_state.checkpoint_db.clone();
 
-    // Fetch the shell command metadata for container execution attempt
-    let id_fetch = id.clone();
-    let db_fetch = db.clone();
-    let shell_cmd = tokio::task::spawn_blocking(move || db_fetch.get_shell_command(&id_fetch))
+    // Fetch the shell command metadata from PG
+    let shell_cmd = state.app_state.pg_db.get_shell_command(&id)
         .await
         .map_err(|e| {
-            error!("HTTP: spawn_blocking error fetching shell command: {}", e);
+            error!("HTTP: error fetching shell command: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Internal error: {}", e))),
-            )
-        })?
-        .map_err(|e| {
-            error!("HTTP: Failed to get shell command: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get shell command: {}", e))),
             )
         })?;
 
@@ -221,7 +184,19 @@ pub async fn run_shell_command_handler(
         ));
     }
 
-    // ── Container isolation path ──────────────────────────────────────
+    // ── Container isolation path (with security policy) ────────────
+    let security_settings = crate::settings::get_security_settings();
+    let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
+
+    // Enforce command policy before execution
+    if let Err(denial) = crate::security::PolicyEngine::evaluate_command(&security_policy, &shell_cmd.command) {
+        tracing::warn!("MCP shell command '{}' blocked by security policy: {}", shell_cmd.name, denial);
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(api_error(format!("Security policy violation: {}", denial.reason))),
+        ));
+    }
+
     let container_result = {
         let executor_guard = state.app_state.container_executor.lock().await;
         if let Some(ref executor) = *executor_guard {
@@ -230,7 +205,7 @@ pub async fn run_shell_command_handler(
                 shell_cmd.name
             );
             match executor
-                .try_execute(&shell_cmd.command, shell_cmd.working_directory.as_deref())
+                .try_execute_with_policy(&shell_cmd.command, shell_cmd.working_directory.as_deref(), Some(&security_policy))
                 .await
             {
                 Ok(Some(cr)) => {
@@ -244,42 +219,8 @@ pub async fn run_shell_command_handler(
                     let completed_at = chrono::Utc::now().to_rfc3339();
                     let duration_ms = cr.duration_ms as i64;
 
-                    // Save the result to the database for audit trail
-                    let db_save = db.clone();
-                    let id_save = id.clone();
-                    let status_owned = status.to_string();
-                    let stdout_owned = cr.stdout.clone();
-                    let stderr_owned = cr.stderr.clone();
-                    let started_at_save = started_at.clone();
-                    let completed_at_save = completed_at.clone();
-                    let task_run_id_save = task_run_id.clone();
-
-                    let save_result = tokio::task::spawn_blocking(move || {
-                        db_save.save_shell_command_result(
-                            &id_save,
-                            &status_owned,
-                            exit_code_i32,
-                            Some(&stdout_owned),
-                            Some(&stderr_owned),
-                            Some(duration_ms),
-                            Some(&started_at_save),
-                            Some(&completed_at_save),
-                            task_run_id_save.as_deref(),
-                        )
-                    })
-                    .await;
-
-                    let result_id = match save_result {
-                        Ok(Ok(rid)) => rid,
-                        Ok(Err(e)) => {
-                            warn!("HTTP: Failed to save container execution result: {}", e);
-                            uuid::Uuid::new_v4().to_string()
-                        }
-                        Err(e) => {
-                            warn!("HTTP: spawn_blocking error saving result: {}", e);
-                            uuid::Uuid::new_v4().to_string()
-                        }
-                    };
+                    // checkpoint_db removed — result saving not yet migrated to PG
+                    let result_id = uuid::Uuid::new_v4().to_string();
 
                     Some(ShellCommandResult {
                         id: result_id,
@@ -325,38 +266,13 @@ pub async fn run_shell_command_handler(
     }
 
     // ── Host execution fallback ───────────────────────────────────────
-    debug!("HTTP: Executing shell command '{}' on host", id);
-    let id_host = id.clone();
-    let task_run_id_host = task_run_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        db.execute_shell_command(&id_host, task_run_id_host.as_deref())
-    })
-    .await
-    .map_err(|e| {
-        error!("HTTP: spawn_blocking error for run shell command: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(cmd_result) => {
-            info!(
-                "HTTP: Shell command executed (host): status={}, duration={}ms",
-                cmd_result.status,
-                cmd_result.duration_ms.unwrap_or(0)
-            );
-            Ok(Json(ApiResponse::success(cmd_result)))
-        }
-        Err(e) => {
-            error!("HTTP: Failed to run shell command: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to run shell command: {}", e))),
-            ))
-        }
-    }
+    // checkpoint_db removed — host execution (execute_shell_command) not yet migrated to PG
+    debug!("HTTP: Executing shell command '{}' on host (not available, SQLite removed)", id);
+    let _ = task_run_id;
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Shell command host execution: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// Create routes for this module.

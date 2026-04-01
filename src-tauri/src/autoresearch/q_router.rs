@@ -260,8 +260,12 @@ const EPSILON_DECAY_RATE: f64 = 20.0;
 const MIN_VISITS_FOR_ROUTING: u32 = 3;
 
 /// Cost penalty weight applied to total_cost_usd in reward calculation.
-/// reward = composite_agentic_score - COST_PENALTY * total_cost_usd
+/// reward = composite_agentic_score - COST_PENALTY * total_cost_usd + CACHE_SAVINGS_WEIGHT * cache_savings
 const COST_PENALTY: f64 = 0.01;
+
+/// Cache savings bonus weight in reward calculation.
+/// Incentivizes architectures/models that maximize prompt cache reuse.
+const CACHE_SAVINGS_WEIGHT: f64 = 0.005;
 
 /// Q-learning router for workflow architecture selection.
 ///
@@ -379,10 +383,22 @@ impl QRouter {
         entry.clone()
     }
 
-    /// Compute reward from a learning outcome's composite score and cost.
+    /// Compute reward from a learning outcome's composite score, cost, and cache savings.
     pub fn compute_reward(composite_agentic_score: f64, total_cost_usd: Option<f64>) -> f64 {
+        Self::compute_reward_with_cache(composite_agentic_score, total_cost_usd, None)
+    }
+
+    /// Compute reward with optional cache savings bonus.
+    ///
+    /// reward = composite_score - 0.01 * cost + 0.005 * cache_savings, clamped to [0, 1]
+    pub fn compute_reward_with_cache(
+        composite_agentic_score: f64,
+        total_cost_usd: Option<f64>,
+        cache_savings_usd: Option<f64>,
+    ) -> f64 {
         let cost_penalty = total_cost_usd.unwrap_or(0.0) * COST_PENALTY;
-        (composite_agentic_score - cost_penalty).clamp(0.0, 1.0)
+        let cache_bonus = cache_savings_usd.unwrap_or(0.0) * CACHE_SAVINGS_WEIGHT;
+        (composite_agentic_score - cost_penalty + cache_bonus).clamp(0.0, 1.0)
     }
 
     /// Select an architecture using epsilon-greedy policy.
@@ -413,6 +429,8 @@ impl QRouter {
     }
 
     /// Get the greedy (best) architecture for a state.
+    /// Uses min_by with reversed comparison so that on tie the earlier
+    /// (cheaper) architecture wins — same pattern as model_q_router.rs.
     pub fn greedy_architecture(&self, task_state: &TaskState) -> WorkflowArchitecture {
         let architectures = [
             WorkflowArchitecture::Traditional,
@@ -422,10 +440,11 @@ impl QRouter {
 
         architectures
             .iter()
-            .max_by(|a, b| {
+            .min_by(|a, b| {
                 let qa = self.get_q(task_state, a).q_value;
                 let qb = self.get_q(task_state, b).q_value;
-                qa.partial_cmp(&qb).unwrap_or(std::cmp::Ordering::Equal)
+                // Higher Q sorts first; on tie, earlier (cheaper) wins
+                qb.partial_cmp(&qa).unwrap_or(std::cmp::Ordering::Equal)
             })
             .cloned()
             .unwrap_or(WorkflowArchitecture::Traditional)

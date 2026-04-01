@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS phase_token_usage (
     output_tokens BIGINT NOT NULL DEFAULT 0,
     cost_cents BIGINT NOT NULL DEFAULT 0,
     duration_ms BIGINT,
+    cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
     target_app TEXT,
     target_page_url TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -265,12 +267,32 @@ CREATE TABLE IF NOT EXISTS execution_spans (
     iteration INTEGER,              -- Loop iteration number
     workflow_id TEXT,               -- Workflow definition that owns this span
 
+    -- Token usage and cost tracking (v168)
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_cents INTEGER,
+
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_spans_execution ON execution_spans(execution_id);
 CREATE INDEX IF NOT EXISTS idx_spans_trace ON execution_spans(trace_id);
 CREATE INDEX IF NOT EXISTS idx_spans_name ON execution_spans(name);
+
+-- Execution state snapshots (v168)
+CREATE TABLE IF NOT EXISTS execution_state_snapshots (
+    id              BIGSERIAL PRIMARY KEY,
+    execution_id    TEXT NOT NULL,
+    span_id         TEXT NOT NULL DEFAULT '',
+    snapshot_ts     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    state_type      TEXT NOT NULL,
+    summary         TEXT,
+    context_json    TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ess_execution ON execution_state_snapshots(execution_id);
+CREATE INDEX IF NOT EXISTS idx_ess_ts ON execution_state_snapshots(snapshot_ts);
 
 -- Durable Workflow Queue (Inngest-inspired)
 CREATE TABLE IF NOT EXISTS queued_workflows (
@@ -3230,3 +3252,124 @@ CREATE TABLE IF NOT EXISTS iteration_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_iteration_logs_task_run ON iteration_logs(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_iteration_logs_provider ON iteration_logs(provider_used) WHERE provider_used IS NOT NULL;
+
+-- =============================================================================
+-- Online Learning: Performance Drift Detection
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS performance_drift_signals (
+    id              TEXT PRIMARY KEY,
+    detector_type   TEXT NOT NULL,           -- 'adwin' | 'ddm' | 'page_hinkley'
+    metric_name     TEXT NOT NULL,           -- 'composite_score' | 'success_rate' | 'cost_usd' | 'duration_secs'
+    context_key     TEXT NOT NULL DEFAULT '',-- domain:complexity:has_ui (matches Q-Router state)
+    drift_level     TEXT NOT NULL,           -- 'warning' | 'drift'
+    pre_drift_mean  DOUBLE PRECISION,
+    post_drift_mean DOUBLE PRECISION,
+    window_size     BIGINT,
+    acknowledged    BOOLEAN NOT NULL DEFAULT false,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_drift_context ON performance_drift_signals(context_key, metric_name);
+CREATE INDEX IF NOT EXISTS idx_drift_unack ON performance_drift_signals(acknowledged) WHERE acknowledged = false;
+
+CREATE TABLE IF NOT EXISTS drift_detector_state (
+    detector_id     TEXT PRIMARY KEY,        -- 'adwin:composite_score:backend:moderate:no_ui'
+    detector_type   TEXT NOT NULL,
+    state_json      TEXT NOT NULL,           -- serialized detector state
+    last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- =============================================================================
+-- Online Learning: Contextual Bandit Model Routing
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS model_routing_table (
+    context_key     TEXT NOT NULL,
+    model_id        TEXT NOT NULL,
+    q_value         DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    visit_count     INTEGER NOT NULL DEFAULT 0,
+    sum_of_squares  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    last_updated    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (context_key, model_id)
+);
+
+CREATE TABLE IF NOT EXISTS model_routing_overrides (
+    context_key     TEXT PRIMARY KEY,
+    forced_model    TEXT NOT NULL,
+    reason          TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS model_routing_decisions (
+    id              TEXT PRIMARY KEY,
+    task_run_id     TEXT NOT NULL,
+    context_key     TEXT NOT NULL,
+    model_selected  TEXT NOT NULL,
+    source          TEXT NOT NULL,            -- 'bandit' | 'fallback' | 'override'
+    exploration     BOOLEAN NOT NULL DEFAULT false,
+    reward          DOUBLE PRECISION,         -- filled post-run
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_mrd_task_run ON model_routing_decisions(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_mrd_model ON model_routing_decisions(model_selected);
+
+-- =============================================================================
+-- Online Learning: Experience Summaries
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS experience_summaries (
+    id                      TEXT PRIMARY KEY,
+    task_run_id             TEXT NOT NULL,
+    domain                  TEXT NOT NULL,
+    complexity_tier         TEXT NOT NULL,
+    outcome                 TEXT NOT NULL,
+    key_decisions_json      TEXT NOT NULL DEFAULT '[]',
+    failure_points_json     TEXT NOT NULL DEFAULT '[]',
+    effective_patterns_json TEXT NOT NULL DEFAULT '[]',
+    embedding               BYTEA,
+    similarity_cluster      TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_exp_domain ON experience_summaries(domain);
+CREATE INDEX IF NOT EXISTS idx_exp_outcome ON experience_summaries(outcome);
+
+-- =============================================================================
+-- Online Learning: Step Credit Assignments (ADCA)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS step_credit_assignments (
+    id                          TEXT PRIMARY KEY,
+    task_run_id                 TEXT NOT NULL,
+    step_index                  INTEGER NOT NULL,
+    step_type                   TEXT NOT NULL,
+    agent_type                  TEXT,
+    raw_credit                  DOUBLE PRECISION NOT NULL,
+    normalized_credit           DOUBLE PRECISION NOT NULL,
+    temporal_proximity          DOUBLE PRECISION,
+    output_utilization          DOUBLE PRECISION,
+    confidence_delta_signal     DOUBLE PRECISION,
+    downstream_success_signal   DOUBLE PRECISION,
+    cost_efficiency_signal      DOUBLE PRECISION,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sca_task_run ON step_credit_assignments(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_sca_step_type ON step_credit_assignments(step_type);
+
+-- =============================================================================
+-- Online Learning: Evolvable Strategy Bank
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS strategy_bank (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    description         TEXT NOT NULL,
+    applicability_json  TEXT NOT NULL,
+    components_json     TEXT NOT NULL,
+    stats_json          TEXT NOT NULL DEFAULT '{}',
+    provenance_json     TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'candidate',  -- candidate | active | degraded | retired
+    parent_strategy_id  TEXT REFERENCES strategy_bank(id) ON DELETE SET NULL,
+    embedding           BYTEA,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_status ON strategy_bank(status);
+CREATE INDEX IF NOT EXISTS idx_strategy_parent ON strategy_bank(parent_strategy_id);
+
+-- Phase 1A: Add model_used tracking to learning_outcomes
+ALTER TABLE learning_outcomes ADD COLUMN IF NOT EXISTS model_used TEXT;

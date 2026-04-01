@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use std::collections::HashMap;
 
+use crate::ai_provider::cache_aware_builder::StructuredPrompt;
 use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
@@ -1617,7 +1618,7 @@ impl Orchestrator {
             let db = Arc::clone(&self.db);
             let task_desc = base_prompt.to_string();
             let mem_ctx = tokio::runtime::Handle::current().block_on(async {
-                mem.build_context_unified(20, &task_desc, &pg, db).await
+                mem.build_context_unified(20, &task_desc, &pg).await
             });
             if !mem_ctx.trim().is_empty() {
                 info!(
@@ -1662,6 +1663,118 @@ impl Orchestrator {
         }
 
         Ok(prompt)
+    }
+
+    /// Build a structured worker prompt with stable/dynamic block separation.
+    ///
+    /// Returns a `StructuredPrompt` where stable content (orchestrator instructions,
+    /// verification guidance, criteria summary, skills) is separated into cacheable
+    /// system blocks. Dynamic content (iteration context, error monitor, memory) goes
+    /// into dynamic system blocks. The base prompt becomes the user message.
+    pub fn build_structured_worker_prompt(
+        &self,
+        state: &OrchestratorState,
+        base_prompt: &str,
+    ) -> Result<StructuredPrompt, String> {
+        let mut cached_blocks: Vec<String> = Vec::new();
+
+        // Stable block 1: Orchestrator instructions (static constant)
+        cached_blocks.push(WORKER_ORCHESTRATOR_INSTRUCTIONS.to_string());
+
+        // Stable block 2: Verification guidance + criteria summary
+        if let Some(plan) = &state.plan {
+            let mut plan_block = String::new();
+            let verification_guidance = generate_verification_guidance(plan);
+            if !verification_guidance.is_empty() {
+                plan_block.push_str(&verification_guidance);
+            }
+            let criteria_summary = generate_criteria_summary(plan);
+            if !criteria_summary.is_empty() {
+                plan_block.push_str(&criteria_summary);
+            }
+            if !plan_block.is_empty() {
+                cached_blocks.push(plan_block);
+            }
+        }
+
+        // Stable block 3: Procedural skills
+        let skill_context = self.build_skill_context(state);
+        if !skill_context.is_empty() {
+            cached_blocks.push(skill_context);
+        }
+
+        let mut dynamic_blocks: Vec<String> = Vec::new();
+
+        // Dynamic block 1: Initial verification feedback (only iteration 0)
+        if state.iteration == 0 && state.initial_verification_run {
+            if let Some(ref feedback) = state.initial_worker_feedback {
+                dynamic_blocks.push(format!(
+                    "## Initial Verification Results\n\n\
+                     The system ran verification before you started and found the following issues that need to be fixed:\n\n\
+                     {}\n\nPlease address these issues as your primary focus.",
+                    feedback
+                ));
+            } else if let Some(ref results) = state.initial_verification {
+                if results.all_passed {
+                    dynamic_blocks.push(
+                        "## Initial Verification Results\n\n\
+                         The system ran verification before you started and all checks passed.\n\
+                         Review the verification plan criteria and ensure your work maintains these standards."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Dynamic block 2: Cross-iteration context
+        let iteration_context = build_iteration_context_with_compression(
+            &self.knowledge_base,
+            &state.task_run_id,
+            state.iteration,
+            self.config.compression.as_ref(),
+        )?;
+        if !iteration_context.is_empty() {
+            dynamic_blocks.push(iteration_context);
+        }
+
+        // Dynamic block 3: Error monitor context
+        if let Some(error_context) = self.get_error_monitor_context(Some(&state.task_run_id)) {
+            dynamic_blocks.push(error_context);
+        }
+
+        // Dynamic block 4: Unified memory context
+        if let Some(ref pg) = self.pg_db {
+            let mem = super::memory::MemorySystem::new();
+            let pg = Arc::clone(pg);
+            let db = Arc::clone(&self.db);
+            let task_desc = base_prompt.to_string();
+            let mem_ctx = tokio::runtime::Handle::current().block_on(async {
+                mem.build_context_unified(20, &task_desc, &pg).await
+            });
+            if !mem_ctx.trim().is_empty() {
+                dynamic_blocks.push(mem_ctx);
+            }
+        }
+
+        // User message: base prompt + plan context
+        let mut user_message = base_prompt.to_string();
+        if let Some(plan) = &state.plan {
+            user_message = inject_plan_context(&user_message, plan);
+        }
+
+        info!(
+            "Built structured prompt: {} cached blocks (~{} chars), {} dynamic blocks (~{} chars)",
+            cached_blocks.len(),
+            cached_blocks.iter().map(|b| b.len()).sum::<usize>(),
+            dynamic_blocks.len(),
+            dynamic_blocks.iter().map(|b| b.len()).sum::<usize>(),
+        );
+
+        Ok(StructuredPrompt {
+            cached_system_blocks: cached_blocks,
+            dynamic_system_blocks: dynamic_blocks,
+            user_message,
+        })
     }
 
     /// Build context string with approved procedural skills relevant to the current task.

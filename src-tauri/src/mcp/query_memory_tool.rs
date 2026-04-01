@@ -98,7 +98,6 @@ async fn query_handler(
     };
 
     let pg = &state.app_state.pg_db;
-    let db = state.app_state.checkpoint_db.clone();
 
     // Optionally build graph (only if graph source enabled or all sources)
     let want_graph = params.sources.as_ref()
@@ -110,7 +109,7 @@ async fn query_handler(
         None
     };
 
-    match unified_query::query_memory(&params, pg, Some(db), graph.as_deref()).await {
+    match unified_query::query_memory(&params, pg, None, graph.as_deref()).await {
         Ok(results) => {
             let total = results.len();
             Ok(Json(ApiResponse::success(QueryMemoryResponse {

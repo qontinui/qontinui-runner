@@ -14,7 +14,6 @@ use super::llm_judge_metrics::{
     evaluate_answer_relevance, evaluate_content_safety, evaluate_factuality,
     evaluate_hallucination, JudgeInput, JudgeResult,
 };
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 // =============================================================================
@@ -32,7 +31,6 @@ use crate::database::pg::PgDb;
 /// * `recommendation_id` — optional recommendation being validated
 /// * `db` — database handle
 pub fn evaluate_spec(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     spec: &EvalSpec,
     recommendation_id: Option<&str>,
@@ -46,7 +44,6 @@ pub fn evaluate_spec(
         let period_end = chrono::Utc::now().to_rfc3339();
 
         crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db,
             agent,
             &period_start,
             &period_end,
@@ -70,7 +67,7 @@ pub fn evaluate_spec(
 
     // If recommendation is applied, get post-apply metrics
     let candidate_agg = if let Some(rec_id) = recommendation_id {
-        get_post_apply_metrics(db, pg_db, rec_id, spec.target_agent.as_deref())?
+        get_post_apply_metrics(pg_db, rec_id, spec.target_agent.as_deref())?
     } else {
         None
     };
@@ -154,11 +151,11 @@ pub fn evaluate_spec(
     };
 
     // Persist
-    super::eval_spec::save_eval_result(db, pg_db, &result)?;
+    super::eval_spec::save_eval_result(pg_db, &result)?;
 
     // If tied to a recommendation, attach the result
     if let Some(rec_id) = recommendation_id {
-        super::eval_spec::attach_eval_result(db, pg_db, rec_id, &result_id, status)?;
+        super::eval_spec::attach_eval_result(pg_db, rec_id, &result_id, status)?;
     }
 
     info!(
@@ -172,7 +169,6 @@ pub fn evaluate_spec(
 /// Validate a specific recommendation by running its associated eval spec
 /// (or generating a default one).
 pub fn validate_recommendation(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<EvalResult, String> {
@@ -189,26 +185,25 @@ pub fn validate_recommendation(
     // Find or generate an eval spec
     let spec = if let Some(ref agent) = target_agent {
         // Look for an existing spec for this agent
-        let specs = super::eval_spec::list_eval_specs(db, pg_db, Some(agent))?;
+        let specs = super::eval_spec::list_eval_specs(pg_db, Some(agent))?;
         if let Some(spec) = specs.into_iter().next() {
             spec
         } else {
             // Auto-generate a default spec
-            let spec = super::eval_spec::generate_default_spec(db, agent)?;
-            super::eval_spec::save_eval_spec(db, pg_db, &spec)?;
+            let spec = super::eval_spec::generate_default_spec(agent)?;
+            super::eval_spec::save_eval_spec(pg_db, &spec)?;
             spec
         }
     } else {
         return Err("Cannot validate recommendation without target_agent".to_string());
     };
 
-    let result = evaluate_spec(db, pg_db, &spec, Some(recommendation_id))?;
+    let result = evaluate_spec(pg_db, &spec, Some(recommendation_id))?;
 
     // For prompt_rewrite recommendations, also run robustness tests
     if rec_type == "prompt_rewrite" {
         if let Some(ref agent) = target_agent {
             match super::robustness::run_robustness_test(
-                db,
                 pg_db,
                 agent,
                 None, // no specific prompt variant
@@ -242,7 +237,6 @@ pub fn validate_recommendation(
 
 /// Get post-apply metrics for a recommendation (7-day window after applied_at).
 fn get_post_apply_metrics(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     target_agent: Option<&str>,
@@ -268,7 +262,6 @@ fn get_post_apply_metrics(
             .map_err(|e| format!("Invalid applied_at: {}", e))?;
 
         let agg = crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            db,
             agent,
             &applied_at,
             &after_end,
@@ -505,11 +498,10 @@ pub fn evaluate_test_case_with_io(
 /// Validate a recommendation with PG dual-write (fire-and-forget).
 #[allow(dead_code)]
 pub fn validate_recommendation_with_pg(
-    db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     recommendation_id: &str,
 ) -> Result<EvalResult, String> {
-    validate_recommendation(db, pg_db, recommendation_id)
+    validate_recommendation(pg_db, recommendation_id)
 }
 
 #[cfg(test)]

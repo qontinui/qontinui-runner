@@ -70,6 +70,23 @@ impl PgDb {
         Ok(result_id)
     }
 
+    /// Update the model_used field for a learning outcome.
+    /// Called after recording to backfill model tracking data.
+    pub async fn update_learning_outcome_model(
+        &self,
+        task_id: &str,
+        model_used: &str,
+    ) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE learning_outcomes SET model_used = $2 WHERE task_id = $1 AND model_used IS NULL",
+            &[&task_id, &model_used],
+        )
+        .await
+        .map_err(|e| format!("PG update_learning_outcome_model: {}", e))?;
+        Ok(())
+    }
+
     /// Get learning outcomes for analysis.
     pub async fn get_learning_outcomes(
         &self,

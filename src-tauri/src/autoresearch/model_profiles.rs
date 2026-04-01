@@ -32,6 +32,10 @@ pub struct ModelProfile {
     pub trial_count: u32,
     /// When this profile was last computed.
     pub last_updated: String,
+    /// Average prompt cache hit rate (0.0-1.0) for this model.
+    pub avg_cache_hit_rate: f64,
+    /// Average USD saved per run through prompt caching.
+    pub avg_cache_savings_usd: f64,
     /// Performance breakdown by task type (empty until task categorization data exists).
     pub performance_by_task_type: Vec<TaskTypePerformance>,
 }
@@ -86,8 +90,22 @@ pub async fn build_model_profile(
     } else {
         f64::INFINITY
     };
+    // Populate cache metrics from phase_token_usage cache columns.
+    let (avg_cache_hit_rate, avg_cache_savings_usd) = pg
+        .get_model_cache_stats(model_id, &period_start)
+        .await
+        .unwrap_or((0.0, 0.0));
+
+    // Cost efficiency factors in cache reuse: models that achieve high cache hit
+    // rates get a boost because effective cost is lower than nominal cost.
+    // cost_efficiency = pass_rate / (avg_cost * (1.0 - avg_cache_hit_rate * 0.5))
     let cost_efficiency = if avg_cost > 0.0 {
-        pass_rate / avg_cost
+        let effective_cost = avg_cost * (1.0 - avg_cache_hit_rate * 0.5);
+        if effective_cost > 0.0 {
+            pass_rate / effective_cost
+        } else {
+            pass_rate / avg_cost
+        }
     } else {
         0.0
     };
@@ -102,6 +120,8 @@ pub async fn build_model_profile(
         cost_efficiency_score: cost_efficiency,
         trial_count: run_count as u32,
         last_updated: chrono::Utc::now().to_rfc3339(),
+        avg_cache_hit_rate,
+        avg_cache_savings_usd,
         performance_by_task_type: Vec::new(),
     }))
 }

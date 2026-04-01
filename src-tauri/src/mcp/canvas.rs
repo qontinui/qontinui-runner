@@ -236,17 +236,6 @@ async fn create_or_update_panel(
         canvas.panels.insert(panel.panel_id.clone(), panel.clone());
     }
 
-    // Persist to SQLite
-    let db = state.app_state.checkpoint_db.clone();
-    let panel_for_db = panel.clone();
-    if let Err(e) =
-        tokio::task::spawn_blocking(move || db.insert_or_update_canvas_panel(&panel_for_db))
-            .await
-            .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
-    {
-        warn!("Failed to persist canvas panel to SQLite: {}", e);
-    }
-
     // Emit canvas-update event
     let event = AppEvent::CanvasUpdate {
         action: action.to_string(),
@@ -299,16 +288,6 @@ async fn delete_panel(
         canvas.panels.remove(&panel_id);
     }
 
-    // Delete from SQLite
-    let db = state.app_state.checkpoint_db.clone();
-    let pid = panel_id.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || db.delete_canvas_panel(&pid))
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
-    {
-        warn!("Failed to delete canvas panel from SQLite: {}", e);
-    }
-
     // Emit canvas-update event
     let event = AppEvent::CanvasUpdate {
         action: "delete".to_string(),
@@ -335,19 +314,6 @@ async fn clear_panels(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<Pa
         let mut canvas = state.app_state.canvas_state.write().await;
         task_run_id = canvas.task_run_id.clone();
         canvas.clear();
-    }
-
-    // Clear from SQLite if we know the task run
-    if let Some(ref trid) = task_run_id {
-        let db = state.app_state.checkpoint_db.clone();
-        let trid = trid.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || db.clear_canvas_panels_for_task_run(&trid))
-                .await
-                .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
-        {
-            warn!("Failed to clear canvas panels from SQLite: {}", e);
-        }
     }
 
     // Emit canvas-update event
@@ -397,17 +363,6 @@ async fn patch_panel_data(
         updated_panel = panel.clone();
     }
 
-    // Persist to SQLite
-    let db = state.app_state.checkpoint_db.clone();
-    let panel_for_db = updated_panel.clone();
-    if let Err(e) =
-        tokio::task::spawn_blocking(move || db.insert_or_update_canvas_panel(&panel_for_db))
-            .await
-            .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
-    {
-        warn!("Failed to persist patched canvas panel to SQLite: {}", e);
-    }
-
     // Emit canvas-update event
     let event = AppEvent::CanvasUpdate {
         action: "update".to_string(),
@@ -425,26 +380,13 @@ async fn patch_panel_data(
     }))
 }
 
-/// Get historical panels for a completed task run (from SQLite).
+/// Get historical panels for a completed task run.
 async fn get_historical_panels(
-    State(state): State<Arc<ApiState>>,
-    Path(task_run_id): Path<String>,
+    State(_state): State<Arc<ApiState>>,
+    Path(_task_run_id): Path<String>,
 ) -> Json<ApiResponse<Vec<StoredPanel>>> {
-    let db = state.app_state.checkpoint_db.clone();
-    let trid = task_run_id.clone();
-    match tokio::task::spawn_blocking(move || db.get_canvas_panels_for_task_run(&trid))
-        .await
-        .unwrap_or_else(|e| Err(format!("spawn_blocking error: {}", e)))
-    {
-        Ok(panels) => Json(ApiResponse::success(panels)),
-        Err(e) => {
-            warn!("Failed to get historical canvas panels: {}", e);
-            Json(ApiResponse::error(format!(
-                "Failed to get panels for task run {}: {}",
-                task_run_id, e
-            )))
-        }
-    }
+    // SQLite checkpoint_db removed — historical panels not yet migrated to PG
+    Json(ApiResponse::success(vec![]))
 }
 
 /// Define routes for the canvas module.

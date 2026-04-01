@@ -5,7 +5,7 @@
 //! - Getting database statistics
 //! - Running EXPLAIN QUERY PLAN for debugging
 
-use crate::database::{DatabaseOptimizeResult, DatabaseStats};
+use crate::database::DatabaseStats;
 use std::sync::Arc;
 use tauri::State;
 use tracing::info;
@@ -35,26 +35,14 @@ pub fn optimize_database(
         run_integrity_check.unwrap_or(false)
     );
 
-    let result: DatabaseOptimizeResult = state
-        .checkpoint_db
-        .optimize_database(run_integrity_check.unwrap_or(false))?;
-
-    let message = format!(
-        "Database optimized in {}ms. Space reclaimed: {} bytes ({:.2} MB)",
-        result.duration_ms,
-        result.space_reclaimed_bytes,
-        result.space_reclaimed_bytes as f64 / (1024.0 * 1024.0)
-    );
-
-    info!("{}", message);
+    // checkpoint_db removed — SQLite optimization is no longer applicable.
+    // PG databases are maintained via standard PostgreSQL VACUUM/ANALYZE.
+    info!("optimize_database called — no-op after checkpoint_db removal");
 
     Ok(CommandResponse {
         success: true,
-        message: Some(message),
-        data: Some(
-            serde_json::to_value(&result)
-                .map_err(|e| format!("Failed to serialize optimization result: {}", e))?,
-        ),
+        message: Some("No-op: SQLite checkpoint_db has been removed. Use PostgreSQL maintenance tools.".to_string()),
+        data: None,
     })
 }
 

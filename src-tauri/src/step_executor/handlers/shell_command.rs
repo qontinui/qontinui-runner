@@ -117,6 +117,22 @@ impl StepHandler for ShellCommandHandler {
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
 
+        // Enforce security policy: evaluate command against action policy
+        if let Err(denial) = crate::security::PolicyEngine::evaluate_command(
+            &context.security_policy,
+            &command,
+        ) {
+            warn!(
+                "Shell command '{}' blocked by security policy: {}",
+                step_name, denial
+            );
+            context.audit_logger.log_denial(&denial, context.task_run_id.as_deref(), Some(step_name));
+            return StepHandlerResult::failure(format!(
+                "Security policy violation: {}",
+                denial.reason
+            ));
+        }
+
         // Resolve working directory using scoped policy from context.
         // This is done here (in execute) where HandlerContext is available,
         // before passing to run_command which is a static helper without context.
@@ -136,6 +152,26 @@ impl StepHandler for ShellCommandHandler {
             }
             None => None,
         };
+
+        // Enforce security policy: evaluate filesystem access for working directory
+        if let Some(ref wd) = working_directory {
+            if let Err(denial) = crate::security::PolicyEngine::evaluate_filesystem(
+                &context.security_policy,
+                wd,
+                true, // shell commands may write to the working directory
+            ) {
+                warn!(
+                    "Shell command '{}' working directory blocked by security policy: {}",
+                    step_name, denial
+                );
+                context.audit_logger.log_denial(&denial, context.task_run_id.as_deref(), Some(step_name));
+                return StepHandlerResult::failure(format!(
+                    "Security policy violation: {}",
+                    denial.reason
+                ));
+            }
+        }
+
         let timeout_secs = step.timeout_seconds;
 
         // Detect shell type: PowerShell > bash > cmd (on Windows)

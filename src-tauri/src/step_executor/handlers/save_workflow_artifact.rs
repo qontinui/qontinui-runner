@@ -91,8 +91,9 @@ impl StepHandler for SaveWorkflowArtifactHandler {
         // Save to database
         let workflow = match context
             .app_state
-            .checkpoint_db
+            .pg_db
             .create_unified_workflow(&request)
+            .await
         {
             Ok(wf) => wf,
             Err(e) => {
@@ -115,14 +116,7 @@ impl StepHandler for SaveWorkflowArtifactHandler {
                 "generated_workflow_id": workflow.id,
                 "generated_workflow_name": workflow.name,
             });
-            if let Err(e) = context
-                .app_state
-                .checkpoint_db
-                .update_task_run_result_data(task_run_id, &result_data.to_string())
-            {
-                tracing::warn!("Failed to update task run result_data: {}", e);
-                // Non-fatal: the workflow was saved successfully
-            }
+            // Task run result_data persistence removed — all persistence now via PgDb.
         }
 
         // Capture PipelineArtifact if enabled
@@ -185,13 +179,20 @@ impl SaveWorkflowArtifactHandler {
         };
 
         // Load the meta-workflow definition by name
-        let workflow = match context
-            .app_state
-            .checkpoint_db
-            .get_unified_workflow_by_name(&workflow_name)
+        let workflow: crate::unified_workflows::UnifiedWorkflow = match tokio::runtime::Handle::try_current()
+            .ok()
+            .and_then(|h| {
+                let pg = context.app_state.pg_db.clone();
+                let name = workflow_name.clone();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    h.block_on(async move { pg.get_unified_workflow_by_name(&name).await })
+                })).ok()
+            })
+            .and_then(|r| r.ok())
+            .flatten()
         {
-            Ok(Some(wf)) => wf,
-            _ => return,
+            Some(wf) => wf,
+            None => return,
         };
 
         // Extract prompts from setup steps by name
@@ -295,8 +296,9 @@ impl SaveWorkflowArtifactHandler {
         // Save to database
         if let Err(e) = context
             .app_state
-            .checkpoint_db
-            .save_pipeline_artifact(&artifact)
+            .pg_db
+            .save_generation_artifact(&artifact)
+            .await
         {
             tracing::warn!("Failed to save PipelineArtifact: {}", e);
         } else {

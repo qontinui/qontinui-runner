@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 use crate::step_event_builder::StepEventBuilder;
 use crate::step_metadata::{StepDetails, StepMetadata};
 use crate::unified_workflow_executor::get_parent_task_id;
@@ -55,7 +54,6 @@ pub struct StepEventLogger {
     /// Handle to the execution tracker
     tracker: TrackerHandle,
     /// Database for persisting events
-    checkpoint_db: Arc<CheckpointDb>,
     /// PostgreSQL database (PG-primary, SQLite fallback)
     pg_db: Arc<PgDb>,
     /// Workflow name for event context
@@ -66,7 +64,6 @@ impl std::fmt::Debug for StepEventLogger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StepEventLogger")
             .field("tracker", &self.tracker)
-            .field("checkpoint_db", &"<CheckpointDb>")
             .field("pg_db", &"<PgDb>")
             .field("workflow_name", &self.workflow_name)
             .finish()
@@ -80,7 +77,6 @@ impl StepEventLogger {
     /// the execution_id is automatically remapped to the parent task ID because
     /// only parent IDs exist in task_runs (required by foreign key constraint).
     pub fn new(
-        checkpoint_db: Arc<CheckpointDb>,
         pg_db: Arc<PgDb>,
         execution_id: impl Into<String>,
         workflow_name: impl Into<String>,
@@ -91,7 +87,6 @@ impl StepEventLogger {
 
         Self {
             tracker: TrackerHandle::new(parent_id),
-            checkpoint_db,
             pg_db,
             workflow_name: workflow_name.into(),
         }
@@ -106,13 +101,8 @@ impl StepEventLogger {
     /// For full logging support, use the direct run_* methods with a
     /// proper StepEventLogger instance.
     pub fn noop(pg_db: Arc<PgDb>) -> Self {
-        // Use a minimal in-memory database that won't persist anything
-        // This is a workaround - events logged to this logger are silently discarded
-        // because we use an in-memory database that's not shared.
-        let db = CheckpointDb::new_in_memory().expect("Failed to create in-memory db");
         Self {
             tracker: TrackerHandle::new("noop"),
-            checkpoint_db: Arc::new(db),
             pg_db,
             workflow_name: String::new(),
         }

@@ -56,8 +56,6 @@ impl StdioHandle {
 pub struct McpClientManager {
     /// Active connections (server_id -> connection state)
     connections: RwLock<HashMap<String, McpConnection>>,
-    /// Database for loading server configs
-    db: Arc<CheckpointDb>,
 }
 
 /// Connection state for an MCP server
@@ -74,21 +72,25 @@ struct McpConnection {
 
 impl McpClientManager {
     /// Create a new MCP client manager
-    pub fn new(db: Arc<CheckpointDb>) -> Self {
+    pub fn new() -> Self {
         Self {
             connections: RwLock::new(HashMap::new()),
-            db,
         }
+    }
+
+    /// Get the database handle.
+    fn db(&self) -> Arc<CheckpointDb> {
+        CheckpointDb::global()
     }
 
     /// Get all configured MCP servers
     pub async fn list_servers(&self) -> Result<Vec<McpServerConfig>, String> {
-        self.db.list_mcp_servers()
+        self.db().list_mcp_servers()
     }
 
     /// Get a specific MCP server by ID
     pub async fn get_server(&self, server_id: &str) -> Result<Option<McpServerConfig>, String> {
-        self.db.get_mcp_server(server_id)
+        self.db().get_mcp_server(server_id)
     }
 
     /// Create a new MCP server configuration
@@ -96,7 +98,7 @@ impl McpClientManager {
         &self,
         input: CreateMcpServerInput,
     ) -> Result<McpServerConfig, String> {
-        self.db.create_mcp_server(input)
+        self.db().create_mcp_server(input)
     }
 
     /// Update an MCP server configuration
@@ -108,7 +110,7 @@ impl McpClientManager {
         // Disconnect if currently connected (kills stdio process if any)
         self.disconnect(server_id).await?;
 
-        self.db.update_mcp_server(server_id, input)
+        self.db().update_mcp_server(server_id, input)
     }
 
     /// Delete an MCP server configuration
@@ -116,13 +118,13 @@ impl McpClientManager {
         // Disconnect if currently connected (kills stdio process if any)
         self.disconnect(server_id).await?;
 
-        self.db.delete_mcp_server(server_id)
+        self.db().delete_mcp_server(server_id)
     }
 
     /// Get the status of all servers
     pub async fn get_all_status(&self) -> Vec<McpServerStatus> {
         let connections = self.connections.read().await;
-        let servers = self.db.list_mcp_servers().unwrap_or_default();
+        let servers = self.db().list_mcp_servers().unwrap_or_default();
 
         servers
             .into_iter()
@@ -157,7 +159,7 @@ impl McpClientManager {
     /// Get the status of a specific server
     pub async fn get_server_status(&self, server_id: &str) -> Result<McpServerStatus, String> {
         let config = self
-            .db
+            .db()
             .get_mcp_server(server_id)?
             .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
 
@@ -191,7 +193,7 @@ impl McpClientManager {
     /// Connect to an MCP server
     pub async fn connect(&self, server_id: &str) -> Result<Vec<McpToolInfo>, String> {
         let config = self
-            .db
+            .db()
             .get_mcp_server(server_id)?
             .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
 
@@ -220,7 +222,7 @@ impl McpClientManager {
                 // Cache tools in database
                 if let Ok(tools_json) = serde_json::to_string(&tools) {
                     let _ = self
-                        .db
+                        .db()
                         .update_mcp_server_tools_cache(server_id, &tools_json, &now);
                 }
 
@@ -907,7 +909,7 @@ impl McpClientManager {
 
     /// Start all servers marked for auto-start
     pub async fn start_auto_start_servers(&self) {
-        match self.db.list_mcp_servers() {
+        match self.db().list_mcp_servers() {
             Ok(servers) => {
                 for server in servers {
                     if server.enabled && server.auto_start {

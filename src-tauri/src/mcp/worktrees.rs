@@ -242,8 +242,9 @@ pub async fn compare_worktrees_handler(
         let result_summary = if let Some(ref task_run_id) = branch_info.task_run_id {
             state
                 .app_state
-                .checkpoint_db
+                .pg_db
                 .get_task_run(task_run_id)
+                .await
                 .ok()
                 .flatten()
                 .map(|run| {

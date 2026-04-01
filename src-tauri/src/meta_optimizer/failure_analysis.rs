@@ -4,14 +4,14 @@
 //! a comprehensive view of what's going wrong: abort reasons, verification failures,
 //! finding distributions, fix effectiveness, generation quality, and recurring issues.
 
+#[allow(unused_imports)]
+use rusqlite::params;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use super::types::WorkflowCategory;
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
-use rusqlite::params;
 use tracing::debug;
 
 // ── Data Structures ──────────────────────────────────────────────────────
@@ -101,7 +101,6 @@ pub struct RecurringIssue {
 // ── Public API ───────────────────────────────────────────────────────────
 
 pub fn get_failure_analysis(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     days: u32,
     category: WorkflowCategory,
@@ -114,9 +113,8 @@ pub fn get_failure_analysis(
     })?;
 
     analysis.period_days = days;
-    analysis.agentic_metric_summary = db
-        .get_agentic_metric_aggregates(days as i64)
-        .unwrap_or_default();
+    // agentic_metric_summary: SQLite method removed, use default
+    analysis.agentic_metric_summary = Default::default();
 
     Ok(analysis)
 }
@@ -125,12 +123,11 @@ pub fn get_failure_analysis(
 
 /// Get failure analysis with PG (now primary).
 pub fn get_failure_analysis_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     days: u32,
     category: WorkflowCategory,
 ) -> Result<FailureAnalysis, String> {
-    get_failure_analysis(db, pg_db, days, category)
+    get_failure_analysis(pg_db, days, category)
 }
 
 // ── Private Query Functions ──────────────────────────────────────────────

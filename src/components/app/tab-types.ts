@@ -68,6 +68,7 @@ export type MainTabId =
   | "settings-backup"
   | "settings-instances"
   | "settings-debug"
+  | "settings-security"
   | "settings-updates"
   | "orchestration-loop"
   | "image-quality-tests"
@@ -157,6 +158,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-backup",
   "settings-instances",
   "settings-debug",
+  "settings-security",
   "settings-updates",
   "orchestration-loop",
   "image-quality-tests",

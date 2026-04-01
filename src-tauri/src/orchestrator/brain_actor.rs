@@ -68,6 +68,23 @@ impl Default for BrainActorConfig {
     }
 }
 
+impl BrainActorConfig {
+    /// Create a config with adaptive settings based on historical cache efficiency.
+    ///
+    /// If cache_hit_rate > 0.8, increase brain_cache_ttl to reduce Brain invocations.
+    /// If actor pass_rate with Simple tier >= pass_rate with Medium tier, keep Simple.
+    pub fn with_adaptive_cache_ttl(mut self, cache_hit_rate: f64) -> Self {
+        if cache_hit_rate > 0.8 {
+            // High cache hit rate means Brain output is reusable longer
+            self.brain_cache_ttl_iterations = 3;
+        } else if cache_hit_rate > 0.5 {
+            self.brain_cache_ttl_iterations = 2;
+        }
+        // Default remains 1 for low or no cache data
+        self
+    }
+}
+
 // =============================================================================
 // Brain Output
 // =============================================================================
@@ -269,6 +286,27 @@ impl BrainActorOrchestrator {
             .map(|(k, v)| format!("- **{}**: {}", k, v))
             .collect();
         format!("## Stored Records\n{}", entries.join("\n"))
+    }
+
+    /// Update the cache TTL based on observed cache efficiency.
+    /// Called after each iteration when cache metrics are available.
+    pub fn adapt_cache_ttl(&mut self, cache_hit_rate: f64) {
+        let new_ttl = if cache_hit_rate > 0.8 {
+            3
+        } else if cache_hit_rate > 0.5 {
+            2
+        } else {
+            1
+        };
+        if new_ttl != self.config.brain_cache_ttl_iterations {
+            info!(
+                "Adaptive Brain cache TTL: {} → {} (cache hit rate: {:.1}%)",
+                self.config.brain_cache_ttl_iterations,
+                new_ttl,
+                cache_hit_rate * 100.0,
+            );
+            self.config.brain_cache_ttl_iterations = new_ttl;
+        }
     }
 
     /// Whether Brain/Actor mode is enabled.

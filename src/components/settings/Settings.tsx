@@ -27,6 +27,7 @@ import { RunnerInstancesSettings } from "./RunnerInstancesSettings";
 import { NotificationSettings } from "./NotificationSettings";
 import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
+import { SecuritySettings } from "./SecuritySettings";
 import type { Project, ConnectionInfo } from "../../types/auth";
 
 interface WebSocketState {
@@ -68,6 +69,7 @@ type SettingsTab =
   | "instances"
   | "otel"
   | "containers"
+  | "security"
   | "advanced"
   | "updates";
 
@@ -91,6 +93,7 @@ const VALID_TABS = [
   "instances",
   "otel",
   "containers",
+  "security",
   "advanced",
   "updates",
 ] as const;
@@ -210,6 +213,8 @@ export function Settings({
         return <OtelSettings onLog={onLog} />;
       case "containers":
         return <ContainerSettings onLog={onLog} />;
+      case "security":
+        return <SecuritySettings onLog={onLog} />;
       case "advanced":
         return <AdvancedSettings onLog={onLog} onDebugModeChange={onDebugModeChange} />;
       case "updates":

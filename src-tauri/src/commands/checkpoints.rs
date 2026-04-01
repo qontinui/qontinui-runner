@@ -62,9 +62,9 @@ pub async fn checkpoint_status(
     workflow_name: String,
     completion_value: u32,
 ) -> Result<Option<(bool, u32)>, String> {
-    app_state
-        .checkpoint_db
-        .check_checkpoint_status(&workflow_name, completion_value)
+    // checkpoint_db removed — checkpoint status was SQLite-only, returns None
+    let _ = (&workflow_name, completion_value);
+    Ok(None)
 }
 
 /// Get session/checkpoint history.
@@ -74,10 +74,9 @@ pub async fn checkpoint_history(
     workflow_name: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<SessionEvent>, String> {
-    let limit = limit.unwrap_or(50);
-    app_state
-        .checkpoint_db
-        .get_session_history(workflow_name.as_deref(), limit)
+    let _limit = limit.unwrap_or(50);
+    // checkpoint_db removed — session history was SQLite-only, returns empty
+    Ok(Vec::new())
 }
 
 /// Create a new session record.

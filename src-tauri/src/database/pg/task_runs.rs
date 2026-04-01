@@ -1136,4 +1136,229 @@ impl PgDb {
             .map_err(|e| format!("PG get_source_workflow_name_for_task: {}", e))?;
         Ok(row.map(|r| r.get(0)))
     }
+
+    /// Reopen a completed/failed task run for additional iterations.
+    pub async fn reopen_task_run(&self, id: &str, additional_sessions: u32) -> Result<TaskRun, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let add_i32 = additional_sessions as i32;
+        conn.execute(
+            r#"UPDATE task_runs SET
+                status = 'running',
+                max_sessions = COALESCE(max_sessions, 0) + $2,
+                error_message = NULL,
+                updated_at = NOW()
+               WHERE id = $1"#,
+            &[&id, &add_i32],
+        ).await.map_err(|e| format!("PG reopen_task_run: {}", e))?;
+
+        self.get_task_run(id).await?
+            .ok_or_else(|| format!("Task run not found after reopen: {}", id))
+    }
+
+    /// Get child task runs for a parent task run.
+    pub async fn get_child_task_runs(&self, parent_id: &str) -> Result<Vec<TaskRun>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn.query(
+            "SELECT id FROM task_runs WHERE parent_task_run_id = $1 ORDER BY created_at ASC",
+            &[&parent_id],
+        ).await.map_err(|e| format!("PG get_child_task_runs: {}", e))?;
+
+        let mut results = Vec::new();
+        for row in &rows {
+            let child_id: String = row.get(0);
+            if let Some(tr) = self.get_task_run(&child_id).await? {
+                results.push(tr);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Get result_data for a task run.
+    pub async fn get_task_run_result_data(&self, id: &str) -> Result<Option<String>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT result_data FROM task_runs WHERE id = $1",
+            &[&id],
+        ).await.map_err(|e| format!("PG get_task_run_result_data: {}", e))?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    /// Get task output tail (last N characters).
+    pub async fn get_task_output_tail(&self, id: &str, tail_chars: usize) -> Result<String, String> {
+        let output = self.get_task_output(id).await?;
+        if output.len() <= tail_chars {
+            Ok(output)
+        } else {
+            Ok(output[output.len() - tail_chars..].to_string())
+        }
+    }
+
+    /// Get the latest mobile state for a task run.
+    pub async fn get_latest_mobile_state(&self, task_run_id: &str) -> Result<Option<crate::database::types::MobileState>, String> {
+        let states = crate::database::pg::PgDb::get_mobile_states(self, task_run_id, Some(1)).await?;
+        Ok(states.into_iter().next())
+    }
+
+    /// Delete mobile data for a task run.
+    pub async fn delete_mobile_data_for_task(&self, task_run_id: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "DELETE FROM task_run_mobile_logs WHERE task_run_id = $1",
+            &[&task_run_id],
+        ).await.map_err(|e| format!("PG delete_mobile_logs: {}", e))?;
+        conn.execute(
+            "DELETE FROM task_run_mobile_state WHERE task_run_id = $1",
+            &[&task_run_id],
+        ).await.map_err(|e| format!("PG delete_mobile_state: {}", e))?;
+        Ok(())
+    }
+
+    /// Set auto_continue for a task run.
+    pub async fn set_task_auto_continue(&self, id: &str, auto_continue: bool) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET auto_continue = $2, updated_at = NOW() WHERE id = $1",
+            &[&id, &auto_continue],
+        ).await.map_err(|e| format!("PG set_task_auto_continue: {}", e))?;
+        Ok(())
+    }
+
+    /// Update execution steps JSON for a task run.
+    pub async fn update_task_run_execution_steps(&self, id: &str, steps_json: &str) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET execution_steps_json = $2, updated_at = NOW() WHERE id = $1",
+            &[&id, &steps_json],
+        ).await.map_err(|e| format!("PG update_task_run_execution_steps: {}", e))?;
+        Ok(())
+    }
+
+    /// Get all verification phase results for a task run.
+    pub async fn get_all_verification_phase_results(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn.query(
+            "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 ORDER BY iteration ASC",
+            &[&task_run_id],
+        ).await.map_err(|e| format!("PG get_all_verification_phase_results: {}", e))?;
+
+        let mut results = Vec::new();
+        for row in &rows {
+            let json_str: String = row.get(0);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                results.push(parsed);
+            }
+        }
+        Ok(results)
+    }
+
+    /// Get latest verification results for a task run.
+    pub async fn get_latest_verification_results(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 ORDER BY iteration DESC LIMIT 1",
+            &[&task_run_id],
+        ).await.map_err(|e| format!("PG get_latest_verification_results: {}", e))?;
+
+        match row {
+            Some(r) => {
+                let json_str: String = r.get(0);
+                Ok(serde_json::from_str(&json_str).ok())
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get verification results for a specific iteration.
+    pub async fn get_iteration_verification_results(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.get_verification_phase_result(task_run_id, iteration).await
+    }
+
+    /// Get execution spans for a task run.
+    pub async fn get_execution_spans(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn.query(
+            r#"SELECT id, execution_id, span_type, phase, iteration, step_index,
+                      started_at, completed_at, duration_ms, metadata_json
+               FROM execution_spans
+               WHERE execution_id = $1
+               ORDER BY started_at ASC"#,
+            &[&execution_id],
+        ).await.map_err(|e| format!("PG get_execution_spans: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            serde_json::json!({
+                "id": r.get::<_, String>(0),
+                "execution_id": r.get::<_, String>(1),
+                "span_type": r.get::<_, String>(2),
+                "phase": r.get::<_, Option<String>>(3),
+                "iteration": r.get::<_, Option<i32>>(4),
+                "step_index": r.get::<_, Option<i32>>(5),
+                "started_at": r.get::<_, Option<String>>(6),
+                "completed_at": r.get::<_, Option<String>>(7),
+                "duration_ms": r.get::<_, Option<i64>>(8),
+                "metadata_json": r.get::<_, Option<String>>(9),
+            })
+        }).collect())
+    }
+
+    /// Get step progress markers for a checkpoint.
+    pub async fn get_step_progress_markers(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Vec<crate::workflow_state::StepProgressMarker>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn.query(
+            r#"SELECT id, checkpoint_id, marker_type, current_value, total_value,
+                      description, data_json, created_at
+               FROM step_progress_markers
+               WHERE checkpoint_id = $1
+               ORDER BY created_at DESC"#,
+            &[&checkpoint_id],
+        ).await.map_err(|e| format!("PG get_step_progress_markers: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            let created: chrono::DateTime<chrono::Utc> = r.get(7);
+            crate::workflow_state::StepProgressMarker {
+                id: r.get(0),
+                checkpoint_id: r.get(1),
+                marker_type: r.get(2),
+                current_value: r.get::<_, i64>(3) as u64,
+                total_value: r.get::<_, Option<i64>>(4).map(|v| v as u64),
+                description: r.get(5),
+                data_json: r.get(6),
+                created_at: created.to_rfc3339(),
+            }
+        }).collect())
+    }
+
+    /// Get latest step progress marker for a checkpoint.
+    pub async fn get_latest_step_progress_marker(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<crate::workflow_state::StepProgressMarker>, String> {
+        let markers = self.get_step_progress_markers(checkpoint_id).await?;
+        Ok(markers.into_iter().next())
+    }
+
+    /// Get latest verification plan for a task run (stub — returns None until PG table exists).
+    pub async fn get_latest_verification_plan(
+        &self,
+        _task_run_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        // Verification plans table may not exist in PG yet. Return None.
+        Ok(None)
+    }
 }

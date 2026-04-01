@@ -163,6 +163,7 @@ mod tests {
             error_type: None,
             tools_used: Vec::new(),
             agent_traces: Vec::new(),
+            schema_compliance_inputs: Vec::new(),
         }
     }
 

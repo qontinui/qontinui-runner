@@ -738,6 +738,7 @@ export function TabContent({
     case "settings-backup":
     case "settings-instances":
     case "settings-debug":
+    case "settings-security":
     case "settings-updates": {
       const settingsTabMap: Record<string, string> = {
         settings: "account",
@@ -756,6 +757,7 @@ export function TabContent({
         "settings-backup": "backup",
         "settings-instances": "instances",
         "settings-debug": "advanced",
+        "settings-security": "security",
         "settings-updates": "updates",
       };
       const defaultSettingsTab = settingsTabMap[activeTab] || "account";

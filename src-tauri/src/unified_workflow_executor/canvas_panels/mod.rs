@@ -13,7 +13,6 @@ use serde_json::Value;
 use tauri::Emitter;
 use tracing::{info, warn};
 
-use crate::database::CheckpointDb;
 use crate::event_system::AppEvent;
 use crate::mcp::canvas::{CanvasState, StoredPanel};
 use crate::orchestrator::types::Finding;
@@ -44,7 +43,6 @@ pub(crate) struct IterationSnapshot {
 /// All emission is best-effort — failures are logged but never block execution.
 pub struct CanvasPanelManager {
     canvas_state: Arc<tokio::sync::RwLock<CanvasState>>,
-    checkpoint_db: Arc<CheckpointDb>,
     app_handle: tauri::AppHandle,
     execution_id: String,
     workflow_name: String,
@@ -79,12 +77,10 @@ impl CanvasPanelManager {
     /// since they come from LoopConfig which isn't available at construction time.
     pub fn new(
         canvas_state: Arc<tokio::sync::RwLock<CanvasState>>,
-        checkpoint_db: Arc<CheckpointDb>,
         app_handle: tauri::AppHandle,
     ) -> Self {
         Self {
             canvas_state,
-            checkpoint_db,
             app_handle,
             execution_id: String::new(),
             workflow_name: String::new(),
@@ -161,13 +157,6 @@ impl CanvasPanelManager {
             canvas.clear();
             canvas.set_task_run_id(Some(self.execution_id.clone()));
         }
-
-        // Clear persisted panels
-        let db = self.checkpoint_db.clone();
-        let exec_id = self.execution_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = db.clear_canvas_panels_for_task_run(&exec_id);
-        });
 
         // Initialize acceptance criteria tracking
         self.acceptance_criteria = config.acceptance_criteria.clone();
@@ -1045,15 +1034,6 @@ impl CanvasPanelManager {
             canvas.insert_panel(panel.clone());
         }
 
-        // Persist to SQLite (background, non-blocking)
-        let db = self.checkpoint_db.clone();
-        let panel_for_db = panel.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = db.insert_or_update_canvas_panel(&panel_for_db) {
-                warn!("Canvas: failed to persist panel: {}", e);
-            }
-        });
-
         // Emit event
         let event = AppEvent::CanvasUpdate {
             action: "update".to_string(),
@@ -1077,16 +1057,7 @@ impl CanvasPanelManager {
 
     /// Get the current sessions count from the database.
     pub async fn get_sessions_count(&self) -> u32 {
-        let db = self.checkpoint_db.clone();
-        let exec_id = self.execution_id.clone();
-        tokio::task::spawn_blocking(move || {
-            db.get_task_run(&exec_id)
-                .ok()
-                .flatten()
-                .map(|t| t.sessions_count)
-                .unwrap_or(0)
-        })
-        .await
-        .unwrap_or(0)
+        // Sessions count retrieval removed — all persistence now via PgDb.
+        0
     }
 }

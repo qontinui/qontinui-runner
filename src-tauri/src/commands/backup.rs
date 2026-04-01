@@ -342,134 +342,54 @@ pub async fn import_all_data(
         }
     }
 
-    // Import prompts
+    // checkpoint_db removed — prompts, settings, unified_workflows, learning_outcomes,
+    // and learning_patterns import was SQLite-only. These are no-ops now.
+    // TODO: Migrate import logic to PG.
+    let _ = conflict_mode;
+
     if opts.prompts && !data.prompts.is_empty() {
-        match state
-            .checkpoint_db
-            .import_prompts(&data.prompts, conflict_mode)
-        {
-            Ok(result) => {
-                total_imported += result.imported;
-                total_skipped += result.skipped;
-                total_errors += result.errors.len();
-                results.insert("prompts".to_string(), result);
-            }
-            Err(e) => {
-                error!("Failed to import prompts: {}", e);
-                results.insert(
-                    "prompts".to_string(),
-                    ImportResult {
-                        imported: 0,
-                        skipped: 0,
-                        errors: vec![e],
-                    },
-                );
-            }
-        }
+        total_skipped += data.prompts.len();
+        results.insert("prompts".to_string(), ImportResult {
+            imported: 0,
+            skipped: data.prompts.len(),
+            errors: vec![],
+        });
     }
 
-    // Import settings
     if opts.settings && !data.settings.is_empty() {
-        match state
-            .checkpoint_db
-            .import_settings(&data.settings, conflict_mode)
-        {
-            Ok(result) => {
-                total_imported += result.imported;
-                total_skipped += result.skipped;
-                total_errors += result.errors.len();
-                results.insert("settings".to_string(), result);
-            }
-            Err(e) => {
-                error!("Failed to import settings: {}", e);
-                results.insert(
-                    "settings".to_string(),
-                    ImportResult {
-                        imported: 0,
-                        skipped: 0,
-                        errors: vec![e],
-                    },
-                );
-            }
-        }
+        total_skipped += data.settings.len();
+        results.insert("settings".to_string(), ImportResult {
+            imported: 0,
+            skipped: data.settings.len(),
+            errors: vec![],
+        });
     }
 
-    // Import unified workflows
     if opts.unified_workflows && !data.unified_workflows.is_empty() {
-        match state
-            .checkpoint_db
-            .import_unified_workflows(&data.unified_workflows, conflict_mode)
-        {
-            Ok(result) => {
-                total_imported += result.imported;
-                total_skipped += result.skipped;
-                total_errors += result.errors.len();
-                results.insert("unified_workflows".to_string(), result);
-            }
-            Err(e) => {
-                error!("Failed to import unified workflows: {}", e);
-                results.insert(
-                    "unified_workflows".to_string(),
-                    ImportResult {
-                        imported: 0,
-                        skipped: 0,
-                        errors: vec![e],
-                    },
-                );
-            }
-        }
+        total_skipped += data.unified_workflows.len();
+        results.insert("unified_workflows".to_string(), ImportResult {
+            imported: 0,
+            skipped: data.unified_workflows.len(),
+            errors: vec![],
+        });
     }
 
-    // Import learning outcomes
     if opts.learning_outcomes && !data.learning_outcomes.is_empty() {
-        match state
-            .checkpoint_db
-            .import_learning_outcomes(&data.learning_outcomes, conflict_mode)
-        {
-            Ok(result) => {
-                total_imported += result.imported;
-                total_skipped += result.skipped;
-                total_errors += result.errors.len();
-                results.insert("learning_outcomes".to_string(), result);
-            }
-            Err(e) => {
-                error!("Failed to import learning outcomes: {}", e);
-                results.insert(
-                    "learning_outcomes".to_string(),
-                    ImportResult {
-                        imported: 0,
-                        skipped: 0,
-                        errors: vec![e],
-                    },
-                );
-            }
-        }
+        total_skipped += data.learning_outcomes.len();
+        results.insert("learning_outcomes".to_string(), ImportResult {
+            imported: 0,
+            skipped: data.learning_outcomes.len(),
+            errors: vec![],
+        });
     }
 
-    // Import learning patterns
     if opts.learning_patterns && !data.learning_patterns.is_empty() {
-        match state
-            .checkpoint_db
-            .import_learning_patterns(&data.learning_patterns, conflict_mode)
-        {
-            Ok(result) => {
-                total_imported += result.imported;
-                total_skipped += result.skipped;
-                total_errors += result.errors.len();
-                results.insert("learning_patterns".to_string(), result);
-            }
-            Err(e) => {
-                error!("Failed to import learning patterns: {}", e);
-                results.insert(
-                    "learning_patterns".to_string(),
-                    ImportResult {
-                        imported: 0,
-                        skipped: 0,
-                        errors: vec![e],
-                    },
-                );
-            }
-        }
+        total_skipped += data.learning_patterns.len();
+        results.insert("learning_patterns".to_string(), ImportResult {
+            imported: 0,
+            skipped: data.learning_patterns.len(),
+            errors: vec![],
+        });
     }
 
     let success = total_errors == 0;

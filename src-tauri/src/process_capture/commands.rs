@@ -205,8 +205,7 @@ pub async fn get_process_sessions_from_db(
     limit: Option<u32>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::database::ProcessSession>, String> {
-    let db = &state.checkpoint_db;
-    db.get_process_sessions(config_id.as_deref(), limit.unwrap_or(50))
+    state.pg_db.get_process_sessions(config_id.as_deref(), limit.unwrap_or(50)).await
 }
 
 /// Get process session output from database (historical).
@@ -217,6 +216,5 @@ pub async fn get_process_session_output_from_db(
     offset: Option<u32>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::database::ProcessSessionOutputLine>, String> {
-    let db = &state.checkpoint_db;
-    db.get_process_session_output(&session_id, limit.unwrap_or(5000), offset.unwrap_or(0))
+    state.pg_db.get_process_session_output(&session_id, limit.unwrap_or(5000), offset.unwrap_or(0)).await
 }

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
-use crate::database::CheckpointDb;
 use crate::executor::{ExecutionOutcome, IntoOutcome};
 use crate::step_executor::{
     ExecutionStepConfig, StepExecutionResult, StepExecutor, VerificationPhaseResult,
@@ -32,7 +31,6 @@ use super::super::phase_helpers::{
 pub struct VerificationExecutor {
     pub(crate) app_state: Arc<AppState>,
     executor: StepExecutor,
-    checkpoint_db: Arc<CheckpointDb>,
 }
 
 impl VerificationExecutor {
@@ -41,11 +39,9 @@ impl VerificationExecutor {
         config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
         app_handle: tauri::AppHandle,
     ) -> Self {
-        let checkpoint_db = app_state.checkpoint_db.clone();
         Self {
             app_state: app_state.clone(),
             executor: StepExecutor::with_app_handle(app_state.clone(), config_storage, app_handle),
-            checkpoint_db,
         }
     }
 
@@ -165,7 +161,7 @@ impl VerificationExecutor {
         );
 
         // Create checkpoint manager for step-level checkpointing
-        let checkpoint_mgr = CheckpointManager::new(self.checkpoint_db.clone(), "unified");
+        let checkpoint_mgr = CheckpointManager::new("unified");
 
         // Log START events and save checkpoints for each step before execution
         for (idx, step) in steps.iter().enumerate() {

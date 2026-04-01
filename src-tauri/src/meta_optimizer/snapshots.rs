@@ -9,7 +9,6 @@ use tracing::info;
 
 use super::types::WorkflowCategory;
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -90,7 +89,6 @@ pub struct RecommendationOutcome {
 /// with `VerdictThresholds::recommendation()`. Falls back to simple delta thresholds when
 /// sample sizes are too small for statistical analysis.
 pub fn evaluate_recommendation_outcome(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<RecommendationOutcome, String> {
@@ -142,7 +140,7 @@ pub fn evaluate_recommendation_outcome(
         compute_verdict(before, after)
     } else {
         // No target agent: compare post_apply snapshot against baseline
-        let baseline = get_latest_baseline(db, pg_db, WorkflowCategory::Main)?;
+        let baseline = get_latest_baseline(pg_db, WorkflowCategory::Main)?;
         let post_snap = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 pg_db.get_post_apply_snapshot(&rec_id).await
@@ -213,7 +211,7 @@ pub fn evaluate_recommendation_outcome(
     // Persist the outcome to the recommendation row
     let outcome_json = serde_json::to_string(&outcome)
         .map_err(|e| format!("Failed to serialize outcome: {}", e))?;
-    update_outcome(db, pg_db, &rec_id, &outcome_json)?;
+    update_outcome(pg_db, &rec_id, &outcome_json)?;
 
     Ok(outcome)
 }
@@ -287,37 +285,33 @@ fn compute_verdict(
 /// Capture a baseline snapshot (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn capture_baseline_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_baseline(db, pg_db, category)
+    capture_baseline(pg_db, category)
 }
 
 /// Capture a periodic snapshot (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn capture_periodic_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_periodic(db, pg_db, category)
+    capture_periodic(pg_db, category)
 }
 
 /// Capture a post-apply snapshot (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn capture_post_apply_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_post_apply(db, pg_db, recommendation_id, category)
+    capture_post_apply(pg_db, recommendation_id, category)
 }
 
 /// Update the outcome_after_apply column on a recommendation.
 pub fn update_outcome(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     outcome_json: &str,
@@ -332,12 +326,11 @@ pub fn update_outcome(
 /// Update outcome with PG (same as update_outcome now, kept for backward compat).
 #[allow(dead_code)]
 pub fn update_outcome_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     outcome_json: &str,
 ) -> Result<(), String> {
-    update_outcome(db, pg_db, recommendation_id, outcome_json)
+    update_outcome(pg_db, recommendation_id, outcome_json)
 }
 
 // ── Core snapshot capture ──────────────────────────────────────────────
@@ -348,7 +341,6 @@ pub fn update_outcome_with_pg(
 /// - `recommendation_id`: set for post_apply snapshots
 /// - `lookback_days`: how many days of data to include
 pub fn capture_snapshot(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     snapshot_type: &str,
     recommendation_id: Option<&str>,
@@ -366,14 +358,13 @@ pub fn capture_snapshot(
 /// Capture a snapshot (same as capture_snapshot now, kept for backward compat).
 #[allow(dead_code)]
 pub fn capture_snapshot_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     snapshot_type: &str,
     recommendation_id: Option<&str>,
     lookback_days: i64,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_snapshot(db, pg_db, snapshot_type, recommendation_id, lookback_days, category)
+    capture_snapshot(pg_db, snapshot_type, recommendation_id, lookback_days, category)
 }
 
 // ── Convenience wrappers ───────────────────────────────────────────────
@@ -381,40 +372,36 @@ pub fn capture_snapshot_with_pg(
 /// Capture a baseline snapshot (last 30 days).
 /// Snapshot type is suffixed by category (e.g., "baseline", "baseline_reflection").
 pub fn capture_baseline(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
     let snap_type = format!("baseline{}", category.snapshot_suffix());
-    capture_snapshot(db, pg_db, &snap_type, None, 30, category)
+    capture_snapshot(pg_db, &snap_type, None, 30, category)
 }
 
 /// Capture a periodic snapshot (last 7 days).
 /// Snapshot type is suffixed by category (e.g., "periodic", "periodic_reflection").
 pub fn capture_periodic(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
     let snap_type = format!("periodic{}", category.snapshot_suffix());
-    capture_snapshot(db, pg_db, &snap_type, None, 7, category)
+    capture_snapshot(pg_db, &snap_type, None, 7, category)
 }
 
 /// Capture a post-apply snapshot to measure recommendation impact (last 7 days).
 pub fn capture_post_apply(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_snapshot(db, pg_db, "post_apply", Some(recommendation_id), 7, category)
+    capture_snapshot(pg_db, "post_apply", Some(recommendation_id), 7, category)
 }
 
 // ── Query helpers ──────────────────────────────────────────────────────
 
 /// Get the latest baseline snapshot for the given category.
 pub fn get_latest_baseline(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<Option<MetaOptimizerSnapshot>, String> {
@@ -428,7 +415,6 @@ pub fn get_latest_baseline(
 
 /// List snapshots with optional type filter.
 pub fn list_snapshots(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     snapshot_type: Option<&str>,
 ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
@@ -441,11 +427,10 @@ pub fn list_snapshots(
 
 /// Get a full progress summary: baseline vs current, deltas, and all snapshots.
 pub fn get_progress_summary(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<ProgressSummary, String> {
-    let baseline_snap = get_latest_baseline(db, pg_db, category)?;
+    let baseline_snap = get_latest_baseline(pg_db, category)?;
 
     // Get latest periodic snapshot for this category
     let periodic_type = format!("periodic{}", category.snapshot_suffix());
@@ -473,7 +458,7 @@ pub fn get_progress_summary(
         _ => None,
     };
 
-    let snapshots = list_snapshots(db, pg_db, None)?;
+    let snapshots = list_snapshots(pg_db, None)?;
 
     let applied_recommendations_count: i64 = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
@@ -495,39 +480,35 @@ pub fn get_progress_summary(
 /// Get the latest baseline snapshot (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_latest_baseline_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<Option<MetaOptimizerSnapshot>, String> {
-    get_latest_baseline(db, pg_db, category)
+    get_latest_baseline(pg_db, category)
 }
 
 /// List snapshots (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn list_snapshots_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     snapshot_type: Option<&str>,
 ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
-    list_snapshots(db, pg_db, snapshot_type)
+    list_snapshots(pg_db, snapshot_type)
 }
 
 /// Get a full progress summary (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_progress_summary_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     category: WorkflowCategory,
 ) -> Result<ProgressSummary, String> {
-    get_progress_summary(db, pg_db, category)
+    get_progress_summary(pg_db, category)
 }
 
 /// Evaluate recommendation outcome (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn evaluate_recommendation_outcome_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     recommendation_id: &str,
 ) -> Result<RecommendationOutcome, String> {
-    evaluate_recommendation_outcome(db, pg_db, recommendation_id)
+    evaluate_recommendation_outcome(pg_db, recommendation_id)
 }

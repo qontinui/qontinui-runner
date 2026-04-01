@@ -82,7 +82,6 @@ pub async fn start_comparison(
         .await?;
 
     // Launch runs via local HTTP API in background
-    let db = app_state.checkpoint_db.clone();
     let pg_db_for_spawn = app_state.pg_db.clone();
     let api_port = app_state
         .api_port
@@ -146,8 +145,6 @@ pub async fn get_comparison_status(
     app_state: State<'_, Arc<AppState>>,
     comparison_id: String,
 ) -> Result<serde_json::Value, String> {
-    let db = &app_state.checkpoint_db;
-
     let cmp_json = app_state
         .pg_db
         .get_comparison(&comparison_id)
@@ -170,7 +167,7 @@ pub async fn get_comparison_status(
     let mut all_done = true;
     for entry in entries.iter_mut() {
         if let Some(ref trid) = entry.task_run_id {
-            if let Ok(Some(task_run)) = db.get_task_run(trid) {
+            if let Ok(Some(task_run)) = app_state.pg_db.get_task_run(trid).await {
                 match task_run.status.as_str() {
                     "complete" => {
                         entry.status = "completed".to_string();

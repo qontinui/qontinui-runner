@@ -107,6 +107,51 @@ pub fn build_schema_context_full(
     )
 }
 
+/// Build schema context partitioned into stable and dynamic parts.
+///
+/// Returns `(stable_part, dynamic_part)` for prompt caching — stable content
+/// gets `cache_control` breakpoints, dynamic content doesn't.
+pub fn build_schema_context_partitioned(
+    description: &str,
+    pg_db: Option<&Arc<PgDb>>,
+) -> (String, String) {
+    let all_types = get_all_step_type_metadata();
+    let filtered = filter_relevant_step_types(description, all_types);
+    let step_types_doc = generate_step_types_documentation(&filtered);
+    let phase_table = generate_phase_constraint_table(&filtered);
+
+    // Stable part: deterministic documentation that only changes on code updates
+    let stable_part = format!(
+        "You are a workflow generation assistant for Qontinui Runner.\n\n\
+         ## Step Types\n\n{}\n\n## Phase Constraints\n\n{}",
+        step_types_doc, phase_table
+    );
+
+    // Dynamic part: DB-sourced content that varies per description
+    let mut dynamic_parts: Vec<String> = Vec::new();
+
+    if let Some(pg) = pg_db {
+        let pg_clone = pg.clone();
+        let desc = description.to_string();
+        let examples = tokio::runtime::Handle::current().block_on(async {
+            pg_clone
+                .search_unified_workflows_for_examples(&desc, 3)
+                .await
+                .unwrap_or_default()
+        });
+        if !examples.is_empty() {
+            let mut s = String::from("## Examples\n\n");
+            for (i, wf) in examples.iter().take(3).enumerate() {
+                s.push_str(&format!("### Example {} — {}\n{}\n\n", i + 1, wf.name, wf.description));
+            }
+            dynamic_parts.push(s);
+        }
+    }
+
+    let dynamic_part = dynamic_parts.join("\n\n");
+    (stable_part, dynamic_part)
+}
+
 // ============================================================================
 // Auto-Generated Documentation
 // ============================================================================

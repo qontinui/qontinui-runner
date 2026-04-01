@@ -82,7 +82,7 @@ export function PlaybookPanel() {
     loadEntries();
   }, [loadEntries]);
 
-  // Auto-refresh on learning_update events
+  // Auto-refresh on learning-update events
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;

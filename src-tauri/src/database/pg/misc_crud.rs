@@ -512,4 +512,277 @@ impl PgDb {
             })
             .collect())
     }
+
+    /// Get mobile states for a task run.
+    pub async fn get_mobile_states(
+        &self,
+        task_run_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<crate::database::types::MobileState>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = limit.unwrap_or(100) as i64;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, task_run_id, timestamp, device_id, device_type, device_model,
+                       app_package, app_activity, app_state, metro_connected, bundle_status,
+                       last_reload_type, last_reload_time, screenshot_path, logcat_path,
+                       has_errors, error_summary, created_at
+                FROM task_run_mobile_state
+                WHERE task_run_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2"#,
+                &[&task_run_id, &limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG get_mobile_states: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let ts: chrono::DateTime<chrono::Utc> = r.get(2);
+                let created: chrono::DateTime<chrono::Utc> = r.get(17);
+                crate::database::types::MobileState {
+                    id: r.get(0),
+                    task_run_id: r.get(1),
+                    timestamp: ts.to_rfc3339(),
+                    device_id: r.get(3),
+                    device_type: r.get(4),
+                    device_model: r.get(5),
+                    app_package: r.get(6),
+                    app_activity: r.get(7),
+                    app_state: r.get(8),
+                    metro_connected: r.get(9),
+                    bundle_status: r.get(10),
+                    last_reload_type: r.get(11),
+                    last_reload_time: r.get(12),
+                    screenshot_path: r.get(13),
+                    logcat_path: r.get(14),
+                    has_errors: r.get(15),
+                    error_summary: r.get(16),
+                    created_at: created.to_rfc3339(),
+                }
+            })
+            .collect())
+    }
+
+    /// Get mobile logs for a task run.
+    pub async fn get_mobile_logs(
+        &self,
+        task_run_id: &str,
+        log_source: Option<&str>,
+        errors_only: bool,
+        limit: Option<u32>,
+    ) -> Result<Vec<crate::database::types::MobileLog>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = limit.unwrap_or(100) as i64;
+
+        let rows = if errors_only {
+            conn.query(
+                r#"SELECT id, task_run_id, mobile_state_id, log_source, log_level, log_tag,
+                       message, raw_line, data, error_type, error_code,
+                       stack_trace, file_path, line_number, column_number,
+                       timestamp, device_timestamp, created_at
+                FROM task_run_mobile_logs
+                WHERE task_run_id = $1 AND log_level IN ('error', 'fatal')
+                ORDER BY created_at DESC LIMIT $2"#,
+                &[&task_run_id, &limit_i64],
+            ).await
+        } else if let Some(source) = log_source {
+            conn.query(
+                r#"SELECT id, task_run_id, mobile_state_id, log_source, log_level, log_tag,
+                       message, raw_line, data, error_type, error_code,
+                       stack_trace, file_path, line_number, column_number,
+                       timestamp, device_timestamp, created_at
+                FROM task_run_mobile_logs
+                WHERE task_run_id = $1 AND log_source = $2
+                ORDER BY created_at DESC LIMIT $3"#,
+                &[&task_run_id, &source, &limit_i64],
+            ).await
+        } else {
+            conn.query(
+                r#"SELECT id, task_run_id, mobile_state_id, log_source, log_level, log_tag,
+                       message, raw_line, data, error_type, error_code,
+                       stack_trace, file_path, line_number, column_number,
+                       timestamp, device_timestamp, created_at
+                FROM task_run_mobile_logs
+                WHERE task_run_id = $1
+                ORDER BY created_at DESC LIMIT $2"#,
+                &[&task_run_id, &limit_i64],
+            ).await
+        }.map_err(|e| format!("PG get_mobile_logs: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            let ts: chrono::DateTime<chrono::Utc> = r.get(15);
+            let created: chrono::DateTime<chrono::Utc> = r.get(17);
+            crate::database::types::MobileLog {
+                id: r.get(0),
+                task_run_id: r.get(1),
+                mobile_state_id: r.get(2),
+                log_source: r.get(3),
+                log_level: r.get(4),
+                log_tag: r.get(5),
+                message: r.get(6),
+                raw_line: r.get(7),
+                data: r.get(8),
+                error_type: r.get(9),
+                error_code: r.get(10),
+                stack_trace: r.get(11),
+                file_path: r.get(12),
+                line_number: r.get(13),
+                column_number: r.get(14),
+                timestamp: ts.to_rfc3339(),
+                device_timestamp: r.get(16),
+                created_at: created.to_rfc3339(),
+            }
+        }).collect())
+    }
+
+    /// Get mobile error logs for a task run.
+    pub async fn get_mobile_errors(
+        &self,
+        task_run_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<crate::database::types::MobileLog>, String> {
+        self.get_mobile_logs(task_run_id, None, true, limit).await
+    }
+
+    // ========================================================================
+    // Artifacts (UI Bridge)
+    // ========================================================================
+
+    /// Save an artifact to the database.
+    pub async fn save_artifact(&self, artifact: &crate::database::types::Artifact) -> Result<(), String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            r#"INSERT INTO artifacts (artifact_id, source_json, result_json, environment_json, passed, created_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
+               ON CONFLICT (artifact_id) DO NOTHING"#,
+            &[
+                &artifact.artifact_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &artifact.source_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &artifact.result_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &artifact.environment_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &artifact.passed as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        ).await.map_err(|e| format!("PG save_artifact: {}", e))?;
+        Ok(())
+    }
+
+    /// Get an artifact by ID.
+    pub async fn get_artifact(&self, artifact_id: &str) -> Result<Option<crate::database::types::Artifact>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn.query_opt(
+            "SELECT artifact_id, source_json, result_json, environment_json, created_at, passed FROM artifacts WHERE artifact_id = $1",
+            &[&artifact_id],
+        ).await.map_err(|e| format!("PG get_artifact: {}", e))?;
+
+        Ok(row.map(|r| {
+            let created: chrono::DateTime<chrono::Utc> = r.get(4);
+            crate::database::types::Artifact {
+                artifact_id: r.get(0),
+                source_json: r.get(1),
+                result_json: r.get(2),
+                environment_json: r.get(3),
+                created_at: created.to_rfc3339(),
+                passed: r.get(5),
+            }
+        }))
+    }
+
+    /// Query artifacts with filters.
+    pub async fn query_artifacts(&self, query: &crate::database::types::ArtifactQuery) -> Result<Vec<crate::database::types::Artifact>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let limit_i64 = query.limit.unwrap_or(100) as i64;
+        let offset_i64 = query.offset.unwrap_or(0) as i64;
+
+        // Build dynamic query
+        let mut conditions = vec!["1=1".to_string()];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut idx = 1u32;
+
+        if let Some(ref spec_id) = query.spec_id {
+            conditions.push(format!("source_json::jsonb->>'specId' = ${}", idx));
+            params.push(Box::new(spec_id.clone()));
+            idx += 1;
+        }
+        if let Some(ref date_from) = query.date_from {
+            conditions.push(format!("created_at >= ${}::timestamptz", idx));
+            params.push(Box::new(date_from.clone()));
+            idx += 1;
+        }
+        if let Some(ref date_to) = query.date_to {
+            conditions.push(format!("created_at <= ${}::timestamptz", idx));
+            params.push(Box::new(date_to.clone()));
+            idx += 1;
+        }
+        if query.passed_only == Some(true) {
+            conditions.push("passed = true".to_string());
+        }
+        if query.failed_only == Some(true) {
+            conditions.push("passed = false".to_string());
+        }
+
+        let sql = format!(
+            "SELECT artifact_id, source_json, result_json, environment_json, created_at, passed FROM artifacts WHERE {} ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            conditions.join(" AND "), idx, idx + 1
+        );
+        params.push(Box::new(limit_i64));
+        params.push(Box::new(offset_i64));
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let rows = conn.query(&sql, &param_refs).await.map_err(|e| format!("PG query_artifacts: {}", e))?;
+
+        Ok(rows.iter().map(|r| {
+            let created: chrono::DateTime<chrono::Utc> = r.get(4);
+            crate::database::types::Artifact {
+                artifact_id: r.get(0),
+                source_json: r.get(1),
+                result_json: r.get(2),
+                environment_json: r.get(3),
+                created_at: created.to_rfc3339(),
+                passed: r.get(5),
+            }
+        }).collect())
+    }
+
+    /// Count artifacts with optional filters.
+    pub async fn count_artifacts(&self, query: &crate::database::types::ArtifactCountQuery) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let mut conditions = vec!["1=1".to_string()];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut idx = 1u32;
+
+        if let Some(ref spec_id) = query.spec_id {
+            conditions.push(format!("source_json::jsonb->>'specId' = ${}", idx));
+            params.push(Box::new(spec_id.clone()));
+            idx += 1;
+        }
+        if let Some(ref date_from) = query.date_from {
+            conditions.push(format!("created_at >= ${}::timestamptz", idx));
+            params.push(Box::new(date_from.clone()));
+            idx += 1;
+        }
+        if let Some(ref date_to) = query.date_to {
+            conditions.push(format!("created_at <= ${}::timestamptz", idx));
+            params.push(Box::new(date_to.clone()));
+            idx += 1;
+        }
+        if query.passed_only == Some(true) {
+            conditions.push("passed = true".to_string());
+        }
+        if query.failed_only == Some(true) {
+            conditions.push("passed = false".to_string());
+        }
+
+        let _ = idx;
+        let sql = format!(
+            "SELECT COUNT(*) FROM artifacts WHERE {}",
+            conditions.join(" AND ")
+        );
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let row = conn.query_one(&sql, &param_refs).await.map_err(|e| format!("PG count_artifacts: {}", e))?;
+        Ok(row.get(0))
+    }
 }

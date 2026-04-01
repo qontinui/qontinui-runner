@@ -19,6 +19,8 @@ pub struct CreatePhaseTokenUsageParams<
     pub output_tokens: i64,
     pub cost_cents: i64,
     pub duration_ms: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
     pub target_app: Option<T5>,
     pub target_page_url: Option<T6>,
 }
@@ -38,6 +40,8 @@ pub struct PhaseTokenUsageRow {
     pub output_tokens: i64,
     pub cost_cents: i64,
     pub duration_ms: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
 }
 pub struct PhaseTokenUsageRowBorrowed<'a> {
@@ -50,6 +54,8 @@ pub struct PhaseTokenUsageRowBorrowed<'a> {
     pub output_tokens: i64,
     pub cost_cents: i64,
     pub duration_ms: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
 }
 impl<'a> From<PhaseTokenUsageRowBorrowed<'a>> for PhaseTokenUsageRow {
@@ -64,6 +70,8 @@ impl<'a> From<PhaseTokenUsageRowBorrowed<'a>> for PhaseTokenUsageRow {
             output_tokens,
             cost_cents,
             duration_ms,
+            cache_creation_tokens,
+            cache_read_tokens,
             created_at,
         }: PhaseTokenUsageRowBorrowed<'a>,
     ) -> Self {
@@ -77,6 +85,8 @@ impl<'a> From<PhaseTokenUsageRowBorrowed<'a>> for PhaseTokenUsageRow {
             output_tokens,
             cost_cents,
             duration_ms,
+            cache_creation_tokens,
+            cache_read_tokens,
             created_at,
         }
     }
@@ -226,7 +236,7 @@ where
 pub struct CreatePhaseTokenUsageStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn create_phase_token_usage() -> CreatePhaseTokenUsageStmt {
     CreatePhaseTokenUsageStmt(
-        "INSERT INTO phase_token_usage (task_run_id, phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, target_app, target_page_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        "INSERT INTO phase_token_usage (task_run_id, phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, cache_creation_tokens, cache_read_tokens, target_app, target_page_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         None,
     )
 }
@@ -262,6 +272,8 @@ impl CreatePhaseTokenUsageStmt {
         output_tokens: &'a i64,
         cost_cents: &'a i64,
         duration_ms: &'a Option<i64>,
+        cache_creation_tokens: &'a Option<i64>,
+        cache_read_tokens: &'a Option<i64>,
         target_app: &'a Option<T5>,
         target_page_url: &'a Option<T6>,
     ) -> Result<u64, tokio_postgres::Error> {
@@ -279,6 +291,8 @@ impl CreatePhaseTokenUsageStmt {
                     output_tokens,
                     cost_cents,
                     duration_ms,
+                    cache_creation_tokens,
+                    cache_read_tokens,
                     target_app,
                     target_page_url,
                 ],
@@ -326,6 +340,8 @@ impl<
             &params.output_tokens,
             &params.cost_cents,
             &params.duration_ms,
+            &params.cache_creation_tokens,
+            &params.cache_read_tokens,
             &params.target_app,
             &params.target_page_url,
         ))
@@ -334,7 +350,7 @@ impl<
 pub struct GetPhaseTokenUsageStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_phase_token_usage() -> GetPhaseTokenUsageStmt {
     GetPhaseTokenUsageStmt(
-        "SELECT phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, created_at FROM phase_token_usage WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, cache_creation_tokens, cache_read_tokens, created_at FROM phase_token_usage WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }
@@ -369,7 +385,9 @@ impl GetPhaseTokenUsageStmt {
                     output_tokens: row.try_get(6)?,
                     cost_cents: row.try_get(7)?,
                     duration_ms: row.try_get(8)?,
-                    created_at: row.try_get(9)?,
+                    cache_creation_tokens: row.try_get(9)?,
+                    cache_read_tokens: row.try_get(10)?,
+                    created_at: row.try_get(11)?,
                 })
             },
             mapper: |it| PhaseTokenUsageRow::from(it),

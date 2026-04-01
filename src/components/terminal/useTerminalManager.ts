@@ -1,5 +1,6 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { CommandResponse } from "./types";
 import { createLogger } from "@/lib/logger";
 
@@ -43,6 +44,36 @@ export function useTerminalManager() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const nextTitleNum = useRef(1);
   const [initialized, setInitialized] = useState(false);
+
+  // Listen for terminals created externally (e.g. via HTTP API) and add them as tabs.
+  // Deduplicates by checking if the terminal ID already exists in state.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<TerminalInfo>("terminal-created", (event) => {
+      const info = event.payload;
+      setTabs((prev) => {
+        if (prev.some((t) => t.id === info.id)) return prev;
+        logger.info(`External terminal created: ${info.id} (${info.title})`);
+        return [
+          ...prev,
+          {
+            id: info.id,
+            title: info.title,
+            pid: info.pid ?? null,
+            isAlive: info.is_alive,
+            exitCode: info.exit_code ?? null,
+            workingDir: info.working_dir || undefined,
+            createdAt: info.created_at,
+          },
+        ];
+      });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   /**
    * Reconnect to existing Rust PTY sessions that survived a React remount.

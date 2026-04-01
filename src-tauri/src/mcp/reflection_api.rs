@@ -327,21 +327,8 @@ pub async fn trigger_reflection_handler(
     State(state): State<Arc<ApiState>>,
     Path(task_run_id): Path<String>,
 ) -> Result<Json<ApiResponse<TriggerResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Check for already-running reflection workflow
-    if let Ok(Some(existing_id)) = state
-        .app_state
-        .checkpoint_db
-        .has_running_reflection_workflow()
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(api_error(format!(
-                "A reflection workflow is already running (task_id: {}). \
-                 Please wait for it to complete before starting a new one.",
-                existing_id
-            ))),
-        ));
-    }
+    // checkpoint_db removed — running reflection check not yet migrated to PG
+    // Skip the guard for now (no SQLite to check)
 
     let session_manager: Option<Arc<crate::claude_session::SessionManager>> = state
         .app_handle

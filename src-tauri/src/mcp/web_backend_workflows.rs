@@ -249,7 +249,7 @@ impl WebBackendWorkflowClient {
 /// Sync all workflows from the web backend to local SQLite cache.
 /// Called on startup and periodically.
 pub async fn sync_workflows_from_backend(
-    db: &crate::database::CheckpointDb,
+    db: &crate::database::pg::PgDb,
 ) -> Result<usize, String> {
     let client = WebBackendWorkflowClient::new();
 
@@ -269,7 +269,7 @@ pub async fn sync_workflows_from_backend(
 
     for workflow in &workflows {
         // Check if workflow exists locally
-        match db.get_unified_workflow(&workflow.id) {
+        match db.get_unified_workflow(&workflow.id).await {
             Ok(Some(_existing)) => {
                 // Update local cache
                 let update_req = crate::unified_workflows::UpdateUnifiedWorkflowRequest {
@@ -317,7 +317,7 @@ pub async fn sync_workflows_from_backend(
                     phase_timeouts_json: workflow.phase_timeouts_json.clone(),
                     rollback_policy: workflow.rollback_policy.clone(),
                 };
-                if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req) {
+                if let Err(e) = db.update_unified_workflow(&workflow.id, &update_req).await {
                     warn!("Failed to update cached workflow {}: {}", workflow.id, e);
                 }
             }
@@ -370,7 +370,7 @@ pub async fn sync_workflows_from_backend(
                     phase_timeouts_json: None,
                     rollback_policy: workflow.rollback_policy.clone(),
                 };
-                if let Err(e) = db.create_unified_workflow(&create_req) {
+                if let Err(e) = db.create_unified_workflow(&create_req).await {
                     warn!("Failed to cache workflow {}: {}", workflow.id, e);
                 }
             }
@@ -392,10 +392,10 @@ pub async fn sync_workflows_from_backend(
 
 /// Push locally-created/modified workflows to the web backend.
 async fn push_pending_workflows(
-    db: &crate::database::CheckpointDb,
+    db: &crate::database::pg::PgDb,
     client: &WebBackendWorkflowClient,
 ) {
-    let pending = match db.get_pending_sync_workflows() {
+    let pending = match db.get_pending_sync_workflows().await {
         Ok(w) => w,
         Err(e) => {
             warn!("Could not get pending workflows: {}", e);
@@ -413,7 +413,7 @@ async fn push_pending_workflows(
         match client.save_workflow(workflow).await {
             Ok(_) => {
                 // Clear sync_pending flag
-                if let Err(e) = db.clear_sync_pending(&workflow.id) {
+                if let Err(e) = db.clear_sync_pending(&workflow.id).await {
                     warn!("Failed to clear sync_pending for {}: {}", workflow.id, e);
                 }
             }

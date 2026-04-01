@@ -1786,6 +1786,8 @@ pub struct PhaseTokenUsageRow {
     pub output_tokens: u64,
     pub cost_cents: u64,
     pub duration_ms: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
     pub created_at: String,
 }
 

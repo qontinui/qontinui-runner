@@ -333,6 +333,199 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           return true;
         }
 
+        // ============================================================
+        // App-agnostic convenience endpoints (IPC fallback)
+        // These delegate to the SDK handlers running in the same webview.
+        // ============================================================
+
+        case "click_by_text": {
+          try {
+            const { text, tag, exact } = (payload.params || {}) as {
+              text?: string;
+              tag?: string;
+              exact?: boolean;
+            };
+            if (!text) {
+              await sendResponse({ requestId, type, success: false, error: "text is required", timestamp: Date.now() });
+              return true;
+            }
+            const selector = tag || "*";
+            const searchText = text.toLowerCase();
+            const candidates = document.querySelectorAll<HTMLElement>(selector);
+            let clicked = false;
+            for (const el of candidates) {
+              const elText = el.textContent?.trim().toLowerCase() ?? "";
+              if (exact ? elText === searchText : elText.includes(searchText)) {
+                el.click();
+                clicked = true;
+                await sendResponse({ requestId, type, success: true, data: { clicked: true, element: { tag: el.tagName.toLowerCase(), text: el.textContent?.trim().slice(0, 200) } }, timestamp: Date.now() });
+                break;
+              }
+            }
+            if (!clicked) {
+              await sendResponse({ requestId, type, success: false, error: `No element found with text "${text}"`, timestamp: Date.now() });
+            }
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
+        case "click_by_selector": {
+          try {
+            const { selector, index } = (payload.params || {}) as { selector?: string; index?: number };
+            if (!selector) {
+              await sendResponse({ requestId, type, success: false, error: "selector is required", timestamp: Date.now() });
+              return true;
+            }
+            const el = index ? document.querySelectorAll<HTMLElement>(selector)[index] : document.querySelector<HTMLElement>(selector);
+            if (!el) {
+              await sendResponse({ requestId, type, success: false, error: `No element found for selector "${selector}"`, timestamp: Date.now() });
+              return true;
+            }
+            el.click();
+            await sendResponse({ requestId, type, success: true, data: { clicked: true, element: { tag: el.tagName.toLowerCase(), text: el.textContent?.trim().slice(0, 200) } }, timestamp: Date.now() });
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
+        case "type_into": {
+          try {
+            const { selector, label, text, clear } = (payload.params || {}) as { selector?: string; label?: string; text?: string; clear?: boolean };
+            if (!text) {
+              await sendResponse({ requestId, type, success: false, error: "text is required", timestamp: Date.now() });
+              return true;
+            }
+            let el: HTMLElement | null = null;
+            if (label) {
+              const labels = document.querySelectorAll<HTMLLabelElement>("label");
+              for (const lbl of labels) {
+                if (lbl.textContent?.trim().toLowerCase().includes(label.toLowerCase())) {
+                  el = lbl.htmlFor ? document.getElementById(lbl.htmlFor) : lbl.querySelector("input, select, textarea");
+                  if (el) break;
+                }
+              }
+            } else if (selector) {
+              el = document.querySelector<HTMLElement>(selector);
+            }
+            if (!el) {
+              await sendResponse({ requestId, type, success: false, error: `No input found`, timestamp: Date.now() });
+              return true;
+            }
+            el.focus();
+            if (clear && "value" in el) (el as HTMLInputElement).value = "";
+            if ("value" in el) {
+              (el as HTMLInputElement).value += text;
+              el.dispatchEvent(new Event("input", { bubbles: true }));
+              el.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            await sendResponse({ requestId, type, success: true, data: { typed: true }, timestamp: Date.now() });
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
+        case "read_value": {
+          try {
+            const { selector } = (payload.params || {}) as { selector?: string };
+            if (!selector) {
+              await sendResponse({ requestId, type, success: false, error: "selector is required", timestamp: Date.now() });
+              return true;
+            }
+            const el = document.querySelector<HTMLElement>(selector);
+            if (!el) {
+              await sendResponse({ requestId, type, success: false, error: `No element found for "${selector}"`, timestamp: Date.now() });
+              return true;
+            }
+            const value = "value" in el ? (el as HTMLInputElement).value : el.textContent ?? null;
+            await sendResponse({ requestId, type, success: true, data: { value, length: value?.length ?? 0 }, timestamp: Date.now() });
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
+        case "find_by_text": {
+          try {
+            const { text, tag, exact } = (payload.params || {}) as { text?: string; tag?: string; exact?: boolean };
+            if (!text) {
+              await sendResponse({ requestId, type, success: false, error: "text is required", timestamp: Date.now() });
+              return true;
+            }
+            const candidates = document.querySelectorAll<HTMLElement>(tag || "*");
+            const searchText = text.toLowerCase();
+            const results: Array<{ index: number; tag: string; text: string; visible: boolean }> = [];
+            let idx = 0;
+            for (const el of candidates) {
+              const elText = el.textContent?.trim().toLowerCase() ?? "";
+              if (exact ? elText === searchText : elText.includes(searchText)) {
+                results.push({ index: idx++, tag: el.tagName.toLowerCase(), text: el.textContent?.trim().slice(0, 200) ?? "", visible: el.offsetParent !== null });
+              }
+            }
+            await sendResponse({ requestId, type, success: true, data: results, timestamp: Date.now() });
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
+        case "get_diagnostics": {
+          try {
+            const globalBridge = (window as any).__UI_BRIDGE__;
+            const registeredCount = globalBridge?.registry?.getAllElements?.()?.length ?? 0;
+            const interactiveSelectors = "a[href],button,input,select,textarea,[role='button'],[role='link'],[role='checkbox'],[role='radio'],[role='menuitem'],[role='tab'],[role='switch'],[role='slider'],[tabindex]:not([tabindex='-1']),[contenteditable='true'],[onclick]";
+            const domCount = document.querySelectorAll(interactiveSelectors).length;
+            await sendResponse({
+              requestId, type, success: true,
+              data: {
+                sdk_initialized: !!globalBridge,
+                auto_register_active: !!globalBridge?.autoRegisterActive,
+                registered_elements: registeredCount,
+                dom_interactive_elements: domCount,
+                mutation_observer_active: !!globalBridge?.mutationObserverActive,
+                navigation_adapter: "window-location",
+                page_title: document.title,
+                page_url: window.location.href,
+                page_ready: document.readyState === "complete",
+                providers_mounted: globalBridge?.providers ?? [],
+                last_discover_at: null,
+                capabilities: ["control", "find", "ai"],
+              },
+              timestamp: Date.now(),
+            });
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
+        case "get_routes": {
+          await sendResponse({
+            requestId, type, success: true,
+            data: [{ name: document.title || "Current Page", path: window.location.pathname }],
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "navigate_by_adapter": {
+          try {
+            const { page } = (payload.params || {}) as { page?: string };
+            if (!page) {
+              await sendResponse({ requestId, type, success: false, error: "page is required", timestamp: Date.now() });
+              return true;
+            }
+            window.location.href = page.startsWith("/") || page.startsWith("http") ? page : "/" + page;
+            await sendResponse({ requestId, type, success: true, data: { navigated: true, route: { name: document.title, path: page } }, timestamp: Date.now() });
+          } catch (err) {
+            await sendResponse({ requestId, type, success: false, error: String(err), timestamp: Date.now() });
+          }
+          return true;
+        }
+
         default:
           return false;
       }

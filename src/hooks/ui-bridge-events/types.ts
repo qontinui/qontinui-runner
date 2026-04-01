@@ -172,7 +172,18 @@ export type UIBridgeRequestType =
   | "execute_intent_from_query"
   // Debug
   | "get_element_tree"
-  | "highlight_element";
+  | "highlight_element"
+  // App-agnostic convenience
+  | "click_by_text"
+  | "click_by_selector"
+  | "type_into"
+  | "read_value"
+  | "find_by_text"
+  // Diagnostics
+  | "get_diagnostics"
+  // Navigation adapter
+  | "get_routes"
+  | "navigate_by_adapter";
 
 /**
  * Payload structure for UI Bridge requests from Rust

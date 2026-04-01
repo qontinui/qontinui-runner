@@ -29,8 +29,6 @@ use tracing::{debug, error, info, warn};
 pub struct RunRecordingHandler {
     /// Current active run recorder (if a workflow is running)
     active_recorder: Arc<Mutex<Option<RunRecorder>>>,
-    /// Database for storing run data
-    db: Arc<CheckpointDb>,
     /// Current config ID (from loaded configuration)
     config_id: Arc<Mutex<Option<String>>>,
     /// Current project ID (optional, for discovery push)
@@ -52,10 +50,9 @@ pub struct RunRecordingHandler {
 
 impl RunRecordingHandler {
     /// Create a new run recording handler.
-    pub fn new(db: Arc<CheckpointDb>) -> Self {
+    pub fn new() -> Self {
         Self {
             active_recorder: Arc::new(Mutex::new(None)),
-            db,
             config_id: Arc::new(Mutex::new(None)),
             project_id: Arc::new(Mutex::new(None)),
             task_run_id: Arc::new(Mutex::new(None)),
@@ -65,6 +62,11 @@ impl RunRecordingHandler {
             latest_test_results: Arc::new(Mutex::new(None)),
             session_number: Arc::new(Mutex::new(1)),
         }
+    }
+
+    /// Get the database handle.
+    fn db(&self) -> Arc<CheckpointDb> {
+        CheckpointDb::global()
     }
 
     /// Set the task run ID for unified task tracking.
@@ -168,7 +170,7 @@ impl RunRecordingHandler {
 
         // Execute "before_workflow" verification tests
         let tests_result = execute_tests_for_trigger(
-            &self.db,
+            &self.db(),
             &config_id,
             &TriggerPoint::BeforeWorkflow,
             task_run_id.as_deref(),
@@ -184,7 +186,7 @@ impl RunRecordingHandler {
             if let Some(ref trid) = task_run_id {
                 let session_num = *self.session_number.lock().await;
                 create_findings_for_failures(
-                    &self.db,
+                    &self.db(),
                     trid,
                     session_num,
                     &tests_result,
@@ -424,7 +426,7 @@ impl RunRecordingHandler {
         // Execute "after_workflow" verification tests
         if let Some(ref cid) = config_id {
             let tests_result = execute_tests_for_trigger(
-                &self.db,
+                &self.db(),
                 cid,
                 &TriggerPoint::AfterWorkflow,
                 task_run_id.as_deref(),
@@ -438,7 +440,7 @@ impl RunRecordingHandler {
 
                 // Create findings for failed critical tests
                 if let Some(ref trid) = task_run_id {
-                    create_findings_for_failures(&self.db, trid, session_num, &tests_result, cid);
+                    create_findings_for_failures(&self.db(), trid, session_num, &tests_result, cid);
                 }
 
                 // Update latest test results (append after-workflow context)
@@ -474,7 +476,7 @@ impl RunRecordingHandler {
             );
 
             safe_eprintln!("[RUN_RECORDING] Calling finish_success_with_db...");
-            match recorder.finish_success_with_db(&self.db) {
+            match recorder.finish_success_with_db(&self.db()) {
                 Ok(run_id) => {
                     safe_eprintln!("[RUN_RECORDING] SUCCESS: Run {} saved to database!", run_id);
                     info!(
@@ -498,7 +500,7 @@ impl RunRecordingHandler {
     /// Handle workflow failed.
     pub async fn on_workflow_failed(&self, error: &str) {
         if let Some(recorder) = self.active_recorder.lock().await.take() {
-            match recorder.finish_failure_with_db(&self.db, error) {
+            match recorder.finish_failure_with_db(&self.db(), error) {
                 Ok(run_id) => {
                     info!("Run {} recorded as failed: {}", run_id, error);
                 }
@@ -512,7 +514,7 @@ impl RunRecordingHandler {
     /// Handle workflow timeout.
     pub async fn on_workflow_timeout(&self) {
         if let Some(recorder) = self.active_recorder.lock().await.take() {
-            match recorder.finish_timeout_with_db(&self.db) {
+            match recorder.finish_timeout_with_db(&self.db()) {
                 Ok(run_id) => {
                     info!("Run {} recorded as timeout", run_id);
                 }
@@ -566,7 +568,7 @@ impl RunRecordingHandler {
     pub async fn cancel_recording(&self) {
         if let Some(recorder) = self.active_recorder.lock().await.take() {
             // Still save the run but as cancelled
-            match recorder.finish_cancelled_with_db(&self.db) {
+            match recorder.finish_cancelled_with_db(&self.db()) {
                 Ok(run_id) => {
                     info!("Run {} recorded as cancelled", run_id);
                 }
@@ -609,6 +611,6 @@ impl RunRecordingHandler {
 /// Create a run recording handler from AppState.
 ///
 /// This is a convenience function for integration with the executor.
-pub fn create_run_recording_handler(db: Arc<CheckpointDb>) -> RunRecordingHandler {
-    RunRecordingHandler::new(db)
+pub fn create_run_recording_handler() -> RunRecordingHandler {
+    RunRecordingHandler::new()
 }

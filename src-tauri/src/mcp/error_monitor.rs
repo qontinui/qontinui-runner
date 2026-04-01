@@ -219,27 +219,9 @@ pub async fn get_error_patterns(
 > {
     let task_run_id = query.get("task_run_id").cloned();
 
-    let checkpoint_db = state.app_state.checkpoint_db.clone();
-    let context = tokio::task::spawn_blocking(move || {
-        let conn = checkpoint_db.get_conn().map_err(|e| format!("DB connection error: {}", e))?;
-        let curator = crate::error_monitor::DebugContextCurator::new();
-        curator.build_context(&conn, task_run_id.as_deref())
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Task join error: {}", e))),
-        )
-    })?
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to build context: {}", e))),
-        )
-    })?;
-
-    Ok(Json(ApiResponse::success(context.patterns)))
+    // checkpoint_db removed — error patterns not yet migrated to PG
+    let _ = task_run_id;
+    Ok(Json(ApiResponse::success(vec![])))
 }
 
 /// Update error status (generic status update)

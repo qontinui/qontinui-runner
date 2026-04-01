@@ -53,11 +53,8 @@ pub async fn get_task_findings_handler(
     State(state): State<Arc<ApiState>>,
     Path(task_run_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<Finding>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state
-        .app_state
-        .checkpoint_db
-        .get_findings_for_task(&task_run_id)
-    {
+    // checkpoint_db removed — use PG for findings
+    match state.app_state.pg_db.get_findings_for_task(&task_run_id).await {
         Ok(findings) => Ok(Json(ApiResponse::success(findings))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,8 +141,9 @@ pub async fn user_response_handler(
 ) -> Result<Json<ApiResponse<FindingMutationResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     state
         .app_state
-        .checkpoint_db
+        .pg_db
         .set_finding_user_response(&finding_id, &req.response)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -176,11 +174,12 @@ pub async fn clear_all_findings_handler(
     State(state): State<Arc<ApiState>>,
     Path(task_run_id): Path<String>,
 ) -> Result<Json<ApiResponse<ClearFindingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Get all findings for the task
+    // Get all findings for the task (PG)
     let findings = state
         .app_state
-        .checkpoint_db
+        .pg_db
         .get_findings_for_task(&task_run_id)
+        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

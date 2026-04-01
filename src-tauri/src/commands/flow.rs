@@ -317,13 +317,8 @@ pub async fn run_flow_execution(
 
     // Record learning outcome + agentic metrics for this flow execution
     let success = result.is_ok();
-    record_flow_learning(
-        &app_state.checkpoint_db,
-        &flow,
-        &state,
-        success,
-        result.as_ref().err().map(|e| e.as_str()),
-    );
+    // checkpoint_db removed — flow learning recording was SQLite-only, no-op
+    let _ = (success, &flow, &state);
 
     match result {
         Ok(()) => {
@@ -1362,105 +1357,5 @@ pub async fn import_flows_bulk(
 // Agentic Metrics Scoring Adapter for Flow Executions
 // ============================================================================
 
-/// Record a learning outcome and agentic metric scores for a completed flow execution.
-///
-/// Maps FlowState → WorkflowOutcome for the scoring pipeline. This bridges
-/// the flow executor (DAG-based) into the same learning/metrics system used
-/// by the unified workflow executor.
-fn record_flow_learning(
-    db: &Arc<crate::database::CheckpointDb>,
-    flow: &Flow,
-    state: &FlowState,
-    success: bool,
-    error_message: Option<&str>,
-) {
-    use crate::orchestrator::learning_recorder;
-
-    let total_steps = state.execution_count();
-    let successful_steps = state.history.iter().filter(|s| s.success).count();
-    let total_duration_secs: f64 = state
-        .history
-        .iter()
-        .filter_map(|s| s.duration_ms)
-        .sum::<u64>() as f64
-        / 1000.0;
-
-    // Count agent steps (AI calls) vs tool steps
-    let agent_step_count = state
-        .history
-        .iter()
-        .filter(|s| {
-            flow.get_step(&s.step_id)
-                .map(|step| {
-                    matches!(
-                        step.step_type,
-                        crate::orchestrator::flow::StepType::Agent { .. }
-                    )
-                })
-                .unwrap_or(false)
-        })
-        .count() as i64;
-
-    let outcome = learning_recorder::WorkflowOutcome {
-        task_run_id: state.instance_id.clone(),
-        workflow_name: flow.name.clone(),
-        category: "flow".to_string(),
-        status: if success {
-            "complete".to_string()
-        } else {
-            "failed".to_string()
-        },
-        duration_secs: total_duration_secs,
-        iterations: 1, // Flows execute once (no verification loop)
-        verification_passed: success,
-        max_iterations_reached: false,
-        was_stopped: state.status == FlowStatus::Cancelled,
-        tools_used: Vec::new(),
-        files_modified: Vec::new(),
-        error_type: error_message.map(learning_recorder::categorize_error),
-        error_message: error_message.map(String::from),
-        workflow_architecture: Some("flow".to_string()),
-        step_count: Some(total_steps as i64),
-        verification_step_count: Some(successful_steps as i64),
-        agentic_step_count: Some(agent_step_count),
-        has_ui_bridge: false,
-        total_tokens: None,
-        total_cost_usd: None,
-    };
-
-    // Record learning outcome + deterministic agentic metrics (sync, fast)
-    let db_arc = db.clone();
-    let pg_db_clone = crate::database::pg::PgDb::global();
-    let instance_id = state.instance_id.clone();
-    let verification_passed = outcome.verification_passed;
-    let was_stopped = outcome.was_stopped;
-    tokio::spawn(async move {
-        // Record learning outcome via PG
-        let outcome_json = serde_json::json!({
-            "id": outcome.task_run_id,
-            "workflow_name": outcome.workflow_name,
-            "status": if outcome.verification_passed { "success" } else { "failure" },
-            "iterations": outcome.iterations,
-            "duration_secs": outcome.duration_secs,
-        });
-        let pg_db_inner = pg_db_clone.clone();
-        let record_result = pg_db_inner.record_workflow_learning(&outcome_json).await;
-        if let Err(e) = record_result
-        {
-            warn!("Failed to record flow learning outcome: {}", e);
-            return;
-        }
-
-        // Trigger LLM judge for failed flows
-        learning_recorder::spawn_llm_judge_if_eligible(
-            db_arc.clone(),
-            instance_id.clone(),
-            1, // flows always have 1 iteration
-            verification_passed,
-            was_stopped,
-        );
-
-        // Trigger RAG judge if retrieval events were captured
-        learning_recorder::spawn_rag_judge_if_eligible(db_arc, instance_id);
-    });
-}
+// record_flow_learning removed — was checkpoint_db-dependent.
+// Flow learning recording should be migrated to PG in the future.

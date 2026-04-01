@@ -9,6 +9,7 @@ export { AgenticSettings } from "./AgenticSettings";
 export { SelfHealingSettings } from "./SelfHealingSettings";
 export { OtelSettings } from "./OtelSettings";
 export { ContainerSettings } from "./ContainerSettings";
+export { SecuritySettings } from "./SecuritySettings";
 export { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 export { SectionHeader } from "./SectionHeader";
 export * from "./types";

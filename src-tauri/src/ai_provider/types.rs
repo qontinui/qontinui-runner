@@ -10,6 +10,10 @@ pub struct AiResponse {
     pub input_tokens: Option<u64>,
     /// Output tokens generated (available for API providers only)
     pub output_tokens: Option<u64>,
+    /// Tokens written to Anthropic prompt cache (1.25x base input price)
+    pub cache_creation_tokens: Option<u64>,
+    /// Tokens read from Anthropic prompt cache (0.1x base input price)
+    pub cache_read_tokens: Option<u64>,
 }
 
 impl AiResponse {
@@ -21,6 +25,35 @@ impl AiResponse {
             error: None,
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+        }
+    }
+
+    /// Create a successful response with token and cache information
+    pub fn success_with_cache_tokens(
+        output: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Self {
+        Self {
+            success: true,
+            output,
+            error: None,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cache_creation_tokens: if cache_creation_tokens > 0 {
+                Some(cache_creation_tokens)
+            } else {
+                None
+            },
+            cache_read_tokens: if cache_read_tokens > 0 {
+                Some(cache_read_tokens)
+            } else {
+                None
+            },
         }
     }
 
@@ -32,6 +65,8 @@ impl AiResponse {
             error: None,
             input_tokens: None,
             output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
         }
     }
 
@@ -43,6 +78,8 @@ impl AiResponse {
             error: Some(message),
             input_tokens: None,
             output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
         }
     }
 
@@ -54,6 +91,8 @@ impl AiResponse {
             error: Some(message),
             input_tokens: None,
             output_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
         }
     }
 

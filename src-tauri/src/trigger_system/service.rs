@@ -453,7 +453,8 @@ impl TriggerService {
                     &event.variables,
                     &trigger.name,
                     event.chain_depth,
-                );
+                )
+                .await;
 
                 match exec_result {
                     Ok(execution_id) => {

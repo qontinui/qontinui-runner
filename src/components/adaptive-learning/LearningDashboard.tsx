@@ -3,7 +3,7 @@
  *
  * Shows playbook size, curated examples, template tracking, GEPA runs,
  * trend charts (lesson growth, domain distribution, helpfulness), and
- * auto-refreshes on learning_update events or every 60 seconds.
+ * auto-refreshes on learning-update events or every 60 seconds.
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::database::CheckpointDb;
+use crate::database::pg::PgDb;
 use crate::unified_workflow_executor::get_parent_task_id;
 
 /// Status of a step checkpoint.
@@ -184,7 +184,7 @@ impl StepCheckpoint {
 /// - Clearing checkpoints for re-execution
 #[derive(Clone)]
 pub struct CheckpointManager {
-    db: Arc<CheckpointDb>,
+    db: Arc<PgDb>,
     workflow_type: String,
 }
 
@@ -192,14 +192,22 @@ impl std::fmt::Debug for CheckpointManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckpointManager")
             .field("workflow_type", &self.workflow_type)
-            .field("db", &"<CheckpointDb>")
+            .field("db", &"<PgDb>")
             .finish()
     }
 }
 
 impl CheckpointManager {
-    /// Create a new checkpoint manager.
-    pub fn new(db: Arc<CheckpointDb>, workflow_type: impl Into<String>) -> Self {
+    /// Create a new checkpoint manager using PgDb::global().
+    pub fn new(workflow_type: impl Into<String>) -> Self {
+        Self {
+            db: PgDb::global(),
+            workflow_type: workflow_type.into(),
+        }
+    }
+
+    /// Create a new checkpoint manager with an explicit PgDb.
+    pub fn with_db(db: Arc<PgDb>, workflow_type: impl Into<String>) -> Self {
         Self {
             db,
             workflow_type: workflow_type.into(),
@@ -231,9 +239,9 @@ impl CheckpointManager {
         if parent_id != checkpoint.execution_id {
             let mut modified = checkpoint.clone();
             modified.execution_id = parent_id;
-            self.db.save_workflow_step_checkpoint(&modified)
+            self.db.save_workflow_step_checkpoint_sync(&modified)
         } else {
-            self.db.save_workflow_step_checkpoint(checkpoint)
+            self.db.save_workflow_step_checkpoint_sync(checkpoint)
         }
     }
 
@@ -247,7 +255,7 @@ impl CheckpointManager {
         iteration: Option<u32>,
     ) -> Result<Vec<StepCheckpoint>, String> {
         self.db
-            .get_workflow_step_checkpoints(execution_id, phase, iteration)
+            .get_workflow_step_checkpoints_sync(execution_id, phase, iteration)
     }
 
     /// Get the last completed step index for a phase/iteration.
@@ -292,7 +300,7 @@ impl CheckpointManager {
         );
 
         self.db
-            .delete_workflow_step_checkpoints(execution_id, Some(phase), Some(iteration))
+            .delete_workflow_step_checkpoints_sync(execution_id, Some(phase), Some(iteration))
     }
 
     /// Clear all checkpoints for an execution.
@@ -305,7 +313,7 @@ impl CheckpointManager {
         );
 
         self.db
-            .delete_workflow_step_checkpoints(execution_id, None, None)
+            .delete_workflow_step_checkpoints_sync(execution_id, None, None)
     }
 
     /// Check if a step has already been completed successfully.

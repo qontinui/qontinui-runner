@@ -559,13 +559,13 @@ fn extract_json_from_response(response: &str) -> Result<String, String> {
 
 /// Async wrapper for generate_task_summary
 pub async fn generate_task_summary_async(
-    db: Arc<CheckpointDb>,
     task_run_id: String,
     doctor_handle: Option<DoctorHandle>,
     model_override: Option<String>,
     provider_override: Option<String>,
 ) -> Result<SummaryResult, String> {
     tokio::task::spawn_blocking(move || {
+        let db = CheckpointDb::global();
         generate_task_summary(
             &db,
             &task_run_id,

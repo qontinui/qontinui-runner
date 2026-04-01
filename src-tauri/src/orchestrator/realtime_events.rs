@@ -26,6 +26,12 @@ pub const EVENT_CHECKPOINT_CREATED: &str = "checkpoint-created";
 /// Event channel for task status changes
 pub const EVENT_TASK_STATUS_CHANGE: &str = "task-status-change";
 
+/// Event channel for performance drift detection (online learning)
+pub const EVENT_DRIFT_DETECTED: &str = "drift-detected";
+
+/// Event channel for model routing decisions (online learning)
+pub const EVENT_MODEL_ROUTING_DECISION: &str = "model-routing-decision";
+
 // ============================================================================
 // Learning Update Events
 // ============================================================================
@@ -292,6 +298,155 @@ pub fn emit_task_completed(
         None,
         Some(verification_passed),
     );
+}
+
+// ============================================================================
+// Cost Optimization Events
+// ============================================================================
+
+pub const EVENT_COST_UPDATE: &str = "cost-update";
+pub const EVENT_BUDGET_WARNING: &str = "budget-warning";
+pub const EVENT_COST_ANOMALY: &str = "cost-anomaly";
+
+/// Payload for cost update events (emitted after each AI call).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostUpdatePayload {
+    pub task_run_id: String,
+    pub phase: String,
+    pub iteration: Option<u32>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_usd: f64,
+    pub cumulative_cost_usd: f64,
+    pub cache_hit_rate: f64,
+    pub timestamp: i64,
+}
+
+pub fn emit_cost_update(
+    app_handle: &tauri::AppHandle,
+    task_run_id: &str,
+    phase: &str,
+    iteration: Option<u32>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
+    cost_usd: f64,
+    cumulative_cost_usd: f64,
+) {
+    let total_input = input_tokens + cache_creation_tokens + cache_read_tokens;
+    let cache_hit_rate = if total_input > 0 {
+        cache_read_tokens as f64 / total_input as f64
+    } else {
+        0.0
+    };
+
+    let payload = CostUpdatePayload {
+        task_run_id: task_run_id.to_string(),
+        phase: phase.to_string(),
+        iteration,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        cost_usd,
+        cumulative_cost_usd,
+        cache_hit_rate,
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
+
+    debug!(
+        "Emitting cost update: task={}, phase={}, cost=${:.4}",
+        task_run_id, phase, cost_usd
+    );
+
+    if let Err(e) = app_handle.emit(EVENT_COST_UPDATE, &payload) {
+        debug!("Failed to emit cost update event: {}", e);
+    }
+}
+
+/// Payload for budget warning events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetWarningPayload {
+    pub task_run_id: String,
+    pub remaining_fraction: f64,
+    pub total_cost_usd: f64,
+    pub budget_limit_usd: f64,
+    pub message: String,
+    pub timestamp: i64,
+}
+
+pub fn emit_budget_warning(
+    app_handle: &tauri::AppHandle,
+    task_run_id: &str,
+    remaining_fraction: f64,
+    total_cost_usd: f64,
+    budget_limit_usd: f64,
+    message: &str,
+) {
+    let payload = BudgetWarningPayload {
+        task_run_id: task_run_id.to_string(),
+        remaining_fraction,
+        total_cost_usd,
+        budget_limit_usd,
+        message: message.to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
+
+    debug!(
+        "Emitting budget warning: task={}, remaining={:.0}%",
+        task_run_id,
+        remaining_fraction * 100.0
+    );
+
+    if let Err(e) = app_handle.emit(EVENT_BUDGET_WARNING, &payload) {
+        debug!("Failed to emit budget warning event: {}", e);
+    }
+}
+
+/// Payload for cost anomaly events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostAnomalyPayload {
+    pub task_run_id: String,
+    pub cost_usd: f64,
+    pub mean_cost_usd: f64,
+    pub std_dev: f64,
+    pub z_score: f64,
+    pub message: String,
+    pub timestamp: i64,
+}
+
+pub fn emit_cost_anomaly(
+    app_handle: &tauri::AppHandle,
+    task_run_id: &str,
+    cost_usd: f64,
+    mean_cost_usd: f64,
+    std_dev: f64,
+    z_score: f64,
+) {
+    let payload = CostAnomalyPayload {
+        task_run_id: task_run_id.to_string(),
+        cost_usd,
+        mean_cost_usd,
+        std_dev,
+        z_score,
+        message: format!(
+            "Cost anomaly detected: ${:.4} is {:.1} std devs above mean ${:.4}",
+            cost_usd, z_score, mean_cost_usd
+        ),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+    };
+
+    debug!(
+        "Emitting cost anomaly: task={}, z_score={:.1}",
+        task_run_id, z_score
+    );
+
+    if let Err(e) = app_handle.emit(EVENT_COST_ANOMALY, &payload) {
+        debug!("Failed to emit cost anomaly event: {}", e);
+    }
 }
 
 // ============================================================================

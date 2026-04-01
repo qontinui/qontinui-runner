@@ -206,6 +206,8 @@ pub struct TaskContext {
     pub criteria_count: Option<usize>,
     /// File paths involved (for pattern analysis)
     pub file_paths: Vec<String>,
+    /// Current workflow phase (for per-phase model routing via PhaseModelRouter)
+    pub phase: Option<String>,
 }
 
 impl TaskContext {
@@ -441,6 +443,40 @@ impl TaskRouter {
         );
         assessment.selected_model
     }
+
+    /// Route a task using the online learning bandit, falling back to the
+    /// static heuristic router when the bandit lacks data.
+    ///
+    /// Returns `(model_name, routing_decision)` where the decision contains
+    /// metadata about how the model was selected (for observability).
+    pub fn route_task_with_bandit(
+        &self,
+        context: &TaskContext,
+        bandit: &mut crate::online_learning::model_router::ModelRouterBandit,
+    ) -> (String, crate::online_learning::model_router::ModelRoutingDecision) {
+        use crate::online_learning::context::ModelRoutingContext;
+
+        // Build bandit context from TaskContext
+        let bandit_context = ModelRoutingContext {
+            prompt_length: context.prompt.len(),
+            file_count: context.file_count.unwrap_or(0),
+            complexity_tier: {
+                let assessment = self.assess_and_route(context);
+                format!("{:?}", assessment.complexity).to_lowercase()
+            },
+            domain: "unknown".to_string(), // Domain not available at routing time
+            has_ui: false, // Not reliably available at routing time
+            step_type: context.phase.clone(),
+        };
+
+        // Get the static fallback model
+        let fallback_model = self.route_task(context);
+
+        // Try the bandit
+        let decision = bandit.route(&bandit_context, &fallback_model);
+
+        (decision.model.clone(), decision)
+    }
 }
 
 // ============================================================================
@@ -458,6 +494,61 @@ pub fn model_for_tier(tier: crate::orchestrator::agent_roles::ModelTier) -> Stri
         ModelTier::Simple => config.simple_model,
         ModelTier::Medium => config.medium_model,
         ModelTier::Complex => config.complex_model,
+    }
+}
+
+// ============================================================================
+// Q-table-enhanced routing
+// ============================================================================
+
+/// Select model tier using the PhaseModelRouter Q-table when sufficient data exists,
+/// falling back to the heuristic TaskRouter assessment otherwise.
+///
+/// Returns the model ID string (e.g., "claude-sonnet-4-20250514").
+pub fn route_with_learning(
+    context: &TaskContext,
+    phase_router: Option<&crate::autoresearch::model_q_router::PhaseModelRouter>,
+    routing_config: &RoutingConfig,
+) -> String {
+    // If we have a phase router and phase context, try Q-table first
+    if let (Some(router), Some(phase)) = (phase_router, context.phase.as_deref()) {
+        // Build TaskState from context (need domain_tags and complexity_tier)
+        // For now, use a simplified state based on prompt characteristics
+        let state = crate::autoresearch::q_router::TaskState {
+            primary_domain: crate::autoresearch::q_router::Domain::Backend, // default
+            complexity: infer_complexity_tier(context, routing_config),
+            has_ui_component: context.prompt.to_lowercase().contains("ui-bridge")
+                || context.prompt.to_lowercase().contains("sdk"),
+        };
+
+        if router.has_sufficient_data(&state, phase) {
+            let tier = router.greedy_tier(&state, phase);
+            let model = model_for_tier(tier);
+            info!(
+                "PhaseModelRouter selected {} for phase '{}' (state: {})",
+                model,
+                phase,
+                state.to_key()
+            );
+            return model;
+        }
+    }
+
+    // Fallback to heuristic router
+    let router = TaskRouter::new(routing_config.clone());
+    router.route_task(context)
+}
+
+fn infer_complexity_tier(
+    context: &TaskContext,
+    config: &RoutingConfig,
+) -> crate::autoresearch::q_router::ComplexityTier {
+    let router = TaskRouter::new(config.clone());
+    let assessment = router.assess_and_route(context);
+    match assessment.complexity {
+        TaskComplexity::Simple => crate::autoresearch::q_router::ComplexityTier::Simple,
+        TaskComplexity::Medium => crate::autoresearch::q_router::ComplexityTier::Moderate,
+        TaskComplexity::Complex => crate::autoresearch::q_router::ComplexityTier::Complex,
     }
 }
 

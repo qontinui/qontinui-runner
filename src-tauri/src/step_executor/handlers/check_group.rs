@@ -44,11 +44,9 @@ impl StepHandler for CheckGroupHandler {
             step_name, group_id
         );
 
-        // Get the checkpoint_db from app_state
-        let db = &context.app_state.checkpoint_db;
-
         // Get the group
-        let group = match db.get_check_group(&group_id) {
+        let db = &context.app_state.pg_db;
+        let group = match db.get_check_group(&group_id).await {
             Ok(Some(g)) => g,
             Ok(None) => {
                 return StepHandlerResult::failure(format!("Check group not found: {}", group_id));
@@ -67,7 +65,7 @@ impl StepHandler for CheckGroupHandler {
         }
 
         // Get checks in the group
-        let checks = match db.get_checks_in_group(&group_id) {
+        let checks = match db.get_checks_in_group(&group_id).await {
             Ok(c) => c,
             Err(e) => {
                 return StepHandlerResult::failure(format!("Failed to get checks in group: {}", e));

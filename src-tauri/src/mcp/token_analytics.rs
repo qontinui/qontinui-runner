@@ -212,53 +212,32 @@ pub async fn get_cost_per_interaction(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // checkpoint_db removed — token analytics not yet migrated to PG
     let days = params.days.unwrap_or(7);
-    let db = state.app_state.checkpoint_db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.get_cost_per_interaction(days))
-        .await
-        .map_err(|e| format!("spawn_blocking error: {}", e))
-        .and_then(|r| r)
-        .map_err(|e| {
-            error!("Failed to get cost per interaction: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
-    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": rows.len() })))
+    let rows: Vec<serde_json::Value> = vec![];
+    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 })))
 }
 
 /// GET /analytics/token-usage/page-complexity
 pub async fn get_page_complexity(
-    State(state): State<Arc<ApiState>>,
+    State(_state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // checkpoint_db removed — token analytics not yet migrated to PG
     let days = params.days.unwrap_or(7);
-    let db = state.app_state.checkpoint_db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.get_page_complexity_scores(days))
-        .await
-        .map_err(|e| format!("spawn_blocking error: {}", e))
-        .and_then(|r| r)
-        .map_err(|e| {
-            error!("Failed to get page complexity: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
-    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": rows.len() })))
+    let rows: Vec<serde_json::Value> = vec![];
+    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 })))
 }
 
 /// GET /analytics/token-usage/model-action-matrix
 pub async fn get_model_action_matrix(
-    State(state): State<Arc<ApiState>>,
+    State(_state): State<Arc<ApiState>>,
     Query(params): Query<TimeRangeParams>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // checkpoint_db removed — token analytics not yet migrated to PG
     let days = params.days.unwrap_or(7);
-    let db = state.app_state.checkpoint_db.clone();
-    let rows = tokio::task::spawn_blocking(move || db.get_model_action_success_rates(days))
-        .await
-        .map_err(|e| format!("spawn_blocking error: {}", e))
-        .and_then(|r| r)
-        .map_err(|e| {
-            error!("Failed to get model-action matrix: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?;
-    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": rows.len() })))
+    let rows: Vec<serde_json::Value> = vec![];
+    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 })))
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {

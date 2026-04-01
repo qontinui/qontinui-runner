@@ -82,8 +82,9 @@ impl StepHandler for WorkflowStepHandler {
         // 3. Load workflow from database
         let workflow = match context
             .app_state
-            .checkpoint_db
+            .pg_db
             .get_unified_workflow(&workflow_id)
+            .await
         {
             Ok(Some(w)) => w,
             Ok(None) => {
@@ -232,10 +233,6 @@ impl StepHandler for WorkflowStepHandler {
             info!("Nested workflow '{}' completed successfully", workflow.name);
             // PG-primary
             let _ = context.app_state.pg_db.complete_task_run(&execution_id).await;
-            let _ = context
-                .app_state
-                .checkpoint_db
-                .complete_task_run(&execution_id);
 
             StepHandlerResult::success_with_data(serde_json::json!({
                 "nested_workflow_id": workflow.id,
@@ -248,10 +245,6 @@ impl StepHandler for WorkflowStepHandler {
             warn!("{}", error_msg);
             // PG-primary
             let _ = context.app_state.pg_db.fail_task_run(&execution_id, &error_msg).await;
-            let _ = context
-                .app_state
-                .checkpoint_db
-                .fail_task_run(&execution_id, &error_msg);
 
             StepHandlerResult::failure_with_data(
                 error_msg,

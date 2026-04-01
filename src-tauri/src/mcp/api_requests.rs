@@ -184,44 +184,12 @@ pub async fn import_curl_to_library(
         format!("{} Request", parsed.method)
     });
 
-    // Create the saved API request
-    let create_request = crate::saved_api_requests::CreateSavedApiRequestRequest {
-        name,
-        description: String::new(),
-        category: request.category.unwrap_or_else(|| "imported".to_string()),
-        tags: vec![],
-        method: parsed.method,
-        url: parsed.url.clone(),
-        headers: parsed.headers,
-        body: parsed.body,
-        body_content_type: parsed.content_type,
-        timeout_ms: 30000,
-        follow_redirects: true,
-        variable_extractions: vec![],
-        assertions: vec![],
-        credential_id: None,
-    };
-
-    match state
-        .app_state
-        .checkpoint_db
-        .create_saved_api_request(&create_request)
-    {
-        Ok(saved) => {
-            info!(
-                "Saved API request to library: {} ({}) - {} {}",
-                saved.name, saved.id, saved.method, parsed.url
-            );
-            Ok(Json(ApiResponse::success(saved)))
-        }
-        Err(e) => {
-            error!("Failed to save API request to library: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to save API request: {}", e))),
-            ))
-        }
-    }
+    // checkpoint_db removed — saved API requests not yet migrated to PG
+    let _ = name;
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error("Saved API requests: SQLite removed, not yet migrated to PG".to_string())),
+    ))
 }
 
 /// Create routes for this module.

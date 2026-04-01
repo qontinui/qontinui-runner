@@ -20,7 +20,6 @@ pub fn get_meta_optimizer_recommendations(
     status: Option<String>,
 ) -> Result<Vec<Recommendation>, String> {
     crate::meta_optimizer::recommendations::list_recommendations(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         optimizer_type.as_deref(),
         status.as_deref(),
@@ -33,7 +32,6 @@ pub fn apply_meta_optimizer_recommendation(
     recommendation_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::recommendations::apply_recommendation_with_side_effects(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &recommendation_id,
     )
@@ -45,7 +43,6 @@ pub fn reject_meta_optimizer_recommendation(
     recommendation_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::recommendations::reject_recommendation(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &recommendation_id,
     )
@@ -57,7 +54,6 @@ pub fn rollback_meta_optimizer_recommendation(
     recommendation_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::recommendations::rollback_recommendation(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &recommendation_id,
     )
@@ -71,7 +67,6 @@ pub fn get_prompt_variants(
     agent_type: Option<String>,
 ) -> Result<Vec<PromptVariant>, String> {
     crate::meta_optimizer::prompt_registry::list_variants(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         agent_type.as_deref(),
     )
@@ -83,7 +78,6 @@ pub fn activate_prompt_variant(
     variant_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::prompt_registry::activate_variant(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &variant_id,
     )
@@ -96,7 +90,6 @@ pub fn get_meta_optimizer_runs(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<MetaOptimizerRun>, String> {
     crate::meta_optimizer::recommendations::list_optimizer_runs(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
     )
 }
@@ -111,7 +104,6 @@ pub fn get_meta_optimizer_progress(
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let summary =
         crate::meta_optimizer::snapshots::get_progress_summary(
-            &app_state.checkpoint_db,
             &app_state.pg_db,
             cat,
         )?;
@@ -126,7 +118,6 @@ pub fn capture_meta_optimizer_baseline(
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     let snapshot =
         crate::meta_optimizer::snapshots::capture_baseline(
-            &app_state.checkpoint_db,
             &app_state.pg_db,
             cat,
         )?;
@@ -139,7 +130,6 @@ pub fn get_meta_optimizer_snapshots(
     snapshot_type: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let snapshots = crate::meta_optimizer::snapshots::list_snapshots(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         snapshot_type.as_deref(),
     )?;
@@ -154,7 +144,6 @@ pub fn get_agent_effectiveness(
     limit: Option<u32>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentTraceAggregate>, String> {
     crate::database::pipeline_traces::get_agent_trace_aggregates(
-        &app_state.checkpoint_db,
         limit.unwrap_or(200),
     )
 }
@@ -169,7 +158,6 @@ pub fn get_meta_optimizer_failure_analysis(
 ) -> Result<crate::meta_optimizer::failure_analysis::FailureAnalysis, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
     crate::meta_optimizer::failure_analysis::get_failure_analysis(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         days.unwrap_or(30),
         cat,
@@ -183,7 +171,6 @@ pub fn get_recommendation_outcomes(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let recs = crate::meta_optimizer::recommendations::list_recommendations(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         None,
         Some("applied"),
@@ -209,7 +196,6 @@ pub fn reevaluate_recommendation_outcome(
     recommendation_id: String,
 ) -> Result<serde_json::Value, String> {
     let outcome = crate::meta_optimizer::snapshots::evaluate_recommendation_outcome(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &recommendation_id,
     )?;
@@ -225,7 +211,6 @@ pub fn get_agent_cost_effectiveness(
     days: Option<i64>,
 ) -> Result<Vec<crate::database::pipeline_traces::CostEffectivenessPoint>, String> {
     crate::database::pipeline_traces::get_agent_cost_effectiveness(
-        &app_state.checkpoint_db,
         agent_type.as_deref(),
         days.unwrap_or(90),
     )
@@ -239,7 +224,6 @@ pub fn get_agent_interaction_matrix(
     days: Option<i64>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentInteraction>, String> {
     crate::database::pipeline_traces::get_agent_interaction_matrix(
-        &app_state.checkpoint_db,
         days.unwrap_or(30),
     )
 }
@@ -250,7 +234,6 @@ pub fn get_agent_cascade_effect(
     recommendation_id: String,
 ) -> Result<Vec<crate::database::pipeline_traces::CascadeEffect>, String> {
     crate::database::pipeline_traces::get_agent_cascade_effect(
-        &app_state.checkpoint_db,
         &recommendation_id,
     )
 }
@@ -264,7 +247,6 @@ pub fn start_canary_rollout(
     percentage: Option<i64>,
 ) -> Result<String, String> {
     crate::meta_optimizer::canary::start_canary(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &recommendation_id,
         percentage.unwrap_or(10),
@@ -276,11 +258,9 @@ pub fn get_canary_rollouts(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let rollouts = crate::meta_optimizer::canary::get_active_canaries(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
     )?;
     let recs = crate::meta_optimizer::recommendations::list_recommendations(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         None,
         None,
@@ -308,7 +288,6 @@ pub fn promote_canary_rollout(
     canary_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::canary::promote_canary(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &canary_id,
     )
@@ -320,7 +299,6 @@ pub fn rollback_canary_rollout(
     canary_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::canary::rollback_canary(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &canary_id,
     )
@@ -396,7 +374,6 @@ pub fn get_eval_specs(
     target_agent: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalSpec>, String> {
     crate::meta_optimizer::eval_spec::list_eval_specs(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         target_agent.as_deref(),
     )
@@ -408,7 +385,6 @@ pub fn create_eval_spec(
     spec: crate::meta_optimizer::eval_spec::EvalSpec,
 ) -> Result<(), String> {
     crate::meta_optimizer::eval_spec::save_eval_spec(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &spec,
     )
@@ -420,7 +396,6 @@ pub fn delete_eval_spec(
     spec_id: String,
 ) -> Result<(), String> {
     crate::meta_optimizer::eval_spec::delete_eval_spec(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &spec_id,
     )
@@ -433,7 +408,6 @@ pub fn get_eval_results(
     recommendation_id: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalResult>, String> {
     crate::meta_optimizer::eval_spec::list_eval_results(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         spec_id.as_deref(),
         recommendation_id.as_deref(),
@@ -446,7 +420,6 @@ pub fn run_recommendation_eval(
     recommendation_id: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalResult, String> {
     crate::meta_optimizer::eval_runner::validate_recommendation(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &recommendation_id,
     )
@@ -458,11 +431,9 @@ pub fn generate_default_eval_spec(
     target_agent: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalSpec, String> {
     let spec = crate::meta_optimizer::eval_spec::generate_default_spec(
-        &app_state.checkpoint_db,
         &target_agent,
     )?;
     crate::meta_optimizer::eval_spec::save_eval_spec(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &spec,
     )?;
@@ -496,7 +467,6 @@ pub fn evaluate_with_io(
         let period_end = chrono::Utc::now().to_rfc3339();
 
         crate::database::pipeline_traces::get_agent_aggregates_for_period(
-            &app_state.checkpoint_db,
             agent,
             &period_start,
             &period_end,
@@ -556,7 +526,6 @@ pub fn run_robustness_test(
     recommendation_id: Option<String>,
 ) -> Result<crate::meta_optimizer::robustness::RobustnessReport, String> {
     crate::meta_optimizer::robustness::run_robustness_test(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &agent_type,
         prompt_variant_id.as_deref(),
@@ -571,7 +540,6 @@ pub fn get_robustness_reports(
     recommendation_id: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::robustness::RobustnessReport>, String> {
     crate::meta_optimizer::robustness::list_robustness_reports(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         prompt_variant_id.as_deref(),
         recommendation_id.as_deref(),
@@ -586,7 +554,6 @@ pub fn get_golden_datasets(
     agent_type: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::golden_dataset::GoldenDataset>, String> {
     crate::meta_optimizer::golden_dataset::list_golden_datasets(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         agent_type.as_deref(),
     )
@@ -599,7 +566,6 @@ pub fn build_golden_dataset(
     max_entries: Option<usize>,
 ) -> Result<crate::meta_optimizer::golden_dataset::GoldenDataset, String> {
     crate::meta_optimizer::golden_dataset::build_from_history(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &agent_type,
         max_entries.unwrap_or(50),
@@ -645,7 +611,6 @@ pub fn convert_comparison_to_recommendation(
     comparison_id: String,
 ) -> Result<Option<String>, String> {
     crate::meta_optimizer::comparison_bridge::comparison_to_recommendation(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         &comparison_id,
     )
@@ -657,16 +622,15 @@ pub fn convert_comparison_to_recommendation(
 pub fn get_prompt_optimization_status(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<serde_json::Value, String> {
-    let db = &app_state.checkpoint_db;
     let pg_db = &app_state.pg_db;
 
     // Get prompt group metrics
-    let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples(db, 500)?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, db, pg_db);
+    let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)?;
+    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
 
     // Get active evolution entries (canaries in progress)
     let evolution =
-        crate::meta_optimizer::prompt_evolution::get_evolution_history(db, pg_db, None, 50)?;
+        crate::meta_optimizer::prompt_evolution::get_evolution_history(pg_db, None, 50)?;
     let active_canaries: Vec<_> = evolution
         .iter()
         .filter(|e| e.canary_verdict.is_none())
@@ -685,13 +649,12 @@ pub fn get_prompt_group_metrics(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::meta_optimizer::prompt_extractor::PromptGroupMetrics>, String> {
     let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples(
-            &app_state.checkpoint_db,
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(
+            &app_state.pg_db,
             500,
         )?;
     Ok(crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(
         &samples,
-        &app_state.checkpoint_db,
         &app_state.pg_db,
     ))
 }
@@ -704,8 +667,8 @@ pub fn get_prompt_optimization_evidence(
     max_successes: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     let (failures, successes) =
-        crate::meta_optimizer::prompt_extractor::collect_evidence_samples(
-            &app_state.checkpoint_db,
+        crate::meta_optimizer::prompt_extractor::collect_evidence_samples_pg(
+            &app_state.pg_db,
             &phase,
             "",
             max_failures.unwrap_or(5),
@@ -726,7 +689,6 @@ pub fn get_prompt_evolution_history(
     limit: Option<usize>,
 ) -> Result<Vec<crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry>, String> {
     crate::meta_optimizer::prompt_evolution::get_evolution_history(
-        &app_state.checkpoint_db,
         &app_state.pg_db,
         agent_type.as_deref(),
         limit.unwrap_or(50),
@@ -746,11 +708,10 @@ pub async fn get_prompt_evolution_diff(
     app_state: State<'_, Arc<AppState>>,
     evolution_id: String,
 ) -> Result<serde_json::Value, String> {
-    let db = &app_state.checkpoint_db;
     let pg_db = &app_state.pg_db;
 
     // Get the evolution entry
-    let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(db, pg_db, None, 100)?;
+    let history = crate::meta_optimizer::prompt_evolution::get_evolution_history(pg_db, None, 100)?;
     let entry = history
         .iter()
         .find(|e| e.id == evolution_id)

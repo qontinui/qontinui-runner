@@ -204,8 +204,9 @@ impl StepExecutor {
         // Get the test from database
         let verification_test = self
             .app_state
-            .checkpoint_db
-            .get_verification_test(test_id)?
+            .pg_db
+            .get_verification_test(test_id)
+            .await?
             .ok_or_else(|| format!("Verification test not found: {}", test_id))?;
 
         // Convert database TestType to test_executor TestType
@@ -223,7 +224,7 @@ impl StepExecutor {
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
         // Parse repo test config if present
-        let repo_test_config = verification_test
+        let repo_test_config: Option<crate::test_executor::RepoTestConfig> = verification_test
             .repo_test_config
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -1710,11 +1711,9 @@ impl StepExecutor {
             step_name, group_id
         );
 
-        // Get the checkpoint_db from app_state
-        let db = &self.app_state.checkpoint_db;
-
         // Get the group
-        let group = match db.get_check_group(&group_id) {
+        let db = &self.app_state.pg_db;
+        let group = match db.get_check_group(&group_id).await {
             Ok(Some(g)) => g,
             Ok(None) => {
                 return (
@@ -1745,7 +1744,7 @@ impl StepExecutor {
         }
 
         // Get checks in the group
-        let checks = match db.get_checks_in_group(&group_id) {
+        let checks = match db.get_checks_in_group(&group_id).await {
             Ok(c) => c,
             Err(e) => {
                 return (

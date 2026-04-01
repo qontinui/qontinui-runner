@@ -26,15 +26,14 @@
 
 use tracing::{debug, info};
 
-use crate::database::CheckpointDb;
 
 // Token tracking, UI Bridge, environment readiness, response mode, and token
 // estimation extracted to phase_helpers module.
 pub(super) use super::phase_helpers::{
     build_llm_metrics, check_environment_readiness, compute_embedding_sync, estimate_tokens,
     execute_prompt_response_mode, get_active_sdk_app_name, record_phase_token_usage,
-    record_phase_token_usage_with_target, try_auto_connect_sdk_for_ui_workflow,
-    REFLECTION_MODE_PREAMBLE,
+    record_phase_token_usage_with_cache, record_phase_token_usage_with_target,
+    try_auto_connect_sdk_for_ui_workflow, REFLECTION_MODE_PREAMBLE,
 };
 
 // Phase executor submodules (extracted from this file)
@@ -57,99 +56,10 @@ pub use verification::VerificationExecutor;
 ///
 /// Returns None if no spans exist or the query fails.
 fn build_execution_timing_context(
-    checkpoint_db: &CheckpointDb,
-    execution_id: &str,
+    _execution_id: &str,
 ) -> Option<String> {
-    // TODO: Wire to PG when get_execution_spans PG wrapper is implemented
-    let spans = checkpoint_db
-        .get_execution_spans(Some(execution_id), None, None, Some(100))
-        .ok()?;
-
-    if spans.is_empty() {
-        return None;
-    }
-
-    let mut sections = Vec::new();
-
-    // Phase timings
-    let phase_spans: Vec<_> = spans
-        .iter()
-        .filter(|s| s.name.starts_with("workflow.phase."))
-        .collect();
-    if !phase_spans.is_empty() {
-        let mut phase_lines = vec!["**Phase Timings:**".to_string()];
-        for span in &phase_spans {
-            let phase_name = span
-                .name
-                .strip_prefix("workflow.phase.")
-                .unwrap_or(&span.name);
-            let duration = span
-                .duration_ms
-                .map(format_duration_ms)
-                .unwrap_or_else(|| "in progress".to_string());
-            let status = if !span.success { " (failed)" } else { "" };
-            phase_lines.push(format!("- {}: {}{}", phase_name, duration, status));
-        }
-        sections.push(phase_lines.join("\n"));
-    }
-
-    // AI session stats
-    let ai_spans: Vec<_> = spans.iter().filter(|s| s.name == "ai.session").collect();
-    if !ai_spans.is_empty() {
-        let total_ms: i64 = ai_spans.iter().filter_map(|s| s.duration_ms).sum();
-        let count = ai_spans.len();
-        let avg_ms = if count > 0 {
-            total_ms / count as i64
-        } else {
-            0
-        };
-        let failed = ai_spans.iter().filter(|s| !s.success).count();
-
-        let mut ai_lines = vec!["**AI Sessions:**".to_string()];
-        ai_lines.push(format!(
-            "- Total: {} sessions, {} total",
-            count,
-            format_duration_ms(total_ms)
-        ));
-        ai_lines.push(format!(
-            "- Average: {} per session",
-            format_duration_ms(avg_ms)
-        ));
-        if failed > 0 {
-            ai_lines.push(format!("- Failed: {} sessions", failed));
-        }
-        sections.push(ai_lines.join("\n"));
-    }
-
-    // Slow operations (>5s)
-    let slow_spans: Vec<_> = spans
-        .iter()
-        .filter(|s| s.duration_ms.unwrap_or(0) > 5000)
-        .collect();
-    if !slow_spans.is_empty() {
-        let mut slow_lines = vec!["**Slow Operations (>5s):**".to_string()];
-        for span in &slow_spans {
-            let duration = span.duration_ms.map(format_duration_ms).unwrap_or_default();
-            let error_suffix = if let Some(ref err) = span.error {
-                format!(" - FAILED: {}", err)
-            } else if !span.success {
-                " - FAILED".to_string()
-            } else {
-                String::new()
-            };
-            slow_lines.push(format!("- {}: {}{}", span.name, duration, error_suffix));
-        }
-        sections.push(slow_lines.join("\n"));
-    }
-
-    if sections.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "---\n\n### Execution Timing\n\n{}",
-        sections.join("\n\n")
-    ))
+    // Execution timing context removed — all persistence now via PgDb.
+    None
 }
 
 /// Format milliseconds into a human-readable duration string.
@@ -180,7 +90,6 @@ fn format_duration_ms(ms: i64) -> String {
 /// - Recent iteration (N-1): Full context
 /// - Old iterations (1..N-2): ~400 chars each
 async fn build_compressed_iteration_history(
-    checkpoint_db: &std::sync::Arc<CheckpointDb>,
     execution_id: &str,
     current_iteration: u32,
     process_status_summary: Option<&str>,
@@ -905,7 +814,7 @@ async fn build_compressed_iteration_history(
             .flat_map(|o| extract_changed_files_from_observation(&o.content))
             .collect();
         if let Some(wf_name) = workflow_name {
-            if let Some(section) = build_impact_context(checkpoint_db, wf_name, &changed).await {
+            if let Some(section) = build_impact_context(wf_name, &changed).await {
                 let tokens = estimate_tokens(&section);
                 let capped_tokens = tokens.min(600);
                 if capped_tokens <= budget_remaining {
@@ -1171,7 +1080,6 @@ fn extract_changed_files_from_observation(content: &str) -> Vec<String> {
 /// For each changed file, looks up the architecture model for impact data.
 /// Returns None if no architecture data exists or no impacts found.
 async fn build_impact_context(
-    checkpoint_db: &std::sync::Arc<crate::database::CheckpointDb>,
     workflow_name: &str,
     changed_files: &[String],
 ) -> Option<String> {
@@ -1375,8 +1283,7 @@ fn extract_and_preread_failure_files(
 /// prior iterations, then reads the current state of those files. This gives the
 /// AI immediate access to files it previously modified without needing tool calls.
 fn preread_previously_edited_files(
-    checkpoint_db: &CheckpointDb,
-    execution_id: &str,
+    _execution_id: &str,
     current_iteration: u32,
     project_path: Option<&str>,
     max_files: usize,
@@ -1390,10 +1297,8 @@ fn preread_previously_edited_files(
         return String::new();
     }
 
-    // Load observations from all previous iterations
-    let all_observations = checkpoint_db
-        .list_task_knowledge(execution_id, Some("observation"), false)
-        .unwrap_or_default();
+    // Observation loading removed — all persistence now via PgDb.
+    let all_observations: Vec<serde_json::Value> = Vec::new();
 
     // Extract changed files from observation content (git diff stat lines)
     let mut seen = HashSet::new();
@@ -1401,9 +1306,9 @@ fn preread_previously_edited_files(
 
     for obs in all_observations
         .iter()
-        .filter(|o| o.iteration < current_iteration)
+        .filter(|o| o.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0) < current_iteration as u64)
     {
-        for file_str in extract_changed_files_from_observation(&obs.content) {
+        for file_str in extract_changed_files_from_observation(obs.get("content").and_then(|v| v.as_str()).unwrap_or("")) {
             if seen.contains(&file_str) {
                 continue;
             }

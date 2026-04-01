@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 
 /// A single entry in the prompt evolution history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +45,6 @@ pub fn compute_prompt_hash(prompt: &str) -> String {
 
 /// Record a new prompt evolution entry when a meta-prompt rewrite is created.
 pub fn record_evolution(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     parent_variant_id: Option<&str>,
@@ -57,7 +55,7 @@ pub fn record_evolution(
     score_before: Option<f64>,
 ) -> Result<String, String> {
     record_evolution_full(
-        db,
+        
         pg_db,
         agent_type,
         parent_variant_id,
@@ -72,7 +70,6 @@ pub fn record_evolution(
 
 /// Record a new prompt evolution entry with baseline hash and rejection count.
 pub fn record_evolution_full(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     parent_variant_id: Option<&str>,
@@ -86,7 +83,7 @@ pub fn record_evolution_full(
     let id = format!("pe-{}", uuid::Uuid::new_v4());
 
     // Count consecutive rejections for this agent_type (for circuit breaker)
-    let consecutive_rejections = count_consecutive_rejections(db, pg_db, agent_type);
+    let consecutive_rejections = count_consecutive_rejections(pg_db, agent_type);
 
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
@@ -104,7 +101,6 @@ pub fn record_evolution_full(
 /// Record evolution (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn record_evolution_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     parent_variant_id: Option<&str>,
@@ -114,12 +110,11 @@ pub fn record_evolution_with_pg(
     changes_summary: Option<&str>,
     score_before: Option<f64>,
 ) -> Result<String, String> {
-    record_evolution(db, pg_db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before)
+    record_evolution(pg_db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before)
 }
 
 /// Update the canary verdict and post-canary score for an evolution entry.
 pub fn update_verdict(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     evolution_id: &str,
     verdict: &str,
@@ -137,18 +132,16 @@ pub fn update_verdict(
 /// Update verdict (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn update_verdict_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     evolution_id: &str,
     verdict: &str,
     score_after: Option<f64>,
 ) -> Result<(), String> {
-    update_verdict(db, pg_db, evolution_id, verdict, score_after)
+    update_verdict(pg_db, evolution_id, verdict, score_after)
 }
 
 /// Update the canary verdict for an evolution entry identified by its variant_id.
 pub fn update_verdict_by_variant(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     variant_id: &str,
     verdict: &str,
@@ -163,18 +156,16 @@ pub fn update_verdict_by_variant(
 
 /// Update verdict by variant with PG dual-write (fire-and-forget).
 pub fn update_verdict_by_variant_with_pg(
-    db: &CheckpointDb,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
     variant_id: &str,
     verdict: &str,
     score_after: Option<f64>,
 ) -> Result<(), String> {
-    update_verdict_by_variant(db, pg_db, variant_id, verdict, score_after)
+    update_verdict_by_variant(pg_db, variant_id, verdict, score_after)
 }
 
 /// Get evolution history for an agent type (most recent first).
 pub fn get_evolution_history(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
     limit: usize,
@@ -188,7 +179,7 @@ pub fn get_evolution_history(
 
 /// Check whether there is an active (no verdict yet) evolution entry for an agent type.
 /// This indicates a canary is in progress and we should NOT create another rewrite.
-pub fn has_active_evolution(db: &CheckpointDb, pg_db: &Arc<PgDb>, agent_type: &str) -> bool {
+pub fn has_active_evolution(pg_db: &Arc<PgDb>, agent_type: &str) -> bool {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             pg_db.has_active_evolution(agent_type).await
@@ -200,7 +191,6 @@ pub fn has_active_evolution(db: &CheckpointDb, pg_db: &Arc<PgDb>, agent_type: &s
 /// Get the most recent evolution entry for an agent type that was rejected.
 /// Used to feed failure context back into the next optimization round.
 pub fn get_latest_rejected(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Option<PromptEvolutionEntry>, String> {
@@ -213,7 +203,7 @@ pub fn get_latest_rejected(
 
 /// Check the cooldown: returns true if the last evolution entry for this agent_type
 /// was created less than `cooldown_hours` ago.
-pub fn is_in_cooldown(db: &CheckpointDb, pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) -> bool {
+pub fn is_in_cooldown(pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) -> bool {
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cooldown_hours)).to_rfc3339();
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
@@ -228,7 +218,7 @@ pub fn is_in_cooldown(db: &CheckpointDb, pg_db: &Arc<PgDb>, agent_type: &str, co
 /// Looks at the most recent evolution entries and counts how many consecutive
 /// "reject" verdicts appear (stopping at the first non-reject). Used by the
 /// diminishing-returns circuit breaker.
-pub fn count_consecutive_rejections(db: &CheckpointDb, pg_db: &Arc<PgDb>, agent_type: &str) -> i32 {
+pub fn count_consecutive_rejections(pg_db: &Arc<PgDb>, agent_type: &str) -> i32 {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             pg_db.count_consecutive_rejections(agent_type).await
@@ -258,7 +248,6 @@ pub fn adaptive_cooldown_hours(consecutive_rejections: i32) -> i64 {
 /// Returns (variant_id, prompt_content) pairs for similarity comparison.
 /// Only fetches variants that were part of rejected evolution entries.
 pub fn get_rejected_prompt_contents(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Vec<(String, String)>, String> {
@@ -276,7 +265,6 @@ pub fn get_rejected_prompt_contents(
 /// be invalid (the prompt being compared against is different from when the
 /// canary started).
 pub fn has_baseline_drifted(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     current_prompt_hash: &str,
@@ -292,92 +280,83 @@ pub fn has_baseline_drifted(
 /// Get evolution history (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_evolution_history_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
     limit: usize,
 ) -> Result<Vec<PromptEvolutionEntry>, String> {
-    get_evolution_history(db, pg_db, agent_type, limit)
+    get_evolution_history(pg_db, agent_type, limit)
 }
 
 /// Check whether there is an active evolution (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn has_active_evolution_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> bool {
-    has_active_evolution(db, pg_db, agent_type)
+    has_active_evolution(pg_db, agent_type)
 }
 
 /// Get the most recent rejected evolution entry (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_latest_rejected_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Option<PromptEvolutionEntry>, String> {
-    get_latest_rejected(db, pg_db, agent_type)
+    get_latest_rejected(pg_db, agent_type)
 }
 
 /// Check cooldown (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn is_in_cooldown_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     cooldown_hours: i64,
 ) -> bool {
-    is_in_cooldown(db, pg_db, agent_type, cooldown_hours)
+    is_in_cooldown(pg_db, agent_type, cooldown_hours)
 }
 
 /// Count consecutive rejections (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn count_consecutive_rejections_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> i32 {
-    count_consecutive_rejections(db, pg_db, agent_type)
+    count_consecutive_rejections(pg_db, agent_type)
 }
 
 /// Get rejected prompt contents (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn get_rejected_prompt_contents_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    get_rejected_prompt_contents(db, pg_db, agent_type)
+    get_rejected_prompt_contents(pg_db, agent_type)
 }
 
 /// Check baseline drift (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn has_baseline_drifted_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     current_prompt_hash: &str,
 ) -> bool {
-    has_baseline_drifted(db, pg_db, agent_type, current_prompt_hash)
+    has_baseline_drifted(pg_db, agent_type, current_prompt_hash)
 }
 
 /// Update verdict by variant (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn update_verdict_by_variant_direct_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     variant_id: &str,
     verdict: &str,
     score_after: Option<f64>,
 ) -> Result<(), String> {
-    update_verdict_by_variant(db, pg_db, variant_id, verdict, score_after)
+    update_verdict_by_variant(pg_db, variant_id, verdict, score_after)
 }
 
 /// Record evolution with full parameters (backward compat, delegates to primary).
 #[allow(dead_code)]
 pub fn record_evolution_full_with_pg(
-    db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
     agent_type: &str,
     parent_variant_id: Option<&str>,
@@ -388,7 +367,7 @@ pub fn record_evolution_full_with_pg(
     score_before: Option<f64>,
     baseline_prompt_hash: Option<&str>,
 ) -> Result<String, String> {
-    record_evolution_full(db, pg_db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before, baseline_prompt_hash)
+    record_evolution_full(pg_db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before, baseline_prompt_hash)
 }
 
 // Tests removed during PG migration: all tests relied on SQLite in-memory

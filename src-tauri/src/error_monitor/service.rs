@@ -339,10 +339,10 @@ pub struct ErrorMonitorService {
 impl ErrorMonitorService {
     /// Create a new error monitor service.
     pub fn new(
-        db: Arc<CheckpointDb>,
         pg_db: Arc<crate::database::pg::PgDb>,
         config: ErrorMonitorConfig,
     ) -> (Self, ErrorMonitorHandle, Receiver<ServiceCommand>) {
+        let db = CheckpointDb::global();
         let (command_tx, command_rx) = mpsc::channel(100);
         let (event_tx, event_rx) = mpsc::channel(config.max_queue_size);
 
@@ -883,11 +883,10 @@ impl ErrorMonitorService {
 ///
 /// MUST be called from within a Tokio runtime context (e.g., inside tauri::async_runtime::spawn).
 pub async fn start_error_monitor_async(
-    db: Arc<CheckpointDb>,
     pg_db: Arc<crate::database::pg::PgDb>,
     config: ErrorMonitorConfig,
 ) -> ErrorMonitorHandle {
-    let (service, handle, command_rx) = ErrorMonitorService::new(db, pg_db, config);
+    let (service, handle, command_rx) = ErrorMonitorService::new(pg_db, config);
 
     tokio::spawn(async move {
         service.run(command_rx).await;
@@ -904,21 +903,22 @@ mod tests {
 
     /// Helper to create a test service via the public constructor.
     /// Requires DATABASE_URL env var for PgDb connection.
-    fn create_test_service(
-        db: Arc<CheckpointDb>,
-    ) -> (
+    fn create_test_service() -> (
         ErrorMonitorService,
         ErrorMonitorHandle,
         Receiver<ServiceCommand>,
     ) {
+        // Ensure a global CheckpointDb is set for tests (idempotent — ignored if already set)
+        if CheckpointDb::try_global().is_none() {
+            CheckpointDb::set_global(Arc::new(CheckpointDb::new_in_memory().unwrap()));
+        }
         let pg_db = crate::database::pg::PgDb::new_blocking_for_test();
-        ErrorMonitorService::new(db, pg_db, ErrorMonitorConfig::default())
+        ErrorMonitorService::new(pg_db, ErrorMonitorConfig::default())
     }
 
     #[tokio::test]
     async fn test_service_creation() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let (_service, handle, _command_rx) = create_test_service(db);
+        let (_service, handle, _command_rx) = create_test_service();
 
         // Verify handle can receive events
         let _event_rx = handle.take_event_receiver().await;
@@ -927,8 +927,7 @@ mod tests {
 
     #[test]
     fn test_resolve_paths_file() {
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let (service, _handle, _command_rx) = create_test_service(db);
+        let (service, _handle, _command_rx) = create_test_service();
 
         let source = LogSourceConfig {
             id: None,
@@ -970,8 +969,7 @@ mod tests {
         writeln!(file, "ERROR: Something went wrong").unwrap();
         file.flush().unwrap();
 
-        let db = Arc::new(CheckpointDb::new_in_memory().unwrap());
-        let (service, _handle, _command_rx) = create_test_service(db);
+        let (service, _handle, _command_rx) = create_test_service();
 
         // Read only new content
         let content = service

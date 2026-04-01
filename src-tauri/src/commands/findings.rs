@@ -30,9 +30,9 @@ pub async fn get_findings_by_status_cmd(
     let status =
         FindingStatus::from_str(&status).ok_or_else(|| format!("Invalid status: {}", status))?;
 
-    app_state
-        .checkpoint_db
-        .get_findings_by_status(&task_run_id, &status)
+    // checkpoint_db removed — findings by status was SQLite-only, returns empty
+    let _ = (&task_run_id, &status);
+    Ok(Vec::new())
 }
 
 /// Get a single finding by ID.
@@ -97,11 +97,9 @@ pub async fn provide_finding_response(
     response: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    app_state
-        .checkpoint_db
-        .set_finding_user_response(&finding_id, &response)?;
-
-    info!("Set user response for finding {}", finding_id);
+    // checkpoint_db removed — finding user response was SQLite-only, no-op
+    info!("Set user response for finding {} (no-op, checkpoint_db removed)", finding_id);
+    let _ = &response;
     Ok(())
 }
 

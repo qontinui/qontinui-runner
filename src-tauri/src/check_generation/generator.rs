@@ -193,6 +193,7 @@ fn generate_with_ai(
         file_count: Some(scan.projects.len()),
         criteria_count: None,
         file_paths: scan.projects.iter().map(|p| p.path.clone()).collect(),
+        phase: None,
     };
 
     // Run AI prompt

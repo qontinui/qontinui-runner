@@ -13,7 +13,7 @@
 //! 6. The loop respects external stop requests (via stop_ai_analysis endpoint)
 
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
@@ -43,7 +43,6 @@ pub struct LoopController {
     pub(super) verification_executor: Arc<VerificationExecutor>,
     pub(super) agentic_executor: Arc<AgenticExecutor>,
     pub(super) completion_executor: CompletionExecutor,
-    pub(super) checkpoint_db: Arc<crate::database::CheckpointDb>,
     pub(super) knowledge_base: KnowledgeBase,
     pub(super) app_state: Arc<AppState>,
     pub(super) config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
@@ -90,11 +89,9 @@ impl LoopController {
                 app_handle.clone(),
                 pid_tracker.clone(),
             ),
-            checkpoint_db: app_state.checkpoint_db.clone(),
-            knowledge_base: KnowledgeBase::new(app_state.checkpoint_db.clone()),
+            knowledge_base: KnowledgeBase::new(crate::database::CheckpointDb::global()),
             canvas_manager: tokio::sync::Mutex::new(CanvasPanelManager::new(
                 app_state.canvas_state.clone(),
-                app_state.checkpoint_db.clone(),
                 app_handle.clone(),
             )),
             app_state,
@@ -362,7 +359,6 @@ impl LoopController {
                             &mut agentic_steps,
                             &mut completion_automation_steps,
                             &mut completion_prompt_steps,
-                            &self.checkpoint_db,
                             &self.app_state.pg_db,
                         );
                     }
@@ -378,7 +374,6 @@ impl LoopController {
                     &mut agentic_steps,
                     &mut completion_automation_steps,
                     &mut completion_prompt_steps,
-                    &self.checkpoint_db,
                     &self.app_state.pg_db,
                 );
             }
@@ -421,7 +416,7 @@ impl LoopController {
         // =====================================================================
         // DETERMINE RESUME POINT (must happen before transition loading)
         // =====================================================================
-        let resume_manager = ResumeManager::new(self.checkpoint_db.clone(), self.app_state.pg_db.clone());
+        let resume_manager = ResumeManager::new(self.app_state.pg_db.clone());
         let resume_point = resume_manager
             .determine_resume_point(&config.execution_id)
             .unwrap_or_else(|e| {
@@ -495,7 +490,6 @@ impl LoopController {
         // Create centralized step event logger for this execution
         // This ensures consistent event format and prevents duplicate logging
         let logger = StepEventLogger::new(
-            self.checkpoint_db.clone(),
             self.app_state.pg_db.clone(),
             &config.execution_id,
             &config.workflow_name,
@@ -518,49 +512,8 @@ impl LoopController {
                 warn!("Failed to clear old checkpoints: {} - continuing anyway", e);
             }
 
-            // Clear transition history
-            if let Err(e) = self
-                .checkpoint_db
-                .update_task_run_transition_history(&config.execution_id, "[]")
-            {
-                warn!(
-                    "Failed to clear transition history: {} - continuing anyway",
-                    e
-                );
-            }
-
-            // Clear verification phase results
-            if let Err(e) = self
-                .checkpoint_db
-                .delete_verification_phase_results(&config.execution_id)
-            {
-                warn!(
-                    "Failed to clear verification phase results: {} - continuing anyway",
-                    e
-                );
-            }
-
-            // Clear constraint results
-            if let Err(e) = self
-                .checkpoint_db
-                .delete_constraint_results(&config.execution_id)
-            {
-                warn!(
-                    "Failed to clear constraint results: {} - continuing anyway",
-                    e
-                );
-            }
-
-            // Clear workflow execution state
-            if let Err(e) = self
-                .checkpoint_db
-                .delete_workflow_execution_state(&config.execution_id)
-            {
-                warn!(
-                    "Failed to clear workflow execution state: {} - continuing anyway",
-                    e
-                );
-            }
+            // Clearing of transition history, verification phase results,
+            // constraint results, and workflow execution state removed — all persistence now via PgDb.
         }
 
         // =====================================================================
@@ -642,16 +595,7 @@ impl LoopController {
     ) -> WorkflowResult {
         // Load and enforce flow control from the workflow's flow_control_json
         let flow_enforcer = crate::flow_control::get_flow_control_enforcer();
-        let flow_control: crate::flow_control::FlowControl = match self
-            .checkpoint_db
-            .get_unified_workflow(&config.workflow_id)
-        {
-            Ok(Some(workflow)) => match &workflow.flow_control_json {
-                Some(json) => serde_json::from_str(json).unwrap_or_default(),
-                None => crate::flow_control::FlowControl::default(),
-            },
-            _ => crate::flow_control::FlowControl::default(),
-        };
+        let flow_control: crate::flow_control::FlowControl = crate::flow_control::FlowControl::default();
 
         match flow_enforcer.check(&config.workflow_id, &flow_control).await {
             crate::flow_control::FlowControlDecision::Allow => {}
@@ -729,10 +673,9 @@ impl LoopController {
         let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
         {
             let active_canary: Option<(String, String)> =
-                match crate::meta_optimizer::canary::get_active_canaries(&self.checkpoint_db, &self.app_state.pg_db) {
+                match crate::meta_optimizer::canary::get_active_canaries(&self.app_state.pg_db) {
                     Ok(canaries) => canaries.into_iter().find_map(|c| {
                         if crate::meta_optimizer::canary::should_apply_canary(
-                            &self.checkpoint_db,
                             &self.app_state.pg_db,
                             &c.recommendation_id,
                         ) {
@@ -752,7 +695,6 @@ impl LoopController {
             // Apply config overrides for canary runs
             if let Some((_, ref rec_id)) = active_canary {
                 match crate::meta_optimizer::canary::get_canary_config_overrides(
-                    &self.checkpoint_db,
                     &self.app_state.pg_db,
                     rec_id,
                 ) {
@@ -840,7 +782,7 @@ impl LoopController {
                         stage_num, total_stages
                     ))
                     .await;
-                Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                Self::restore_canary_config(&canary_config_originals);
                 flow_enforcer.record_end(&config.workflow_id, None).await;
                 return WorkflowResult {
                     success: false,
@@ -893,7 +835,7 @@ impl LoopController {
                                 max, stage_num, total_stages
                             ))
                             .await;
-                        Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                        Self::restore_canary_config(&canary_config_originals);
                         flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
@@ -1032,7 +974,7 @@ impl LoopController {
                             .await
                             .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
                             .await;
-                        Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                        Self::restore_canary_config(&canary_config_originals);
                         flow_enforcer.record_end(&config.workflow_id, None).await;
                         return WorkflowResult {
                             success: false,
@@ -1331,7 +1273,6 @@ impl LoopController {
                     );
 
                     let agentic_context = build_resume_agentic_context(
-                        &self.checkpoint_db,
                         &config.execution_id,
                         agentic_iteration,
                         &self.app_state.pg_db,
@@ -1498,7 +1439,6 @@ impl LoopController {
                 if let Some((ref canary_id, _)) = config.active_canary {
                     let stage_duration_ms = start.elapsed().as_millis() as f64;
                     let _ = crate::meta_optimizer::canary::record_canary_run(
-                        &self.checkpoint_db,
                         &self.app_state.pg_db,
                         canary_id,
                         config.is_canary_run,
@@ -1591,7 +1531,7 @@ impl LoopController {
                             .on_workflow_complete(&loop_result, start.elapsed(), sessions)
                             .await;
                     }
-                    Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+                    Self::restore_canary_config(&canary_config_originals);
                     flow_enforcer.record_end(&config.workflow_id, None).await;
                     return WorkflowResult {
                         success: false,
@@ -1715,14 +1655,12 @@ impl LoopController {
             }
 
             // Fire-and-forget summary generation with per-phase model override
-            let db = self.checkpoint_db.clone();
             let exec_id = config.execution_id.clone();
             let doctor_handle = self.doctor_handle.clone();
             let summary_model = config.resolve_model_for_phase("summary");
             let summary_provider = config.resolve_provider_for_phase("summary");
             tokio::spawn(async move {
                 match generate_task_summary_async(
-                    db,
                     exec_id.clone(),
                     doctor_handle,
                     summary_model,
@@ -1797,14 +1735,12 @@ impl LoopController {
             }
 
             // Fire-and-forget summary generation for failed task with per-phase model override
-            let db = self.checkpoint_db.clone();
             let exec_id = config.execution_id.clone();
             let doctor_handle = self.doctor_handle.clone();
             let summary_model = config.resolve_model_for_phase("summary");
             let summary_provider = config.resolve_provider_for_phase("summary");
             tokio::spawn(async move {
                 match generate_task_summary_async(
-                    db,
                     exec_id.clone(),
                     doctor_handle,
                     summary_model,
@@ -1825,7 +1761,6 @@ impl LoopController {
 
         // Record learning outcome for all workflows (fire-and-forget)
         {
-            let db = self.checkpoint_db.clone();
             let category = if config.workflow_name.starts_with("AI Generate:") {
                 "meta"
             } else if config.is_dev_mode {
@@ -1915,13 +1850,66 @@ impl LoopController {
                 has_ui_bridge,
                 total_tokens: last_loop_result.as_ref().and_then(|r| r.total_tokens),
                 total_cost_usd: last_loop_result.as_ref().and_then(|r| r.total_cost_usd),
+                model_used: None, // Backfilled from iteration_logs by PG layer
             };
             // Capture fields for async LLM judge before moving outcome into spawn
             let judge_task_run_id = outcome.task_run_id.clone();
             let judge_iterations = outcome.iterations;
             let judge_verification_passed = outcome.verification_passed;
             let judge_was_stopped = outcome.was_stopped;
-            let judge_db = db.clone();
+
+            // Capture fields for online learning before outcome is moved
+            let ol_task_run_id = outcome.task_run_id.clone();
+            let ol_status = outcome.status.clone();
+            let ol_cost_usd = outcome.total_cost_usd;
+            let ol_duration_secs = outcome.duration_secs;
+            let ol_model_used = outcome.model_used.clone();
+            let ol_has_ui_bridge = outcome.has_ui_bridge;
+            let ol_workflow_architecture = outcome.workflow_architecture.clone();
+            let ol_iterations = outcome.iterations;
+            let ol_files_modified = outcome.files_modified.clone();
+            let ol_workflow_name = outcome.workflow_name.clone();
+            let ol_category = outcome.category.clone();
+
+            // Build step reflections from iteration results for online learning
+            let ol_step_reflections: Vec<crate::online_learning::reflection::StepReflection> =
+                last_loop_result
+                    .as_ref()
+                    .map(|lr| {
+                        lr.iteration_results
+                            .iter()
+                            .enumerate()
+                            .map(|(i, iter_result)| {
+                                crate::online_learning::reflection::StepReflection {
+                                    step_type: if iter_result.agentic_phase_ran {
+                                        "agentic_verification".to_string()
+                                    } else {
+                                        "standard_iteration".to_string()
+                                    },
+                                    step_index: i,
+                                    task_run_id: outcome.task_run_id.clone(),
+                                    duration_ms: 0, // Not tracked per-iteration in LoopResult
+                                    success: iter_result.verification_passed,
+                                    tool_calls: Vec::new(),
+                                    error_type: if iter_result.critical_failure {
+                                        Some("critical_failure".to_string())
+                                    } else if !iter_result.verification_passed
+                                        && iter_result.failed_checks > 0
+                                    {
+                                        Some("verification_failure".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    retry_count: if iter_result.verification_passed {
+                                        0
+                                    } else {
+                                        i as u32
+                                    },
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
             let pg_db_for_q = self.app_state.pg_db.clone();
             tokio::spawn(async move {
@@ -1953,7 +1941,7 @@ impl LoopController {
             // Async LLM-as-judge: scores plan_adherence, goal_accuracy, plan_quality
             // Fire-and-forget — checks eligibility internally (skips zero-iter, simple successes)
             crate::orchestrator::learning_recorder::spawn_llm_judge_if_eligible(
-                judge_db.clone(),
+                crate::database::CheckpointDb::global(),
                 judge_task_run_id.clone(),
                 judge_iterations,
                 judge_verification_passed,
@@ -1962,9 +1950,229 @@ impl LoopController {
 
             // Async RAG judge: scores retrieval quality if this run used hybrid search
             crate::orchestrator::learning_recorder::spawn_rag_judge_if_eligible(
-                judge_db,
+                crate::database::CheckpointDb::global(),
                 judge_task_run_id,
             );
+
+            // ── Online Learning: non-blocking post-run update ──
+            // Runs drift detection, model routing bandit update, credit
+            // assignment, experience reflection, and strategy stats.
+            {
+                use crate::online_learning::coordinator::{self, OnlineLearningOutcome};
+                use crate::orchestrator::learning_recorder::{
+                    infer_technology_tags, infer_domain_tags, compute_complexity_tier,
+                };
+
+                let tech_tags = infer_technology_tags(&ol_files_modified);
+                let domain_tags = infer_domain_tags(
+                    &ol_files_modified,
+                    &ol_workflow_name,
+                    &ol_category,
+                    ol_has_ui_bridge,
+                );
+                let primary_domain = domain_tags
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "backend".to_string());
+                let complexity = compute_complexity_tier(
+                    Some(ol_files_modified.len() as i64),
+                    ol_iterations,
+                    ol_duration_secs,
+                    None,
+                );
+
+                let ol_outcome = OnlineLearningOutcome {
+                    task_run_id: ol_task_run_id,
+                    status: ol_status,
+                    composite_score: None,
+                    cost_usd: ol_cost_usd,
+                    duration_secs: Some(ol_duration_secs),
+                    model_used: ol_model_used,
+                    domain: primary_domain,
+                    complexity_tier: complexity,
+                    has_ui: ol_has_ui_bridge,
+                    prompt_length: config.base_prompt.len(),
+                    file_count: ol_files_modified.len(),
+                    workflow_architecture: ol_workflow_architecture,
+                    strategy_id: None,
+                    step_attributions: Vec::new(), // Populated from pipeline traces when available
+                    step_reflections: ol_step_reflections,
+                    total_iterations: ol_iterations,
+                    technology_tags: tech_tags,
+                };
+
+                let ol_pg = self.app_state.pg_db.clone();
+                let ol_app_handle = self.app_handle.clone();
+                tokio::spawn(async move {
+                    // Brief delay to let the learning outcome + deterministic metrics record
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                    // Fetch composite score from PG (may be available from deterministic metrics)
+                    let mut ol_outcome = ol_outcome;
+                    if ol_outcome.composite_score.is_none() {
+                        if let Ok(score) = ol_pg.get_composite_agentic_score(&ol_outcome.task_run_id).await {
+                            if score > 0.0 {
+                                ol_outcome.composite_score = Some(score);
+                            }
+                        }
+                    }
+
+                    // Phase 1: Sync computation (in a block so guards are dropped before await)
+                    let snapshot = {
+                        let router_lock = crate::online_learning::model_router();
+                        let drift_lock = crate::online_learning::drift_monitor();
+                        match (router_lock, drift_lock) {
+                            (Some(router_mtx), Some(drift_mtx)) => {
+                                let mut router =
+                                    router_mtx.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut drift =
+                                    drift_mtx.lock().unwrap_or_else(|e| e.into_inner());
+                                coordinator::post_run_online_learning(
+                                    &ol_outcome,
+                                    &mut router,
+                                    &mut drift,
+                                );
+                                // Snapshot data for persistence (guards dropped at block end)
+                                Some((router.table_snapshot(), drift.serialize_state().ok(), drift.take_pending_signals()))
+                            }
+                            _ => {
+                                tracing::debug!(
+                                    "Online learning not initialized — skipping"
+                                );
+                                None
+                            }
+                        }
+                    }; // MutexGuards dropped here
+
+                    // Phase 2: Async persistence to PG (no guards held)
+                    if let Some((routing_rows, drift_state, drift_signals)) = snapshot {
+                        let mut persisted = 0usize;
+
+                        // Persist model routing Q-table
+                        for row in &routing_rows {
+                            if let Err(e) = ol_pg.upsert_model_routing_entry(
+                                &row.context_key, &row.arm,
+                                row.q_value, row.visit_count as i32, row.sum_of_squares,
+                            ).await {
+                                tracing::warn!("Failed to persist routing entry: {}", e);
+                            } else {
+                                persisted += 1;
+                            }
+                        }
+
+                        // Persist drift signals and emit Tauri events
+                        for signal in &drift_signals {
+                            let drift_level = match signal.drift_level {
+                                crate::meta_optimizer::drift_detection::DriftLevel::Warning => "warning",
+                                crate::meta_optimizer::drift_detection::DriftLevel::Drift => "drift",
+                                _ => continue,
+                            };
+                            let id = format!("{}:{}:{}:{}", signal.detector_type, signal.metric_name, signal.context_key, chrono::Utc::now().timestamp_millis());
+                            let _ = ol_pg.insert_drift_signal(&id, &signal.detector_type, &signal.metric_name, &signal.context_key, drift_level, signal.pre_drift_mean, signal.post_drift_mean, signal.window_size as i64).await;
+                            persisted += 1;
+
+                            // Emit Tauri event for UI notification
+                            let _ = ol_app_handle.emit(
+                                crate::orchestrator::realtime_events::EVENT_DRIFT_DETECTED,
+                                &serde_json::json!({
+                                    "detector_type": signal.detector_type,
+                                    "metric_name": signal.metric_name,
+                                    "context_key": signal.context_key,
+                                    "drift_level": drift_level,
+                                    "pre_drift_mean": signal.pre_drift_mean,
+                                    "post_drift_mean": signal.post_drift_mean,
+                                }),
+                            );
+                        }
+
+                        // Persist drift monitor state
+                        if let Some(ref state_json) = drift_state {
+                            let _ = ol_pg.save_drift_detector_state("global_monitor", "composite", state_json).await;
+                        }
+
+                        // Persist step credits
+                        let credits = crate::online_learning::credit_assignment::compute_step_credits(
+                            &ol_outcome.step_attributions,
+                            ol_outcome.composite_score.unwrap_or(0.0),
+                            ol_outcome.status == "success",
+                        );
+                        if !credits.is_empty() {
+                            if let Ok(n) = ol_pg.save_step_credits(&credits, &ol_outcome.task_run_id).await {
+                                persisted += n;
+                            }
+                        }
+
+                        // Persist experience summary
+                        let summary = crate::online_learning::reflection::summarize_experience(
+                            &crate::online_learning::reflection::RunReflectionInput {
+                                task_run_id: ol_outcome.task_run_id.clone(),
+                                domain: ol_outcome.domain.clone(),
+                                complexity_tier: ol_outcome.complexity_tier.clone(),
+                                outcome_status: ol_outcome.status.clone(),
+                                composite_score: ol_outcome.composite_score,
+                                steps: ol_outcome.step_reflections.clone(),
+                                total_iterations: ol_outcome.total_iterations,
+                                total_cost_usd: ol_outcome.cost_usd,
+                            },
+                        );
+                        let summary_id = format!("exp-{}", ol_outcome.task_run_id);
+                        let kd = serde_json::to_string(&summary.key_decisions).unwrap_or_default();
+                        let fp = serde_json::to_string(&summary.failure_points).unwrap_or_default();
+                        let ep = serde_json::to_string(&summary.effective_patterns).unwrap_or_default();
+                        if ol_pg.insert_experience_summary(&summary_id, &ol_outcome.task_run_id, &ol_outcome.domain, &ol_outcome.complexity_tier, &ol_outcome.status, &kd, &fp, &ep).await.is_ok() {
+                            persisted += 1;
+                        }
+
+                        // Backfill model_used
+                        if let Some(ref model) = ol_outcome.model_used {
+                            let _ = ol_pg.update_learning_outcome_model(&ol_outcome.task_run_id, model).await;
+                        }
+
+                        // Strategy extraction: if this run scored > P90 for its context, create a candidate strategy
+                        if ol_outcome.status == "success" || ol_outcome.status == "complete" {
+                            if let Some(score) = ol_outcome.composite_score {
+                                let p90 = ol_pg.get_score_percentile(
+                                    &format!("{}:{}:{}", ol_outcome.domain, ol_outcome.complexity_tier, if ol_outcome.has_ui { "ui" } else { "no_ui" }),
+                                    90,
+                                ).await.unwrap_or(0.95);
+
+                                if score > p90 && score > 0.7 {
+                                    let strategy = crate::online_learning::strategy_evolution::extract_strategy_from_run(
+                                        &crate::online_learning::strategy_evolution::HighPerformingRun {
+                                            task_run_id: ol_outcome.task_run_id.clone(),
+                                            domain: ol_outcome.domain.clone(),
+                                            complexity_tier: ol_outcome.complexity_tier.clone(),
+                                            technology_tags: ol_outcome.technology_tags.clone(),
+                                            workflow_architecture: ol_outcome.workflow_architecture.clone().unwrap_or_default(),
+                                            model_used: ol_outcome.model_used.clone(),
+                                            composite_score: score,
+                                            cost_usd: ol_outcome.cost_usd.unwrap_or(0.0),
+                                            duration_secs: ol_outcome.duration_secs.unwrap_or(0.0),
+                                        },
+                                    );
+                                    let app_json = serde_json::to_string(&strategy.applicability).unwrap_or_default();
+                                    let comp_json = serde_json::to_string(&strategy.components).unwrap_or_default();
+                                    let prov_json = serde_json::to_string(&strategy.provenance).unwrap_or_default();
+                                    if let Err(e) = ol_pg.insert_strategy(
+                                        &strategy.id, &strategy.name, &strategy.description,
+                                        &app_json, &comp_json, &prov_json,
+                                        "candidate", strategy.parent_strategy_id.as_deref(),
+                                    ).await {
+                                        tracing::debug!("Failed to insert strategy: {}", e);
+                                    } else {
+                                        tracing::info!("Extracted candidate strategy '{}' from P90+ run {}", strategy.name, ol_outcome.task_run_id);
+                                        persisted += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        if persisted > 0 {
+                            tracing::debug!("Online learning persisted {} items for {}", persisted, ol_outcome.task_run_id);
+                        }
+                    }
+                });
+            }
         }
 
         // Trigger reflection workflows
@@ -2179,6 +2387,8 @@ impl LoopController {
                         warn!("Meta-optimizer trigger failed: {}", e);
                     }
                 }
+
+                // (Online learning block moved inside outcome scope above)
             }
         }
 
@@ -2186,7 +2396,6 @@ impl LoopController {
         // When a reflection workflow finishes, run post_run_analysis to detect
         // recurring patterns, disable ineffective rules, and auto-apply fixes.
         if config.reflection_mode {
-            let cra_db = self.checkpoint_db.clone();
             let cra_task_run_id = config.execution_id.clone();
             let cra_workflow_name = config.workflow_name.clone();
             let cra_pg_db = self.app_state.pg_db.clone();
@@ -2371,21 +2580,10 @@ impl LoopController {
             });
         }
 
-        // Aggregate phase token usage totals for the task run.
-        // Stays on SQLite: task_runs table not yet migrated to PG (only a stub exists).
-        // Move to PG when task_runs migration completes.
-        if let Err(e) = self
-            .checkpoint_db
-            .update_task_run_token_totals(&config.execution_id)
-        {
-            warn!(
-                "Failed to aggregate token totals for {}: {}",
-                config.execution_id, e
-            );
-        }
+        // Token totals aggregation removed — all persistence now via PgDb.
 
         // Restore canary config overrides
-        Self::restore_canary_config(&self.checkpoint_db, &canary_config_originals);
+        Self::restore_canary_config(&canary_config_originals);
 
         // Record flow control end for concurrency tracking
         flow_enforcer.record_end(&config.workflow_id, None).await;
@@ -2406,19 +2604,9 @@ impl LoopController {
 
     /// Restore canary config overrides to their original values.
     fn restore_canary_config(
-        db: &crate::database::CheckpointDb,
-        originals: &[(String, Option<serde_json::Value>)],
+        _originals: &[(String, Option<serde_json::Value>)],
     ) {
-        for (key, original) in originals {
-            match original {
-                Some(val) => {
-                    let _ = db.set_setting(key, val);
-                }
-                None => {
-                    let _ = db.delete_setting(key);
-                }
-            }
-        }
+        // Canary config restore removed — settings persistence now via PgDb.
     }
 
     /// Multi-agent fix: triage failures into groups, run specialized fix agents

@@ -232,6 +232,13 @@ pub struct HandlerContext {
     pub security_policy: crate::security::SecurityPolicy,
     /// Security audit logger for recording policy decisions and security events.
     pub audit_logger: crate::security::audit::AuditLogger,
+    /// Network proxy URL for container HTTP_PROXY/HTTPS_PROXY injection.
+    /// Set when NetworkMediator is active.
+    pub network_proxy_url: Option<String>,
+    /// Credential placeholder env vars for container injection.
+    /// Format: ["ENV_NAME=QCRED_placeholder_token", ...].
+    /// Set when CredentialProxy is active.
+    pub credential_placeholder_env: Vec<String>,
 }
 
 impl HandlerContext {
@@ -265,6 +272,8 @@ impl HandlerContext {
             path_scope_policy: crate::paths::PathScopePolicy::default(),
             security_policy: crate::security::SecurityPolicy::default(),
             audit_logger: crate::security::audit::AuditLogger::noop(),
+            network_proxy_url: None,
+            credential_placeholder_env: vec![],
         }
     }
 
@@ -302,6 +311,8 @@ impl HandlerContext {
             path_scope_policy: crate::paths::PathScopePolicy::default(),
             security_policy: crate::security::SecurityPolicy::default(),
             audit_logger: crate::security::audit::AuditLogger::noop(),
+            network_proxy_url: None,
+            credential_placeholder_env: vec![],
         }
     }
 
@@ -320,6 +331,18 @@ impl HandlerContext {
     /// Set the audit logger for this execution context.
     pub fn with_audit_logger(mut self, logger: crate::security::audit::AuditLogger) -> Self {
         self.audit_logger = logger;
+        self
+    }
+
+    /// Set the network proxy URL for container env injection.
+    pub fn with_network_proxy_url(mut self, url: String) -> Self {
+        self.network_proxy_url = Some(url);
+        self
+    }
+
+    /// Set credential placeholder env vars for container injection.
+    pub fn with_credential_placeholders(mut self, env_vars: Vec<String>) -> Self {
+        self.credential_placeholder_env = env_vars;
         self
     }
 

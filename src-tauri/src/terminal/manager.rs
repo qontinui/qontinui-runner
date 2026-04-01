@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tracing::{error, info};
 
 use super::interceptor::OutputInterceptor;
@@ -48,6 +48,7 @@ impl TerminalManager {
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
 
+        let emitter = app_handle.clone();
         let session = TerminalSession::spawn(
             id.clone(),
             title,
@@ -66,6 +67,11 @@ impl TerminalManager {
             .lock()
             .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
         sessions.insert(id, session);
+
+        // Notify frontend so externally-created terminals get a UI tab
+        if let Err(e) = emitter.emit("terminal-created", &info) {
+            error!("Failed to emit terminal-created: {}", e);
+        }
 
         Ok(info)
     }
