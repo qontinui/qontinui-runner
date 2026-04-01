@@ -1,12 +1,5 @@
 import { useMemo } from "react";
-import {
-  ScatterChart,
-  Scatter,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-} from "recharts";
+import { ScatterChart, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { FileChange } from "@/lib/session-recap/types";
 
 interface Props {
@@ -51,11 +44,13 @@ export function SessionTimeline({ filesCreated, filesModified, filesDeleted }: P
     const repos = [...new Set(allFiles.map((f) => f.repo))];
     const repoIndex = Object.fromEntries(repos.map((r, i) => [r, i]));
 
-    return allFiles.map((file, idx): DataPoint => ({
-      x: repoIndex[file.repo] * 100 + idx,
-      y: LAYER_MAP[file.category] ?? 5,
-      file,
-    }));
+    return allFiles.map(
+      (file, idx): DataPoint => ({
+        x: repoIndex[file.repo] * 100 + idx,
+        y: LAYER_MAP[file.category] ?? 5,
+        file,
+      }),
+    );
   }, [allFiles]);
 
   if (allFiles.length === 0) {
@@ -85,13 +80,7 @@ export function SessionTimeline({ filesCreated, filesModified, filesDeleted }: P
       <div className="flex-1 min-h-0">
         <ResponsiveContainer width="100%" height="100%">
           <ScatterChart margin={{ left: 60, right: 8, top: 8, bottom: 8 }}>
-            <XAxis
-              dataKey="x"
-              type="number"
-              tick={false}
-              axisLine={false}
-              tickLine={false}
-            />
+            <XAxis dataKey="x" type="number" tick={false} axisLine={false} tickLine={false} />
             <YAxis
               dataKey="y"
               type="number"
@@ -124,8 +113,15 @@ export function SessionTimeline({ filesCreated, filesModified, filesDeleted }: P
             <Scatter
               data={data}
               shape={(props) => {
-                const { cx = 0, cy = 0, payload } = props as { cx?: number; cy?: number; payload: DataPoint };
-                const r = Math.min(3 + Math.sqrt(payload.file.lines_added + payload.file.lines_removed) * 0.5, 10);
+                const {
+                  cx = 0,
+                  cy = 0,
+                  payload,
+                } = props as { cx?: number; cy?: number; payload: DataPoint };
+                const r = Math.min(
+                  3 + Math.sqrt(payload.file.lines_added + payload.file.lines_removed) * 0.5,
+                  10,
+                );
                 const fill = CHANGE_COLORS[payload.file.change_type] ?? "#6B7280";
                 return <circle cx={cx} cy={cy} r={r} fill={fill} />;
               }}

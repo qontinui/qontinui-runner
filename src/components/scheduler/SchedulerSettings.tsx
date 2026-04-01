@@ -30,11 +30,12 @@ export function SchedulerSettings({
   const [defaultAutoFix, setDefaultAutoFix] = useState(settings.default_auto_fix_on_failure);
   const [timezone, setTimezone] = useState(settings.timezone || "");
   // Track changes (derived from current form state vs props)
-  const hasChanges = useMemo(() =>
-    enabled !== settings.enabled ||
-    maxConcurrent !== settings.max_concurrent ||
-    defaultAutoFix !== settings.default_auto_fix_on_failure ||
-    timezone !== (settings.timezone || ""),
+  const hasChanges = useMemo(
+    () =>
+      enabled !== settings.enabled ||
+      maxConcurrent !== settings.max_concurrent ||
+      defaultAutoFix !== settings.default_auto_fix_on_failure ||
+      timezone !== (settings.timezone || ""),
     [enabled, maxConcurrent, defaultAutoFix, timezone, settings],
   );
 

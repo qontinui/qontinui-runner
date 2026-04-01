@@ -33,36 +33,27 @@ import type { TaskRunData } from "./queries";
  * Refetches task run list after completion.
  */
 export function useStopTaskRunGql() {
-  return useMutation<{ stopTaskRun: boolean }, { id: string }>(
-    STOP_TASK_RUN_MUTATION,
-    {
-      refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
-    },
-  );
+  return useMutation<{ stopTaskRun: boolean }, { id: string }>(STOP_TASK_RUN_MUTATION, {
+    refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
+  });
 }
 
 /**
  * Pause a running task run.
  */
 export function usePauseTaskRunGql() {
-  return useMutation<{ pauseTaskRun: boolean }, { id: string }>(
-    PAUSE_TASK_RUN_MUTATION,
-    {
-      refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
-    },
-  );
+  return useMutation<{ pauseTaskRun: boolean }, { id: string }>(PAUSE_TASK_RUN_MUTATION, {
+    refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
+  });
 }
 
 /**
  * Unpause a paused task run.
  */
 export function useUnpauseTaskRunGql() {
-  return useMutation<{ unpauseTaskRun: boolean }, { id: string }>(
-    UNPAUSE_TASK_RUN_MUTATION,
-    {
-      refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
-    },
-  );
+  return useMutation<{ unpauseTaskRun: boolean }, { id: string }>(UNPAUSE_TASK_RUN_MUTATION, {
+    refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
+  });
 }
 
 /**
@@ -70,21 +61,18 @@ export function useUnpauseTaskRunGql() {
  * Removes from cache after completion.
  */
 export function useDeleteTaskRunGql() {
-  return useMutation<{ deleteTaskRun: boolean }, { id: string }>(
-    DELETE_TASK_RUN_MUTATION,
-    {
-      refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
-      update(cache, _result, { variables }) {
-        if (variables?.id) {
-          const cacheId = cache.identify({ __typename: "GqlTaskRun", id: variables.id });
-          if (cacheId) {
-            cache.evict({ id: cacheId });
-            cache.gc();
-          }
+  return useMutation<{ deleteTaskRun: boolean }, { id: string }>(DELETE_TASK_RUN_MUTATION, {
+    refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
+    update(cache, _result, { variables }) {
+      if (variables?.id) {
+        const cacheId = cache.identify({ __typename: "GqlTaskRun", id: variables.id });
+        if (cacheId) {
+          cache.evict({ id: cacheId });
+          cache.gc();
         }
-      },
+      }
     },
-  );
+  });
 }
 
 /**
@@ -114,12 +102,12 @@ export function useCreateTaskRunGql() {
  * Run a workflow by ID. Returns the created task run.
  */
 export function useRunWorkflowGql() {
-  return useMutation<
-    { runWorkflow: TaskRunData },
-    { workflowId: string; prompt?: string }
-  >(RUN_WORKFLOW_MUTATION, {
-    refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
-  });
+  return useMutation<{ runWorkflow: TaskRunData }, { workflowId: string; prompt?: string }>(
+    RUN_WORKFLOW_MUTATION,
+    {
+      refetchQueries: [{ query: TASK_RUNS_QUERY, variables: { limit: 50 } }],
+    },
+  );
 }
 
 // ==========================================================================
@@ -146,10 +134,9 @@ export function useUpdateFindingStatusGql() {
  * Respond to a finding that needs user input.
  */
 export function useRespondToFindingGql() {
-  return useMutation<
-    { respondToFinding: boolean },
-    { findingId: string; response: string }
-  >(RESPOND_TO_FINDING_MUTATION);
+  return useMutation<{ respondToFinding: boolean }, { findingId: string; response: string }>(
+    RESPOND_TO_FINDING_MUTATION,
+  );
 }
 
 // ==========================================================================
@@ -160,19 +147,16 @@ export function useRespondToFindingGql() {
  * Delete a workflow.
  */
 export function useDeleteWorkflowGql() {
-  return useMutation<{ deleteWorkflow: boolean }, { id: string }>(
-    DELETE_WORKFLOW_MUTATION,
-    {
-      refetchQueries: [{ query: WORKFLOWS_QUERY }],
-      update(cache, _result, { variables }) {
-        if (variables?.id) {
-          const cacheId = cache.identify({ __typename: "GqlWorkflowSummary", id: variables.id });
-          if (cacheId) {
-            cache.evict({ id: cacheId });
-            cache.gc();
-          }
+  return useMutation<{ deleteWorkflow: boolean }, { id: string }>(DELETE_WORKFLOW_MUTATION, {
+    refetchQueries: [{ query: WORKFLOWS_QUERY }],
+    update(cache, _result, { variables }) {
+      if (variables?.id) {
+        const cacheId = cache.identify({ __typename: "GqlWorkflowSummary", id: variables.id });
+        if (cacheId) {
+          cache.evict({ id: cacheId });
+          cache.gc();
         }
-      },
+      }
     },
-  );
+  });
 }

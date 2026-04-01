@@ -105,16 +105,12 @@ async function executeAction(action: DemoAction): Promise<void> {
         caption: action.caption,
         durationMs: action.durationMs,
       };
-      window.dispatchEvent(
-        new CustomEvent(DEMO_VISUAL_OVERLAY_EVENT, { detail: showDetail }),
-      );
+      window.dispatchEvent(new CustomEvent(DEMO_VISUAL_OVERLAY_EVENT, { detail: showDetail }));
       // Hold for the specified duration while the overlay is visible on screen
       await sleep(action.durationMs);
       // Dismiss the overlay
       const hideDetail: DemoVisualOverlayDetail = { action: "hide" };
-      window.dispatchEvent(
-        new CustomEvent(DEMO_VISUAL_OVERLAY_EVENT, { detail: hideDetail }),
-      );
+      window.dispatchEvent(new CustomEvent(DEMO_VISUAL_OVERLAY_EVENT, { detail: hideDetail }));
       break;
     }
   }
@@ -139,7 +135,7 @@ export function abortExecution(): void {
 export async function executeScript(
   script: DemoScript,
   config: Partial<DemoRecordingConfig> = {},
-  callbacks?: ExecutionCallbacks
+  callbacks?: ExecutionCallbacks,
 ): Promise<DemoExecutionResult> {
   abortRequested = false;
   const mergedConfig = { ...DEFAULT_RECORDING_CONFIG, ...config };
@@ -206,9 +202,9 @@ export async function executeScript(
   }
 
   // Always stop recording, even on error
-  const stopResult = await invoke<{ success: boolean; path: string }>(
-    "stop_video_recording"
-  ).catch(() => ({ success: false, path: "" }));
+  const stopResult = await invoke<{ success: boolean; path: string }>("stop_video_recording").catch(
+    () => ({ success: false, path: "" }),
+  );
 
   const totalDurationMs = Date.now() - recordingStartTime;
 

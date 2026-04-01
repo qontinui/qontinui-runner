@@ -540,433 +540,439 @@ export function OrchestrationLoopPanel() {
         {panelMode === "multi" ? (
           <MultiLoopPanel />
         ) : (
-        <>
-        <p className="text-[0.78rem] text-muted-foreground -mt-1 mb-2">
-          Iterative develop-rebuild-verify loop for testing changes to the runner itself.
-        </p>
+          <>
+            <p className="text-[0.78rem] text-muted-foreground -mt-1 mb-2">
+              Iterative develop-rebuild-verify loop for testing changes to the runner itself.
+            </p>
 
-        {/* Save input */}
-        {showSaveInput && !running && (
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              value={saveName}
-              onChange={(e) => setSaveName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSave()}
-              placeholder="Config name..."
-              className={cn(inputCls, "flex-1")}
-              autoFocus
-            />
-            <button
-              onClick={handleSave}
-              disabled={!saveName.trim()}
-              className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40"
-            >
-              Save
-            </button>
-            <button
-              onClick={() => {
-                setShowSaveInput(false);
-                setSaveName("");
-              }}
-              className="px-2.5 py-1 text-xs font-medium rounded bg-muted text-muted-foreground"
-            >
-              Cancel
-            </button>
-          </div>
-        )}
-
-        {/* Library panel */}
-        {showLibrary && !running && (
-          <div className="border border-border rounded">
-            <div className="px-3 py-1.5 border-b border-border flex items-center justify-between">
-              <span className="text-xs font-semibold">Saved Configurations</span>
-              <span className="text-[0.7rem] text-muted-foreground">
-                {savedConfigs.length} configs
-              </span>
-            </div>
-            {savedConfigs.length === 0 ? (
-              <div className="px-3 py-3 text-xs text-muted-foreground text-center">
-                No saved configurations yet
+            {/* Save input */}
+            {showSaveInput && !running && (
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={saveName}
+                  onChange={(e) => setSaveName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleSave()}
+                  placeholder="Config name..."
+                  className={cn(inputCls, "flex-1")}
+                  autoFocus
+                />
+                <button
+                  onClick={handleSave}
+                  disabled={!saveName.trim()}
+                  className="px-2.5 py-1 text-xs font-medium rounded bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-40"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => {
+                    setShowSaveInput(false);
+                    setSaveName("");
+                  }}
+                  className="px-2.5 py-1 text-xs font-medium rounded bg-muted text-muted-foreground"
+                >
+                  Cancel
+                </button>
               </div>
-            ) : (
-              <div className="divide-y divide-border/50">
-                {savedConfigs.map((cfg) => (
-                  <div
-                    key={cfg.id}
-                    className="flex items-center gap-2 px-3 py-1.5 hover:bg-muted/30 group"
-                  >
-                    <button
-                      onClick={() => handleToggleFavorite(cfg.id, cfg.is_favorite)}
-                      className="shrink-0"
-                      title={cfg.is_favorite ? "Remove from favorites" : "Add to favorites"}
-                    >
-                      <Star
-                        className={cn(
-                          "w-3.5 h-3.5",
-                          cfg.is_favorite
-                            ? "fill-yellow-400 text-yellow-400"
-                            : "text-muted-foreground/40 hover:text-yellow-400",
-                        )}
-                      />
-                    </button>
-                    <button
-                      onClick={() => handleLoad(cfg)}
-                      className="flex-1 text-left text-xs truncate hover:text-primary"
-                      title={`Load "${cfg.name}"`}
-                    >
-                      <span className="font-medium">{cfg.name}</span>
-                      <span className="ml-2 text-muted-foreground text-[0.7rem]">
-                        {cfg.config_json?.mode || "?"} &middot;{" "}
-                        {new Date(cfg.updated_at).toLocaleDateString()}
-                      </span>
-                    </button>
-                    <button
-                      onClick={() => handleOverwrite(cfg)}
-                      className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary"
-                      title="Overwrite with current settings"
-                    >
-                      <Save className="w-3 h-3" />
-                    </button>
-                    <button
-                      onClick={() => handleDeleteConfig(cfg.id)}
-                      className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400"
-                      title="Delete"
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
+            )}
+
+            {/* Library panel */}
+            {showLibrary && !running && (
+              <div className="border border-border rounded">
+                <div className="px-3 py-1.5 border-b border-border flex items-center justify-between">
+                  <span className="text-xs font-semibold">Saved Configurations</span>
+                  <span className="text-[0.7rem] text-muted-foreground">
+                    {savedConfigs.length} configs
+                  </span>
+                </div>
+                {savedConfigs.length === 0 ? (
+                  <div className="px-3 py-3 text-xs text-muted-foreground text-center">
+                    No saved configurations yet
                   </div>
+                ) : (
+                  <div className="divide-y divide-border/50">
+                    {savedConfigs.map((cfg) => (
+                      <div
+                        key={cfg.id}
+                        className="flex items-center gap-2 px-3 py-1.5 hover:bg-muted/30 group"
+                      >
+                        <button
+                          onClick={() => handleToggleFavorite(cfg.id, cfg.is_favorite)}
+                          className="shrink-0"
+                          title={cfg.is_favorite ? "Remove from favorites" : "Add to favorites"}
+                        >
+                          <Star
+                            className={cn(
+                              "w-3.5 h-3.5",
+                              cfg.is_favorite
+                                ? "fill-yellow-400 text-yellow-400"
+                                : "text-muted-foreground/40 hover:text-yellow-400",
+                            )}
+                          />
+                        </button>
+                        <button
+                          onClick={() => handleLoad(cfg)}
+                          className="flex-1 text-left text-xs truncate hover:text-primary"
+                          title={`Load "${cfg.name}"`}
+                        >
+                          <span className="font-medium">{cfg.name}</span>
+                          <span className="ml-2 text-muted-foreground text-[0.7rem]">
+                            {cfg.config_json?.mode || "?"} &middot;{" "}
+                            {new Date(cfg.updated_at).toLocaleDateString()}
+                          </span>
+                        </button>
+                        <button
+                          onClick={() => handleOverwrite(cfg)}
+                          className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary"
+                          title="Overwrite with current settings"
+                        >
+                          <Save className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteConfig(cfg.id)}
+                          className="shrink-0 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-red-400"
+                          title="Delete"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Favorite quick-load (shown when library is closed and there are favorites) */}
+            {!showLibrary && !running && favorites.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <Star className="w-3 h-3 text-yellow-400 shrink-0" />
+                {favorites.map((cfg) => (
+                  <button
+                    key={cfg.id}
+                    onClick={() => handleLoad(cfg)}
+                    className="px-2 py-0.5 text-[0.7rem] rounded bg-muted hover:bg-primary/10 hover:text-primary text-muted-foreground transition-colors"
+                  >
+                    {cfg.name}
+                  </button>
                 ))}
               </div>
             )}
-          </div>
-        )}
 
-        {/* Favorite quick-load (shown when library is closed and there are favorites) */}
-        {!showLibrary && !running && favorites.length > 0 && (
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <Star className="w-3 h-3 text-yellow-400 shrink-0" />
-            {favorites.map((cfg) => (
-              <button
-                key={cfg.id}
-                onClick={() => handleLoad(cfg)}
-                className="px-2 py-0.5 text-[0.7rem] rounded bg-muted hover:bg-primary/10 hover:text-primary text-muted-foreground transition-colors"
-              >
-                {cfg.name}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* Error */}
-        {(error || status?.error) && (
-          <div className="border-l-2 border-red-500 bg-red-500/10 px-3 py-1.5 text-xs text-red-400 rounded-r">
-            {error || status?.error}
-          </div>
-        )}
-
-        {/* Progress bar */}
-        {(running || phase === "complete") && (
-          <div
-            className={cn(
-              "border-l-2 rounded-r px-3 py-2 flex items-center gap-3",
-              phase === "error" ? "border-red-500" : "border-primary",
+            {/* Error */}
+            {(error || status?.error) && (
+              <div className="border-l-2 border-red-500 bg-red-500/10 px-3 py-1.5 text-xs text-red-400 rounded-r">
+                {error || status?.error}
+              </div>
             )}
-          >
-            <PhaseBadge phase={phase} />
-            <div className="flex-1 bg-muted rounded h-1.5">
+
+            {/* Progress bar */}
+            {(running || phase === "complete") && (
               <div
                 className={cn(
-                  "h-1.5 rounded transition-all duration-300",
-                  phase === "complete" ? "bg-green-500" : "bg-primary",
+                  "border-l-2 rounded-r px-3 py-2 flex items-center gap-3",
+                  phase === "error" ? "border-red-500" : "border-primary",
                 )}
-                style={{ width: `${progressPct}%` }}
-              />
-            </div>
-            <span className="text-xs font-mono text-muted-foreground">
-              {status?.current_iteration ?? 0}/{cfgMax}
-            </span>
-          </div>
-        )}
-
-        {/* Config form */}
-        {!running && (
-          <div className="border border-border rounded p-3 space-y-3">
-            <div className="flex items-center gap-4 flex-wrap">
-              <div className="flex items-center gap-2">
-                <label className="flex items-center gap-1 text-xs cursor-pointer">
-                  <input
-                    type="radio"
-                    name="olMode"
-                    checked={mode === "simple"}
-                    onChange={() => setMode("simple")}
-                    className="accent-primary"
-                  />{" "}
-                  Simple
-                </label>
-                <label className="flex items-center gap-1 text-xs cursor-pointer">
-                  <input
-                    type="radio"
-                    name="olMode"
-                    checked={mode === "pipeline"}
-                    onChange={() => setMode("pipeline")}
-                    className="accent-primary"
-                  />{" "}
-                  Pipeline
-                </label>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className={labelCls}>Between</span>
-                <select
-                  value={between}
-                  onChange={(e) => setBetween(e.target.value)}
-                  className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
-                  style={{ colorScheme: "dark" }}
-                >
-                  <option value="restart_on_signal">Signal (rebuild)</option>
-                  <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
-                  <option value="restart_runner">Always (rebuild)</option>
-                  <option value="restart_runner_no_rebuild">Always (no rebuild)</option>
-                  <option value="wait_healthy">Wait Healthy</option>
-                  <option value="none">None</option>
-                </select>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className={labelCls}>Max</span>
-                <input
-                  type="number"
-                  value={maxIter}
-                  onChange={(e) => setMaxIter(Number(e.target.value))}
-                  min={1}
-                  max={50}
-                  className={cn(inputCls, "w-12 text-center")}
-                />
-              </div>
-              <div className="flex items-center gap-1.5">
-                <span className={labelCls}>Target</span>
-                <select
-                  value={targetRunner}
-                  onChange={(e) => handleTargetRunnerChange(e.target.value)}
-                  className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
-                  style={{ colorScheme: "dark" }}
-                >
-                  <option value="self">This runner (self)</option>
-                  {runnerInstances.map((inst) => (
-                    <option key={inst.id} value={inst.id}>
-                      {inst.name} (:{inst.port}){inst.running ? "" : " [stopped]"}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-4 flex-wrap">
-              <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={retryOnFailure}
-                  onChange={(e) => setRetryOnFailure(e.target.checked)}
-                  className="accent-primary"
-                />
-                <span className="text-muted-foreground">Retry on failure</span>
-                <span className="text-muted-foreground/60 text-[0.7rem]">
-                  — Re-run after fixer completes
-                </span>
-              </label>
-              {retryOnFailure && (
-                <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={waitForFixer}
-                    onChange={(e) => setWaitForFixer(e.target.checked)}
-                    className="accent-primary"
-                  />
-                  <span className="text-muted-foreground">Wait for fixer</span>
-                  <span className="text-muted-foreground/60 text-[0.7rem]">
-                    — Pause until fixer workflow finishes
-                  </span>
-                </label>
-              )}
-              <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={useWorktree}
-                  onChange={(e) => setUseWorktree(e.target.checked)}
-                  className="accent-primary"
-                />
-                <span className="text-muted-foreground">Run in isolated worktree</span>
-                <span className="text-muted-foreground/60 text-[0.7rem]">
-                  — Create a new git branch and worktree for this run. Changes stay isolated until
-                  merged.
-                </span>
-              </label>
-            </div>
-
-            {mode === "simple" ? (
-              <div className="flex items-center gap-4 flex-wrap">
-                <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
-                  <span className={labelCls}>Workflow</span>
-                  <input
-                    type="text"
-                    value={workflowId}
-                    onChange={(e) => setWorkflowId(e.target.value)}
-                    placeholder="workflow-id"
-                    className={cn(inputCls, "flex-1")}
+              >
+                <PhaseBadge phase={phase} />
+                <div className="flex-1 bg-muted rounded h-1.5">
+                  <div
+                    className={cn(
+                      "h-1.5 rounded transition-all duration-300",
+                      phase === "complete" ? "bg-green-500" : "bg-primary",
+                    )}
+                    style={{ width: `${progressPct}%` }}
                   />
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <span className={labelCls}>Exit</span>
-                  <select
-                    value={exitStrategy}
-                    onChange={(e) => setExitStrategy(e.target.value)}
-                    className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
-                    style={{ colorScheme: "dark" }}
-                  >
-                    <option value="reflection">Reflection (0 fixes)</option>
-                    <option value="workflow_verification">Verification</option>
-                    <option value="fixed_iterations">Fixed Iterations</option>
-                    <option value="diagnostic_evaluation">Diagnostic Evaluation</option>
-                  </select>
-                </div>
+                <span className="text-xs font-mono text-muted-foreground">
+                  {status?.current_iteration ?? 0}/{cfgMax}
+                </span>
               </div>
-            ) : (
-              <>
-                <div className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")}>
-                  <div>
-                    <div className={cn(labelCls, "mb-1")}>Build Description</div>
-                    <textarea
-                      value={buildDesc}
-                      onChange={(e) => setBuildDesc(e.target.value)}
-                      placeholder="Describe the workflow to generate..."
-                      rows={8}
-                      className={textareaCls}
-                    />
-                  </div>
-                  <div>
-                    <div className={cn(labelCls, "mb-1")}>Build Context (optional)</div>
-                    <textarea
-                      value={buildContext}
-                      onChange={(e) => setBuildContext(e.target.value)}
-                      placeholder="Additional context for the builder..."
-                      rows={8}
-                      className={textareaCls}
-                    />
-                  </div>
-                  {enableFixes && (
-                    <div>
-                      <div className={cn(labelCls, "mb-1")}>Fix Context (optional)</div>
-                      <textarea
-                        value={fixContext}
-                        onChange={(e) => setFixContext(e.target.value)}
-                        placeholder="Extra instructions for the fix agent..."
-                        rows={8}
-                        className={textareaCls}
-                      />
-                    </div>
-                  )}
-                </div>
+            )}
+
+            {/* Config form */}
+            {!running && (
+              <div className="border border-border rounded p-3 space-y-3">
                 <div className="flex items-center gap-4 flex-wrap">
-                  <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
-                    <span className={cn(labelCls, "whitespace-nowrap")}>Workflow (fallback)</span>
+                  <div className="flex items-center gap-2">
+                    <label className="flex items-center gap-1 text-xs cursor-pointer">
+                      <input
+                        type="radio"
+                        name="olMode"
+                        checked={mode === "simple"}
+                        onChange={() => setMode("simple")}
+                        className="accent-primary"
+                      />{" "}
+                      Simple
+                    </label>
+                    <label className="flex items-center gap-1 text-xs cursor-pointer">
+                      <input
+                        type="radio"
+                        name="olMode"
+                        checked={mode === "pipeline"}
+                        onChange={() => setMode("pipeline")}
+                        className="accent-primary"
+                      />{" "}
+                      Pipeline
+                    </label>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className={labelCls}>Between</span>
+                    <select
+                      value={between}
+                      onChange={(e) => setBetween(e.target.value)}
+                      className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                      style={{ colorScheme: "dark" }}
+                    >
+                      <option value="restart_on_signal">Signal (rebuild)</option>
+                      <option value="restart_on_signal_no_rebuild">Signal (no rebuild)</option>
+                      <option value="restart_runner">Always (rebuild)</option>
+                      <option value="restart_runner_no_rebuild">Always (no rebuild)</option>
+                      <option value="wait_healthy">Wait Healthy</option>
+                      <option value="none">None</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className={labelCls}>Max</span>
                     <input
-                      type="text"
-                      value={workflowId}
-                      onChange={(e) => setWorkflowId(e.target.value)}
-                      placeholder="None (use build)"
-                      className={cn(inputCls, "flex-1")}
+                      type="number"
+                      value={maxIter}
+                      onChange={(e) => setMaxIter(Number(e.target.value))}
+                      min={1}
+                      max={50}
+                      className={cn(inputCls, "w-12 text-center")}
                     />
                   </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className={labelCls}>Target</span>
+                    <select
+                      value={targetRunner}
+                      onChange={(e) => handleTargetRunnerChange(e.target.value)}
+                      className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                      style={{ colorScheme: "dark" }}
+                    >
+                      <option value="self">This runner (self)</option>
+                      {runnerInstances.map((inst) => (
+                        <option key={inst.id} value={inst.id}>
+                          {inst.name} (:{inst.port}){inst.running ? "" : " [stopped]"}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4 flex-wrap">
                   <label className="flex items-center gap-1.5 text-xs cursor-pointer">
                     <input
                       type="checkbox"
-                      checked={enableFixes}
-                      onChange={(e) => setEnableFixes(e.target.checked)}
+                      checked={retryOnFailure}
+                      onChange={(e) => setRetryOnFailure(e.target.checked)}
                       className="accent-primary"
                     />
-                    <span className="text-muted-foreground">Enable Fix Implementation</span>
+                    <span className="text-muted-foreground">Retry on failure</span>
                     <span className="text-muted-foreground/60 text-[0.7rem]">
-                      — Spawns Claude Code after reflection
+                      — Re-run after fixer completes
+                    </span>
+                  </label>
+                  {retryOnFailure && (
+                    <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={waitForFixer}
+                        onChange={(e) => setWaitForFixer(e.target.checked)}
+                        className="accent-primary"
+                      />
+                      <span className="text-muted-foreground">Wait for fixer</span>
+                      <span className="text-muted-foreground/60 text-[0.7rem]">
+                        — Pause until fixer workflow finishes
+                      </span>
+                    </label>
+                  )}
+                  <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={useWorktree}
+                      onChange={(e) => setUseWorktree(e.target.checked)}
+                      className="accent-primary"
+                    />
+                    <span className="text-muted-foreground">Run in isolated worktree</span>
+                    <span className="text-muted-foreground/60 text-[0.7rem]">
+                      — Create a new git branch and worktree for this run. Changes stay isolated
+                      until merged.
                     </span>
                   </label>
                 </div>
-              </>
-            )}
-          </div>
-        )}
 
-        {/* Iteration History */}
-        <div className="border border-border rounded">
-          <div className="px-3 py-1.5 border-b border-border flex items-center justify-between">
-            <span className="text-xs font-semibold">Iteration History</span>
-            <span className="text-[0.7rem] text-muted-foreground">{results.length} iterations</span>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-border text-muted-foreground">
-                  <th className="px-3 py-1.5 text-left font-medium">#</th>
-                  <th className="px-3 py-1.5 text-left font-medium">Duration</th>
-                  <th className="px-3 py-1.5 text-left font-medium">Exit</th>
-                  <th className="px-3 py-1.5 text-left font-medium">Reason</th>
-                  <th className="px-3 py-1.5 text-left font-medium">Pipeline</th>
-                </tr>
-              </thead>
-              <tbody>
-                {results.map((iter) => {
-                  const duration =
-                    iter.started_at && iter.completed_at
-                      ? (
-                          (new Date(iter.completed_at).getTime() -
-                            new Date(iter.started_at).getTime()) /
-                          1000
-                        ).toFixed(1) + "s"
-                      : "--";
-                  const meta: string[] = [];
-                  if (iter.fix_count != null) meta.push(`fixes=${iter.fix_count}`);
-                  if (iter.fixes_implemented != null)
-                    meta.push(`applied=${iter.fixes_implemented ? "yes" : "no"}`);
-                  if (iter.rebuild_triggered) meta.push("rebuild");
-                  if (iter.generated_workflow_id) meta.push("built");
-                  return (
-                    <tr
-                      key={iter.iteration}
-                      className="border-b border-border/50 hover:bg-muted/30"
-                    >
-                      <td className="px-3 py-1.5 text-primary font-semibold">#{iter.iteration}</td>
-                      <td className="px-3 py-1.5 font-mono">{duration}</td>
-                      <td className="px-3 py-1.5">
-                        <span
-                          className={
-                            iter.exit_check?.should_exit ? "text-green-400" : "text-yellow-400"
-                          }
-                        >
-                          {iter.exit_check?.should_exit ? "EXIT" : "CONTINUE"}
-                        </span>
-                      </td>
-                      <td
-                        className="px-3 py-1.5 max-w-[300px] truncate"
-                        title={iter.exit_check?.reason}
+                {mode === "simple" ? (
+                  <div className="flex items-center gap-4 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
+                      <span className={labelCls}>Workflow</span>
+                      <input
+                        type="text"
+                        value={workflowId}
+                        onChange={(e) => setWorkflowId(e.target.value)}
+                        placeholder="workflow-id"
+                        className={cn(inputCls, "flex-1")}
+                      />
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className={labelCls}>Exit</span>
+                      <select
+                        value={exitStrategy}
+                        onChange={(e) => setExitStrategy(e.target.value)}
+                        className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                        style={{ colorScheme: "dark" }}
                       >
-                        {iter.exit_check?.reason || "--"}
-                      </td>
-                      <td className="px-3 py-1.5 text-muted-foreground text-[0.7rem]">
-                        {meta.length > 0 ? meta.join(", ") : "--"}
-                      </td>
-                    </tr>
-                  );
-                })}
-                {results.length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">
-                      No iterations yet
-                    </td>
-                  </tr>
+                        <option value="reflection">Reflection (0 fixes)</option>
+                        <option value="workflow_verification">Verification</option>
+                        <option value="fixed_iterations">Fixed Iterations</option>
+                        <option value="diagnostic_evaluation">Diagnostic Evaluation</option>
+                      </select>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")}>
+                      <div>
+                        <div className={cn(labelCls, "mb-1")}>Build Description</div>
+                        <textarea
+                          value={buildDesc}
+                          onChange={(e) => setBuildDesc(e.target.value)}
+                          placeholder="Describe the workflow to generate..."
+                          rows={8}
+                          className={textareaCls}
+                        />
+                      </div>
+                      <div>
+                        <div className={cn(labelCls, "mb-1")}>Build Context (optional)</div>
+                        <textarea
+                          value={buildContext}
+                          onChange={(e) => setBuildContext(e.target.value)}
+                          placeholder="Additional context for the builder..."
+                          rows={8}
+                          className={textareaCls}
+                        />
+                      </div>
+                      {enableFixes && (
+                        <div>
+                          <div className={cn(labelCls, "mb-1")}>Fix Context (optional)</div>
+                          <textarea
+                            value={fixContext}
+                            onChange={(e) => setFixContext(e.target.value)}
+                            placeholder="Extra instructions for the fix agent..."
+                            rows={8}
+                            className={textareaCls}
+                          />
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-4 flex-wrap">
+                      <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
+                        <span className={cn(labelCls, "whitespace-nowrap")}>
+                          Workflow (fallback)
+                        </span>
+                        <input
+                          type="text"
+                          value={workflowId}
+                          onChange={(e) => setWorkflowId(e.target.value)}
+                          placeholder="None (use build)"
+                          className={cn(inputCls, "flex-1")}
+                        />
+                      </div>
+                      <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={enableFixes}
+                          onChange={(e) => setEnableFixes(e.target.checked)}
+                          className="accent-primary"
+                        />
+                        <span className="text-muted-foreground">Enable Fix Implementation</span>
+                        <span className="text-muted-foreground/60 text-[0.7rem]">
+                          — Spawns Claude Code after reflection
+                        </span>
+                      </label>
+                    </div>
+                  </>
                 )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-        </>
+              </div>
+            )}
+
+            {/* Iteration History */}
+            <div className="border border-border rounded">
+              <div className="px-3 py-1.5 border-b border-border flex items-center justify-between">
+                <span className="text-xs font-semibold">Iteration History</span>
+                <span className="text-[0.7rem] text-muted-foreground">
+                  {results.length} iterations
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-border text-muted-foreground">
+                      <th className="px-3 py-1.5 text-left font-medium">#</th>
+                      <th className="px-3 py-1.5 text-left font-medium">Duration</th>
+                      <th className="px-3 py-1.5 text-left font-medium">Exit</th>
+                      <th className="px-3 py-1.5 text-left font-medium">Reason</th>
+                      <th className="px-3 py-1.5 text-left font-medium">Pipeline</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((iter) => {
+                      const duration =
+                        iter.started_at && iter.completed_at
+                          ? (
+                              (new Date(iter.completed_at).getTime() -
+                                new Date(iter.started_at).getTime()) /
+                              1000
+                            ).toFixed(1) + "s"
+                          : "--";
+                      const meta: string[] = [];
+                      if (iter.fix_count != null) meta.push(`fixes=${iter.fix_count}`);
+                      if (iter.fixes_implemented != null)
+                        meta.push(`applied=${iter.fixes_implemented ? "yes" : "no"}`);
+                      if (iter.rebuild_triggered) meta.push("rebuild");
+                      if (iter.generated_workflow_id) meta.push("built");
+                      return (
+                        <tr
+                          key={iter.iteration}
+                          className="border-b border-border/50 hover:bg-muted/30"
+                        >
+                          <td className="px-3 py-1.5 text-primary font-semibold">
+                            #{iter.iteration}
+                          </td>
+                          <td className="px-3 py-1.5 font-mono">{duration}</td>
+                          <td className="px-3 py-1.5">
+                            <span
+                              className={
+                                iter.exit_check?.should_exit ? "text-green-400" : "text-yellow-400"
+                              }
+                            >
+                              {iter.exit_check?.should_exit ? "EXIT" : "CONTINUE"}
+                            </span>
+                          </td>
+                          <td
+                            className="px-3 py-1.5 max-w-[300px] truncate"
+                            title={iter.exit_check?.reason}
+                          >
+                            {iter.exit_check?.reason || "--"}
+                          </td>
+                          <td className="px-3 py-1.5 text-muted-foreground text-[0.7rem]">
+                            {meta.length > 0 ? meta.join(", ") : "--"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {results.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-3 text-center text-muted-foreground">
+                          No iterations yet
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
         )}
       </div>
     </div>

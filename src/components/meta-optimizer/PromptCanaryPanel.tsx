@@ -192,10 +192,7 @@ export function PromptCanaryPanel() {
       <div className="flex items-center justify-between">
         <div className="text-sm text-zinc-400">Prompt Canary A/B Tests</div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={refresh}
-            className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1"
-          >
+          <button onClick={refresh} className="text-sm text-zinc-400 hover:text-zinc-200 px-2 py-1">
             Refresh
           </button>
           <button
@@ -208,10 +205,7 @@ export function PromptCanaryPanel() {
       </div>
 
       {showCreate && (
-        <CreatePromptCanaryForm
-          onCreated={handleCreated}
-          onClose={() => setShowCreate(false)}
-        />
+        <CreatePromptCanaryForm onCreated={handleCreated} onClose={() => setShowCreate(false)} />
       )}
 
       {error && (

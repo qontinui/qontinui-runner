@@ -17,7 +17,10 @@ interface RunErrorSummaryProps {
 }
 
 export function RunErrorSummary({ taskRunId, taskRunName, className }: RunErrorSummaryProps) {
-  const { summary } = useErrorSummary({ taskRunId, refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL });
+  const { summary } = useErrorSummary({
+    taskRunId,
+    refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL,
+  });
 
   const handleClick = useCallback(() => {
     window.dispatchEvent(
@@ -59,9 +62,7 @@ export function RunErrorSummary({ taskRunId, taskRunName, className }: RunErrorS
           {summary.warningCount}
         </span>
       )}
-      <span className="text-muted-foreground">
-        ({summary.unresolvedCount} unresolved)
-      </span>
+      <span className="text-muted-foreground">({summary.unresolvedCount} unresolved)</span>
       <ArrowRight className="w-3 h-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
     </button>
   );

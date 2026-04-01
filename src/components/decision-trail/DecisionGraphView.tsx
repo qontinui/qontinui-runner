@@ -74,7 +74,11 @@ function layoutNodes(
   return { nodes, edges };
 }
 
-export function DecisionGraphView({ decisions, fullDecisions, onSelectDecision }: DecisionGraphViewProps) {
+export function DecisionGraphView({
+  decisions,
+  fullDecisions,
+  onSelectDecision,
+}: DecisionGraphViewProps) {
   const { nodes, edges } = useMemo(
     () => layoutNodes(decisions, fullDecisions),
     [decisions, fullDecisions],
@@ -88,8 +92,14 @@ export function DecisionGraphView({ decisions, fullDecisions, onSelectDecision }
     );
   }
 
-  const width = Math.max(800, nodes.reduce((max, n) => Math.max(max, n.x + 200), 0));
-  const height = Math.max(400, nodes.reduce((max, n) => Math.max(max, n.y + 60), 0));
+  const width = Math.max(
+    800,
+    nodes.reduce((max, n) => Math.max(max, n.x + 200), 0),
+  );
+  const height = Math.max(
+    400,
+    nodes.reduce((max, n) => Math.max(max, n.y + 60), 0),
+  );
 
   // Build node position map for edges
   const posMap = new Map(nodes.map((n) => [n.id, { x: n.x, y: n.y }]));
@@ -145,11 +155,7 @@ export function DecisionGraphView({ decisions, fullDecisions, onSelectDecision }
           const color = DECISION_CATEGORY_COLORS[node.category as DecisionCategory] || "#6B7280";
           const isStrategic = node.scale === "strategic";
           return (
-            <g
-              key={node.id}
-              onClick={() => onSelectDecision(node.id)}
-              className="cursor-pointer"
-            >
+            <g key={node.id} onClick={() => onSelectDecision(node.id)} className="cursor-pointer">
               <rect
                 x={node.x}
                 y={node.y + 10}

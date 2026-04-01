@@ -760,7 +760,8 @@ class ExecutionReportingServiceImpl {
       timeout_actions: this.executionStats.timeoutActions,
       skipped_actions: this.executionStats.skippedActions,
       total_duration_ms: durationMs,
-      avg_action_duration_ms: totalActions > 0 ? Math.round(this.executionStats.totalActionDurationMs / totalActions) : 0,
+      avg_action_duration_ms:
+        totalActions > 0 ? Math.round(this.executionStats.totalActionDurationMs / totalActions) : 0,
       llm_action_count: this.executionStats.llmActionCount,
       total_tokens_input: this.executionStats.totalTokensInput,
       total_tokens_output: this.executionStats.totalTokensOutput,

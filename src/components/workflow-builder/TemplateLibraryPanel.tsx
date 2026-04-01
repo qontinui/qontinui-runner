@@ -16,10 +16,7 @@ interface TemplateLibraryPanelProps {
   apiBase: string;
 }
 
-export const TemplateLibraryPanel: React.FC<TemplateLibraryPanelProps> = ({
-  domain,
-  apiBase,
-}) => {
+export const TemplateLibraryPanel: React.FC<TemplateLibraryPanelProps> = ({ domain, apiBase }) => {
   const [templates, setTemplates] = useState<StepTemplate[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -46,11 +43,7 @@ export const TemplateLibraryPanel: React.FC<TemplateLibraryPanelProps> = ({
   }, [fetchTemplates]);
 
   if (loading) {
-    return (
-      <div className="p-4 text-sm text-zinc-500 dark:text-zinc-400">
-        Loading templates...
-      </div>
-    );
+    return <div className="p-4 text-sm text-zinc-500 dark:text-zinc-400">Loading templates...</div>;
   }
 
   if (templates.length === 0) {
@@ -78,8 +71,8 @@ export const TemplateLibraryPanel: React.FC<TemplateLibraryPanelProps> = ({
                   t.confidence >= 0.8
                     ? "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
                     : t.confidence >= 0.5
-                    ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400"
-                    : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                      ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400"
+                      : "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
                 }`}
               >
                 {(t.confidence * 100).toFixed(0)}%
@@ -87,7 +80,9 @@ export const TemplateLibraryPanel: React.FC<TemplateLibraryPanelProps> = ({
             </div>
             <div className="flex gap-3 mt-1 text-xs text-zinc-500 dark:text-zinc-400">
               <span>{t.domain}</span>
-              <span>{t.success_count}&#10003; / {t.failure_count}&#10007;</span>
+              <span>
+                {t.success_count}&#10003; / {t.failure_count}&#10007;
+              </span>
               <span>{t.source}</span>
             </div>
           </div>

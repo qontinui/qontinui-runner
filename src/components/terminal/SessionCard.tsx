@@ -175,9 +175,7 @@ export function SessionCard({
               <span className="text-[9px] text-[#e0af68]/80">{fileConflictCount}</span>
             </span>
           )}
-          {isPinned && (
-            <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />
-          )}
+          {isPinned && <Pin className="w-3 h-3 text-[#e0af68] shrink-0" />}
           {sessionLabel && (
             <span className="px-1 py-0 rounded text-[9px] font-medium shrink-0 bg-[#73daca]/10 text-[#73daca] truncate max-w-[60px]">
               {sessionLabel}
@@ -283,33 +281,48 @@ export function SessionCard({
           ) : (
             <>
               <button
-                onClick={() => { onResume(session); setContextMenu(null); }}
+                onClick={() => {
+                  onResume(session);
+                  setContextMenu(null);
+                }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
                 <TerminalSquare className="w-3 h-3 text-[#9ece6a]" /> Resume
               </button>
               <button
-                onClick={() => { onViewTranscript(session); setContextMenu(null); }}
+                onClick={() => {
+                  onViewTranscript(session);
+                  setContextMenu(null);
+                }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
                 <Eye className="w-3 h-3 text-[#7aa2f7]" /> View Transcript
               </button>
               <button
-                onClick={() => { onCopyId(session); setContextMenu(null); }}
+                onClick={() => {
+                  onCopyId(session);
+                  setContextMenu(null);
+                }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
                 <Copy className="w-3 h-3" /> Copy Session ID
               </button>
               <div className="my-1 h-px bg-[#2a2d3d]" />
               <button
-                onClick={() => { onTogglePin(session.sessionId); setContextMenu(null); }}
+                onClick={() => {
+                  onTogglePin(session.sessionId);
+                  setContextMenu(null);
+                }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
                 <Pin className={`w-3 h-3 ${isPinned ? "text-[#e0af68]" : ""}`} />
                 {isPinned ? "Unpin" : "Pin to Top"}
               </button>
               <button
-                onClick={() => { setShowLabelInput(true); setLabelInput(sessionLabel ?? ""); }}
+                onClick={() => {
+                  setShowLabelInput(true);
+                  setLabelInput(sessionLabel ?? "");
+                }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
               >
                 <Tag className="w-3 h-3 text-[#73daca]" />
@@ -317,7 +330,10 @@ export function SessionCard({
               </button>
               {!selectionMode && (
                 <button
-                  onClick={() => { onToggleSelect(session.sessionId); setContextMenu(null); }}
+                  onClick={() => {
+                    onToggleSelect(session.sessionId);
+                    setContextMenu(null);
+                  }}
                   className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[#a9b1d6] hover:bg-[#2a2d3d] transition-colors"
                 >
                   <Copy className="w-3 h-3" /> Select for Bulk

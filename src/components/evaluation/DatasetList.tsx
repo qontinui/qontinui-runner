@@ -24,7 +24,13 @@ function formatDate(iso: string): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
-export function DatasetList({ datasets, isLoading, selectedId, onSelect, onDelete }: DatasetListProps) {
+export function DatasetList({
+  datasets,
+  isLoading,
+  selectedId,
+  onSelect,
+  onDelete,
+}: DatasetListProps) {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   if (isLoading) {
@@ -66,7 +72,9 @@ export function DatasetList({ datasets, isLoading, selectedId, onSelect, onDelet
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-medium truncate">{ds.name}</span>
-                <Badge variant="muted" size="sm">v{ds.version}</Badge>
+                <Badge variant="muted" size="sm">
+                  v{ds.version}
+                </Badge>
               </div>
               <div className="flex items-center gap-3 mt-0.5 text-xs text-muted-foreground">
                 <span>{ds.item_count} items</span>

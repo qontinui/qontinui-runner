@@ -302,7 +302,11 @@ function ConfigureView({
           <ChevronRight className="w-4 h-4 rotate-180" />
         </button>
         <div className={`p-2 rounded ${iconData.bgClass}`}>
-          <ResolvedSkillIcon iconId={selectedSkill.icon} className={`w-5 h-5 ${iconData.textClass}`} resolveIcon={resolveIcon} />
+          <ResolvedSkillIcon
+            iconId={selectedSkill.icon}
+            className={`w-5 h-5 ${iconData.textClass}`}
+            resolveIcon={resolveIcon}
+          />
         </div>
         <div className="flex-1 min-w-0">
           <h3 className="text-sm font-medium text-zinc-200">{selectedSkill.name}</h3>
@@ -393,7 +397,11 @@ function SkillRow({
       onClick={onClick}
     >
       <div className={`shrink-0 p-1.5 rounded ${iconData.bgClass}`}>
-        <ResolvedSkillIcon iconId={skill.icon} className={`w-4 h-4 ${iconData.textClass}`} resolveIcon={resolveIcon} />
+        <ResolvedSkillIcon
+          iconId={skill.icon}
+          className={`w-4 h-4 ${iconData.textClass}`}
+          resolveIcon={resolveIcon}
+        />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">

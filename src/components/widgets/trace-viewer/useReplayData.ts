@@ -27,9 +27,7 @@ export function deriveReplaySteps(spans: TraceSpan[]): ReplayStep[] {
   const steps: ReplayStep[] = [];
 
   // Sort by start timestamp
-  const sorted = [...spans].sort((a, b) =>
-    (a.start_ts || "").localeCompare(b.start_ts || "")
-  );
+  const sorted = [...spans].sort((a, b) => (a.start_ts || "").localeCompare(b.start_ts || ""));
 
   for (const span of sorted) {
     // Phase transitions

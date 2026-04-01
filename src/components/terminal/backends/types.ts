@@ -28,10 +28,7 @@ export interface ITerminalLink {
 }
 
 export interface ITerminalLinkProvider {
-  provideLinks(
-    lineNumber: number,
-    callback: (links: ITerminalLink[] | undefined) => void,
-  ): void;
+  provideLinks(lineNumber: number, callback: (links: ITerminalLink[] | undefined) => void): void;
 }
 
 // ---------------------------------------------------------------------------

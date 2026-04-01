@@ -156,9 +156,7 @@
             "label": "Empty state message"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "No feedback scores exist for the current run"
-          ],
+          "preconditions": ["No feedback scores exist for the current run"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -176,9 +174,7 @@
             "label": "Loading indicator"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Feedback scores are currently being fetched"
-          ],
+          "preconditions": ["Feedback scores are currently being fetched"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -196,9 +192,7 @@
             "label": "Error state with retry"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "The feedback scores API returned an error"
-          ],
+          "preconditions": ["The feedback scores API returned an error"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -248,11 +242,7 @@
           "action": "click",
           "expectedState": {
             "formVisible": true,
-            "fields": [
-              "Name",
-              "Value (0 \u00e2\u20ac\u201c 1)",
-              "Reason"
-            ]
+            "fields": ["Name", "Value (0 \u00e2\u20ac\u201c 1)", "Reason"]
           },
           "source": "manual",
           "reviewed": true,
@@ -274,9 +264,7 @@
             "label": "Score name input field"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Add Score form is visible"
-          ],
+          "preconditions": ["Add Score form is visible"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -295,9 +283,7 @@
             "label": "Score value number input"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Add Score form is visible"
-          ],
+          "preconditions": ["Add Score form is visible"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -317,9 +303,7 @@
             "label": "Score reason textarea"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Add Score form is visible"
-          ],
+          "preconditions": ["Add Score form is visible"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -338,9 +322,7 @@
             "label": "Submit button"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Add Score form is visible"
-          ],
+          "preconditions": ["Add Score form is visible"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -359,9 +341,7 @@
             "label": "Cancel button"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Add Score form is visible"
-          ],
+          "preconditions": ["Add Score form is visible"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -382,9 +362,7 @@
           "assertionType": "attribute",
           "attribute": "disabled",
           "expectedValue": true,
-          "preconditions": [
-            "Score creation mutation is in flight"
-          ],
+          "preconditions": ["Score creation mutation is in flight"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -412,9 +390,7 @@
             "label": "Expandable score row with chevron"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "At least one score has a reason field"
-          ],
+          "preconditions": ["At least one score has a reason field"],
           "source": "manual",
           "reviewed": true,
           "enabled": true,
@@ -457,9 +433,7 @@
             "label": "Expanded reason text"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "A score row with a reason is expanded"
-          ],
+          "preconditions": ["A score row with a reason is expanded"],
           "source": "manual",
           "reviewed": true,
           "enabled": true,
@@ -480,9 +454,7 @@
           "assertionType": "attribute",
           "attribute": "role",
           "expectedValue": null,
-          "preconditions": [
-            "At least one score has no reason field"
-          ],
+          "preconditions": ["At least one score has no reason field"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -638,9 +610,7 @@
             "label": "Cost empty state"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "The run had zero LLM actions"
-          ],
+          "preconditions": ["The run had zero LLM actions"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -658,9 +628,7 @@
             "label": "Cost loading indicator"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "Cost summary is currently being fetched"
-          ],
+          "preconditions": ["Cost summary is currently being fetched"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -678,9 +646,7 @@
             "label": "Cost error state"
           },
           "assertionType": "exists",
-          "preconditions": [
-            "The cost summary API returned an error"
-          ],
+          "preconditions": ["The cost summary API returned an error"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -817,11 +783,7 @@
             "type": "component",
             "criteria": {
               "component": "ScoreRow",
-              "children": [
-                "score.name",
-                "formatScore(score.value)",
-                "progress-bar"
-              ]
+              "children": ["score.name", "formatScore(score.value)", "progress-bar"]
             },
             "label": "Score row structural elements"
           },
@@ -853,10 +815,7 @@
             "type": "component",
             "criteria": {
               "component": "SummaryStrip",
-              "children": [
-                "Avg Score",
-                "scores:"
-              ]
+              "children": ["Avg Score", "scores:"]
             },
             "label": "Summary strip average and count"
           },
@@ -890,9 +849,7 @@
             "type": "component",
             "criteria": {
               "component": "SummaryStrip",
-              "children": [
-                "Badge"
-              ]
+              "children": ["Badge"]
             },
             "label": "Conditional source badges"
           },
@@ -961,9 +918,7 @@
               "textContent": "Actions"
             }
           ],
-          "preconditions": [
-            "Run has at least one LLM action (llm_action_count > 0)"
-          ],
+          "preconditions": ["Run has at least one LLM action (llm_action_count > 0)"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -1213,9 +1168,7 @@
             "ariaLabel": "Collapse reason for {score.name}",
             "reasonContainer": ".px-3.pb-3.pt-0.ml-7.border-t.border-border"
           },
-          "preconditions": [
-            "Score has a non-empty reason field (!!score.reason === true)"
-          ],
+          "preconditions": ["Score has a non-empty reason field (!!score.reason === true)"],
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -1286,9 +1239,7 @@
             "type": "component",
             "criteria": {
               "component": "SummaryStrip",
-              "children": [
-                "Badge"
-              ]
+              "children": ["Badge"]
             },
             "label": "Source badge counts"
           },
@@ -1333,10 +1284,7 @@
             "type": "component",
             "criteria": {
               "component": "TotalsStrip",
-              "props": [
-                "tokensInput",
-                "tokensOutput"
-              ]
+              "props": ["tokensInput", "tokensOutput"]
             },
             "label": "Total token counts vs per-model sums"
           },
@@ -1365,12 +1313,6 @@
     "pageUrl": "/run-summary",
     "elementSource": "sdk",
     "specType": "semantic",
-    "tags": [
-      "feedback-scores",
-      "llm-costs",
-      "run-recap",
-      "opik",
-      "tier-2"
-    ]
+    "tags": ["feedback-scores", "llm-costs", "run-recap", "opik", "tier-2"]
   }
 }

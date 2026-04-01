@@ -29,13 +29,12 @@ const DEFAULTS: NotificationPreferences = {
 };
 
 function readPrefs(): NotificationPreferences {
-  const raw = instanceStorage.getJSON<Partial<NotificationPreferences> | null>(
-    STORAGE_KEY,
-    null,
-  );
+  const raw = instanceStorage.getJSON<Partial<NotificationPreferences> | null>(STORAGE_KEY, null);
   if (!raw) return { ...DEFAULTS };
   return {
-    severityFilter: isValidSeverity(raw.severityFilter) ? raw.severityFilter : DEFAULTS.severityFilter,
+    severityFilter: isValidSeverity(raw.severityFilter)
+      ? raw.severityFilter
+      : DEFAULTS.severityFilter,
     mutedSources: Array.isArray(raw.mutedSources) ? raw.mutedSources : DEFAULTS.mutedSources,
     maxPerBatch:
       typeof raw.maxPerBatch === "number" && raw.maxPerBatch >= 0
@@ -88,13 +87,16 @@ export interface UseNotificationPreferencesResult {
 export function useNotificationPreferences(): UseNotificationPreferencesResult {
   const [prefs, setPrefs] = useState<NotificationPreferences>(readPrefs);
 
-  const update = useCallback((updater: (prev: NotificationPreferences) => NotificationPreferences) => {
-    setPrefs((prev) => {
-      const next = updater(prev);
-      writePrefs(next);
-      return next;
-    });
-  }, []);
+  const update = useCallback(
+    (updater: (prev: NotificationPreferences) => NotificationPreferences) => {
+      setPrefs((prev) => {
+        const next = updater(prev);
+        writePrefs(next);
+        return next;
+      });
+    },
+    [],
+  );
 
   const setSeverityFilter = useCallback(
     (filter: NotificationSeverityFilter) => {
@@ -151,6 +153,14 @@ export function useNotificationPreferences(): UseNotificationPreferencesResult {
       isSourceMuted,
       resetToDefaults,
     }),
-    [prefs, setSeverityFilter, setMaxPerBatch, muteSource, unmuteSource, isSourceMuted, resetToDefaults],
+    [
+      prefs,
+      setSeverityFilter,
+      setMaxPerBatch,
+      muteSource,
+      unmuteSource,
+      isSourceMuted,
+      resetToDefaults,
+    ],
   );
 }

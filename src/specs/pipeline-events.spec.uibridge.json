@@ -204,8 +204,14 @@
           "severity": "warning",
           "assertionType": "exists",
           "expected": "HH:mm:ss format derived from ISO 8601 created_at",
-          "target": { "type": "search", "criteria": { "textContent": ":" }, "label": "Formatted timestamp" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": ":" },
+            "label": "Formatted timestamp"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "pipe-data-duration",
@@ -214,8 +220,14 @@
           "severity": "warning",
           "assertionType": "containsText",
           "expected": "Integer suffixed with 'ms', e.g. '1234ms'",
-          "target": { "type": "search", "criteria": { "textContent": "ms" }, "label": "Duration in milliseconds" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ms" },
+            "label": "Duration in milliseconds"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "pipe-data-error-delta",
@@ -224,8 +236,14 @@
           "severity": "info",
           "assertionType": "containsText",
           "expected": "Format 'errors: N → M' where N=validation_errors_before, M=validation_errors_after",
-          "target": { "type": "search", "criteria": { "textContent": "errors:" }, "label": "Validation error delta" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "errors:" },
+            "label": "Validation error delta"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -243,8 +261,14 @@
           "severity": "warning",
           "assertionType": "behavior",
           "precondition": "More events exist than fit in the max-h-96 container",
-          "target": { "type": "search", "criteria": { "textContent": "Pipeline Events" }, "label": "Scrollable events container" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Pipeline Events" },
+            "label": "Scrollable events container"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "pipe-behavior-chronological",
@@ -253,8 +277,14 @@
           "severity": "critical",
           "assertionType": "order",
           "precondition": "Multiple events exist for the task run",
-          "target": { "type": "search", "criteria": { "textContent": "Pipeline Events" }, "label": "Chronological event ordering" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Pipeline Events" },
+            "label": "Chronological event ordering"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -271,8 +301,14 @@
           "category": "element-presence",
           "severity": "info",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "textContent": "Pipeline Events" }, "label": "Phase indicator dots" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Pipeline Events" },
+            "label": "Phase indicator dots"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"

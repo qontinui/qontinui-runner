@@ -85,9 +85,7 @@ export function useEvaluationExperiments(datasetId: string | null) {
   const experimentsQuery = useQuery({
     queryKey: evaluationExperimentKeys.list(datasetId ?? ""),
     queryFn: () =>
-      apiFetch<EvaluationExperiment[]>(
-        `/api/v1/evaluation/experiments?dataset_id=${datasetId}`,
-      ),
+      apiFetch<EvaluationExperiment[]>(`/api/v1/evaluation/experiments?dataset_id=${datasetId}`),
     enabled: !!datasetId,
     staleTime: 15_000,
     refetchInterval: 30_000,
@@ -128,9 +126,7 @@ export function useExperimentResults(experimentId: string | null) {
   const resultsQuery = useQuery({
     queryKey: evaluationExperimentKeys.results(experimentId ?? ""),
     queryFn: () =>
-      apiFetch<ExperimentResultsResponse>(
-        `/api/v1/evaluation/experiments/${experimentId}/results`,
-      ),
+      apiFetch<ExperimentResultsResponse>(`/api/v1/evaluation/experiments/${experimentId}/results`),
     enabled: !!experimentId,
     staleTime: 15_000,
     refetchInterval: 30_000,

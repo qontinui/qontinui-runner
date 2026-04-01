@@ -1,7 +1,20 @@
 import React, { useState, useRef, useMemo, useCallback, useEffect } from "react";
-import type { TraceSpan, SpanFilter, TraceViewMode, CriticalPathInfo, TokenOverlayMode } from "./types";
+import type {
+  TraceSpan,
+  SpanFilter,
+  TraceViewMode,
+  CriticalPathInfo,
+  TokenOverlayMode,
+} from "./types";
 import { useTraceViewerData } from "./useTraceViewerData";
-import { buildTraceTree, flattenTree, filterSpans, computeInsights, computeCriticalPath, computeTokenInsights } from "./trace-utils";
+import {
+  buildTraceTree,
+  flattenTree,
+  filterSpans,
+  computeInsights,
+  computeCriticalPath,
+  computeTokenInsights,
+} from "./trace-utils";
 import { TraceToolbar } from "./TraceToolbar";
 import { TraceWaterfall } from "./TraceWaterfall";
 import { FlameChart } from "./FlameChart";
@@ -118,8 +131,8 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   // Trace time bounds for minimap
   const traceDurationMs = useMemo(() => {
     if (spans.length === 0) return 0;
-    const times = spans.filter(s => s.start_ts).map(s => new Date(s.start_ts).getTime());
-    const endTimes = spans.filter(s => s.end_ts).map(s => new Date(s.end_ts!).getTime());
+    const times = spans.filter((s) => s.start_ts).map((s) => new Date(s.start_ts).getTime());
+    const endTimes = spans.filter((s) => s.end_ts).map((s) => new Date(s.end_ts!).getTime());
     const start = Math.min(...times);
     const end = Math.max(...endTimes, ...times);
     return end - start;
@@ -160,9 +173,15 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
   }
 
   return (
-    <div className="flex flex-col bg-zinc-900 rounded border border-zinc-700 overflow-hidden" data-tutorial-id="trace-viewer-widget">
+    <div
+      className="flex flex-col bg-zinc-900 rounded border border-zinc-700 overflow-hidden"
+      data-tutorial-id="trace-viewer-widget"
+    >
       {/* Toolbar with view toggle */}
-      <div className="flex items-center gap-2 bg-zinc-900 border-b border-zinc-700" data-tutorial-id="trace-view-mode-bar">
+      <div
+        className="flex items-center gap-2 bg-zinc-900 border-b border-zinc-700"
+        data-tutorial-id="trace-view-mode-bar"
+      >
         {/* View mode tabs */}
         <div className="flex items-center gap-0.5 px-3 py-1.5" data-tutorial-id="trace-view-tabs">
           {VIEW_OPTIONS.map((opt) => (
@@ -182,7 +201,10 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
 
         {/* Critical path toggle (waterfall & flamechart only) */}
         {viewMode !== "comparison" && viewMode !== "agent-graph" && (
-          <label className="flex items-center gap-1.5 text-[11px] text-zinc-500 cursor-pointer select-none" data-tutorial-id="trace-critical-path-toggle">
+          <label
+            className="flex items-center gap-1.5 text-[11px] text-zinc-500 cursor-pointer select-none"
+            data-tutorial-id="trace-critical-path-toggle"
+          >
             <input
               type="checkbox"
               checked={showCriticalPath}
@@ -278,7 +300,9 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
             criticalPath={criticalPath}
             tokenOverlay={tokenOverlay}
             tokenInsights={tokenInsights}
-            highlightedSpanId={replayMode && replaySteps[replayStep] ? replaySteps[replayStep].spanId : null}
+            highlightedSpanId={
+              replayMode && replaySteps[replayStep] ? replaySteps[replayStep].spanId : null
+            }
             onViewportChange={(start, end) => {
               if (scrollSourceRef.current !== "minimap") {
                 setMinimapViewport({ start, end });
@@ -342,7 +366,11 @@ export const TraceViewerWidget: React.FC<TraceViewerWidgetProps> = ({
 
       {/* Footer insights (not shown for comparison — it has its own summary) */}
       {viewMode !== "comparison" && (
-        <PerformanceInsights insights={insights} criticalPath={criticalPath} tokenInsights={tokenInsights} />
+        <PerformanceInsights
+          insights={insights}
+          criticalPath={criticalPath}
+          tokenInsights={tokenInsights}
+        />
       )}
     </div>
   );

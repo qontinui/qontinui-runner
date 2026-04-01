@@ -45,12 +45,17 @@ export function FailureTaxonomyPanel({ days = 7 }: FailureTaxonomyPanelProps) {
                 {elements.length > 0 && (
                   <div className="flex flex-wrap gap-1 mt-2">
                     {elements.slice(0, 5).map((el) => (
-                      <span key={el} className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-mono">
+                      <span
+                        key={el}
+                        className="text-xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground font-mono"
+                      >
                         {el}
                       </span>
                     ))}
                     {elements.length > 5 && (
-                      <span className="text-xs text-muted-foreground">+{elements.length - 5} more</span>
+                      <span className="text-xs text-muted-foreground">
+                        +{elements.length - 5} more
+                      </span>
                     )}
                   </div>
                 )}

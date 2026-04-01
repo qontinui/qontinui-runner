@@ -21,12 +21,12 @@ import type { SessionRecap, FileChange, DependencyEdge } from "./types";
 // ============================================================================
 
 const LANGUAGE_COLORS: Record<string, string> = {
-  rust: "#F97316",       // orange
+  rust: "#F97316", // orange
   typescript: "#3B82F6", // blue
   javascript: "#EAB308", // yellow
-  python: "#22C55E",     // green
-  sql: "#A855F7",        // purple
-  json: "#6B7280",       // gray
+  python: "#22C55E", // green
+  sql: "#A855F7", // purple
+  json: "#6B7280", // gray
   other: "#9CA3AF",
 };
 
@@ -77,11 +77,7 @@ export function buildSessionGraph(recap: SessionRecap): {
   const edges: Edge[] = [];
   const nodeIdSet = new Set<string>();
 
-  const allFiles = [
-    ...recap.files_created,
-    ...recap.files_modified,
-    ...recap.files_deleted,
-  ];
+  const allFiles = [...recap.files_created, ...recap.files_modified, ...recap.files_deleted];
 
   // --- File nodes ---
   for (const file of allFiles) {

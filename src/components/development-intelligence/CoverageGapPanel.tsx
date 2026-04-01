@@ -55,7 +55,11 @@ interface CoverageGapPanelProps {
 const NODE_W = 180;
 const NODE_H = 60;
 
-function CoverageNode({ data }: { data: { label: string; score: number; assertions: number; gaps: number } }) {
+function CoverageNode({
+  data,
+}: {
+  data: { label: string; score: number; assertions: number; gaps: number };
+}) {
   const color = getCoverageTierColor(data.score);
   return (
     <div
@@ -71,9 +75,7 @@ function CoverageNode({ data }: { data: { label: string; score: number; assertio
       <div className="flex items-center gap-2 mt-1 text-muted-foreground">
         <span style={{ color }}>{Math.round(data.score * 100)}%</span>
         <span>{data.assertions} assertions</span>
-        {data.gaps > 0 && (
-          <span className="text-destructive">{data.gaps} gaps</span>
-        )}
+        {data.gaps > 0 && <span className="text-destructive">{data.gaps} gaps</span>}
       </div>
       <Handle type="source" position={Position.Right} className="!bg-border" />
     </div>
@@ -137,9 +139,7 @@ function GapDetailRow({ gap }: { gap: GapDetail }) {
       {severityIcon}
       <span className="font-medium">{gap.specGroupName}</span>
       <span className="text-muted-foreground">({gap.category})</span>
-      <span className="text-muted-foreground ml-auto">
-        {gap.assertionCount} assertions
-      </span>
+      <span className="text-muted-foreground ml-auto">{gap.assertionCount} assertions</span>
     </div>
   );
 }
@@ -148,11 +148,7 @@ function GapDetailRow({ gap }: { gap: GapDetail }) {
 // Main Panel
 // =============================================================================
 
-export function CoverageGapPanel({
-  data,
-  loading,
-  onRefresh,
-}: CoverageGapPanelProps) {
+export function CoverageGapPanel({ data, loading, onRefresh }: CoverageGapPanelProps) {
   const [view, setView] = useState<"table" | "graph">("table");
   const [expandedPage, setExpandedPage] = useState<string | null>(null);
 
@@ -175,8 +171,7 @@ export function CoverageGapPanel({
   }
 
   const toggleExpand = useCallback(
-    (page: string) =>
-      setExpandedPage((prev) => (prev === page ? null : page)),
+    (page: string) => setExpandedPage((prev) => (prev === page ? null : page)),
     [],
   );
 
@@ -206,21 +201,11 @@ export function CoverageGapPanel({
           <span className="text-sm font-medium">Coverage Analysis</span>
         </div>
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
-          <span>
-            {data.summary.totalPages} pages
-          </span>
-          <span className="text-emerald-500">
-            {data.summary.wellCovered} covered
-          </span>
-          <span className="text-yellow-500">
-            {data.summary.partiallyCovered} partial
-          </span>
-          <span className="text-destructive">
-            {data.summary.uncovered} uncovered
-          </span>
-          <span>
-            Avg: {Math.round(data.summary.averageCoverageScore * 100)}%
-          </span>
+          <span>{data.summary.totalPages} pages</span>
+          <span className="text-emerald-500">{data.summary.wellCovered} covered</span>
+          <span className="text-yellow-500">{data.summary.partiallyCovered} partial</span>
+          <span className="text-destructive">{data.summary.uncovered} uncovered</span>
+          <span>Avg: {Math.round(data.summary.averageCoverageScore * 100)}%</span>
         </div>
         <div className="ml-auto flex items-center gap-1">
           <button
@@ -245,9 +230,7 @@ export function CoverageGapPanel({
             <thead className="sticky top-0 bg-card border-b">
               <tr>
                 <th className="text-left px-3 py-2 font-medium">Page</th>
-                <th className="text-right px-3 py-2 font-medium">
-                  Spec Assertions
-                </th>
+                <th className="text-right px-3 py-2 font-medium">Spec Assertions</th>
                 <th className="text-right px-3 py-2 font-medium">Tests</th>
                 <th className="text-right px-3 py-2 font-medium">Coverage</th>
                 <th className="text-left px-3 py-2 font-medium">Top Gap</th>
@@ -283,8 +266,7 @@ export function CoverageGapPanel({
                         )}
                       </td>
                       <td className="text-right px-3 py-2">
-                        {gap.testFileCount} files / {gap.testAssertionCount}{" "}
-                        asserts
+                        {gap.testFileCount} files / {gap.testAssertionCount} asserts
                       </td>
                       <td className="text-right px-3 py-2">
                         <span
@@ -308,9 +290,7 @@ export function CoverageGapPanel({
                     {isExpanded && gap.gaps.length > 0 && (
                       <tr>
                         <td colSpan={5} className="bg-muted/30 px-6 py-2">
-                          <div className="text-xs font-medium mb-1">
-                            Uncovered spec groups:
-                          </div>
+                          <div className="text-xs font-medium mb-1">Uncovered spec groups:</div>
                           {gap.gaps.map((g) => (
                             <GapDetailRow key={g.specGroupId} gap={g} />
                           ))}
@@ -339,9 +319,7 @@ export function CoverageGapPanel({
             <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
             <Controls showInteractive={false} />
             <MiniMap
-              nodeColor={(n) =>
-                getCoverageTierColor((n.data?.score as number) ?? 0)
-              }
+              nodeColor={(n) => getCoverageTierColor((n.data?.score as number) ?? 0)}
               maskColor="rgba(0,0,0,0.1)"
             />
           </ReactFlow>

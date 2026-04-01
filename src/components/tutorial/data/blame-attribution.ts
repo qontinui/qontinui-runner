@@ -19,14 +19,7 @@ export const blameAttributionTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "help",
   category: "Architecture",
-  tags: [
-    "blame",
-    "verification",
-    "convergence",
-    "architecture",
-    "advanced",
-    "featured",
-  ],
+  tags: ["blame", "verification", "convergence", "architecture", "advanced", "featured"],
   prerequisites: ["getting-started"],
   learningObjectives: [
     "Understand why blame attribution exists and what problem it solves",

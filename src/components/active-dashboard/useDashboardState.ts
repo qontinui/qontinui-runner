@@ -156,9 +156,7 @@ export function useDashboardState(): DashboardState {
 
   // GraphQL subscription triggers refresh on task status changes,
   // replacing aggressive 2s polling with event-driven updates
-  const { data: eventData } = useRunnerEvents(
-    ["TaskRunUpdate", "StepProgress"],
-  );
+  const { data: eventData } = useRunnerEvents(["TaskRunUpdate", "StepProgress"]);
   const lastEventKeyRef = useRef("");
   useEffect(() => {
     const event = eventData?.runnerEvents;

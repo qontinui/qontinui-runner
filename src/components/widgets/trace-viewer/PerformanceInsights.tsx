@@ -8,7 +8,11 @@ interface PerformanceInsightsProps {
   tokenInsights?: ReturnType<typeof computeTokenInsights>;
 }
 
-export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insights, criticalPath, tokenInsights }) => {
+export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({
+  insights,
+  criticalPath,
+  tokenInsights,
+}) => {
   if (insights.spanCount === 0) return null;
 
   const parallelSlack =
@@ -17,7 +21,10 @@ export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insigh
       : null;
 
   return (
-    <div className="flex flex-wrap items-center gap-4 px-3 py-1.5 bg-zinc-900 border-t border-zinc-700 text-[11px] text-zinc-500" data-tutorial-id="trace-performance-insights">
+    <div
+      className="flex flex-wrap items-center gap-4 px-3 py-1.5 bg-zinc-900 border-t border-zinc-700 text-[11px] text-zinc-500"
+      data-tutorial-id="trace-performance-insights"
+    >
       <span>
         Total: <span className="text-zinc-300">{formatDuration(insights.totalDurationMs)}</span>
       </span>
@@ -73,15 +80,20 @@ export const PerformanceInsights: React.FC<PerformanceInsightsProps> = ({ insigh
         <>
           <span className="text-zinc-600">|</span>
           <span>
-            Tokens: <span className="text-zinc-300">{tokenInsights.totalInputTokens.toLocaleString()}</span>
-            <span className="text-zinc-500">&#8593;</span>
-            {' '}
-            <span className="text-zinc-300">{tokenInsights.totalOutputTokens.toLocaleString()}</span>
+            Tokens:{" "}
+            <span className="text-zinc-300">{tokenInsights.totalInputTokens.toLocaleString()}</span>
+            <span className="text-zinc-500">&#8593;</span>{" "}
+            <span className="text-zinc-300">
+              {tokenInsights.totalOutputTokens.toLocaleString()}
+            </span>
             <span className="text-zinc-500">&#8595;</span>
           </span>
           {tokenInsights.totalCostCents > 0 && (
             <span>
-              Cost: <span className="text-zinc-300">${(tokenInsights.totalCostCents / 100).toFixed(4)}</span>
+              Cost:{" "}
+              <span className="text-zinc-300">
+                ${(tokenInsights.totalCostCents / 100).toFixed(4)}
+              </span>
             </span>
           )}
         </>

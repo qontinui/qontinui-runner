@@ -41,7 +41,9 @@ function ResultRow({ result }: { result: UnifiedSearchResult }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <p className="text-sm font-medium text-foreground truncate">{result.title}</p>
-          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-muted text-muted-foreground capitalize">{result.entity_type}</span>
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs bg-muted text-muted-foreground capitalize">
+            {result.entity_type}
+          </span>
         </div>
         <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{result.snippet}</p>
       </div>
@@ -76,7 +78,7 @@ export default function UnifiedSearchPanel({ results, isLoading, error, onSearch
         <input
           type="text"
           value={query}
-          onChange={e => setQuery(e.target.value)}
+          onChange={(e) => setQuery(e.target.value)}
           placeholder="Search findings, fixes, rules, errors..."
           className="flex-1 px-3 py-1.5 text-sm bg-muted border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-ring"
         />
@@ -101,19 +103,29 @@ export default function UnifiedSearchPanel({ results, isLoading, error, onSearch
         {results && results.length > 0 && (
           <div className="bg-card rounded-lg border border-border">
             <div className="p-3 border-b border-border flex items-center justify-between">
-              <h3 className="text-sm font-medium">{results.length} result{results.length !== 1 ? "s" : ""}</h3>
+              <h3 className="text-sm font-medium">
+                {results.length} result{results.length !== 1 ? "s" : ""}
+              </h3>
               <div className="flex gap-1">
                 {Object.entries(
-                  results.reduce<Record<string, number>>((acc, r) => { acc[r.entity_type] = (acc[r.entity_type] || 0) + 1; return acc; }, {})
+                  results.reduce<Record<string, number>>((acc, r) => {
+                    acc[r.entity_type] = (acc[r.entity_type] || 0) + 1;
+                    return acc;
+                  }, {}),
                 ).map(([type, count]) => (
-                  <span key={type} className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs ${ENTITY_COLORS[type] || "bg-muted text-muted-foreground"}`}>
+                  <span
+                    key={type}
+                    className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs ${ENTITY_COLORS[type] || "bg-muted text-muted-foreground"}`}
+                  >
                     {count} {type}
                   </span>
                 ))}
               </div>
             </div>
             <div className="divide-y divide-border px-3">
-              {results.map(r => <ResultRow key={`${r.entity_type}-${r.entity_id}`} result={r} />)}
+              {results.map((r) => (
+                <ResultRow key={`${r.entity_type}-${r.entity_id}`} result={r} />
+              ))}
             </div>
           </div>
         )}

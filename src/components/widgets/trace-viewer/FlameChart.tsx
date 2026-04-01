@@ -1,6 +1,18 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
-import type { TraceSpan, FlameNode, CriticalPathInfo, TraceTreeNode, TokenOverlayMode } from "./types";
-import { buildFlameData, flattenFlameNodes, formatDuration, getTokenHeat, computeTokenInsights } from "./trace-utils";
+import type {
+  TraceSpan,
+  FlameNode,
+  CriticalPathInfo,
+  TraceTreeNode,
+  TokenOverlayMode,
+} from "./types";
+import {
+  buildFlameData,
+  flattenFlameNodes,
+  formatDuration,
+  getTokenHeat,
+  computeTokenInsights,
+} from "./trace-utils";
 
 // Canvas color mapping for phases (not Tailwind — raw hex for canvas)
 const PHASE_HEX: Record<string, { bg: string; text: string }> = {
@@ -19,10 +31,10 @@ const NAME_MIN_WIDTH = 60;
 
 function blendHeatColor(baseColor: string, heat: number): string {
   if (heat <= 0) return baseColor;
-  const r = Math.round(239 * heat + parseInt(baseColor.slice(1,3), 16) * (1-heat));
-  const g = Math.round(68 * heat + parseInt(baseColor.slice(3,5), 16) * (1-heat));
-  const b = Math.round(68 * heat + parseInt(baseColor.slice(5,7), 16) * (1-heat));
-  return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+  const r = Math.round(239 * heat + parseInt(baseColor.slice(1, 3), 16) * (1 - heat));
+  const g = Math.round(68 * heat + parseInt(baseColor.slice(3, 5), 16) * (1 - heat));
+  const b = Math.round(68 * heat + parseInt(baseColor.slice(5, 7), 16) * (1 - heat));
+  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
 }
 
 interface FlameChartProps {
@@ -56,7 +68,9 @@ export const FlameChart: React.FC<FlameChartProps> = ({
   const [view, setView] = useState<ViewState>({ zoom: 1, panX: 0 });
   const [maxDepth, setMaxDepth] = useState<number>(20);
   const [focusStack, setFocusStack] = useState<FlameNode[]>([]);
-  const [hoveredSpan, setHoveredSpan] = useState<{ span: TraceSpan; x: number; y: number } | null>(null);
+  const [hoveredSpan, setHoveredSpan] = useState<{ span: TraceSpan; x: number; y: number } | null>(
+    null,
+  );
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 400 });
   const [isDragging, setIsDragging] = useState(false);
   const dragRef = useRef<{ startX: number; startPanX: number } | null>(null);
@@ -149,9 +163,12 @@ export const FlameChart: React.FC<FlameChartProps> = ({
       const isSelected = node.span.span_id === selectedSpanId;
       let baseBg = colors.bg;
       if (tokenOverlay && tokenOverlay !== "none" && tokenInsights) {
-        const maxVal = tokenOverlay === "input" ? tokenInsights.maxInputTokens
-          : tokenOverlay === "output" ? tokenInsights.maxOutputTokens
-          : tokenInsights.maxCostCents;
+        const maxVal =
+          tokenOverlay === "input"
+            ? tokenInsights.maxInputTokens
+            : tokenOverlay === "output"
+              ? tokenInsights.maxOutputTokens
+              : tokenInsights.maxCostCents;
         const heat = getTokenHeat(node.span, tokenOverlay, maxVal);
         baseBg = blendHeatColor(colors.bg, heat);
       }
@@ -196,7 +213,17 @@ export const FlameChart: React.FC<FlameChartProps> = ({
 
       ctx.globalAlpha = 1;
     }
-  }, [displayNodes, canvasSize, view, maxDepth, selectedSpanId, criticalPath, displayRoot, tokenOverlay, tokenInsights]);
+  }, [
+    displayNodes,
+    canvasSize,
+    view,
+    maxDepth,
+    selectedSpanId,
+    criticalPath,
+    displayRoot,
+    tokenOverlay,
+    tokenInsights,
+  ]);
 
   // Hit-test helper
   const hitTest = useCallback(
@@ -239,7 +266,10 @@ export const FlameChart: React.FC<FlameChartProps> = ({
       if (dragRef.current) {
         const dx = e.clientX - dragRef.current.startX;
         const panDelta = -dx / (canvasSize.width * view.zoom);
-        const newPanX = Math.max(0, Math.min(1 - 1 / view.zoom, dragRef.current.startPanX + panDelta));
+        const newPanX = Math.max(
+          0,
+          Math.min(1 - 1 / view.zoom, dragRef.current.startPanX + panDelta),
+        );
         setView((v) => ({ ...v, panX: newPanX }));
         return;
       }
@@ -313,7 +343,10 @@ export const FlameChart: React.FC<FlameChartProps> = ({
   return (
     <div className="flex-1 flex flex-col min-w-0" data-tutorial-id="trace-flamechart">
       {/* Controls bar */}
-      <div className="flex items-center gap-3 px-3 py-1 bg-zinc-900/50 border-b border-zinc-700 text-[11px]" data-tutorial-id="trace-flamechart-controls">
+      <div
+        className="flex items-center gap-3 px-3 py-1 bg-zinc-900/50 border-b border-zinc-700 text-[11px]"
+        data-tutorial-id="trace-flamechart-controls"
+      >
         {/* Breadcrumb */}
         <div className="flex items-center gap-1 text-zinc-400">
           <button
@@ -352,7 +385,9 @@ export const FlameChart: React.FC<FlameChartProps> = ({
               onChange={(e) => setMaxDepth(Number(e.target.value))}
               className="w-16 h-3"
             />
-            <span className="text-zinc-400 w-4 text-right">{Math.min(maxDepth, actualMaxDepth)}</span>
+            <span className="text-zinc-400 w-4 text-right">
+              {Math.min(maxDepth, actualMaxDepth)}
+            </span>
           </label>
 
           {/* Reset zoom */}
@@ -368,10 +403,18 @@ export const FlameChart: React.FC<FlameChartProps> = ({
       </div>
 
       {/* Canvas container */}
-      <div ref={containerRef} className="flex-1 relative overflow-hidden" style={{ minHeight: height - 48 }}>
+      <div
+        ref={containerRef}
+        className="flex-1 relative overflow-hidden"
+        style={{ minHeight: height - 48 }}
+      >
         <canvas
           ref={canvasRef}
-          style={{ width: canvasSize.width, height: canvasSize.height, cursor: isDragging ? "grabbing" : "default" }}
+          style={{
+            width: canvasSize.width,
+            height: canvasSize.height,
+            cursor: isDragging ? "grabbing" : "default",
+          }}
           onMouseMove={handleMouseMove}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
@@ -406,7 +449,8 @@ export const FlameChart: React.FC<FlameChartProps> = ({
             )}
             {criticalPath && !criticalPath.spanIds.has(hoveredSpan.span.span_id) && (
               <div className="text-zinc-500">
-                Slack: {formatDuration(criticalPath.slackBySpanId.get(hoveredSpan.span.span_id) ?? 0)}
+                Slack:{" "}
+                {formatDuration(criticalPath.slackBySpanId.get(hoveredSpan.span.span_id) ?? 0)}
               </div>
             )}
             <div className="text-zinc-500 mt-0.5">Double-click to focus subtree</div>

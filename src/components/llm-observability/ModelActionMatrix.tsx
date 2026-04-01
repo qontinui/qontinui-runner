@@ -31,7 +31,9 @@ export function ModelActionMatrix({ days = 7 }: ModelActionMatrixProps) {
   const { data = [], isLoading } = useQuery<ModelActionRow[]>({
     queryKey: ["llm-analytics", "model-action-matrix", days],
     queryFn: async () => {
-      const res = await fetch(`${getApiBase()}/analytics/token-usage/model-action-matrix?days=${days}`);
+      const res = await fetch(
+        `${getApiBase()}/analytics/token-usage/model-action-matrix?days=${days}`,
+      );
       if (!res.ok) return [];
       const json = await res.json();
       return json.data ?? [];
@@ -64,7 +66,10 @@ export function ModelActionMatrix({ days = 7 }: ModelActionMatrixProps) {
               <tr className="border-b border-border">
                 <th className="py-2 px-2 text-left font-medium text-muted-foreground">Model</th>
                 {actions.map((a) => (
-                  <th key={a} className="py-2 px-2 text-center font-medium text-muted-foreground font-mono">
+                  <th
+                    key={a}
+                    className="py-2 px-2 text-center font-medium text-muted-foreground font-mono"
+                  >
                     {a}
                   </th>
                 ))}
@@ -77,11 +82,20 @@ export function ModelActionMatrix({ days = 7 }: ModelActionMatrixProps) {
                   {actions.map((action) => {
                     const cell = lookup.get(`${model}:${action}`);
                     if (!cell) {
-                      return <td key={action} className="py-2 px-2 text-center text-muted-foreground">-</td>;
+                      return (
+                        <td key={action} className="py-2 px-2 text-center text-muted-foreground">
+                          -
+                        </td>
+                      );
                     }
                     return (
-                      <td key={action} className={`py-2 px-2 text-center ${cellColor(cell.success_rate)}`}>
-                        <div className="tabular-nums font-semibold">{Math.round(cell.success_rate * 100)}%</div>
+                      <td
+                        key={action}
+                        className={`py-2 px-2 text-center ${cellColor(cell.success_rate)}`}
+                      >
+                        <div className="tabular-nums font-semibold">
+                          {Math.round(cell.success_rate * 100)}%
+                        </div>
                         <div className="text-muted-foreground">{cell.total}x</div>
                       </td>
                     );

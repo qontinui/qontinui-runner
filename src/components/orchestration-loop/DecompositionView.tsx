@@ -86,8 +86,7 @@ function SubtaskRow({ subtask, isLast }: SubtaskRowProps) {
   const duration =
     subtask.started_at && subtask.completed_at
       ? (
-          (new Date(subtask.completed_at).getTime() -
-            new Date(subtask.started_at).getTime()) /
+          (new Date(subtask.completed_at).getTime() - new Date(subtask.started_at).getTime()) /
           1000
         ).toFixed(1) + "s"
       : null;
@@ -155,8 +154,7 @@ function SubtaskRow({ subtask, isLast }: SubtaskRowProps) {
           <div className="flex items-center gap-1 mt-1 ml-6">
             <ArrowRight className="w-2.5 h-2.5 text-muted-foreground/50" />
             <span className="text-[0.65rem] text-muted-foreground/70">
-              depends on:{" "}
-              {subtask.dependencies.map((d) => `#${d + 1}`).join(", ")}
+              depends on: {subtask.dependencies.map((d) => `#${d + 1}`).join(", ")}
             </span>
           </div>
         )}
@@ -194,9 +192,7 @@ export function DecompositionView({ running }: DecompositionViewProps) {
 
   const fetchPlan = useCallback(async () => {
     try {
-      const result = await invoke<DecompositionPlan | null>(
-        "get_decomposition_plan",
-      );
+      const result = await invoke<DecompositionPlan | null>("get_decomposition_plan");
       setPlan(result);
       setError(null);
     } catch (e) {
@@ -225,12 +221,8 @@ export function DecompositionView({ running }: DecompositionViewProps) {
     return null;
   }
 
-  const completedCount = plan.subtasks.filter(
-    (s) => s.status === "completed",
-  ).length;
-  const failedCount = plan.subtasks.filter(
-    (s) => s.status === "failed",
-  ).length;
+  const completedCount = plan.subtasks.filter((s) => s.status === "completed").length;
+  const failedCount = plan.subtasks.filter((s) => s.status === "failed").length;
 
   return (
     <div className="border border-border rounded">
@@ -246,9 +238,7 @@ export function DecompositionView({ running }: DecompositionViewProps) {
         <div className="flex items-center gap-2">
           <span className="text-[0.7rem] text-muted-foreground font-mono">
             {completedCount}/{plan.total_subtasks}
-            {failedCount > 0 && (
-              <span className="text-red-400 ml-1">({failedCount} failed)</span>
-            )}
+            {failedCount > 0 && <span className="text-red-400 ml-1">({failedCount} failed)</span>}
           </span>
           {collapsed ? (
             <ChevronRight className="w-3.5 h-3.5 text-muted-foreground" />

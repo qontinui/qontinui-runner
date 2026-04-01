@@ -45,7 +45,10 @@ export function CreatePromptCanaryForm({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="bg-zinc-900 border border-zinc-700 rounded-lg p-4 space-y-4">
+    <form
+      onSubmit={handleSubmit}
+      className="bg-zinc-900 border border-zinc-700 rounded-lg p-4 space-y-4"
+    >
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-zinc-200">Create Prompt Canary A/B Test</h3>
         {onClose && (

@@ -95,9 +95,7 @@ export class XtermBackend implements ITerminalBackend {
   }
 
   getBufferLine(line: number): string | null {
-    return (
-      this.term.buffer.active.getLine(line)?.translateToString(true) ?? null
-    );
+    return this.term.buffer.active.getLine(line)?.translateToString(true) ?? null;
   }
 
   getBufferLength(): number {
@@ -120,9 +118,7 @@ export class XtermBackend implements ITerminalBackend {
     this.term.scrollToBottom();
   }
 
-  attachCustomKeyEventHandler(
-    handler: (event: KeyboardEvent) => boolean,
-  ): void {
+  attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }
 
@@ -157,16 +153,10 @@ export class XtermBackend implements ITerminalBackend {
   }
 
   getInputElement(): HTMLTextAreaElement | null {
-    return (
-      (this.container?.querySelector(
-        ".xterm-helper-textarea",
-      ) as HTMLTextAreaElement) ?? null
-    );
+    return (this.container?.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement) ?? null;
   }
 
   getViewportElement(): HTMLElement | null {
-    return (
-      (this.container?.querySelector(".xterm-viewport") as HTMLElement) ?? null
-    );
+    return (this.container?.querySelector(".xterm-viewport") as HTMLElement) ?? null;
   }
 }

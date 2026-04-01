@@ -27,7 +27,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "textContent": "running|paused|complete|failed|stopped" }, "label": "Status badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "running|paused|complete|failed|stopped" },
+            "label": "Status badge"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -47,7 +51,11 @@
           "category": "data-display",
           "severity": "warning",
           "assertionType": "containsText",
-          "target": { "type": "search", "criteria": { "textContent": "Sessions" }, "label": "Session count" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Sessions" },
+            "label": "Session count"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -58,7 +66,11 @@
           "category": "data-display",
           "severity": "warning",
           "assertionType": "containsText",
-          "target": { "type": "search", "criteria": { "textContent": "Workflow" }, "label": "Workflow name row" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Workflow" },
+            "label": "Workflow name row"
+          },
           "precondition": "Task run was created from a workflow",
           "source": "manual",
           "reviewed": true,
@@ -70,7 +82,11 @@
           "category": "data-display",
           "severity": "info",
           "assertionType": "containsText",
-          "target": { "type": "search", "criteria": { "textContent": "Created" }, "label": "Created timestamp" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Created" },
+            "label": "Created timestamp"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -91,7 +107,11 @@
           "category": "semantic",
           "severity": "critical",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "textContent": "Step:|Status:|Phase:" }, "label": "Progress indicator" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Step:|Status:|Phase:" },
+            "label": "Progress indicator"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -102,7 +122,11 @@
           "category": "element-presence",
           "severity": "info",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "tag": "span" }, "label": "Pulsing indicator dot" },
+          "target": {
+            "type": "search",
+            "criteria": { "tag": "span" },
+            "label": "Pulsing indicator dot"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -150,7 +174,11 @@
           "assertionType": "exists",
           "precondition": "Task status is 'paused'",
           "expected": "Status changes to 'running', Pause+Stop buttons reappear",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Resume button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Resume button"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -163,7 +191,11 @@
           "assertionType": "exists",
           "precondition": "Task status is 'complete', 'failed', or 'stopped'",
           "expected": "Task run is removed from the task list",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Delete button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Delete button"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -174,7 +206,11 @@
           "category": "interaction",
           "severity": "critical",
           "assertionType": "behavior",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Context-sensitive controls" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Context-sensitive controls"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -185,7 +221,11 @@
           "category": "interaction",
           "severity": "warning",
           "assertionType": "behavior",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Disabled during mutation" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Disabled during mutation"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -206,7 +246,11 @@
           "severity": "critical",
           "assertionType": "exists",
           "precondition": "Task has a non-null error_message",
-          "target": { "type": "search", "criteria": { "textContent": "error|Error" }, "label": "Error message" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "error|Error" },
+            "label": "Error message"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -226,7 +270,11 @@
           "category": "state-consistency",
           "severity": "warning",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "textContent": "Loading task run" }, "label": "Loading indicator" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loading task run" },
+            "label": "Loading indicator"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -247,7 +295,11 @@
           "severity": "critical",
           "assertionType": "exists",
           "precondition": "Selected task run has status 'running'",
-          "target": { "type": "search", "criteria": { "textContent": "running" }, "label": "Panel visible for running task" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "running" },
+            "label": "Panel visible for running task"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -259,7 +311,11 @@
           "severity": "critical",
           "assertionType": "not-exists",
           "precondition": "Selected task run has status 'complete' or 'failed' or 'stopped'",
-          "target": { "type": "search", "criteria": { "textContent": "Loading task run" }, "label": "Panel absent for terminal task" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loading task run" },
+            "label": "Panel absent for terminal task"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -279,7 +335,11 @@
           "category": "behavior",
           "severity": "critical",
           "assertionType": "behavior",
-          "target": { "type": "search", "criteria": { "textContent": "stopped|complete|failed" }, "label": "Fast status update" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "stopped|complete|failed" },
+            "label": "Fast status update"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -291,7 +351,11 @@
           "severity": "warning",
           "assertionType": "behavior",
           "precondition": "Task is actively executing steps",
-          "target": { "type": "search", "criteria": { "textContent": "Step:|Phase:" }, "label": "Progress changes over time" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Step:|Phase:" },
+            "label": "Progress changes over time"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true
@@ -311,7 +375,11 @@
           "category": "style",
           "severity": "warning",
           "assertionType": "visual",
-          "target": { "type": "search", "criteria": { "textContent": "running|complete|failed" }, "label": "Color-coded status badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "running|complete|failed" },
+            "label": "Color-coded status badge"
+          },
           "source": "manual",
           "reviewed": true,
           "enabled": true

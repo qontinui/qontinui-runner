@@ -121,7 +121,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-trace-search']", "role": "searchbox" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-trace-search']",
+              "role": "searchbox"
+            },
             "label": "Trace search input"
           },
           "expected": "Input is visible with placeholder text indicating search capability",
@@ -201,7 +204,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-add-feedback-btn']", "role": "button" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-add-feedback-btn']",
+              "role": "button"
+            },
             "label": "Add Feedback button"
           },
           "precondition": "A trace row has been selected and the detail panel is open",
@@ -217,7 +223,10 @@
           "assertionType": "exists",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='opik-open-external-btn']", "role": "button" },
+            "criteria": {
+              "selector": "[data-ui-element='opik-open-external-btn']",
+              "role": "button"
+            },
             "label": "Open in Opik button"
           },
           "precondition": "A trace is selected and Opik connection status is 'Connected'",
@@ -404,7 +413,9 @@
           "assertionType": "stateChange",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='span-tree'] [data-ui-element='span-row']" },
+            "criteria": {
+              "selector": "[data-ui-element='span-tree'] [data-ui-element='span-row']"
+            },
             "label": "Span selection"
           },
           "expected": "Span detail section updates to show the selected span's input JSON, output JSON, model name, provider, input/output token counts, cost, duration, and error info (if any). Previously selected span loses its highlight",
@@ -437,7 +448,9 @@
           "assertionType": "stateChange",
           "target": {
             "type": "search",
-            "criteria": { "selector": "[data-ui-element='span-tree'] [data-ui-element='span-toggle']" },
+            "criteria": {
+              "selector": "[data-ui-element='span-tree'] [data-ui-element='span-toggle']"
+            },
             "label": "Span tree expand/collapse"
           },
           "expected": "Clicking the chevron toggles child span visibility. Collapsed parent shows a '(N spans)' count badge. Expanded parent shows indented child spans",

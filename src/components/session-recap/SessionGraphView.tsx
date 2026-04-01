@@ -12,14 +12,11 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { FileText, Code2, Plug, Database, Component } from "lucide-react";
 import {
-  FileText,
-  Code2,
-  Plug,
-  Database,
-  Component,
-} from "lucide-react";
-import { buildSessionGraph, type RecapNodeData } from "@/lib/session-recap/dependency-graph-builder";
+  buildSessionGraph,
+  type RecapNodeData,
+} from "@/lib/session-recap/dependency-graph-builder";
 import type { SessionRecap } from "@/lib/session-recap/types";
 
 interface Props {
@@ -57,9 +54,7 @@ function RecapNode({ data }: NodeProps) {
         <Icon className="w-3 h-3 shrink-0" style={{ color: nd.color }} />
         <span className="truncate max-w-[160px] font-medium">{nd.label}</span>
         {nd.detail && (
-          <span className="text-[9px] text-muted-foreground ml-auto shrink-0">
-            {nd.detail}
-          </span>
+          <span className="text-[9px] text-muted-foreground ml-auto shrink-0">{nd.detail}</span>
         )}
       </div>
       <Handle type="source" position={Position.Bottom} className="!bg-border !w-1.5 !h-1.5" />
@@ -83,7 +78,10 @@ export function SessionGraphView({ recap }: Props) {
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
   const prevInitialRef = useRef({ nodes: initialNodes, edges: initialEdges });
-  if (prevInitialRef.current.nodes !== initialNodes || prevInitialRef.current.edges !== initialEdges) {
+  if (
+    prevInitialRef.current.nodes !== initialNodes ||
+    prevInitialRef.current.edges !== initialEdges
+  ) {
     prevInitialRef.current = { nodes: initialNodes, edges: initialEdges };
     setNodes(initialNodes);
     setEdges(initialEdges);
@@ -110,7 +108,12 @@ export function SessionGraphView({ recap }: Props) {
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="hsl(var(--border)/0.3)" />
+        <Background
+          variant={BackgroundVariant.Dots}
+          gap={16}
+          size={1}
+          color="hsl(var(--border)/0.3)"
+        />
         <Controls className="!bg-card !border-border !shadow-md" />
         <MiniMap
           nodeColor={(node) => {

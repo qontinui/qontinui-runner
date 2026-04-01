@@ -144,13 +144,26 @@ export function PlaybookPanel() {
 
   return (
     <div style={{ padding: "16px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: "16px",
+        }}
+      >
         <h3 style={{ margin: 0 }}>Playbook Lessons</h3>
         <div style={{ display: "flex", gap: "8px" }}>
           <select
             value={domainFilter}
             onChange={(e) => setDomainFilter(e.target.value)}
-            style={{ padding: "4px 8px", borderRadius: "4px", border: "1px solid #374151", background: "#1f2937", color: "#e5e7eb" }}
+            style={{
+              padding: "4px 8px",
+              borderRadius: "4px",
+              border: "1px solid #374151",
+              background: "#1f2937",
+              color: "#e5e7eb",
+            }}
           >
             <option value="">All Domains</option>
             <option value="compilation">Compilation</option>
@@ -163,14 +176,30 @@ export function PlaybookPanel() {
           <select
             value={statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
-            style={{ padding: "4px 8px", borderRadius: "4px", border: "1px solid #374151", background: "#1f2937", color: "#e5e7eb" }}
+            style={{
+              padding: "4px 8px",
+              borderRadius: "4px",
+              border: "1px solid #374151",
+              background: "#1f2937",
+              color: "#e5e7eb",
+            }}
           >
             <option value="">All Status</option>
             <option value="active">Active</option>
             <option value="staged">Staged</option>
             <option value="retired">Retired</option>
           </select>
-          <button onClick={loadEntries} style={{ padding: "4px 12px", borderRadius: "4px", background: "#3b82f6", color: "white", border: "none", cursor: "pointer" }}>
+          <button
+            onClick={loadEntries}
+            style={{
+              padding: "4px 12px",
+              borderRadius: "4px",
+              background: "#3b82f6",
+              color: "white",
+              border: "none",
+              cursor: "pointer",
+            }}
+          >
             Refresh
           </button>
         </div>
@@ -233,10 +262,26 @@ interface LessonGroupProps {
   onDelete: (id: string) => Promise<void>;
 }
 
-function LessonGroup({ title, color, entries, expandedId, onToggleExpand, onStatusChange, onDelete }: LessonGroupProps) {
+function LessonGroup({
+  title,
+  color,
+  entries,
+  expandedId,
+  onToggleExpand,
+  onStatusChange,
+  onDelete,
+}: LessonGroupProps) {
   return (
     <div style={{ marginBottom: "16px" }}>
-      <h4 style={{ color, margin: "0 0 8px 0", fontSize: "14px", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+      <h4
+        style={{
+          color,
+          margin: "0 0 8px 0",
+          fontSize: "14px",
+          textTransform: "uppercase",
+          letterSpacing: "0.05em",
+        }}
+      >
         {title} ({entries.length})
       </h4>
       <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
@@ -287,7 +332,13 @@ function detailReducer(_state: DetailState, action: DetailAction): DetailState {
   }
 }
 
-function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete }: LessonRowProps) {
+function LessonRow({
+  entry,
+  isExpanded,
+  onToggleExpand,
+  onStatusChange,
+  onDelete,
+}: LessonRowProps) {
   const [detailState, dispatchDetail] = useReducer(detailReducer, { detail: null, loading: false });
   const { detail, loading: detailLoading } = detailState;
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -295,9 +346,8 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
 
   const prefix = entry.positive ? "DO" : "DON'T";
   const prefixColor = entry.positive ? "#22c55e" : "#ef4444";
-  const helpfulness = entry.times_applied > 0
-    ? `${(entry.helpfulness_ratio * 100).toFixed(0)}%`
-    : "n/a";
+  const helpfulness =
+    entry.times_applied > 0 ? `${(entry.helpfulness_ratio * 100).toFixed(0)}%` : "n/a";
 
   // Load detail when expanded
   useEffect(() => {
@@ -310,7 +360,9 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
     dispatchDetail({ type: "loading" });
     (async () => {
       try {
-        const result = await invoke<PlaybookEntryDetail>("get_playbook_entry_detail", { id: entry.id });
+        const result = await invoke<PlaybookEntryDetail>("get_playbook_entry_detail", {
+          id: entry.id,
+        });
         if (!cancelled) dispatchDetail({ type: "loaded", detail: result });
       } catch (err) {
         console.error("Failed to load entry detail:", err);
@@ -384,7 +436,15 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
           {prefix}
         </span>
         <span style={{ flex: 1, color: "#e5e7eb" }}>{entry.lesson}</span>
-        <span style={{ color: "#6b7280", fontSize: "11px", minWidth: "80px", textAlign: "right", flexShrink: 0 }}>
+        <span
+          style={{
+            color: "#6b7280",
+            fontSize: "11px",
+            minWidth: "80px",
+            textAlign: "right",
+            flexShrink: 0,
+          }}
+        >
           {CATEGORY_LABELS[entry.category] || entry.category}
         </span>
         <span
@@ -448,7 +508,14 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
             color: "#9ca3af",
           }}
         >
-          <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "4px 12px", marginBottom: "8px" }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "120px 1fr",
+              gap: "4px 12px",
+              marginBottom: "8px",
+            }}
+          >
             <span style={{ color: "#6b7280" }}>Status:</span>
             <span style={{ color: statusColor(entry.status) }}>{entry.status}</span>
             <span style={{ color: "#6b7280" }}>Category:</span>
@@ -456,7 +523,9 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
             <span style={{ color: "#6b7280" }}>Domain:</span>
             <span>{entry.domain || "General"}</span>
             <span style={{ color: "#6b7280" }}>Applied / Helped:</span>
-            <span>{entry.times_applied}x / {entry.times_helped}x</span>
+            <span>
+              {entry.times_applied}x / {entry.times_helped}x
+            </span>
             <span style={{ color: "#6b7280" }}>Created:</span>
             <span>{formatDate(entry.created_at)}</span>
           </div>
@@ -475,14 +544,27 @@ function LessonRow({ entry, isExpanded, onToggleExpand, onStatusChange, onDelete
                 border: "1px solid #1f2937",
               }}
             >
-              <div style={{ color: "#d1d5db", fontWeight: "bold", marginBottom: "6px", fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              <div
+                style={{
+                  color: "#d1d5db",
+                  fontWeight: "bold",
+                  marginBottom: "6px",
+                  fontSize: "11px",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.05em",
+                }}
+              >
                 Source Run
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "3px 12px" }}>
                 <span style={{ color: "#6b7280" }}>Run ID:</span>
-                <span style={{ fontFamily: "monospace", fontSize: "11px" }}>{detail.source_run.run_id}</span>
+                <span style={{ fontFamily: "monospace", fontSize: "11px" }}>
+                  {detail.source_run.run_id}
+                </span>
                 <span style={{ color: "#6b7280" }}>Status:</span>
-                <span style={{ color: statusColor(detail.source_run.status) }}>{detail.source_run.status}</span>
+                <span style={{ color: statusColor(detail.source_run.status) }}>
+                  {detail.source_run.status}
+                </span>
                 {detail.source_run.duration_secs != null && (
                   <>
                     <span style={{ color: "#6b7280" }}>Duration:</span>

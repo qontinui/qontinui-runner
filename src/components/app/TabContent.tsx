@@ -79,24 +79,68 @@ import { EventHistoryPage } from "@/pages/EventHistoryPage";
 import { lazy, Suspense } from "react";
 import { Loader2 } from "lucide-react";
 
-const LlmObservabilityDashboard = lazy(() => import("../llm-observability/LlmObservabilityDashboard"));
+const LlmObservabilityDashboard = lazy(
+  () => import("../llm-observability/LlmObservabilityDashboard"),
+);
 const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard"));
-const SkillApprovalPanel = lazy(() => import("../skills/SkillApprovalPanel").then(m => ({ default: m.SkillApprovalPanel })));
-const AutomationHealthDashboard = lazy(() => import("../ui-bridge/AutomationHealthDashboard").then(m => ({ default: m.AutomationHealthDashboard })));
-const ObservationBrowser = lazy(() => import("../observations/ObservationBrowser").then(m => ({ default: m.ObservationBrowser })));
-const MemoryHealthPanel = lazy(() => import("../observations/MemoryHealthPanel").then(m => ({ default: m.MemoryHealthPanel })));
-const ActivityTimelinePanel = lazy(() => import("../activity-timeline/ActivityTimelinePanel").then(m => ({ default: m.ActivityTimelinePanel })));
-const WatcherManagementPanel = lazy(() => import("../activity-timeline/WatcherManagementPanel").then(m => ({ default: m.WatcherManagementPanel })));
-const DemoVideoPanel = lazy(() => import("../demo-video/DemoVideoPanel").then(m => ({ default: m.DemoVideoPanel })));
-const DevelopmentIntelligencePage = lazy(() => import("../development-intelligence/DevelopmentIntelligencePage").then(m => ({ default: m.DevelopmentIntelligencePage })));
-const TourCatalog = lazy(() => import("../product-tour/TourCatalog").then(m => ({ default: m.TourCatalog })));
-const SessionRecapPage = lazy(() => import("../session-recap/SessionRecapPage").then(m => ({ default: m.SessionRecapPage })));
-const ApiSurfacePage = lazy(() => import("../api-surface/ApiSurfacePage").then(m => ({ default: m.ApiSurfacePage })));
-const DecisionTrailPage = lazy(() => import("../decision-trail/DecisionTrailPage").then(m => ({ default: m.DecisionTrailPage })));
-const MemorySearchPanel = lazy(() => import("../memory-search").then(m => ({ default: m.MemorySearchPanel })));
+const SkillApprovalPanel = lazy(() =>
+  import("../skills/SkillApprovalPanel").then((m) => ({ default: m.SkillApprovalPanel })),
+);
+const AutomationHealthDashboard = lazy(() =>
+  import("../ui-bridge/AutomationHealthDashboard").then((m) => ({
+    default: m.AutomationHealthDashboard,
+  })),
+);
+const ObservationBrowser = lazy(() =>
+  import("../observations/ObservationBrowser").then((m) => ({ default: m.ObservationBrowser })),
+);
+const MemoryHealthPanel = lazy(() =>
+  import("../observations/MemoryHealthPanel").then((m) => ({ default: m.MemoryHealthPanel })),
+);
+const ActivityTimelinePanel = lazy(() =>
+  import("../activity-timeline/ActivityTimelinePanel").then((m) => ({
+    default: m.ActivityTimelinePanel,
+  })),
+);
+const WatcherManagementPanel = lazy(() =>
+  import("../activity-timeline/WatcherManagementPanel").then((m) => ({
+    default: m.WatcherManagementPanel,
+  })),
+);
+const DemoVideoPanel = lazy(() =>
+  import("../demo-video/DemoVideoPanel").then((m) => ({ default: m.DemoVideoPanel })),
+);
+const DevelopmentIntelligencePage = lazy(() =>
+  import("../development-intelligence/DevelopmentIntelligencePage").then((m) => ({
+    default: m.DevelopmentIntelligencePage,
+  })),
+);
+const TourCatalog = lazy(() =>
+  import("../product-tour/TourCatalog").then((m) => ({ default: m.TourCatalog })),
+);
+const SessionRecapPage = lazy(() =>
+  import("../session-recap/SessionRecapPage").then((m) => ({ default: m.SessionRecapPage })),
+);
+const ApiSurfacePage = lazy(() =>
+  import("../api-surface/ApiSurfacePage").then((m) => ({ default: m.ApiSurfacePage })),
+);
+const DecisionTrailPage = lazy(() =>
+  import("../decision-trail/DecisionTrailPage").then((m) => ({ default: m.DecisionTrailPage })),
+);
+const MemorySearchPanel = lazy(() =>
+  import("../memory-search").then((m) => ({ default: m.MemorySearchPanel })),
+);
 
 /** Register the active page with UI Bridge for AI discoverability */
-function PageRegistration({ id, name, description }: { id: string; name: string; description: string }) {
+function PageRegistration({
+  id,
+  name,
+  description,
+}: {
+  id: string;
+  name: string;
+  description: string;
+}) {
   useUIComponent({ id: `page-${id}`, name, description, actions: [] });
   return null;
 }
@@ -217,10 +261,28 @@ export function TabContent({
 
   switch (activeTab) {
     case "gui-automation":
-      return (<><PageRegistration id="gui-automation" name="Workflows" description="Configure and launch GUI automation workflows" /><ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} /></>);
+      return (
+        <>
+          <PageRegistration
+            id="gui-automation"
+            name="Workflows"
+            description="Configure and launch GUI automation workflows"
+          />
+          <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />
+        </>
+      );
 
     case "workflow-queue":
-      return (<><PageRegistration id="workflow-queue" name="Workflow Queue" description="Queue and manage multiple workflow executions" /><WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} /></>);
+      return (
+        <>
+          <PageRegistration
+            id="workflow-queue"
+            name="Workflow Queue"
+            description="Queue and manage multiple workflow executions"
+          />
+          <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
+        </>
+      );
 
     case "active":
       return (
@@ -249,7 +311,11 @@ export function TabContent({
     case "error-monitor":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="error-monitor" name="Error Monitor" description="Real-time application error monitoring and log analysis" />
+          <PageRegistration
+            id="error-monitor"
+            name="Error Monitor"
+            description="Real-time application error monitoring and log analysis"
+          />
           <ErrorMonitorTab
             taskRunId={errorMonitorScope?.taskRunId}
             taskRunName={errorMonitorScope?.taskRunName}
@@ -261,7 +327,11 @@ export function TabContent({
     case "processes":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="processes" name="Process Manager" description="Manage and monitor development processes (web backend, frontend, mobile)" />
+          <PageRegistration
+            id="processes"
+            name="Process Manager"
+            description="Manage and monitor development processes (web backend, frontend, mobile)"
+          />
           <ProcessManagerTab />
         </div>
       );
@@ -269,7 +339,11 @@ export function TabContent({
     case "reflection":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="reflection" name="Reflection" description="Review reflection analysis from automation runs" />
+          <PageRegistration
+            id="reflection"
+            name="Reflection"
+            description="Review reflection analysis from automation runs"
+          />
           <ReflectionDashboard />
         </div>
       );
@@ -277,7 +351,11 @@ export function TabContent({
     case "observations":
       return (
         <div className="h-full overflow-auto">
-          <PageRegistration id="observations" name="Memory" description="Cross-session observation memory from past automation runs" />
+          <PageRegistration
+            id="observations"
+            name="Memory"
+            description="Cross-session observation memory from past automation runs"
+          />
           <div className="border-b p-4">
             <Suspense fallback={<LazyFallback />}>
               <MemoryHealthPanel />
@@ -606,7 +684,16 @@ export function TabContent({
       );
 
     case "library":
-      return (<><PageRegistration id="library" name="Library" description="Prompt library, macros, checks, shell commands, and reusable components" /><LibraryDashboard onLog={addLog} /></>);
+      return (
+        <>
+          <PageRegistration
+            id="library"
+            name="Library"
+            description="Prompt library, macros, checks, shell commands, and reusable components"
+          />
+          <LibraryDashboard onLog={addLog} />
+        </>
+      );
 
     case "specs":
       return (
@@ -651,7 +738,11 @@ export function TabContent({
     case "unified-workflow-builder":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="workflow-builder" name="Workflow Builder" description="Build and edit multi-step automation workflows with AI assistance" />
+          <PageRegistration
+            id="workflow-builder"
+            name="Workflow Builder"
+            description="Build and edit multi-step automation workflows with AI assistance"
+          />
           <WorkflowBuilderTab
             editWorkflowId={editWorkflowId}
             onNavigateToActive={() => setActiveTab("active")}
@@ -830,7 +921,11 @@ export function TabContent({
     case "decision-trail":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="decision-trail" name="Decision Trail" description="Architectural decision history and concept summaries" />
+          <PageRegistration
+            id="decision-trail"
+            name="Decision Trail"
+            description="Architectural decision history and concept summaries"
+          />
           <Suspense fallback={<LazyFallback />}>
             <DecisionTrailPage />
           </Suspense>
@@ -847,7 +942,11 @@ export function TabContent({
     case "development-intelligence":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="development-intelligence" name="Dev Intelligence" description="Coverage gap analysis, complexity scoring, and dead feature detection" />
+          <PageRegistration
+            id="development-intelligence"
+            name="Dev Intelligence"
+            description="Coverage gap analysis, complexity scoring, and dead feature detection"
+          />
           <Suspense fallback={<LazyFallback />}>
             <DevelopmentIntelligencePage />
           </Suspense>
@@ -857,7 +956,11 @@ export function TabContent({
     case "demo-video":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="demo-video" name="Demo Videos" description="Generate demo videos from UI Bridge page specs" />
+          <PageRegistration
+            id="demo-video"
+            name="Demo Videos"
+            description="Generate demo videos from UI Bridge page specs"
+          />
           <Suspense fallback={<LazyFallback />}>
             <DemoVideoPanel />
           </Suspense>
@@ -867,7 +970,11 @@ export function TabContent({
     case "product-tours":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="product-tours" name="Product Tours" description="Generate and manage interactive product tours" />
+          <PageRegistration
+            id="product-tours"
+            name="Product Tours"
+            description="Generate and manage interactive product tours"
+          />
           <Suspense fallback={<LazyFallback />}>
             <TourCatalog />
           </Suspense>
@@ -877,7 +984,11 @@ export function TabContent({
     case "session-recap":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="session-recap" name="Session Recap" description="Semantic timeline of what was built during a development session — files, types, endpoints, dependencies" />
+          <PageRegistration
+            id="session-recap"
+            name="Session Recap"
+            description="Semantic timeline of what was built during a development session — files, types, endpoints, dependencies"
+          />
           <Suspense fallback={<LazyFallback />}>
             <SessionRecapPage />
           </Suspense>
@@ -887,7 +998,11 @@ export function TabContent({
     case "api-surface":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="api-surface" name="API Surface Map" description="Interactive map of every endpoint, command, query, and their connections — shows orphaned endpoints" />
+          <PageRegistration
+            id="api-surface"
+            name="API Surface Map"
+            description="Interactive map of every endpoint, command, query, and their connections — shows orphaned endpoints"
+          />
           <Suspense fallback={<LazyFallback />}>
             <ApiSurfacePage />
           </Suspense>
@@ -897,7 +1012,11 @@ export function TabContent({
     case "memory-search":
       return (
         <div className="h-full overflow-hidden">
-          <PageRegistration id="memory-search" name="Memory Search" description="Unified memory retrieval with RRF fusion" />
+          <PageRegistration
+            id="memory-search"
+            name="Memory Search"
+            description="Unified memory retrieval with RRF fusion"
+          />
           <Suspense fallback={<LazyFallback />}>
             <MemorySearchPanel />
           </Suspense>
@@ -905,7 +1024,16 @@ export function TabContent({
       );
 
     case "help":
-      return (<><PageRegistration id="help" name="Help" description="Tutorials, documentation, and getting started guides" /><HelpTab /></>);
+      return (
+        <>
+          <PageRegistration
+            id="help"
+            name="Help"
+            description="Tutorials, documentation, and getting started guides"
+          />
+          <HelpTab />
+        </>
+      );
 
     default:
       return null;

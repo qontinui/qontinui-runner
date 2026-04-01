@@ -12,10 +12,7 @@
 
 import { createLogger } from "@/lib/logger";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
-import {
-  sessionManager,
-  type SessionContext,
-} from "./SessionManager";
+import { sessionManager, type SessionContext } from "./SessionManager";
 
 const logger = createLogger("SessionSummaryService");
 
@@ -61,16 +58,14 @@ class SessionSummaryService {
     this.projectId = options.projectId ?? null;
     this.minDurationMs = options.minDurationMs ?? 30_000;
 
-    this.unsubscribe = sessionManager.subscribe(
-      (current, previous) => {
-        // Detect session end: previous was active, current is null (no active session)
-        if (previous && previous.status === "active" && current === null) {
-          this.persistSessionSummary(previous).catch((err) => {
-            logger.error("Failed to persist session summary:", err);
-          });
-        }
-      },
-    );
+    this.unsubscribe = sessionManager.subscribe((current, previous) => {
+      // Detect session end: previous was active, current is null (no active session)
+      if (previous && previous.status === "active" && current === null) {
+        this.persistSessionSummary(previous).catch((err) => {
+          logger.error("Failed to persist session summary:", err);
+        });
+      }
+    });
 
     logger.info("Session summary service started");
   }
@@ -167,9 +162,7 @@ class SessionSummaryService {
 
       if (response.ok) {
         const result = await response.json();
-        logger.info(
-          `Session summary saved as observation ${result.data?.id} (topic: ${topicKey})`,
-        );
+        logger.info(`Session summary saved as observation ${result.data?.id} (topic: ${topicKey})`);
       } else if (response.status === 503) {
         // PG not available — silently skip
         logger.debug("PostgreSQL not available, skipping session summary");
@@ -187,7 +180,12 @@ class SessionSummaryService {
    */
   private async fetchEventSummary(
     actionId: string,
-  ): Promise<{ errorCount: number; actionCount: number; stateChanges: number; lastError: string | null } | null> {
+  ): Promise<{
+    errorCount: number;
+    actionCount: number;
+    stateChanges: number;
+    lastError: string | null;
+  } | null> {
     try {
       const response = await tracedFetch(
         `${getApiBase()}/task-runs/${actionId}/events?max_results=50`,

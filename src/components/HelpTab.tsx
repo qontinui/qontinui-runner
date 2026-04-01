@@ -721,8 +721,8 @@ const AUDIENCE_LABELS: Record<TourAudience, string> = {
 };
 
 function ProductToursPage() {
-  const [tours] = useState<ProductTour[]>(
-    () => instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []),
+  const [tours] = useState<ProductTour[]>(() =>
+    instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []),
   );
   const [activeTour, setActiveTour] = useState<ProductTour | null>(null);
 
@@ -760,7 +760,8 @@ function ProductToursPage() {
           </div>
         </div>
         <p className="text-sm text-muted-foreground">
-          No tours generated yet. Go to <strong>Build &gt; Product Tours</strong> to generate tours from page specs.
+          No tours generated yet. Go to <strong>Build &gt; Product Tours</strong> to generate tours
+          from page specs.
         </p>
       </div>
     );
@@ -785,9 +786,7 @@ function ProductToursPage() {
         if (audienceTours.length === 0) return null;
         return (
           <div key={aud} className="space-y-3">
-            <h3 className="text-sm font-medium text-muted-foreground">
-              {AUDIENCE_LABELS[aud]}
-            </h3>
+            <h3 className="text-sm font-medium text-muted-foreground">{AUDIENCE_LABELS[aud]}</h3>
             <div className="grid gap-3 sm:grid-cols-2">
               {audienceTours.map((tour) => (
                 <TourCard

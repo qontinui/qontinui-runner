@@ -240,12 +240,9 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
       <div className="flex items-center gap-3">
         <Shield className="w-6 h-6 text-blue-400" />
         <div>
-          <h3 className="text-lg font-semibold text-white">
-            Security & Sandboxing
-          </h3>
+          <h3 className="text-lg font-semibold text-white">Security & Sandboxing</h3>
           <p className="text-xs text-neutral-400">
-            Configure security policies and sandbox constraints for workflow
-            execution
+            Configure security policies and sandbox constraints for workflow execution
           </p>
         </div>
       </div>
@@ -267,9 +264,7 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
       <div className="rounded-lg bg-neutral-800/50 border border-neutral-700/50 overflow-hidden">
         <div className="p-4 space-y-4">
           <div className="space-y-1.5">
-            <label className="text-xs font-medium text-neutral-300">
-              Security Profile
-            </label>
+            <label className="text-xs font-medium text-neutral-300">Security Profile</label>
             <select
               value={config.default_profile}
               onChange={(e) =>
@@ -291,13 +286,9 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
 
           {activeProfile && (
             <div className="p-3 bg-neutral-700/30 rounded-md space-y-2">
-              <p className="text-xs text-neutral-300">
-                {activeProfile.description}
-              </p>
+              <p className="text-xs text-neutral-300">{activeProfile.description}</p>
               <div className="flex items-center gap-2">
-                <span className="text-[10px] text-neutral-500 font-mono">
-                  AST Fingerprint:
-                </span>
+                <span className="text-[10px] text-neutral-500 font-mono">AST Fingerprint:</span>
                 <code className="text-[10px] text-blue-400 font-mono bg-neutral-800/50 px-1.5 py-0.5 rounded">
                   {activeProfile.fingerprint}
                 </code>
@@ -315,12 +306,9 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
         <div className="p-4 space-y-4">
           <div className="flex items-center justify-between">
             <div>
-              <h4 className="text-xs font-medium text-neutral-300">
-                Credential Proxy
-              </h4>
+              <h4 className="text-xs font-medium text-neutral-300">Credential Proxy</h4>
               <p className="text-[10px] text-neutral-500">
-                Replace API keys with placeholders; real keys injected by
-                host-side proxy
+                Replace API keys with placeholders; real keys injected by host-side proxy
               </p>
             </div>
             <ToggleSwitch
@@ -333,12 +321,9 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
 
           <div className="flex items-center justify-between">
             <div>
-              <h4 className="text-xs font-medium text-neutral-300">
-                Network Mediation
-              </h4>
+              <h4 className="text-xs font-medium text-neutral-300">Network Mediation</h4>
               <p className="text-[10px] text-neutral-500">
-                Route container network through filtering proxy with domain
-                allowlisting
+                Route container network through filtering proxy with domain allowlisting
               </p>
             </div>
             <ToggleSwitch
@@ -351,19 +336,14 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
 
           <div className="flex items-center justify-between">
             <div>
-              <h4 className="text-xs font-medium text-neutral-300">
-                Security Audit Log
-              </h4>
+              <h4 className="text-xs font-medium text-neutral-300">Security Audit Log</h4>
               <p className="text-[10px] text-neutral-500">
-                Record policy decisions, network requests, and credential
-                activity
+                Record policy decisions, network requests, and credential activity
               </p>
             </div>
             <ToggleSwitch
               checked={config.audit_enabled}
-              onChange={(audit_enabled) =>
-                setConfig((prev) => ({ ...prev, audit_enabled }))
-              }
+              onChange={(audit_enabled) => setConfig((prev) => ({ ...prev, audit_enabled }))}
             />
           </div>
 
@@ -396,9 +376,7 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
           <div className="px-4 py-3 border-b border-neutral-700/50 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <FileSearch className="w-4 h-4 text-neutral-400" />
-              <h4 className="text-sm font-medium text-neutral-200">
-                Audit Log
-              </h4>
+              <h4 className="text-sm font-medium text-neutral-200">Audit Log</h4>
               {auditSummary && (
                 <div className="flex gap-1.5 ml-3">
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
@@ -442,9 +420,7 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
             {auditEvents.length === 0 ? (
               <div className="p-4 text-center">
                 <p className="text-xs text-neutral-500">
-                  {auditLoading
-                    ? "Loading..."
-                    : "No audit events. Click refresh to load."}
+                  {auditLoading ? "Loading..." : "No audit events. Click refresh to load."}
                 </p>
               </div>
             ) : (
@@ -453,15 +429,9 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
                   <tr className="text-neutral-500 border-b border-neutral-700/50">
                     <th className="px-3 py-1.5 text-left font-medium">Time</th>
                     <th className="px-3 py-1.5 text-left font-medium">Type</th>
-                    <th className="px-3 py-1.5 text-left font-medium">
-                      Decision
-                    </th>
-                    <th className="px-3 py-1.5 text-left font-medium">
-                      Action
-                    </th>
-                    <th className="px-3 py-1.5 text-left font-medium">
-                      Reason
-                    </th>
+                    <th className="px-3 py-1.5 text-left font-medium">Decision</th>
+                    <th className="px-3 py-1.5 text-left font-medium">Action</th>
+                    <th className="px-3 py-1.5 text-left font-medium">Reason</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -475,8 +445,7 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
                       </td>
                       <td className="px-3 py-1.5">
                         <span className="px-1 py-0.5 rounded bg-neutral-700/50 text-neutral-300">
-                          {EVENT_TYPE_LABELS[event.event_type] ||
-                            event.event_type}
+                          {EVENT_TYPE_LABELS[event.event_type] || event.event_type}
                         </span>
                       </td>
                       <td className="px-3 py-1.5">
@@ -512,12 +481,12 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
         <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
         <div className="text-xs text-blue-300/80 space-y-1">
           <p>
-            Security policies follow the{" "}
-            <strong>Agent Sandbox Taxonomy (AST)</strong> 7-layer model:
+            Security policies follow the <strong>Agent Sandbox Taxonomy (AST)</strong> 7-layer
+            model:
           </p>
           <p className="font-mono text-[10px] text-blue-400/60">
-            L1:Compute / L2:Resources / L3:Filesystem / L4:Network /
-            L5:Credentials / L6:Actions / L7:Audit
+            L1:Compute / L2:Resources / L3:Filesystem / L4:Network / L5:Credentials / L6:Actions /
+            L7:Audit
           </p>
         </div>
       </div>

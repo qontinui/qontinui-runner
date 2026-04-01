@@ -100,10 +100,7 @@ function SortIndicator({ field, sort }: { field: SortField; sort: SortState }) {
 // Sorting
 // ---------------------------------------------------------------------------
 
-function sortResults(
-  results: ExperimentResult[],
-  sort: SortState,
-): ExperimentResult[] {
+function sortResults(results: ExperimentResult[], sort: SortState): ExperimentResult[] {
   if (!sort.field) return results;
 
   const sorted = [...results].sort((a, b) => {
@@ -138,7 +135,13 @@ function sortResults(
 // Main component
 // ---------------------------------------------------------------------------
 
-export function ExperimentResults({ results, summary, isLoading, error, onEvaluateRow }: ExperimentResultsProps) {
+export function ExperimentResults({
+  results,
+  summary,
+  isLoading,
+  error,
+  onEvaluateRow,
+}: ExperimentResultsProps) {
   const [page, setPage] = useState(0);
   const [sort, setSort] = useState<SortState>({ field: null, direction: "desc" });
 
@@ -207,7 +210,9 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
             {Object.entries(summary.avg_scores).map(([name, value]) => (
               <Card key={name} className="!p-0">
                 <CardContent className="!px-3 !py-2">
-                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{name}</p>
+                  <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    {name}
+                  </p>
                   <p className="text-lg font-semibold">{(value * 100).toFixed(1)}%</p>
                 </CardContent>
               </Card>
@@ -215,21 +220,27 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
             {/* Total cost */}
             <Card className="!p-0">
               <CardContent className="!px-3 !py-2">
-                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Total Cost</p>
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Total Cost
+                </p>
                 <p className="text-lg font-semibold">{formatCost(summary.total_cost_cents)}</p>
               </CardContent>
             </Card>
             {/* Total tokens */}
             <Card className="!p-0">
               <CardContent className="!px-3 !py-2">
-                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Total Tokens</p>
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Total Tokens
+                </p>
                 <p className="text-lg font-semibold">{summary.total_tokens.toLocaleString()}</p>
               </CardContent>
             </Card>
             {/* Results count */}
             <Card className="!p-0">
               <CardContent className="!px-3 !py-2">
-                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Results</p>
+                <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Results
+                </p>
                 <p className="text-lg font-semibold">{summary.result_count}</p>
               </CardContent>
             </Card>
@@ -248,7 +259,8 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
                 Scores
                 {scoreNames.length > 0 && (
                   <span className="ml-1 text-[10px] opacity-60">
-                    ({scoreNames.map((name) => (
+                    (
+                    {scoreNames.map((name) => (
                       <button
                         key={name}
                         onClick={() => toggleSort(`score:${name}`)}
@@ -258,7 +270,8 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
                         {name}
                         <SortIndicator field={`score:${name}`} sort={sort} />
                       </button>
-                    ))})
+                    ))}
+                    )
                   </span>
                 )}
               </th>
@@ -294,7 +307,10 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
           </thead>
           <tbody>
             {pageResults.map((r) => (
-              <tr key={r.id} className="border-b border-border/30 hover:bg-muted/30 transition-colors">
+              <tr
+                key={r.id}
+                className="border-b border-border/30 hover:bg-muted/30 transition-colors"
+              >
                 <td className="px-4 py-2 align-top whitespace-pre-wrap break-words max-w-[200px]">
                   {r.input}
                 </td>
@@ -333,10 +349,13 @@ export function ExperimentResults({ results, summary, isLoading, error, onEvalua
 
       {/* Pagination */}
       {sorted.length > PAGE_SIZE && (
-        <div className="flex items-center justify-between px-4 py-3 border-t border-border/50 text-xs text-muted-foreground" data-tutorial-id="experiment-results-pagination">
+        <div
+          className="flex items-center justify-between px-4 py-3 border-t border-border/50 text-xs text-muted-foreground"
+          data-tutorial-id="experiment-results-pagination"
+        >
           <span>
-            Showing {start + 1}-{Math.min(start + PAGE_SIZE, sorted.length)} of{" "}
-            {sorted.length} results
+            Showing {start + 1}-{Math.min(start + PAGE_SIZE, sorted.length)} of {sorted.length}{" "}
+            results
           </span>
           <div className="flex items-center gap-2">
             <button

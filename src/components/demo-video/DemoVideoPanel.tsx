@@ -32,18 +32,9 @@ import type {
   DemoGenerationState,
   DemoExecutionResult,
 } from "@/lib/demo-video/types";
-import {
-  DEFAULT_RECORDING_CONFIG,
-  INITIAL_GENERATION_STATE,
-} from "@/lib/demo-video/types";
-import {
-  fetchRegisteredElements,
-  planDemoScript,
-} from "@/lib/demo-video/script-planner";
-import {
-  executeScript,
-  abortExecution,
-} from "@/lib/demo-video/script-executor";
+import { DEFAULT_RECORDING_CONFIG, INITIAL_GENERATION_STATE } from "@/lib/demo-video/types";
+import { fetchRegisteredElements, planDemoScript } from "@/lib/demo-video/script-planner";
+import { executeScript, abortExecution } from "@/lib/demo-video/script-executor";
 import { generateNarration } from "@/lib/demo-video/narration-generator";
 import type { NarrationOutput } from "@/lib/demo-video/narration-generator";
 import { ScriptPreview } from "./ScriptPreview";
@@ -363,9 +354,7 @@ export function DemoVideoPanel() {
                     ) : (
                       <Square className="h-4 w-4 text-muted-foreground shrink-0" />
                     )}
-                    <span className="truncate">
-                      {s.config.metadata?.component || s.specId}
-                    </span>
+                    <span className="truncate">{s.config.metadata?.component || s.specId}</span>
                     {s.config.description && (
                       <span className="text-xs text-muted-foreground truncate ml-1">
                         — {s.config.description.slice(0, 50)}
@@ -444,8 +433,9 @@ export function DemoVideoPanel() {
         {state.phase === "recording" && (
           <div className="flex items-center gap-2 text-sm text-green-400">
             <div className="h-2 w-2 rounded-full bg-red-500 animate-pulse" />
-            Recording{allScripts.length > 1 ? ` (video ${batchIndex + 1}/${allScripts.length})` : ""}{" "}
-            — Step {state.currentStepIndex + 1} of {state.script?.steps.length ?? 0}
+            Recording
+            {allScripts.length > 1 ? ` (video ${batchIndex + 1}/${allScripts.length})` : ""} — Step{" "}
+            {state.currentStepIndex + 1} of {state.script?.steps.length ?? 0}
           </div>
         )}
 
@@ -476,9 +466,7 @@ export function DemoVideoPanel() {
                 <ScriptPreview
                   script={script}
                   activeStepIndex={
-                    state.phase === "recording" && batchIndex === i
-                      ? state.currentStepIndex
-                      : -1
+                    state.phase === "recording" && batchIndex === i ? state.currentStepIndex : -1
                   }
                 />
               </div>
@@ -541,9 +529,15 @@ export function DemoVideoPanel() {
 
                 {/* Cross-link to matching product tour */}
                 {(() => {
-                  const savedTours = instanceStorage.getJSON<ProductTour[]>(PRODUCT_TOURS_STORAGE_KEY, []);
+                  const savedTours = instanceStorage.getJSON<ProductTour[]>(
+                    PRODUCT_TOURS_STORAGE_KEY,
+                    [],
+                  );
                   const matchingTour = savedTours.find((t) =>
-                    t.pages.some((p) => entry.script.targetPage.includes(p) || p.includes(entry.script.targetPage))
+                    t.pages.some(
+                      (p) =>
+                        entry.script.targetPage.includes(p) || p.includes(entry.script.targetPage),
+                    ),
                   );
                   if (!matchingTour) return null;
                   return (

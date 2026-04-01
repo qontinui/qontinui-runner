@@ -18,10 +18,7 @@ import {
   Brain,
   AlertCircle,
 } from "lucide-react";
-import {
-  useObservationSearch,
-  type ObservationSearchResult,
-} from "@/hooks/useObservationMemory";
+import { useObservationSearch, type ObservationSearchResult } from "@/hooks/useObservationMemory";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -194,12 +191,22 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
   const totalCount = stats.reduce((sum, s) => sum + s.count, 0);
 
   return (
-    <div className="flex flex-col h-full" data-ui-element="observation-browser" data-tutorial-id="observation-browser">
+    <div
+      className="flex flex-col h-full"
+      data-ui-element="observation-browser"
+      data-tutorial-id="observation-browser"
+    >
       {/* Header */}
       <div className="flex items-center gap-3 p-4 border-b border-border">
         <Brain className="w-5 h-5 text-primary" />
         <div className="flex-1">
-          <h2 className="font-semibold text-sm" data-ui-element="observation-heading" data-tutorial-id="observation-heading">Observation Memory</h2>
+          <h2
+            className="font-semibold text-sm"
+            data-ui-element="observation-heading"
+            data-tutorial-id="observation-heading"
+          >
+            Observation Memory
+          </h2>
           <p className="text-xs text-muted-foreground" data-ui-element="observation-subtitle">
             Cross-session knowledge from past runs
           </p>
@@ -280,10 +287,11 @@ export function ObservationBrowser({ projectId }: { projectId?: string | null })
 
       {/* Stats bar */}
       {stats.length > 0 && (
-        <div className="flex items-center gap-2 px-4 py-2 border-b border-border overflow-x-auto" data-tutorial-id="observation-stats">
-          <span className="text-xs text-muted-foreground shrink-0">
-            {totalCount} total
-          </span>
+        <div
+          className="flex items-center gap-2 px-4 py-2 border-b border-border overflow-x-auto"
+          data-tutorial-id="observation-stats"
+        >
+          <span className="text-xs text-muted-foreground shrink-0">{totalCount} total</span>
           {stats.map((s) => {
             const color = TYPE_COLORS[s.observationType] || "zinc";
             return (
@@ -394,7 +402,9 @@ function ObservationRow({
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <span className={`px-1.5 py-0.5 text-[10px] rounded ${colorClasses.bg} ${colorClasses.text}`}>
+            <span
+              className={`px-1.5 py-0.5 text-[10px] rounded ${colorClasses.bg} ${colorClasses.text}`}
+            >
               {observation.observationType}
             </span>
             <span className="font-medium text-sm truncate">{observation.title}</span>
@@ -409,9 +419,7 @@ function ObservationRow({
               </span>
             )}
           </div>
-          <p className="text-xs text-muted-foreground line-clamp-2">
-            {observation.contentPreview}
-          </p>
+          <p className="text-xs text-muted-foreground line-clamp-2">{observation.contentPreview}</p>
           <div className="flex items-center gap-3 mt-1 text-[10px] text-muted-foreground">
             {observation.topicKey && <span>[{observation.topicKey}]</span>}
             <span>{new Date(observation.updatedAt).toLocaleDateString()}</span>

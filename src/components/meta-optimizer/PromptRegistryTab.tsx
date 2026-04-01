@@ -187,9 +187,7 @@ export function PromptRegistryTab() {
                             </button>
                             <button
                               onClick={() =>
-                                setCanaryFormVariantId(
-                                  canaryFormVariantId === v.id ? null : v.id,
-                                )
+                                setCanaryFormVariantId(canaryFormVariantId === v.id ? null : v.id)
                               }
                               className={`px-3 py-1 text-xs rounded ${
                                 canaryFormVariantId === v.id

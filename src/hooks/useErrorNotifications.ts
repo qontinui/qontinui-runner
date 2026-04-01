@@ -37,8 +37,7 @@ function readPrefs(): NotificationPreferences {
   return {
     severityFilter: isValidSeverity(raw.severityFilter) ? raw.severityFilter : "error",
     mutedSources: Array.isArray(raw.mutedSources) ? raw.mutedSources : [],
-    maxPerBatch:
-      typeof raw.maxPerBatch === "number" && raw.maxPerBatch >= 0 ? raw.maxPerBatch : 3,
+    maxPerBatch: typeof raw.maxPerBatch === "number" && raw.maxPerBatch >= 0 ? raw.maxPerBatch : 3,
   };
 }
 
@@ -89,19 +88,13 @@ export function useErrorNotifications(showToast: ShowToastFn) {
       for (const err of newErrors) {
         if (shown >= prefs.maxPerBatch) break;
         const prefix = err.severity === "critical" ? "CRITICAL" : "Error";
-        const msg =
-          err.message.length > 120
-            ? err.message.slice(0, 120) + "\u2026"
-            : err.message;
+        const msg = err.message.length > 120 ? err.message.slice(0, 120) + "\u2026" : err.message;
         showToast(`[${prefix}] ${msg}`, "error");
         shown++;
       }
 
       if (newErrors.length > prefs.maxPerBatch) {
-        showToast(
-          `${newErrors.length - prefs.maxPerBatch} more error(s) detected`,
-          "error",
-        );
+        showToast(`${newErrors.length - prefs.maxPerBatch} more error(s) detected`, "error");
       }
 
       // Keep set from growing unbounded — prune entries older than 1000

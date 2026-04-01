@@ -84,12 +84,7 @@ export function useObservationMemory(
     enabled?: boolean;
   } = {},
 ): ObservationMemoryContext {
-  const {
-    maxResults = 15,
-    observationType,
-    refreshInterval = 0,
-    enabled = true,
-  } = options;
+  const { maxResults = 15, observationType, refreshInterval = 0, enabled = true } = options;
 
   const [observations, setObservations] = useState<ObservationSearchResult[]>([]);
   const [loading, setLoading] = useState(false);
@@ -115,9 +110,7 @@ export function useObservationMemory(
         params.set("observation_type", observationType);
       }
 
-      const response = await tracedFetch(
-        `${getApiBase()}/observations/context?${params}`,
-      );
+      const response = await tracedFetch(`${getApiBase()}/observations/context?${params}`);
 
       if (response.status === 503) {
         // PG not available
@@ -159,10 +152,7 @@ export function useObservationMemory(
   }, [refreshInterval, fetchContext]);
 
   // Format observations as markdown context for prompt injection
-  const contextContent = useMemo(
-    () => formatObservationsAsContext(observations),
-    [observations],
-  );
+  const contextContent = useMemo(() => formatObservationsAsContext(observations), [observations]);
 
   return {
     contextContent,
@@ -182,39 +172,34 @@ export function useObservationSearch() {
   const [results, setResults] = useState<ObservationSearchResult[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const search = useCallback(
-    async (query: string, projectId?: string, maxResults = 20) => {
-      if (!query.trim()) {
-        setResults([]);
-        return;
+  const search = useCallback(async (query: string, projectId?: string, maxResults = 20) => {
+    if (!query.trim()) {
+      setResults([]);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({
+        q: query,
+        max_results: String(maxResults),
+      });
+      if (projectId) {
+        params.set("project_id", projectId);
       }
 
-      setLoading(true);
-      try {
-        const params = new URLSearchParams({
-          q: query,
-          max_results: String(maxResults),
-        });
-        if (projectId) {
-          params.set("project_id", projectId);
-        }
+      const response = await tracedFetch(`${getApiBase()}/observations/search?${params}`);
+      const result: ApiResponse<ObservationSearchResult[]> = await response.json();
 
-        const response = await tracedFetch(
-          `${getApiBase()}/observations/search?${params}`,
-        );
-        const result: ApiResponse<ObservationSearchResult[]> = await response.json();
-
-        if (result.success && result.data) {
-          setResults(result.data);
-        }
-      } catch (err) {
-        console.error("[ObservationSearch] Error:", err);
-      } finally {
-        setLoading(false);
+      if (result.success && result.data) {
+        setResults(result.data);
       }
-    },
-    [],
-  );
+    } catch (err) {
+      console.error("[ObservationSearch] Error:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   return { results, loading, search };
 }
@@ -229,9 +214,7 @@ export function useObservationSearch() {
  * Uses progressive disclosure: 300-char previews with IDs.
  * The AI agent can request full content via GET /observations/:id.
  */
-function formatObservationsAsContext(
-  observations: ObservationSearchResult[],
-): string {
+function formatObservationsAsContext(observations: ObservationSearchResult[]): string {
   if (observations.length === 0) return "";
 
   const lines: string[] = [
@@ -256,8 +239,7 @@ function formatObservationsAsContext(
     lines.push("");
 
     for (const obs of items) {
-      const rev =
-        obs.revisionCount > 1 ? ` (rev ${obs.revisionCount})` : "";
+      const rev = obs.revisionCount > 1 ? ` (rev ${obs.revisionCount})` : "";
       const topicTag = obs.topicKey ? ` [${obs.topicKey}]` : "";
       lines.push(`- **${obs.title}**${rev}${topicTag} (id: ${obs.id})`);
       lines.push(`  ${obs.contentPreview}`);

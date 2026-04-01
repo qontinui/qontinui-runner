@@ -46,10 +46,7 @@ export function generateSrt(steps: StepTimestamp[]): string {
 // Markdown Narration Script
 // =============================================================================
 
-export function generateMarkdownNarration(
-  script: DemoScript,
-  steps: StepTimestamp[]
-): string {
+export function generateMarkdownNarration(script: DemoScript, steps: StepTimestamp[]): string {
   const lines: string[] = [
     `# ${script.title} — Narration Script`,
     "",
@@ -81,7 +78,7 @@ export interface NarrationOutput {
 
 export function generateNarration(
   script: DemoScript,
-  result: DemoExecutionResult
+  result: DemoExecutionResult,
 ): NarrationOutput {
   return {
     srt: generateSrt(result.steps),

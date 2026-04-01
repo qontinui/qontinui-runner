@@ -331,8 +331,14 @@
           "category": "interaction",
           "severity": "critical",
           "assertionType": "disabled",
-          "target": { "type": "search", "criteria": { "textContent": "Search" }, "label": "Disabled search button" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Search" },
+            "label": "Disabled search button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-interaction-form-submit",
@@ -340,8 +346,14 @@
           "category": "interaction",
           "severity": "critical",
           "assertionType": "behavior",
-          "target": { "type": "search", "criteria": { "role": "textbox" }, "label": "Search input form submission" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Search input form submission"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-interaction-cmd-k-toggle",
@@ -350,8 +362,14 @@
           "severity": "critical",
           "assertionType": "behavior",
           "precondition": "Tauri webview has keyboard focus",
-          "target": { "type": "search", "criteria": { "textContent": "ESC" }, "label": "Command palette keyboard shortcut" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ESC" },
+            "label": "Command palette keyboard shortcut"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-interaction-escape-close",
@@ -359,8 +377,14 @@
           "category": "interaction",
           "severity": "critical",
           "assertionType": "behavior",
-          "target": { "type": "search", "criteria": { "textContent": "ESC" }, "label": "Escape to close palette" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ESC" },
+            "label": "Escape to close palette"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-interaction-backdrop-close",
@@ -369,8 +393,14 @@
           "severity": "warning",
           "assertionType": "behavior",
           "precondition": "Command palette is open",
-          "target": { "type": "search", "criteria": { "textContent": "ESC" }, "label": "Backdrop click to close" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ESC" },
+            "label": "Backdrop click to close"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-interaction-autofocus",
@@ -379,8 +409,14 @@
           "severity": "warning",
           "assertionType": "behavior",
           "precondition": "Command palette just opened",
-          "target": { "type": "search", "criteria": { "role": "textbox" }, "label": "Auto-focused search input" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Auto-focused search input"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-interaction-result-click",
@@ -389,8 +425,14 @@
           "severity": "warning",
           "assertionType": "behavior",
           "precondition": "Search has returned results",
-          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Clickable result rows" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button" },
+            "label": "Clickable result rows"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -408,8 +450,14 @@
           "severity": "warning",
           "assertionType": "containsText",
           "expected": "Format '{N} result' or '{N} results' with per-entity-type badges",
-          "target": { "type": "search", "criteria": { "textContent": "result" }, "label": "Result count header" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "result" },
+            "label": "Result count header"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-data-relevance-score",
@@ -418,8 +466,14 @@
           "severity": "info",
           "assertionType": "exists",
           "expected": "Percentage 0-100, computed as Math.round(relevance_score * 100)",
-          "target": { "type": "search", "criteria": { "textContent": "%" }, "label": "Relevance score percentage" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "%" },
+            "label": "Relevance score percentage"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-data-entity-type-badge",
@@ -428,8 +482,14 @@
           "severity": "warning",
           "assertionType": "exists",
           "expected": "One of: finding, fix, knowledge, error, rule, workflow — capitalized",
-          "target": { "type": "search", "criteria": { "textContent": "finding|fix|knowledge|error|rule|workflow" }, "label": "Entity type badge" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "finding|fix|knowledge|error|rule|workflow" },
+            "label": "Entity type badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -446,8 +506,14 @@
           "category": "navigation",
           "severity": "warning",
           "assertionType": "exists",
-          "target": { "type": "search", "criteria": { "textContent": "Search Everything" }, "label": "Unified search tab page" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Search Everything" },
+            "label": "Unified search tab page"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "search-nav-global-palette",
@@ -455,8 +521,14 @@
           "category": "navigation",
           "severity": "critical",
           "assertionType": "behavior",
-          "target": { "type": "search", "criteria": { "textContent": "ESC" }, "label": "Global command palette" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "ESC" },
+            "label": "Global command palette"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"

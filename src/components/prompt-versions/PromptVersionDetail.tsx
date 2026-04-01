@@ -122,40 +122,43 @@ export function PromptVersionDetail({
       )}
 
       {/* Performance metrics */}
-      {metrics && (metrics.success_rate != null || metrics.avg_cost != null || metrics.avg_latency != null) && (
-        <div className="space-y-2">
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <BarChart3 className="w-3.5 h-3.5" />
-            Performance Metrics
+      {metrics &&
+        (metrics.success_rate != null ||
+          metrics.avg_cost != null ||
+          metrics.avg_latency != null) && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <BarChart3 className="w-3.5 h-3.5" />
+              Performance Metrics
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              {metrics.success_rate != null && (
+                <div className="bg-muted/50 rounded-md p-3 text-center">
+                  <div className="text-lg font-semibold text-green-400">
+                    {(metrics.success_rate * 100).toFixed(1)}%
+                  </div>
+                  <div className="text-xs text-muted-foreground">Success Rate</div>
+                </div>
+              )}
+              {metrics.avg_cost != null && (
+                <div className="bg-muted/50 rounded-md p-3 text-center">
+                  <div className="text-lg font-semibold text-primary">
+                    ${metrics.avg_cost.toFixed(4)}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Avg Cost</div>
+                </div>
+              )}
+              {metrics.avg_latency != null && (
+                <div className="bg-muted/50 rounded-md p-3 text-center">
+                  <div className="text-lg font-semibold text-amber-400">
+                    {metrics.avg_latency.toFixed(0)}ms
+                  </div>
+                  <div className="text-xs text-muted-foreground">Avg Latency</div>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="grid grid-cols-3 gap-3">
-            {metrics.success_rate != null && (
-              <div className="bg-muted/50 rounded-md p-3 text-center">
-                <div className="text-lg font-semibold text-green-400">
-                  {(metrics.success_rate * 100).toFixed(1)}%
-                </div>
-                <div className="text-xs text-muted-foreground">Success Rate</div>
-              </div>
-            )}
-            {metrics.avg_cost != null && (
-              <div className="bg-muted/50 rounded-md p-3 text-center">
-                <div className="text-lg font-semibold text-primary">
-                  ${metrics.avg_cost.toFixed(4)}
-                </div>
-                <div className="text-xs text-muted-foreground">Avg Cost</div>
-              </div>
-            )}
-            {metrics.avg_latency != null && (
-              <div className="bg-muted/50 rounded-md p-3 text-center">
-                <div className="text-lg font-semibold text-amber-400">
-                  {metrics.avg_latency.toFixed(0)}ms
-                </div>
-                <div className="text-xs text-muted-foreground">Avg Latency</div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
+        )}
 
       {/* Prompt content */}
       <div>

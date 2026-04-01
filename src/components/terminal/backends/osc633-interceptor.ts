@@ -66,10 +66,7 @@ export class Osc633Interceptor {
    * The data is never modified — this is read-only scanning.
    */
   scan(data: Uint8Array | string): void {
-    const bytes =
-      typeof data === "string"
-        ? new TextEncoder().encode(data)
-        : data;
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
 
     for (let i = 0; i < bytes.length; i++) {
       const b = bytes[i];

@@ -47,12 +47,18 @@ function TraceRow({
   highlightedSpanId,
 }: RowComponentProps<TraceRowProps>) {
   const node = filteredNodes[index];
-  const heat = tokenOverlay && tokenOverlay !== "none" && tokenInsights
-    ? getTokenHeat(node.span, tokenOverlay,
-        tokenOverlay === "input" ? tokenInsights.maxInputTokens
-          : tokenOverlay === "output" ? tokenInsights.maxOutputTokens
-          : tokenInsights.maxCostCents)
-    : 0;
+  const heat =
+    tokenOverlay && tokenOverlay !== "none" && tokenInsights
+      ? getTokenHeat(
+          node.span,
+          tokenOverlay,
+          tokenOverlay === "input"
+            ? tokenInsights.maxInputTokens
+            : tokenOverlay === "output"
+              ? tokenInsights.maxOutputTokens
+              : tokenInsights.maxCostCents,
+        )
+      : 0;
   return (
     <div style={style}>
       <SpanRow
@@ -112,7 +118,8 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
     }
 
     // Build consecutive pairs
-    const segments: { fromRow: number; toRow: number; fromSpan: TraceSpan; toSpan: TraceSpan }[] = [];
+    const segments: { fromRow: number; toRow: number; fromSpan: TraceSpan; toSpan: TraceSpan }[] =
+      [];
     for (let i = 0; i < critRows.length - 1; i++) {
       segments.push({
         fromRow: critRows[i],
@@ -128,7 +135,10 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
 
   // Report viewport position when visible rows change
   const handleRowsRendered = useCallback(
-    (_visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => {
+    (
+      _visibleRows: { startIndex: number; stopIndex: number },
+      allRows: { startIndex: number; stopIndex: number },
+    ) => {
       if (!onViewportChange || filteredNodes.length === 0) return;
       const start = allRows.startIndex / filteredNodes.length;
       const end = Math.min(1, (allRows.stopIndex + 1) / filteredNodes.length);
@@ -140,7 +150,9 @@ export const TraceWaterfall: React.FC<TraceWaterfallProps> = ({
   // Scroll to a specific fraction when requested by the minimap
   useEffect(() => {
     if (scrollToFraction == null || filteredNodes.length === 0) return;
-    const ref = listRef as React.RefObject<{ scrollToRow: (config: { index: number; align?: string }) => void } | null>;
+    const ref = listRef as React.RefObject<{
+      scrollToRow: (config: { index: number; align?: string }) => void;
+    } | null>;
     if (!ref?.current) return;
     const targetIndex = Math.round(scrollToFraction * filteredNodes.length);
     const clampedIndex = Math.max(0, Math.min(filteredNodes.length - 1, targetIndex));

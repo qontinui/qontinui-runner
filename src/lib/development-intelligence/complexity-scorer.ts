@@ -53,17 +53,12 @@ export interface DriftAlert {
   currentComposite: number;
 }
 
-export async function analyzeComplexity(
-  projectPath: string,
-): Promise<ComplexityAnalysisResult> {
-  const response = await fetch(
-    `${API_BASE}/development-intelligence/complexity-scores`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_path: projectPath }),
-    },
-  );
+export async function analyzeComplexity(projectPath: string): Promise<ComplexityAnalysisResult> {
+  const response = await fetch(`${API_BASE}/development-intelligence/complexity-scores`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_path: projectPath }),
+  });
 
   if (!response.ok) {
     throw new Error(`Complexity analysis failed: ${response.statusText}`);
@@ -109,9 +104,7 @@ export function computeComposite(scores: ComplexityScore["scores"]): number {
 /**
  * Determine complexity tier from composite score.
  */
-export function getTier(
-  composite: number,
-): "simple" | "moderate" | "complex" | "critical" {
+export function getTier(composite: number): "simple" | "moderate" | "complex" | "critical" {
   if (composite < 25) return "simple";
   if (composite < 50) return "moderate";
   if (composite < 75) return "complex";
@@ -121,9 +114,7 @@ export function getTier(
 /**
  * Get tier color for visualization.
  */
-export function getTierColor(
-  tier: "simple" | "moderate" | "complex" | "critical",
-): string {
+export function getTierColor(tier: "simple" | "moderate" | "complex" | "critical"): string {
   switch (tier) {
     case "simple":
       return "#10B981";
@@ -153,9 +144,7 @@ export function scoreComplexityFromSpecs(
   >,
 ): ComplexityScore[] {
   return specs.map((spec) => {
-    const enabledAssertions = spec.groups.flatMap((g) =>
-      g.assertions.filter((a) => a.enabled),
-    );
+    const enabledAssertions = spec.groups.flatMap((g) => g.assertions.filter((a) => a.enabled));
 
     const elementCount = spec.groups
       .filter((g) => g.category === "element-presence")
@@ -172,9 +161,7 @@ export function scoreComplexityFromSpecs(
           (g) =>
             g.category === "interaction" &&
             g.assertions.includes(a) &&
-            /form|input|select|textarea|field/i.test(
-              JSON.stringify(g),
-            ),
+            /form|input|select|textarea|field/i.test(JSON.stringify(g)),
         ),
     ).length;
 
@@ -216,8 +203,7 @@ export function detectDrift(
   const recent = trend.slice(-4);
   const oldest = recent[0];
   const newest = recent[recent.length - 1];
-  const changePercent =
-    oldest > 0 ? ((newest - oldest) / oldest) * 100 : 0;
+  const changePercent = oldest > 0 ? ((newest - oldest) / oldest) * 100 : 0;
   const weeksSpan = Math.max(1, recent.length - 1);
   const velocityPerWeek = changePercent / weeksSpan;
 

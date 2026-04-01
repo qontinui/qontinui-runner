@@ -10,14 +10,22 @@ interface SpanDetailPanelProps {
   allSpans?: TraceSpan[];
 }
 
-export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose, criticalPath, allSpans = [] }) => {
+export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({
+  span,
+  onClose,
+  criticalPath,
+  allSpans = [],
+}) => {
   if (!span) return null;
 
   const phase = inferPhase(span.name);
   const colors = PHASE_COLORS[phase];
 
   return (
-    <div className="w-[280px] min-w-[280px] border-l border-zinc-700 bg-zinc-900 overflow-y-auto" data-tutorial-id="trace-span-detail-panel">
+    <div
+      className="w-[280px] min-w-[280px] border-l border-zinc-700 bg-zinc-900 overflow-y-auto"
+      data-tutorial-id="trace-span-detail-panel"
+    >
       <div className="flex items-center justify-between p-3 border-b border-zinc-700">
         <h3 className="text-sm font-medium text-zinc-200 truncate">
           {span.name.replace(/^qontinui\./, "")}
@@ -102,8 +110,8 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose,
               <>
                 <span className="text-zinc-500 font-medium text-[10px]">Off critical path</span>
                 <p className="text-zinc-400 mt-1">
-                  Slack: {formatDuration(criticalPath.slackBySpanId.get(span.span_id) ?? 0)} —
-                  this span could take that much longer without affecting total time.
+                  Slack: {formatDuration(criticalPath.slackBySpanId.get(span.span_id) ?? 0)} — this
+                  span could take that much longer without affecting total time.
                 </p>
               </>
             )}
@@ -117,47 +125,62 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose,
             <div className="mt-1 grid grid-cols-2 gap-1">
               {span.input_tokens != null && (
                 <div className="bg-blue-500/10 rounded px-1.5 py-0.5 text-[10px]">
-                  In: <span className="font-mono text-zinc-300">{span.input_tokens.toLocaleString()}</span>
+                  In:{" "}
+                  <span className="font-mono text-zinc-300">
+                    {span.input_tokens.toLocaleString()}
+                  </span>
                 </div>
               )}
               {span.output_tokens != null && (
                 <div className="bg-green-500/10 rounded px-1.5 py-0.5 text-[10px]">
-                  Out: <span className="font-mono text-zinc-300">{span.output_tokens.toLocaleString()}</span>
+                  Out:{" "}
+                  <span className="font-mono text-zinc-300">
+                    {span.output_tokens.toLocaleString()}
+                  </span>
                 </div>
               )}
               {span.cost_cents != null && (
                 <div className="bg-amber-500/10 rounded px-1.5 py-0.5 text-[10px] col-span-2">
-                  Cost: <span className="font-mono text-zinc-300">${(span.cost_cents / 100).toFixed(4)}</span>
+                  Cost:{" "}
+                  <span className="font-mono text-zinc-300">
+                    ${(span.cost_cents / 100).toFixed(4)}
+                  </span>
                 </div>
               )}
             </div>
             {/* Child tool calls */}
-            {allSpans.length > 0 && (() => {
-              const childTools = allSpans.filter(
-                (s) => s.parent_span_id === span.span_id && s.name.includes("tool_call"),
-              );
-              if (childTools.length === 0) return null;
-              return (
-                <div className="mt-2">
-                  <span className="text-zinc-500 font-medium text-[10px]">Tool Calls ({childTools.length}):</span>
-                  <div className="mt-1 space-y-0.5">
-                    {childTools.map((tool) => (
-                      <div key={tool.span_id} className="flex items-center gap-1 text-[10px]">
-                        <span className={tool.success ? "text-emerald-400" : "text-red-400"}>
-                          {tool.success ? "\u2713" : "\u2717"}
-                        </span>
-                        <span className="text-zinc-400 truncate">
-                          {(tool.attributes ?? {})["ai.tool_name"] as string || tool.name.replace(/^qontinui\./, "")}
-                        </span>
-                        {tool.duration_ms != null && (
-                          <span className="text-zinc-600 ml-auto shrink-0">{formatDuration(tool.duration_ms)}</span>
-                        )}
-                      </div>
-                    ))}
+            {allSpans.length > 0 &&
+              (() => {
+                const childTools = allSpans.filter(
+                  (s) => s.parent_span_id === span.span_id && s.name.includes("tool_call"),
+                );
+                if (childTools.length === 0) return null;
+                return (
+                  <div className="mt-2">
+                    <span className="text-zinc-500 font-medium text-[10px]">
+                      Tool Calls ({childTools.length}):
+                    </span>
+                    <div className="mt-1 space-y-0.5">
+                      {childTools.map((tool) => (
+                        <div key={tool.span_id} className="flex items-center gap-1 text-[10px]">
+                          <span className={tool.success ? "text-emerald-400" : "text-red-400"}>
+                            {tool.success ? "\u2713" : "\u2717"}
+                          </span>
+                          <span className="text-zinc-400 truncate">
+                            {((tool.attributes ?? {})["ai.tool_name"] as string) ||
+                              tool.name.replace(/^qontinui\./, "")}
+                          </span>
+                          {tool.duration_ms != null && (
+                            <span className="text-zinc-600 ml-auto shrink-0">
+                              {formatDuration(tool.duration_ms)}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              );
-            })()}
+                );
+              })()}
           </div>
         )}
 
@@ -186,7 +209,9 @@ export const SpanDetailPanel: React.FC<SpanDetailPanelProps> = ({ span, onClose,
         {/* Attributes (excluding gen_ai.* which are shown above) */}
         {(() => {
           const attrs = span.attributes ?? {};
-          const nonGenAiEntries = Object.entries(attrs).filter(([key]) => !key.startsWith("gen_ai."));
+          const nonGenAiEntries = Object.entries(attrs).filter(
+            ([key]) => !key.startsWith("gen_ai."),
+          );
           if (nonGenAiEntries.length === 0) return null;
           return (
             <div className="pt-2 border-t border-zinc-800">

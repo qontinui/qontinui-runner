@@ -53,7 +53,9 @@ export function DeveloperArchitecturePanel({
   useEffect(() => {
     const controller = new AbortController();
     loadSpecPageIds(controller.signal);
-    return () => { controller.abort(); };
+    return () => {
+      controller.abort();
+    };
   }, [loadSpecPageIds]);
 
   const clampedIndex = useMemo(
@@ -132,7 +134,9 @@ export function DeveloperArchitecturePanel({
       {/* Active view */}
       <div className="flex-1 min-h-0 overflow-auto">
         {activeView === "overview" && <DeveloperOverviewPanel project={project} />}
-        {activeView === "dependencies" && <DeveloperDependencyGraph project={project} specPageIds={specPageIds} />}
+        {activeView === "dependencies" && (
+          <DeveloperDependencyGraph project={project} specPageIds={specPageIds} />
+        )}
         {activeView === "tech-map" && <DeveloperTechMap project={project} />}
         {activeView === "explorer" && <DeveloperExplorerPanel project={project} />}
         {activeView === "agentic" && <DeveloperAgenticPanel project={project} />}

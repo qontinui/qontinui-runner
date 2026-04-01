@@ -252,9 +252,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         const isNetworkError =
           errStr.includes("Network error") || errStr.includes("Failed to fetch");
         const isTransientError =
-          isNetworkError ||
-          errStr.includes("Server error") ||
-          errStr.includes("Rate limit");
+          isNetworkError || errStr.includes("Server error") || errStr.includes("Rate limit");
         if (isTransientError && devLoginRetryCount.current < MAX_DEV_LOGIN_RETRIES) {
           // Transient error (network, server, rate limit) — retry with backoff
           devLoginRetryCount.current += 1;

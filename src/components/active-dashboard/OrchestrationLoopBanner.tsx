@@ -119,15 +119,20 @@ export function OrchestrationLoopBanner() {
   }, [subData, fetchStatus]);
 
   // Check for active multi-loops (excluding default)
-  const multiLoops = multiStatus?.loops.filter(
-    (l) => l.loop_id !== "default" && (l.status.running || l.status.phase !== "idle"),
-  ) ?? [];
+  const multiLoops =
+    multiStatus?.loops.filter(
+      (l) => l.loop_id !== "default" && (l.status.running || l.status.phase !== "idle"),
+    ) ?? [];
   const multiRunning = multiLoops.filter((l) => l.status.running);
 
   // Show multi-loop banner if there are active multi-loops
   if (multiLoops.length > 0) {
     const handleStopAll = async () => {
-      try { await invoke("stop_all_orchestration_loops"); } catch { /* ignore */ }
+      try {
+        await invoke("stop_all_orchestration_loops");
+      } catch {
+        /* ignore */
+      }
     };
     return (
       <div className="px-3 py-1.5 border-b border-border bg-muted/30 flex items-center gap-3 text-xs">

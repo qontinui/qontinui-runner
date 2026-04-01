@@ -13,7 +13,14 @@ import { ComparisonTab } from "../components/autoresearch/ComparisonTab";
 import { ModelProfilesTab } from "../components/autoresearch/ModelProfilesTab";
 import { QRoutingTab } from "../components/autoresearch/QRoutingTab";
 
-type SubTab = "campaign" | "results" | "worktrees" | "comparison" | "model_profiles" | "q_routing" | "per_agent";
+type SubTab =
+  | "campaign"
+  | "results"
+  | "worktrees"
+  | "comparison"
+  | "model_profiles"
+  | "q_routing"
+  | "per_agent";
 
 const TABS: { id: SubTab; label: string; devOnly?: boolean }[] = [
   { id: "campaign", label: "Campaign" },

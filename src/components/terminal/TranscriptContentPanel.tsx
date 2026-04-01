@@ -1,5 +1,15 @@
 import { useState, useCallback } from "react";
-import { X, Check, Wand2, Play, User, Bot, TerminalSquare, ListChecks, Sparkles } from "lucide-react";
+import {
+  X,
+  Check,
+  Wand2,
+  Play,
+  User,
+  Bot,
+  TerminalSquare,
+  ListChecks,
+  Sparkles,
+} from "lucide-react";
 import type { TranscriptMessage, TranscriptSession } from "./useTranscriptSessions";
 
 interface TranscriptContentPanelProps {

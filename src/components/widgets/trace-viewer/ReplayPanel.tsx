@@ -41,8 +41,7 @@ export function ReplayPanel({ step, previousStep }: ReplayPanelProps) {
         <div className="text-xs font-medium text-muted-foreground">Timing</div>
         {span.duration_ms != null && (
           <div className="text-xs">
-            Duration:{" "}
-            <span className="font-mono">{formatDuration(span.duration_ms)}</span>
+            Duration: <span className="font-mono">{formatDuration(span.duration_ms)}</span>
           </div>
         )}
         {span.start_ts && (
@@ -74,18 +73,12 @@ export function ReplayPanel({ step, previousStep }: ReplayPanelProps) {
           <div className="grid grid-cols-2 gap-1 text-xs">
             {span.input_tokens != null && (
               <div className="bg-blue-500/10 rounded px-1.5 py-0.5">
-                In:{" "}
-                <span className="font-mono">
-                  {span.input_tokens.toLocaleString()}
-                </span>
+                In: <span className="font-mono">{span.input_tokens.toLocaleString()}</span>
               </div>
             )}
             {span.output_tokens != null && (
               <div className="bg-green-500/10 rounded px-1.5 py-0.5">
-                Out:{" "}
-                <span className="font-mono">
-                  {span.output_tokens.toLocaleString()}
-                </span>
+                Out: <span className="font-mono">{span.output_tokens.toLocaleString()}</span>
               </div>
             )}
           </div>
@@ -96,33 +89,32 @@ export function ReplayPanel({ step, previousStep }: ReplayPanelProps) {
       {step.snapshot && (
         <div className="space-y-1">
           <div className="text-xs font-medium text-muted-foreground">Context Snapshot</div>
-          {step.snapshot.summary && (
-            <div className="text-xs">{step.snapshot.summary}</div>
-          )}
-          {step.snapshot.context_json && (() => {
-            try {
-              const ctx = JSON.parse(step.snapshot.context_json);
-              return (
-                <div className="space-y-0.5 text-xs">
-                  {Object.entries(ctx).map(([k, v]) => (
-                    <div key={k} className="flex justify-between">
-                      <span className="text-muted-foreground">{k}:</span>
-                      <span className="font-mono truncate ml-2">{String(v)}</span>
-                    </div>
-                  ))}
-                </div>
-              );
-            } catch { return null; }
-          })()}
+          {step.snapshot.summary && <div className="text-xs">{step.snapshot.summary}</div>}
+          {step.snapshot.context_json &&
+            (() => {
+              try {
+                const ctx = JSON.parse(step.snapshot.context_json);
+                return (
+                  <div className="space-y-0.5 text-xs">
+                    {Object.entries(ctx).map(([k, v]) => (
+                      <div key={k} className="flex justify-between">
+                        <span className="text-muted-foreground">{k}:</span>
+                        <span className="font-mono truncate ml-2">{String(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              } catch {
+                return null;
+              }
+            })()}
         </div>
       )}
 
       {/* Context change */}
       {previousStep && (
         <div className="space-y-1">
-          <div className="text-xs font-medium text-muted-foreground">
-            Previous Step
-          </div>
+          <div className="text-xs font-medium text-muted-foreground">Previous Step</div>
           <div className="text-xs text-muted-foreground">
             {previousStep.title}
             {previousStep.span.duration_ms != null && (

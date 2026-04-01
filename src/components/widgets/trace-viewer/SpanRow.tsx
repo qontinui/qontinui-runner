@@ -15,7 +15,16 @@ interface SpanRowProps {
 }
 
 export const SpanRow: React.FC<SpanRowProps> = React.memo(
-  ({ node, traceStartMs, traceDurationMs, isSelected, onClick, criticalPath, tokenHeat, isHighlighted }) => {
+  ({
+    node,
+    traceStartMs,
+    traceDurationMs,
+    isSelected,
+    onClick,
+    criticalPath,
+    tokenHeat,
+    isHighlighted,
+  }) => {
     const { span, depth } = node;
     const phase = inferPhase(span.name);
     const colors = PHASE_COLORS[phase];
@@ -45,7 +54,9 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
         } ${isHighlighted ? "ring-1 ring-blue-500 animate-pulse" : ""}`}
         style={{
           opacity: dimmed ? 0.4 : 1,
-          ...(tokenHeat && tokenHeat > 0 ? { backgroundColor: `rgba(239, 68, 68, ${tokenHeat * 0.3})` } : {}),
+          ...(tokenHeat && tokenHeat > 0
+            ? { backgroundColor: `rgba(239, 68, 68, ${tokenHeat * 0.3})` }
+            : {}),
         }}
         onClick={onClick}
         onKeyDown={(e) => {
@@ -63,7 +74,9 @@ export const SpanRow: React.FC<SpanRowProps> = React.memo(
           style={{ paddingLeft: `${depth * 20 + 8}px` }}
         >
           {!span.success && <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />}
-          <span className={`truncate ${span.success ? "text-zinc-300" : "text-red-400"} ${onCritPath ? "font-medium" : ""}`}>
+          <span
+            className={`truncate ${span.success ? "text-zinc-300" : "text-red-400"} ${onCritPath ? "font-medium" : ""}`}
+          >
             {displayName}
           </span>
           <span className={`text-[10px] px-1 rounded ${colors.badge} ${colors.text} shrink-0`}>

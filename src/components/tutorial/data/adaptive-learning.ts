@@ -107,7 +107,7 @@ Severity thresholds:
       estimatedDuration: 1,
       tips: [
         "Lessons are grouped by severity when injected: Critical rules appear first",
-        'Each lesson has a DO/DON\'T prefix — e.g., "DON\'T use substring matching on error messages"',
+        "Each lesson has a DO/DON'T prefix — e.g., \"DON'T use substring matching on error messages\"",
       ],
     },
     {

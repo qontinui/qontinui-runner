@@ -139,7 +139,12 @@ export function TaskRunCostTable({ data }: TaskRunCostTableProps) {
                 <SortButton field="calls" label="Calls" sortField={sortField} onSort={handleSort} />
               </th>
               <th className="pb-2 font-medium text-muted-foreground text-right">
-                <SortButton field="started_at" label="Started" sortField={sortField} onSort={handleSort} />
+                <SortButton
+                  field="started_at"
+                  label="Started"
+                  sortField={sortField}
+                  onSort={handleSort}
+                />
               </th>
             </tr>
           </thead>

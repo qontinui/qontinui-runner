@@ -11,7 +11,15 @@
  */
 
 import { useState } from "react";
-import { Activity, AlertCircle, XCircle, LayoutDashboard, GitCommitHorizontal, BarChart3, DollarSign } from "lucide-react";
+import {
+  Activity,
+  AlertCircle,
+  XCircle,
+  LayoutDashboard,
+  GitCommitHorizontal,
+  BarChart3,
+  DollarSign,
+} from "lucide-react";
 import { cn } from "../../lib/utils";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";

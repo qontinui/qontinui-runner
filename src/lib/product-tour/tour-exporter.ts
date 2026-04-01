@@ -81,7 +81,7 @@ export function exportTourAsHtml(tour: ProductTour): string {
         <h2>${escapeHtml(step.headline)}</h2>
         <p>${escapeHtml(step.body)}</p>
         ${step.demoAction ? `<div class="demo-badge">${escapeHtml(describeDemoAction(step.demoAction))}</div>` : ""}
-      </div>`
+      </div>`,
     )
     .join("\n");
 

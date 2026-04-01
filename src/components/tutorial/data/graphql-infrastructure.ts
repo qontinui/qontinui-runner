@@ -352,9 +352,21 @@ Think of it in three layers:
 The GraphQL layer handles **reads, simple writes, and real-time monitoring**. Complex orchestration stays in the REST layer.`,
       estimatedDuration: 1.5,
       resources: [
-        { title: "async-graphql docs", url: "https://async-graphql.github.io/async-graphql/en/", type: "documentation" },
-        { title: "Apollo Client v4 docs", url: "https://www.apollographql.com/docs/react/", type: "documentation" },
-        { title: "graphql-ws protocol", url: "https://github.com/enisdenjo/graphql-ws", type: "documentation" },
+        {
+          title: "async-graphql docs",
+          url: "https://async-graphql.github.io/async-graphql/en/",
+          type: "documentation",
+        },
+        {
+          title: "Apollo Client v4 docs",
+          url: "https://www.apollographql.com/docs/react/",
+          type: "documentation",
+        },
+        {
+          title: "graphql-ws protocol",
+          url: "https://github.com/enisdenjo/graphql-ws",
+          type: "documentation",
+        },
       ],
     },
   ],

@@ -270,7 +270,12 @@ export function useKeyboardShortcuts({
           if (frozen) {
             // Pass the full session object (includes _transcript) to resumeSession
             sessionManager.resumeSession(frozen);
-            addHistoryEvent("Resume frozen", `Session ${frozen.sessionId?.slice(0, 8) ?? ""}`, undefined, "#f7768e");
+            addHistoryEvent(
+              "Resume frozen",
+              `Session ${frozen.sessionId?.slice(0, 8) ?? ""}`,
+              undefined,
+              "#f7768e",
+            );
           }
         }
         return;

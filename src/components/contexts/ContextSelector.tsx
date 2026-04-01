@@ -585,11 +585,7 @@ function MemorySection({ observations }: { observations: ObservationSearchResult
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-2 w-full text-left px-1 py-1 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
       >
-        {expanded ? (
-          <ChevronDown className="w-3 h-3" />
-        ) : (
-          <ChevronRight className="w-3 h-3" />
-        )}
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
         <BookOpen className="w-3.5 h-3.5" />
         <span>Memory ({observations.length})</span>
         <span

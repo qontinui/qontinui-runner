@@ -110,7 +110,13 @@ function PhaseBadge({ phase }: { phase: string }) {
   const color = PHASE_COLORS[phase] || "text-muted-foreground";
   const bg = PHASE_BG[phase] || "bg-muted";
   return (
-    <span className={cn("inline-flex px-2 py-0.5 rounded-full text-[0.65rem] font-semibold font-mono", color, bg)}>
+    <span
+      className={cn(
+        "inline-flex px-2 py-0.5 rounded-full text-[0.65rem] font-semibold font-mono",
+        color,
+        bg,
+      )}
+    >
       {phase.replace(/_/g, " ")}
     </span>
   );
@@ -118,7 +124,8 @@ function PhaseBadge({ phase }: { phase: string }) {
 
 // --- Shared styles ---
 
-const inputCls = "px-2 py-1 text-xs bg-muted border border-border rounded text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary";
+const inputCls =
+  "px-2 py-1 text-xs bg-muted border border-border rounded text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary";
 const labelCls = "text-[0.78rem] text-muted-foreground";
 
 // --- Types for loop assignment ---
@@ -170,14 +177,18 @@ export function MultiLoopPanel() {
     try {
       const instances = await invoke<RunnerInstance[]>("get_runner_instances");
       setRunnerInstances(instances);
-    } catch { /* not available */ }
+    } catch {
+      /* not available */
+    }
   }, []);
 
   const loadWorkflows = useCallback(async () => {
     try {
       const wfs = await invoke<SavedWorkflow[]>("list_unified_workflows");
       setWorkflows(wfs);
-    } catch { /* not available */ }
+    } catch {
+      /* not available */
+    }
   }, []);
 
   useEffect(() => {
@@ -185,7 +196,9 @@ export function MultiLoopPanel() {
     loadRunnerInstances();
     loadWorkflows();
     pollRef.current = setInterval(fetchMultiStatus, 3000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [fetchMultiStatus, loadRunnerInstances, loadWorkflows]);
 
   // --- Assignment management ---
@@ -212,16 +225,15 @@ export function MultiLoopPanel() {
   };
 
   const updateAssignment = (idx: number, field: keyof LoopAssignment, value: string | number) => {
-    setAssignments((prev) =>
-      prev.map((a, i) => (i === idx ? { ...a, [field]: value } : a)),
-    );
+    setAssignments((prev) => prev.map((a, i) => (i === idx ? { ...a, [field]: value } : a)));
   };
 
   // --- Start / Stop ---
 
   const buildBetween = (): { type: string; rebuild?: boolean } => {
     if (between === "restart_on_signal") return { type: "restart_on_signal", rebuild: true };
-    if (between === "restart_on_signal_no_rebuild") return { type: "restart_on_signal", rebuild: false };
+    if (between === "restart_on_signal_no_rebuild")
+      return { type: "restart_on_signal", rebuild: false };
     if (between === "restart_runner") return { type: "restart_runner", rebuild: true };
     if (between === "restart_runner_no_rebuild") return { type: "restart_runner", rebuild: false };
     if (between === "wait_healthy") return { type: "wait_healthy" };
@@ -385,12 +397,9 @@ export function MultiLoopPanel() {
           </div>
           {visibleLoops.map((loop) => {
             const s = loop.status;
-            const pct = s.max_iterations > 0
-              ? Math.round((s.current_iteration / s.max_iterations) * 100)
-              : 0;
-            const totalFixes = s.iteration_results.reduce(
-              (sum, r) => sum + (r.fix_count ?? 0), 0,
-            );
+            const pct =
+              s.max_iterations > 0 ? Math.round((s.current_iteration / s.max_iterations) * 100) : 0;
+            const totalFixes = s.iteration_results.reduce((sum, r) => sum + (r.fix_count ?? 0), 0);
             return (
               <div
                 key={loop.loop_id}
@@ -440,7 +449,10 @@ export function MultiLoopPanel() {
                     </>
                   )}
                   {s.error && (
-                    <span className="text-red-400 text-[0.65rem] truncate max-w-[120px]" title={s.error}>
+                    <span
+                      className="text-red-400 text-[0.65rem] truncate max-w-[120px]"
+                      title={s.error}
+                    >
                       {s.error}
                     </span>
                   )}
@@ -452,23 +464,26 @@ export function MultiLoopPanel() {
       )}
 
       {/* Aggregated results — show when all loops complete */}
-      {!anyRunning && multiStatus && (multiStatus.all_complete || multiStatus.any_error) && visibleLoops.length > 0 && (
-        <MultiLoopResults
-          loops={visibleLoops.map((l) => ({
-            loop_id: l.loop_id,
-            label: l.label,
-            running: l.status.running,
-            phase: l.status.phase,
-            current_iteration: l.status.current_iteration,
-            max_iterations: l.status.max_iterations,
-            workflow_id: l.status.workflow_id,
-            target_runner_port: l.status.target_runner_port,
-            target_runner_id: l.status.target_runner_id ?? null,
-            error: l.status.error,
-            iteration_results: l.status.iteration_results,
-          }))}
-        />
-      )}
+      {!anyRunning &&
+        multiStatus &&
+        (multiStatus.all_complete || multiStatus.any_error) &&
+        visibleLoops.length > 0 && (
+          <MultiLoopResults
+            loops={visibleLoops.map((l) => ({
+              loop_id: l.loop_id,
+              label: l.label,
+              running: l.status.running,
+              phase: l.status.phase,
+              current_iteration: l.status.current_iteration,
+              max_iterations: l.status.max_iterations,
+              workflow_id: l.status.workflow_id,
+              target_runner_port: l.status.target_runner_port,
+              target_runner_id: l.status.target_runner_id ?? null,
+              error: l.status.error,
+              iteration_results: l.status.iteration_results,
+            }))}
+          />
+        )}
 
       {/* Spec partition wizard */}
       {showWizard && !anyRunning && (

@@ -1156,12 +1156,6 @@
     "pageUrl": "/llm-analytics",
     "elementSource": "sdk",
     "specType": "semantic",
-    "tags": [
-      "llm-observability",
-      "cost-tracking",
-      "token-analytics",
-      "opik",
-      "tier-2"
-    ]
+    "tags": ["llm-observability", "cost-tracking", "token-analytics", "opik", "tier-2"]
   }
 }

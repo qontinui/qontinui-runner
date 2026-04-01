@@ -12,7 +12,16 @@
  */
 
 import { useTaskRunLive, useTaskRunControls } from "@/hooks/graphql";
-import { Loader2, Square, Pause, Play, Trash2, AlertCircle, CheckCircle2, Clock } from "lucide-react";
+import {
+  Loader2,
+  Square,
+  Pause,
+  Play,
+  Trash2,
+  AlertCircle,
+  CheckCircle2,
+  Clock,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { RunErrorSummary } from "../error-monitor/RunErrorSummary";
 
@@ -42,7 +51,12 @@ function StatusBadge({ status }: { status: string }) {
   };
 
   return (
-    <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border", colors[status] || colors.pending)}>
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border",
+        colors[status] || colors.pending,
+      )}
+    >
       {icons[status] || icons.pending}
       {status}
     </span>
@@ -148,13 +162,18 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
           </>
         )}
         <span>Sessions</span>
-        <span className="text-foreground">{taskRun.sessionsCount}{taskRun.maxSessions ? ` / ${taskRun.maxSessions}` : ""}</span>
+        <span className="text-foreground">
+          {taskRun.sessionsCount}
+          {taskRun.maxSessions ? ` / ${taskRun.maxSessions}` : ""}
+        </span>
         <span>Created</span>
         <span className="text-foreground">{new Date(taskRun.createdAt).toLocaleTimeString()}</span>
         {taskRun.completedAt && (
           <>
             <span>Completed</span>
-            <span className="text-foreground">{new Date(taskRun.completedAt).toLocaleTimeString()}</span>
+            <span className="text-foreground">
+              {new Date(taskRun.completedAt).toLocaleTimeString()}
+            </span>
           </>
         )}
       </div>
@@ -164,7 +183,9 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
         <div className="text-xs text-muted-foreground bg-muted/50 rounded px-2 py-1 flex items-center gap-1">
           <span className="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
           {latestEvent.__typename === "StepProgressEvent" && (
-            <span>Step: {latestEvent.stepName} — {latestEvent.status}</span>
+            <span>
+              Step: {latestEvent.stepName} — {latestEvent.status}
+            </span>
           )}
           {latestEvent.__typename === "TaskRunUpdateEvent" && (
             <span>Status: {latestEvent.status}</span>
@@ -197,9 +218,7 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
           {/* Findings summary */}
           {summary && summary.total > 0 && (
             <div className="border rounded p-2">
-              <div className="text-xs font-medium mb-1">
-                Findings ({summary.total})
-              </div>
+              <div className="text-xs font-medium mb-1">Findings ({summary.total})</div>
               <div className="flex gap-2 text-xs text-muted-foreground">
                 {summary.outstandingCount > 0 && (
                   <span className="text-yellow-400">{summary.outstandingCount} outstanding</span>
@@ -216,12 +235,16 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
                 <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
                   {findings.slice(0, 10).map((f) => (
                     <div key={f.id} className="text-xs flex items-center gap-1">
-                      <span className={cn(
-                        "px-1 rounded",
-                        f.severity === "CRITICAL" ? "bg-red-500/20 text-red-300" :
-                        f.severity === "HIGH" ? "bg-orange-500/20 text-orange-300" :
-                        "bg-muted text-muted-foreground"
-                      )}>
+                      <span
+                        className={cn(
+                          "px-1 rounded",
+                          f.severity === "CRITICAL"
+                            ? "bg-red-500/20 text-red-300"
+                            : f.severity === "HIGH"
+                              ? "bg-orange-500/20 text-orange-300"
+                              : "bg-muted text-muted-foreground",
+                        )}
+                      >
                         {f.severity}
                       </span>
                       <span className="truncate">{f.title}</span>

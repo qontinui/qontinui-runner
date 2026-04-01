@@ -169,14 +169,12 @@ export const graphAnalyticsKeys = {
     [...graphAnalyticsKeys.all, "pipeline-events", taskRunId] as const,
   workflowVersions: (workflowId: string) =>
     [...graphAnalyticsKeys.all, "workflow-versions", workflowId] as const,
-  ruleInfluence: (ruleId: string) =>
-    [...graphAnalyticsKeys.all, "rule-influence", ruleId] as const,
+  ruleInfluence: (ruleId: string) => [...graphAnalyticsKeys.all, "rule-influence", ruleId] as const,
   ineffectiveRules: (threshold?: number) =>
     [...graphAnalyticsKeys.all, "ineffective-rules", threshold ?? 3] as const,
   phaseStats: (workflowId: string) =>
     [...graphAnalyticsKeys.all, "phase-stats", workflowId] as const,
-  unifiedSearch: (query: string) =>
-    [...graphAnalyticsKeys.all, "search", query] as const,
+  unifiedSearch: (query: string) => [...graphAnalyticsKeys.all, "search", query] as const,
 };
 
 // ============================================================================
@@ -201,7 +199,9 @@ export function useStepProvenance(workflowId: string) {
   return useQuery({
     queryKey: graphAnalyticsKeys.stepProvenance(workflowId),
     queryFn: () =>
-      fetchJson<StepProvenance[]>(`/graph/step-provenance?workflow_id=${encodeURIComponent(workflowId)}`),
+      fetchJson<StepProvenance[]>(
+        `/graph/step-provenance?workflow_id=${encodeURIComponent(workflowId)}`,
+      ),
     staleTime: 30_000,
     enabled: !!workflowId,
   });
@@ -223,7 +223,9 @@ export function useFlakyElements() {
   return useQuery({
     queryKey: graphAnalyticsKeys.flakyElements(),
     queryFn: () =>
-      fetchJson<ElementReliability[]>("/ui-bridge/history/flaky?min_interactions=5&max_success_rate=0.9"),
+      fetchJson<ElementReliability[]>(
+        "/ui-bridge/history/flaky?min_interactions=5&max_success_rate=0.9",
+      ),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -233,7 +235,10 @@ export function useFlakyElements() {
 export function usePipelineEvents(taskRunId: string) {
   return useQuery({
     queryKey: graphAnalyticsKeys.pipelineEvents(taskRunId),
-    queryFn: () => fetchJson<PipelineEvent[]>(`/graph/pipeline-events?task_run_id=${encodeURIComponent(taskRunId)}`),
+    queryFn: () =>
+      fetchJson<PipelineEvent[]>(
+        `/graph/pipeline-events?task_run_id=${encodeURIComponent(taskRunId)}`,
+      ),
     staleTime: 30_000,
     enabled: !!taskRunId,
   });
@@ -243,7 +248,10 @@ export function usePipelineEvents(taskRunId: string) {
 export function useWorkflowVersions(workflowId: string) {
   return useQuery({
     queryKey: graphAnalyticsKeys.workflowVersions(workflowId),
-    queryFn: () => fetchJson<WorkflowVersion[]>(`/graph/workflow-versions?workflow_id=${encodeURIComponent(workflowId)}`),
+    queryFn: () =>
+      fetchJson<WorkflowVersion[]>(
+        `/graph/workflow-versions?workflow_id=${encodeURIComponent(workflowId)}`,
+      ),
     staleTime: 30_000,
     enabled: !!workflowId,
   });
@@ -253,7 +261,8 @@ export function useWorkflowVersions(workflowId: string) {
 export function useRuleInfluence(ruleId: string) {
   return useQuery({
     queryKey: graphAnalyticsKeys.ruleInfluence(ruleId),
-    queryFn: () => fetchJson<RuleInfluence[]>(`/graph/rule-influence?rule_id=${encodeURIComponent(ruleId)}`),
+    queryFn: () =>
+      fetchJson<RuleInfluence[]>(`/graph/rule-influence?rule_id=${encodeURIComponent(ruleId)}`),
     staleTime: 30_000,
     enabled: !!ruleId,
   });
@@ -263,7 +272,8 @@ export function useRuleInfluence(ruleId: string) {
 export function useIneffectiveRules(threshold?: number) {
   return useQuery({
     queryKey: graphAnalyticsKeys.ineffectiveRules(threshold),
-    queryFn: () => fetchJson<IneffectiveRule[]>(`/graph/ineffective-rules?threshold=${threshold ?? 3}`),
+    queryFn: () =>
+      fetchJson<IneffectiveRule[]>(`/graph/ineffective-rules?threshold=${threshold ?? 3}`),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -273,7 +283,8 @@ export function useIneffectiveRules(threshold?: number) {
 export function usePhaseStats(workflowId: string) {
   return useQuery({
     queryKey: graphAnalyticsKeys.phaseStats(workflowId),
-    queryFn: () => fetchJson<PhaseStats[]>(`/graph/phase-stats?workflow_id=${encodeURIComponent(workflowId)}`),
+    queryFn: () =>
+      fetchJson<PhaseStats[]>(`/graph/phase-stats?workflow_id=${encodeURIComponent(workflowId)}`),
     staleTime: 30_000,
     enabled: !!workflowId,
   });
@@ -283,7 +294,8 @@ export function usePhaseStats(workflowId: string) {
 export function useUnifiedSearch(query: string) {
   return useQuery({
     queryKey: graphAnalyticsKeys.unifiedSearch(query),
-    queryFn: () => fetchJson<UnifiedSearchResult[]>(`/graph/search?q=${encodeURIComponent(query)}&limit=20`),
+    queryFn: () =>
+      fetchJson<UnifiedSearchResult[]>(`/graph/search?q=${encodeURIComponent(query)}&limit=20`),
     staleTime: 10_000,
     enabled: query.length >= 2,
   });
@@ -358,7 +370,7 @@ export function useDecayCurve(elementId: string, windowMs = 86_400_000, windows 
     queryKey: [...graphAnalyticsKeys.all, "decay-curve", elementId, windowMs, windows] as const,
     queryFn: () =>
       fetchJson<DecayCurveBucket[]>(
-        `/ui-bridge/analytics/decay-curve?element_id=${encodeURIComponent(elementId)}&window_ms=${windowMs}&windows=${windows}`
+        `/ui-bridge/analytics/decay-curve?element_id=${encodeURIComponent(elementId)}&window_ms=${windowMs}&windows=${windows}`,
       ),
     staleTime: 30_000,
     enabled: !!elementId,
@@ -369,7 +381,8 @@ export function useDecayCurve(elementId: string, windowMs = 86_400_000, windows 
 export function useActionBaselines(days = 7) {
   return useQuery({
     queryKey: [...graphAnalyticsKeys.all, "action-baselines", days] as const,
-    queryFn: () => fetchJson<ActionBaseline[]>(`/ui-bridge/analytics/action-baselines?days=${days}`),
+    queryFn: () =>
+      fetchJson<ActionBaseline[]>(`/ui-bridge/analytics/action-baselines?days=${days}`),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -379,7 +392,8 @@ export function useActionBaselines(days = 7) {
 export function useFailureTaxonomy(days = 7) {
   return useQuery({
     queryKey: [...graphAnalyticsKeys.all, "failure-taxonomy", days] as const,
-    queryFn: () => fetchJson<FailureCluster[]>(`/ui-bridge/analytics/failure-taxonomy?days=${days}`),
+    queryFn: () =>
+      fetchJson<FailureCluster[]>(`/ui-bridge/analytics/failure-taxonomy?days=${days}`),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -389,7 +403,8 @@ export function useFailureTaxonomy(days = 7) {
 export function useFragilityHeatmap(days = 7) {
   return useQuery({
     queryKey: [...graphAnalyticsKeys.all, "fragility-heatmap", days] as const,
-    queryFn: () => fetchJson<ElementFragility[]>(`/ui-bridge/analytics/fragility-heatmap?days=${days}`),
+    queryFn: () =>
+      fetchJson<ElementFragility[]>(`/ui-bridge/analytics/fragility-heatmap?days=${days}`),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -403,7 +418,8 @@ export function useFragilityHeatmap(days = 7) {
 export function useAutomationRegressions(days = 7) {
   return useQuery({
     queryKey: [...graphAnalyticsKeys.all, "regressions", days] as const,
-    queryFn: () => fetchJson<AutomationRegression[]>(`/ui-bridge/analytics/regressions?days=${days}`),
+    queryFn: () =>
+      fetchJson<AutomationRegression[]>(`/ui-bridge/analytics/regressions?days=${days}`),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -413,7 +429,8 @@ export function useAutomationRegressions(days = 7) {
 export function useStallFrequency(days = 7) {
   return useQuery({
     queryKey: [...graphAnalyticsKeys.all, "stall-frequency", days] as const,
-    queryFn: () => fetchJson<StallFrequencyRow[]>(`/ui-bridge/analytics/stall-frequency?days=${days}`),
+    queryFn: () =>
+      fetchJson<StallFrequencyRow[]>(`/ui-bridge/analytics/stall-frequency?days=${days}`),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
@@ -424,7 +441,9 @@ export function useInterventionEffectiveness(days = 7) {
   return useQuery({
     queryKey: [...graphAnalyticsKeys.all, "intervention-effectiveness", days] as const,
     queryFn: () =>
-      fetchJson<InterventionStatsRow[]>(`/ui-bridge/analytics/intervention-effectiveness?days=${days}`),
+      fetchJson<InterventionStatsRow[]>(
+        `/ui-bridge/analytics/intervention-effectiveness?days=${days}`,
+      ),
     staleTime: 30_000,
     refetchInterval: 60_000,
   });

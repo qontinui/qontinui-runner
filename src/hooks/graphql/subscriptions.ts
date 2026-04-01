@@ -153,11 +153,7 @@ export function useTaskRunProgress(taskRunId: string, skip = false) {
  * @param intervalMs - Poll interval in ms (default 2000, min 500)
  * @param skip - Skip subscription
  */
-export function useFindingUpdates(
-  taskRunId: string,
-  intervalMs = 2000,
-  skip = false,
-) {
+export function useFindingUpdates(taskRunId: string, intervalMs = 2000, skip = false) {
   return useSubscription<{
     findingUpdates: FindingData[];
   }>(FINDING_UPDATES_SUBSCRIPTION, {

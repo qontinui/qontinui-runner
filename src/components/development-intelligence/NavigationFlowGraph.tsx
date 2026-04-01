@@ -98,9 +98,7 @@ function extractNavLinks(specs: PageSpec[]): NavLink[] {
       if (group.category !== "navigation") continue;
 
       for (const assertion of group.assertions) {
-        const target =
-          assertion.target?.criteria?.pageNavigate ||
-          assertion.target?.criteria?.href;
+        const target = assertion.target?.criteria?.pageNavigate || assertion.target?.criteria?.href;
 
         if (target) {
           const targetPageId = pageUrls.get(target) ?? target.replace(/^\//, "");
@@ -146,10 +144,7 @@ function extractNavLinks(specs: PageSpec[]): NavLink[] {
 // Build graph
 // =============================================================================
 
-function buildNavGraph(
-  specs: PageSpec[],
-  links: NavLink[],
-): { nodes: Node[]; edges: Edge[] } {
+function buildNavGraph(specs: PageSpec[], links: NavLink[]): { nodes: Node[]; edges: Edge[] } {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: "LR", ranksep: 100, nodesep: 50 });
@@ -162,7 +157,8 @@ function buildNavGraph(
   }
 
   // If no links found, show all pages
-  const pagesToShow = linkedPages.size > 0 ? linkedPages : new Set(specs.map((s) => s.metadata.pageId));
+  const pagesToShow =
+    linkedPages.size > 0 ? linkedPages : new Set(specs.map((s) => s.metadata.pageId));
 
   const nodes: Node[] = [];
   const specByPageId = new Map(specs.map((s) => [s.metadata.pageId, s]));
@@ -243,7 +239,9 @@ export function NavigationFlowGraph() {
   useEffect(() => {
     const controller = new AbortController();
     loadSpecs(controller.signal);
-    return () => { controller.abort(); };
+    return () => {
+      controller.abort();
+    };
   }, [loadSpecs]);
 
   const navLinks = useMemo(() => extractNavLinks(specs), [specs]);

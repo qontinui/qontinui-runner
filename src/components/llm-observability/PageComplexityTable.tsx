@@ -57,10 +57,17 @@ export function PageComplexityTable({ days = 7 }: PageComplexityTableProps) {
             </thead>
             <tbody>
               {data.map((r) => (
-                <tr key={r.target_page_url} className="border-b border-border last:border-0 hover:bg-muted/50">
-                  <td className="py-2 px-3 font-mono text-xs truncate max-w-[300px]">{r.target_page_url}</td>
+                <tr
+                  key={r.target_page_url}
+                  className="border-b border-border last:border-0 hover:bg-muted/50"
+                >
+                  <td className="py-2 px-3 font-mono text-xs truncate max-w-[300px]">
+                    {r.target_page_url}
+                  </td>
                   <td className="py-2 px-3 text-right tabular-nums">{r.call_count}</td>
-                  <td className="py-2 px-3 text-right tabular-nums">${(r.total_cost_cents / 100).toFixed(2)}</td>
+                  <td className="py-2 px-3 text-right tabular-nums">
+                    ${(r.total_cost_cents / 100).toFixed(2)}
+                  </td>
                   <td className="py-2 px-3 text-right tabular-nums font-semibold">
                     ${(r.avg_cost_per_call_cents / 100).toFixed(3)}
                   </td>

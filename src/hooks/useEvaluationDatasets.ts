@@ -110,19 +110,17 @@ export function useDatasetItems(datasetId: string | null) {
   const itemsQuery = useQuery({
     queryKey: evaluationDatasetKeys.items(datasetId ?? ""),
     queryFn: () =>
-      apiFetch<EvaluationDatasetItem[]>(
-        `/api/v1/evaluation/datasets/${datasetId}/items`,
-      ),
+      apiFetch<EvaluationDatasetItem[]>(`/api/v1/evaluation/datasets/${datasetId}/items`),
     enabled: !!datasetId,
     staleTime: 30_000,
   });
 
   const addItems = useMutation({
     mutationFn: (req: AddItemsRequest) =>
-      apiFetch<EvaluationDatasetItem[]>(
-        `/api/v1/evaluation/datasets/${datasetId}/items`,
-        { method: "POST", body: JSON.stringify(req) },
-      ),
+      apiFetch<EvaluationDatasetItem[]>(`/api/v1/evaluation/datasets/${datasetId}/items`, {
+        method: "POST",
+        body: JSON.stringify(req),
+      }),
     onSuccess: () => {
       if (datasetId) {
         queryClient.invalidateQueries({ queryKey: evaluationDatasetKeys.items(datasetId) });

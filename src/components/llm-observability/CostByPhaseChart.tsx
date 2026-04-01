@@ -96,7 +96,12 @@ export function CostByPhaseChart({ data }: CostByPhaseChartProps) {
               width={leftMargin - 10}
             />
             <Tooltip content={<CustomTooltip />} />
-            <Bar dataKey="cost" fill="hsl(var(--secondary))" radius={[0, 4, 4, 0]} maxBarSize={20} />
+            <Bar
+              dataKey="cost"
+              fill="hsl(var(--secondary))"
+              radius={[0, 4, 4, 0]}
+              maxBarSize={20}
+            />
           </BarChart>
         </ResponsiveContainer>
       </div>

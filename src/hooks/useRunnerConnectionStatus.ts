@@ -87,9 +87,12 @@ export function useRunnerConnectionStatus(): ConnectionStatus {
   }, [checkHealth, hasSubscriptionData, subError]);
 
   // Return subscription data if available, otherwise fallback
-  return subscriptionStatus ?? fallbackStatus ?? {
-    isConnected: !subError, // Optimistic if no data yet
-    latencyMs: null,
-    lastCheckedAt: null,
-  };
+  return (
+    subscriptionStatus ??
+    fallbackStatus ?? {
+      isConnected: !subError, // Optimistic if no data yet
+      latencyMs: null,
+      lastCheckedAt: null,
+    }
+  );
 }

@@ -65,7 +65,10 @@ function usePolledData<T>(path: string, intervalMs: number): T | null {
     };
     poll();
     const id = setInterval(poll, intervalMs);
-    return () => { cancelled = true; clearInterval(id); };
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, [path, intervalMs]);
   return data;
 }
@@ -77,28 +80,48 @@ function usePolledData<T>(path: string, intervalMs: number): T | null {
 function fmtTime(iso: string): string {
   try {
     const d = new Date(iso);
-    return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
-      + " " + d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-  } catch { return iso; }
+    return (
+      d.toLocaleTimeString("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }) +
+      " " +
+      d.toLocaleDateString("en-US", { month: "short", day: "numeric" })
+    );
+  } catch {
+    return iso;
+  }
 }
 
 function fmtTimeFull(iso: string): string {
   try {
     return new Date(iso).toLocaleString("en-US", {
-      year: "numeric", month: "short", day: "numeric",
-      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
     });
-  } catch { return iso; }
+  } catch {
+    return iso;
+  }
 }
 
 function truncJson(value: unknown, maxLen = 120): string {
-  const s = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+  const s = typeof value === "string" ? value : (JSON.stringify(value) ?? "");
   return s.length > maxLen ? s.slice(0, maxLen) + "\u2026" : s;
 }
 
 function fmtJson(value: unknown): string {
-  try { return JSON.stringify(value, null, 2) ?? "null"; }
-  catch { return String(value); }
+  try {
+    return JSON.stringify(value, null, 2) ?? "null";
+  } catch {
+    return String(value);
+  }
 }
 
 function srcLabel(source: EventSource): string {
@@ -137,13 +160,18 @@ function QueueWidget() {
   return (
     <div data-tutorial-id="queue-status-widget" className="flex items-center gap-2 flex-wrap">
       {stats.map((s) => (
-        <div key={s.label} className="flex items-center gap-1.5 px-2 py-1 rounded border border-zinc-700 bg-zinc-800/60 text-xs">
+        <div
+          key={s.label}
+          className="flex items-center gap-1.5 px-2 py-1 rounded border border-zinc-700 bg-zinc-800/60 text-xs"
+        >
           <span className="text-zinc-400">{s.label}</span>
           <span className="font-semibold text-zinc-200 tabular-nums">{s.value}</span>
         </div>
       ))}
       <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-zinc-700 bg-zinc-800/60 text-xs">
-        <span className={`w-1.5 h-1.5 rounded-full ${queue.durable_persistence ? "bg-green-500" : "bg-zinc-500"}`} />
+        <span
+          className={`w-1.5 h-1.5 rounded-full ${queue.durable_persistence ? "bg-green-500" : "bg-zinc-500"}`}
+        />
         <span className="text-zinc-400">{queue.durable_persistence ? "Durable" : "In-Memory"}</span>
       </div>
     </div>
@@ -168,7 +196,9 @@ function CBWidget() {
       </div>
       <div className="flex items-center gap-1.5 px-2 py-1 rounded border border-zinc-700 bg-zinc-800/60 text-xs">
         <span className="text-zinc-400">Failures</span>
-        <span className="font-semibold text-zinc-200 tabular-nums">{cb.failure_count}/{cb.failure_threshold}</span>
+        <span className="font-semibold text-zinc-200 tabular-nums">
+          {cb.failure_count}/{cb.failure_threshold}
+        </span>
       </div>
     </div>
   );
@@ -180,12 +210,27 @@ function DetailPanel({ evt }: { evt: WorkflowEvent }) {
       <td colSpan={4} className="px-4 py-3 bg-zinc-800/40 border-b border-zinc-700">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
           <div className="space-y-1.5">
-            <div><span className="text-zinc-500">Full Timestamp:</span> <span className="text-zinc-300">{fmtTimeFull(evt.timestamp)}</span></div>
-            <div><span className="text-zinc-500">Task Run ID:</span> <span className="text-zinc-300 font-mono">{evt.source.task_run_id ?? "\u2014"}</span></div>
-            <div><span className="text-zinc-500">Workflow ID:</span> <span className="text-zinc-300 font-mono">{evt.source.workflow_id ?? "\u2014"}</span></div>
-            <div><span className="text-zinc-500">Workflow Name:</span> <span className="text-zinc-300">{evt.source.workflow_name ?? "\u2014"}</span></div>
+            <div>
+              <span className="text-zinc-500">Full Timestamp:</span>{" "}
+              <span className="text-zinc-300">{fmtTimeFull(evt.timestamp)}</span>
+            </div>
+            <div>
+              <span className="text-zinc-500">Task Run ID:</span>{" "}
+              <span className="text-zinc-300 font-mono">{evt.source.task_run_id ?? "\u2014"}</span>
+            </div>
+            <div>
+              <span className="text-zinc-500">Workflow ID:</span>{" "}
+              <span className="text-zinc-300 font-mono">{evt.source.workflow_id ?? "\u2014"}</span>
+            </div>
+            <div>
+              <span className="text-zinc-500">Workflow Name:</span>{" "}
+              <span className="text-zinc-300">{evt.source.workflow_name ?? "\u2014"}</span>
+            </div>
             {evt.idempotency_key && (
-              <div><span className="text-zinc-500">Idempotency Key:</span> <span className="text-zinc-300 font-mono">{evt.idempotency_key}</span></div>
+              <div>
+                <span className="text-zinc-500">Idempotency Key:</span>{" "}
+                <span className="text-zinc-300 font-mono">{evt.idempotency_key}</span>
+              </div>
             )}
           </div>
           <div>
@@ -217,7 +262,8 @@ export function EventHistoryPage() {
     if (!filter) return list;
     const lower = filter.toLowerCase();
     return list.filter(
-      (e) => e.name.toLowerCase().includes(lower) || srcLabel(e.source).toLowerCase().includes(lower),
+      (e) =>
+        e.name.toLowerCase().includes(lower) || srcLabel(e.source).toLowerCase().includes(lower),
     );
   }, [events, filter]);
 
@@ -236,7 +282,11 @@ export function EventHistoryPage() {
               {subscriptions.length} subscription{subscriptions.length !== 1 ? "s" : ""}
             </span>
           )}
-          {events && <span>{events.length} event{events.length !== 1 ? "s" : ""}</span>}
+          {events && (
+            <span>
+              {events.length} event{events.length !== 1 ? "s" : ""}
+            </span>
+          )}
         </div>
       </header>
 
@@ -259,13 +309,17 @@ export function EventHistoryPage() {
       {/* Content */}
       <main className="flex-1 overflow-y-auto">
         {!events && (
-          <div className="flex items-center justify-center py-12 text-zinc-500 text-xs">Loading event history...</div>
+          <div className="flex items-center justify-center py-12 text-zinc-500 text-xs">
+            Loading event history...
+          </div>
         )}
 
         {events && filtered.length === 0 && (
           <div className="flex flex-col items-center justify-center py-12 text-zinc-500">
             <Radio className="w-10 h-10 mb-2 opacity-30" />
-            <p className="text-xs">{filter ? "No events match the filter." : "No events recorded yet."}</p>
+            <p className="text-xs">
+              {filter ? "No events match the filter." : "No events recorded yet."}
+            </p>
           </div>
         )}
 
@@ -291,18 +345,28 @@ export function EventHistoryPage() {
                     >
                       <td className="px-4 py-1.5 text-zinc-500 whitespace-nowrap font-mono">
                         <span className="flex items-center gap-1.5">
-                          {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                          {isExpanded ? (
+                            <ChevronDown className="w-3 h-3" />
+                          ) : (
+                            <ChevronRight className="w-3 h-3" />
+                          )}
                           {fmtTime(evt.timestamp)}
                         </span>
                       </td>
                       <td className="px-4 py-1.5">
                         <span className="flex items-center gap-1.5">
-                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor(evt.name)}`} />
+                          <span
+                            className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor(evt.name)}`}
+                          />
                           <span className={`font-medium ${textColor(evt.name)}`}>{evt.name}</span>
                         </span>
                       </td>
-                      <td className="px-4 py-1.5 text-zinc-400 whitespace-nowrap">{srcLabel(evt.source)}</td>
-                      <td className="px-4 py-1.5 text-zinc-500 font-mono max-w-md truncate">{truncJson(evt.data)}</td>
+                      <td className="px-4 py-1.5 text-zinc-400 whitespace-nowrap">
+                        {srcLabel(evt.source)}
+                      </td>
+                      <td className="px-4 py-1.5 text-zinc-500 font-mono max-w-md truncate">
+                        {truncJson(evt.data)}
+                      </td>
                     </tr>
                     {isExpanded && <DetailPanel evt={evt} />}
                   </Fragment>
@@ -318,7 +382,10 @@ export function EventHistoryPage() {
             <h2 className="text-xs font-medium text-zinc-500 mb-1.5">Active Subscriptions</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-1.5">
               {subscriptions.map((sub) => (
-                <div key={sub.id} className="flex items-center gap-1.5 px-2 py-1.5 rounded border border-zinc-700 bg-zinc-800/60 text-xs">
+                <div
+                  key={sub.id}
+                  className="flex items-center gap-1.5 px-2 py-1.5 rounded border border-zinc-700 bg-zinc-800/60 text-xs"
+                >
                   <span className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
                   <span className="font-mono text-zinc-300 truncate">{sub.event_pattern}</span>
                   {sub.once && <span className="ml-auto text-zinc-500">once</span>}

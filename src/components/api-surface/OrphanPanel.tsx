@@ -43,9 +43,7 @@ export function OrphanPanel({ orphans, onSelect }: Props) {
 
   if (orphans.length === 0) {
     return (
-      <div className="p-4 text-center text-zinc-500 text-xs">
-        No orphaned endpoints detected
-      </div>
+      <div className="p-4 text-center text-zinc-500 text-xs">No orphaned endpoints detected</div>
     );
   }
 
@@ -54,9 +52,7 @@ export function OrphanPanel({ orphans, onSelect }: Props) {
       <div className="p-3 border-b border-zinc-700/50">
         <div className="flex items-center gap-2 mb-2">
           <AlertTriangle className="w-4 h-4 text-red-400" />
-          <span className="text-sm font-semibold text-zinc-200">
-            Orphans ({filtered.length})
-          </span>
+          <span className="text-sm font-semibold text-zinc-200">Orphans ({filtered.length})</span>
         </div>
         <div className="relative">
           <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-500" />

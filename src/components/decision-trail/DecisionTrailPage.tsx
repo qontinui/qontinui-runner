@@ -163,7 +163,10 @@ export function DecisionTrailPage() {
             <h1 className="text-lg font-semibold text-foreground">Decision Trail</h1>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => { fetchDecisions(); fetchConcepts(); }}
+                onClick={() => {
+                  fetchDecisions();
+                  fetchConcepts();
+                }}
                 className="p-1.5 rounded-md hover:bg-accent text-muted-foreground"
                 title="Refresh"
               >
@@ -218,7 +221,8 @@ export function DecisionTrailPage() {
 
             <div className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
               {decisions.length} decision{decisions.length !== 1 ? "s" : ""}
-              {concepts.length > 0 && ` · ${concepts.length} concept${concepts.length !== 1 ? "s" : ""}`}
+              {concepts.length > 0 &&
+                ` · ${concepts.length} concept${concepts.length !== 1 ? "s" : ""}`}
             </div>
           </div>
         </div>

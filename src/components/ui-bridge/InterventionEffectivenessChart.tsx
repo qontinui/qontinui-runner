@@ -45,7 +45,13 @@ export function InterventionEffectivenessChart({ days = 7 }: InterventionEffecti
               <Tooltip />
               <Legend />
               <Bar dataKey="successful" stackId="a" fill="hsl(var(--chart-2))" name="Resolved" />
-              <Bar dataKey="failed" stackId="a" fill="hsl(var(--chart-5))" name="Unresolved" radius={[4, 4, 0, 0]} />
+              <Bar
+                dataKey="failed"
+                stackId="a"
+                fill="hsl(var(--chart-5))"
+                name="Unresolved"
+                radius={[4, 4, 0, 0]}
+              />
             </BarChart>
           </ResponsiveContainer>
         </div>

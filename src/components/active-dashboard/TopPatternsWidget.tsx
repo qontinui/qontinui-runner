@@ -11,11 +11,11 @@ import { useCrossRunPatterns } from "../../hooks/useGraphAnalytics";
 export function TopPatternsWidget() {
   const { data: patterns } = useCrossRunPatterns();
 
-  const activePatterns = patterns?.filter(p => p.status === "active") || [];
+  const activePatterns = patterns?.filter((p) => p.status === "active") || [];
   if (activePatterns.length === 0) return null;
 
-  const recurring = activePatterns.filter(p => p.pattern_type === "recurring_finding").length;
-  const oscillations = activePatterns.filter(p => p.pattern_type === "fix_oscillation").length;
+  const recurring = activePatterns.filter((p) => p.pattern_type === "recurring_finding").length;
+  const oscillations = activePatterns.filter((p) => p.pattern_type === "fix_oscillation").length;
 
   return (
     <div className="bg-card rounded-lg border border-border p-3">

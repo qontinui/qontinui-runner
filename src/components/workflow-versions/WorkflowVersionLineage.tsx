@@ -84,9 +84,7 @@ export function WorkflowVersionLineage() {
       )}
 
       {versions && versions.length === 0 && (
-        <div className="text-center text-muted-foreground py-8">
-          No version history available
-        </div>
+        <div className="text-center text-muted-foreground py-8">No version history available</div>
       )}
 
       {versions && versions.length > 0 && (

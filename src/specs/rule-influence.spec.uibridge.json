@@ -204,8 +204,14 @@
           "severity": "warning",
           "assertionType": "exists",
           "expected": "First 16 characters of rule_id in monospace font",
-          "target": { "type": "search", "criteria": { "textContent": "Loaded" }, "label": "Rule load count" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Loaded" },
+            "label": "Rule load count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         },
         {
           "id": "rule-data-effectiveness-ratio",
@@ -214,8 +220,14 @@
           "severity": "critical",
           "assertionType": "exists",
           "expected": "Percentage computed as (prevented_error_count / total_loaded_count * 100), green when >50%, orange when <=50%",
-          "target": { "type": "search", "criteria": { "textContent": "effective" }, "label": "Effectiveness percentage" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "effective" },
+            "label": "Effectiveness percentage"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"
@@ -233,8 +245,14 @@
           "severity": "warning",
           "assertionType": "exists",
           "precondition": "No rules meet the ineffectiveness threshold (this is the healthy state)",
-          "target": { "type": "search", "criteria": { "textContent": "All rules appear effective" }, "label": "Positive empty state" },
-          "source": "manual", "reviewed": true, "enabled": true
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "All rules appear effective" },
+            "label": "Positive empty state"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
         }
       ],
       "source": "manual"

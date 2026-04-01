@@ -16,7 +16,12 @@ import type { ProjectAnalysis, IntegrationResult, FileModification, ApiResponse 
 import { getApiBase } from "@/lib/runner-api";
 import { HookGenerationPanel } from "./HookGenerationPanel";
 import { PageSelectionPanel } from "./PageSelectionPanel";
-import type { PageComponent, PageGenerationOptions, DiscoverPagesResult, ApiResponse as ApiResp } from "./types";
+import type {
+  PageComponent,
+  PageGenerationOptions,
+  DiscoverPagesResult,
+  ApiResponse as ApiResp,
+} from "./types";
 
 interface SourceIntegrationPanelProps {
   /** When set externally (e.g. from a discovered app card), pre-fills the path and auto-analyzes */
@@ -164,7 +169,10 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
         const resp = await fetch(`${getApiBase()}/ui-bridge/integration/integrate`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_path: projectPath.trim(), options: { install_deps: true } }),
+          body: JSON.stringify({
+            project_path: projectPath.trim(),
+            options: { install_deps: true },
+          }),
         });
         const data: ApiResp<IntegrationResult> = await resp.json();
         if (!data.success || !data.data?.success) {
@@ -201,7 +209,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
       };
 
       window.dispatchEvent(
-        new CustomEvent("ui-bridge-generate-pages", { detail: { pages: allPages, options } })
+        new CustomEvent("ui-bridge-generate-pages", { detail: { pages: allPages, options } }),
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Prepare All failed");
@@ -462,7 +470,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
           projectPath={projectPath}
           onStartGeneration={(pages: PageComponent[], options: PageGenerationOptions) => {
             window.dispatchEvent(
-              new CustomEvent("ui-bridge-generate-pages", { detail: { pages, options } })
+              new CustomEvent("ui-bridge-generate-pages", { detail: { pages, options } }),
             );
           }}
         />

@@ -44,10 +44,14 @@ export function ConceptCard({ concept, onClick }: ConceptCardProps) {
 
       <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
         {benefits.length > 0 && (
-          <span>{benefits.length} benefit{benefits.length !== 1 ? "s" : ""}</span>
+          <span>
+            {benefits.length} benefit{benefits.length !== 1 ? "s" : ""}
+          </span>
         )}
         {relatedDecisions.length > 0 && (
-          <span>{relatedDecisions.length} decision{relatedDecisions.length !== 1 ? "s" : ""}</span>
+          <span>
+            {relatedDecisions.length} decision{relatedDecisions.length !== 1 ? "s" : ""}
+          </span>
         )}
       </div>
     </button>

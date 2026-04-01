@@ -227,15 +227,14 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
             <input
               type="text"
               value={config.base_image}
-              onChange={(e) =>
-                setConfig((prev) => ({ ...prev, base_image: e.target.value }))
-              }
+              onChange={(e) => setConfig((prev) => ({ ...prev, base_image: e.target.value }))}
               placeholder="ubuntu:22.04"
               disabled={!config.enabled}
               className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
             />
             <p className="text-[10px] text-muted-foreground">
-              Docker image used as the base for execution containers (e.g., ubuntu:22.04, node:20-slim)
+              Docker image used as the base for execution containers (e.g., ubuntu:22.04,
+              node:20-slim)
             </p>
           </div>
 
@@ -330,9 +329,7 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
               </div>
               <ToggleSwitch
                 checked={config.read_only_mount}
-                onChange={(read_only_mount) =>
-                  setConfig((prev) => ({ ...prev, read_only_mount }))
-                }
+                onChange={(read_only_mount) => setConfig((prev) => ({ ...prev, read_only_mount }))}
                 disabled={!config.enabled}
               />
             </div>
@@ -346,9 +343,7 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
               </div>
               <ToggleSwitch
                 checked={config.network_enabled}
-                onChange={(network_enabled) =>
-                  setConfig((prev) => ({ ...prev, network_enabled }))
-                }
+                onChange={(network_enabled) => setConfig((prev) => ({ ...prev, network_enabled }))}
                 disabled={!config.enabled}
               />
             </div>
@@ -361,8 +356,9 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
         <div className={`p-3 ${getAccentColors("red").bg} rounded-lg flex gap-2`}>
           <X className={`w-4 h-4 ${getAccentColors("red").text} shrink-0 mt-0.5`} />
           <p className={`text-xs ${getAccentColors("red").text}`}>
-            Docker is not available. Container isolation requires Docker to be installed and running.
-            Please install Docker Desktop or start the Docker daemon before enabling this feature.
+            Docker is not available. Container isolation requires Docker to be installed and
+            running. Please install Docker Desktop or start the Docker daemon before enabling this
+            feature.
           </p>
         </div>
       )}
@@ -371,9 +367,10 @@ export function ContainerSettings({ onLog }: ContainerSettingsProps) {
       <div className={`p-3 ${getAccentColors("blue").bg} rounded-lg flex gap-2`}>
         <Info className={`w-4 h-4 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />
         <p className={`text-xs ${getAccentColors("blue").text}`}>
-          Container isolation runs each workflow step in an ephemeral Docker container. This provides
-          a clean environment for each execution and prevents steps from modifying the host system.
-          The workspace directory is mounted (optionally read-only) so steps can access project files.
+          Container isolation runs each workflow step in an ephemeral Docker container. This
+          provides a clean environment for each execution and prevents steps from modifying the host
+          system. The workspace directory is mounted (optionally read-only) so steps can access
+          project files.
         </p>
       </div>
 

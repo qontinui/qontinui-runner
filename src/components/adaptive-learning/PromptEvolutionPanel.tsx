@@ -167,13 +167,11 @@ export function PromptEvolutionPanel() {
       </div>
 
       {loading ? (
-        <div style={{ textAlign: "center", padding: "32px", color: "#9ca3af" }}>
-          Loading...
-        </div>
+        <div style={{ textAlign: "center", padding: "32px", color: "#9ca3af" }}>Loading...</div>
       ) : runs.length === 0 ? (
         <div style={{ textAlign: "center", padding: "32px", color: "#9ca3af" }}>
-          No GEPA optimization runs yet. Runs are triggered automatically after
-          enough workflow executions.
+          No GEPA optimization runs yet. Runs are triggered automatically after enough workflow
+          executions.
         </div>
       ) : (
         <>
@@ -189,17 +187,12 @@ export function PromptEvolutionPanel() {
             {domainStats.map((ds) => (
               <div
                 key={ds.domain}
-                onClick={() =>
-                  setDomainFilter(domainFilter === ds.domain ? "all" : ds.domain)
-                }
+                onClick={() => setDomainFilter(domainFilter === ds.domain ? "all" : ds.domain)}
                 style={{
                   background: "#111827",
                   borderRadius: "8px",
                   padding: "12px",
-                  border:
-                    domainFilter === ds.domain
-                      ? "1px solid #3b82f6"
-                      : "1px solid #1f2937",
+                  border: domainFilter === ds.domain ? "1px solid #3b82f6" : "1px solid #1f2937",
                   cursor: "pointer",
                   transition: "border-color 0.15s",
                 }}
@@ -214,9 +207,7 @@ export function PromptEvolutionPanel() {
                 >
                   {ds.domain}
                 </div>
-                <div
-                  style={{ fontSize: "11px", color: "#9ca3af", marginTop: "4px" }}
-                >
+                <div style={{ fontSize: "11px", color: "#9ca3af", marginTop: "4px" }}>
                   {ds.runs.length} runs, {ds.successfulRuns} improved
                 </div>
                 <div
@@ -237,24 +228,14 @@ export function PromptEvolutionPanel() {
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
             <thead>
               <tr style={{ borderBottom: "1px solid #374151" }}>
-                <th style={{ textAlign: "left", padding: "8px", color: "#9ca3af" }}>
-                  Date
-                </th>
-                <th style={{ textAlign: "left", padding: "8px", color: "#9ca3af" }}>
-                  Domain
-                </th>
-                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>
-                  Old Score
-                </th>
-                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>
-                  New Score
-                </th>
+                <th style={{ textAlign: "left", padding: "8px", color: "#9ca3af" }}>Date</th>
+                <th style={{ textAlign: "left", padding: "8px", color: "#9ca3af" }}>Domain</th>
+                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>Old Score</th>
+                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>New Score</th>
                 <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>
                   Improvement
                 </th>
-                <th style={{ textAlign: "center", padding: "8px", color: "#9ca3af" }}>
-                  Status
-                </th>
+                <th style={{ textAlign: "center", padding: "8px", color: "#9ca3af" }}>Status</th>
               </tr>
             </thead>
             <tbody>
@@ -304,8 +285,7 @@ function RunRow({
           transition: "background 0.1s",
         }}
         onMouseEnter={(e) => {
-          if (!isExpanded)
-            (e.currentTarget as HTMLTableRowElement).style.background = "#111827";
+          if (!isExpanded) (e.currentTarget as HTMLTableRowElement).style.background = "#111827";
         }}
         onMouseLeave={(e) => {
           if (!isExpanded)
@@ -313,7 +293,14 @@ function RunRow({
         }}
       >
         <td style={{ padding: "6px 8px", color: "#6b7280", fontSize: "12px" }}>
-          <span style={{ marginRight: "6px", display: "inline-block", transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.15s" }}>
+          <span
+            style={{
+              marginRight: "6px",
+              display: "inline-block",
+              transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+              transition: "transform 0.15s",
+            }}
+          >
             &#9654;
           </span>
           {new Date(run.created_at).toLocaleDateString()}
@@ -341,9 +328,7 @@ function RunRow({
           }}
         >
           {run.improvement !== null
-            ? (run.improvement > 0 ? "+" : "") +
-              (run.improvement * 100).toFixed(1) +
-              "%"
+            ? (run.improvement > 0 ? "+" : "") + (run.improvement * 100).toFixed(1) + "%"
             : "-"}
         </td>
         <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -427,9 +412,7 @@ function RunDetail({ detail }: { detail: GepaRunDetail }) {
             textAlign: "center",
           }}
         >
-          <div style={{ fontSize: "11px", color: "#9ca3af", marginBottom: "2px" }}>
-            Delta
-          </div>
+          <div style={{ fontSize: "11px", color: "#9ca3af", marginBottom: "2px" }}>Delta</div>
           <div
             style={{
               fontSize: "22px",
@@ -535,14 +518,13 @@ function RunDetail({ detail }: { detail: GepaRunDetail }) {
         }}
       >
         <span>
-          Domain: <strong style={{ color: "#9ca3af", textTransform: "capitalize" }}>{detail.domain}</strong>
+          Domain:{" "}
+          <strong style={{ color: "#9ca3af", textTransform: "capitalize" }}>{detail.domain}</strong>
         </span>
         <span>
           Status: <StatusBadge status={detail.status} />
         </span>
-        <span>
-          Created: {new Date(detail.created_at).toLocaleString()}
-        </span>
+        <span>Created: {new Date(detail.created_at).toLocaleString()}</span>
       </div>
     </div>
   );
@@ -552,23 +534,11 @@ function RunDetail({ detail }: { detail: GepaRunDetail }) {
 /*  Small helper components                                           */
 /* ------------------------------------------------------------------ */
 
-function ScoreBox({
-  label,
-  score,
-  color,
-}: {
-  label: string;
-  score: number;
-  color: string;
-}) {
+function ScoreBox({ label, score, color }: { label: string; score: number; color: string }) {
   return (
     <div style={{ textAlign: "center" }}>
-      <div style={{ fontSize: "11px", color: "#9ca3af", marginBottom: "2px" }}>
-        {label}
-      </div>
-      <div style={{ fontSize: "18px", fontWeight: "bold", color }}>
-        {(score * 100).toFixed(1)}%
-      </div>
+      <div style={{ fontSize: "11px", color: "#9ca3af", marginBottom: "2px" }}>{label}</div>
+      <div style={{ fontSize: "18px", fontWeight: "bold", color }}>{(score * 100).toFixed(1)}%</div>
     </div>
   );
 }

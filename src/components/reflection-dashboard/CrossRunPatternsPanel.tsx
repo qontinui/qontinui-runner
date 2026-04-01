@@ -17,9 +17,7 @@ function PatternBadge({ type }: { type: string }) {
   return (
     <span
       className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
-        isOscillation
-          ? "bg-orange-500/10 text-orange-500"
-          : "bg-yellow-500/10 text-yellow-500"
+        isOscillation ? "bg-orange-500/10 text-orange-500" : "bg-yellow-500/10 text-yellow-500"
       }`}
     >
       {isOscillation ? <RefreshCw className="w-3 h-3" /> : <TrendingUp className="w-3 h-3" />}
@@ -83,9 +81,7 @@ export function CrossRunPatternsPanel({ workflowName }: CrossRunPatternsPanelPro
       )}
 
       {patterns && patterns.length === 0 && (
-        <div className="text-center text-muted-foreground py-8">
-          No cross-run patterns detected
-        </div>
+        <div className="text-center text-muted-foreground py-8">No cross-run patterns detected</div>
       )}
 
       {patterns && patterns.length > 0 && (

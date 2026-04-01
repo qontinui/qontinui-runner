@@ -2,7 +2,11 @@ import { useMemo } from "react";
 import { TerminalSquare, X, CheckSquare } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { SessionCard } from "./SessionCard";
-import type { UseSessionManagerReturn, UnifiedSession, SessionLiveStatus } from "./useSessionManager";
+import type {
+  UseSessionManagerReturn,
+  UnifiedSession,
+  SessionLiveStatus,
+} from "./useSessionManager";
 
 interface SessionManagerPanelProps {
   manager: UseSessionManagerReturn;
@@ -77,7 +81,11 @@ function formatDateGroupKey(iso: string): string {
   }
 }
 
-export function SessionManagerPanel({ manager, selectedSessionId, sessionConflictCounts }: SessionManagerPanelProps) {
+export function SessionManagerPanel({
+  manager,
+  selectedSessionId,
+  sessionConflictCounts,
+}: SessionManagerPanelProps) {
   const {
     sessions,
     loading,

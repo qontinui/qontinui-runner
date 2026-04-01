@@ -40,9 +40,7 @@ export function ConnectionChain({ surface, selectedNode }: Props) {
 
   return (
     <div className="p-3">
-      <h3 className="text-xs font-semibold text-zinc-300 mb-3">
-        Call Chain: {selectedNode.name}
-      </h3>
+      <h3 className="text-xs font-semibold text-zinc-300 mb-3">Call Chain: {selectedNode.name}</h3>
       <div className="space-y-1">
         {chain.map((link, i) => {
           const colors = NODE_COLORS[link.type as NodeCategory];
@@ -119,7 +117,9 @@ function findNodeInfo(surface: ApiSurface, type: string, name: string): ChainLin
     return { type, name, file: cmd?.file, line: cmd?.line, detail: cmd?.returnType };
   }
   if (type === "mcp_route") {
-    const route = surface.mcpRoutes.find((r) => `${r.method} ${r.path}` === name || r.path === name);
+    const route = surface.mcpRoutes.find(
+      (r) => `${r.method} ${r.path}` === name || r.path === name,
+    );
     return { type, name, file: route?.file, line: route?.line, detail: route?.handler };
   }
   if (type === "pg_method") {
@@ -128,7 +128,13 @@ function findNodeInfo(surface: ApiSurface, type: string, name: string): ChainLin
   }
   if (type === "clorinde_query") {
     const query = surface.clorindeQueries.find((q) => q.name === name);
-    return { type, name, file: query?.file, line: query?.line, detail: query?.sqlPreview?.slice(0, 100) };
+    return {
+      type,
+      name,
+      file: query?.file,
+      line: query?.line,
+      detail: query?.sqlPreview?.slice(0, 100),
+    };
   }
   if (type === "db_table") {
     const table = surface.dbTables.find((t) => t.name === name);
@@ -140,7 +146,13 @@ function findNodeInfo(surface: ApiSurface, type: string, name: string): ChainLin
   }
   if (type === "ui_bridge_route") {
     const route = surface.uiBridgeRoutes.find((r) => r.path === name);
-    return { type, name, file: route?.file, line: route?.line, detail: route ? `${route.method} ${route.path}` : undefined };
+    return {
+      type,
+      name,
+      file: route?.file,
+      line: route?.line,
+      detail: route ? `${route.method} ${route.path}` : undefined,
+    };
   }
   if (type === "frontend") {
     return { type, name, file: name };

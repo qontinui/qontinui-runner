@@ -51,9 +51,10 @@ export const langfuseAdapter: TraceImportAdapter<LangfuseTrace, LangfuseObservat
       "langfuse.type": obs.type,
       ...(obs.model && { "gen_ai.request.model": obs.model }),
       ...(obs.modelParameters && { "langfuse.model_parameters": obs.modelParameters }),
-      ...(obs.metadata && Object.fromEntries(
-        Object.entries(obs.metadata).map(([k, v]) => [`langfuse.metadata.${k}`, v])
-      )),
+      ...(obs.metadata &&
+        Object.fromEntries(
+          Object.entries(obs.metadata).map(([k, v]) => [`langfuse.metadata.${k}`, v]),
+        )),
     };
 
     return {
@@ -73,16 +74,17 @@ export const langfuseAdapter: TraceImportAdapter<LangfuseTrace, LangfuseObservat
       error: obs.level === "ERROR" ? (obs.statusMessage ?? "Error") : null,
       input_tokens: obs.usage?.input,
       output_tokens: obs.usage?.output,
-      cost_cents: obs.calculatedTotalCost != null
-        ? Math.round(obs.calculatedTotalCost * 100)
-        : undefined,
+      cost_cents:
+        obs.calculatedTotalCost != null ? Math.round(obs.calculatedTotalCost * 100) : undefined,
     };
   },
 
   classifySpan(obs) {
     switch (obs.type) {
-      case "GENERATION": return "llm";
-      case "EVENT": return "other";
+      case "GENERATION":
+        return "llm";
+      case "EVENT":
+        return "other";
       case "SPAN": {
         const name = obs.name?.toLowerCase() ?? "";
         if (name.includes("tool") || name.includes("function")) return "tool";
@@ -91,7 +93,8 @@ export const langfuseAdapter: TraceImportAdapter<LangfuseTrace, LangfuseObservat
         if (name.includes("chain")) return "chain";
         return "other";
       }
-      default: return "other";
+      default:
+        return "other";
     }
   },
 

@@ -1,6 +1,10 @@
 import { Clock, Tag, ArrowRight } from "lucide-react";
 import type { DecisionPreview, DecisionCategory } from "@/types/decision-trail";
-import { DECISION_CATEGORY_COLORS, DECISION_STATUS_COLORS, parseJsonField } from "@/types/decision-trail";
+import {
+  DECISION_CATEGORY_COLORS,
+  DECISION_STATUS_COLORS,
+  parseJsonField,
+} from "@/types/decision-trail";
 
 interface DecisionCardProps {
   decision: DecisionPreview;
@@ -25,9 +29,7 @@ function ScaleBadge({ scale }: { scale: string }) {
   return (
     <span
       className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-        isStrategic
-          ? "bg-purple-500/20 text-purple-400"
-          : "bg-zinc-500/20 text-zinc-400"
+        isStrategic ? "bg-purple-500/20 text-purple-400" : "bg-zinc-500/20 text-zinc-400"
       }`}
     >
       {isStrategic ? "Strategic" : "Tactical"}

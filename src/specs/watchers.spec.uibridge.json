@@ -13,7 +13,11 @@
           "description": "The page loads when the 'watchers' tab is selected, showing the heading 'Watchers' with an Eye icon",
           "category": "navigation",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "h2", "textContent": "Watchers" }, "label": "Watchers h2 heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "h2", "textContent": "Watchers" },
+            "label": "Watchers h2 heading"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -33,7 +37,11 @@
           "description": "The page shows a heading 'Watchers' preceded by an Eye icon (h-5 w-5 text-primary) that conveys the monitoring/surveillance concept",
           "category": "semantic",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "svg.lucide-eye + h2" }, "label": "Eye icon + Watchers heading" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "svg.lucide-eye + h2" },
+            "label": "Eye icon + Watchers heading"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -44,7 +52,13 @@
           "description": "The page shows 'No watchers configured. Create one to start monitoring the activity timeline.' when no watchers exist and the form is closed",
           "category": "semantic",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "text": "No watchers configured. Create one to start monitoring the activity timeline." }, "label": "Empty state message" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No watchers configured. Create one to start monitoring the activity timeline."
+            },
+            "label": "Empty state message"
+          },
           "assertionType": "visible",
           "precondition": "No watchers exist in the PostgreSQL watchers table and the create form is not open",
           "source": "manual",
@@ -56,7 +70,11 @@
           "description": "The page shows the total watcher count in parentheses next to the heading (e.g., '(3)') so users know how many are configured",
           "category": "semantic",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "selector": "span.text-xs.text-muted-foreground", "textContains": "(" }, "label": "Count badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.text-xs.text-muted-foreground", "textContains": "(" },
+            "label": "Count badge"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -76,7 +94,11 @@
           "description": "The page shows a button labeled 'New Watcher' with a Plus icon, styled with bg-primary text-primary-foreground",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "New Watcher" }, "label": "New Watcher button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "New Watcher" },
+            "label": "New Watcher button"
+          },
           "assertionType": "exists",
           "precondition": "The create form is not currently open",
           "source": "manual",
@@ -88,7 +110,11 @@
           "description": "The page shows a 'Cancel' button with an X icon when the create form is open (replaces 'New Watcher')",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Cancel" }, "label": "Cancel button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Cancel" },
+            "label": "Cancel button"
+          },
           "assertionType": "exists",
           "precondition": "The create form is currently open",
           "source": "manual",
@@ -100,7 +126,11 @@
           "description": "The create form shows a text input with placeholder 'e.g., Error Toast Watcher' under a 'Name' label",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "input[placeholder*='Error Toast Watcher']" }, "label": "Name input" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "input[placeholder*='Error Toast Watcher']" },
+            "label": "Name input"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -112,7 +142,11 @@
           "description": "The create form shows a text input with placeholder 'e.g., error toast failed' under a 'Timeline Query (FTS)' label",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "input[placeholder*='error toast failed']" }, "label": "Timeline query input" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "input[placeholder*='error toast failed']" },
+            "label": "Timeline query input"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -124,7 +158,11 @@
           "description": "The create form shows a select dropdown for schedule interval with options: 'Every 1 minute', 'Every 5 minutes', 'Every 15 minutes', 'Every 30 minutes', 'Every 1 hour'",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "select", "textContains": "Every 5 minutes" }, "label": "Schedule interval select" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "select", "textContains": "Every 5 minutes" },
+            "label": "Schedule interval select"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -136,7 +174,11 @@
           "description": "The create form shows a select dropdown for lookback window with options: '5 minutes', '15 minutes', '30 minutes', '1 hour', '6 hours', '1 day'",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "select", "textContains": "15 minutes" }, "label": "Lookback window select" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "select", "textContains": "15 minutes" },
+            "label": "Lookback window select"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -148,7 +190,11 @@
           "description": "The create form shows a select dropdown for action type with options: 'Log Only', 'Create Observation', 'Notify'",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "select", "textContains": "Log Only" }, "label": "Action type select" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "select", "textContains": "Log Only" },
+            "label": "Action type select"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -160,7 +206,11 @@
           "description": "The create form shows a textarea with pre-filled AI reasoning prompt containing {{results}}, {{result_count}}, {{query}} placeholders, styled with font-mono",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "textarea.font-mono" }, "label": "AI prompt textarea" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "textarea.font-mono" },
+            "label": "AI prompt textarea"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -172,7 +222,11 @@
           "description": "The create form shows helper text 'Available placeholders: {{results}}, {{result_count}}, {{query}}' below the prompt textarea",
           "category": "element-presence",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "text": "Available placeholders:" }, "label": "Placeholder help text" },
+          "target": {
+            "type": "search",
+            "criteria": { "text": "Available placeholders:" },
+            "label": "Placeholder help text"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -184,7 +238,11 @@
           "description": "The create form shows a submit button labeled 'Create Watcher' (or 'Creating...' when submitting)",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Create Watcher" }, "label": "Create Watcher button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Create Watcher" },
+            "label": "Create Watcher button"
+          },
           "assertionType": "exists",
           "precondition": "The create form is open",
           "source": "manual",
@@ -196,7 +254,11 @@
           "description": "Each watcher card shows a toggle button with title 'Disable' (when enabled) or 'Enable' (when disabled)",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "button[title='Disable'], button[title='Enable']" }, "label": "Toggle button" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "button[title='Disable'], button[title='Enable']" },
+            "label": "Toggle button"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists",
           "source": "manual",
@@ -208,7 +270,11 @@
           "description": "Each watcher card shows a delete button with title='Delete' containing a Trash2 icon",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "button[title='Delete']" }, "label": "Delete button" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "button[title='Delete']" },
+            "label": "Delete button"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists",
           "source": "manual",
@@ -230,7 +296,11 @@
           "description": "Each watcher card shows the watcher name in a span with class 'font-medium text-sm'",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "span.font-medium.text-sm" }, "label": "Watcher name" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.font-medium.text-sm" },
+            "label": "Watcher name"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists",
           "source": "manual",
@@ -242,7 +312,11 @@
           "description": "Each watcher card shows the FTS query in a code element with classes 'text-xs bg-muted px-1.5 py-0.5 rounded'",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "code.text-xs.bg-muted" }, "label": "Query code snippet" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "code.text-xs.bg-muted" },
+            "label": "Query code snippet"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists",
           "source": "manual",
@@ -254,7 +328,11 @@
           "description": "Each watcher card shows the lookback window value (e.g., '15 minutes') next to a Clock icon, in 'text-xs text-muted-foreground'",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "span.text-xs.text-muted-foreground svg.lucide-clock" }, "label": "Lookback with clock icon" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.text-xs.text-muted-foreground svg.lucide-clock" },
+            "label": "Lookback with clock icon"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists",
           "source": "manual",
@@ -266,7 +344,11 @@
           "description": "Each watcher card shows 'Last run: {timestamp}' or 'Last run: Never' in the second row of the card, in text-xs text-muted-foreground",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Last run:" }, "label": "Last run timestamp" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Last run:" },
+            "label": "Last run timestamp"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists",
           "source": "manual",
@@ -278,7 +360,11 @@
           "description": "Watcher cards with an app filter show 'App: {appName}' in the metadata row",
           "category": "custom",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "App:" }, "label": "App filter label" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "App:" },
+            "label": "App filter label"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists with a non-null appNameFilter",
           "source": "manual",
@@ -290,7 +376,11 @@
           "description": "Watcher cards with a source filter show 'Source: {sourceType}' in the metadata row",
           "category": "custom",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "Source:" }, "label": "Source filter label" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Source:" },
+            "label": "Source filter label"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists with a non-null sourceTypeFilter",
           "source": "manual",
@@ -302,7 +392,11 @@
           "description": "Enabled watchers show a ToggleRight icon with class 'text-green-500'. Disabled watchers show a ToggleLeft icon without the green class.",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "svg.lucide-toggle-right.text-green-500" }, "label": "Green toggle-right icon" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "svg.lucide-toggle-right.text-green-500" },
+            "label": "Green toggle-right icon"
+          },
           "assertionType": "exists",
           "precondition": "At least one enabled watcher exists",
           "source": "manual",
@@ -324,7 +418,11 @@
           "description": "Users can click a watcher's toggle button to invert its enabled state. An enabled watcher (title='Disable') becomes disabled (title='Enable') and vice versa. The Tauri command set_watcher_enabled is called with the opposite boolean.",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "button[title='Enable']" }, "label": "Toggle now showing Enable (was Disable)" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "button[title='Enable']" },
+            "label": "Toggle now showing Enable (was Disable)"
+          },
           "assertionType": "exists",
           "precondition": "A watcher that was enabled has had its toggle button clicked",
           "source": "manual",
@@ -336,7 +434,11 @@
           "description": "Users can click a watcher's delete button (title='Delete') to permanently remove it. The watcher disappears from the list after the delete_watcher Tauri command completes.",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "button[title='Delete']" }, "label": "Delete button" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "button[title='Delete']" },
+            "label": "Delete button"
+          },
           "assertionType": "exists",
           "precondition": "At least one watcher exists (clicking it will remove this watcher)",
           "source": "manual",
@@ -348,7 +450,11 @@
           "description": "Users can fill in the form and click 'Create Watcher' to submit. The form collapses, resets to defaults, and the new watcher appears in the list. Button shows 'Creating...' during submission.",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "text": "Creating..." }, "label": "Submit button during creation" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "text": "Creating..." },
+            "label": "Submit button during creation"
+          },
           "assertionType": "exists",
           "precondition": "The create form is filled with valid name and query, and the Create Watcher button has been clicked",
           "source": "manual",
@@ -369,7 +475,11 @@
           "description": "The 'Create Watcher' button has the disabled attribute when the name input is empty, with class 'disabled:opacity-50'",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Create Watcher" }, "label": "Submit button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Create Watcher" },
+            "label": "Submit button"
+          },
           "assertionType": "disabled",
           "precondition": "The create form is open and the name field is empty",
           "source": "manual",
@@ -381,7 +491,11 @@
           "description": "The 'Create Watcher' button has the disabled attribute when the timeline query input is empty",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Create Watcher" }, "label": "Submit button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Create Watcher" },
+            "label": "Submit button"
+          },
           "assertionType": "disabled",
           "precondition": "The create form is open and the timeline query field is empty",
           "source": "manual",
@@ -393,7 +507,11 @@
           "description": "The 'Create Watcher' button is enabled when both name and query fields contain non-whitespace text",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Create Watcher" }, "label": "Submit button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Create Watcher" },
+            "label": "Submit button"
+          },
           "assertionType": "enabled",
           "precondition": "The create form is open and both name and query fields contain text",
           "source": "manual",
@@ -405,7 +523,11 @@
           "description": "The page shows 'Last run: Never' for watchers that have never been executed (lastRunAt is null), not an empty string or 'Invalid Date'",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "textContains": "Last run: Never" }, "label": "Never-run timestamp" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Last run: Never" },
+            "label": "Never-run timestamp"
+          },
           "assertionType": "exists",
           "precondition": "A watcher exists that has never been executed by the scheduler",
           "source": "manual",
@@ -417,7 +539,11 @@
           "description": "The count badge number matches the actual number of watcher cards displayed in the list",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "span.text-xs.text-muted-foreground", "textContains": "(" }, "label": "Count badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.text-xs.text-muted-foreground", "textContains": "(" },
+            "label": "Count badge"
+          },
           "assertionType": "exists",
           "notes": "The count badge renders watchers.length which is the same array rendered in the list below.",
           "source": "manual",
@@ -439,7 +565,11 @@
           "description": "The page automatically fetches the watcher list when it mounts (useEffect calls loadWatchers which invokes 'list_watchers' Tauri command). No manual refresh is needed.",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "h2", "textContent": "Watchers" }, "label": "Heading present (page loaded)" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "h2", "textContent": "Watchers" },
+            "label": "Heading present (page loaded)"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -450,7 +580,11 @@
           "description": "After a successful create, the form collapses (showForm=false) and all fields reset to defaults (name='', query='', schedule='5 minutes', lookback='15 minutes', action='LogOnly', prompt=default template)",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "New Watcher" }, "label": "New Watcher button (form collapsed)" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "New Watcher" },
+            "label": "New Watcher button (form collapsed)"
+          },
           "assertionType": "exists",
           "precondition": "A watcher has just been successfully created",
           "source": "manual",
@@ -462,7 +596,13 @@
           "description": "If PostgreSQL is unavailable, the page silently shows an empty watcher list (catch block in loadWatchers ignores errors). No error toast or crash occurs.",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "text": "No watchers configured. Create one to start monitoring the activity timeline." }, "label": "Empty state (PG unavailable)" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "text": "No watchers configured. Create one to start monitoring the activity timeline."
+            },
+            "label": "Empty state (PG unavailable)"
+          },
           "assertionType": "exists",
           "precondition": "PostgreSQL is not connected (RUNNER_DATABASE_URL not set or PG server down)",
           "source": "manual",

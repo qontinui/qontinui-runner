@@ -7,14 +7,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import {
-  FileCode,
-  CheckCircle2,
-  XCircle,
-  Loader2,
-  RefreshCw,
-  Sparkles,
-} from "lucide-react";
+import { FileCode, CheckCircle2, XCircle, Loader2, RefreshCw, Sparkles } from "lucide-react";
 import type {
   PageComponent,
   DiscoverPagesResult,
@@ -25,10 +18,7 @@ import { getApiBase } from "@/lib/runner-api";
 
 interface PageSelectionPanelProps {
   projectPath: string;
-  onStartGeneration: (
-    selectedPages: PageComponent[],
-    options: PageGenerationOptions
-  ) => void;
+  onStartGeneration: (selectedPages: PageComponent[], options: PageGenerationOptions) => void;
   disabled?: boolean;
 }
 
@@ -54,24 +44,19 @@ export function PageSelectionPanel({
     setLoading(true);
     setError(null);
     try {
-      const resp = await fetch(
-        `${getApiBase()}/ui-bridge/integration/discover-pages`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_path: projectPath }),
-        }
-      );
+      const resp = await fetch(`${getApiBase()}/ui-bridge/integration/discover-pages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_path: projectPath }),
+      });
       const data: ApiResponse<DiscoverPagesResult> = await resp.json();
       if (data.success && data.data) {
         setPages(data.data.pages);
         // Auto-select pages that need work
         const needsWork = new Set(
           data.data.pages
-            .filter(
-              (p) => !p.has_registrations || !p.has_spec || !p.has_tutorial
-            )
-            .map((p) => p.component_path)
+            .filter((p) => !p.has_registrations || !p.has_spec || !p.has_tutorial)
+            .map((p) => p.component_path),
         );
         setSelectedIds(needsWork);
       } else {
@@ -99,17 +84,14 @@ export function PageSelectionPanel({
     });
   };
 
-  const selectAll = () =>
-    setSelectedIds(new Set(pages.map((p) => p.component_path)));
+  const selectAll = () => setSelectedIds(new Set(pages.map((p) => p.component_path)));
   const deselectAll = () => setSelectedIds(new Set());
 
   const selectedPages = pages.filter((p) => selectedIds.has(p.component_path));
 
   const statusBadge = (page: PageComponent) => {
     const total =
-      (page.has_registrations ? 1 : 0) +
-      (page.has_spec ? 1 : 0) +
-      (page.has_tutorial ? 1 : 0);
+      (page.has_registrations ? 1 : 0) + (page.has_spec ? 1 : 0) + (page.has_tutorial ? 1 : 0);
     if (total === 3)
       return (
         <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
@@ -122,11 +104,7 @@ export function PageSelectionPanel({
           Partial
         </span>
       );
-    return (
-      <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">
-        New
-      </span>
-    );
+    return <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">New</span>;
   };
 
   const checkIcon = (has: boolean) =>
@@ -162,9 +140,7 @@ export function PageSelectionPanel({
       </div>
 
       {error && (
-        <div className="text-xs text-destructive bg-destructive/10 p-2 rounded">
-          {error}
-        </div>
+        <div className="text-xs text-destructive bg-destructive/10 p-2 rounded">{error}</div>
       )}
 
       {loading && (
@@ -179,17 +155,11 @@ export function PageSelectionPanel({
         <>
           {/* Select all / deselect all */}
           <div className="flex gap-2 text-xs">
-            <button
-              onClick={selectAll}
-              className="text-primary hover:underline"
-            >
+            <button onClick={selectAll} className="text-primary hover:underline">
               Select all
             </button>
             <span className="text-muted-foreground">|</span>
-            <button
-              onClick={deselectAll}
-              className="text-primary hover:underline"
-            >
+            <button onClick={deselectAll} className="text-primary hover:underline">
               Deselect all
             </button>
           </div>
@@ -224,18 +194,10 @@ export function PageSelectionPanel({
                       />
                     </td>
                     <td className="p-2 font-mono">{page.route}</td>
-                    <td className="p-2 text-muted-foreground">
-                      {page.component_name}
-                    </td>
-                    <td className="p-2 text-center">
-                      {checkIcon(page.has_registrations)}
-                    </td>
-                    <td className="p-2 text-center">
-                      {checkIcon(page.has_spec)}
-                    </td>
-                    <td className="p-2 text-center">
-                      {checkIcon(page.has_tutorial)}
-                    </td>
+                    <td className="p-2 text-muted-foreground">{page.component_name}</td>
+                    <td className="p-2 text-center">{checkIcon(page.has_registrations)}</td>
+                    <td className="p-2 text-center">{checkIcon(page.has_spec)}</td>
+                    <td className="p-2 text-center">{checkIcon(page.has_tutorial)}</td>
                     <td className="p-2 text-right">{statusBadge(page)}</td>
                   </tr>
                 ))}
@@ -263,9 +225,7 @@ export function PageSelectionPanel({
               <input
                 type="checkbox"
                 checked={options.generateSpecs}
-                onChange={(e) =>
-                  setOptions({ ...options, generateSpecs: e.target.checked })
-                }
+                onChange={(e) => setOptions({ ...options, generateSpecs: e.target.checked })}
                 className="rounded"
               />
               Page Specs

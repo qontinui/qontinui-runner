@@ -52,31 +52,28 @@ export function useLiveEvaluation() {
     staleTime: 60_000,
   });
 
-  const evaluate = useCallback(
-    async ({ specJson, input, output, context }: EvaluateRequest) => {
-      setLoading(true);
-      setError(null);
-      setResults(null);
+  const evaluate = useCallback(async ({ specJson, input, output, context }: EvaluateRequest) => {
+    setLoading(true);
+    setError(null);
+    setResults(null);
 
-      try {
-        const res = await invoke<AssertionResult[]>("evaluate_with_io", {
-          evalSpecJson: specJson,
-          input,
-          output,
-          context: context || null,
-        });
-        setResults(res);
-        return res;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        setError(msg);
-        return null;
-      } finally {
-        setLoading(false);
-      }
-    },
-    [],
-  );
+    try {
+      const res = await invoke<AssertionResult[]>("evaluate_with_io", {
+        evalSpecJson: specJson,
+        input,
+        output,
+        context: context || null,
+      });
+      setResults(res);
+      return res;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   const reset = useCallback(() => {
     setResults(null);

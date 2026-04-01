@@ -11,10 +11,7 @@ import { FlaskConical, Plus, RefreshCw, AlertTriangle, Play } from "lucide-react
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { useEvaluationDatasets, useDatasetItems } from "@/hooks/useEvaluationDatasets";
-import {
-  useEvaluationExperiments,
-  useExperimentResults,
-} from "@/hooks/useEvaluationExperiments";
+import { useEvaluationExperiments, useExperimentResults } from "@/hooks/useEvaluationExperiments";
 import { DatasetList } from "./DatasetList";
 import { DatasetDetail } from "./DatasetDetail";
 import { ExperimentList } from "./ExperimentList";
@@ -44,7 +41,12 @@ export default function EvaluationDashboard() {
     deleteDataset,
   } = useEvaluationDatasets();
 
-  const { items, isLoading: itemsLoading, addItems, deleteItem } = useDatasetItems(selectedDatasetId);
+  const {
+    items,
+    isLoading: itemsLoading,
+    addItems,
+    deleteItem,
+  } = useDatasetItems(selectedDatasetId);
 
   const {
     experiments,
@@ -86,7 +88,9 @@ export default function EvaluationDashboard() {
         }
       },
       onError: (err) => {
-        window.alert(`Failed to delete dataset: ${err instanceof Error ? err.message : String(err)}`);
+        window.alert(
+          `Failed to delete dataset: ${err instanceof Error ? err.message : String(err)}`,
+        );
       },
     });
   };
@@ -176,7 +180,9 @@ export default function EvaluationDashboard() {
             />
           </div>
           <div className="flex-1 space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">Description (optional)</label>
+            <label className="text-xs font-medium text-muted-foreground">
+              Description (optional)
+            </label>
             <input
               className="w-full rounded-md bg-background border border-border px-3 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary"
               placeholder="Brief description..."
@@ -184,7 +190,11 @@ export default function EvaluationDashboard() {
               onChange={(e) => setNewDatasetDescription(e.target.value)}
             />
           </div>
-          <Button size="sm" onClick={handleCreateDataset} disabled={!newDatasetName.trim() || createDataset.isPending}>
+          <Button
+            size="sm"
+            onClick={handleCreateDataset}
+            disabled={!newDatasetName.trim() || createDataset.isPending}
+          >
             {createDataset.isPending ? "Creating..." : "Create"}
           </Button>
           <Button size="sm" variant="ghost" onClick={() => setShowCreateDataset(false)}>
@@ -196,7 +206,10 @@ export default function EvaluationDashboard() {
       {/* Main two-panel layout */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Left panel: datasets + detail */}
-        <div className="w-1/2 flex flex-col border-r border-border/50 min-h-0" data-tutorial-id="evaluation-datasets-panel">
+        <div
+          className="w-1/2 flex flex-col border-r border-border/50 min-h-0"
+          data-tutorial-id="evaluation-datasets-panel"
+        >
           {/* Dataset list (top portion) */}
           <Card className="m-2 mb-1 shrink-0 max-h-[40%] overflow-auto">
             <div className="px-3 py-2 border-b border-border/50">
@@ -239,7 +252,10 @@ export default function EvaluationDashboard() {
         </div>
 
         {/* Right panel: experiments + results / live evaluation */}
-        <div className="w-1/2 flex flex-col min-h-0" data-tutorial-id="evaluation-experiments-panel">
+        <div
+          className="w-1/2 flex flex-col min-h-0"
+          data-tutorial-id="evaluation-experiments-panel"
+        >
           {/* Tab switcher */}
           <div className="flex items-center gap-1 px-2 pt-2 shrink-0">
             <button

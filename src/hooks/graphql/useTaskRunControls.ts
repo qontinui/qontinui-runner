@@ -104,28 +104,18 @@ export function useTaskRunControls(): TaskRunControls {
 
 export interface FindingControls {
   /** Update a finding's status (resolve, defer, won't fix). */
-  updateStatus: (
-    findingId: string,
-    status: string,
-    resolution?: string,
-  ) => Promise<boolean>;
+  updateStatus: (findingId: string, status: string, resolution?: string) => Promise<boolean>;
   /** Respond to a finding that needs user input. */
   respond: (findingId: string, response: string) => Promise<boolean>;
   loading: boolean;
 }
 
 export function useFindingControls(): FindingControls {
-  const [updateMutation, { loading: updateLoading }] =
-    useUpdateFindingStatusGql();
-  const [respondMutation, { loading: respondLoading }] =
-    useRespondToFindingGql();
+  const [updateMutation, { loading: updateLoading }] = useUpdateFindingStatusGql();
+  const [respondMutation, { loading: respondLoading }] = useRespondToFindingGql();
 
   const updateStatus = useCallback(
-    async (
-      findingId: string,
-      status: string,
-      resolution?: string,
-    ): Promise<boolean> => {
+    async (findingId: string, status: string, resolution?: string): Promise<boolean> => {
       try {
         const { data } = await updateMutation({
           variables: { input: { findingId, status, resolution } },

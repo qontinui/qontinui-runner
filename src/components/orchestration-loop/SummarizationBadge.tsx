@@ -31,9 +31,7 @@ export function SummarizationBadge({ running }: SummarizationBadgeProps) {
 
   const fetchInfo = useCallback(async () => {
     try {
-      const result = await invoke<SummarizationInfo | null>(
-        "get_summarization_info",
-      );
+      const result = await invoke<SummarizationInfo | null>("get_summarization_info");
       setInfo(result);
     } catch {
       // Command may not exist yet
@@ -58,11 +56,7 @@ export function SummarizationBadge({ running }: SummarizationBadgeProps) {
 
   const savingsPercent =
     info.original_tokens > 0
-      ? Math.round(
-          ((info.original_tokens - info.compressed_tokens) /
-            info.original_tokens) *
-            100,
-        )
+      ? Math.round(((info.original_tokens - info.compressed_tokens) / info.original_tokens) * 100)
       : 0;
 
   const iterRange = info.iterations_summarized
@@ -84,12 +78,9 @@ export function SummarizationBadge({ running }: SummarizationBadgeProps) {
       >
         <Shrink className="w-3 h-3" />
         <span>Context compressed</span>
-        {iterRange && (
-          <span className="font-mono text-purple-400/70">({iterRange})</span>
-        )}
+        {iterRange && <span className="font-mono text-purple-400/70">({iterRange})</span>}
         <span className="font-mono">
-          {formatTokens(info.original_tokens)} &rarr;{" "}
-          {formatTokens(info.compressed_tokens)}
+          {formatTokens(info.original_tokens)} &rarr; {formatTokens(info.compressed_tokens)}
         </span>
       </button>
 
@@ -105,21 +96,15 @@ export function SummarizationBadge({ running }: SummarizationBadgeProps) {
           <div className="space-y-1.5 text-xs">
             <div className="flex justify-between">
               <span className="text-muted-foreground">Original tokens</span>
-              <span className="font-mono">
-                {info.original_tokens.toLocaleString()}
-              </span>
+              <span className="font-mono">{info.original_tokens.toLocaleString()}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">Compressed tokens</span>
-              <span className="font-mono">
-                {info.compressed_tokens.toLocaleString()}
-              </span>
+              <span className="font-mono">{info.compressed_tokens.toLocaleString()}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">Savings</span>
-              <span className="font-mono text-green-400">
-                {savingsPercent}%
-              </span>
+              <span className="font-mono text-green-400">{savingsPercent}%</span>
             </div>
             {iterRange && (
               <div className="flex justify-between">

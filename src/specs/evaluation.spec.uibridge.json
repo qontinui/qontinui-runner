@@ -1441,13 +1441,6 @@
     "pageUrl": "/evaluation",
     "elementSource": "sdk",
     "specType": "semantic",
-    "tags": [
-      "evaluation",
-      "datasets",
-      "experiments",
-      "llm-judge",
-      "opik",
-      "tier-2"
-    ]
+    "tags": ["evaluation", "datasets", "experiments", "llm-judge", "opik", "tier-2"]
   }
 }

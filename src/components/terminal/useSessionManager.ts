@@ -165,7 +165,10 @@ function extractProjectLabel(projectPath: string): string {
   return normalized.split("/").pop() ?? "";
 }
 
-function computeDuration(startedAt: string | null | undefined, lastModified: string): number | null {
+function computeDuration(
+  startedAt: string | null | undefined,
+  lastModified: string,
+): number | null {
   if (!startedAt) return null;
   try {
     const start = new Date(startedAt).getTime();
@@ -218,7 +221,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   const STORAGE_PREFIX = "session-manager-";
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<SessionLiveStatus | "all">(
-    () => (instanceStorage.getItem(`${STORAGE_PREFIX}status-filter`) as SessionLiveStatus | "all") || "all",
+    () =>
+      (instanceStorage.getItem(`${STORAGE_PREFIX}status-filter`) as SessionLiveStatus | "all") ||
+      "all",
   );
   const [accountFilter, setAccountFilter] = useState<string | "all">(
     () => instanceStorage.getItem(`${STORAGE_PREFIX}account-filter`) || "all",
@@ -231,10 +236,18 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   );
 
   // Persist filter/sort changes
-  useEffect(() => { instanceStorage.setItem(`${STORAGE_PREFIX}status-filter`, statusFilter); }, [statusFilter]);
-  useEffect(() => { instanceStorage.setItem(`${STORAGE_PREFIX}account-filter`, accountFilter); }, [accountFilter]);
-  useEffect(() => { instanceStorage.setItem(`${STORAGE_PREFIX}group-by`, groupBy); }, [groupBy]);
-  useEffect(() => { instanceStorage.setItem(`${STORAGE_PREFIX}sort-by`, sortBy); }, [sortBy]);
+  useEffect(() => {
+    instanceStorage.setItem(`${STORAGE_PREFIX}status-filter`, statusFilter);
+  }, [statusFilter]);
+  useEffect(() => {
+    instanceStorage.setItem(`${STORAGE_PREFIX}account-filter`, accountFilter);
+  }, [accountFilter]);
+  useEffect(() => {
+    instanceStorage.setItem(`${STORAGE_PREFIX}group-by`, groupBy);
+  }, [groupBy]);
+  useEffect(() => {
+    instanceStorage.setItem(`${STORAGE_PREFIX}sort-by`, sortBy);
+  }, [sortBy]);
 
   // ── Pinning (persisted) ───────────────────────────────────────────────────
 
@@ -629,9 +642,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   }, []);
 
   const selectAllFrozen = useCallback(() => {
-    const frozenIds = allSessions
-      .filter((s) => s.liveStatus === "frozen")
-      .map((s) => s.sessionId);
+    const frozenIds = allSessions.filter((s) => s.liveStatus === "frozen").map((s) => s.sessionId);
     setSelectedIds(new Set(frozenIds));
   }, [allSessions]);
 

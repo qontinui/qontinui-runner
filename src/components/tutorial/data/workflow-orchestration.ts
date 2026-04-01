@@ -18,7 +18,15 @@ export const workflowOrchestrationTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "gui-automation",
   category: "Architecture",
-  tags: ["featured", "architecture", "inngest", "event-bus", "flow-control", "queue", "circuit-breaker"],
+  tags: [
+    "featured",
+    "architecture",
+    "inngest",
+    "event-bus",
+    "flow-control",
+    "queue",
+    "circuit-breaker",
+  ],
   prerequisites: ["getting-started"],
   learningObjectives: [
     "Understand the event bus and how workflows communicate",
@@ -371,9 +379,7 @@ You can also verify API contracts using the spec runner:
         "The Event History page polls these endpoints every 5 seconds",
         "You can test endpoints directly with curl from the terminal",
       ],
-      resources: [
-        { title: "Inngest (inspiration)", url: "https://www.inngest.com/docs" },
-      ],
+      resources: [{ title: "Inngest (inspiration)", url: "https://www.inngest.com/docs" }],
     },
 
     // =========================================================================

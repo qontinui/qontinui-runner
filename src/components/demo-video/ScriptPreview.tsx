@@ -30,7 +30,8 @@ function actionLabel(action: DemoAction): string {
     case "waitForIdle":
       return `Wait for idle`;
     case "visual": {
-      const name = action.filePath === "PLACEHOLDER" ? "needs asset" : action.filePath.split(/[/\\]/).pop();
+      const name =
+        action.filePath === "PLACEHOLDER" ? "needs asset" : action.filePath.split(/[/\\]/).pop();
       return `Visual: ${name}${action.caption ? ` — "${action.caption}"` : ""}`;
     }
   }
@@ -69,38 +70,22 @@ function ActionBadge({ action }: { action: DemoAction }) {
 // Step Card
 // =============================================================================
 
-function StepCard({
-  step,
-  index,
-  isActive,
-}: {
-  step: DemoStep;
-  index: number;
-  isActive: boolean;
-}) {
+function StepCard({ step, index, isActive }: { step: DemoStep; index: number; isActive: boolean }) {
   return (
     <div
-      className={`relative pl-8 pb-6 border-l-2 ${
-        isActive
-          ? "border-primary"
-          : "border-border"
-      }`}
+      className={`relative pl-8 pb-6 border-l-2 ${isActive ? "border-primary" : "border-border"}`}
     >
       {/* Timeline dot */}
       <div
         className={`absolute left-0 top-0 -translate-x-1/2 w-3 h-3 rounded-full border-2 ${
-          isActive
-            ? "bg-primary border-primary"
-            : "bg-background border-muted-foreground"
+          isActive ? "bg-primary border-primary" : "bg-background border-muted-foreground"
         }`}
       />
 
       {/* Step content */}
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-mono text-muted-foreground">
-            Step {index + 1}
-          </span>
+          <span className="text-xs font-mono text-muted-foreground">Step {index + 1}</span>
           {step.highlight && (
             <span className="text-xs text-primary/70">
               ✦ {step.highlight.type} on {step.highlight.elementId}
@@ -157,12 +142,7 @@ export function ScriptPreview({ script, activeStepIndex = -1 }: ScriptPreviewPro
       {/* Timeline */}
       <div className="mt-4">
         {script.steps.map((step, i) => (
-          <StepCard
-            key={step.id}
-            step={step}
-            index={i}
-            isActive={i === activeStepIndex}
-          />
+          <StepCard key={step.id} step={step} index={i} isActive={i === activeStepIndex} />
         ))}
       </div>
     </div>

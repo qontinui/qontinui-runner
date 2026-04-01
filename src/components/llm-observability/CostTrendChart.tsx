@@ -37,9 +37,7 @@ function CustomTooltip({
         <p className="font-semibold text-sm">{d.date}</p>
         <div className="text-xs text-muted-foreground mt-1 space-y-1">
           <p>Daily cost: ${d.cost.toFixed(2)}</p>
-          {d.movingAvg !== null && (
-            <p>7-day avg: ${d.movingAvg.toFixed(2)}</p>
-          )}
+          {d.movingAvg !== null && <p>7-day avg: ${d.movingAvg.toFixed(2)}</p>}
           <p>Calls: {d.calls.toLocaleString()}</p>
           <p>Input tokens: {d.inputTokens.toLocaleString()}</p>
           <p>Output tokens: {d.outputTokens.toLocaleString()}</p>
@@ -95,10 +93,7 @@ export function CostTrendChart() {
         </h3>
         <div className="text-center text-muted-foreground py-8">
           <p className="text-sm">Failed to load cost trends</p>
-          <button
-            onClick={() => refetch()}
-            className="mt-2 text-xs underline hover:no-underline"
-          >
+          <button onClick={() => refetch()} className="mt-2 text-xs underline hover:no-underline">
             Retry
           </button>
         </div>
@@ -122,7 +117,10 @@ export function CostTrendChart() {
   }
 
   return (
-    <div className="bg-card rounded-lg border border-border p-4" data-tutorial-id="llm-cost-trend-chart">
+    <div
+      className="bg-card rounded-lg border border-border p-4"
+      data-tutorial-id="llm-cost-trend-chart"
+    >
       <div className="flex items-center justify-between mb-4">
         <h3 className="font-semibold flex items-center gap-2">
           <TrendingUp className="w-4 h-4" />
@@ -158,11 +156,7 @@ export function CostTrendChart() {
               tickFormatter={(value: number) => `$${value.toFixed(2)}`}
             />
             <Tooltip content={<CustomTooltip />} />
-            <Legend
-              verticalAlign="top"
-              height={28}
-              wrapperStyle={{ fontSize: 11 }}
-            />
+            <Legend verticalAlign="top" height={28} wrapperStyle={{ fontSize: 11 }} />
             <Line
               name="Daily Cost"
               type="monotone"

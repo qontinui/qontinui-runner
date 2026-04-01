@@ -104,9 +104,7 @@ These metrics update based on the selected time range and can be filtered by mod
 
 This helps you catch cost regressions early — for example, if a prompt change doubles token usage.`,
       details: `The chart data comes from the \`CostTrendResponse\` schema, which includes an array of \`{ date, cost, calls }\` objects. The frontend \`useCostTrends\` hook fetches this from \`/llm-analytics/cost-trends\` with start/end date parameters. The 7-day moving average is calculated client-side for responsive filtering.`,
-      tips: [
-        "A sudden spike in the trend line often indicates a prompt regression or retry loop",
-      ],
+      tips: ["A sudden spike in the trend line often indicates a prompt regression or retry loop"],
       targetElement: {
         selector: '[data-tutorial-id="llm-cost-trend-chart"]',
         highlightType: "border",

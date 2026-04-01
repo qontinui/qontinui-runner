@@ -8,10 +8,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import {
-  DEMO_VISUAL_OVERLAY_EVENT,
-  type DemoVisualOverlayDetail,
-} from "@/lib/demo-video/types";
+import { DEMO_VISUAL_OVERLAY_EVENT, type DemoVisualOverlayDetail } from "@/lib/demo-video/types";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
 // =============================================================================
@@ -104,9 +101,7 @@ export function DemoVisualOverlay() {
       )}
 
       {caption && (
-        <p className="mt-4 text-lg text-white/90 font-medium max-w-2xl text-center">
-          {caption}
-        </p>
+        <p className="mt-4 text-lg text-white/90 font-medium max-w-2xl text-center">{caption}</p>
       )}
     </div>
   );

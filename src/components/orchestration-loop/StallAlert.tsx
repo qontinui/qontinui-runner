@@ -45,9 +45,7 @@ const DEFAULT_COLORS = {
 };
 
 function formatPatternType(type: string): string {
-  return type
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 interface StallAlertProps {
@@ -130,9 +128,7 @@ export function StallAlert({ running }: StallAlertProps) {
       <span className={cn("shrink-0 mt-0.5", colors.text)}>{icon}</span>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className={cn("text-xs font-semibold", colors.text)}>
-            Stall Detected
-          </span>
+          <span className={cn("text-xs font-semibold", colors.text)}>Stall Detected</span>
           <span
             className={cn(
               "inline-flex px-1.5 py-0.5 rounded-full text-[0.65rem] font-mono font-semibold",
@@ -148,9 +144,7 @@ export function StallAlert({ running }: StallAlertProps) {
             </span>
           )}
         </div>
-        <p className="text-xs text-muted-foreground mt-0.5 leading-snug">
-          {stall.intervention}
-        </p>
+        <p className="text-xs text-muted-foreground mt-0.5 leading-snug">{stall.intervention}</p>
       </div>
       <button
         onClick={() => setDismissed(true)}

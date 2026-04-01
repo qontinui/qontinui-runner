@@ -15,12 +15,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { useMemorySearch } from "./useMemorySearch";
-import {
-  ALL_SOURCES,
-  SOURCE_COLORS,
-  type MemoryResult,
-  type MemorySourceFilter,
-} from "./types";
+import { ALL_SOURCES, SOURCE_COLORS, type MemoryResult, type MemorySourceFilter } from "./types";
 
 const SOURCE_ICON_MAP: Record<string, typeof Search> = {
   observation: Eye,
@@ -39,7 +34,9 @@ function SourceBadge({ source }: { source: string }) {
   const Icon = SOURCE_ICON_MAP[source] || Search;
   const color = SOURCE_COLORS[source] || "bg-muted text-muted-foreground";
   return (
-    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs border ${color}`}>
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs border ${color}`}
+    >
       <Icon className="w-3 h-3" />
       {source.replace(/_/g, " ")}
     </span>
@@ -86,7 +83,7 @@ function ResultRow({ result }: { result: MemoryResult }) {
           )}
           {result.found_by.length > 0 && (
             <div className="flex gap-1">
-              {result.found_by.map(strategy => (
+              {result.found_by.map((strategy) => (
                 <span
                   key={strategy}
                   className="inline-flex items-center px-1 py-0.5 rounded text-[10px] bg-muted text-muted-foreground"
@@ -124,10 +121,8 @@ export function MemorySearchPanel() {
   };
 
   const toggleSource = (source: MemorySourceFilter) => {
-    setSelectedSources(prev =>
-      prev.includes(source)
-        ? prev.filter(s => s !== source)
-        : [...prev, source]
+    setSelectedSources((prev) =>
+      prev.includes(source) ? prev.filter((s) => s !== source) : [...prev, source],
     );
   };
 
@@ -154,13 +149,13 @@ export function MemorySearchPanel() {
         <input
           type="text"
           value={query}
-          onChange={e => setQuery(e.target.value)}
+          onChange={(e) => setQuery(e.target.value)}
           placeholder="Search observations, findings, rules, knowledge..."
           className="flex-1 px-3 py-1.5 text-sm bg-muted border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-ring"
         />
         <button
           type="button"
-          onClick={() => setShowFilters(f => !f)}
+          onClick={() => setShowFilters((f) => !f)}
           className={`px-2.5 py-1.5 text-sm rounded-md border border-border ${showFilters ? "bg-blue-500/10 text-blue-400 border-blue-500/30" : "bg-muted text-muted-foreground"}`}
         >
           <Filter className="w-4 h-4" />
@@ -190,7 +185,7 @@ export function MemorySearchPanel() {
           <div>
             <p className="text-xs font-medium text-muted-foreground mb-1.5">Sources</p>
             <div className="flex flex-wrap gap-1.5">
-              {ALL_SOURCES.map(source => {
+              {ALL_SOURCES.map((source) => {
                 const active = selectedSources.includes(source);
                 return (
                   <button
@@ -217,7 +212,7 @@ export function MemorySearchPanel() {
               <input
                 type="date"
                 value={dateFrom}
-                onChange={e => setDateFrom(e.target.value)}
+                onChange={(e) => setDateFrom(e.target.value)}
                 className="w-full px-2 py-1 text-xs bg-muted border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-ring"
               />
             </div>
@@ -226,7 +221,7 @@ export function MemorySearchPanel() {
               <input
                 type="date"
                 value={dateTo}
-                onChange={e => setDateTo(e.target.value)}
+                onChange={(e) => setDateTo(e.target.value)}
                 className="w-full px-2 py-1 text-xs bg-muted border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-ring"
               />
             </div>
@@ -243,7 +238,7 @@ export function MemorySearchPanel() {
               max="1"
               step="0.05"
               value={minScore}
-              onChange={e => setMinScore(parseFloat(e.target.value))}
+              onChange={(e) => setMinScore(parseFloat(e.target.value))}
               className="w-full accent-blue-500"
             />
           </div>
@@ -275,13 +270,15 @@ export function MemorySearchPanel() {
         {results.length > 0 && (
           <div className="bg-card rounded-lg border border-border">
             <div className="p-3 border-b border-border flex items-center justify-between">
-              <h3 className="text-sm font-medium">{total} result{total !== 1 ? "s" : ""}</h3>
+              <h3 className="text-sm font-medium">
+                {total} result{total !== 1 ? "s" : ""}
+              </h3>
               <div className="flex gap-1">
                 {Object.entries(
                   results.reduce<Record<string, number>>((acc, r) => {
                     acc[r.source] = (acc[r.source] || 0) + 1;
                     return acc;
-                  }, {})
+                  }, {}),
                 ).map(([source, count]) => (
                   <span
                     key={source}
@@ -293,7 +290,7 @@ export function MemorySearchPanel() {
               </div>
             </div>
             <div className="divide-y divide-border px-3">
-              {results.map(r => (
+              {results.map((r) => (
                 <ResultRow key={r.id} result={r} />
               ))}
             </div>

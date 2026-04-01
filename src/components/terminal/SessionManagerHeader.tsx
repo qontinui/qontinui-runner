@@ -91,7 +91,7 @@ export function SessionManagerHeader({
               <div
                 key={a.config_dir}
                 className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-[#1a1b26] border border-[#2a2d3d]"
-                title={`${label}: ${pct != null ? `${pct}% utilization` : a.status ?? "unknown"}`}
+                title={`${label}: ${pct != null ? `${pct}% utilization` : (a.status ?? "unknown")}`}
               >
                 <span
                   className="w-1.5 h-1.5 rounded-full shrink-0"
@@ -202,7 +202,9 @@ export function SessionManagerHeader({
           <span className="text-[10px] text-[#414868]">Group:</span>
           <select
             value={groupBy}
-            onChange={(e) => onGroupByChange(e.target.value as "status" | "account" | "project" | "date")}
+            onChange={(e) =>
+              onGroupByChange(e.target.value as "status" | "account" | "project" | "date")
+            }
             className="text-[10px] bg-[#1a1b26] border border-[#2a2d3d] rounded px-1 py-0.5 text-[#a9b1d6] focus:outline-none focus:border-[#7aa2f7]/50"
           >
             <option value="status">Status</option>
@@ -215,7 +217,9 @@ export function SessionManagerHeader({
           <span className="text-[10px] text-[#414868]">Sort:</span>
           <select
             value={sortBy}
-            onChange={(e) => onSortByChange(e.target.value as "recent" | "oldest" | "messages" | "staleness")}
+            onChange={(e) =>
+              onSortByChange(e.target.value as "recent" | "oldest" | "messages" | "staleness")
+            }
             className="text-[10px] bg-[#1a1b26] border border-[#2a2d3d] rounded px-1 py-0.5 text-[#a9b1d6] focus:outline-none focus:border-[#7aa2f7]/50"
           >
             <option value="recent">Recent</option>

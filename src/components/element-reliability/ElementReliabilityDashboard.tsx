@@ -3,9 +3,26 @@ import { useFlakyElements } from "../../hooks/useGraphAnalytics";
 import type { ElementReliability } from "../../hooks/useGraphAnalytics";
 
 function ReliabilityBadge({ rate }: { rate: number }) {
-  if (rate >= 0.95) return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-500/10 text-green-400"><CheckCircle className="w-3 h-3" />Stable</span>;
-  if (rate >= 0.8) return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-500/10 text-yellow-500"><AlertTriangle className="w-3 h-3" />Flaky</span>;
-  return <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-500"><XCircle className="w-3 h-3" />Unreliable</span>;
+  if (rate >= 0.95)
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-500/10 text-green-400">
+        <CheckCircle className="w-3 h-3" />
+        Stable
+      </span>
+    );
+  if (rate >= 0.8)
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-500/10 text-yellow-500">
+        <AlertTriangle className="w-3 h-3" />
+        Flaky
+      </span>
+    );
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 text-red-500">
+      <XCircle className="w-3 h-3" />
+      Unreliable
+    </span>
+  );
 }
 
 function ElementRow({ element }: { element: ElementReliability }) {
@@ -13,7 +30,9 @@ function ElementRow({ element }: { element: ElementReliability }) {
   return (
     <div className="flex items-center justify-between py-2 px-1">
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium text-foreground truncate">{element.element_id || "Unknown"}</p>
+        <p className="text-sm font-medium text-foreground truncate">
+          {element.element_id || "Unknown"}
+        </p>
         <p className="text-xs text-muted-foreground">{element.total_interactions} interactions</p>
       </div>
       <div className="flex items-center gap-3">
@@ -51,15 +70,21 @@ export default function ElementReliabilityDashboard() {
           <>
             <div className="grid grid-cols-3 gap-3">
               <div className="bg-card rounded-lg border border-border p-3 text-center">
-                <p className="text-2xl font-bold text-green-400">{elements.filter(e => e.success_rate >= 0.95).length}</p>
+                <p className="text-2xl font-bold text-green-400">
+                  {elements.filter((e) => e.success_rate >= 0.95).length}
+                </p>
                 <p className="text-xs text-muted-foreground">Stable</p>
               </div>
               <div className="bg-card rounded-lg border border-border p-3 text-center">
-                <p className="text-2xl font-bold text-yellow-500">{elements.filter(e => e.success_rate >= 0.8 && e.success_rate < 0.95).length}</p>
+                <p className="text-2xl font-bold text-yellow-500">
+                  {elements.filter((e) => e.success_rate >= 0.8 && e.success_rate < 0.95).length}
+                </p>
                 <p className="text-xs text-muted-foreground">Flaky</p>
               </div>
               <div className="bg-card rounded-lg border border-border p-3 text-center">
-                <p className="text-2xl font-bold text-red-500">{elements.filter(e => e.success_rate < 0.8).length}</p>
+                <p className="text-2xl font-bold text-red-500">
+                  {elements.filter((e) => e.success_rate < 0.8).length}
+                </p>
                 <p className="text-xs text-muted-foreground">Unreliable</p>
               </div>
             </div>
@@ -71,7 +96,9 @@ export default function ElementReliabilityDashboard() {
               <div className="divide-y divide-border px-3">
                 {elements
                   .sort((a, b) => a.success_rate - b.success_rate)
-                  .map((el, i) => <ElementRow key={el.element_id || i} element={el} />)}
+                  .map((el, i) => (
+                    <ElementRow key={el.element_id || i} element={el} />
+                  ))}
               </div>
             </div>
           </>

@@ -62,9 +62,7 @@ export const feedbackScoreKeys = {
 // ---------------------------------------------------------------------------
 
 async function fetchFeedbackScores(runId: string): Promise<FeedbackScore[]> {
-  const res = await tracedFetch(
-    `${getApiBase()}/api/v1/execution-runs/${runId}/feedback-scores`,
-  );
+  const res = await tracedFetch(`${getApiBase()}/api/v1/execution-runs/${runId}/feedback-scores`);
   if (!res.ok) {
     throw new Error(`Failed to fetch feedback scores (HTTP ${res.status})`);
   }

@@ -76,7 +76,10 @@ export default function LlmObservabilityDashboard() {
   }
 
   return (
-    <div className="h-full overflow-auto p-4 space-y-4" data-tutorial-id="llm-observability-dashboard">
+    <div
+      className="h-full overflow-auto p-4 space-y-4"
+      data-tutorial-id="llm-observability-dashboard"
+    >
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -137,9 +140,7 @@ export default function LlmObservabilityDashboard() {
       </div>
 
       {/* UI Bridge Cost Attribution */}
-      {costByTargetApp.length > 0 && (
-        <CostByTargetAppChart data={costByTargetApp} />
-      )}
+      {costByTargetApp.length > 0 && <CostByTargetAppChart data={costByTargetApp} />}
 
       {/* Task Run Cost Table */}
       <TaskRunCostTable data={taskRunCosts} />

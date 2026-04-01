@@ -79,8 +79,16 @@ const SEVERITY_COLORS: Record<string, string> = {
 };
 
 const DOMAIN_COLORS = [
-  "#3b82f6", "#22c55e", "#f59e0b", "#ef4444", "#a855f7",
-  "#06b6d4", "#ec4899", "#84cc16", "#f97316", "#6366f1",
+  "#3b82f6",
+  "#22c55e",
+  "#f59e0b",
+  "#ef4444",
+  "#a855f7",
+  "#06b6d4",
+  "#ec4899",
+  "#84cc16",
+  "#f97316",
+  "#6366f1",
 ];
 
 function domainColor(index: number): string {
@@ -196,12 +204,7 @@ function HorizontalBarChart({
               fill={d.color}
               rx={3}
             />
-            <text
-              x={labelWidth + barW + 6}
-              y={y + rowHeight / 2 + 4}
-              fill="#9ca3af"
-              fontSize="11"
-            >
+            <text x={labelWidth + barW + 6} y={y + rowHeight / 2 + 4} fill="#9ca3af" fontSize="11">
               {d.value}
             </text>
             <title>{`${d.label}: ${d.value}`}</title>
@@ -348,13 +351,7 @@ function SourceBadge({ source }: { source: string }) {
   );
 }
 
-function ChartCard({
-  title,
-  children,
-}: {
-  title: string;
-  children: React.ReactNode;
-}) {
+function ChartCard({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div
       style={{
@@ -476,9 +473,7 @@ export function LearningDashboard() {
       >
         <h3 style={{ margin: 0 }}>Adaptive Learning</h3>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          {loading && (
-            <span style={{ fontSize: "11px", color: "#6b7280" }}>refreshing...</span>
-          )}
+          {loading && <span style={{ fontSize: "11px", color: "#6b7280" }}>refreshing...</span>}
           <button
             onClick={loadData}
             style={{
@@ -509,7 +504,11 @@ export function LearningDashboard() {
           value={stats.playbook_entries}
           detail={`${stats.active_lessons} active, ${stats.staged_lessons} staged`}
         />
-        <StatCard label="Curated Examples" value={stats.curated_examples} detail="Few-shot library" />
+        <StatCard
+          label="Curated Examples"
+          value={stats.curated_examples}
+          detail="Few-shot library"
+        />
         <StatCard
           label="Templates Tracked"
           value={stats.templates_tracked}
@@ -592,7 +591,9 @@ export function LearningDashboard() {
                 <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>Success</th>
                 <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>Failure</th>
                 <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>Confidence</th>
-                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>Avg Quality</th>
+                <th style={{ textAlign: "right", padding: "8px", color: "#9ca3af" }}>
+                  Avg Quality
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -613,11 +614,7 @@ export function LearningDashboard() {
                       padding: "6px 8px",
                       textAlign: "right",
                       color:
-                        t.confidence > 0.7
-                          ? "#22c55e"
-                          : t.confidence > 0.4
-                            ? "#f59e0b"
-                            : "#ef4444",
+                        t.confidence > 0.7 ? "#22c55e" : t.confidence > 0.4 ? "#f59e0b" : "#ef4444",
                     }}
                   >
                     {(t.confidence * 100).toFixed(0)}%

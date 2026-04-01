@@ -49,7 +49,7 @@ const AUDIENCE_CONTEXT: Record<TourAudience, string> = {
 function buildTourPlanningPrompt(
   spec: SpecConfig,
   elements: RegisteredElement[],
-  audience: TourAudience
+  audience: TourAudience,
 ): string {
   const specDescription = spec.description || "No description available";
   const pageUrl = spec.metadata?.pageUrl || "unknown";
@@ -68,7 +68,7 @@ function buildTourPlanningPrompt(
   const elementList = elements
     .map(
       (el) =>
-        `  - id: "${el.id}" | type: ${el.type} | label: "${el.label}" | actions: [${el.actions.join(", ")}]`
+        `  - id: "${el.id}" | type: ${el.type} | label: "${el.label}" | actions: [${el.actions.join(", ")}]`,
     )
     .join("\n");
 
@@ -150,7 +150,7 @@ Respond ONLY with the JSON object. No explanation, no markdown.`;
 export async function generateTour(
   spec: SpecConfig,
   elements: RegisteredElement[],
-  audience: TourAudience = "new-user"
+  audience: TourAudience = "new-user",
 ): Promise<ProductTour> {
   const prompt = buildTourPlanningPrompt(spec, elements, audience);
 

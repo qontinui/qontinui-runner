@@ -1,6 +1,15 @@
 import { X, ExternalLink, FileText, Globe, Database, Tag, ArrowRight, Clock } from "lucide-react";
-import type { Decision, ConceptSummaryRecord, Alternative, Inspiration } from "@/types/decision-trail";
-import { DECISION_CATEGORY_COLORS, DECISION_STATUS_COLORS, parseJsonField } from "@/types/decision-trail";
+import type {
+  Decision,
+  ConceptSummaryRecord,
+  Alternative,
+  Inspiration,
+} from "@/types/decision-trail";
+import {
+  DECISION_CATEGORY_COLORS,
+  DECISION_STATUS_COLORS,
+  parseJsonField,
+} from "@/types/decision-trail";
 import type { DecisionCategory, DecisionStatus } from "@/types/decision-trail";
 
 interface DecisionDetailPanelProps {
@@ -12,7 +21,9 @@ interface DecisionDetailPanelProps {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
-      <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">{title}</h4>
+      <h4 className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
+        {title}
+      </h4>
       {children}
     </div>
   );
@@ -21,13 +32,17 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function DecisionDetail({ decision }: { decision: Decision }) {
   const alternatives: Alternative[] = parseJsonField(decision.alternativesJson, []);
   const tradeoffs: string[] = parseJsonField(decision.tradeoffsJson, []);
-  const inspiration: Inspiration | null = parseJsonField<Inspiration | null>(decision.inspirationJson, null);
+  const inspiration: Inspiration | null = parseJsonField<Inspiration | null>(
+    decision.inspirationJson,
+    null,
+  );
   const relatedDecisions: string[] = parseJsonField(decision.relatedDecisionsJson, []);
   const affectedFiles: string[] = parseJsonField(decision.affectedFilesJson, []);
   const affectedEndpoints: string[] = parseJsonField(decision.affectedEndpointsJson, []);
   const affectedTables: string[] = parseJsonField(decision.affectedTablesJson, []);
   const tags: string[] = parseJsonField(decision.tagsJson, []);
-  const categoryColor = DECISION_CATEGORY_COLORS[decision.category as DecisionCategory] || "#6B7280";
+  const categoryColor =
+    DECISION_CATEGORY_COLORS[decision.category as DecisionCategory] || "#6B7280";
   const statusColor = DECISION_STATUS_COLORS[decision.status as DecisionStatus] || "#6B7280";
 
   return (
@@ -47,9 +62,13 @@ function DecisionDetail({ decision }: { decision: Decision }) {
           >
             {decision.status}
           </span>
-          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-            decision.scale === "strategic" ? "bg-purple-500/20 text-purple-400" : "bg-zinc-500/20 text-zinc-400"
-          }`}>
+          <span
+            className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+              decision.scale === "strategic"
+                ? "bg-purple-500/20 text-purple-400"
+                : "bg-zinc-500/20 text-zinc-400"
+            }`}
+          >
             {decision.scale}
           </span>
         </div>
@@ -110,7 +129,12 @@ function DecisionDetail({ decision }: { decision: Decision }) {
               <Globe className="w-3 h-3" />
               {inspiration.source}
               {inspiration.url && (
-                <a href={inspiration.url} target="_blank" rel="noopener noreferrer" className="text-primary">
+                <a
+                  href={inspiration.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary"
+                >
                   <ExternalLink className="w-3 h-3" />
                 </a>
               )}
@@ -129,7 +153,10 @@ function DecisionDetail({ decision }: { decision: Decision }) {
         <Section title="Affected Files">
           <div className="space-y-0.5">
             {affectedFiles.map((f, i) => (
-              <div key={i} className="flex items-center gap-1 text-[11px] text-foreground/70 font-mono">
+              <div
+                key={i}
+                className="flex items-center gap-1 text-[11px] text-foreground/70 font-mono"
+              >
                 <FileText className="w-3 h-3 shrink-0" />
                 <span className="truncate">{f}</span>
               </div>
@@ -142,7 +169,9 @@ function DecisionDetail({ decision }: { decision: Decision }) {
         <Section title="Affected Endpoints">
           <div className="space-y-0.5">
             {affectedEndpoints.map((e, i) => (
-              <div key={i} className="text-[11px] text-foreground/70 font-mono">{e}</div>
+              <div key={i} className="text-[11px] text-foreground/70 font-mono">
+                {e}
+              </div>
             ))}
           </div>
         </Section>
@@ -152,8 +181,12 @@ function DecisionDetail({ decision }: { decision: Decision }) {
         <Section title="Affected Tables">
           <div className="flex flex-wrap gap-1">
             {affectedTables.map((t, i) => (
-              <span key={i} className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-muted text-foreground/70 font-mono">
-                <Database className="w-3 h-3" />{t}
+              <span
+                key={i}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-muted text-foreground/70 font-mono"
+              >
+                <Database className="w-3 h-3" />
+                {t}
               </span>
             ))}
           </div>
@@ -164,8 +197,12 @@ function DecisionDetail({ decision }: { decision: Decision }) {
         <Section title="Tags">
           <div className="flex flex-wrap gap-1">
             {tags.map((t, i) => (
-              <span key={i} className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-muted text-muted-foreground">
-                <Tag className="w-3 h-3" />{t}
+              <span
+                key={i}
+                className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-muted text-muted-foreground"
+              >
+                <Tag className="w-3 h-3" />
+                {t}
               </span>
             ))}
           </div>
@@ -176,7 +213,9 @@ function DecisionDetail({ decision }: { decision: Decision }) {
         <Section title="Related Decisions">
           <div className="space-y-0.5">
             {relatedDecisions.map((id, i) => (
-              <div key={i} className="text-[11px] text-primary font-mono">{id}</div>
+              <div key={i} className="text-[11px] text-primary font-mono">
+                {id}
+              </div>
             ))}
           </div>
         </Section>
@@ -186,7 +225,10 @@ function DecisionDetail({ decision }: { decision: Decision }) {
 }
 
 function ConceptDetail({ concept }: { concept: ConceptSummaryRecord }) {
-  const inspiration: Inspiration | null = parseJsonField<Inspiration | null>(concept.inspirationJson, null);
+  const inspiration: Inspiration | null = parseJsonField<Inspiration | null>(
+    concept.inspirationJson,
+    null,
+  );
   const benefits: string[] = parseJsonField(concept.benefitsJson, []);
   const components: string[] = parseJsonField(concept.componentsJson, []);
   const relatedDecisions: string[] = parseJsonField(concept.relatedDecisionsJson, []);
@@ -200,7 +242,9 @@ function ConceptDetail({ concept }: { concept: ConceptSummaryRecord }) {
       </div>
 
       <Section title="Description">
-        <p className="text-xs text-foreground/80 leading-relaxed whitespace-pre-wrap">{concept.description}</p>
+        <p className="text-xs text-foreground/80 leading-relaxed whitespace-pre-wrap">
+          {concept.description}
+        </p>
       </Section>
 
       {inspiration && (
@@ -243,7 +287,8 @@ function ConceptDetail({ concept }: { concept: ConceptSummaryRecord }) {
           <div className="space-y-0.5">
             {components.map((c, i) => (
               <div key={i} className="text-[11px] text-foreground/70 font-mono">
-                <FileText className="w-3 h-3 inline mr-1" />{c}
+                <FileText className="w-3 h-3 inline mr-1" />
+                {c}
               </div>
             ))}
           </div>
@@ -279,7 +324,9 @@ function ConceptDetail({ concept }: { concept: ConceptSummaryRecord }) {
         <Section title="Related Decisions">
           <div className="space-y-0.5">
             {relatedDecisions.map((id, i) => (
-              <div key={i} className="text-[11px] text-primary font-mono">{id}</div>
+              <div key={i} className="text-[11px] text-primary font-mono">
+                {id}
+              </div>
             ))}
           </div>
         </Section>

@@ -90,16 +90,9 @@ export function useTaskRunLive(
   const taskRun = taskRunData?.taskRun ?? null;
   const isRunning = taskRun?.status === "running" || taskRun?.status === "paused";
   const isTerminal =
-    taskRun?.status === "complete" ||
-    taskRun?.status === "failed" ||
-    taskRun?.status === "stopped";
+    taskRun?.status === "complete" || taskRun?.status === "failed" || taskRun?.status === "stopped";
 
-  const { data: outputData } = useTaskRunOutputGql(
-    taskRunId,
-    outputOffset,
-    outputLimit,
-    !active,
-  );
+  const { data: outputData } = useTaskRunOutputGql(taskRunId, outputOffset, outputLimit, !active);
 
   const { data: summaryData } = useFindingSummaryGql(taskRunId, !active);
 

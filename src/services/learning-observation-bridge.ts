@@ -76,14 +76,10 @@ class LearningObservationBridge {
     }
 
     // Run initial sync
-    this.syncPatterns().catch((e) =>
-      logger.debug("Initial pattern sync skipped:", e),
-    );
+    this.syncPatterns().catch((e) => logger.debug("Initial pattern sync skipped:", e));
 
     this.syncIntervalId = setInterval(() => {
-      this.syncPatterns().catch((e) =>
-        logger.debug("Periodic pattern sync failed:", e),
-      );
+      this.syncPatterns().catch((e) => logger.debug("Periodic pattern sync failed:", e));
     }, intervalMs);
 
     logger.info(`Learning observation bridge started (interval: ${intervalMs}ms)`);
@@ -147,9 +143,7 @@ class LearningObservationBridge {
     }
 
     if (patternsSynced > 0 || insightsSynced > 0) {
-      logger.info(
-        `Synced ${patternsSynced} patterns, ${insightsSynced} insights to observations`,
-      );
+      logger.info(`Synced ${patternsSynced} patterns, ${insightsSynced} insights to observations`);
     }
 
     return { patterns: patternsSynced, insights: insightsSynced };
@@ -167,8 +161,7 @@ class LearningObservationBridge {
     }
 
     return (
-      pattern.confidence >= MIN_PATTERN_CONFIDENCE &&
-      pattern.occurrences >= MIN_PATTERN_OCCURRENCES
+      pattern.confidence >= MIN_PATTERN_CONFIDENCE && pattern.occurrences >= MIN_PATTERN_OCCURRENCES
     );
   }
 
@@ -181,8 +174,7 @@ class LearningObservationBridge {
   }
 
   private async savePatternAsObservation(pattern: Pattern): Promise<boolean> {
-    const observationType =
-      PATTERN_TYPE_TO_OBSERVATION[pattern.pattern_type] || "pattern";
+    const observationType = PATTERN_TYPE_TO_OBSERVATION[pattern.pattern_type] || "pattern";
 
     const content = [
       `## ${pattern.name}`,
@@ -194,9 +186,7 @@ class LearningObservationBridge {
       `- **Success Rate:** ${(pattern.success_rate * 100).toFixed(0)}%`,
       `- **Occurrences:** ${pattern.occurrences}`,
       "",
-      pattern.triggers.length > 0
-        ? `**Triggers:** ${pattern.triggers.join(", ")}`
-        : "",
+      pattern.triggers.length > 0 ? `**Triggers:** ${pattern.triggers.join(", ")}` : "",
       "",
       pattern.recommendations.length > 0
         ? `**Recommendations:**\n${pattern.recommendations.map((r) => `- ${r}`).join("\n")}`
@@ -249,9 +239,7 @@ class LearningObservationBridge {
     });
   }
 
-  private async postObservation(
-    payload: CreateObservationPayload,
-  ): Promise<boolean> {
+  private async postObservation(payload: CreateObservationPayload): Promise<boolean> {
     try {
       const response = await tracedFetch(`${getApiBase()}/observations`, {
         method: "POST",

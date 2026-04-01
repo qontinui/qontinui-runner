@@ -6,22 +6,8 @@
  */
 
 import { useState, useMemo } from "react";
-import {
-  ResponsiveContainer,
-  PieChart,
-  Pie,
-  Cell,
-  Tooltip,
-} from "recharts";
-import {
-  Activity,
-  Clock,
-  AlertTriangle,
-  Archive,
-  Filter,
-  GitCommit,
-  FileText,
-} from "lucide-react";
+import { ResponsiveContainer, PieChart, Pie, Cell, Tooltip } from "recharts";
+import { Activity, Clock, AlertTriangle, Archive, Filter, GitCommit, FileText } from "lucide-react";
 import type {
   FeatureHealth,
   FeatureHealthResult,
@@ -49,10 +35,7 @@ function FeatureCard({ feature }: { feature: FeatureHealth }) {
   return (
     <div className="border rounded-lg p-2.5 text-xs bg-card hover:bg-muted/30 transition-colors">
       <div className="flex items-center gap-1.5 mb-1.5">
-        <div
-          className="w-2 h-2 rounded-full shrink-0"
-          style={{ background: statusColor }}
-        />
+        <div className="w-2 h-2 rounded-full shrink-0" style={{ background: statusColor }} />
         <span className="font-medium truncate">{feature.page}</span>
       </div>
 
@@ -60,24 +43,16 @@ function FeatureCard({ feature }: { feature: FeatureHealth }) {
         <div className="flex items-center gap-1.5">
           <GitCommit className="w-3 h-3" />
           <span>
-            Code:{" "}
-            {feature.codeAge === 0
-              ? "today"
-              : `${Math.round(feature.codeAge)}d ago`}
+            Code: {feature.codeAge === 0 ? "today" : `${Math.round(feature.codeAge)}d ago`}
           </span>
           {feature.codeCommitCount30d > 0 && (
-            <span className="text-foreground">
-              ({feature.codeCommitCount30d} commits/30d)
-            </span>
+            <span className="text-foreground">({feature.codeCommitCount30d} commits/30d)</span>
           )}
         </div>
         <div className="flex items-center gap-1.5">
           <FileText className="w-3 h-3" />
           <span>
-            Spec:{" "}
-            {feature.specAge === 0
-              ? "today"
-              : `${Math.round(feature.specAge)}d ago`}
+            Spec: {feature.specAge === 0 ? "today" : `${Math.round(feature.specAge)}d ago`}
           </span>
         </div>
       </div>
@@ -133,9 +108,7 @@ function StatusColumn({
       </div>
       <div className="flex-1 overflow-auto p-2 space-y-2">
         {features.length === 0 ? (
-          <div className="text-xs text-muted-foreground text-center py-4">
-            None
-          </div>
+          <div className="text-xs text-muted-foreground text-center py-4">None</div>
         ) : (
           features.map((f) => <FeatureCard key={f.page} feature={f} />)
         )}
@@ -152,9 +125,7 @@ function TimelineView({ features }: { features: FeatureHealth[] }) {
   const sorted = useMemo(
     () =>
       [...features].sort(
-        (a, b) =>
-          new Date(b.lastCodeChange).getTime() -
-          new Date(a.lastCodeChange).getTime(),
+        (a, b) => new Date(b.lastCodeChange).getTime() - new Date(a.lastCodeChange).getTime(),
       ),
     [features],
   );
@@ -171,13 +142,11 @@ function TimelineView({ features }: { features: FeatureHealth[] }) {
         {sorted.map((f) => {
           const codeDaysAgo = Math.min(
             maxAge,
-            (now - new Date(f.lastCodeChange).getTime()) /
-              (1000 * 60 * 60 * 24),
+            (now - new Date(f.lastCodeChange).getTime()) / (1000 * 60 * 60 * 24),
           );
           const specDaysAgo = Math.min(
             maxAge,
-            (now - new Date(f.lastSpecChange).getTime()) /
-              (1000 * 60 * 60 * 24),
+            (now - new Date(f.lastSpecChange).getTime()) / (1000 * 60 * 60 * 24),
           );
           const codeLeft = ((maxAge - codeDaysAgo) / maxAge) * 100;
           const specLeft = ((maxAge - specDaysAgo) / maxAge) * 100;
@@ -186,8 +155,7 @@ function TimelineView({ features }: { features: FeatureHealth[] }) {
           // Gap bar between spec and code (red if code changed but spec didn't)
           const gapStart = Math.min(codeLeft, specLeft);
           const gapEnd = Math.max(codeLeft, specLeft);
-          const hasGap =
-            f.status === "spec-drift" && gapEnd - gapStart > 2;
+          const hasGap = f.status === "spec-drift" && gapEnd - gapStart > 2;
 
           return (
             <div key={f.page} className="flex items-center gap-2 h-6">
@@ -233,23 +201,13 @@ function TimelineView({ features }: { features: FeatureHealth[] }) {
 // Main Panel
 // =============================================================================
 
-export function FeatureHealthPanel({
-  data,
-  loading,
-  onRefresh,
-}: FeatureHealthPanelProps) {
+export function FeatureHealthPanel({ data, loading, onRefresh }: FeatureHealthPanelProps) {
   const [view, setView] = useState<"board" | "timeline">("board");
   const [filter, setFilter] = useState<FeatureHealth["status"] | "all">("all");
 
-  const grouped = useMemo(
-    () => (data ? groupByStatus(data.features) : null),
-    [data],
-  );
+  const grouped = useMemo(() => (data ? groupByStatus(data.features) : null), [data]);
 
-  const distribution = useMemo(
-    () => (data ? getStatusDistribution(data.features) : []),
-    [data],
-  );
+  const distribution = useMemo(() => (data ? getStatusDistribution(data.features) : []), [data]);
 
   const filteredFeatures = useMemo(() => {
     if (!data) return [];
@@ -309,18 +267,14 @@ export function FeatureHealthPanel({
           <span className="text-emerald-500">{data.summary.active} active</span>
           <span className="text-yellow-500">{data.summary.stale} stale</span>
           <span className="text-orange-500">{data.summary.specDrift} drift</span>
-          <span className="text-destructive">
-            {data.summary.abandoned} abandoned
-          </span>
+          <span className="text-destructive">{data.summary.abandoned} abandoned</span>
         </div>
 
         <div className="ml-auto flex items-center gap-1">
           <select
             className="text-xs bg-muted rounded px-1.5 py-1 border-0"
             value={filter}
-            onChange={(e) =>
-              setFilter(e.target.value as FeatureHealth["status"] | "all")
-            }
+            onChange={(e) => setFilter(e.target.value as FeatureHealth["status"] | "all")}
           >
             <option value="all">All</option>
             <option value="active">Active</option>
@@ -348,22 +302,10 @@ export function FeatureHealthPanel({
         <div className="flex-1 flex min-h-0 divide-x">
           {filter === "all" ? (
             <>
-              <StatusColumn
-                status="active"
-                features={grouped!.active}
-              />
-              <StatusColumn
-                status="stale"
-                features={grouped!.stale}
-              />
-              <StatusColumn
-                status="spec-drift"
-                features={grouped!["spec-drift"]}
-              />
-              <StatusColumn
-                status="abandoned"
-                features={grouped!.abandoned}
-              />
+              <StatusColumn status="active" features={grouped!.active} />
+              <StatusColumn status="stale" features={grouped!.stale} />
+              <StatusColumn status="spec-drift" features={grouped!["spec-drift"]} />
+              <StatusColumn status="abandoned" features={grouped!.abandoned} />
             </>
           ) : (
             <StatusColumn status={filter} features={filteredFeatures} />

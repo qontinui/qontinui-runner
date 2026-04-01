@@ -182,11 +182,7 @@ export function buildFlameData(roots: TraceTreeNode[]): FlameNode[] {
    * parentXStart/parentXEnd define the parent's fraction range — children are laid out
    * within this range proportional to their duration, with idle gaps removed.
    */
-  function buildFlameNode(
-    node: TraceTreeNode,
-    xStart: number,
-    xEnd: number,
-  ): FlameNode {
+  function buildFlameNode(node: TraceTreeNode, xStart: number, xEnd: number): FlameNode {
     const phase = inferPhase(node.span.name);
 
     const sortedChildren = [...node.children].sort(
@@ -264,9 +260,21 @@ export function alignSpans(spansA: TraceSpan[], spansB: TraceSpan[]): SpanMatch[
     const b = mapB.get(key) ?? null;
 
     if (!a) {
-      matches.push({ spanA: null, spanB: b, durationDelta: null, durationDeltaPct: null, status: "added" });
+      matches.push({
+        spanA: null,
+        spanB: b,
+        durationDelta: null,
+        durationDeltaPct: null,
+        status: "added",
+      });
     } else if (!b) {
-      matches.push({ spanA: a, spanB: null, durationDelta: null, durationDeltaPct: null, status: "removed" });
+      matches.push({
+        spanA: a,
+        spanB: null,
+        durationDelta: null,
+        durationDeltaPct: null,
+        status: "removed",
+      });
     } else {
       const durA = a.duration_ms ?? 0;
       const durB = b.duration_ms ?? 0;
@@ -280,7 +288,13 @@ export function alignSpans(spansA: TraceSpan[], spansB: TraceSpan[]): SpanMatch[
         status = delta > 0 ? "slower" : "faster";
       }
 
-      matches.push({ spanA: a, spanB: b, durationDelta: delta, durationDeltaPct: deltaPct, status });
+      matches.push({
+        spanA: a,
+        spanB: b,
+        durationDelta: delta,
+        durationDeltaPct: deltaPct,
+        status,
+      });
     }
   }
 
@@ -294,7 +308,10 @@ export function alignSpans(spansA: TraceSpan[], spansB: TraceSpan[]): SpanMatch[
       faster: 4,
       unchanged: 5,
     };
-    return (order[a.status] - order[b.status]) || (Math.abs(b.durationDelta ?? 0) - Math.abs(a.durationDelta ?? 0));
+    return (
+      order[a.status] - order[b.status] ||
+      Math.abs(b.durationDelta ?? 0) - Math.abs(a.durationDelta ?? 0)
+    );
   });
 
   return matches;
@@ -310,16 +327,30 @@ export function computeComparisonSummary(
   const totalB = computeInsights(spansB).totalDurationMs;
   const totalDeltaPct = totalA > 0 ? ((totalB - totalA) / totalA) * 100 : 0;
 
-  let fasterCount = 0, slowerCount = 0, addedCount = 0, removedCount = 0, statusChangedCount = 0;
+  let fasterCount = 0,
+    slowerCount = 0,
+    addedCount = 0,
+    removedCount = 0,
+    statusChangedCount = 0;
   const regressions: SpanMatch[] = [];
 
   for (const m of matches) {
     switch (m.status) {
-      case "faster": fasterCount++; break;
-      case "slower": slowerCount++; break;
-      case "added": addedCount++; break;
-      case "removed": removedCount++; break;
-      case "status_changed": statusChangedCount++; break;
+      case "faster":
+        fasterCount++;
+        break;
+      case "slower":
+        slowerCount++;
+        break;
+      case "added":
+        addedCount++;
+        break;
+      case "removed":
+        removedCount++;
+        break;
+      case "status_changed":
+        statusChangedCount++;
+        break;
     }
     // Flag regressions: >50% slower, status changed to error, or new error spans
     const isRegression =
@@ -460,24 +491,46 @@ export function computeCriticalPath(roots: TraceTreeNode[]): CriticalPathInfo {
 
 /** Compute aggregate token insights across all spans. */
 export function computeTokenInsights(spans: TraceSpan[]): {
-  totalInputTokens: number; totalOutputTokens: number; totalCostCents: number;
-  maxInputTokens: number; maxOutputTokens: number; maxCostCents: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCostCents: number;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxCostCents: number;
   phaseTokens: Record<string, { input: number; output: number; cost: number }>;
 } {
-  let totalInputTokens = 0, totalOutputTokens = 0, totalCostCents = 0;
-  let maxInputTokens = 0, maxOutputTokens = 0, maxCostCents = 0;
+  let totalInputTokens = 0,
+    totalOutputTokens = 0,
+    totalCostCents = 0;
+  let maxInputTokens = 0,
+    maxOutputTokens = 0,
+    maxCostCents = 0;
   const phaseTokens: Record<string, { input: number; output: number; cost: number }> = {};
   for (const span of spans) {
-    const input = span.input_tokens ?? 0, output = span.output_tokens ?? 0, cost = span.cost_cents ?? 0;
-    totalInputTokens += input; totalOutputTokens += output; totalCostCents += cost;
+    const input = span.input_tokens ?? 0,
+      output = span.output_tokens ?? 0,
+      cost = span.cost_cents ?? 0;
+    totalInputTokens += input;
+    totalOutputTokens += output;
+    totalCostCents += cost;
     if (input > maxInputTokens) maxInputTokens = input;
     if (output > maxOutputTokens) maxOutputTokens = output;
     if (cost > maxCostCents) maxCostCents = cost;
     const phase = inferPhase(span.name);
     if (!phaseTokens[phase]) phaseTokens[phase] = { input: 0, output: 0, cost: 0 };
-    phaseTokens[phase].input += input; phaseTokens[phase].output += output; phaseTokens[phase].cost += cost;
+    phaseTokens[phase].input += input;
+    phaseTokens[phase].output += output;
+    phaseTokens[phase].cost += cost;
   }
-  return { totalInputTokens, totalOutputTokens, totalCostCents, maxInputTokens, maxOutputTokens, maxCostCents, phaseTokens };
+  return {
+    totalInputTokens,
+    totalOutputTokens,
+    totalCostCents,
+    maxInputTokens,
+    maxOutputTokens,
+    maxCostCents,
+    phaseTokens,
+  };
 }
 
 /** Get 0-1 heat intensity for a span given the overlay mode. */
@@ -485,9 +538,15 @@ export function getTokenHeat(span: TraceSpan, mode: TokenOverlayMode, maxValue: 
   if (mode === "none" || maxValue === 0) return 0;
   let value = 0;
   switch (mode) {
-    case "input": value = span.input_tokens ?? 0; break;
-    case "output": value = span.output_tokens ?? 0; break;
-    case "cost": value = span.cost_cents ?? 0; break;
+    case "input":
+      value = span.input_tokens ?? 0;
+      break;
+    case "output":
+      value = span.output_tokens ?? 0;
+      break;
+    case "cost":
+      value = span.cost_cents ?? 0;
+      break;
   }
   return Math.min(value / maxValue, 1);
 }

@@ -18,22 +18,13 @@ import {
   Bar,
   Cell,
 } from "recharts";
-import {
-  TrendingUp,
-  AlertTriangle,
-  Layers,
-  ChevronDown,
-  ChevronRight,
-} from "lucide-react";
+import { TrendingUp, AlertTriangle, Layers, ChevronDown, ChevronRight } from "lucide-react";
 import type {
   ComplexityScore,
   ComplexityAnalysisResult,
   DriftAlert,
 } from "@/lib/development-intelligence/complexity-scorer";
-import {
-  getTierColor,
-  getScoreBreakdown,
-} from "@/lib/development-intelligence/complexity-scorer";
+import { getTierColor, getScoreBreakdown } from "@/lib/development-intelligence/complexity-scorer";
 
 interface ComplexityDashboardProps {
   data: ComplexityAnalysisResult | null;
@@ -81,9 +72,7 @@ function TreemapContent(props: {
             fontSize={11}
             fontWeight={600}
           >
-            {name.length > width / 8
-              ? name.slice(0, Math.floor(width / 8)) + "…"
-              : name}
+            {name.length > width / 8 ? name.slice(0, Math.floor(width / 8)) + "…" : name}
           </text>
           <text
             x={x + width / 2}
@@ -146,7 +135,11 @@ function ScoreBreakdownPanel({ score }: { score: ComplexityScore }) {
 
       <div className="h-32">
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={breakdown} layout="vertical" margin={{ left: 70, right: 8, top: 4, bottom: 4 }}>
+          <BarChart
+            data={breakdown}
+            layout="vertical"
+            margin={{ left: 70, right: 8, top: 4, bottom: 4 }}
+          >
             <XAxis type="number" tick={{ fontSize: 9 }} />
             <YAxis type="category" dataKey="label" tick={{ fontSize: 9 }} width={65} />
             <Tooltip
@@ -156,7 +149,9 @@ function ScoreBreakdownPanel({ score }: { score: ComplexityScore }) {
                 return (
                   <div className="bg-popover border border-border rounded-lg p-2 text-xs">
                     <p className="font-medium">{d.label}</p>
-                    <p>Value: {d.value} × {d.weight} = {d.weighted}</p>
+                    <p>
+                      Value: {d.value} × {d.weight} = {d.weighted}
+                    </p>
                   </div>
                 );
               }}
@@ -172,9 +167,7 @@ function ScoreBreakdownPanel({ score }: { score: ComplexityScore }) {
 
       {score.drift && (
         <div className="mt-2">
-          <div className="text-xs text-muted-foreground mb-1">
-            Complexity Trend
-          </div>
+          <div className="text-xs text-muted-foreground mb-1">Complexity Trend</div>
           <div className="h-16">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={score.drift.complexityTrend.map((v, i) => ({ i, v }))}>
@@ -189,9 +182,7 @@ function ScoreBreakdownPanel({ score }: { score: ComplexityScore }) {
             </ResponsiveContainer>
           </div>
           {score.drift.warning && (
-            <div className="text-xs text-yellow-500 mt-1">
-              {score.drift.warning}
-            </div>
+            <div className="text-xs text-yellow-500 mt-1">{score.drift.warning}</div>
           )}
         </div>
       )}
@@ -203,11 +194,7 @@ function ScoreBreakdownPanel({ score }: { score: ComplexityScore }) {
 // Main Dashboard
 // =============================================================================
 
-export function ComplexityDashboard({
-  data,
-  loading,
-  onRefresh,
-}: ComplexityDashboardProps) {
+export function ComplexityDashboard({ data, loading, onRefresh }: ComplexityDashboardProps) {
   const [selectedPage, setSelectedPage] = useState<string | null>(null);
 
   const treemapData = useMemo(() => {
@@ -252,18 +239,10 @@ export function ComplexityDashboard({
         </div>
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span>{data.summary.totalPages} pages</span>
-          <span style={{ color: getTierColor("simple") }}>
-            {data.summary.simple} simple
-          </span>
-          <span style={{ color: getTierColor("moderate") }}>
-            {data.summary.moderate} moderate
-          </span>
-          <span style={{ color: getTierColor("complex") }}>
-            {data.summary.complex} complex
-          </span>
-          <span style={{ color: getTierColor("critical") }}>
-            {data.summary.critical} critical
-          </span>
+          <span style={{ color: getTierColor("simple") }}>{data.summary.simple} simple</span>
+          <span style={{ color: getTierColor("moderate") }}>{data.summary.moderate} moderate</span>
+          <span style={{ color: getTierColor("complex") }}>{data.summary.complex} complex</span>
+          <span style={{ color: getTierColor("critical") }}>{data.summary.critical} critical</span>
           <span>Avg: {Math.round(data.summary.averageComposite)}</span>
         </div>
       </div>
@@ -293,7 +272,9 @@ export function ComplexityDashboard({
                 data={treemapData}
                 dataKey="size"
                 aspectRatio={4 / 3}
-                content={<TreemapContent x={0} y={0} width={0} height={0} name="" tier="" composite={0} />}
+                content={
+                  <TreemapContent x={0} y={0} width={0} height={0} name="" tier="" composite={0} />
+                }
                 onClick={(node: { name?: string }) => {
                   if (node?.name) setSelectedPage(node.name);
                 }}

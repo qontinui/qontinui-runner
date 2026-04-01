@@ -10,15 +10,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIComponent, useUIElement } from "ui-bridge";
-import {
-  Eye,
-  Plus,
-  Trash2,
-  ToggleLeft,
-  ToggleRight,
-  Clock,
-  X,
-} from "lucide-react";
+import { Eye, Plus, Trash2, ToggleLeft, ToggleRight, Clock, X } from "lucide-react";
 
 interface Watcher {
   id: string;
@@ -146,17 +138,25 @@ export function WatcherManagementPanel() {
       {
         id: "new-watcher",
         label: "New Watcher",
-        handler: async () => { setShowForm(true); setEditingId(null); setForm({ ...DEFAULT_FORM }); },
+        handler: async () => {
+          setShowForm(true);
+          setEditingId(null);
+          setForm({ ...DEFAULT_FORM });
+        },
       },
       {
         id: "cancel-form",
         label: "Cancel Form",
-        handler: async () => { setShowForm(false); },
+        handler: async () => {
+          setShowForm(false);
+        },
       },
       {
         id: "refresh",
         label: "Refresh List",
-        handler: async () => { await loadWatchers(); },
+        handler: async () => {
+          await loadWatchers();
+        },
       },
     ],
   });
@@ -236,9 +236,7 @@ export function WatcherManagementPanel() {
         <div className="flex items-center gap-2">
           <Eye className="h-5 w-5 text-primary" />
           <h2 className="text-lg font-semibold">Watchers</h2>
-          <span className="text-xs text-muted-foreground">
-            ({watchers.length})
-          </span>
+          <span className="text-xs text-muted-foreground">({watchers.length})</span>
         </div>
         <button
           ref={newWatcherBtnRef}
@@ -256,7 +254,10 @@ export function WatcherManagementPanel() {
 
       {/* Create/Edit Form */}
       {showForm && (
-        <div className="border border-border rounded-md p-4 space-y-3 bg-card" data-tutorial-id="watchers-create-form">
+        <div
+          className="border border-border rounded-md p-4 space-y-3 bg-card"
+          data-tutorial-id="watchers-create-form"
+        >
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="text-xs font-medium text-muted-foreground">Name</label>
@@ -270,7 +271,9 @@ export function WatcherManagementPanel() {
               />
             </div>
             <div>
-              <label className="text-xs font-medium text-muted-foreground">Timeline Query (FTS)</label>
+              <label className="text-xs font-medium text-muted-foreground">
+                Timeline Query (FTS)
+              </label>
               <input
                 ref={queryInputRef}
                 type="text"
@@ -329,7 +332,9 @@ export function WatcherManagementPanel() {
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="text-xs font-medium text-muted-foreground">App Filter (optional)</label>
+              <label className="text-xs font-medium text-muted-foreground">
+                App Filter (optional)
+              </label>
               <input
                 ref={appFilterInputRef}
                 type="text"
@@ -340,7 +345,9 @@ export function WatcherManagementPanel() {
               />
             </div>
             <div>
-              <label className="text-xs font-medium text-muted-foreground">Source Filter (optional)</label>
+              <label className="text-xs font-medium text-muted-foreground">
+                Source Filter (optional)
+              </label>
               <select
                 ref={sourceFilterSelectRef}
                 className="w-full px-3 py-1.5 mt-1 rounded-md border border-border bg-background text-sm"
@@ -355,9 +362,7 @@ export function WatcherManagementPanel() {
             </div>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              AI Reasoning Prompt
-            </label>
+            <label className="text-xs font-medium text-muted-foreground">AI Reasoning Prompt</label>
             <textarea
               ref={promptTextareaRef}
               className="w-full px-3 py-2 mt-1 rounded-md border border-border bg-background text-sm font-mono resize-y"
@@ -453,9 +458,7 @@ function WatcherCard({
             )}
           </button>
           <span className="font-medium text-sm">{w.name}</span>
-          <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
-            {w.timelineQuery}
-          </code>
+          <code className="text-xs bg-muted px-1.5 py-0.5 rounded">{w.timelineQuery}</code>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-xs text-muted-foreground flex items-center gap-1">

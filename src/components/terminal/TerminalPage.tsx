@@ -87,8 +87,7 @@ export function TerminalPage({
       {
         id: "list-terminals",
         label: "List Terminals",
-        handler: () =>
-          tabs.map((t) => ({ id: t.id, title: t.title, isAlive: t.isAlive })),
+        handler: () => tabs.map((t) => ({ id: t.id, title: t.title, isAlive: t.isAlive })),
       },
     ],
   });
@@ -303,7 +302,9 @@ export function TerminalPage({
         );
         if (result.success && result.data) {
           // Extract markdown content from first panel in the response
-          const data = result.data as Array<{ type?: string; content?: string }> | { panels?: Array<{ content?: string }> };
+          const data = result.data as
+            | Array<{ type?: string; content?: string }>
+            | { panels?: Array<{ content?: string }> };
           let summaryContent: string | null = null;
 
           if (Array.isArray(data)) {

@@ -4,7 +4,15 @@
  * Line chart showing element success rate over time windows (decay curve).
  */
 
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+} from "recharts";
 import { TrendingDown } from "lucide-react";
 import { useDecayCurve } from "../../hooks/useGraphAnalytics";
 
@@ -14,7 +22,11 @@ interface SelectorDecayChartProps {
   windows?: number;
 }
 
-export function SelectorDecayChart({ elementId, windowMs = 86_400_000, windows = 7 }: SelectorDecayChartProps) {
+export function SelectorDecayChart({
+  elementId,
+  windowMs = 86_400_000,
+  windows = 7,
+}: SelectorDecayChartProps) {
   const { data, isLoading, error } = useDecayCurve(elementId, windowMs, windows);
 
   const chartData = (data ?? [])
@@ -44,14 +56,22 @@ export function SelectorDecayChart({ elementId, windowMs = 86_400_000, windows =
               <YAxis domain={[0, 100]} tick={{ fontSize: 11 }} tickFormatter={(v) => `${v}%`} />
               <ReferenceLine y={95} stroke="hsl(var(--muted-foreground))" strokeDasharray="3 3" />
               <Tooltip formatter={(v) => [`${Number(v)}%`, "Success Rate"]} />
-              <Line type="monotone" dataKey="rate" stroke="hsl(var(--primary))" strokeWidth={2} dot />
+              <Line
+                type="monotone"
+                dataKey="rate"
+                stroke="hsl(var(--primary))"
+                strokeWidth={2}
+                dot
+              />
             </LineChart>
           </ResponsiveContainer>
         </div>
       )}
 
       {chartData.length === 0 && !isLoading && (
-        <div className="text-center text-muted-foreground py-8">No interaction data for this element</div>
+        <div className="text-center text-muted-foreground py-8">
+          No interaction data for this element
+        </div>
       )}
     </div>
   );

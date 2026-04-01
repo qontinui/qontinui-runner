@@ -530,14 +530,16 @@ export function LogSourcesSettings({ onLog }: LogSourcesSettingsProps) {
           <div className="bg-background rounded-lg shadow-xl w-full max-w-sm p-4 space-y-4">
             <div className="flex items-center gap-2">
               <Trash2 className="w-5 h-5 text-destructive" />
-              <h3 className="font-medium">Delete {deleteConfirm.type === "source" ? "Source" : "Profile"}</h3>
+              <h3 className="font-medium">
+                Delete {deleteConfirm.type === "source" ? "Source" : "Profile"}
+              </h3>
             </div>
             <p className="text-sm text-muted-foreground">
               Are you sure you want to delete{" "}
               <span className="font-medium text-foreground">{deleteConfirm.name}</span>?
               {deleteConfirm.type === "source" &&
-                " It will also be removed from any profiles that reference it."}
-              {" "}This action cannot be undone until you save.
+                " It will also be removed from any profiles that reference it."}{" "}
+              This action cannot be undone until you save.
             </p>
             <div className="flex justify-end gap-2">
               <button

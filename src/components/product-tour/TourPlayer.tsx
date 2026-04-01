@@ -228,13 +228,8 @@ export function TourPlayer({ tour, onClose, onComplete }: TourPlayerProps) {
     <div className="fixed bottom-6 right-6 z-[9998] w-96 bg-card border border-border rounded-xl shadow-2xl animate-in slide-in-from-bottom-4">
       {/* Header */}
       <div className="flex items-center justify-between px-4 pt-3 pb-1">
-        <span className="text-xs text-muted-foreground font-medium">
-          {tour.title}
-        </span>
-        <button
-          onClick={handleClose}
-          className="text-muted-foreground hover:text-foreground p-0.5"
-        >
+        <span className="text-xs text-muted-foreground font-medium">{tour.title}</span>
+        <button onClick={handleClose} className="text-muted-foreground hover:text-foreground p-0.5">
           <X className="h-3.5 w-3.5" />
         </button>
       </div>

@@ -56,9 +56,7 @@ export function RuleInfluencePanel() {
         Rule Influence
       </h3>
 
-      {isLoading && (
-        <div className="text-center text-muted-foreground py-8">Loading rules...</div>
-      )}
+      {isLoading && <div className="text-center text-muted-foreground py-8">Loading rules...</div>}
 
       {error && (
         <div className="text-center text-destructive py-8">

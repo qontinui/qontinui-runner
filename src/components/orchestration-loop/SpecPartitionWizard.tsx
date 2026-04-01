@@ -81,7 +81,8 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
   };
 
   const buildBetween = useCallback(() => {
-    if (between === "restart_on_signal") return { type: "restart_on_signal" as const, rebuild: true };
+    if (between === "restart_on_signal")
+      return { type: "restart_on_signal" as const, rebuild: true };
     if (between === "restart_runner") return { type: "restart_runner" as const, rebuild: true };
     if (between === "wait_healthy") return { type: "wait_healthy" as const };
     return { type: "none" as const };
@@ -106,7 +107,16 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
       stopAllOnError,
     });
     setResult(buildResult);
-  }, [specs, runnerInstances, selectedRunners, strategy, maxIter, specMaxIter, stopAllOnError, buildBetween]);
+  }, [
+    specs,
+    runnerInstances,
+    selectedRunners,
+    strategy,
+    maxIter,
+    specMaxIter,
+    stopAllOnError,
+    buildBetween,
+  ]);
 
   // Launch the multi-loop
   const handleLaunch = async () => {
@@ -296,8 +306,9 @@ export function SpecPartitionWizard({ onClose, onLaunched }: SpecPartitionWizard
       {step === "preview" && result && (
         <div className="space-y-3">
           <p className="text-[0.75rem] text-muted-foreground">
-            {result.partitions.length} partitions across {selectedRunners.size} runners.
-            {" "}{specs.length} specs, {result.partitions.reduce((s, p) => s + p.assertionCount, 0)} total assertions.
+            {result.partitions.length} partitions across {selectedRunners.size} runners.{" "}
+            {specs.length} specs, {result.partitions.reduce((s, p) => s + p.assertionCount, 0)}{" "}
+            total assertions.
           </p>
           <div className="border border-border rounded overflow-hidden">
             <div className="grid grid-cols-[1fr_auto_auto_auto] gap-x-3 px-3 py-1 border-b border-border text-[0.65rem] font-semibold text-muted-foreground uppercase tracking-wider">

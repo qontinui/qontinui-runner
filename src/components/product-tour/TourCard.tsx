@@ -33,9 +33,7 @@ export function TourCard({ tour, onLaunch, onExport }: TourCardProps) {
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <h3 className="text-sm font-semibold truncate">{tour.title}</h3>
-            <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">
-              {tour.subtitle}
-            </p>
+            <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">{tour.subtitle}</p>
           </div>
           <span
             className={`shrink-0 text-[10px] font-medium px-2 py-0.5 rounded-full border ${AUDIENCE_COLORS[tour.targetAudience]}`}

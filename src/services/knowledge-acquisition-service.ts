@@ -160,10 +160,7 @@ export interface AuditManifestRequest {
 // API Client
 // ============================================================================
 
-async function fetchApi<T>(
-  path: string,
-  body?: unknown,
-): Promise<T> {
+async function fetchApi<T>(path: string, body?: unknown): Promise<T> {
   const url = `${getApiBase()}${path}`;
   const response = await tracedFetch(url, {
     method: body ? "POST" : "GET",
@@ -221,9 +218,7 @@ export async function searchVulnerabilities(
 }
 
 /** Batch dependency audit (pre-parsed packages) */
-export async function auditDependencies(
-  req: AuditDependenciesRequest,
-): Promise<VulnAuditResponse> {
+export async function auditDependencies(req: AuditDependenciesRequest): Promise<VulnAuditResponse> {
   return fetchApi<VulnAuditResponse>("/knowledge/audit-dependencies", req);
 }
 

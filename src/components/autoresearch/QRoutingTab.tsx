@@ -140,23 +140,29 @@ export function QRoutingTab() {
     }
   }, []);
 
-  const handleSetOverride = useCallback(async (stateKey: string, action: string) => {
-    try {
-      await invoke("set_q_routing_override", { stateKey, forcedAction: action });
-      fetchData();
-    } catch {
-      // silent fail
-    }
-  }, [fetchData]);
+  const handleSetOverride = useCallback(
+    async (stateKey: string, action: string) => {
+      try {
+        await invoke("set_q_routing_override", { stateKey, forcedAction: action });
+        fetchData();
+      } catch {
+        // silent fail
+      }
+    },
+    [fetchData],
+  );
 
-  const handleRemoveOverride = useCallback(async (stateKey: string) => {
-    try {
-      await invoke("remove_q_routing_override", { stateKey });
-      fetchData();
-    } catch {
-      // silent fail
-    }
-  }, [fetchData]);
+  const handleRemoveOverride = useCallback(
+    async (stateKey: string) => {
+      try {
+        await invoke("remove_q_routing_override", { stateKey });
+        fetchData();
+      } catch {
+        // silent fail
+      }
+    },
+    [fetchData],
+  );
 
   const handleResetTable = useCallback(async () => {
     if (!confirm("Reset all Q-routing data? Overrides will be preserved.")) return;
@@ -175,9 +181,7 @@ export function QRoutingTab() {
   }, [fetchData]);
 
   if (loading) {
-    return (
-      <div className="p-6 text-zinc-500 text-sm">Loading Q-routing data...</div>
-    );
+    return <div className="p-6 text-zinc-500 text-sm">Loading Q-routing data...</div>;
   }
 
   if (table.length === 0) {
@@ -186,9 +190,9 @@ export function QRoutingTab() {
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-8 text-center">
           <div className="text-zinc-400 text-sm mb-2">No Q-routing data yet</div>
           <div className="text-zinc-600 text-xs max-w-md mx-auto">
-            Q-values are populated automatically as workflows complete.
-            Run campaigns with different architectures to seed the Q-table,
-            then switch to <code className="text-blue-400">q_learning</code> mutation strategy.
+            Q-values are populated automatically as workflows complete. Run campaigns with different
+            architectures to seed the Q-table, then switch to{" "}
+            <code className="text-blue-400">q_learning</code> mutation strategy.
           </div>
         </div>
       </div>
@@ -265,9 +269,7 @@ export function QRoutingTab() {
           onRemoveOverride={handleRemoveOverride}
         />
       )}
-      {viewMode === "visits" && (
-        <VisitsView stateKeys={stateKeys} lookup={lookup} />
-      )}
+      {viewMode === "visits" && <VisitsView stateKeys={stateKeys} lookup={lookup} />}
     </div>
   );
 }
@@ -277,8 +279,16 @@ export function QRoutingTab() {
 function StatsBar({ stats }: { stats: QRoutingStats }) {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
-      <StatCard label="States with Data" value={stats.states_with_data} sub={`/ ${stats.total_possible_states}`} />
-      <StatCard label="Routable States" value={stats.routable_states} sub={`/ ${stats.states_with_data}`} />
+      <StatCard
+        label="States with Data"
+        value={stats.states_with_data}
+        sub={`/ ${stats.total_possible_states}`}
+      />
+      <StatCard
+        label="Routable States"
+        value={stats.routable_states}
+        sub={`/ ${stats.states_with_data}`}
+      />
       <StatCard label="State-Action Pairs" value={stats.total_state_action_pairs} />
       <StatCard label="Total Visits" value={stats.total_visits} />
       <StatCard label="Avg Q-Value" value={stats.avg_q_value.toFixed(3)} />
@@ -326,7 +336,10 @@ function HeatmapView({
           <tr className="border-b border-zinc-800">
             <th className="text-left px-3 py-2 text-zinc-500 text-xs font-normal w-48">State</th>
             {ARCHITECTURES.map((arch) => (
-              <th key={arch} className="text-center px-3 py-2 text-zinc-500 text-xs font-normal w-36">
+              <th
+                key={arch}
+                className="text-center px-3 py-2 text-zinc-500 text-xs font-normal w-36"
+              >
                 {ARCH_LABELS[arch]}
               </th>
             ))}
@@ -369,9 +382,7 @@ function HeatmapView({
                             <div className="text-zinc-100 font-mono text-xs">
                               {entry.q_value.toFixed(3)}
                             </div>
-                            <div className="text-zinc-400 text-[10px]">
-                              n={entry.visit_count}
-                            </div>
+                            <div className="text-zinc-400 text-[10px]">n={entry.visit_count}</div>
                           </div>
                         ) : (
                           <div className="text-zinc-700 text-xs">--</div>
@@ -387,7 +398,8 @@ function HeatmapView({
                     </span>
                   ) : policyEntry ? (
                     <span className="text-xs text-blue-400 font-medium">
-                      {ARCH_LABELS[policyEntry.recommended_architecture] ?? policyEntry.recommended_architecture}
+                      {ARCH_LABELS[policyEntry.recommended_architecture] ??
+                        policyEntry.recommended_architecture}
                     </span>
                   ) : (
                     <span className="text-zinc-700 text-xs">--</span>
@@ -428,7 +440,9 @@ function PolicyView({
             <th className="text-right px-3 py-2 text-zinc-500 text-xs font-normal">Confidence</th>
             <th className="text-right px-3 py-2 text-zinc-500 text-xs font-normal">Visits</th>
             <th className="text-center px-3 py-2 text-zinc-500 text-xs font-normal">Status</th>
-            <th className="text-center px-3 py-2 text-zinc-500 text-xs font-normal w-40">Override</th>
+            <th className="text-center px-3 py-2 text-zinc-500 text-xs font-normal w-40">
+              Override
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -437,7 +451,10 @@ function PolicyView({
             const currentOverride = overrideLookup.get(entry.state_key);
 
             return (
-              <tr key={entry.state_key} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+              <tr
+                key={entry.state_key}
+                className="border-b border-zinc-800/50 hover:bg-zinc-800/30"
+              >
                 <td className="px-3 py-2 text-zinc-300 text-xs font-mono">
                   {formatState(entry.state_key)}
                 </td>
@@ -453,7 +470,9 @@ function PolicyView({
                 <td className="px-3 py-2 text-right font-mono text-xs text-zinc-200">
                   {entry.q_value.toFixed(3)}
                 </td>
-                <td className={`px-3 py-2 text-right font-mono text-xs ${confidenceClass(entry.confidence)}`}>
+                <td
+                  className={`px-3 py-2 text-right font-mono text-xs ${confidenceClass(entry.confidence)}`}
+                >
                   {(entry.confidence * 100).toFixed(0)}%
                 </td>
                 <td className="px-3 py-2 text-right font-mono text-xs text-zinc-400">
@@ -516,10 +535,14 @@ function PolicyView({
 /** Color for each architecture. */
 function archColor(arch: string): string {
   switch (arch) {
-    case "traditional": return "#3b82f6"; // blue
-    case "agentic_verification": return "#22c55e"; // green
-    case "multi_agent_pipeline": return "#a855f7"; // purple
-    default: return "#71717a";
+    case "traditional":
+      return "#3b82f6"; // blue
+    case "agentic_verification":
+      return "#22c55e"; // green
+    case "multi_agent_pipeline":
+      return "#a855f7"; // purple
+    default:
+      return "#71717a";
   }
 }
 
@@ -539,7 +562,10 @@ function VisitsView({
           <tr className="border-b border-zinc-800">
             <th className="text-left px-3 py-2 text-zinc-500 text-xs font-normal w-48">State</th>
             {ARCHITECTURES.map((arch) => (
-              <th key={arch} className="text-center px-3 py-2 text-zinc-500 text-xs font-normal w-36">
+              <th
+                key={arch}
+                className="text-center px-3 py-2 text-zinc-500 text-xs font-normal w-36"
+              >
                 {ARCH_LABELS[arch]}
               </th>
             ))}
@@ -574,9 +600,7 @@ function VisitsView({
                     </td>
                   );
                 })}
-                <td className="px-3 py-2 text-right font-mono text-xs text-zinc-400">
-                  {total}
-                </td>
+                <td className="px-3 py-2 text-right font-mono text-xs text-zinc-400">{total}</td>
               </tr>
             );
           })}

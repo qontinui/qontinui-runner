@@ -18,15 +18,7 @@ export const multimodalVisionTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "settings",
   category: "AI Features",
-  tags: [
-    "featured",
-    "ai",
-    "vision",
-    "multimodal",
-    "brain-actor",
-    "screenshots",
-    "advanced",
-  ],
+  tags: ["featured", "ai", "vision", "multimodal", "brain-actor", "screenshots", "advanced"],
   prerequisites: ["ai-analysis"],
   learningObjectives: [
     "Understand how screenshots are annotated with numbered element markers for LLMs",

@@ -210,8 +210,12 @@ describe("alignSpans", () => {
   });
 
   it("flags status_changed when success differs", () => {
-    const spansA = [makeSpan({ name: "setup.init", span_id: "a1", duration_ms: 100, success: true })];
-    const spansB = [makeSpan({ name: "setup.init", span_id: "b1", duration_ms: 100, success: false })];
+    const spansA = [
+      makeSpan({ name: "setup.init", span_id: "a1", duration_ms: 100, success: true }),
+    ];
+    const spansB = [
+      makeSpan({ name: "setup.init", span_id: "b1", duration_ms: 100, success: false }),
+    ];
 
     const matches = alignSpans(spansA, spansB);
     expect(matches[0].status).toBe("status_changed");
@@ -236,11 +240,26 @@ describe("alignSpans", () => {
 
   it("handles runs with different iteration counts", () => {
     const spansA = [
-      makeSpan({ name: "verification.check", span_id: "a1", duration_ms: 100, attributes: { iteration: 1 } }),
-      makeSpan({ name: "verification.check", span_id: "a2", duration_ms: 100, attributes: { iteration: 2 } }),
+      makeSpan({
+        name: "verification.check",
+        span_id: "a1",
+        duration_ms: 100,
+        attributes: { iteration: 1 },
+      }),
+      makeSpan({
+        name: "verification.check",
+        span_id: "a2",
+        duration_ms: 100,
+        attributes: { iteration: 2 },
+      }),
     ];
     const spansB = [
-      makeSpan({ name: "verification.check", span_id: "b1", duration_ms: 120, attributes: { iteration: 1 } }),
+      makeSpan({
+        name: "verification.check",
+        span_id: "b1",
+        duration_ms: 120,
+        attributes: { iteration: 1 },
+      }),
       // No iteration 2 in B
     ];
 
@@ -252,10 +271,24 @@ describe("alignSpans", () => {
 
 describe("computeComparisonSummary", () => {
   it("flags >50% slower spans as regressions", () => {
-    const spansA = [makeSpan({ name: "ai.session", span_id: "a1", duration_ms: 1000,
-      start_ts: "2026-01-01T00:00:00.000Z", end_ts: "2026-01-01T00:00:01.000Z" })];
-    const spansB = [makeSpan({ name: "ai.session", span_id: "b1", duration_ms: 2000,
-      start_ts: "2026-01-01T00:00:00.000Z", end_ts: "2026-01-01T00:00:02.000Z" })];
+    const spansA = [
+      makeSpan({
+        name: "ai.session",
+        span_id: "a1",
+        duration_ms: 1000,
+        start_ts: "2026-01-01T00:00:00.000Z",
+        end_ts: "2026-01-01T00:00:01.000Z",
+      }),
+    ];
+    const spansB = [
+      makeSpan({
+        name: "ai.session",
+        span_id: "b1",
+        duration_ms: 2000,
+        start_ts: "2026-01-01T00:00:00.000Z",
+        end_ts: "2026-01-01T00:00:02.000Z",
+      }),
+    ];
 
     const matches = alignSpans(spansA, spansB);
     const summary = computeComparisonSummary(spansA, spansB, matches);
@@ -267,7 +300,9 @@ describe("computeComparisonSummary", () => {
 
   it("flags new error spans as regressions", () => {
     const spansA: TraceSpan[] = [];
-    const spansB = [makeSpan({ name: "ai.session", span_id: "b1", duration_ms: 100, success: false })];
+    const spansB = [
+      makeSpan({ name: "ai.session", span_id: "b1", duration_ms: 100, success: false }),
+    ];
 
     const matches = alignSpans(spansA, spansB);
     const summary = computeComparisonSummary(spansA, spansB, matches);
@@ -464,8 +499,20 @@ describe("computeCriticalPath", () => {
 describe("computeTokenInsights", () => {
   it("should aggregate token counts across spans", () => {
     const spans: TraceSpan[] = [
-      makeSpan({ name: "qontinui.ai.session", span_id: "t1", input_tokens: 100, output_tokens: 50, cost_cents: 10 }),
-      makeSpan({ name: "qontinui.ai.session", span_id: "t2", input_tokens: 200, output_tokens: 150, cost_cents: 25 }),
+      makeSpan({
+        name: "qontinui.ai.session",
+        span_id: "t1",
+        input_tokens: 100,
+        output_tokens: 50,
+        cost_cents: 10,
+      }),
+      makeSpan({
+        name: "qontinui.ai.session",
+        span_id: "t2",
+        input_tokens: 200,
+        output_tokens: 150,
+        cost_cents: 25,
+      }),
     ];
     const insights = computeTokenInsights(spans);
     expect(insights.totalInputTokens).toBe(300);
@@ -541,8 +588,16 @@ describe("getTokenHeat", () => {
 describe("deriveReplaySteps", () => {
   it("should categorize phase transition spans", () => {
     const spans: TraceSpan[] = [
-      makeSpan({ name: "qontinui.workflow.phase.setup", span_id: "r1", start_ts: "2024-01-01T00:00:00Z" }),
-      makeSpan({ name: "qontinui.workflow.phase.verification", span_id: "r2", start_ts: "2024-01-01T00:01:00Z" }),
+      makeSpan({
+        name: "qontinui.workflow.phase.setup",
+        span_id: "r1",
+        start_ts: "2024-01-01T00:00:00Z",
+      }),
+      makeSpan({
+        name: "qontinui.workflow.phase.verification",
+        span_id: "r2",
+        start_ts: "2024-01-01T00:01:00Z",
+      }),
     ];
     const steps = deriveReplaySteps(spans);
     expect(steps).toHaveLength(2);
@@ -552,7 +607,12 @@ describe("deriveReplaySteps", () => {
 
   it("should categorize AI session spans", () => {
     const spans: TraceSpan[] = [
-      makeSpan({ name: "qontinui.ai.session", span_id: "r3", start_ts: "2024-01-01T00:00:00Z", input_tokens: 100 }),
+      makeSpan({
+        name: "qontinui.ai.session",
+        span_id: "r3",
+        start_ts: "2024-01-01T00:00:00Z",
+        input_tokens: 100,
+      }),
     ];
     const steps = deriveReplaySteps(spans);
     expect(steps).toHaveLength(1);
@@ -561,7 +621,12 @@ describe("deriveReplaySteps", () => {
 
   it("should categorize tool call spans", () => {
     const spans: TraceSpan[] = [
-      makeSpan({ name: "qontinui.ai.tool_call", span_id: "r4", start_ts: "2024-01-01T00:00:00Z", attributes: { "ai.tool_name": "Read" } }),
+      makeSpan({
+        name: "qontinui.ai.tool_call",
+        span_id: "r4",
+        start_ts: "2024-01-01T00:00:00Z",
+        attributes: { "ai.tool_name": "Read" },
+      }),
     ];
     const steps = deriveReplaySteps(spans);
     expect(steps).toHaveLength(1);
@@ -572,7 +637,11 @@ describe("deriveReplaySteps", () => {
   it("should sort steps by start_ts", () => {
     const spans: TraceSpan[] = [
       makeSpan({ name: "qontinui.ai.session", span_id: "r5", start_ts: "2024-01-01T00:02:00Z" }),
-      makeSpan({ name: "qontinui.workflow.phase.setup", span_id: "r6", start_ts: "2024-01-01T00:00:00Z" }),
+      makeSpan({
+        name: "qontinui.workflow.phase.setup",
+        span_id: "r6",
+        start_ts: "2024-01-01T00:00:00Z",
+      }),
       makeSpan({ name: "qontinui.ai.tool_call", span_id: "r7", start_ts: "2024-01-01T00:01:00Z" }),
     ];
     const steps = deriveReplaySteps(spans);
@@ -587,7 +656,11 @@ describe("deriveReplaySteps", () => {
 
   it("should skip unrecognized span names", () => {
     const spans: TraceSpan[] = [
-      makeSpan({ name: "qontinui.python.startup", span_id: "r8", start_ts: "2024-01-01T00:00:00Z" }),
+      makeSpan({
+        name: "qontinui.python.startup",
+        span_id: "r8",
+        start_ts: "2024-01-01T00:00:00Z",
+      }),
     ];
     const steps = deriveReplaySteps(spans);
     expect(steps).toHaveLength(0);

@@ -838,7 +838,17 @@
     "updatedAt": "2026-03-26T00:00:00.000Z",
     "pageUrl": "/runs/traces",
     "elementSource": "sdk",
-    "tags": ["run-traces", "trace-viewer", "waterfall", "flamechart", "comparison", "critical-path", "performance", "execution-spans", "observe"],
+    "tags": [
+      "run-traces",
+      "trace-viewer",
+      "waterfall",
+      "flamechart",
+      "comparison",
+      "critical-path",
+      "performance",
+      "execution-spans",
+      "observe"
+    ],
     "backendFiles": [
       "src/components/widgets/trace-viewer/TraceViewerWidget.tsx",
       "src/components/widgets/trace-viewer/TraceWaterfall.tsx",
@@ -854,9 +864,7 @@
       "src/components/widgets/trace-viewer/types.ts",
       "src/components/run-dashboard/TraceViewerPage.tsx"
     ],
-    "apiEndpoints": [
-      "GET /execution-spans?execution_id={id}&order=asc"
-    ],
+    "apiEndpoints": ["GET /execution-spans?execution_id={id}&order=asc"],
     "specType": "semantic"
   }
 }

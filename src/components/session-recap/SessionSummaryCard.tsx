@@ -1,13 +1,4 @@
-import {
-  FileText,
-  GitBranch,
-  Database,
-  Code2,
-  Plug,
-  Component,
-  Plus,
-  Minus,
-} from "lucide-react";
+import { FileText, GitBranch, Database, Code2, Plug, Component, Plus, Minus } from "lucide-react";
 import type { RecapSummary, RepoSummary } from "@/lib/session-recap/types";
 
 interface Props {
@@ -26,20 +17,14 @@ export function SessionSummaryCard({ summary, repos, lookback }: Props) {
     { icon: Component, label: "Components", value: summary.new_components, color: "#3B82F6" },
   ];
 
-  const categories = Object.entries(summary.categories).sort(
-    ([, a], [, b]) => b - a,
-  );
+  const categories = Object.entries(summary.categories).sort(([, a], [, b]) => b - a);
 
   return (
     <div className="space-y-4">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-foreground">
-          Session Recap
-        </h2>
-        <span className="text-xs text-muted-foreground">
-          lookback: {lookback}
-        </span>
+        <h2 className="text-sm font-semibold text-foreground">Session Recap</h2>
+        <span className="text-xs text-muted-foreground">lookback: {lookback}</span>
       </div>
 
       {/* Stat grid */}
@@ -52,9 +37,7 @@ export function SessionSummaryCard({ summary, repos, lookback }: Props) {
             <s.icon className="w-4 h-4 shrink-0" style={{ color: s.color }} />
             <div className="min-w-0">
               <div className="text-lg font-bold leading-none">{s.value}</div>
-              <div className="text-[10px] text-muted-foreground truncate">
-                {s.label}
-              </div>
+              <div className="text-[10px] text-muted-foreground truncate">{s.label}</div>
             </div>
           </div>
         ))}
@@ -75,9 +58,7 @@ export function SessionSummaryCard({ summary, repos, lookback }: Props) {
       {/* Category breakdown */}
       {categories.length > 0 && (
         <div className="space-y-1">
-          <h3 className="text-[11px] font-medium text-muted-foreground">
-            By category
-          </h3>
+          <h3 className="text-[11px] font-medium text-muted-foreground">By category</h3>
           <div className="flex flex-wrap gap-1.5">
             {categories.map(([cat, count]) => (
               <span
@@ -94,9 +75,7 @@ export function SessionSummaryCard({ summary, repos, lookback }: Props) {
       {/* Per-repo */}
       {repos.length > 0 && (
         <div className="space-y-1">
-          <h3 className="text-[11px] font-medium text-muted-foreground">
-            Repos
-          </h3>
+          <h3 className="text-[11px] font-medium text-muted-foreground">Repos</h3>
           <div className="space-y-1">
             {repos.map((r) => (
               <div

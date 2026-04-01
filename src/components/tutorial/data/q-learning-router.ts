@@ -53,7 +53,7 @@ export const qLearningRouterTutorial: Tutorial = {
 **The solution:** A Q-learning router that learns *per-task-type* preferences. Frontend tasks might work best with Traditional, while complex backend refactors might benefit from Multi-Agent Pipeline.`,
       estimatedDuration: 1,
       tips: [
-        "The Q-router is opt-in via mutation_strategy: \"q_learning\" in campaign config",
+        'The Q-router is opt-in via mutation_strategy: "q_learning" in campaign config',
         "It does NOT replace existing grid/LLM/random strategies — it's an additional option",
       ],
     },

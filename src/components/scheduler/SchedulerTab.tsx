@@ -161,9 +161,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
       )}
 
       {/* Statistics dashboard - hidden when creating/editing a task */}
-      {!isFormOpen && (
-        <SchedulerStats tasks={tasks} taskHistory={taskHistory} status={status} />
-      )}
+      {!isFormOpen && <SchedulerStats tasks={tasks} taskHistory={taskHistory} status={status} />}
 
       {/* Sub-tabs */}
       <Tabs.Root

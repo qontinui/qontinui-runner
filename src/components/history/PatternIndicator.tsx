@@ -13,7 +13,7 @@ interface PatternIndicatorProps {
 
 export function PatternIndicator({ workflowName }: PatternIndicatorProps) {
   const { data: patterns } = useCrossRunPatterns(workflowName);
-  const active = patterns?.filter(p => p.status === "active").length || 0;
+  const active = patterns?.filter((p) => p.status === "active").length || 0;
   if (active === 0) return null;
   return (
     <span

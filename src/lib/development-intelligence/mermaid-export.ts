@@ -28,8 +28,7 @@ export function toMermaid(
   }
 
   // Sanitize ID for Mermaid (no colons, slashes, etc.)
-  const sanitize = (id: string) =>
-    id.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const sanitize = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "_");
 
   // Get label from node data
   const getLabel = (node: Node): string => {
@@ -41,8 +40,7 @@ export function toMermaid(
   };
 
   // Escape characters that break Mermaid syntax
-  const escapeLabel = (s: string) =>
-    s.replace(/"/g, "&quot;").replace(/\|/g, "&#124;");
+  const escapeLabel = (s: string) => s.replace(/"/g, "&quot;").replace(/\|/g, "&#124;");
 
   for (const node of nodes) {
     const id = sanitize(node.id);

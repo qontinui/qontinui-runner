@@ -1,7 +1,7 @@
-import { useState, useCallback, useRef } from 'react';
-import type { MemoryResult, MemorySearchResponse, MemorySourceFilter } from './types';
+import { useState, useCallback, useRef } from "react";
+import type { MemoryResult, MemorySearchResponse, MemorySourceFilter } from "./types";
 
-const API_BASE = 'http://localhost:9876';
+const API_BASE = "http://localhost:9876";
 
 interface SearchParams {
   query: string;
@@ -34,15 +34,15 @@ export function useMemorySearch() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    setState(prev => ({ ...prev, loading: true, error: null }));
+    setState((prev) => ({ ...prev, loading: true, error: null }));
 
     const searchParams = new URLSearchParams();
-    searchParams.set('q', params.query);
-    if (params.limit) searchParams.set('limit', String(params.limit));
-    if (params.sources?.length) searchParams.set('sources', params.sources.join(','));
-    if (params.from) searchParams.set('from', params.from);
-    if (params.to) searchParams.set('to', params.to);
-    if (params.minScore !== undefined) searchParams.set('min_score', String(params.minScore));
+    searchParams.set("q", params.query);
+    if (params.limit) searchParams.set("limit", String(params.limit));
+    if (params.sources?.length) searchParams.set("sources", params.sources.join(","));
+    if (params.from) searchParams.set("from", params.from);
+    if (params.to) searchParams.set("to", params.to);
+    if (params.minScore !== undefined) searchParams.set("min_score", String(params.minScore));
 
     try {
       const res = await fetch(`${API_BASE}/memory/search?${searchParams}`, {
@@ -57,14 +57,14 @@ export function useMemorySearch() {
           error: null,
         });
       } else {
-        setState(prev => ({ ...prev, loading: false, error: json.error || 'Search failed' }));
+        setState((prev) => ({ ...prev, loading: false, error: json.error || "Search failed" }));
       }
     } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') return;
-      setState(prev => ({
+      if (err instanceof Error && err.name === "AbortError") return;
+      setState((prev) => ({
         ...prev,
         loading: false,
-        error: err instanceof Error ? err.message : 'Network error',
+        error: err instanceof Error ? err.message : "Network error",
       }));
     }
   }, []);

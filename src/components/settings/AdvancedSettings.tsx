@@ -1,6 +1,15 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, X, Wrench, Settings as SettingsIcon, Monitor, Copy, RefreshCw, FlaskConical } from "lucide-react";
+import {
+  Check,
+  X,
+  Wrench,
+  Settings as SettingsIcon,
+  Monitor,
+  Copy,
+  RefreshCw,
+  FlaskConical,
+} from "lucide-react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SectionHeader } from "./SectionHeader";
 import { getStatusColors } from "@/design-system";
@@ -382,7 +391,8 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
         </h4>
 
         <p className="text-xs text-muted-foreground">
-          These features are experimental and may be unstable. Changes take effect for new terminals only.
+          These features are experimental and may be unstable. Changes take effect for new terminals
+          only.
         </p>
 
         <div className="space-y-2 p-3 rounded-lg bg-muted/30">
@@ -398,7 +408,10 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
                 onClick={() => {
                   setTerminalBackend(backend);
                   instanceStorage.setItem("terminal-backend", backend);
-                  onLog("info", `Terminal backend set to ${backend}. Open new terminals to see the change.`);
+                  onLog(
+                    "info",
+                    `Terminal backend set to ${backend}. Open new terminals to see the change.`,
+                  );
                 }}
                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
                   terminalBackend === backend

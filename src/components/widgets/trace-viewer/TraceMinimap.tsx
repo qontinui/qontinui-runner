@@ -7,7 +7,7 @@ interface TraceMinimapProps {
   traceStartMs: number;
   traceDurationMs: number;
   viewportStart: number; // 0-1 fraction of trace visible start
-  viewportEnd: number;   // 0-1 fraction of trace visible end
+  viewportEnd: number; // 0-1 fraction of trace visible end
   onViewportChange?: (start: number, end: number) => void;
   height?: number;
 }
@@ -36,7 +36,7 @@ export function TraceMinimap({
 
   // Flatten nodes for rendering
   const spans = useMemo(() => {
-    return nodes.map(node => ({
+    return nodes.map((node) => ({
       start: node.offsetMs,
       duration: node.span.duration_ms ?? 0,
       depth: node.depth,
@@ -45,7 +45,7 @@ export function TraceMinimap({
     }));
   }, [nodes]);
 
-  const maxDepth = useMemo(() => Math.max(1, ...spans.map(s => s.depth + 1)), [spans]);
+  const maxDepth = useMemo(() => Math.max(1, ...spans.map((s) => s.depth + 1)), [spans]);
 
   // Draw minimap
   useEffect(() => {
@@ -77,7 +77,7 @@ export function TraceMinimap({
       const y = 2 + span.depth * rowHeight;
       const spanH = Math.max(1, rowHeight - 1);
 
-      ctx.fillStyle = span.error ? "#ef4444" : (PHASE_HEX[span.phase] || "#6b7280");
+      ctx.fillStyle = span.error ? "#ef4444" : PHASE_HEX[span.phase] || "#6b7280";
       ctx.globalAlpha = 0.7;
       ctx.fillRect(x, y, spanW, spanH);
     }
@@ -99,27 +99,36 @@ export function TraceMinimap({
   }, [spans, maxDepth, traceDurationMs, viewportStart, viewportEnd]);
 
   // Click/drag handler
-  const handlePointerEvent = useCallback((e: React.PointerEvent) => {
-    if (!onViewportChange) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+  const handlePointerEvent = useCallback(
+    (e: React.PointerEvent) => {
+      if (!onViewportChange) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
 
-    const rect = canvas.getBoundingClientRect();
-    const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const vpWidth = viewportEnd - viewportStart;
-    const newStart = Math.max(0, Math.min(1 - vpWidth, fraction - vpWidth / 2));
-    onViewportChange(newStart, newStart + vpWidth);
-  }, [onViewportChange, viewportStart, viewportEnd]);
+      const rect = canvas.getBoundingClientRect();
+      const fraction = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const vpWidth = viewportEnd - viewportStart;
+      const newStart = Math.max(0, Math.min(1 - vpWidth, fraction - vpWidth / 2));
+      onViewportChange(newStart, newStart + vpWidth);
+    },
+    [onViewportChange, viewportStart, viewportEnd],
+  );
 
-  const onPointerDown = useCallback((e: React.PointerEvent) => {
-    isDragging.current = true;
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    handlePointerEvent(e);
-  }, [handlePointerEvent]);
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      isDragging.current = true;
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      handlePointerEvent(e);
+    },
+    [handlePointerEvent],
+  );
 
-  const onPointerMove = useCallback((e: React.PointerEvent) => {
-    if (isDragging.current) handlePointerEvent(e);
-  }, [handlePointerEvent]);
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (isDragging.current) handlePointerEvent(e);
+    },
+    [handlePointerEvent],
+  );
 
   const onPointerUp = useCallback(() => {
     isDragging.current = false;

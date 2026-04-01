@@ -44,9 +44,7 @@ function ElementRow({ element }: { element: ElementReliability }) {
           )}
         </div>
       </td>
-      <td className="py-2 px-3 text-right tabular-nums text-sm">
-        {element.total_interactions}
-      </td>
+      <td className="py-2 px-3 text-right tabular-nums text-sm">{element.total_interactions}</td>
       <td className="py-2 px-3 w-40">
         <SuccessBar rate={element.success_rate} />
       </td>
@@ -73,9 +71,7 @@ export function ElementInteractionHeatmap() {
       </h3>
 
       {isLoading && (
-        <div className="text-center text-muted-foreground py-8">
-          Loading element data...
-        </div>
+        <div className="text-center text-muted-foreground py-8">Loading element data...</div>
       )}
 
       {error && (

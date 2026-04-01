@@ -240,7 +240,10 @@ function GraphInsightsSection({
       <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
         Graph Insights
       </h3>
-      <div className="flex gap-1 border-b border-border pb-px" data-tutorial-id="graph-insights-tabs">
+      <div
+        className="flex gap-1 border-b border-border pb-px"
+        data-tutorial-id="graph-insights-tabs"
+      >
         {GRAPH_TABS.map((tab) => (
           <button
             key={tab.id}
@@ -257,19 +260,12 @@ function GraphInsightsSection({
         ))}
       </div>
       <div>
-        {activeTab === "patterns" && (
-          <CrossRunPatternsPanel workflowName={workflowName} />
-        )}
+        {activeTab === "patterns" && <CrossRunPatternsPanel workflowName={workflowName} />}
         {activeTab === "rules" && <RuleInfluencePanel />}
         {activeTab === "pipeline" && (
-          <PipelineEventsTimeline
-            events={pipelineEvents}
-            isLoading={eventsLoading}
-          />
+          <PipelineEventsTimeline events={pipelineEvents} isLoading={eventsLoading} />
         )}
-        {activeTab === "provenance" && (
-          <StepProvenanceTimeline workflowId={workflowName} />
-        )}
+        {activeTab === "provenance" && <StepProvenanceTimeline workflowId={workflowName} />}
         {activeTab === "versions" && <WorkflowVersionLineage />}
       </div>
     </div>

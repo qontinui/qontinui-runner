@@ -27,9 +27,19 @@ import {
 import { cn } from "../../lib/utils";
 import { ScrollArea } from "../ui/ScrollArea";
 import { getStatusColors } from "@/design-system";
-import { useErrorEvents, useErrorSummary, useDebugContext, ERROR_MONITOR_REFRESH_INTERVAL } from "../../hooks/useErrorMonitor";
+import {
+  useErrorEvents,
+  useErrorSummary,
+  useDebugContext,
+  ERROR_MONITOR_REFRESH_INTERVAL,
+} from "../../hooks/useErrorMonitor";
 import { errorMonitorService, formatErrorTime } from "../../services/error-monitor-service";
-import type { StoredErrorEvent, ErrorSeverity, ErrorStatus, RecurrenceEntry } from "../../types/errorMonitor";
+import type {
+  StoredErrorEvent,
+  ErrorSeverity,
+  ErrorStatus,
+  RecurrenceEntry,
+} from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
 import { BrowserErrorsPanel } from "./BrowserErrorsPanel";
 // Log source management is now in Settings > Log Sources (LogSourcesSettings.tsx)
@@ -140,9 +150,7 @@ function RecurrenceHistory({ signatureHash }: { signatureHash: string }) {
   }, [signatureHash]);
 
   if (loading) {
-    return (
-      <div className="text-xs text-muted-foreground py-1">Loading recurrence history...</div>
-    );
+    return <div className="text-xs text-muted-foreground py-1">Loading recurrence history...</div>;
   }
 
   if (!entries || entries.length === 0) {
@@ -161,9 +169,7 @@ function RecurrenceHistory({ signatureHash }: { signatureHash: string }) {
             className="flex items-center gap-2 text-xs text-muted-foreground bg-orange-500/5 px-2 py-1 rounded"
           >
             <span className="shrink-0">
-              {entry.resolvedAt
-                ? new Date(entry.resolvedAt).toLocaleDateString()
-                : "unknown date"}
+              {entry.resolvedAt ? new Date(entry.resolvedAt).toLocaleDateString() : "unknown date"}
             </span>
             <span className="text-orange-400/60">|</span>
             <span className="shrink-0">x{entry.occurrenceCount}</span>
@@ -445,7 +451,10 @@ export function ErrorMonitorTab({
     refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL,
   });
 
-  const { summary } = useErrorSummary({ taskRunId, refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL });
+  const { summary } = useErrorSummary({
+    taskRunId,
+    refreshInterval: ERROR_MONITOR_REFRESH_INTERVAL,
+  });
 
   const { context: debugContext } = useDebugContext({ taskRunId });
   const patterns = debugContext?.patterns ?? [];
@@ -504,7 +513,10 @@ export function ErrorMonitorTab({
   };
 
   const hasActiveFilters =
-    selectedSeverities.length > 0 || selectedStatuses.length > 0 || searchText.length > 0 || selectedPatternIds !== null;
+    selectedSeverities.length > 0 ||
+    selectedStatuses.length > 0 ||
+    searchText.length > 0 ||
+    selectedPatternIds !== null;
 
   return (
     <div className="flex flex-col h-full">

@@ -24,20 +24,12 @@ interface KnowledgeStatsWidgetProps {
   compact?: boolean;
 }
 
-export function KnowledgeStatsWidget({
-  className,
-  compact = false,
-}: KnowledgeStatsWidgetProps) {
+export function KnowledgeStatsWidget({ className, compact = false }: KnowledgeStatsWidgetProps) {
   const { data: stats, isLoading, error } = useKnowledgeStats();
 
   if (isLoading) {
     return (
-      <div
-        className={cn(
-          "bg-card rounded-lg border border-border p-3",
-          className,
-        )}
-      >
+      <div className={cn("bg-card rounded-lg border border-border p-3", className)}>
         <div className="flex items-center gap-2 text-muted-foreground">
           <Loader2 className="w-4 h-4 animate-spin" />
           <span className="text-xs">Loading knowledge stats...</span>
@@ -48,12 +40,7 @@ export function KnowledgeStatsWidget({
 
   if (error || !stats) {
     return (
-      <div
-        className={cn(
-          "bg-card rounded-lg border border-border p-3",
-          className,
-        )}
-      >
+      <div className={cn("bg-card rounded-lg border border-border p-3", className)}>
         <div className="flex items-center gap-2 text-muted-foreground">
           <Brain className="w-4 h-4" />
           <span className="text-xs">Knowledge stats unavailable</span>
@@ -69,12 +56,7 @@ export function KnowledgeStatsWidget({
 
   if (compact) {
     return (
-      <div
-        className={cn(
-          "bg-card rounded-lg border border-border p-2",
-          className,
-        )}
-      >
+      <div className={cn("bg-card rounded-lg border border-border p-2", className)}>
         <div className="flex items-center gap-3 text-xs">
           <span className="flex items-center gap-1 text-muted-foreground">
             <Search className="w-3 h-3" />
@@ -100,9 +82,7 @@ export function KnowledgeStatsWidget({
   }
 
   return (
-    <div
-      className={cn("bg-card rounded-lg border border-border", className)}
-    >
+    <div className={cn("bg-card rounded-lg border border-border", className)}>
       {/* Header */}
       <div className="px-3 py-2 border-b border-border/50 bg-muted/30">
         <div className="flex items-center justify-between">
@@ -134,11 +114,7 @@ export function KnowledgeStatsWidget({
           icon={<Database className="w-3.5 h-3.5" />}
           label="Results Stored"
           value={stats.results_ingested}
-          subtitle={
-            stats.dedup_skipped > 0
-              ? `${stats.dedup_skipped} deduped`
-              : undefined
-          }
+          subtitle={stats.dedup_skipped > 0 ? `${stats.dedup_skipped} deduped` : undefined}
           color="text-blue-400"
         />
         <StatCell
@@ -218,13 +194,9 @@ function StatCell({
         <div className={cn("text-sm font-semibold tabular-nums", color)}>
           {typeof value === "number" ? value.toLocaleString() : value}
         </div>
-        <div className="text-[10px] text-muted-foreground leading-tight">
-          {label}
-        </div>
+        <div className="text-[10px] text-muted-foreground leading-tight">{label}</div>
         {subtitle && (
-          <div className="text-[10px] text-muted-foreground/60 leading-tight">
-            {subtitle}
-          </div>
+          <div className="text-[10px] text-muted-foreground/60 leading-tight">{subtitle}</div>
         )}
       </div>
     </div>

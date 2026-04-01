@@ -41,7 +41,12 @@ export function StallFrequencyChart({ days = 7 }: StallFrequencyChartProps) {
               <XAxis dataKey="type" tick={{ fontSize: 10 }} />
               <YAxis tick={{ fontSize: 11 }} />
               <Tooltip />
-              <Bar dataKey="count" fill="hsl(var(--chart-4))" radius={[4, 4, 0, 0]} maxBarSize={40} />
+              <Bar
+                dataKey="count"
+                fill="hsl(var(--chart-4))"
+                radius={[4, 4, 0, 0]}
+                maxBarSize={40}
+              />
             </BarChart>
           </ResponsiveContainer>
         </div>

@@ -909,18 +909,11 @@ function SummaryContainer({
 
   // Compute width tier from live data for grid layout.
   // narrow/medium = 1 column, wide/full = span all columns.
-  const tier = config.getSummaryWidthTier
-    ? config.getSummaryWidthTier(data)
-    : "medium";
-  const gridColumn =
-    tier === "full" || tier === "wide" ? "1 / -1"
-    : undefined;
+  const tier = config.getSummaryWidthTier ? config.getSummaryWidthTier(data) : "medium";
+  const gridColumn = tier === "full" || tier === "wide" ? "1 / -1" : undefined;
 
   return (
-    <div
-      style={{ gridColumn }}
-      className="min-w-0"
-    >
+    <div style={{ gridColumn }} className="min-w-0">
       <div
         className={cn(
           "relative group rounded-lg border overflow-hidden bg-background cursor-pointer",
@@ -1468,9 +1461,15 @@ export function DashboardLayout({
         )}
 
         {/* Standalone widgets: convergence tracking, constraint results, and AI output stream */}
-        <div style={{ gridColumn: "1 / -1" }}><ConvergenceWidget /></div>
-        <div style={{ gridColumn: "1 / -1" }}><ConstraintResultsWidget /></div>
-        <div style={{ gridColumn: "1 / -1" }}><AiStreamWidget /></div>
+        <div style={{ gridColumn: "1 / -1" }}>
+          <ConvergenceWidget />
+        </div>
+        <div style={{ gridColumn: "1 / -1" }}>
+          <ConstraintResultsWidget />
+        </div>
+        <div style={{ gridColumn: "1 / -1" }}>
+          <AiStreamWidget />
+        </div>
 
         {summaryWidgets.map((type) => (
           <SummaryWidget

@@ -97,9 +97,7 @@ export class GhosttyBackend implements ITerminalBackend {
   }
 
   getBufferLine(line: number): string | null {
-    return (
-      this.term.buffer.active.getLine(line)?.translateToString(true) ?? null
-    );
+    return this.term.buffer.active.getLine(line)?.translateToString(true) ?? null;
   }
 
   getBufferLength(): number {
@@ -122,9 +120,7 @@ export class GhosttyBackend implements ITerminalBackend {
     this.term.scrollToBottom();
   }
 
-  attachCustomKeyEventHandler(
-    handler: (event: KeyboardEvent) => boolean,
-  ): void {
+  attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean): void {
     this.term.attachCustomKeyEventHandler(handler);
   }
 

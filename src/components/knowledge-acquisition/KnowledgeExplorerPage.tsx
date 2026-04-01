@@ -33,10 +33,20 @@ import type { KnowledgeResult } from "@/services/knowledge-acquisition-service";
 type Tab = "search" | "stats";
 type SearchMode = "web" | "error" | "vulnerability";
 
-const SEARCH_MODES: { id: SearchMode; label: string; icon: React.ElementType; placeholder: string }[] = [
+const SEARCH_MODES: {
+  id: SearchMode;
+  label: string;
+  icon: React.ElementType;
+  placeholder: string;
+}[] = [
   { id: "web", label: "Web Search", icon: Globe, placeholder: "Search the web for anything..." },
   { id: "error", label: "Error Research", icon: Bug, placeholder: "Paste an error message..." },
-  { id: "vulnerability", label: "Vuln Search", icon: ShieldAlert, placeholder: "CVE ID or software name + version..." },
+  {
+    id: "vulnerability",
+    label: "Vuln Search",
+    icon: ShieldAlert,
+    placeholder: "CVE ID or software name + version...",
+  },
 ];
 
 export function KnowledgeExplorerPage() {
@@ -85,8 +95,7 @@ function SearchTab() {
   const errorSearch = useResearchError();
   const vulnSearch = useVulnerabilitySearch();
 
-  const isLoading =
-    webSearch.isPending || errorSearch.isPending || vulnSearch.isPending;
+  const isLoading = webSearch.isPending || errorSearch.isPending || vulnSearch.isPending;
 
   const handleSearch = async () => {
     if (!query.trim() || query.trim().length < 2) return;
@@ -188,9 +197,7 @@ function SearchTab() {
           <div className="flex flex-col items-center justify-center h-48 text-muted-foreground">
             <FileSearch className="w-8 h-8 mb-2 opacity-50" />
             <p className="text-sm">
-              {query
-                ? "No results found"
-                : "Enter a search query to explore knowledge"}
+              {query ? "No results found" : "Enter a search query to explore knowledge"}
             </p>
           </div>
         )}
@@ -201,12 +208,7 @@ function SearchTab() {
               <span>
                 {results.length} result{results.length !== 1 ? "s" : ""}
               </span>
-              <span>
-                via{" "}
-                {providersUsed
-                  .map((p) => formatProvider(p))
-                  .join(", ")}
-              </span>
+              <span>via {providersUsed.map((p) => formatProvider(p)).join(", ")}</span>
             </div>
           </div>
         )}
@@ -241,18 +243,11 @@ function StatsTab() {
           </div>
           <div className="p-3 space-y-2">
             {providers.map((p) => (
-              <div
-                key={p.name}
-                className="flex items-center justify-between text-xs"
-              >
-                <span className="text-foreground">
-                  {formatProvider(p.name)}
-                </span>
+              <div key={p.name} className="flex items-center justify-between text-xs">
+                <span className="text-foreground">{formatProvider(p.name)}</span>
                 <div className="flex items-center gap-2">
                   {p.requires_api_key && (
-                    <span className="text-[10px] text-muted-foreground">
-                      API key required
-                    </span>
+                    <span className="text-[10px] text-muted-foreground">API key required</span>
                   )}
                   <span
                     className={cn(
@@ -277,27 +272,20 @@ function StatsTab() {
 function ResultCard({ result }: { result: KnowledgeResult }) {
   const [expanded, setExpanded] = useState(false);
   const hasLongContent = result.content.length > 500;
-  const displayContent = expanded
-    ? result.content
-    : result.content.slice(0, 500);
+  const displayContent = expanded ? result.content : result.content.slice(0, 500);
 
   return (
     <div className="bg-card rounded-lg border border-border overflow-hidden">
       {/* Header */}
       <div className="px-3 py-2 flex items-start gap-3">
         <div
-          className={cn(
-            "mt-0.5 p-1.5 rounded flex-shrink-0",
-            getProviderColor(result.provider),
-          )}
+          className={cn("mt-0.5 p-1.5 rounded flex-shrink-0", getProviderColor(result.provider))}
         >
           {getProviderIcon(result.provider)}
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h4 className="text-sm font-medium text-foreground truncate">
-              {result.title}
-            </h4>
+            <h4 className="text-sm font-medium text-foreground truncate">{result.title}</h4>
           </div>
           <div className="flex items-center gap-2 mt-0.5">
             <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] bg-muted text-muted-foreground">

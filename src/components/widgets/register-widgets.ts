@@ -143,8 +143,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.playwright,
     defaultPriority: 15,
     detailRoute: "/logs/playwright",
-    getSummaryWidthTier: (data): SummaryWidthTier =>
-      data.totalTests === 0 ? "narrow" : "medium",
+    getSummaryWidthTier: (data): SummaryWidthTier => (data.totalTests === 0 ? "narrow" : "medium"),
   });
 
   // AI Conversation - for AI analysis and chat
@@ -174,8 +173,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.verification,
     defaultPriority: 25,
     detailRoute: "/verification",
-    getSummaryWidthTier: (data): SummaryWidthTier =>
-      data.stats.total === 0 ? "narrow" : "medium",
+    getSummaryWidthTier: (data): SummaryWidthTier => (data.stats.total === 0 ? "narrow" : "medium"),
   });
 
   // Findings - AI-detected issues
@@ -190,8 +188,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.findings,
     defaultPriority: 30,
     detailRoute: "/findings",
-    getSummaryWidthTier: (data): SummaryWidthTier =>
-      data.totalCount === 0 ? "narrow" : "medium",
+    getSummaryWidthTier: (data): SummaryWidthTier => (data.totalCount === 0 ? "narrow" : "medium"),
   });
 
   // Execution Status - Real-time agentic feature status
@@ -299,8 +296,7 @@ export function registerAllWidgets(): void {
     detectActivity: defaultDetectors.canvas,
     defaultPriority: 3,
     detailRoute: "/canvas",
-    getSummaryWidthTier: (data): SummaryWidthTier =>
-      data.panelCount === 0 ? "narrow" : "medium",
+    getSummaryWidthTier: (data): SummaryWidthTier => (data.panelCount === 0 ? "narrow" : "medium"),
   });
 
   // Trace Viewer - Jaeger-inspired waterfall execution trace viewer

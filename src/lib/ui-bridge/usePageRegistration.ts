@@ -21,7 +21,7 @@ export function usePageRegistration(
   id: string,
   name: string,
   description: string,
-  actions?: PageAction[]
+  actions?: PageAction[],
 ) {
   useUIComponent({
     id: `page-${id}`,

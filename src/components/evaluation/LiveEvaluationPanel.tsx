@@ -125,7 +125,9 @@ export default function LiveEvaluationPanel({
             <div className="flex rounded-md overflow-hidden border border-border text-xs ml-auto">
               <button
                 className={`px-2.5 py-1 transition-colors ${
-                  specMode === "saved" ? "bg-primary text-primary-foreground" : "bg-muted/30 hover:bg-muted/50"
+                  specMode === "saved"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/30 hover:bg-muted/50"
                 }`}
                 onClick={() => setSpecMode("saved")}
               >
@@ -133,7 +135,9 @@ export default function LiveEvaluationPanel({
               </button>
               <button
                 className={`px-2.5 py-1 transition-colors ${
-                  specMode === "inline" ? "bg-primary text-primary-foreground" : "bg-muted/30 hover:bg-muted/50"
+                  specMode === "inline"
+                    ? "bg-primary text-primary-foreground"
+                    : "bg-muted/30 hover:bg-muted/50"
                 }`}
                 onClick={() => setSpecMode("inline")}
               >
@@ -175,7 +179,9 @@ export default function LiveEvaluationPanel({
 
         {/* Input */}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">Input (prompt / question)</label>
+          <label className="text-xs font-medium text-muted-foreground">
+            Input (prompt / question)
+          </label>
           <textarea
             className="w-full rounded-md bg-background border border-border px-3 py-2 text-sm focus:outline-hidden focus:ring-2 focus:ring-primary resize-y min-h-[60px]"
             placeholder="Enter the prompt or question that was sent to the LLM..."
@@ -213,7 +219,12 @@ export default function LiveEvaluationPanel({
 
         {/* Actions */}
         <div className="flex items-center gap-2">
-          <Button size="sm" onClick={handleEvaluate} disabled={!canEvaluate} data-tutorial-id="live-evaluation-run">
+          <Button
+            size="sm"
+            onClick={handleEvaluate}
+            disabled={!canEvaluate}
+            data-tutorial-id="live-evaluation-run"
+          >
             {loading ? (
               <>
                 <RefreshCw className="w-3.5 h-3.5 animate-spin" />
@@ -253,7 +264,9 @@ export default function LiveEvaluationPanel({
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-medium text-muted-foreground">Results</span>
                   <Badge
-                    variant={passCount === totalCount ? "success" : passCount === 0 ? "danger" : "warning"}
+                    variant={
+                      passCount === totalCount ? "success" : passCount === 0 ? "danger" : "warning"
+                    }
                     size="sm"
                   >
                     {passCount}/{totalCount} passed

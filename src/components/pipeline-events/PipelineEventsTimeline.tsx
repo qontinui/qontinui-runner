@@ -88,14 +88,10 @@ export function PipelineEventsTimeline({ events = [], isLoading }: PipelineEvent
         Pipeline Events
       </h3>
 
-      {isLoading && (
-        <div className="text-center text-muted-foreground py-8">Loading events...</div>
-      )}
+      {isLoading && <div className="text-center text-muted-foreground py-8">Loading events...</div>}
 
       {!isLoading && events.length === 0 && (
-        <div className="text-center text-muted-foreground py-8">
-          No pipeline events recorded
-        </div>
+        <div className="text-center text-muted-foreground py-8">No pipeline events recorded</div>
       )}
 
       {events.length > 0 && (

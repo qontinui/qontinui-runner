@@ -48,7 +48,12 @@ export function ReplayController({
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT") return;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT"
+      )
+        return;
       if (e.key === "ArrowLeft") goBack();
       else if (e.key === "ArrowRight") goForward();
       else if (e.key === " ") {
@@ -86,11 +91,7 @@ export function ReplayController({
           className="p-0.5 hover:bg-zinc-700 rounded"
           title="Play/Pause (Space)"
         >
-          {isPlaying ? (
-            <Pause className="w-3.5 h-3.5" />
-          ) : (
-            <Play className="w-3.5 h-3.5" />
-          )}
+          {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
         </button>
         <button
           onClick={goForward}

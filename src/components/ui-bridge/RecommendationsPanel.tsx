@@ -30,7 +30,9 @@ export function RecommendationsPanel({ days = 7 }: RecommendationsPanelProps) {
   const { data = [], isLoading } = useQuery<Recommendation[]>({
     queryKey: ["graph-analytics", "recommendations", days],
     queryFn: async () => {
-      const res = await fetch(`http://localhost:9876/ui-bridge/analytics/recommendations?days=${days}`);
+      const res = await fetch(
+        `http://localhost:9876/ui-bridge/analytics/recommendations?days=${days}`,
+      );
       if (!res.ok) return [];
       const json = await res.json();
       return json.data ?? [];
@@ -64,7 +66,9 @@ export function RecommendationsPanel({ days = 7 }: RecommendationsPanelProps) {
                 </span>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 mb-1">
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${CATEGORY_COLORS[rec.category] ?? "bg-muted text-muted-foreground"}`}>
+                    <span
+                      className={`text-xs px-2 py-0.5 rounded-full font-medium ${CATEGORY_COLORS[rec.category] ?? "bg-muted text-muted-foreground"}`}
+                    >
                       {rec.category}
                     </span>
                   </div>

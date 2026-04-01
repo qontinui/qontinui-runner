@@ -18,15 +18,8 @@ import {
 } from "lucide-react";
 import { useUIComponent } from "ui-bridge";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
-import type {
-  ProductTour,
-  TourAudience,
-  TourGenerationState,
-} from "@/types/product-tour";
-import {
-  INITIAL_GENERATION_STATE,
-  PRODUCT_TOURS_STORAGE_KEY,
-} from "@/types/product-tour";
+import type { ProductTour, TourAudience, TourGenerationState } from "@/types/product-tour";
+import { INITIAL_GENERATION_STATE, PRODUCT_TOURS_STORAGE_KEY } from "@/types/product-tour";
 import { fetchRegisteredElements, generateTour } from "@/lib/product-tour/tour-generator";
 import { exportTour } from "@/lib/product-tour/tour-exporter";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -149,10 +142,7 @@ export function TourCatalog() {
     const existing = loadSavedTours();
     const newIds = new Set(genState.tours.map((t) => t.id));
     // Replace existing tours with same ID, append new ones
-    const merged = [
-      ...existing.filter((t) => !newIds.has(t.id)),
-      ...genState.tours,
-    ];
+    const merged = [...existing.filter((t) => !newIds.has(t.id)), ...genState.tours];
     saveTours(merged);
     setSavedTours(merged);
     setGenState({ phase: "done", tours: genState.tours, error: null });
@@ -161,22 +151,25 @@ export function TourCatalog() {
   // -------------------------------------------------------------------------
   // Export
   // -------------------------------------------------------------------------
-  const handleExport = useCallback((tour: ProductTour, format: "html" | "json" | "markdown" = "html") => {
-    const exports = exportTour(tour);
-    const formatMap = {
-      html: { content: exports.html, mime: "text/html", ext: "html" },
-      json: { content: exports.json, mime: "application/json", ext: "json" },
-      markdown: { content: exports.markdown, mime: "text/markdown", ext: "md" },
-    };
-    const { content, mime, ext } = formatMap[format];
-    const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${tour.id}.${ext}`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, []);
+  const handleExport = useCallback(
+    (tour: ProductTour, format: "html" | "json" | "markdown" = "html") => {
+      const exports = exportTour(tour);
+      const formatMap = {
+        html: { content: exports.html, mime: "text/html", ext: "html" },
+        json: { content: exports.json, mime: "application/json", ext: "json" },
+        markdown: { content: exports.markdown, mime: "text/markdown", ext: "md" },
+      };
+      const { content, mime, ext } = formatMap[format];
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${tour.id}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    [],
+  );
 
   // -------------------------------------------------------------------------
   // Delete
@@ -259,9 +252,7 @@ export function TourCatalog() {
                       ) : (
                         <Square className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                       )}
-                      <span className="truncate">
-                        {s.config.metadata?.component || s.specId}
-                      </span>
+                      <span className="truncate">{s.config.metadata?.component || s.specId}</span>
                     </button>
                   );
                 })}
@@ -285,7 +276,9 @@ export function TourCatalog() {
 
           {/* Generate button */}
           <div className="flex items-center gap-3">
-            {(genState.phase === "idle" || genState.phase === "error" || genState.phase === "done") && (
+            {(genState.phase === "idle" ||
+              genState.phase === "error" ||
+              genState.phase === "done") && (
               <button
                 onClick={handleGenerate}
                 disabled={selectedSpecIds.size === 0}
@@ -373,11 +366,7 @@ export function TourCatalog() {
                   <div className="grid gap-3 sm:grid-cols-2">
                     {tours.map((tour) => (
                       <div key={tour.id} className="relative group">
-                        <TourCard
-                          tour={tour}
-                          onLaunch={setActiveTour}
-                          onExport={handleExport}
-                        />
+                        <TourCard tour={tour} onLaunch={setActiveTour} onExport={handleExport} />
                         <button
                           onClick={() => handleDelete(tour.id)}
                           className="absolute top-2 right-2 text-xs text-muted-foreground hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"

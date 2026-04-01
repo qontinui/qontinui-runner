@@ -116,7 +116,10 @@ function TreeNode({
         )}
 
         {!isGroup && (
-          <TypeIcon type={node.type} className={`w-3 h-3 shrink-0 ${isUnspecced ? "opacity-30" : "opacity-60"}`} />
+          <TypeIcon
+            type={node.type}
+            className={`w-3 h-3 shrink-0 ${isUnspecced ? "opacity-30" : "opacity-60"}`}
+          />
         )}
 
         <span className="truncate flex-1">{node.label}</span>

@@ -62,17 +62,12 @@ interface SpecAssertion {
   enabled: boolean;
 }
 
-export async function analyzeCoverage(
-  projectPath: string,
-): Promise<CoverageAnalysisResult> {
-  const response = await fetch(
-    `${API_BASE}/development-intelligence/coverage-analysis`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_path: projectPath }),
-    },
-  );
+export async function analyzeCoverage(projectPath: string): Promise<CoverageAnalysisResult> {
+  const response = await fetch(`${API_BASE}/development-intelligence/coverage-analysis`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_path: projectPath }),
+  });
 
   if (!response.ok) {
     throw new Error(`Coverage analysis failed: ${response.statusText}`);
@@ -110,31 +105,21 @@ export function analyzeSpecCoverage(
     );
 
     const criticalAssertions = spec.groups.reduce(
-      (sum, g) =>
-        sum +
-        g.assertions.filter((a) => a.enabled && a.severity === "critical")
-          .length,
+      (sum, g) => sum + g.assertions.filter((a) => a.enabled && a.severity === "critical").length,
       0,
     );
 
-    const totalTestAssertions = matchingTests.reduce(
-      (sum, tf) => sum + tf.assertionCount,
-      0,
-    );
+    const totalTestAssertions = matchingTests.reduce((sum, tf) => sum + tf.assertionCount, 0);
 
     // Analyze per-group coverage
     const groupGaps: GapDetail[] = spec.groups.map((group) => {
       const enabledAssertions = group.assertions.filter((a) => a.enabled);
       const groupKeywords = extractKeywords(group.name);
       const hasTest = matchingTests.some((tf) =>
-        groupKeywords.some((kw) =>
-          tf.content.toLowerCase().includes(kw.toLowerCase()),
-        ),
+        groupKeywords.some((kw) => tf.content.toLowerCase().includes(kw.toLowerCase())),
       );
 
-      const maxSeverity = enabledAssertions.reduce<
-        "critical" | "warning" | "info"
-      >((max, a) => {
+      const maxSeverity = enabledAssertions.reduce<"critical" | "warning" | "info">((max, a) => {
         const order = { critical: 3, warning: 2, info: 1 };
         return order[a.severity] > order[max] ? a.severity : max;
       }, "info");
@@ -150,9 +135,7 @@ export function analyzeSpecCoverage(
     });
 
     const coverageScore =
-      totalAssertions > 0
-        ? Math.min(1, totalTestAssertions / totalAssertions)
-        : 0;
+      totalAssertions > 0 ? Math.min(1, totalTestAssertions / totalAssertions) : 0;
 
     gaps.push({
       page: pageId,
@@ -167,12 +150,8 @@ export function analyzeSpecCoverage(
 
   // Sort by gap severity (most critical gaps first)
   gaps.sort((a, b) => {
-    const aCriticalGaps = a.gaps.filter(
-      (g) => g.severity === "critical",
-    ).length;
-    const bCriticalGaps = b.gaps.filter(
-      (g) => g.severity === "critical",
-    ).length;
+    const aCriticalGaps = a.gaps.filter((g) => g.severity === "critical").length;
+    const bCriticalGaps = b.gaps.filter((g) => g.severity === "critical").length;
     if (aCriticalGaps !== bCriticalGaps) return bCriticalGaps - aCriticalGaps;
     return a.coverageScore - b.coverageScore;
   });
@@ -183,9 +162,7 @@ export function analyzeSpecCoverage(
   ).length;
   const uncovered = gaps.filter((g) => g.coverageScore <= 0.3).length;
   const averageCoverageScore =
-    gaps.length > 0
-      ? gaps.reduce((sum, g) => sum + g.coverageScore, 0) / gaps.length
-      : 0;
+    gaps.length > 0 ? gaps.reduce((sum, g) => sum + g.coverageScore, 0) / gaps.length : 0;
 
   return {
     gaps,
@@ -210,12 +187,7 @@ export interface TestFileInfo {
  * Count test assertions in file content.
  */
 export function countTestAssertions(content: string): number {
-  const patterns = [
-    /\bexpect\s*\(/g,
-    /\bassert\s*[\.(]/g,
-    /\bit\s*\(/g,
-    /\btest\s*\(/g,
-  ];
+  const patterns = [/\bexpect\s*\(/g, /\bassert\s*[\.(]/g, /\bit\s*\(/g, /\btest\s*\(/g];
   return patterns.reduce((count, pattern) => {
     const matches = content.match(pattern);
     return count + (matches?.length ?? 0);
@@ -245,9 +217,7 @@ export function getCoverageTierColor(score: number): string {
 /**
  * Get the coverage tier label for a score.
  */
-export function getCoverageTier(
-  score: number,
-): "good" | "partial" | "uncovered" {
+export function getCoverageTier(score: number): "good" | "partial" | "uncovered" {
   if (score > 0.7) return "good";
   if (score > 0.3) return "partial";
   return "uncovered";

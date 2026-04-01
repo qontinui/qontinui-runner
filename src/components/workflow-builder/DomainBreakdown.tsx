@@ -23,25 +23,20 @@ const DOMAIN_COLORS: Record<string, string> = {
   general: "bg-zinc-500",
 };
 
-export const DomainBreakdown: React.FC<DomainBreakdownProps> = ({
-  domains,
-  complexityLevel,
-}) => {
+export const DomainBreakdown: React.FC<DomainBreakdownProps> = ({ domains, complexityLevel }) => {
   const total = domains.reduce((sum, d) => sum + d.criteria_count, 0);
 
   return (
     <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-          Domain Breakdown
-        </h3>
+        <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Domain Breakdown</h3>
         <span
           className={`text-xs font-mono px-2 py-0.5 rounded ${
             complexityLevel === "complex"
               ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
               : complexityLevel === "moderate"
-              ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400"
-              : "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                ? "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400"
+                : "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
           }`}
         >
           {complexityLevel}
@@ -64,9 +59,7 @@ export const DomainBreakdown: React.FC<DomainBreakdownProps> = ({
       <div className="space-y-1.5">
         {domains.map((d) => (
           <div key={d.domain} className="flex items-center gap-2 text-sm">
-            <div
-              className={`w-2.5 h-2.5 rounded-sm ${DOMAIN_COLORS[d.domain] || "bg-zinc-400"}`}
-            />
+            <div className={`w-2.5 h-2.5 rounded-sm ${DOMAIN_COLORS[d.domain] || "bg-zinc-400"}`} />
             <span className="text-zinc-700 dark:text-zinc-300 flex-1">
               {d.domain.replace(/_/g, " ")}
             </span>

@@ -1,12 +1,5 @@
 import { useCallback, useMemo } from "react";
-import {
-  ReactFlow,
-  Background,
-  Controls,
-  type Node,
-  type Edge,
-  Position,
-} from "@xyflow/react";
+import { ReactFlow, Background, Controls, type Node, type Edge, Position } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "dagre";
 import type { TraceSpan } from "./types";
@@ -129,12 +122,7 @@ function layoutGraph(nodes: Node[], edges: Edge[]) {
   });
 }
 
-export function AgentGraph({
-  spans,
-  selectedSpanId,
-  onSelectSpan,
-  height = 400,
-}: AgentGraphProps) {
+export function AgentGraph({ spans, selectedSpanId, onSelectSpan, height = 400 }: AgentGraphProps) {
   const { nodes: rawNodes, edges } = useMemo(() => buildAgentGraph(spans), [spans]);
   const nodes = useMemo(() => layoutGraph(rawNodes, edges), [rawNodes, edges]);
 

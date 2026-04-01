@@ -21,11 +21,15 @@ interface AnnotationGapTableProps {
 }
 
 export function AnnotationGapTable({ minInteractions = 10 }: AnnotationGapTableProps) {
-  const { data = [], isLoading, error } = useQuery<AnnotationGap[]>({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery<AnnotationGap[]>({
     queryKey: ["graph-analytics", "annotation-gaps", minInteractions],
     queryFn: async () => {
       const res = await fetch(
-        `http://localhost:9876/ui-bridge/analytics/annotation-gaps?min_interactions=${minInteractions}`
+        `http://localhost:9876/ui-bridge/analytics/annotation-gaps?min_interactions=${minInteractions}`,
       );
       if (!res.ok) return [];
       const json = await res.json();
@@ -68,16 +72,29 @@ export function AnnotationGapTable({ minInteractions = 10 }: AnnotationGapTableP
             </thead>
             <tbody>
               {data.map((gap) => (
-                <tr key={gap.element_id} className="border-b border-border last:border-0 hover:bg-muted/50">
-                  <td className="py-2 px-3 font-mono text-sm truncate max-w-[200px]">{gap.element_id}</td>
-                  <td className="py-2 px-3 text-xs text-muted-foreground">{gap.element_type ?? "-"}</td>
-                  <td className="py-2 px-3 text-right tabular-nums font-semibold">{gap.interaction_count}</td>
+                <tr
+                  key={gap.element_id}
+                  className="border-b border-border last:border-0 hover:bg-muted/50"
+                >
+                  <td className="py-2 px-3 font-mono text-sm truncate max-w-[200px]">
+                    {gap.element_id}
+                  </td>
+                  <td className="py-2 px-3 text-xs text-muted-foreground">
+                    {gap.element_type ?? "-"}
+                  </td>
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold">
+                    {gap.interaction_count}
+                  </td>
                   <td className="py-2 px-3 text-right">
-                    <span className={`tabular-nums ${gap.success_rate >= 0.95 ? "text-green-500" : gap.success_rate >= 0.8 ? "text-yellow-500" : "text-red-500"}`}>
+                    <span
+                      className={`tabular-nums ${gap.success_rate >= 0.95 ? "text-green-500" : gap.success_rate >= 0.8 ? "text-yellow-500" : "text-red-500"}`}
+                    >
                       {Math.round(gap.success_rate * 100)}%
                     </span>
                   </td>
-                  <td className="py-2 px-3 text-xs text-muted-foreground truncate max-w-[150px]">{gap.label ?? "-"}</td>
+                  <td className="py-2 px-3 text-xs text-muted-foreground truncate max-w-[150px]">
+                    {gap.label ?? "-"}
+                  </td>
                 </tr>
               ))}
             </tbody>

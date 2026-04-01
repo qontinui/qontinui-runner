@@ -17,13 +17,13 @@ export const ExplorationPanel: React.FC<ExplorationPanelProps> = ({ stats }) => 
 
   return (
     <div className="rounded-lg border border-zinc-200 dark:border-zinc-700 p-4 space-y-3">
-      <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-        Exploration Results
-      </h3>
+      <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Exploration Results</h3>
       <div className="grid grid-cols-2 gap-3 text-sm">
         <div>
           <span className="text-zinc-500 dark:text-zinc-400">Candidates explored</span>
-          <p className="font-mono text-zinc-900 dark:text-zinc-100">{stats.total_candidates_explored}</p>
+          <p className="font-mono text-zinc-900 dark:text-zinc-100">
+            {stats.total_candidates_explored}
+          </p>
         </div>
         <div>
           <span className="text-zinc-500 dark:text-zinc-400">Search depth</span>
@@ -35,7 +35,9 @@ export const ExplorationPanel: React.FC<ExplorationPanelProps> = ({ stats }) => 
         </div>
         <div>
           <span className="text-zinc-500 dark:text-zinc-400">Strategy</span>
-          <p className="font-mono text-zinc-900 dark:text-zinc-100 truncate">{stats.strategy_used}</p>
+          <p className="font-mono text-zinc-900 dark:text-zinc-100 truncate">
+            {stats.strategy_used}
+          </p>
         </div>
       </div>
       {stats.score_progression.length > 0 && (

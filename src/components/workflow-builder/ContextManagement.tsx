@@ -44,7 +44,7 @@ export function ContextManagement() {
   // project_id is not part of the canonical UnifiedWorkflow schema but may
   // be attached at runtime by the builder.  Access it safely via index signature.
   const memoryContext = useObservationMemory(
-    (workflow as unknown as Record<string, unknown>)["project_id"] as string | null ?? null,
+    ((workflow as unknown as Record<string, unknown>)["project_id"] as string | null) ?? null,
   );
 
   // Local state
@@ -431,7 +431,9 @@ export function ContextManagement() {
             <span className="text-xs font-medium text-zinc-400">
               Memory ({memoryContext.observationCount} observations from past sessions)
             </span>
-            <span className={`ml-auto px-1.5 py-0.5 text-[10px] ${getAccentColors("violet").bg} ${getAccentColors("violet").text} rounded`}>
+            <span
+              className={`ml-auto px-1.5 py-0.5 text-[10px] ${getAccentColors("violet").bg} ${getAccentColors("violet").text} rounded`}
+            >
               auto-injected
             </span>
           </div>

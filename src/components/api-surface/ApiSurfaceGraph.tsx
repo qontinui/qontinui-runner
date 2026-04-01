@@ -69,7 +69,10 @@ const SurfaceNode = memo(({ data }: { data: SurfaceNodeData }) => {
             className="w-2 h-2 rounded-full shrink-0"
             style={{ backgroundColor: data.isOrphan ? "#ef4444" : colors.border }}
           />
-          <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: colors.text }}>
+          <span
+            className="text-[10px] font-medium uppercase tracking-wider"
+            style={{ color: colors.text }}
+          >
             {data.category.replace(/_/g, " ")}
           </span>
           {data.callerCount > 0 && (
@@ -103,7 +106,12 @@ interface GraphItem {
   callerCount: number;
 }
 
-function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: Set<NodeCategory>, searchQuery: string) {
+function buildGraphData(
+  surface: ApiSurface,
+  showOrphans: boolean,
+  layerFilter: Set<NodeCategory>,
+  searchQuery: string,
+) {
   const items: GraphItem[] = [];
   const orphanNames = new Set(surface.orphans.map((o) => `${o.endpointType}:${o.name}`));
   const q = searchQuery.toLowerCase();
@@ -122,7 +130,14 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
     }
     for (const file of frontendFiles) {
       if (matchSearch(file)) {
-        items.push({ id: `frontend:${file}`, category: "frontend", label: file.split("/").pop() ?? file, sublabel: file, isOrphan: false, callerCount: 0 });
+        items.push({
+          id: `frontend:${file}`,
+          category: "frontend",
+          label: file.split("/").pop() ?? file,
+          sublabel: file,
+          isOrphan: false,
+          callerCount: 0,
+        });
       }
     }
   }
@@ -132,7 +147,14 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
       const isOrphan = orphanNames.has(`tauri_command:${cmd.name}`);
       if (!showOrphans && isOrphan) continue;
       if (!matchSearch(cmd.name, cmd.file)) continue;
-      items.push({ id: `tauri_command:${cmd.name}`, category: "tauri_command", label: cmd.name, sublabel: cmd.file, isOrphan, callerCount: cmd.callers.length });
+      items.push({
+        id: `tauri_command:${cmd.name}`,
+        category: "tauri_command",
+        label: cmd.name,
+        sublabel: cmd.file,
+        isOrphan,
+        callerCount: cmd.callers.length,
+      });
     }
   }
 
@@ -142,14 +164,28 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
       const isOrphan = orphanNames.has(`mcp_route:${key}`);
       if (!showOrphans && isOrphan) continue;
       if (!matchSearch(route.path, route.file)) continue;
-      items.push({ id: `mcp_route:${route.path}`, category: "mcp_route", label: `${route.method} ${route.path}`, sublabel: route.handler, isOrphan, callerCount: route.callers.length });
+      items.push({
+        id: `mcp_route:${route.path}`,
+        category: "mcp_route",
+        label: `${route.method} ${route.path}`,
+        sublabel: route.handler,
+        isOrphan,
+        callerCount: route.callers.length,
+      });
     }
   }
 
   if (layerFilter.has("ui_bridge_route")) {
     for (const route of surface.uiBridgeRoutes) {
       if (!matchSearch(route.path, route.file)) continue;
-      items.push({ id: `ui_bridge_route:${route.path}`, category: "ui_bridge_route", label: `${route.method} ${route.path}`, sublabel: route.file, isOrphan: false, callerCount: 0 });
+      items.push({
+        id: `ui_bridge_route:${route.path}`,
+        category: "ui_bridge_route",
+        label: `${route.method} ${route.path}`,
+        sublabel: route.file,
+        isOrphan: false,
+        callerCount: 0,
+      });
     }
   }
 
@@ -158,7 +194,14 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
       const isOrphan = orphanNames.has(`pg_method:${method.name}`);
       if (!showOrphans && isOrphan) continue;
       if (!matchSearch(method.name, method.file)) continue;
-      items.push({ id: `pg_method:${method.name}`, category: "pg_method", label: method.name, sublabel: method.file, isOrphan, callerCount: method.callers.length });
+      items.push({
+        id: `pg_method:${method.name}`,
+        category: "pg_method",
+        label: method.name,
+        sublabel: method.file,
+        isOrphan,
+        callerCount: method.callers.length,
+      });
     }
   }
 
@@ -167,7 +210,14 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
       const isOrphan = orphanNames.has(`python_event:${event.value}`);
       if (!showOrphans && isOrphan) continue;
       if (!matchSearch(event.value, event.file)) continue;
-      items.push({ id: `python_event:${event.value}`, category: "python_event", label: event.name, sublabel: event.value, isOrphan, callerCount: event.interceptedBy.length });
+      items.push({
+        id: `python_event:${event.value}`,
+        category: "python_event",
+        label: event.name,
+        sublabel: event.value,
+        isOrphan,
+        callerCount: event.interceptedBy.length,
+      });
     }
   }
 
@@ -176,14 +226,28 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
       const isOrphan = orphanNames.has(`clorinde_query:${query.name}`);
       if (!showOrphans && isOrphan) continue;
       if (!matchSearch(query.name, query.file)) continue;
-      items.push({ id: `clorinde_query:${query.name}`, category: "clorinde_query", label: query.name, sublabel: query.table ?? undefined, isOrphan, callerCount: query.wrapper ? 1 : 0 });
+      items.push({
+        id: `clorinde_query:${query.name}`,
+        category: "clorinde_query",
+        label: query.name,
+        sublabel: query.table ?? undefined,
+        isOrphan,
+        callerCount: query.wrapper ? 1 : 0,
+      });
     }
   }
 
   if (layerFilter.has("db_table")) {
     for (const table of surface.dbTables) {
       if (!matchSearch(table.name, table.file)) continue;
-      items.push({ id: `db_table:${table.name}`, category: "db_table", label: table.name, sublabel: `${table.columnCount} columns`, isOrphan: false, callerCount: 0 });
+      items.push({
+        id: `db_table:${table.name}`,
+        category: "db_table",
+        label: table.name,
+        sublabel: `${table.columnCount} columns`,
+        isOrphan: false,
+        callerCount: 0,
+      });
     }
   }
 
@@ -213,7 +277,10 @@ function buildGraphData(surface: ApiSurface, showOrphans: boolean, layerFilter: 
   return { items, edges };
 }
 
-function layoutGraph(items: GraphItem[], graphEdges: Array<{ source: string; target: string; type: string }>) {
+function layoutGraph(
+  items: GraphItem[],
+  graphEdges: Array<{ source: string; target: string; type: string }>,
+) {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: "TB", ranksep: 80, nodesep: 30 });
@@ -286,7 +353,13 @@ function getConnectedIds(nodeId: string, edges: Edge[]): Set<string> {
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
-function ApiSurfaceGraphInner({ surface, showOrphans, layerFilter, searchQuery, onNodeSelect }: Props) {
+function ApiSurfaceGraphInner({
+  surface,
+  showOrphans,
+  layerFilter,
+  searchQuery,
+  onNodeSelect,
+}: Props) {
   const { items, edges: graphEdges } = useMemo(
     () => buildGraphData(surface, showOrphans, layerFilter, searchQuery),
     [surface, showOrphans, layerFilter, searchQuery],
@@ -325,9 +398,7 @@ function ApiSurfaceGraphInner({ surface, showOrphans, layerFilter, searchQuery, 
 
   const onNodeMouseLeave = useCallback(() => {
     setHoveredId(null);
-    setNodes((nds) =>
-      nds.map((n) => ({ ...n, data: { ...n.data, dimmed: false } })),
-    );
+    setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, dimmed: false } })));
   }, [setNodes]);
 
   const onNodeClick = useCallback(

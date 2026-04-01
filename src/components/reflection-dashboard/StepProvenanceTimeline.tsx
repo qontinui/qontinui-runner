@@ -62,9 +62,7 @@ function ProvenanceStep({ step }: { step: StepProvenance }) {
             by <span className="font-mono">{step.generating_agent}</span>
           </span>
           {step.generation_iteration != null && (
-            <span className="text-xs text-muted-foreground">
-              iter {step.generation_iteration}
-            </span>
+            <span className="text-xs text-muted-foreground">iter {step.generation_iteration}</span>
           )}
           {hasUiBridgeEvents && (
             <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary">

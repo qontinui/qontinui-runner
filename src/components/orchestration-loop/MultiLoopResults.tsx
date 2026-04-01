@@ -49,8 +49,7 @@ export function MultiLoopResults({ loops }: MultiLoopResultsProps) {
   const errorLoops = loops.filter((l) => l.phase === "error");
   const totalIterations = loops.reduce((s, l) => s + l.current_iteration, 0);
   const totalFixes = loops.reduce(
-    (s, l) =>
-      s + l.iteration_results.reduce((fs, r) => fs + (r.fix_count ?? 0), 0),
+    (s, l) => s + l.iteration_results.reduce((fs, r) => fs + (r.fix_count ?? 0), 0),
     0,
   );
 
@@ -66,11 +65,12 @@ export function MultiLoopResults({ loops }: MultiLoopResultsProps) {
   const startTime = allStarts[0] ? new Date(allStarts[0]) : null;
   const endTime = allEnds.length > 0 ? new Date(allEnds[allEnds.length - 1]) : null;
   const durationMs = startTime && endTime ? endTime.getTime() - startTime.getTime() : 0;
-  const durationStr = durationMs > 0
-    ? durationMs > 60000
-      ? `${Math.round(durationMs / 60000)}m`
-      : `${Math.round(durationMs / 1000)}s`
-    : "--";
+  const durationStr =
+    durationMs > 0
+      ? durationMs > 60000
+        ? `${Math.round(durationMs / 60000)}m`
+        : `${Math.round(durationMs / 1000)}s`
+      : "--";
 
   return (
     <div className="border border-border rounded overflow-hidden">
@@ -91,10 +91,7 @@ export function MultiLoopResults({ loops }: MultiLoopResultsProps) {
       {/* Per-loop rows */}
       <div className="divide-y divide-border/50">
         {loops.map((loop) => {
-          const fixes = loop.iteration_results.reduce(
-            (s, r) => s + (r.fix_count ?? 0),
-            0,
-          );
+          const fixes = loop.iteration_results.reduce((s, r) => s + (r.fix_count ?? 0), 0);
           const lastResult = loop.iteration_results[loop.iteration_results.length - 1];
           const exitReason = lastResult?.exit_check.reason ?? "--";
 
@@ -107,7 +104,9 @@ export function MultiLoopResults({ loops }: MultiLoopResultsProps) {
                 <span className="ml-auto font-mono text-muted-foreground">
                   {loop.current_iteration}/{loop.max_iterations} iterations
                 </span>
-                <span className={cn("font-mono", fixes === 0 ? "text-green-400" : "text-yellow-400")}>
+                <span
+                  className={cn("font-mono", fixes === 0 ? "text-green-400" : "text-yellow-400")}
+                >
                   {fixes} fixes
                 </span>
               </div>

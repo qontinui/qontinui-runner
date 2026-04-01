@@ -8,7 +8,13 @@
 import type { DecisionCategory } from "@/types/decision-trail";
 
 export interface DetectedChange {
-  type: "new-table" | "new-dependency" | "new-endpoint" | "new-directory" | "explicit-comment" | "new-file";
+  type:
+    | "new-table"
+    | "new-dependency"
+    | "new-endpoint"
+    | "new-directory"
+    | "explicit-comment"
+    | "new-file";
   file: string;
   detail: string;
 }
@@ -86,9 +92,7 @@ export function detectDecisions(
     if (file.diff) {
       for (const pattern of DECISION_COMMENT_PATTERNS) {
         if (pattern.test(file.diff)) {
-          const lineMatch = file.diff
-            .split("\n")
-            .find((l) => l.startsWith("+") && pattern.test(l));
+          const lineMatch = file.diff.split("\n").find((l) => l.startsWith("+") && pattern.test(l));
           if (lineMatch) {
             changes.push({
               type: "explicit-comment",

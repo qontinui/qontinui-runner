@@ -59,7 +59,7 @@ export function FailureChainViewer({ elementId }: FailureChainViewerProps) {
     queryKey: ["graph-analytics", "ui-failure-chain", elementId],
     queryFn: async () => {
       const res = await fetch(
-        `http://localhost:9876/graph/ui-failure-chain?element_id=${encodeURIComponent(elementId)}`
+        `http://localhost:9876/graph/ui-failure-chain?element_id=${encodeURIComponent(elementId)}`,
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
@@ -76,11 +76,15 @@ export function FailureChainViewer({ elementId }: FailureChainViewerProps) {
         Failure Chain: <span className="font-mono text-sm">{elementId}</span>
       </h3>
 
-      {isLoading && <div className="text-center text-muted-foreground py-8">Tracing failure chain...</div>}
+      {isLoading && (
+        <div className="text-center text-muted-foreground py-8">Tracing failure chain...</div>
+      )}
       {error && <div className="text-center text-destructive py-8">{String(error)}</div>}
 
       {data && data.length === 0 && (
-        <div className="text-center text-muted-foreground py-8">No failure chains found for this element</div>
+        <div className="text-center text-muted-foreground py-8">
+          No failure chains found for this element
+        </div>
       )}
 
       {data && data.length > 0 && (
@@ -94,9 +98,7 @@ export function FailureChainViewer({ elementId }: FailureChainViewerProps) {
                     {j < path.nodes.length - 1 && (
                       <div className="flex items-center gap-0.5 text-muted-foreground">
                         <ChevronRight className="w-3 h-3" />
-                        {path.edges[j] && (
-                          <span className="text-[10px]">{path.edges[j].kind}</span>
-                        )}
+                        {path.edges[j] && <span className="text-[10px]">{path.edges[j].kind}</span>}
                         <ChevronRight className="w-3 h-3" />
                       </div>
                     )}

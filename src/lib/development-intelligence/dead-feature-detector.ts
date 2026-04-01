@@ -32,17 +32,12 @@ export interface FeatureHealthResult {
   };
 }
 
-export async function analyzeFeatureHealth(
-  projectPath: string,
-): Promise<FeatureHealthResult> {
-  const response = await fetch(
-    `${API_BASE}/development-intelligence/feature-health`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_path: projectPath }),
-    },
-  );
+export async function analyzeFeatureHealth(projectPath: string): Promise<FeatureHealthResult> {
+  const response = await fetch(`${API_BASE}/development-intelligence/feature-health`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_path: projectPath }),
+  });
 
   if (!response.ok) {
     throw new Error(`Feature health analysis failed: ${response.statusText}`);
@@ -91,23 +86,14 @@ export function classifyFeature(input: {
   // Classify
   let status: FeatureHealth["status"];
 
-  if (
-    codeAge <= THRESHOLDS.activeCodeDays &&
-    specAge <= THRESHOLDS.activeSpecDays
-  ) {
+  if (codeAge <= THRESHOLDS.activeCodeDays && specAge <= THRESHOLDS.activeSpecDays) {
     status = "active";
-  } else if (
-    codeAge <= THRESHOLDS.specDriftCodeDays &&
-    specAge > THRESHOLDS.specDriftSpecDays
-  ) {
+  } else if (codeAge <= THRESHOLDS.specDriftCodeDays && specAge > THRESHOLDS.specDriftSpecDays) {
     status = "spec-drift";
     signals.push(
       `Component modified ${input.codeCommitCount30d} times in 30 days but spec unchanged for ${Math.round(specAge / 30)} months`,
     );
-  } else if (
-    codeAge > THRESHOLDS.abandonedDays &&
-    !input.hasTestFiles
-  ) {
+  } else if (codeAge > THRESHOLDS.abandonedDays && !input.hasTestFiles) {
     status = "abandoned";
     signals.push(
       `No git commits touching this component since ${formatDate(input.lastCodeChange)}`,
@@ -117,18 +103,13 @@ export function classifyFeature(input: {
     }
   } else if (codeAge > THRESHOLDS.staleDays) {
     status = "stale";
-    signals.push(
-      `No code changes in ${Math.round(codeAge)} days`,
-    );
+    signals.push(`No code changes in ${Math.round(codeAge)} days`);
   } else {
     status = "active";
   }
 
   // Compute staleness score (0-1, higher = more stale)
-  const staleness = Math.min(
-    1,
-    (codeAge / 180 + specAge / 180) / 2,
-  );
+  const staleness = Math.min(1, (codeAge / 180 + specAge / 180) / 2);
 
   return { status, staleness, signals };
 }
@@ -136,9 +117,7 @@ export function classifyFeature(input: {
 /**
  * Get the status color for visualization.
  */
-export function getStatusColor(
-  status: FeatureHealth["status"],
-): string {
+export function getStatusColor(status: FeatureHealth["status"]): string {
   switch (status) {
     case "active":
       return "#10B981";
@@ -154,9 +133,7 @@ export function getStatusColor(
 /**
  * Get status label for display.
  */
-export function getStatusLabel(
-  status: FeatureHealth["status"],
-): string {
+export function getStatusLabel(status: FeatureHealth["status"]): string {
   switch (status) {
     case "active":
       return "Active";

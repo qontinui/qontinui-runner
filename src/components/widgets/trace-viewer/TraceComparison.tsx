@@ -28,7 +28,12 @@ const STATUS_COLORS: Record<SpanMatch["status"], { bg: string; text: string; lab
 
 function SummaryBar({ summary }: { summary: ComparisonSummary }) {
   const deltaSign = summary.totalDeltaPct > 0 ? "+" : "";
-  const deltaColor = summary.totalDeltaPct > 5 ? "text-red-400" : summary.totalDeltaPct < -5 ? "text-emerald-400" : "text-zinc-300";
+  const deltaColor =
+    summary.totalDeltaPct > 5
+      ? "text-red-400"
+      : summary.totalDeltaPct < -5
+        ? "text-emerald-400"
+        : "text-zinc-300";
 
   return (
     <div className="flex items-center gap-4 px-3 py-2 bg-zinc-800/50 border-b border-zinc-700 text-[11px]">
@@ -39,7 +44,8 @@ function SummaryBar({ summary }: { summary: ComparisonSummary }) {
         Run B: <span className="text-zinc-200">{formatDuration(summary.totalDurationB)}</span>
       </span>
       <span className={deltaColor}>
-        {deltaSign}{summary.totalDeltaPct.toFixed(1)}% overall
+        {deltaSign}
+        {summary.totalDeltaPct.toFixed(1)}% overall
       </span>
 
       <span className="ml-auto flex gap-3">
@@ -108,10 +114,14 @@ function MatchRow({
       onClick={onClick}
       role="button"
       tabIndex={0}
-      onKeyDown={(e) => { if (e.key === "Enter") onClick(); }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onClick();
+      }}
     >
       {/* Status badge */}
-      <span className={`text-[10px] px-1.5 rounded ${statusStyle.text} shrink-0 w-[80px] text-center`}>
+      <span
+        className={`text-[10px] px-1.5 rounded ${statusStyle.text} shrink-0 w-[80px] text-center`}
+      >
         {statusStyle.label}
       </span>
 
@@ -289,28 +299,29 @@ export const TraceComparison: React.FC<TraceComparisonProps> = ({
 
   const handleSelectMatch = useCallback((match: SpanMatch) => {
     setSelectedMatch((prev) =>
-      prev && (prev.spanA?.span_id ?? prev.spanB?.span_id) === (match.spanA?.span_id ?? match.spanB?.span_id)
+      prev &&
+      (prev.spanA?.span_id ?? prev.spanB?.span_id) ===
+        (match.spanA?.span_id ?? match.spanB?.span_id)
         ? null
         : match,
     );
   }, []);
 
   const filteredMatches = useMemo(() => {
-    let result = statusFilter === "all"
-      ? matches
-      : matches.filter((m) => m.status === statusFilter);
+    let result =
+      statusFilter === "all" ? matches : matches.filter((m) => m.status === statusFilter);
     if (nameFilter) {
       const lower = nameFilter.toLowerCase();
-      result = result.filter(m => {
+      result = result.filter((m) => {
         const name = (m.spanA?.name || m.spanB?.name || "").toLowerCase();
         return name.includes(lower);
       });
     }
     if (minDelta != null) {
-      result = result.filter(m => Math.abs(m.durationDelta ?? 0) >= minDelta);
+      result = result.filter((m) => Math.abs(m.durationDelta ?? 0) >= minDelta);
     }
     if (phaseFilter !== "all") {
-      result = result.filter(m => {
+      result = result.filter((m) => {
         const span = m.spanA || m.spanB;
         return span && inferPhase(span.name) === phaseFilter;
       });
@@ -319,22 +330,23 @@ export const TraceComparison: React.FC<TraceComparisonProps> = ({
   }, [matches, statusFilter, nameFilter, minDelta, phaseFilter]);
 
   // Run selector bar (always shown)
-  const runSelectorBar = availableRuns && availableRuns.length > 0 ? (
-    <div className="flex items-center gap-4 px-3 py-1.5 bg-zinc-900 border-b border-zinc-700">
-      <RunSelector
-        label="Run A (baseline)"
-        value={baselineExecutionId}
-        onChange={onSelectRunA}
-        runs={availableRuns}
-      />
-      <RunSelector
-        label="Run B (current)"
-        value={currentExecutionId}
-        onChange={onSelectRunB}
-        runs={availableRuns}
-      />
-    </div>
-  ) : null;
+  const runSelectorBar =
+    availableRuns && availableRuns.length > 0 ? (
+      <div className="flex items-center gap-4 px-3 py-1.5 bg-zinc-900 border-b border-zinc-700">
+        <RunSelector
+          label="Run A (baseline)"
+          value={baselineExecutionId}
+          onChange={onSelectRunA}
+          runs={availableRuns}
+        />
+        <RunSelector
+          label="Run B (current)"
+          value={currentExecutionId}
+          onChange={onSelectRunB}
+          runs={availableRuns}
+        />
+      </div>
+    ) : null;
 
   if (!currentExecutionId || !baselineExecutionId) {
     return (
@@ -386,14 +398,14 @@ export const TraceComparison: React.FC<TraceComparisonProps> = ({
 
       {/* Status filter tabs */}
       <div className="flex items-center gap-1 px-3 py-1 border-b border-zinc-700 text-[10px]">
-        {(["all", "slower", "faster", "added", "removed", "status_changed", "unchanged"] as const).map((s) => (
+        {(
+          ["all", "slower", "faster", "added", "removed", "status_changed", "unchanged"] as const
+        ).map((s) => (
           <button
             key={s}
             onClick={() => setStatusFilter(s)}
             className={`px-2 py-0.5 rounded ${
-              statusFilter === s
-                ? "bg-zinc-700 text-zinc-200"
-                : "text-zinc-500 hover:text-zinc-300"
+              statusFilter === s ? "bg-zinc-700 text-zinc-200" : "text-zinc-500 hover:text-zinc-300"
             }`}
           >
             {s === "all" ? "All" : STATUS_COLORS[s].label}

@@ -6,15 +6,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import {
-  Brain,
-  RefreshCw,
-  Loader2,
-  Activity,
-  Archive,
-  Zap,
-  Clock,
-} from "lucide-react";
+import { Brain, RefreshCw, Loader2, Activity, Archive, Zap, Clock } from "lucide-react";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { getAccentColors, getStatusColors } from "@/design-system";
 
@@ -62,8 +54,7 @@ export function MemoryHealthPanel() {
   const [log, setLog] = useState<ConsolidationLogEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isConsolidating, setIsConsolidating] = useState(false);
-  const [consolidationResult, setConsolidationResult] =
-    useState<ConsolidationStats | null>(null);
+  const [consolidationResult, setConsolidationResult] = useState<ConsolidationStats | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const accent = getAccentColors("violet");
@@ -118,9 +109,7 @@ export function MemoryHealthPanel() {
         setError(json.error || "Consolidation failed");
       }
     } catch (e) {
-      setError(
-        e instanceof Error ? e.message : "Failed to trigger consolidation",
-      );
+      setError(e instanceof Error ? e.message : "Failed to trigger consolidation");
     } finally {
       setIsConsolidating(false);
     }
@@ -175,8 +164,8 @@ export function MemoryHealthPanel() {
       {/* Consolidation result */}
       {consolidationResult && (
         <div className={`rounded-md px-3 py-2 text-xs ${statusSuccess.bg} ${statusSuccess.text}`}>
-          Consolidation complete: {consolidationResult.modelsCreated} models
-          created, {consolidationResult.observationsMerged} merged,{" "}
+          Consolidation complete: {consolidationResult.modelsCreated} models created,{" "}
+          {consolidationResult.observationsMerged} merged,{" "}
           {consolidationResult.observationsArchived} archived
         </div>
       )}
@@ -200,17 +189,15 @@ export function MemoryHealthPanel() {
             icon={<Archive className="h-4 w-4" />}
             label="Decay Queue"
             value={health.decayQueueSize}
-            colorClasses={health.decayQueueSize > 50
-              ? getAccentColors("amber")
-              : getAccentColors("zinc")}
+            colorClasses={
+              health.decayQueueSize > 50 ? getAccentColors("amber") : getAccentColors("zinc")
+            }
           />
           <StatCard
             icon={<Clock className="h-4 w-4" />}
             label="Last Consolidation"
             value={
-              health.lastConsolidation
-                ? formatRelativeTime(health.lastConsolidation)
-                : "Never"
+              health.lastConsolidation ? formatRelativeTime(health.lastConsolidation) : "Never"
             }
             colorClasses={getAccentColors("zinc")}
           />
@@ -229,19 +216,13 @@ export function MemoryHealthPanel() {
                 key={entry.id}
                 className="flex items-center justify-between rounded-md bg-muted/30 px-3 py-1.5 text-xs"
               >
-                <span className="text-muted-foreground">
-                  {formatRelativeTime(entry.startedAt)}
-                </span>
+                <span className="text-muted-foreground">{formatRelativeTime(entry.startedAt)}</span>
                 <div className="flex items-center gap-3">
                   {entry.error ? (
-                    <span className={statusError.text}>
-                      Error: {entry.error.slice(0, 40)}
-                    </span>
+                    <span className={statusError.text}>Error: {entry.error.slice(0, 40)}</span>
                   ) : (
                     <>
-                      <span>
-                        {entry.modelsCreated} models
-                      </span>
+                      <span>{entry.modelsCreated} models</span>
                       <span className="text-muted-foreground">
                         {entry.observationsScanned} scanned
                       </span>
@@ -281,9 +262,7 @@ function StatCard({
         <span className={colorClasses.text}>{icon}</span>
         <span className="text-[10px] uppercase tracking-wider">{label}</span>
       </div>
-      <div className={`mt-1 text-lg font-semibold ${colorClasses.text}`}>
-        {value}
-      </div>
+      <div className={`mt-1 text-lg font-semibold ${colorClasses.text}`}>{value}</div>
     </div>
   );
 }

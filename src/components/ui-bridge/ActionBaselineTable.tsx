@@ -43,7 +43,10 @@ export function ActionBaselineTable({ days = 7 }: ActionBaselineTableProps) {
             </thead>
             <tbody>
               {data.map((row) => (
-                <tr key={row.action} className="border-b border-border last:border-0 hover:bg-muted/50">
+                <tr
+                  key={row.action}
+                  className="border-b border-border last:border-0 hover:bg-muted/50"
+                >
                   <td className="py-2 px-3 font-mono">{row.action}</td>
                   <td className="py-2 px-3 text-right tabular-nums">{row.count}</td>
                   <td className="py-2 px-3 text-right tabular-nums">
@@ -56,7 +59,9 @@ export function ActionBaselineTable({ days = 7 }: ActionBaselineTableProps) {
                     {row.max_duration_ms != null ? Math.round(row.max_duration_ms) : "-"}
                   </td>
                   <td className="py-2 px-3 text-right">
-                    <span className={`tabular-nums ${row.success_rate >= 0.95 ? "text-green-500" : row.success_rate >= 0.8 ? "text-yellow-500" : "text-red-500"}`}>
+                    <span
+                      className={`tabular-nums ${row.success_rate >= 0.95 ? "text-green-500" : row.success_rate >= 0.8 ? "text-yellow-500" : "text-red-500"}`}
+                    >
                       {Math.round(row.success_rate * 100)}%
                     </span>
                   </td>

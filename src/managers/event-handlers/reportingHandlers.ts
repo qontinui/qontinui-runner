@@ -164,7 +164,13 @@ function extractLLMMetrics(metadata: any, runtime?: any): LLMMetrics | undefined
   const costUsd = source.cost_usd;
 
   // Return undefined if no LLM data found
-  if (model == null && provider == null && tokensInput == null && tokensOutput == null && costUsd == null) {
+  if (
+    model == null &&
+    provider == null &&
+    tokensInput == null &&
+    tokensOutput == null &&
+    costUsd == null
+  ) {
     return undefined;
   }
 

@@ -747,7 +747,17 @@
   "metadata": {
     "component": "TuriXCUAMultimodalPipeline",
     "pageUrl": "/settings-ai",
-    "tags": ["turix-cua", "multimodal", "vision", "brain-actor", "annotation", "playbook", "click-highlight", "compression", "agentic-verification"],
+    "tags": [
+      "turix-cua",
+      "multimodal",
+      "vision",
+      "brain-actor",
+      "annotation",
+      "playbook",
+      "click-highlight",
+      "compression",
+      "agentic-verification"
+    ],
     "backendFiles": [
       "src-tauri/src/ai_provider/multimodal.rs",
       "src-tauri/src/ai_provider/claude_api.rs",

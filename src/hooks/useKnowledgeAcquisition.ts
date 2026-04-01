@@ -23,8 +23,7 @@ export const knowledgeKeys = {
   stats: () => [...knowledgeKeys.all, "stats"] as const,
   providers: () => [...knowledgeKeys.all, "providers"] as const,
   search: (query: string) => [...knowledgeKeys.all, "search", query] as const,
-  vulnSearch: (query: string) =>
-    [...knowledgeKeys.all, "vuln-search", query] as const,
+  vulnSearch: (query: string) => [...knowledgeKeys.all, "vuln-search", query] as const,
 };
 
 // ============================================================================
@@ -73,13 +72,7 @@ export function useKnowledgeSearch() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async ({
-      query,
-      maxResults = 5,
-    }: {
-      query: string;
-      maxResults?: number;
-    }) =>
+    mutationFn: async ({ query, maxResults = 5 }: { query: string; maxResults?: number }) =>
       fetchKnowledge<SearchResponse>("/knowledge/search-web", {
         query,
         max_results: maxResults,
@@ -129,9 +122,7 @@ export function useVulnerabilitySearch() {
 /** Audit dependencies from a package list */
 export function useAuditDependencies() {
   return useMutation({
-    mutationFn: async (
-      packages: Array<{ name: string; ecosystem: string; version: string }>,
-    ) =>
+    mutationFn: async (packages: Array<{ name: string; ecosystem: string; version: string }>) =>
       fetchKnowledge<VulnAuditResponse>("/knowledge/audit-dependencies", {
         packages,
       }),

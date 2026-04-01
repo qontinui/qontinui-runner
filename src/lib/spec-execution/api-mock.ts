@@ -23,7 +23,8 @@ export function setupApiMocks(config: ApiMockConfig): void {
   _activeMocks = config;
 
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const method = init?.method?.toUpperCase() ?? "GET";
 
     // Extract path from full URL
@@ -35,9 +36,8 @@ export function setupApiMocks(config: ApiMockConfig): void {
     }
 
     // Check mocks
-    const responses = method === "POST"
-      ? { ...config.getResponses, ...config.postResponses }
-      : config.getResponses;
+    const responses =
+      method === "POST" ? { ...config.getResponses, ...config.postResponses } : config.getResponses;
 
     for (const [mockPath, mockBody] of Object.entries(responses)) {
       if (path === mockPath || path.startsWith(mockPath + "?") || path.startsWith(mockPath + "&")) {
@@ -54,10 +54,13 @@ export function setupApiMocks(config: ApiMockConfig): void {
     }
 
     // Default: return 404
-    return new Response(JSON.stringify({ success: false, error: `No mock for ${method} ${path}` }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({ success: false, error: `No mock for ${method} ${path}` }),
+      {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
   };
 }
 
@@ -97,7 +100,13 @@ export const INNGEST_API_MOCKS: ApiMockConfig = {
     },
     "/inngest/queue": {
       success: true,
-      data: { pending: 0, running: 0, max_concurrent: 3, max_queue_depth: 50, durable_persistence: true },
+      data: {
+        pending: 0,
+        running: 0,
+        max_concurrent: 3,
+        max_queue_depth: 50,
+        durable_persistence: true,
+      },
     },
     "/inngest/circuit-breaker": {
       success: true,
@@ -105,9 +114,7 @@ export const INNGEST_API_MOCKS: ApiMockConfig = {
     },
     "/inngest/subscriptions": {
       success: true,
-      data: [
-        { id: "sub-1", event_pattern: "workflow.*", target_workflow_id: null, once: false },
-      ],
+      data: [{ id: "sub-1", event_pattern: "workflow.*", target_workflow_id: null, once: false }],
     },
     "/inngest/flow-control": {
       success: true,

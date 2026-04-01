@@ -151,7 +151,9 @@ export function ExperimentList({
                       </Badge>
                     </div>
                     <div className="flex items-center gap-3 mt-0.5 text-xs text-muted-foreground">
-                      <span>{exp.completed_count}/{exp.total_count} completed</span>
+                      <span>
+                        {exp.completed_count}/{exp.total_count} completed
+                      </span>
                       <span>{formatDate(exp.created_at)}</span>
                     </div>
                   </div>

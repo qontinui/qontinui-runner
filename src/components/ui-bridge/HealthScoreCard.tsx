@@ -36,7 +36,15 @@ function scoreLabel(score: number): string {
   return "Poor";
 }
 
-function MetricRow({ label, value, format = "percent" }: { label: string; value: number; format?: "percent" | "count" }) {
+function MetricRow({
+  label,
+  value,
+  format = "percent",
+}: {
+  label: string;
+  value: number;
+  format?: "percent" | "count";
+}) {
   return (
     <div className="flex justify-between items-center text-sm">
       <span className="text-muted-foreground">{label}</span>
@@ -51,7 +59,9 @@ export function HealthScoreCard({ days = 7 }: HealthScoreCardProps) {
   const { data, isLoading } = useQuery<AutomationHealthScore>({
     queryKey: ["graph-analytics", "health-score", days],
     queryFn: async () => {
-      const res = await fetch(`http://localhost:9876/ui-bridge/analytics/health-score?days=${days}`);
+      const res = await fetch(
+        `http://localhost:9876/ui-bridge/analytics/health-score?days=${days}`,
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       return json.data;

@@ -84,9 +84,15 @@ function ModelRow({ model }: { model: ModelCostBreakdown }) {
     <tr className="border-b border-border last:border-b-0 hover:bg-muted/30 transition-colors">
       <td className="py-2 px-3 text-sm font-medium">{model.model}</td>
       <td className="py-2 px-3 text-sm text-muted-foreground">{model.provider}</td>
-      <td className="py-2 px-3 text-sm tabular-nums text-right">{formatTokens(model.tokens_input)}</td>
-      <td className="py-2 px-3 text-sm tabular-nums text-right">{formatTokens(model.tokens_output)}</td>
-      <td className="py-2 px-3 text-sm tabular-nums text-right font-medium">{formatCost(model.cost_usd)}</td>
+      <td className="py-2 px-3 text-sm tabular-nums text-right">
+        {formatTokens(model.tokens_input)}
+      </td>
+      <td className="py-2 px-3 text-sm tabular-nums text-right">
+        {formatTokens(model.tokens_output)}
+      </td>
+      <td className="py-2 px-3 text-sm tabular-nums text-right font-medium">
+        {formatCost(model.cost_usd)}
+      </td>
       <td className="py-2 px-3 text-sm tabular-nums text-right">{model.action_count}</td>
     </tr>
   );
@@ -131,9 +137,7 @@ export function RunCostBreakdown({ runId }: RunCostBreakdownProps) {
       <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
         <DollarSign className="w-8 h-8 mb-3 opacity-40" />
         <p className="text-sm font-medium">No LLM Costs</p>
-        <p className="text-xs mt-1">
-          This run did not include any LLM actions.
-        </p>
+        <p className="text-xs mt-1">This run did not include any LLM actions.</p>
       </div>
     );
   }
@@ -154,12 +158,24 @@ export function RunCostBreakdown({ runId }: RunCostBreakdownProps) {
           <table className="w-full">
             <thead>
               <tr className="border-b border-border bg-muted/30">
-                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-left">Model</th>
-                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-left">Provider</th>
-                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">Tokens In</th>
-                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">Tokens Out</th>
-                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">Cost</th>
-                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">Actions</th>
+                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-left">
+                  Model
+                </th>
+                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-left">
+                  Provider
+                </th>
+                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">
+                  Tokens In
+                </th>
+                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">
+                  Tokens Out
+                </th>
+                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">
+                  Cost
+                </th>
+                <th className="py-2 px-3 text-xs font-medium text-muted-foreground text-right">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody>

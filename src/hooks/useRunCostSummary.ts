@@ -51,9 +51,7 @@ export const runCostSummaryKeys = {
 // ---------------------------------------------------------------------------
 
 async function fetchRunCostSummary(runId: string): Promise<RunCostSummary> {
-  const res = await tracedFetch(
-    `${getApiBase()}/api/v1/execution/runs/${runId}/cost-summary`,
-  );
+  const res = await tracedFetch(`${getApiBase()}/api/v1/execution/runs/${runId}/cost-summary`);
   if (!res.ok) {
     throw new Error(`Failed to fetch cost summary (HTTP ${res.status})`);
   }

@@ -67,7 +67,11 @@ export async function renderAndDiscover(
     if (textContent || isInteractive || role) {
       const attrs: Record<string, string> = {};
       for (const attr of Array.from(node.attributes ?? [])) {
-        if (attr.name.startsWith("data-") || attr.name === "aria-label" || attr.name === "placeholder") {
+        if (
+          attr.name.startsWith("data-") ||
+          attr.name === "aria-label" ||
+          attr.name === "placeholder"
+        ) {
           attrs[attr.name] = attr.value;
         }
       }
@@ -104,7 +108,8 @@ export async function renderAndDiscover(
 function getDirectText(el: Element): string {
   let text = "";
   for (const node of Array.from(el.childNodes)) {
-    if (node.nodeType === 3) { // TEXT_NODE
+    if (node.nodeType === 3) {
+      // TEXT_NODE
       text += node.textContent ?? "";
     }
   }
@@ -117,8 +122,10 @@ function getDirectText(el: Element): string {
 
 function inferRole(tagName: string, el: Element): string {
   switch (tagName) {
-    case "button": return "button";
-    case "a": return "link";
+    case "button":
+      return "button";
+    case "a":
+      return "link";
     case "input": {
       const type = el.getAttribute("type") ?? "text";
       if (type === "checkbox") return "checkbox";
@@ -127,17 +134,31 @@ function inferRole(tagName: string, el: Element): string {
       if (type === "search") return "searchbox";
       return "textbox";
     }
-    case "select": return "combobox";
-    case "textarea": return "textbox";
-    case "table": return "table";
-    case "tr": return "row";
-    case "th": return "columnheader";
-    case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
+    case "select":
+      return "combobox";
+    case "textarea":
+      return "textbox";
+    case "table":
+      return "table";
+    case "tr":
+      return "row";
+    case "th":
+      return "columnheader";
+    case "h1":
+    case "h2":
+    case "h3":
+    case "h4":
+    case "h5":
+    case "h6":
       return "heading";
-    case "nav": return "navigation";
-    case "main": return "main";
-    case "img": return "img";
-    default: return "";
+    case "nav":
+      return "navigation";
+    case "main":
+      return "main";
+    case "img":
+      return "img";
+    default:
+      return "";
   }
 }
 
@@ -151,7 +172,8 @@ function isInteractiveElement(tagName: string, el: Element): boolean {
 function mapType(tagName: string, role: string, _el: Element): string {
   if (role === "button" || tagName === "button") return "button";
   if (role === "link" || tagName === "a") return "link";
-  if (role === "textbox" || role === "searchbox" || tagName === "input" || tagName === "textarea") return "input";
+  if (role === "textbox" || role === "searchbox" || tagName === "input" || tagName === "textarea")
+    return "input";
   if (role === "spinbutton") return "input";
   if (role === "combobox" || tagName === "select") return "select";
   if (role === "checkbox") return "checkbox";

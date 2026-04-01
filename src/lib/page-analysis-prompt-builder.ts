@@ -11,10 +11,7 @@
  * spec-prompt-builder.ts for spec generation quality.
  */
 
-import {
-  SPEC_CREATION_INSTRUCTIONS,
-  SPEC_MERGE_INSTRUCTIONS,
-} from "./spec-prompt-builder";
+import { SPEC_CREATION_INSTRUCTIONS, SPEC_MERGE_INSTRUCTIONS } from "./spec-prompt-builder";
 
 // =============================================================================
 // Registration Prompt
@@ -99,7 +96,7 @@ export function buildRegistrationPrompt(
   pageName: string,
   route: string,
   framework: string,
-  existingRegistrations?: string
+  existingRegistrations?: string,
 ): string {
   const parts: string[] = [];
 
@@ -127,9 +124,7 @@ export function buildRegistrationPrompt(
 
   if (existingRegistrations) {
     parts.push(`\n## Existing Registrations (UPDATE MODE)\n`);
-    parts.push(
-      "The page already has registrations. Compare against the current component source:"
-    );
+    parts.push("The page already has registrations. Compare against the current component source:");
     parts.push("- **Keep** registrations for elements that still exist");
     parts.push("- **Update** labels/descriptions for elements that changed");
     parts.push("- **Add** registrations for new elements");
@@ -141,7 +136,7 @@ export function buildRegistrationPrompt(
   }
 
   parts.push(
-    `\n## Output\n\nGenerate the complete registration file. Start with \`\`\`tsx\\n// FILE: src/lib/ui-bridge/pages/${pageName.toLowerCase().replace(/\s+/g, "-")}-registrations.tsx\``
+    `\n## Output\n\nGenerate the complete registration file. Start with \`\`\`tsx\\n// FILE: src/lib/ui-bridge/pages/${pageName.toLowerCase().replace(/\s+/g, "-")}-registrations.tsx\``,
   );
 
   return parts.join("\n");
@@ -161,7 +156,7 @@ export function buildPageSpecPrompt(
   pageName: string,
   route: string,
   registrations: string,
-  existingSpec?: string
+  existingSpec?: string,
 ): string {
   const parts: string[] = [];
 
@@ -188,18 +183,16 @@ export function buildPageSpecPrompt(
 
   parts.push(`## UI Bridge Registrations\n`);
   parts.push(
-    "These elements are registered with the UI Bridge. Use their IDs as assertion targets where applicable:\n"
+    "These elements are registered with the UI Bridge. Use their IDs as assertion targets where applicable:\n",
   );
   parts.push(`\`\`\`tsx\n${registrations}\n\`\`\`\n`);
 
   parts.push(`## Output\n`);
-  parts.push(
-    "Generate a complete .spec.uibridge.json file. Output it as a JSON code block:\n"
-  );
+  parts.push("Generate a complete .spec.uibridge.json file. Output it as a JSON code block:\n");
   parts.push("```json\n{ ... }\n```");
   parts.push(`\nSet metadata.pageUrl to "${route}" and metadata.component to "${pageName}".`);
   parts.push(
-    "\nInclude groups for ALL applicable categories: element-presence, interaction, data-display, behavior, state-consistency, navigation, semantic, accessibility, layout, design."
+    "\nInclude groups for ALL applicable categories: element-presence, interaction, data-display, behavior, state-consistency, navigation, semantic, accessibility, layout, design.",
   );
 
   return parts.join("\n");
@@ -250,7 +243,7 @@ export function buildTutorialPrompt(
   pageName: string,
   route: string,
   registrations: string,
-  specSummary: string
+  specSummary: string,
 ): string {
   const parts: string[] = [];
 
@@ -264,20 +257,16 @@ export function buildTutorialPrompt(
   parts.push(`\n## Page Component Source\n\n\`\`\`tsx\n${pageSource.slice(0, 10000)}\n\`\`\`\n`);
 
   parts.push(`## Registered UI Bridge Elements\n`);
-  parts.push(
-    "These elements can be targeted with spotlight/border/pulse highlighting:\n"
-  );
+  parts.push("These elements can be targeted with spotlight/border/pulse highlighting:\n");
   parts.push(`\`\`\`tsx\n${registrations}\n\`\`\`\n`);
 
   parts.push(`## Page Spec Summary\n`);
-  parts.push(
-    "The spec describes what this page does (use this to understand the feature):\n"
-  );
+  parts.push("The spec describes what this page does (use this to understand the feature):\n");
   parts.push(specSummary.slice(0, 5000));
 
   parts.push(`\n## Output\n`);
   parts.push(
-    `Generate the tutorial file. Start with \`\`\`ts\\n// FILE: src/components/tutorial/data/${pageName.toLowerCase().replace(/\s+/g, "-")}.ts\``
+    `Generate the tutorial file. Start with \`\`\`ts\\n// FILE: src/components/tutorial/data/${pageName.toLowerCase().replace(/\s+/g, "-")}.ts\``,
   );
 
   return parts.join("\n");

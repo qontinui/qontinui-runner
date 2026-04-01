@@ -13,7 +13,13 @@
           "description": "The page loads when the 'activity-timeline' tab is selected, showing the search interface",
           "category": "navigation",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" }, "label": "Search input with placeholder" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+            },
+            "label": "Search input with placeholder"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -33,7 +39,13 @@
           "description": "The page communicates its purpose through the search input placeholder which includes an example query ('login button disabled')",
           "category": "semantic",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "placeholder": "Search activity timeline... (e.g., 'login button disabled')" }, "label": "Search input with example query" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Search activity timeline... (e.g., 'login button disabled')"
+            },
+            "label": "Search input with example query"
+          },
           "assertionType": "visible",
           "source": "manual",
           "reviewed": true,
@@ -44,7 +56,11 @@
           "description": "The page shows 'No results found. Try a different query.' after a search with no matches, guiding users to refine their query",
           "category": "semantic",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "text": "No results found. Try a different query." }, "label": "Empty results guidance" },
+          "target": {
+            "type": "search",
+            "criteria": { "text": "No results found. Try a different query." },
+            "label": "Empty results guidance"
+          },
           "assertionType": "visible",
           "precondition": "A search has been performed that returned zero results",
           "source": "manual",
@@ -65,7 +81,13 @@
           "description": "The page shows a text input with placeholder 'Search activity timeline... (e.g., 'login button disabled')'",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "input[type='text'][placeholder*='Search activity timeline']" }, "label": "Search text input" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "selector": "input[type='text'][placeholder*='Search activity timeline']"
+            },
+            "label": "Search text input"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -76,7 +98,11 @@
           "description": "The page shows a button labeled 'Search' (or 'Searching...' during a query)",
           "category": "element-presence",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Search" }, "label": "Search button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Search" },
+            "label": "Search button"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -87,7 +113,11 @@
           "description": "The page shows a button containing a Filter icon (lucide Filter) for toggling the filter panel",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "button svg.lucide-funnel" }, "label": "Filter toggle button with icon" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "button svg.lucide-funnel" },
+            "label": "Filter toggle button with icon"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -98,7 +128,11 @@
           "description": "The page shows a button with title='Load stats' containing a Clock icon",
           "category": "element-presence",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "selector": "button[title='Load stats']" }, "label": "Stats button" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "button[title='Load stats']" },
+            "label": "Stats button"
+          },
           "assertionType": "exists",
           "source": "manual",
           "reviewed": true,
@@ -109,7 +143,11 @@
           "description": "The page shows a select dropdown with options 'All sources', 'UI Bridge', 'Accessibility', 'OCR'",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "select" }, "label": "Source filter dropdown" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "select" },
+            "label": "Source filter dropdown"
+          },
           "assertionType": "exists",
           "precondition": "The filter toggle button has been activated (showFilters=true)",
           "source": "manual",
@@ -121,7 +159,11 @@
           "description": "The page shows a text input with placeholder 'App name filter'",
           "category": "element-presence",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "input[placeholder='App name filter']" }, "label": "App name filter input" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "input[placeholder='App name filter']" },
+            "label": "App name filter input"
+          },
           "assertionType": "exists",
           "precondition": "The filter toggle button has been activated (showFilters=true)",
           "source": "manual",
@@ -143,7 +185,11 @@
           "description": "Users can press Enter in the search input to trigger a search without clicking the button. The input has an onKeyDown handler that calls handleSearch on Enter.",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "input[placeholder*='Search activity timeline']" }, "label": "Search input" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "input[placeholder*='Search activity timeline']" },
+            "label": "Search input"
+          },
           "assertionType": "enabled",
           "source": "manual",
           "reviewed": true,
@@ -154,7 +200,11 @@
           "description": "Users can click the filter button to reveal a filter row containing an app name input and source type dropdown. Clicking again hides it.",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": "input[placeholder='App name filter']" }, "label": "App filter visible after toggle" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "input[placeholder='App name filter']" },
+            "label": "App filter visible after toggle"
+          },
           "assertionType": "exists",
           "precondition": "The filter toggle button has been clicked once",
           "source": "manual",
@@ -166,7 +216,11 @@
           "description": "Users can click the 'Load stats' button to fetch aggregate capture counts. Results appear as colored badges showing '{sourceType} ({captureMode}): {count} entries'.",
           "category": "custom",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "entries" }, "label": "Stats badge showing entry count" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "entries" },
+            "label": "Stats badge showing entry count"
+          },
           "assertionType": "exists",
           "precondition": "The stats button has been clicked and at least one entry exists in the activity_timeline table",
           "source": "manual",
@@ -188,7 +242,11 @@
           "description": "Each result is rendered as a div with classes 'border border-border rounded-md p-3 mb-2 hover:bg-accent/50 transition-colors'",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": ".border.border-border.rounded-md.p-3.mb-2" }, "label": "Result card container" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": ".border.border-border.rounded-md.p-3.mb-2" },
+            "label": "Result card container"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned at least one result",
           "source": "manual",
@@ -200,7 +258,11 @@
           "description": "Each result card shows the source type as a badge with classes 'px-1.5 py-0.5 rounded text-xs font-medium'. Badge text is one of: 'ui_bridge', 'accessibility', 'ocr'. Colors: ui_bridge=bg-blue-500/20 text-blue-400, accessibility=bg-green-500/20 text-green-400, ocr=bg-amber-500/20 text-amber-400.",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "span.text-xs.font-medium.rounded" }, "label": "Source type badge" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.text-xs.font-medium.rounded" },
+            "label": "Source type badge"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned at least one result",
           "source": "manual",
@@ -212,7 +274,11 @@
           "description": "Each result card shows a timestamp formatted via toLocaleString() in 'text-xs text-muted-foreground ml-auto' positioned to the right of the header row",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "span.text-xs.text-muted-foreground.ml-auto" }, "label": "Right-aligned timestamp" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.text-xs.text-muted-foreground.ml-auto" },
+            "label": "Right-aligned timestamp"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned at least one result",
           "source": "manual",
@@ -224,7 +290,11 @@
           "description": "Each result card shows captured text in a paragraph with classes 'text-sm text-foreground line-clamp-3', truncated to 3 visible lines",
           "category": "custom",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "selector": "p.line-clamp-3" }, "label": "Text preview paragraph" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "p.line-clamp-3" },
+            "label": "Text preview paragraph"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned at least one result",
           "source": "manual",
@@ -236,7 +306,11 @@
           "description": "Each result card shows 'rank: {number}' where number is the PostgreSQL ts_rank relevance score formatted to 2 decimal places",
           "category": "custom",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "textContains": "rank:" }, "label": "Relevance rank value" },
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "rank:" },
+            "label": "Relevance rank value"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned at least one result with a non-null rank",
           "source": "manual",
@@ -248,7 +322,11 @@
           "description": "Results that captured a URL show it below the text preview with an ExternalLink icon (lucide) and the URL text in a truncated span",
           "category": "custom",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "selector": "span.truncate" }, "label": "Truncated URL display" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": "span.truncate" },
+            "label": "Truncated URL display"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned a result where the captured page had a URL",
           "source": "manual",
@@ -260,7 +338,13 @@
           "description": "Results that have an app name show it as 'text-xs text-muted-foreground' next to the source badge",
           "category": "custom",
           "severity": "info",
-          "target": { "type": "search", "criteria": { "selector": ".flex.items-center.gap-2 > span.text-xs.text-muted-foreground" }, "label": "App name next to badge" },
+          "target": {
+            "type": "search",
+            "criteria": {
+              "selector": ".flex.items-center.gap-2 > span.text-xs.text-muted-foreground"
+            },
+            "label": "App name next to badge"
+          },
           "assertionType": "exists",
           "precondition": "A search has returned a result with a non-null appName",
           "source": "manual",
@@ -282,7 +366,11 @@
           "description": "The Search button text changes to 'Searching...' while a search request is in-flight, then reverts to 'Search' when complete",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "text": "Searching..." }, "label": "Loading state button text" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "text": "Searching..." },
+            "label": "Loading state button text"
+          },
           "assertionType": "exists",
           "precondition": "A search has been triggered and the Tauri IPC call is pending",
           "source": "manual",
@@ -294,7 +382,11 @@
           "description": "The page does not show the 'No results found' message before any search has been performed. The message only appears when searched=true and results are empty.",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "text": "No results found. Try a different query." }, "label": "Empty state message" },
+          "target": {
+            "type": "search",
+            "criteria": { "text": "No results found. Try a different query." },
+            "label": "Empty state message"
+          },
           "assertionType": "notExists",
           "precondition": "The page has just loaded and no search has been performed",
           "source": "manual",
@@ -306,7 +398,11 @@
           "description": "If a search fails (Tauri command error), the results array is cleared to [] and no stale results are displayed",
           "category": "custom",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "selector": ".border.border-border.rounded-md.p-3" }, "label": "Result card (should not exist after error)" },
+          "target": {
+            "type": "search",
+            "criteria": { "selector": ".border.border-border.rounded-md.p-3" },
+            "label": "Result card (should not exist after error)"
+          },
           "assertionType": "notExists",
           "precondition": "A search has been performed and the backend returned an error (e.g., PostgreSQL unavailable)",
           "source": "manual",
@@ -327,7 +423,11 @@
           "description": "The Search button has the disabled attribute when the search input value is empty or whitespace-only. The button has class 'disabled:opacity-50'.",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Search" }, "label": "Search button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Search" },
+            "label": "Search button"
+          },
           "assertionType": "disabled",
           "precondition": "The search input is empty",
           "source": "manual",
@@ -339,7 +439,11 @@
           "description": "The Search button is enabled (not disabled) when the search input contains non-whitespace text",
           "category": "state-consistency",
           "severity": "critical",
-          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Search" }, "label": "Search button" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "textContains": "Search" },
+            "label": "Search button"
+          },
           "assertionType": "enabled",
           "precondition": "The search input contains at least one non-whitespace character",
           "source": "manual",
@@ -351,7 +455,11 @@
           "description": "The Search button is disabled while a search is in progress (loading=true), showing 'Searching...' text",
           "category": "state-consistency",
           "severity": "warning",
-          "target": { "type": "search", "criteria": { "role": "button", "text": "Searching..." }, "label": "Search button during loading" },
+          "target": {
+            "type": "search",
+            "criteria": { "role": "button", "text": "Searching..." },
+            "label": "Search button during loading"
+          },
           "assertionType": "disabled",
           "precondition": "A search has been triggered and is still pending",
           "source": "manual",
@@ -392,7 +500,13 @@
     "createdAt": "2026-03-26T00:00:00.000Z",
     "updatedAt": "2026-03-26T00:00:00.000Z",
     "pageUrl": "/observe/activity-timeline",
-    "tags": ["screenpipe", "activity-timeline", "full-text-search", "capture-history", "postgresql"],
+    "tags": [
+      "screenpipe",
+      "activity-timeline",
+      "full-text-search",
+      "capture-history",
+      "postgresql"
+    ],
     "backendFiles": [
       "qontinui-runner/src-tauri/src/commands/activity_timeline.rs",
       "qontinui-runner/src-tauri/src/database/pg/activity_timeline.rs",

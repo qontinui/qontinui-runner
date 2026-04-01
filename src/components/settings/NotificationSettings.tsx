@@ -18,21 +18,24 @@ interface NotificationSettingsProps {
   onLog: LogFunction;
 }
 
-const SEVERITY_OPTIONS: { value: NotificationSeverityFilter; label: string; description: string }[] = [
+const SEVERITY_OPTIONS: {
+  value: NotificationSeverityFilter;
+  label: string;
+  description: string;
+}[] = [
   { value: "critical", label: "Critical only", description: "Only show critical errors" },
   { value: "error", label: "Error and above", description: "Show critical and error (default)" },
-  { value: "warning", label: "Warning and above", description: "Show critical, error, and warnings" },
+  {
+    value: "warning",
+    label: "Warning and above",
+    description: "Show critical, error, and warnings",
+  },
   { value: "off", label: "Off", description: "Disable all error toast notifications" },
 ];
 
 export function NotificationSettings({ onLog }: NotificationSettingsProps) {
-  const {
-    prefs,
-    setSeverityFilter,
-    setMaxPerBatch,
-    muteSource,
-    unmuteSource,
-  } = useNotificationPreferences();
+  const { prefs, setSeverityFilter, setMaxPerBatch, muteSource, unmuteSource } =
+    useNotificationPreferences();
 
   const [newMutedSource, setNewMutedSource] = useState("");
 
@@ -114,8 +117,8 @@ export function NotificationSettings({ onLog }: NotificationSettingsProps) {
         </div>
         <div className="p-3 bg-primary/5 rounded-lg">
           <div className="text-xs text-muted-foreground">
-            <strong className="text-foreground">Tip:</strong> Set to 0 to suppress individual
-            toasts entirely. A summary toast will still appear when errors are rate-limited.
+            <strong className="text-foreground">Tip:</strong> Set to 0 to suppress individual toasts
+            entirely. A summary toast will still appear when errors are rate-limited.
           </div>
         </div>
       </div>

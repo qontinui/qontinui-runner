@@ -24,7 +24,9 @@ export function CostPerInteractionChart({ days = 7 }: CostPerInteractionChartPro
   const { data = [], isLoading } = useQuery<CostPerInteractionRow[]>({
     queryKey: ["llm-analytics", "cost-per-interaction", days],
     queryFn: async () => {
-      const res = await fetch(`${getApiBase()}/analytics/token-usage/cost-per-interaction?days=${days}`);
+      const res = await fetch(
+        `${getApiBase()}/analytics/token-usage/cost-per-interaction?days=${days}`,
+      );
       if (!res.ok) return [];
       const json = await res.json();
       return json.data ?? [];
@@ -58,7 +60,12 @@ export function CostPerInteractionChart({ days = 7 }: CostPerInteractionChartPro
               <XAxis dataKey="run" tick={{ fontSize: 10 }} />
               <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => `$${v.toFixed(2)}`} />
               <Tooltip formatter={(v) => [`$${Number(v).toFixed(3)}`, "Cost/Action"]} />
-              <Bar dataKey="costPerAction" fill="hsl(var(--chart-1))" radius={[4, 4, 0, 0]} maxBarSize={30} />
+              <Bar
+                dataKey="costPerAction"
+                fill="hsl(var(--chart-1))"
+                radius={[4, 4, 0, 0]}
+                maxBarSize={30}
+              />
             </BarChart>
           </ResponsiveContainer>
         </div>

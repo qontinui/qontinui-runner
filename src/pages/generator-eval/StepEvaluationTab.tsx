@@ -39,10 +39,7 @@ function scoreColor(score: number): string {
 
 function ScoreCell({ score, title }: { score: number; title?: string }) {
   return (
-    <td
-      className={`px-2 py-1 text-center text-xs font-mono ${scoreColor(score)}`}
-      title={title}
-    >
+    <td className={`px-2 py-1 text-center text-xs font-mono ${scoreColor(score)}`} title={title}>
       {score.toFixed(2)}
     </td>
   );
@@ -65,24 +62,15 @@ function StepRow({
 
   return (
     <>
-      <tr
-        className="border-b border-border/50 hover:bg-muted/30 cursor-pointer"
-        onClick={onToggle}
-      >
+      <tr className="border-b border-border/50 hover:bg-muted/30 cursor-pointer" onClick={onToggle}>
         <td className="px-2 py-1.5 text-sm max-w-[200px] truncate" title={step.step_name}>
           {step.step_name || step.step_id}
         </td>
-        <td className="px-2 py-1 text-xs text-muted-foreground">
-          {step.criterion_id || "—"}
-        </td>
+        <td className="px-2 py-1 text-xs text-muted-foreground">{step.criterion_id || "—"}</td>
         {DIMENSION_ORDER.map((dim) => {
           const ds = scoreMap.get(dim);
           return ds ? (
-            <ScoreCell
-              key={dim}
-              score={ds.score}
-              title={ds.explanation || undefined}
-            />
+            <ScoreCell key={dim} score={ds.score} title={ds.explanation || undefined} />
           ) : (
             <td key={dim} className="px-2 py-1 text-center text-xs text-muted-foreground">
               —
@@ -93,7 +81,10 @@ function StepRow({
         <ScoreCell score={step.min_score} title="Min-form (weakest dimension)" />
         <td className="px-2 py-1 text-center">
           {step.flags.length > 0 && (
-            <span className="text-xs text-red-400" title={step.flags.map((f) => f.message).join("; ")}>
+            <span
+              className="text-xs text-red-400"
+              title={step.flags.map((f) => f.message).join("; ")}
+            >
               {step.flags.length}
             </span>
           )}
@@ -168,9 +159,7 @@ function CoverageSection({ entries }: { entries: CoverageEntry[] }) {
             <span className="text-muted-foreground flex-1 truncate">
               {entry.criterion_description}
             </span>
-            <span
-              className={`font-mono ${scoreColor(entry.best_entailment)} px-1 rounded`}
-            >
+            <span className={`font-mono ${scoreColor(entry.best_entailment)} px-1 rounded`}>
               {entry.best_entailment.toFixed(2)}
             </span>
             <span className="text-muted-foreground capitalize text-[10px]">
@@ -223,11 +212,11 @@ export function StepEvaluationTab() {
     (async () => {
       try {
         const artifacts = await fetchApi<{ id: string; workflow_id: string }[]>(
-          "/generator-eval/artifacts?limit=1"
+          "/generator-eval/artifacts?limit=1",
         );
         if (artifacts.length > 0) {
           const artifact = await fetchApi<{ final_json?: unknown }>(
-            `/generator-eval/artifacts/${artifacts[0].id}`
+            `/generator-eval/artifacts/${artifacts[0].id}`,
           );
           if (artifact.final_json) {
             setWorkflowJson(JSON.stringify(artifact.final_json, null, 2));
@@ -276,13 +265,17 @@ export function StepEvaluationTab() {
           <div className="grid grid-cols-4 gap-3">
             <div className="rounded-lg border border-border bg-card p-3">
               <div className="text-xs text-muted-foreground mb-1">Overall Score</div>
-              <div className={`text-xl font-semibold ${evaluation.overall_score >= 0.6 ? "text-green-400" : "text-red-400"}`}>
+              <div
+                className={`text-xl font-semibold ${evaluation.overall_score >= 0.6 ? "text-green-400" : "text-red-400"}`}
+              >
                 {evaluation.overall_score.toFixed(3)}
               </div>
             </div>
             <div className="rounded-lg border border-border bg-card p-3">
               <div className="text-xs text-muted-foreground mb-1">Quality Gate</div>
-              <div className={`text-xl font-semibold ${evaluation.quality_gate.passed ? "text-green-400" : "text-red-400"}`}>
+              <div
+                className={`text-xl font-semibold ${evaluation.quality_gate.passed ? "text-green-400" : "text-red-400"}`}
+              >
                 {evaluation.quality_gate.passed ? "PASS" : "FAIL"}
               </div>
               <div className="text-xs text-muted-foreground capitalize">
@@ -295,7 +288,9 @@ export function StepEvaluationTab() {
             </div>
             <div className="rounded-lg border border-border bg-card p-3">
               <div className="text-xs text-muted-foreground mb-1">Coverage</div>
-              <div className={`text-xl font-semibold ${evaluation.coverage_matrix.overall_coverage_score >= 0.6 ? "text-green-400" : "text-yellow-400"}`}>
+              <div
+                className={`text-xl font-semibold ${evaluation.coverage_matrix.overall_coverage_score >= 0.6 ? "text-green-400" : "text-yellow-400"}`}
+              >
                 {(evaluation.coverage_matrix.overall_coverage_score * 100).toFixed(0)}%
               </div>
             </div>
@@ -304,9 +299,7 @@ export function StepEvaluationTab() {
           {/* Gate Failures */}
           {evaluation.quality_gate.failures.length > 0 && (
             <div className="rounded border border-red-500/20 bg-red-500/5 p-3">
-              <div className="text-sm font-medium text-red-400 mb-1">
-                Quality Gate Failures
-              </div>
+              <div className="text-sm font-medium text-red-400 mb-1">Quality Gate Failures</div>
               {evaluation.quality_gate.failures.map((f, i) => (
                 <div key={i} className="text-xs text-red-300/80">
                   [{f.gate_level}] {f.reason}
@@ -371,7 +364,8 @@ export function StepEvaluationTab() {
           )}
 
           <div className="text-xs text-muted-foreground text-right">
-            Strategy: {evaluation.scoring_strategy} | Duration: {evaluation.evaluation_duration_ms}ms
+            Strategy: {evaluation.scoring_strategy} | Duration: {evaluation.evaluation_duration_ms}
+            ms
           </div>
         </>
       )}

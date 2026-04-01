@@ -107,7 +107,15 @@ function parseCsv(text: string): Array<{ input: string; expected_output: string 
   return results;
 }
 
-export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding, onDeleteItem, isDeletingItem }: DatasetDetailProps) {
+export function DatasetDetail({
+  dataset,
+  items,
+  isLoading,
+  onAddItems,
+  isAdding,
+  onDeleteItem,
+  isDeletingItem,
+}: DatasetDetailProps) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [jsonInput, setJsonInput] = useState("");
   const [parseError, setParseError] = useState<string | null>(null);
@@ -124,9 +132,7 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
 
   const handleExportCsv = () => {
     const header = "input,expected_output";
-    const rows = items.map(
-      (item) => `${csvEscape(item.input)},${csvEscape(item.expected_output)}`,
-    );
+    const rows = items.map((item) => `${csvEscape(item.input)},${csvEscape(item.expected_output)}`);
     downloadFile(`${dataset.name}.csv`, [header, ...rows].join("\n"), "text/csv");
   };
 
@@ -137,7 +143,11 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
 
     try {
       const text = await file.text();
-      let parsed: Array<{ input: string; expected_output: string; metadata?: Record<string, unknown> }>;
+      let parsed: Array<{
+        input: string;
+        expected_output: string;
+        metadata?: Record<string, unknown>;
+      }>;
 
       if (file.name.endsWith(".csv")) {
         parsed = parseCsv(text);
@@ -189,11 +199,17 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
       }
       try {
         await onAddItems({
-          items: parsed.map((item: { input: string; expected_output: string; metadata?: Record<string, unknown> }) => ({
-            input: item.input,
-            expected_output: item.expected_output,
-            metadata: item.metadata,
-          })),
+          items: parsed.map(
+            (item: {
+              input: string;
+              expected_output: string;
+              metadata?: Record<string, unknown>;
+            }) => ({
+              input: item.input,
+              expected_output: item.expected_output,
+              metadata: item.metadata,
+            }),
+          ),
         });
         setJsonInput("");
         setShowAddForm(false);
@@ -219,13 +235,21 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
           <h3 className="text-sm font-semibold">{dataset.name}</h3>
           <div className="flex items-center gap-2 mt-0.5 text-xs text-muted-foreground">
             <span>{dataset.item_count} items</span>
-            <Badge variant="muted" size="sm">v{dataset.version}</Badge>
+            <Badge variant="muted" size="sm">
+              v{dataset.version}
+            </Badge>
           </div>
         </div>
         <div className="flex items-center gap-1.5">
           {items.length > 0 && (
             <>
-              <Button size="sm" variant="ghost" onClick={handleExportJson} title="Export as JSON" data-tutorial-id="evaluation-export-json">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={handleExportJson}
+                title="Export as JSON"
+                data-tutorial-id="evaluation-export-json"
+              >
                 <Download className="w-3.5 h-3.5" />
                 JSON
               </Button>
@@ -259,9 +283,7 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
             value={jsonInput}
             onChange={(e) => setJsonInput(e.target.value)}
           />
-          {parseError && (
-            <p className="text-xs text-destructive">{parseError}</p>
-          )}
+          {parseError && <p className="text-xs text-destructive">{parseError}</p>}
           <div className="flex items-center justify-between">
             <div>
               <input
@@ -312,9 +334,16 @@ export function DatasetDetail({ dataset, items, isLoading, onAddItems, isAdding,
             </thead>
             <tbody>
               {items.map((item) => (
-                <tr key={item.id} className="border-b border-border/30 hover:bg-muted/30 transition-colors">
-                  <td className="px-4 py-2 align-top whitespace-pre-wrap break-words max-w-0">{item.input}</td>
-                  <td className="px-4 py-2 align-top whitespace-pre-wrap break-words max-w-0">{item.expected_output}</td>
+                <tr
+                  key={item.id}
+                  className="border-b border-border/30 hover:bg-muted/30 transition-colors"
+                >
+                  <td className="px-4 py-2 align-top whitespace-pre-wrap break-words max-w-0">
+                    {item.input}
+                  </td>
+                  <td className="px-4 py-2 align-top whitespace-pre-wrap break-words max-w-0">
+                    {item.expected_output}
+                  </td>
                   {onDeleteItem && (
                     <td className="px-2 py-2 align-top">
                       <button

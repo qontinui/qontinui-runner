@@ -85,9 +85,7 @@ function computeTrendDirection(data: CostTrendChartPoint[]): "up" | "down" | "fl
 // ---------------------------------------------------------------------------
 
 async function fetchCostTrends(): Promise<CostTrendDataPoint[]> {
-  const res = await tracedFetch(
-    `${getApiBase()}/api/v1/execution/analytics/cost-trends`,
-  );
+  const res = await tracedFetch(`${getApiBase()}/api/v1/execution/analytics/cost-trends`);
   if (!res.ok) {
     throw new Error(`Failed to fetch cost trends (HTTP ${res.status})`);
   }

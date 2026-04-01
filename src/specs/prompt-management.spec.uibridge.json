@@ -1688,12 +1688,6 @@
     "pageUrl": "/meta-optimizer",
     "elementSource": "sdk",
     "specType": "semantic",
-    "tags": [
-      "prompt-versions",
-      "prompt-canary",
-      "a-b-testing",
-      "opik",
-      "tier-2"
-    ]
+    "tags": ["prompt-versions", "prompt-canary", "a-b-testing", "opik", "tier-2"]
   }
 }

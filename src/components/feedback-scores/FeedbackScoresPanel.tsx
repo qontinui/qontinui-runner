@@ -75,7 +75,12 @@ function SummaryStrip({ summary }: { summary: FeedbackScoresSummary }) {
       <div className="flex items-center gap-2">
         <BarChart3 className="w-4 h-4 text-muted-foreground" />
         <span className="text-muted-foreground">Avg Score</span>
-        <span className={cn("font-semibold tabular-nums", scoreBarColor(summary.averageScore).replace("bg-", "text-"))}>
+        <span
+          className={cn(
+            "font-semibold tabular-nums",
+            scoreBarColor(summary.averageScore).replace("bg-", "text-"),
+          )}
+        >
           {formatScore(summary.averageScore)}
         </span>
       </div>
@@ -110,7 +115,9 @@ function ScoreRow({ score }: { score: FeedbackScore }) {
           hasReason && "cursor-pointer hover:bg-muted/30 transition-colors",
         )}
         role={hasReason ? "button" : undefined}
-        aria-label={hasReason ? `${expanded ? "Collapse" : "Expand"} reason for ${score.name}` : undefined}
+        aria-label={
+          hasReason ? `${expanded ? "Collapse" : "Expand"} reason for ${score.name}` : undefined
+        }
         onClick={() => hasReason && setExpanded(!expanded)}
       >
         {/* Expand indicator */}
@@ -189,13 +196,13 @@ function AddScoreForm({ onSubmit, onCancel, isSubmitting }: AddScoreFormProps) {
   };
 
   return (
-    <form
-      onSubmit={handleSubmit}
-      className="rounded-lg border border-border bg-card p-3 space-y-3"
-    >
+    <form onSubmit={handleSubmit} className="rounded-lg border border-border bg-card p-3 space-y-3">
       <div className="grid gap-2 sm:grid-cols-2">
         <div>
-          <label htmlFor="score-name" className="block text-xs font-medium text-muted-foreground mb-1">
+          <label
+            htmlFor="score-name"
+            className="block text-xs font-medium text-muted-foreground mb-1"
+          >
             Name
           </label>
           <input
@@ -209,7 +216,10 @@ function AddScoreForm({ onSubmit, onCancel, isSubmitting }: AddScoreFormProps) {
           />
         </div>
         <div>
-          <label htmlFor="score-value" className="block text-xs font-medium text-muted-foreground mb-1">
+          <label
+            htmlFor="score-value"
+            className="block text-xs font-medium text-muted-foreground mb-1"
+          >
             Value (0 – 1)
           </label>
           <input
@@ -227,7 +237,10 @@ function AddScoreForm({ onSubmit, onCancel, isSubmitting }: AddScoreFormProps) {
       </div>
 
       <div>
-        <label htmlFor="score-reason" className="block text-xs font-medium text-muted-foreground mb-1">
+        <label
+          htmlFor="score-reason"
+          className="block text-xs font-medium text-muted-foreground mb-1"
+        >
           Reason <span className="text-muted-foreground/60">(optional)</span>
         </label>
         <textarea
@@ -280,12 +293,7 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
         <XCircle className="w-8 h-8 mb-3 text-red-500 opacity-50" />
         <p className="text-sm font-medium">Failed to load feedback scores</p>
         <p className="text-xs mt-1">{error.message}</p>
-        <Button
-          variant="outline"
-          size="sm"
-          className="mt-3"
-          onClick={() => refetch()}
-        >
+        <Button variant="outline" size="sm" className="mt-3" onClick={() => refetch()}>
           <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
           Retry
         </Button>
@@ -302,12 +310,7 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
         <p className="text-xs mt-1">
           Scores will appear here once manual, automated, or LLM judge feedback is recorded.
         </p>
-        <Button
-          variant="outline"
-          size="sm"
-          className="mt-3"
-          onClick={() => setShowForm(true)}
-        >
+        <Button variant="outline" size="sm" className="mt-3" onClick={() => setShowForm(true)}>
           <Plus className="w-3.5 h-3.5 mr-1.5" />
           Add Score
         </Button>
@@ -321,7 +324,12 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-muted-foreground">Feedback Scores</h3>
         {!showForm && (
-          <Button variant="outline" size="sm" onClick={() => setShowForm(true)} data-tutorial-id="feedback-add-score">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowForm(true)}
+            data-tutorial-id="feedback-add-score"
+          >
             <Plus className="w-3.5 h-3.5 mr-1.5" />
             Add Score
           </Button>
@@ -348,7 +356,11 @@ export function FeedbackScoresPanel({ runId }: FeedbackScoresPanelProps) {
       )}
 
       {/* Summary */}
-      {memoizedSummary && <div data-tutorial-id="feedback-summary"><SummaryStrip summary={memoizedSummary} /></div>}
+      {memoizedSummary && (
+        <div data-tutorial-id="feedback-summary">
+          <SummaryStrip summary={memoizedSummary} />
+        </div>
+      )}
 
       {/* Individual scores */}
       <div className="space-y-2">

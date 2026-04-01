@@ -176,15 +176,14 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
             <input
               type="text"
               value={config.endpoint}
-              onChange={(e) =>
-                setConfig((prev) => ({ ...prev, endpoint: e.target.value }))
-              }
+              onChange={(e) => setConfig((prev) => ({ ...prev, endpoint: e.target.value }))}
               placeholder="http://localhost:4317"
               disabled={!config.enabled}
               className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
             />
             <p className="text-[10px] text-muted-foreground">
-              OTLP collector endpoint (e.g., http://localhost:4317 for gRPC, http://localhost:4318 for HTTP)
+              OTLP collector endpoint (e.g., http://localhost:4317 for gRPC, http://localhost:4318
+              for HTTP)
             </p>
           </div>
 
@@ -205,16 +204,12 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
               <option value="grpc">gRPC (port 4317)</option>
               <option value="http">HTTP/protobuf (port 4318)</option>
             </select>
-            <p className="text-[10px] text-muted-foreground">
-              Transport protocol for OTLP export
-            </p>
+            <p className="text-[10px] text-muted-foreground">Transport protocol for OTLP export</p>
           </div>
 
           {/* Sampling Rate */}
           <div className="space-y-1.5">
-            <label className="text-xs font-medium">
-              Sampling Rate: {config.sampling_rate}%
-            </label>
+            <label className="text-xs font-medium">Sampling Rate: {config.sampling_rate}%</label>
             <input
               type="range"
               min="0"
@@ -242,9 +237,7 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
             <input
               type="text"
               value={config.service_name}
-              onChange={(e) =>
-                setConfig((prev) => ({ ...prev, service_name: e.target.value }))
-              }
+              onChange={(e) => setConfig((prev) => ({ ...prev, service_name: e.target.value }))}
               placeholder="qontinui-runner"
               disabled={!config.enabled}
               className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
@@ -260,8 +253,8 @@ export function OtelSettings({ onLog }: OtelSettingsProps) {
       <div className={`p-3 ${getAccentColors("yellow").bg} rounded-lg flex gap-2`}>
         <Info className={`w-4 h-4 ${getAccentColors("yellow").text} shrink-0 mt-0.5`} />
         <p className={`text-xs ${getAccentColors("yellow").text}`}>
-          Changes to OpenTelemetry settings require a restart of the runner to take effect.
-          Make sure your collector is running and accessible at the configured endpoint before enabling.
+          Changes to OpenTelemetry settings require a restart of the runner to take effect. Make
+          sure your collector is running and accessible at the configured endpoint before enabling.
         </p>
       </div>
 

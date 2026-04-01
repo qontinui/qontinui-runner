@@ -14,13 +14,7 @@
  * - Lazy WebSocket connection (only connects when first subscription is created)
  */
 
-import {
-  ApolloClient,
-  InMemoryCache,
-  HttpLink,
-  split,
-  from,
-} from "@apollo/client/core";
+import { ApolloClient, InMemoryCache, HttpLink, split, from } from "@apollo/client/core";
 import { ErrorLink } from "@apollo/client/link/error";
 import { CombinedGraphQLErrors } from "@apollo/client/errors";
 import { GraphQLWsLink } from "@apollo/client/link/subscriptions";
@@ -59,16 +53,12 @@ export function getGraphQLClient(): ApolloClient {
         // Detect circuit breaker / rate limit errors for recovery hints
         const msg = err.message.toLowerCase();
         if (msg.includes("circuit breaker") || msg.includes("concurrency")) {
-          console.warn(
-            "[GraphQL] Circuit breaker or concurrency limit hit — retry after delay",
-          );
+          console.warn("[GraphQL] Circuit breaker or concurrency limit hit — retry after delay");
         }
       }
     } else {
       // Network error or other non-GraphQL error
-      console.error(
-        `[GraphQL Network Error] ${error.message} [op: ${operation.operationName}]`,
-      );
+      console.error(`[GraphQL Network Error] ${error.message} [op: ${operation.operationName}]`);
     }
   });
 
@@ -117,10 +107,7 @@ export function getGraphQLClient(): ApolloClient {
   const splitLink = split(
     ({ query }) => {
       const definition = getMainDefinition(query);
-      return (
-        definition.kind === "OperationDefinition" &&
-        definition.operation === "subscription"
-      );
+      return definition.kind === "OperationDefinition" && definition.operation === "subscription";
     },
     wsLink,
     from([errorLink, httpLink]),

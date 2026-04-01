@@ -43,7 +43,9 @@ export function AutomationRegressionTable({ days = 7 }: AutomationRegressionTabl
             <tbody>
               {data.map((r, i) => (
                 <tr key={i} className="border-b border-border last:border-0 hover:bg-muted/50">
-                  <td className="py-2 px-3 font-mono text-sm truncate max-w-[200px]">{r.element_id}</td>
+                  <td className="py-2 px-3 font-mono text-sm truncate max-w-[200px]">
+                    {r.element_id}
+                  </td>
                   <td className="py-2 px-3 font-mono">{r.action}</td>
                   <td className="py-2 px-3 text-right tabular-nums text-green-500">
                     {Math.round(r.prior_success_rate * 100)}%

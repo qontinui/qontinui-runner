@@ -31,8 +31,15 @@ export interface MultiRunnerSpecWorkflowInput {
   loopSettings?: {
     maxIterations?: number;
     supervisorPort?: number;
-    exitStrategy?: { type: "reflection" } | { type: "workflow_verification" } | { type: "fixed_iterations" };
-    betweenIterations?: { type: "restart_runner"; rebuild: boolean } | { type: "restart_on_signal"; rebuild: boolean } | { type: "wait_healthy" } | { type: "none" };
+    exitStrategy?:
+      | { type: "reflection" }
+      | { type: "workflow_verification" }
+      | { type: "fixed_iterations" };
+    betweenIterations?:
+      | { type: "restart_runner"; rebuild: boolean }
+      | { type: "restart_on_signal"; rebuild: boolean }
+      | { type: "wait_healthy" }
+      | { type: "none" };
     retryOnFailure?: boolean;
   };
   /** Custom agentic prompt for failure recovery in each workflow. */

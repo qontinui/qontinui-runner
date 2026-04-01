@@ -8,14 +8,7 @@
  */
 
 import { useState, useCallback, useEffect } from "react";
-import {
-  RefreshCw,
-  Shield,
-  Layers,
-  Activity,
-  Brain,
-  Navigation,
-} from "lucide-react";
+import { RefreshCw, Shield, Layers, Activity, Brain, Navigation } from "lucide-react";
 import { CoverageGapPanel } from "./CoverageGapPanel";
 import { ComplexityDashboard } from "./ComplexityDashboard";
 import { FeatureHealthPanel } from "./FeatureHealthPanel";
@@ -75,13 +68,9 @@ export function DevelopmentIntelligencePage() {
   const [projectPath, setProjectPath] = useState<string>("");
 
   // Data states
-  const [coverageData, setCoverageData] =
-    useState<CoverageAnalysisResult | null>(null);
-  const [complexityData, setComplexityData] =
-    useState<ComplexityAnalysisResult | null>(null);
-  const [healthData, setHealthData] = useState<FeatureHealthResult | null>(
-    null,
-  );
+  const [coverageData, setCoverageData] = useState<CoverageAnalysisResult | null>(null);
+  const [complexityData, setComplexityData] = useState<ComplexityAnalysisResult | null>(null);
+  const [healthData, setHealthData] = useState<FeatureHealthResult | null>(null);
 
   // Loading states
   const [coverageLoading, setCoverageLoading] = useState(false);
@@ -96,14 +85,11 @@ export function DevelopmentIntelligencePage() {
     if (!projectPath) return;
     setCoverageLoading(true);
     try {
-      const res = await fetch(
-        `${API_BASE}/development-intelligence/coverage-analysis`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_path: projectPath }),
-        },
-      );
+      const res = await fetch(`${API_BASE}/development-intelligence/coverage-analysis`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_path: projectPath }),
+      });
       const json = await res.json();
       if (json.data) setCoverageData(json.data);
     } catch (err) {
@@ -117,14 +103,11 @@ export function DevelopmentIntelligencePage() {
     if (!projectPath) return;
     setComplexityLoading(true);
     try {
-      const res = await fetch(
-        `${API_BASE}/development-intelligence/complexity-scores`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_path: projectPath }),
-        },
-      );
+      const res = await fetch(`${API_BASE}/development-intelligence/complexity-scores`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_path: projectPath }),
+      });
       const json = await res.json();
       if (json.data) setComplexityData(json.data);
     } catch (err) {
@@ -138,14 +121,11 @@ export function DevelopmentIntelligencePage() {
     if (!projectPath) return;
     setHealthLoading(true);
     try {
-      const res = await fetch(
-        `${API_BASE}/development-intelligence/feature-health`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_path: projectPath }),
-        },
-      );
+      const res = await fetch(`${API_BASE}/development-intelligence/feature-health`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_path: projectPath }),
+      });
       const json = await res.json();
       if (json.data) setHealthData(json.data);
     } catch (err) {
@@ -221,9 +201,7 @@ export function DevelopmentIntelligencePage() {
             onClick={refreshCurrent}
             disabled={isAnyLoading}
           >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${isAnyLoading ? "animate-spin" : ""}`}
-            />
+            <RefreshCw className={`w-3.5 h-3.5 ${isAnyLoading ? "animate-spin" : ""}`} />
             Refresh
           </button>
           <button
@@ -253,11 +231,7 @@ export function DevelopmentIntelligencePage() {
           />
         )}
         {activePanel === "health" && (
-          <FeatureHealthPanel
-            data={healthData}
-            loading={healthLoading}
-            onRefresh={fetchHealth}
-          />
+          <FeatureHealthPanel data={healthData} loading={healthLoading} onRefresh={fetchHealth} />
         )}
         {activePanel === "navigation" && <NavigationFlowGraph />}
       </div>

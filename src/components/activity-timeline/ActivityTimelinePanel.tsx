@@ -61,7 +61,7 @@ export function ActivityTimelinePanel() {
               taskRunId: null,
               maxResults: 50,
             }
-          : { query: query.trim(), maxResults: 50 }
+          : { query: query.trim(), maxResults: 50 },
       );
       setResults(res);
     } catch (err) {
@@ -95,10 +95,14 @@ export function ActivityTimelinePanel() {
 
   const sourceColor = (source: string) => {
     switch (source) {
-      case "ui_bridge": return "bg-blue-500/20 text-blue-400";
-      case "accessibility": return "bg-green-500/20 text-green-400";
-      case "ocr": return "bg-amber-500/20 text-amber-400";
-      default: return "bg-gray-500/20 text-gray-400";
+      case "ui_bridge":
+        return "bg-blue-500/20 text-blue-400";
+      case "accessibility":
+        return "bg-green-500/20 text-green-400";
+      case "ocr":
+        return "bg-amber-500/20 text-amber-400";
+      default:
+        return "bg-gray-500/20 text-gray-400";
     }
   };
 
@@ -107,27 +111,38 @@ export function ActivityTimelinePanel() {
   useUIComponent({
     id: "activity-timeline",
     name: "Activity Timeline",
-    description: "Searchable capture history — full-text search over screen content from UI Bridge, accessibility trees, and OCR",
+    description:
+      "Searchable capture history — full-text search over screen content from UI Bridge, accessibility trees, and OCR",
     actions: [
       {
         id: "search",
         label: "Search Timeline",
-        handler: async () => { await handleSearch(); },
+        handler: async () => {
+          await handleSearch();
+        },
       },
       {
         id: "load-stats",
         label: "Load Stats",
-        handler: async () => { await loadStats(); },
+        handler: async () => {
+          await loadStats();
+        },
       },
       {
         id: "toggle-filters",
         label: "Toggle Filters",
-        handler: async () => { setShowFilters((v) => !v); },
+        handler: async () => {
+          setShowFilters((v) => !v);
+        },
       },
       {
         id: "clear-search",
         label: "Clear Search",
-        handler: async () => { setQuery(""); setResults([]); setSearched(false); },
+        handler: async () => {
+          setQuery("");
+          setResults([]);
+          setSearched(false);
+        },
       },
     ],
   });
@@ -270,19 +285,17 @@ export function ActivityTimelinePanel() {
             className="border border-border rounded-md p-3 mb-2 hover:bg-accent/50 transition-colors"
           >
             <div className="flex items-center gap-2 mb-1">
-              <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${sourceColor(r.sourceType)}`}>
+              <span
+                className={`px-1.5 py-0.5 rounded text-xs font-medium ${sourceColor(r.sourceType)}`}
+              >
                 {r.sourceType}
               </span>
-              {r.appName && (
-                <span className="text-xs text-muted-foreground">{r.appName}</span>
-              )}
+              {r.appName && <span className="text-xs text-muted-foreground">{r.appName}</span>}
               <span className="text-xs text-muted-foreground ml-auto">
                 {formatTime(r.createdAt)}
               </span>
               {r.rank != null && (
-                <span className="text-xs text-muted-foreground">
-                  rank: {r.rank.toFixed(2)}
-                </span>
+                <span className="text-xs text-muted-foreground">rank: {r.rank.toFixed(2)}</span>
               )}
             </div>
             <p className="text-sm text-foreground line-clamp-3">{r.textPreview}</p>

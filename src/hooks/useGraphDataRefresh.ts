@@ -62,11 +62,7 @@ export function useGraphDataRefresh(skip = false) {
       // For TaskRunUpdateEvent, only invalidate on terminal statuses
       if (event.__typename === "TaskRunUpdateEvent") {
         const status = event.status?.toLowerCase();
-        if (
-          status === "completed" ||
-          status === "failed" ||
-          status === "stopped"
-        ) {
+        if (status === "completed" || status === "failed" || status === "stopped") {
           isRelevant = true;
         }
       } else {

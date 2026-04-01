@@ -24,7 +24,10 @@ const FILE_PATH_RE =
 export class FilePathLinkProvider implements ITerminalLinkProvider {
   constructor(private _getBufferLine: (line: number) => string | null) {}
 
-  provideLinks(bufferLineNumber: number, callback: (links: ITerminalLink[] | undefined) => void): void {
+  provideLinks(
+    bufferLineNumber: number,
+    callback: (links: ITerminalLink[] | undefined) => void,
+  ): void {
     const lineText = this._getBufferLine(bufferLineNumber);
     if (!lineText) {
       callback(undefined);
@@ -68,9 +71,7 @@ export class FilePathLinkProvider implements ITerminalLinkProvider {
           if (!event.ctrlKey && !event.metaKey) return;
 
           // Re-parse from the activated text in case it differs
-          const parts = text.match(
-            /^(.+?)(?::(\d+)(?::(\d+))?)?$/,
-          );
+          const parts = text.match(/^(.+?)(?::(\d+)(?::(\d+))?)?$/);
           const path = parts?.[1] ?? text;
           const line = parts?.[2] ? parseInt(parts[2], 10) : undefined;
           const col = parts?.[3] ? parseInt(parts[3], 10) : undefined;

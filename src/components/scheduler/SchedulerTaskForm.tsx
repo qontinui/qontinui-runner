@@ -63,7 +63,13 @@ const CRON_PRESETS = [
   { label: "First of month at midnight", value: "0 0 1 * *" },
 ];
 
-export function SchedulerTaskForm({ task, prefill, onSubmit, onCancel, loading }: SchedulerTaskFormProps) {
+export function SchedulerTaskForm({
+  task,
+  prefill,
+  onSubmit,
+  onCancel,
+  loading,
+}: SchedulerTaskFormProps) {
   const isEditing = !!task;
   const src = task ?? prefill;
 

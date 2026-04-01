@@ -118,11 +118,7 @@ export interface RunnerStatusData {
 /**
  * Fetch recent task runs with optional filters.
  */
-export function useTaskRunsGql(
-  limit = 50,
-  workflowType?: string,
-  skip = false,
-) {
+export function useTaskRunsGql(limit = 50, workflowType?: string, skip = false) {
   return useQuery<{ taskRuns: TaskRunData[] }>(TASK_RUNS_QUERY, {
     variables: { limit, workflowType },
     skip,
@@ -152,12 +148,7 @@ export interface TaskRunOutputData {
  * Fetch task run output with offset/limit pagination.
  * Defaults to last 10000 characters.
  */
-export function useTaskRunOutputGql(
-  id: string,
-  offset = 0,
-  limit = 10000,
-  skip = false,
-) {
+export function useTaskRunOutputGql(id: string, offset = 0, limit = 10000, skip = false) {
   return useQuery<{ taskRunOutput: TaskRunOutputData }>(TASK_RUN_OUTPUT_QUERY, {
     variables: { id, offset, limit },
     skip: skip || !id,
@@ -168,10 +159,7 @@ export function useTaskRunOutputGql(
  * Fetch only currently running task runs.
  */
 export function useRunningTaskRunsGql(skip = false) {
-  return useQuery<{ runningTaskRuns: TaskRunData[] }>(
-    RUNNING_TASK_RUNS_QUERY,
-    { skip },
-  );
+  return useQuery<{ runningTaskRuns: TaskRunData[] }>(RUNNING_TASK_RUNS_QUERY, { skip });
 }
 
 /**
@@ -214,13 +202,10 @@ export function useFindingsGql(taskRunId: string, skip = false) {
  * Fetch finding summary statistics for a task run.
  */
 export function useFindingSummaryGql(taskRunId: string, skip = false) {
-  return useQuery<{ findingSummary: FindingSummaryData }>(
-    FINDING_SUMMARY_QUERY,
-    {
-      variables: { taskRunId },
-      skip: skip || !taskRunId,
-    },
-  );
+  return useQuery<{ findingSummary: FindingSummaryData }>(FINDING_SUMMARY_QUERY, {
+    variables: { taskRunId },
+    skip: skip || !taskRunId,
+  });
 }
 
 /**
@@ -246,8 +231,5 @@ export function useOrchestrationLoopStatusGql(skip = false) {
  * Fetch UI Bridge health (one-shot, not streaming).
  */
 export function useUiBridgeHealthGql(skip = false) {
-  return useQuery<{ uiBridgeHealth: UiBridgeHealthData }>(
-    UI_BRIDGE_HEALTH_QUERY,
-    { skip },
-  );
+  return useQuery<{ uiBridgeHealth: UiBridgeHealthData }>(UI_BRIDGE_HEALTH_QUERY, { skip });
 }

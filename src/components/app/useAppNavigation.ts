@@ -131,7 +131,9 @@ export function useAppNavigation(): UseAppNavigationReturn {
   }, []);
 
   useEffect(() => {
-    const handleNavigateToErrorMonitor = (e: CustomEvent<{ taskRunId?: string; taskRunName?: string }>) => {
+    const handleNavigateToErrorMonitor = (
+      e: CustomEvent<{ taskRunId?: string; taskRunName?: string }>,
+    ) => {
       const { taskRunId, taskRunName } = e.detail ?? {};
       setErrorMonitorScope({ taskRunId, taskRunName });
       setActiveTab("error-monitor");

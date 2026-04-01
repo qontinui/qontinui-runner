@@ -39,7 +39,7 @@ export async function fetchRegisteredElements(): Promise<RegisteredElement[]> {
 function buildScriptPlanningPrompt(
   spec: SpecConfig,
   elements: RegisteredElement[],
-  focusAreas?: string[]
+  focusAreas?: string[],
 ): string {
   const specDescription = spec.description || "No description available";
   const pageUrl = spec.metadata?.pageUrl || "unknown";
@@ -56,7 +56,10 @@ function buildScriptPlanningPrompt(
     .join("\n\n");
 
   const elementList = elements
-    .map((el) => `  - id: "${el.id}" | type: ${el.type} | label: "${el.label}" | actions: [${el.actions.join(", ")}]`)
+    .map(
+      (el) =>
+        `  - id: "${el.id}" | type: ${el.type} | label: "${el.label}" | actions: [${el.actions.join(", ")}]`,
+    )
     .join("\n");
 
   const focusSection = focusAreas?.length
@@ -138,7 +141,7 @@ Respond ONLY with the JSON object. No explanation, no markdown.`;
 export async function planDemoScript(
   spec: SpecConfig,
   elements: RegisteredElement[],
-  focusAreas?: string[]
+  focusAreas?: string[],
 ): Promise<DemoScript> {
   const prompt = buildScriptPlanningPrompt(spec, elements, focusAreas);
 

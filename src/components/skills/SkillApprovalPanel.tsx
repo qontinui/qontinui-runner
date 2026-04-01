@@ -124,11 +124,7 @@ export function SkillApprovalPanel() {
         console.error(`Failed to update skill ${id} to ${status}: HTTP ${res.status}`);
         return;
       }
-      setSkills((prev) =>
-        prev.map((s) =>
-          s.id === id ? { ...s, approval_status: status } : s
-        )
-      );
+      setSkills((prev) => prev.map((s) => (s.id === id ? { ...s, approval_status: status } : s)));
     } catch (e) {
       console.error(`Failed to update skill ${id} to ${status}:`, e);
     }
@@ -156,15 +152,9 @@ export function SkillApprovalPanel() {
         <div className="flex items-center gap-2">
           <Zap className="w-4 h-4 text-amber-500" />
           <h2 className="text-sm font-semibold">Procedural Skills</h2>
-          <span className="text-xs text-muted-foreground">
-            Auto-extracted from successful runs
-          </span>
+          <span className="text-xs text-muted-foreground">Auto-extracted from successful runs</span>
         </div>
-        <button
-          onClick={fetchSkills}
-          className="p-1 rounded hover:bg-accent"
-          title="Refresh"
-        >
+        <button onClick={fetchSkills} className="p-1 rounded hover:bg-accent" title="Refresh">
           <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
         </button>
       </div>
@@ -182,20 +172,14 @@ export function SkillApprovalPanel() {
             }`}
           >
             {f === "all" ? "All" : f.charAt(0).toUpperCase() + f.slice(1)}
-            {f !== "all" && (
-              <span className="ml-1 opacity-70">
-                ({counts[f]})
-              </span>
-            )}
+            {f !== "all" && <span className="ml-1 opacity-70">({counts[f]})</span>}
           </button>
         ))}
       </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        {error && (
-          <div className="px-4 py-3 text-sm text-destructive">{error}</div>
-        )}
+        {error && <div className="px-4 py-3 text-sm text-destructive">{error}</div>}
 
         {!loading && filtered.length === 0 && (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground">
@@ -212,16 +196,10 @@ export function SkillApprovalPanel() {
           const status = skill.approval_status || "pending";
 
           return (
-            <div
-              key={skill.id}
-              className="border-b border-border last:border-0"
-            >
+            <div key={skill.id} className="border-b border-border last:border-0">
               {/* Skill row */}
               <div className="flex items-center gap-2 px-4 py-2.5 hover:bg-accent/50">
-                <button
-                  onClick={() => handleExpand(skill)}
-                  className="p-0.5"
-                >
+                <button onClick={() => handleExpand(skill)} className="p-0.5">
                   {isExpanded ? (
                     <ChevronDown className="w-3.5 h-3.5" />
                   ) : (
@@ -233,18 +211,12 @@ export function SkillApprovalPanel() {
                 {status === "approved" && (
                   <CheckCircle className="w-3.5 h-3.5 text-green-500 shrink-0" />
                 )}
-                {status === "rejected" && (
-                  <XCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />
-                )}
-                {status === "pending" && (
-                  <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                )}
+                {status === "rejected" && <XCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />}
+                {status === "pending" && <Clock className="w-3.5 h-3.5 text-amber-500 shrink-0" />}
 
                 {/* Skill info */}
                 <div className="flex-1 min-w-0">
-                  <div className="text-xs font-medium truncate">
-                    {skill.name}
-                  </div>
+                  <div className="text-xs font-medium truncate">{skill.name}</div>
                   <div className="text-[10px] text-muted-foreground truncate">
                     {skill.category} &middot; v{skill.version || "1.0.0"} &middot; used{" "}
                     {skill.usage_count || 0}x
@@ -280,30 +252,20 @@ export function SkillApprovalPanel() {
               {isExpanded && (
                 <div className="px-4 pb-3 pl-10 text-xs space-y-2">
                   <div>
-                    <span className="font-medium text-muted-foreground">
-                      Description:
-                    </span>{" "}
+                    <span className="font-medium text-muted-foreground">Description:</span>{" "}
                     {skill.description}
                   </div>
                   <div>
-                    <span className="font-medium text-muted-foreground">
-                      Tags:
-                    </span>{" "}
+                    <span className="font-medium text-muted-foreground">Tags:</span>{" "}
                     {skill.tags?.join(", ") || "none"}
                   </div>
                   <div>
-                    <span className="font-medium text-muted-foreground">
-                      Phases:
-                    </span>{" "}
+                    <span className="font-medium text-muted-foreground">Phases:</span>{" "}
                     {skill.allowed_phases?.join(", ")}
                   </div>
                   <div>
-                    <span className="font-medium text-muted-foreground">
-                      Created:
-                    </span>{" "}
-                    {skill.created_at
-                      ? new Date(skill.created_at).toLocaleString()
-                      : "unknown"}
+                    <span className="font-medium text-muted-foreground">Created:</span>{" "}
+                    {skill.created_at ? new Date(skill.created_at).toLocaleString() : "unknown"}
                   </div>
 
                   {/* Provenance: source fix and task run */}
@@ -333,7 +295,9 @@ export function SkillApprovalPanel() {
                       {provenance[skill.id].effectiveness && (
                         <div>
                           <span className="text-muted-foreground">Effectiveness:</span>{" "}
-                          <span className="text-green-600">{provenance[skill.id].effectiveness}</span>
+                          <span className="text-green-600">
+                            {provenance[skill.id].effectiveness}
+                          </span>
                         </div>
                       )}
                     </div>
