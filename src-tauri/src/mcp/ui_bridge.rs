@@ -6772,6 +6772,352 @@ pub async fn ui_bridge_element_reliability_handler(
     }
 }
 
+// =========================================================================
+// Convenience endpoints — app-agnostic DOM interaction helpers
+// =========================================================================
+
+/// Find elements by visible text content.
+/// POST /ui-bridge/control/page/find-by-text
+/// Body: { "text": "Submit", "tag": "button", "exact": true }
+pub async fn ui_bridge_find_by_text_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
+    let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if text.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("'text' field is required")),
+        ));
+    }
+
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{}'", escaped_text)
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+
+    let js = format!(
+        r#"JSON.stringify(Array.from(document.querySelectorAll('{tag}'))
+            .filter(el => el.offsetParent !== null && {match_expr})
+            .map((el, i) => ({{
+                index: i,
+                tag: el.tagName,
+                text: el.textContent.trim().slice(0, 100),
+                id: el.id || null,
+                disabled: el.disabled || false,
+                visible: el.offsetParent !== null,
+                rect: (() => {{ const r = el.getBoundingClientRect(); return {{ x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }}; }})()
+            }})))"#,
+        tag = tag,
+        match_expr = match_expr
+    );
+
+    match direct_webview_evaluate_with_result(&state, &js).await {
+        Ok(result) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::Value::Array(vec![]));
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "matches": parsed,
+                "count": parsed.as_array().map(|a| a.len()).unwrap_or(0),
+                "query": { "text": text, "tag": tag, "exact": exact }
+            }))))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Click an element by its visible text content.
+/// POST /ui-bridge/control/page/click-by-text
+/// Body: { "text": "Submit", "tag": "button", "exact": true, "index": 0 }
+pub async fn ui_bridge_click_by_text_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let tag = body.get("tag").and_then(|v| v.as_str()).unwrap_or("*");
+    let exact = body.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if text.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("'text' field is required")),
+        ));
+    }
+
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+    let match_expr = if exact {
+        format!("el.textContent.trim() === '{}'", escaped_text)
+    } else {
+        format!(
+            "el.textContent.trim().toLowerCase().includes('{}')",
+            escaped_text.to_lowercase()
+        )
+    };
+
+    let js = format!(
+        r#"(() => {{
+            const matches = Array.from(document.querySelectorAll('{tag}'))
+                .filter(el => el.offsetParent !== null && {match_expr});
+            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No matching elements found' }});
+            const idx = {index};
+            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
+            const el = matches[idx];
+            el.scrollIntoView({{ block: 'center' }});
+            el.click();
+            return JSON.stringify({{
+                clicked: true,
+                tag: el.tagName,
+                text: el.textContent.trim().slice(0, 100),
+                index: idx,
+                totalMatches: matches.length
+            }});
+        }})()"#,
+        tag = tag,
+        match_expr = match_expr,
+        index = index
+    );
+
+    match direct_webview_evaluate_with_result(&state, &js).await {
+        Ok(result) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
+            Ok(Json(ApiResponse::success(parsed)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Click an element by CSS selector.
+/// POST /ui-bridge/control/page/click-by-selector
+/// Body: { "selector": "button[type='submit']", "index": 0 }
+pub async fn ui_bridge_click_by_selector_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let selector = body
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if selector.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("'selector' field is required")),
+        ));
+    }
+
+    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
+
+    let js = format!(
+        r#"(() => {{
+            const matches = Array.from(document.querySelectorAll('{selector}'))
+                .filter(el => el.offsetParent !== null);
+            if (matches.length === 0) return JSON.stringify({{ clicked: false, error: 'No elements match selector' }});
+            const idx = {index};
+            if (idx >= matches.length) return JSON.stringify({{ clicked: false, error: 'Index ' + idx + ' out of range (found ' + matches.length + ')' }});
+            const el = matches[idx];
+            el.scrollIntoView({{ block: 'center' }});
+            el.click();
+            return JSON.stringify({{
+                clicked: true,
+                tag: el.tagName,
+                text: el.textContent.trim().slice(0, 100),
+                index: idx,
+                totalMatches: matches.length
+            }});
+        }})()"#,
+        selector = escaped_selector,
+        index = index
+    );
+
+    match direct_webview_evaluate_with_result(&state, &js).await {
+        Ok(result) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
+            Ok(Json(ApiResponse::success(parsed)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Read the value of a form element by CSS selector.
+/// POST /ui-bridge/control/page/read-value
+/// Body: { "selector": "textarea", "index": 0 }
+pub async fn ui_bridge_read_value_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let selector = body
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if selector.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("'selector' field is required")),
+        ));
+    }
+
+    let escaped_selector = selector.replace('\\', "\\\\").replace('\'', "\\'");
+
+    let js = format!(
+        r#"(() => {{
+            const matches = Array.from(document.querySelectorAll('{selector}'));
+            if (matches.length === 0) return JSON.stringify({{ found: false, error: 'No elements match selector' }});
+            const idx = {index};
+            if (idx >= matches.length) return JSON.stringify({{ found: false, error: 'Index out of range' }});
+            const el = matches[idx];
+            return JSON.stringify({{
+                found: true,
+                tag: el.tagName,
+                type: el.type || null,
+                value: el.value || el.textContent?.trim() || '',
+                length: (el.value || el.textContent || '').length,
+                placeholder: el.placeholder || null,
+                disabled: el.disabled || false,
+                readOnly: el.readOnly || false,
+                index: idx,
+                totalMatches: matches.length
+            }});
+        }})()"#,
+        selector = escaped_selector,
+        index = index
+    );
+
+    match direct_webview_evaluate_with_result(&state, &js).await {
+        Ok(result) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
+            Ok(Json(ApiResponse::success(parsed)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Type text into an element by CSS selector or label.
+/// POST /ui-bridge/control/page/type-into
+/// Body: { "selector": "textarea", "text": "hello", "clear": true, "index": 0 }
+/// Or:   { "label": "Email", "text": "user@example.com" }
+pub async fn ui_bridge_type_into_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let selector = body.get("selector").and_then(|v| v.as_str());
+    let label = body.get("label").and_then(|v| v.as_str());
+    let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let clear = body.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+    let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let find_expr = if let Some(sel) = selector {
+        let escaped = sel.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("document.querySelectorAll('{}')", escaped)
+    } else if let Some(lbl) = label {
+        let escaped = lbl.replace('\\', "\\\\").replace('\'', "\\'");
+        format!(
+            "(() => {{ const lb = Array.from(document.querySelectorAll('label')).find(l => l.textContent.trim().toLowerCase().includes('{}')); return lb && lb.htmlFor ? [document.getElementById(lb.htmlFor)] : []; }})()",
+            escaped.to_lowercase()
+        )
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("'selector' or 'label' field is required")),
+        ));
+    };
+
+    let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
+
+    let js = format!(
+        r#"(() => {{
+            const matches = Array.from({find_expr}).filter(el => el);
+            if (matches.length === 0) return JSON.stringify({{ typed: false, error: 'No elements found' }});
+            const idx = {index};
+            if (idx >= matches.length) return JSON.stringify({{ typed: false, error: 'Index out of range' }});
+            const el = matches[idx];
+            el.scrollIntoView({{ block: 'center' }});
+            el.focus();
+            if ({clear}) {{
+                el.value = '';
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            }}
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+                || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (nativeInputValueSetter) {{
+                nativeInputValueSetter.call(el, {clear} ? '{text}' : el.value + '{text}');
+            }} else {{
+                el.value = {clear} ? '{text}' : el.value + '{text}';
+            }}
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return JSON.stringify({{
+                typed: true,
+                tag: el.tagName,
+                valueLength: el.value.length,
+                index: idx
+            }});
+        }})()"#,
+        find_expr = find_expr,
+        index = index,
+        clear = clear,
+        text = escaped_text
+    );
+
+    match direct_webview_evaluate_with_result(&state, &js).await {
+        Ok(result) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::json!({"typed": false, "error": "Parse error"}));
+            Ok(Json(ApiResponse::success(parsed)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get a summary of the current page state.
+/// POST /ui-bridge/control/page/summary
+pub async fn ui_bridge_page_summary_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(_body): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let js = r#"JSON.stringify({
+        title: document.title,
+        url: window.location.href,
+        headings: Array.from(document.querySelectorAll('h1, h2, h3')).filter(el => el.offsetParent !== null).map(el => ({ tag: el.tagName, text: el.textContent.trim().slice(0, 100) })).slice(0, 10),
+        buttons: Array.from(document.querySelectorAll('button')).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0).map(el => el.textContent.trim().slice(0, 40)).filter(t => t.length < 30).slice(0, 20),
+        inputs: Array.from(document.querySelectorAll('input, textarea, select')).filter(el => el.offsetParent !== null).map(el => ({ tag: el.tagName, type: el.type || null, placeholder: el.placeholder?.slice(0, 40) || null, hasValue: (el.value || '').length > 0 })).slice(0, 15),
+        links: Array.from(document.querySelectorAll('a[href]')).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0).map(el => ({ text: el.textContent.trim().slice(0, 40), href: el.getAttribute('href')?.slice(0, 60) })).slice(0, 15),
+        modals: Array.from(document.querySelectorAll('[role="dialog"], [class*="modal"]')).filter(el => el.offsetParent !== null).map(el => el.textContent.trim().slice(0, 100)).slice(0, 3),
+        errors: Array.from(document.querySelectorAll('[role="alert"], [class*="error"], [class*="Error"]')).filter(el => el.offsetParent !== null && el.textContent.trim().length > 0).map(el => el.textContent.trim().slice(0, 100)).slice(0, 5),
+        elementCounts: {
+            buttons: document.querySelectorAll('button').length,
+            inputs: document.querySelectorAll('input').length,
+            textareas: document.querySelectorAll('textarea').length,
+            selects: document.querySelectorAll('select').length,
+            links: document.querySelectorAll('a').length,
+            images: document.querySelectorAll('img').length
+        }
+    })"#;
+
+    match direct_webview_evaluate_with_result(&state, js).await {
+        Ok(result) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&result).unwrap_or(serde_json::json!({"error": "Parse error"}));
+            Ok(Json(ApiResponse::success(parsed)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -6951,6 +7297,36 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/evaluate-batch",
             post(ui_bridge_page_evaluate_batch_handler),
+        )
+        // Convenience DOM interaction endpoints
+        .route(
+            "/ui-bridge/control/page/find-by-text",
+            post(ui_bridge_find_by_text_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/click-by-text",
+            post(ui_bridge_click_by_text_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/click-by-selector",
+            post(ui_bridge_click_by_selector_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/read-value",
+            post(ui_bridge_read_value_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/type-into",
+            post(ui_bridge_type_into_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/summary",
+            post(ui_bridge_page_summary_handler),
+        )
+        // Aliases under /ai/ namespace
+        .route(
+            "/ui-bridge/ai/page-summary",
+            post(ui_bridge_page_summary_handler),
         )
         .route(
             "/ui-bridge/control/assert",
