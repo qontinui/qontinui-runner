@@ -2,12 +2,20 @@ import { useState, useRef, useEffect } from "react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
 
+export interface ZoneSessionInfo {
+  zoneIndex: number;
+  claudeSessionId: string;
+  claudeConfigDir?: string;
+}
+
 interface ZoneProfile {
   layoutId: string;
   labels: Record<number, string>;
   notes: Record<number, string>;
   pins: number[];
   autoApprovePatterns: string[];
+  /** Claude session IDs per zone (added in later version, may be absent in old profiles) */
+  sessions?: ZoneSessionInfo[];
 }
 
 interface ZoneProfilePickerProps {
@@ -16,18 +24,27 @@ interface ZoneProfilePickerProps {
   zoneNotes: Record<number, string>;
   pinnedZones: Set<number>;
   autoApprovePatterns: string[];
+  /** Current zone assignments (zoneIndex -> tabId) and tabs for session capture */
+  zoneAssignments?: Record<number, string>;
+  tabs?: Array<{ id: string; claudeSessionId?: string; claudeConfigDir?: string }>;
+  /** Terminal page ID for storage namespacing */
+  pageId?: string;
   onLoadProfile: (profile: ZoneProfile) => void;
 }
 
-const STORAGE_KEY = "zone-profiles";
+const BASE_STORAGE_KEY = "zone-profiles";
 const MAX_PROFILES = 10;
 
-function loadProfiles(): Record<string, ZoneProfile> {
-  return instanceStorage.getJSON<Record<string, ZoneProfile>>(STORAGE_KEY, {});
+function profileStorageKey(pageId: string): string {
+  return pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
 }
 
-function saveProfiles(profiles: Record<string, ZoneProfile>) {
-  instanceStorage.setJSON(STORAGE_KEY, profiles);
+function loadProfiles(pageId: string = "default"): Record<string, ZoneProfile> {
+  return instanceStorage.getJSON<Record<string, ZoneProfile>>(profileStorageKey(pageId), {});
+}
+
+function saveProfiles(profiles: Record<string, ZoneProfile>, pageId: string = "default") {
+  instanceStorage.setJSON(profileStorageKey(pageId), profiles);
 }
 
 export function ZoneProfilePicker({
@@ -36,10 +53,13 @@ export function ZoneProfilePicker({
   zoneNotes,
   pinnedZones,
   autoApprovePatterns,
+  zoneAssignments,
+  tabs,
+  pageId = "default",
   onLoadProfile,
 }: ZoneProfilePickerProps) {
   const [open, setOpen] = useState(false);
-  const [profiles, setProfiles] = useState(loadProfiles);
+  const [profiles, setProfiles] = useState(() => loadProfiles(pageId));
   const [saveName, setSaveName] = useState("");
   const [showSaveInput, setShowSaveInput] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -66,16 +86,33 @@ export function ZoneProfilePicker({
       // At limit, don't save
       return;
     }
+    // Capture Claude session IDs from current zone assignments
+    const sessions: ZoneSessionInfo[] = [];
+    if (zoneAssignments && tabs) {
+      const tabsById = new Map(tabs.map((t) => [t.id, t]));
+      for (const [zoneIdxStr, tabId] of Object.entries(zoneAssignments)) {
+        const tab = tabsById.get(tabId);
+        if (tab?.claudeSessionId) {
+          sessions.push({
+            zoneIndex: Number(zoneIdxStr),
+            claudeSessionId: tab.claudeSessionId,
+            claudeConfigDir: tab.claudeConfigDir,
+          });
+        }
+      }
+    }
+
     const profile: ZoneProfile = {
       layoutId: currentLayoutId,
       labels: { ...zoneLabels },
       notes: { ...zoneNotes },
       pins: [...pinnedZones],
       autoApprovePatterns: [...autoApprovePatterns],
+      sessions: sessions.length > 0 ? sessions : undefined,
     };
     const updated = { ...profiles, [name]: profile };
     setProfiles(updated);
-    saveProfiles(updated);
+    saveProfiles(updated, pageId);
     setShowSaveInput(false);
     setSaveName("");
   };
@@ -92,7 +129,7 @@ export function ZoneProfilePicker({
     const updated = { ...profiles };
     delete updated[name];
     setProfiles(updated);
-    saveProfiles(updated);
+    saveProfiles(updated, pageId);
   };
 
   return (
@@ -174,8 +211,13 @@ export function ZoneProfilePicker({
                     <button onClick={() => handleLoad(name)} className="flex-1 min-w-0 text-left">
                       <div className="text-[11px] text-[#c0caf5] truncate">{name}</div>
                       <div className="text-[9px] text-[#565f89]">
-                        {p.layoutId} · {labelCount} label{labelCount !== 1 ? "s" : ""} ·{" "}
-                        {p.pins.length} pin{p.pins.length !== 1 ? "s" : ""}
+                        {p.layoutId} · {labelCount} label{labelCount !== 1 ? "s" : ""}
+                        {p.pins.length > 0 && ` · ${p.pins.length} pin${p.pins.length !== 1 ? "s" : ""}`}
+                        {p.sessions && p.sessions.length > 0 && (
+                          <span className="text-[#7aa2f7]">
+                            {" "}· {p.sessions.length} session{p.sessions.length !== 1 ? "s" : ""}
+                          </span>
+                        )}
                       </div>
                     </button>
                     <button

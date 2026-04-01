@@ -28,19 +28,22 @@ RETURNING id;
 SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type,
        COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count,
        COALESCE(max_sessions, 0) as max_sessions,
-       error_message, COALESCE(auto_continue, true) as auto_continue,
-       execution_steps_json, log_sources_json, config_id, workflow_name, workflow_id,
+       COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue,
+       COALESCE(execution_steps_json, '') as execution_steps_json, COALESCE(log_sources_json, '') as log_sources_json,
+       COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id,
        COALESCE(summary, ai_summary, '') as summary, COALESCE(ai_summary, '') as ai_summary,
        COALESCE(goal_achieved, false) as goal_achieved,
-       remaining_work, summary_generated_at, transition_history_json,
+       COALESCE(remaining_work, '') as remaining_work, COALESCE(summary_generated_at::TEXT, '') as summary_generated_at,
+       COALESCE(transition_history_json, '') as transition_history_json,
        COALESCE(workflow_type, 'task') as workflow_type,
-       workspace_id, triggered_by,
-       parent_task_run_id, root_task_run_id, COALESCE(depth, 0) as depth, bridge_id, result_data,
-       COALESCE(is_reflection, false) as is_reflection, reflection_source_task_run_id,
-       COALESCE(is_follow_up, false) as is_follow_up, follow_up_source_task_run_id,
-       COALESCE(is_fixer, false) as is_fixer, fixer_source_task_run_id,
+       COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by,
+       COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id,
+       COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id, COALESCE(result_data, '') as result_data,
+       COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id,
+       COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id,
+       COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
        COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
-       created_at::TEXT, updated_at::TEXT, completed_at::TEXT
+       COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
 FROM task_runs
 WHERE id = :id;
 
@@ -48,13 +51,13 @@ WHERE id = :id;
 SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type,
        COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count,
        COALESCE(max_sessions, 0) as max_sessions,
-       error_message, COALESCE(auto_continue, true) as auto_continue,
-       config_id, workflow_name, workflow_id,
+       COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue,
+       COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id,
        COALESCE(summary, ai_summary, '') as summary, COALESCE(ai_summary, '') as ai_summary,
        COALESCE(goal_achieved, false) as goal_achieved,
-       remaining_work, summary_generated_at,
-       workspace_id, triggered_by,
-       created_at::TEXT, updated_at::TEXT, completed_at::TEXT
+       COALESCE(remaining_work, '') as remaining_work, COALESCE(summary_generated_at::TEXT, '') as summary_generated_at,
+       COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by,
+       COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
 FROM task_runs
 WHERE (workflow_type IS NULL OR workflow_type != 'chat')
   AND (:runner_port::integer IS NULL OR runner_port IS NULL OR runner_port = :runner_port)
@@ -101,16 +104,18 @@ RETURNING id;
 SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type,
        COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count,
        COALESCE(max_sessions, 0) as max_sessions,
-       error_message, COALESCE(auto_continue, true) as auto_continue,
-       config_id, workflow_name, workflow_id, COALESCE(workflow_type, 'task') as workflow_type,
-       workspace_id, triggered_by,
-       parent_task_run_id, root_task_run_id, COALESCE(depth, 0) as depth, bridge_id,
-       COALESCE(is_reflection, false) as is_reflection, reflection_source_task_run_id,
-       COALESCE(is_follow_up, false) as is_follow_up, follow_up_source_task_run_id,
-       COALESCE(is_fixer, false) as is_fixer, fixer_source_task_run_id,
+       COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue,
+       COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id,
+       COALESCE(workflow_type, 'task') as workflow_type,
+       COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by,
+       COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id,
+       COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id,
+       COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id,
+       COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id,
+       COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
        COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
-       runner_port,
-       created_at::TEXT, updated_at::TEXT, completed_at::TEXT
+       COALESCE(runner_port, 0) as runner_port,
+       COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
 FROM task_runs
 WHERE status = 'running'
   AND (:runner_port::integer IS NULL OR runner_port IS NULL OR runner_port = :runner_port)
@@ -138,13 +143,13 @@ RETURNING id;
 SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type,
        COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count,
        COALESCE(max_sessions, 0) as max_sessions,
-       error_message, COALESCE(auto_continue, true) as auto_continue,
-       config_id, workflow_name, workflow_id,
+       COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue,
+       COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id,
        COALESCE(summary, ai_summary, '') as summary, COALESCE(ai_summary, '') as ai_summary,
        COALESCE(goal_achieved, false) as goal_achieved,
-       remaining_work, summary_generated_at,
-       workspace_id, triggered_by,
-       created_at::TEXT, updated_at::TEXT, completed_at::TEXT
+       COALESCE(remaining_work, '') as remaining_work, COALESCE(summary_generated_at::TEXT, '') as summary_generated_at,
+       COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by,
+       COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
 FROM task_runs
 WHERE (:workflow_type::text IS NULL OR workflow_type = :workflow_type)
   AND (workflow_type IS NULL OR workflow_type != 'chat')
@@ -153,4 +158,4 @@ ORDER BY updated_at DESC
 LIMIT :max_results;
 
 --! get_task_output
-SELECT output_log FROM task_runs WHERE id = :id;
+SELECT COALESCE(output_log, '') as output_log FROM task_runs WHERE id = :id;

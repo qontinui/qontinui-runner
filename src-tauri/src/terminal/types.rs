@@ -20,6 +20,13 @@ pub struct TerminalInfo {
     pub created_at: u64,
     /// Monotonic counter of all bytes ever produced by the PTY.
     pub total_bytes_produced: u64,
+    /// Which terminal page this session belongs to (for multi-page support).
+    #[serde(default = "default_page_id")]
+    pub page_id: String,
+}
+
+fn default_page_id() -> String {
+    "default".to_string()
 }
 
 /// Event payload emitted when a terminal produces output.

@@ -51,9 +51,13 @@ export interface SavedSessionLayout {
 // Constants
 // ---------------------------------------------------------------------------
 
-const STORAGE_KEY = "qontinui-terminal-session-layout";
+const BASE_STORAGE_KEY = "qontinui-terminal-session-layout";
 const DEBOUNCE_MS = 500;
 const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function storageKey(pageId: string): string {
+  return pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
+}
 
 // ---------------------------------------------------------------------------
 // Hook
@@ -77,7 +81,8 @@ export interface SaveSessionLayoutParams {
   focusedZone: number;
 }
 
-export function useSessionPersistence() {
+export function useSessionPersistence(pageId: string = "default") {
+  const key = storageKey(pageId);
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Clean up debounce timer on unmount
@@ -150,7 +155,7 @@ export function useSessionPersistence() {
       };
 
       try {
-        instanceStorage.setJSON(STORAGE_KEY, layout);
+        instanceStorage.setJSON(key, layout);
       } catch {
         // storage may be full or unavailable — silently ignore
       }
@@ -203,7 +208,7 @@ export function useSessionPersistence() {
   const updateScrollbackPaths = useCallback(
     (pathMap: Record<string, string>, tabIdToSessionIndex: Record<string, number>) => {
       try {
-        const layout = instanceStorage.getJSON<SavedSessionLayout | null>(STORAGE_KEY, null);
+        const layout = instanceStorage.getJSON<SavedSessionLayout | null>(key, null);
         if (!layout) return;
 
         for (const [tabId, path] of Object.entries(pathMap)) {
@@ -213,7 +218,7 @@ export function useSessionPersistence() {
           }
         }
 
-        instanceStorage.setJSON(STORAGE_KEY, layout);
+        instanceStorage.setJSON(key, layout);
       } catch {
         // Best-effort
       }
@@ -222,11 +227,11 @@ export function useSessionPersistence() {
   );
 
   const getSavedLayout = useCallback((): SavedSessionLayout | null => {
-    return instanceStorage.getJSON<SavedSessionLayout | null>(STORAGE_KEY, null);
+    return instanceStorage.getJSON<SavedSessionLayout | null>(key, null);
   }, []);
 
   const clearSavedLayout = useCallback(() => {
-    instanceStorage.removeItem(STORAGE_KEY);
+    instanceStorage.removeItem(key);
   }, []);
 
   const hasSavedLayout = useCallback((): boolean => {

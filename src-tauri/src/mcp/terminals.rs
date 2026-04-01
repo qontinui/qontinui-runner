@@ -33,6 +33,9 @@ pub struct CreateTerminalRequest {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Which terminal page this session belongs to.
+    #[serde(default)]
+    pub page_id: Option<String>,
     /// Optional command to execute immediately after shell initialization.
     #[serde(default)]
     pub initial_command: Option<String>,
@@ -97,6 +100,7 @@ pub async fn create_terminal_handler(
     match terminal_manager.create(
         request.title,
         request.working_dir,
+        request.page_id,
         request.cols,
         request.rows,
         app_handle,

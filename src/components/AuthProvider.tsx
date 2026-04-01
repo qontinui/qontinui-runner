@@ -295,6 +295,22 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [loading]);
 
   /**
+   * Failsafe timeout for devAutoLoginPending
+   * Covers the case where login() resolves quickly (clearing loading)
+   * but devAutoLoginPending stays stuck true due to a race condition
+   */
+  useEffect(() => {
+    if (!devAutoLoginPending) return;
+
+    const timeout = setTimeout(() => {
+      log.warn("devAutoLoginPending timeout - forcing to false");
+      setDevAutoLoginPending(false);
+    }, 10000);
+
+    return () => clearTimeout(timeout);
+  }, [devAutoLoginPending]);
+
+  /**
    * Set up auto-refresh timer when authenticated
    */
   useEffect(() => {

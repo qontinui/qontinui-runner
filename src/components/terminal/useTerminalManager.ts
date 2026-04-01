@@ -37,9 +37,10 @@ interface TerminalInfo {
   exit_code: number | null;
   created_at: number;
   total_bytes_produced: number;
+  page_id?: string;
 }
 
-export function useTerminalManager() {
+export function useTerminalManager(pageId: string = "default") {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const nextTitleNum = useRef(1);
@@ -77,25 +78,30 @@ export function useTerminalManager() {
 
   /**
    * Reconnect to existing Rust PTY sessions that survived a React remount.
-   * Returns true if sessions were found and restored.
+   * Returns the ordered list of reconnected tab IDs, or null if no sessions found.
    */
-  const reconnectToExistingSessions = useCallback(async (): Promise<boolean> => {
+  const reconnectToExistingSessions = useCallback(async (): Promise<string[] | null> => {
     try {
       const result = await invoke<CommandResponse>("terminal_list");
-      if (!result.success || !result.data) return false;
+      if (!result.success || !result.data) return null;
 
       const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
-      if (!terminals || terminals.length === 0) return false;
+      if (!terminals || terminals.length === 0) return null;
+
+      // Filter to terminals belonging to this page
+      const pageTerminals = terminals.filter(
+        (t) => (t.page_id || "default") === pageId,
+      );
 
       // Only reconnect to alive sessions; silently close dead ones
-      const dead = terminals.filter((t) => !t.is_alive);
-      const alive = terminals.filter((t) => t.is_alive);
+      const dead = pageTerminals.filter((t) => !t.is_alive);
+      const alive = pageTerminals.filter((t) => t.is_alive);
 
       for (const t of dead) {
         invoke("terminal_close", { terminalId: t.id }).catch(() => {});
       }
 
-      if (alive.length === 0) return false;
+      if (alive.length === 0) return null;
 
       logger.info(`Reconnecting to ${alive.length} existing PTY session(s)`);
 
@@ -122,10 +128,10 @@ export function useTerminalManager() {
       setTabs(reconnectedTabs);
       // Select the last tab (most recently created)
       setActiveId(reconnectedTabs[reconnectedTabs.length - 1].id);
-      return true;
+      return reconnectedTabs.map((t) => t.id);
     } catch (err) {
       console.error("[TerminalManager] Failed to reconnect:", err);
-      return false;
+      return null;
     }
   }, []);
 
@@ -141,6 +147,7 @@ export function useTerminalManager() {
         const result = await invoke<CommandResponse>("terminal_create", {
           title: displayTitle,
           workingDir: workingDir ?? null,
+          pageId: pageId !== "default" ? pageId : null,
         });
 
         if (!result.success || !result.data) return null;

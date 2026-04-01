@@ -551,6 +551,7 @@ pub fn create_router(
         .merge(crate::mcp::image_quality_tests::routes())
         .merge(crate::mcp::step_type_knowledge_api::routes())
         .merge(crate::mcp::step_type_metadata_api::routes())
+        .merge(crate::mcp::task_run_inspection::routes())
         .merge(crate::mcp::task_runs::routes())
         .merge(crate::mcp::terminals::routes())
         .merge(crate::mcp::testing::routes())

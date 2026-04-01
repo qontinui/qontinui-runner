@@ -141,7 +141,7 @@ export type ZoneAssignments = Record<number, string>;
 
 export type SessionState = "idle" | "working" | "needs-input" | "completed" | "error";
 
-const STORAGE_KEY = "qontinui-zone-layout";
+const BASE_STORAGE_KEY = "qontinui-zone-layout";
 
 interface PersistedState {
   layoutId: string;
@@ -149,13 +149,17 @@ interface PersistedState {
   focusedZone: number;
 }
 
-function loadPersistedState(): PersistedState | null {
-  return instanceStorage.getJSON<PersistedState | null>(STORAGE_KEY, null);
+function storageKey(pageId: string): string {
+  return pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
 }
 
-function persistState(state: PersistedState) {
+function loadPersistedState(pageId: string): PersistedState | null {
+  return instanceStorage.getJSON<PersistedState | null>(storageKey(pageId), null);
+}
+
+function persistState(pageId: string, state: PersistedState) {
   try {
-    instanceStorage.setJSON(STORAGE_KEY, state);
+    instanceStorage.setJSON(storageKey(pageId), state);
   } catch {
     // ignore storage errors
   }
@@ -163,8 +167,8 @@ function persistState(state: PersistedState) {
 
 // ── Hook ───────────────────────────────────────────────────────────────────
 
-export function useZoneLayout(tabIds: string[]) {
-  const [persistedState] = useState(() => loadPersistedState());
+export function useZoneLayout(tabIds: string[], pageId: string = "default") {
+  const [persistedState] = useState(() => loadPersistedState(pageId));
 
   const [layoutId, setLayoutIdState] = useState<string>(persistedState?.layoutId ?? "single");
   const [assignments, setAssignments] = useState<ZoneAssignments>(
@@ -178,8 +182,8 @@ export function useZoneLayout(tabIds: string[]) {
 
   // Persist on changes
   useEffect(() => {
-    persistState({ layoutId, assignments, focusedZone });
-  }, [layoutId, assignments, focusedZone]);
+    persistState(pageId, { layoutId, assignments, focusedZone });
+  }, [pageId, layoutId, assignments, focusedZone]);
 
   // Auto-assign tabs to empty zones when tabs change
   useEffect(() => {

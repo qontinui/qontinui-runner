@@ -78,6 +78,8 @@ interface ZoneControlPanelProps {
   onSwapZones?: (sourceZone: number, targetZone: number) => void;
   onLoadWorkspace?: (workspace: SavedWorkspace) => void;
   layoutId?: string;
+  /** Terminal page ID for storage namespacing */
+  pageId?: string;
 }
 
 type SessionState = "idle" | "working" | "needs-input" | "completed" | "error";
@@ -104,8 +106,12 @@ const STATE_LABELS: Record<SessionState, string> = {
 
 const ALL_STATES: SessionState[] = ["idle", "working", "needs-input", "completed", "error"];
 
-const WORKSPACES_STORAGE_KEY = "qontinui-workspaces";
+const BASE_WORKSPACES_STORAGE_KEY = "qontinui-workspaces";
 const MAX_WORKSPACES = 10;
+
+function workspacesStorageKey(pageId: string): string {
+  return pageId === "default" ? BASE_WORKSPACES_STORAGE_KEY : `page:${pageId}:${BASE_WORKSPACES_STORAGE_KEY}`;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -137,15 +143,15 @@ function getState(raw: string | undefined): SessionState {
   return "idle";
 }
 
-function loadWorkspaces(): SavedWorkspace[] {
-  const parsed = instanceStorage.getJSON<unknown>(WORKSPACES_STORAGE_KEY, []);
+function loadWorkspaces(pageId: string = "default"): SavedWorkspace[] {
+  const parsed = instanceStorage.getJSON<unknown>(workspacesStorageKey(pageId), []);
   if (!Array.isArray(parsed)) return [];
   return parsed as SavedWorkspace[];
 }
 
-function saveWorkspacesToStorage(workspaces: SavedWorkspace[]): void {
+function saveWorkspacesToStorage(workspaces: SavedWorkspace[], pageId: string = "default"): void {
   try {
-    instanceStorage.setJSON(WORKSPACES_STORAGE_KEY, workspaces);
+    instanceStorage.setJSON(workspacesStorageKey(pageId), workspaces);
   } catch {
     // storage full or unavailable — silently ignore
   }
@@ -736,6 +742,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   onSwapZones,
   onLoadWorkspace,
   layoutId,
+  pageId = "default",
 }: ZoneControlPanelProps) {
   // -----------------------------------------------------------------------
   // Drag-and-drop state
@@ -768,7 +775,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
   // -----------------------------------------------------------------------
   // Workspaces
   // -----------------------------------------------------------------------
-  const [workspaces, setWorkspaces] = useState<SavedWorkspace[]>(() => loadWorkspaces());
+  const [workspaces, setWorkspaces] = useState<SavedWorkspace[]>(() => loadWorkspaces(pageId));
 
   const handleSaveWorkspace = useCallback(
     (name: string) => {
@@ -794,7 +801,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
 
       setWorkspaces((prev) => {
         const next = [ws, ...prev].slice(0, MAX_WORKSPACES);
-        saveWorkspacesToStorage(next);
+        saveWorkspacesToStorage(next, pageId);
         return next;
       });
     },
@@ -805,7 +812,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
     setWorkspaces((prev) => {
       const next = [...prev];
       next.splice(index, 1);
-      saveWorkspacesToStorage(next);
+      saveWorkspacesToStorage(next, pageId);
       return next;
     });
   }, []);

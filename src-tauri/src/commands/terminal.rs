@@ -16,10 +16,11 @@ pub fn terminal_create(
     app_handle: tauri::AppHandle,
     title: Option<String>,
     working_dir: Option<String>,
+    page_id: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<CommandResponse, String> {
-    let info = terminal_manager.create(title, working_dir, cols, rows, app_handle)?;
+    let info = terminal_manager.create(title, working_dir, page_id, cols, rows, app_handle)?;
 
     Ok(CommandResponse {
         success: true,

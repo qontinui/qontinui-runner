@@ -32,6 +32,7 @@ impl TerminalManager {
         &self,
         title: Option<String>,
         working_dir: Option<String>,
+        page_id: Option<String>,
         cols: Option<u16>,
         rows: Option<u16>,
         app_handle: AppHandle,
@@ -45,6 +46,7 @@ impl TerminalManager {
                 crate::mcp::shared::current_project_path()
             })
             .unwrap_or_default();
+        let page_id = page_id.unwrap_or_else(|| "default".to_string());
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
 
@@ -53,6 +55,7 @@ impl TerminalManager {
             id.clone(),
             title,
             working_dir,
+            page_id,
             cols,
             rows,
             app_handle,

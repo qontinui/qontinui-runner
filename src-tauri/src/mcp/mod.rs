@@ -95,6 +95,7 @@ pub mod state_machine;
 pub mod step_evaluation_api;
 pub mod step_type_knowledge_api;
 pub mod step_type_metadata_api;
+pub mod task_run_inspection;
 pub mod task_run_queries;
 pub mod task_run_workflow_state;
 pub mod task_runs;

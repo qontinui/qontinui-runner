@@ -54,6 +54,9 @@ import { SetupWizard } from "./components/setup-wizard";
 import { LogSourcePicker } from "./components/LogSourcePicker";
 import { Sidebar } from "./components/navigation";
 import { TerminalPage } from "./components/terminal";
+import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
+import { useTerminalPages } from "./components/terminal/useTerminalPages";
+import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
 import { PerformanceOverlay } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
 import { useTaskRuns } from "./hooks/useAiData";
@@ -116,6 +119,8 @@ function AppContent() {
     clearErrorMonitorScope,
     ProfilerWrapper,
   } = useAppNavigation();
+
+  const terminalPages = useTerminalPages();
 
   const {
     isRunningLastWorkflow,
@@ -397,12 +402,25 @@ function AppContent() {
                 errorMonitorScope={errorMonitorScope}
                 clearErrorMonitorScope={clearErrorMonitorScope}
               />
-              <div className={`absolute inset-0 ${activeTab === "terminal" ? "" : "hidden"}`}>
-                <TerminalPage
-                  onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
-                  onNavigateToActive={() => setActiveTab("active")}
-                  onSessionCountChange={setTerminalSessionCount}
+              <div className={`absolute inset-0 flex flex-col ${activeTab === "terminal" ? "" : "hidden"}`}>
+                <TerminalPageTabBar
+                  pages={terminalPages.pages}
+                  activePageId={terminalPages.activePageId}
+                  onSelectPage={terminalPages.setActivePageId}
+                  onAddPage={terminalPages.addPage}
+                  onRemovePage={terminalPages.removePage}
+                  onRenamePage={terminalPages.renamePage}
                 />
+                <div className="flex-1 min-h-0">
+                  <TerminalPageProvider value={terminalPages.activePageId}>
+                    <TerminalPage
+                      key={terminalPages.activePageId}
+                      onNavigateToBuilder={() => setActiveTab("unified-workflow-builder")}
+                      onNavigateToActive={() => setActiveTab("active")}
+                      onSessionCountChange={setTerminalSessionCount}
+                    />
+                  </TerminalPageProvider>
+                </div>
               </div>
             </main>
           </div>

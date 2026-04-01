@@ -7,10 +7,16 @@ import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { CommandResponse } from "./types";
 import type { SaveSessionLayoutParams } from "./useSessionPersistence";
 
+/** Validate session IDs before interpolating into shell commands. */
+const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
+function isValidSessionId(id: string): boolean {
+  return SESSION_ID_RE.test(id);
+}
+
 interface UseTerminalInitializationParams {
   tabs: TerminalTab[];
   terminalRefs: React.MutableRefObject<Map<string, React.RefObject<TerminalInstanceHandle | null>>>;
-  reconnectToExistingSessions: () => Promise<boolean>;
+  reconnectToExistingSessions: () => Promise<string[] | null>;
   createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
   setInitialized: (v: boolean) => void;
@@ -113,8 +119,93 @@ export function useTerminalInitialization({
     didInit.current = true;
 
     (async () => {
-      const reconnected = await reconnectToExistingSessions();
-      if (!reconnected) {
+      const reconnectedTabIds = await reconnectToExistingSessions();
+
+      // Even when reconnection succeeds, merge saved session metadata
+      // (claudeSessionId, labels, etc.) that the PTY data doesn't carry.
+      // We use the returned tab IDs directly (ordered by creation time,
+      // matching the sequential zone auto-assignment) to avoid reading
+      // stale zoneLayout.assignments from this closure.
+      if (reconnectedTabIds) {
+        const saved = sessionPersistence.hasSavedLayout()
+          ? sessionPersistence.getSavedLayout()
+          : null;
+        if (saved && saved.sessions.length > 0) {
+          // Restore layout preset if it differs
+          if (saved.layoutId !== zoneLayout.layoutId) {
+            const preset = LAYOUT_PRESETS.find((p) => p.id === saved.layoutId);
+            if (preset) zoneLayout.setLayoutId(preset.id);
+          }
+
+          for (const session of saved.sessions) {
+            // Match by zone index: tabs are auto-assigned to zones sequentially
+            const tabId =
+              session.zoneIndex >= 0 && session.zoneIndex < reconnectedTabIds.length
+                ? reconnectedTabIds[session.zoneIndex]
+                : undefined;
+
+            // Restore zone labels, notes, pins
+            if (session.zoneIndex >= 0) {
+              if (session.label) {
+                labelsAndTags.setZoneLabel(session.zoneIndex, session.label);
+              }
+              if (session.notes) {
+                labelsAndTags.setZoneNote(session.zoneIndex, session.notes);
+              }
+              if (session.pinned) {
+                labelsAndTags.setPinnedZones((prev) => new Set([...prev, session.zoneIndex]));
+              }
+            }
+
+            // Merge Claude session ID into the reconnected tab and queue resume
+            if (tabId && session.claudeSessionId && isValidSessionId(session.claudeSessionId)) {
+              updateTab(tabId, {
+                claudeSessionId: session.claudeSessionId,
+                claudeConfigDir: session.claudeConfigDir,
+              });
+              pendingRestoresRef.current.push({
+                tabId,
+                isClaudeSession: true,
+                claudeSessionId: session.claudeSessionId,
+                claudeConfigDir: session.claudeConfigDir,
+              });
+            }
+          }
+
+          if (saved.focusedZone >= 0) {
+            zoneLayout.setFocusedZone(saved.focusedZone);
+          }
+
+          // Auto-resume Claude sessions after terminals are ready
+          if (pendingRestoresRef.current.length > 0) {
+            setTimeout(async () => {
+              for (const restore of pendingRestoresRef.current) {
+                if (restore.isClaudeSession && restore.claudeSessionId) {
+                  const ref = terminalRefs.current.get(restore.tabId);
+                  const handle = ref?.current;
+                  if (handle) {
+                    try {
+                      const resumeCmd = `claude --resume ${restore.claudeSessionId}\r`;
+                      await new Promise((r) => setTimeout(r, 500));
+                      handle.writeToTerminal(resumeCmd);
+                    } catch (err) {
+                      console.warn(
+                        `[TerminalPage] Failed to resume Claude session for ${restore.tabId}:`,
+                        err,
+                      );
+                    }
+                  }
+                }
+              }
+              pendingRestoresRef.current = [];
+            }, 1500);
+          }
+
+          sessionPersistence.clearSavedLayout();
+        }
+      }
+
+      if (!reconnectedTabIds) {
         const saved = sessionPersistence.hasSavedLayout()
           ? sessionPersistence.getSavedLayout()
           : null;
@@ -231,7 +322,12 @@ export function useTerminalInitialization({
                   }
                 }
 
-                if (restore.isClaudeSession && restore.claudeSessionId && handle) {
+                if (
+                  restore.isClaudeSession &&
+                  restore.claudeSessionId &&
+                  isValidSessionId(restore.claudeSessionId) &&
+                  handle
+                ) {
                   try {
                     const resumeCmd = `claude --resume ${restore.claudeSessionId}\r`;
                     await new Promise((r) => setTimeout(r, 500));
@@ -297,7 +393,7 @@ export function useTerminalInitialization({
     sessionPersistence,
   ]);
 
-  // Save scrollback buffers to disk when the window is about to close
+  // Refs for unmount/close handlers that need latest values
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -306,6 +402,32 @@ export function useTerminalInitialization({
   useEffect(() => {
     zoneLayoutRef.current = zoneLayout;
   }, [zoneLayout]);
+  const layoutStateRef = useRef(layoutState);
+  useEffect(() => {
+    layoutStateRef.current = layoutState;
+  }, [layoutState]);
+
+  // Immediate save on unmount (page switch) — the debounced auto-save may not
+  // have flushed, so we save synchronously to avoid losing state.
+  useEffect(() => {
+    return () => {
+      const ls = layoutStateRef.current;
+      const currentTabs = tabsRef.current;
+      if (currentTabs.length > 0) {
+        sessionPersistence.saveSessionLayout({
+          layoutId: ls.layoutId,
+          tabs: currentTabs,
+          assignments: zoneLayoutRef.current.assignments,
+          zoneLabels: ls.zoneLabels,
+          zoneNotes: ls.zoneNotes,
+          pinnedZones: ls.pinnedZones,
+          focusedZone: ls.focusedZone,
+        });
+      }
+    };
+  }, [sessionPersistence]);
+
+  // Save scrollback buffers to disk when the window is about to close
 
   const handleWindowClose = useCallback(async () => {
     const currentTabs = tabsRef.current;

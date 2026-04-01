@@ -1126,6 +1126,37 @@ impl PgDb {
             "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS validation_retries INTEGER",
             "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS coercions_applied TEXT",
             "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS validation_error_summary TEXT",
+            // Scheduler tables
+            "CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                description         TEXT,
+                enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+                schedule_type       TEXT NOT NULL,
+                schedule_value      TEXT NOT NULL,
+                task_config         TEXT NOT NULL DEFAULT '{}',
+                skip_if_completed   BOOLEAN NOT NULL DEFAULT FALSE,
+                auto_fix_on_failure BOOLEAN NOT NULL DEFAULT FALSE,
+                success_criteria    TEXT,
+                created_at          TEXT NOT NULL DEFAULT '',
+                modified_at         TEXT NOT NULL DEFAULT '',
+                next_run            TEXT,
+                last_run_id         TEXT,
+                condition_status    TEXT
+            )",
+            "CREATE TABLE IF NOT EXISTS scheduler_history (
+                execution_id        TEXT PRIMARY KEY,
+                task_id             TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                session_id          TEXT,
+                started_at          TEXT NOT NULL,
+                ended_at            TEXT,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                success             BOOLEAN,
+                error_message       TEXT,
+                triggered_auto_fix  BOOLEAN NOT NULL DEFAULT FALSE,
+                auto_fix_session_id TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_scheduler_history_task ON scheduler_history(task_id)",
         ];
 
         for sql in &ddl {

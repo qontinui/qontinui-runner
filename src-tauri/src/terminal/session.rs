@@ -42,6 +42,8 @@ pub struct TerminalSession {
     title: String,
     /// Working directory the shell was started in.
     working_dir: String,
+    /// Which terminal page this session belongs to.
+    page_id: String,
     /// Thread-safe writer to PTY stdin.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Handle to the PTY master (needed for resize).
@@ -76,6 +78,7 @@ impl TerminalSession {
         id: TerminalId,
         title: String,
         working_dir: String,
+        page_id: String,
         cols: u16,
         rows: u16,
         app_handle: AppHandle,
@@ -292,6 +295,7 @@ impl TerminalSession {
             id,
             title,
             working_dir: cwd,
+            page_id,
             writer,
             master: Arc::new(Mutex::new(master)),
             child_pid,
@@ -413,6 +417,7 @@ impl TerminalSession {
             exit_code: self.exit_code.lock().ok().and_then(|ec| *ec),
             created_at: self.created_at,
             total_bytes_produced: self.total_bytes_produced.load(Ordering::Relaxed),
+            page_id: self.page_id.clone(),
         }
     }
 

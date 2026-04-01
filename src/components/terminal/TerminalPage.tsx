@@ -16,7 +16,8 @@ import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { ZoneStatusBar } from "./ZoneStatusBar";
 import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
-import { ZoneProfilePicker } from "./ZoneProfilePicker";
+import { ZoneProfilePicker, type ZoneSessionInfo } from "./ZoneProfilePicker";
+import { useTerminalPageId } from "./TerminalPageContext";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
 import { useSessionPersistence } from "./useSessionPersistence";
@@ -54,11 +55,13 @@ export function TerminalPage({
   onNavigateToActive,
   onSessionCountChange,
 }: TerminalPageProps) {
+  const pageId = useTerminalPageId();
+
   const {
     tabs,
     activeId,
     setActiveId,
-    initialized: _initialized,
+    initialized,
     setInitialized,
     createTerminal,
     closeTerminal,
@@ -67,7 +70,7 @@ export function TerminalPage({
     reconnectToExistingSessions,
     markReconnected,
     createPlanTab,
-  } = useTerminalManager();
+  } = useTerminalManager(pageId);
 
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
@@ -93,7 +96,7 @@ export function TerminalPage({
   });
 
   const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
-  const zoneLayout = useZoneLayout(tabIds);
+  const zoneLayout = useZoneLayout(tabIds, pageId);
 
   useEffect(() => {
     if (
@@ -120,6 +123,9 @@ export function TerminalPage({
     new Map(),
   );
 
+  // Pending Claude sessions to resume after a zone profile load settles
+  const pendingProfileSessionsRef = useRef<ZoneSessionInfo[] | null>(null);
+
   for (const tab of tabs) {
     if (!terminalRefs.current.has(tab.id)) {
       terminalRefs.current.set(tab.id, createRef<TerminalInstanceHandle>());
@@ -130,6 +136,29 @@ export function TerminalPage({
       terminalRefs.current.delete(key);
     }
   }
+
+  // Resume Claude sessions from a loaded zone profile after assignments settle
+  const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
+  useEffect(() => {
+    const sessions = pendingProfileSessionsRef.current;
+    if (!sessions) return;
+    pendingProfileSessionsRef.current = null;
+
+    for (const s of sessions) {
+      const tabId = zoneLayout.assignments[s.zoneIndex];
+      if (tabId && SESSION_ID_RE.test(s.claudeSessionId)) {
+        updateTab(tabId, {
+          claudeSessionId: s.claudeSessionId,
+          claudeConfigDir: s.claudeConfigDir,
+        });
+        const ref = terminalRefs.current.get(tabId);
+        const handle = ref?.current;
+        if (handle) {
+          handle.writeToTerminal(`claude --resume ${s.claudeSessionId}\r`);
+        }
+      }
+    }
+  }, [zoneLayout.assignments, updateTab]);
 
   const stateTracking = useSessionStateTracking({
     tabs,
@@ -350,7 +379,7 @@ export function TerminalPage({
     cycleViewMode,
   } = useUIState();
 
-  const sessionPersistence = useSessionPersistence();
+  const sessionPersistence = useSessionPersistence(pageId);
 
   useTerminalInitialization({
     tabs,
@@ -445,6 +474,17 @@ export function TerminalPage({
     },
   });
 
+  if (!initialized) {
+    return (
+      <div className="h-full flex items-center justify-center bg-[#1a1b26]">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
+          <span className="text-[12px] text-[#565f89]">Loading terminals...</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-full flex flex-col bg-[#1a1b26]">
       <TerminalTabBar
@@ -504,12 +544,19 @@ export function TerminalPage({
               zoneNotes={labelsAndTags.zoneNotes}
               pinnedZones={labelsAndTags.pinnedZones}
               autoApprovePatterns={transitionEffects.autoApprovePatterns}
+              pageId={pageId}
+              zoneAssignments={zoneLayout.assignments}
+              tabs={tabs}
               onLoadProfile={(profile) => {
                 zoneLayout.setLayoutId(profile.layoutId);
                 labelsAndTags.setZoneLabels(profile.labels);
                 labelsAndTags.setZoneNotes(profile.notes);
                 labelsAndTags.setPinnedZones(new Set(profile.pins));
                 transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
+                // Stash sessions for resume after assignments settle (useEffect above)
+                if (profile.sessions && profile.sessions.length > 0) {
+                  pendingProfileSessionsRef.current = profile.sessions;
+                }
               }}
             />
           </div>
@@ -806,6 +853,7 @@ export function TerminalPage({
               }
             }}
             layoutId={zoneLayout.layoutId}
+            pageId={pageId}
           />
         )}
 
