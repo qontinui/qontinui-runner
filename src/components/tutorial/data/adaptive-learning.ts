@@ -375,7 +375,7 @@ The system is self-improving — the more workflows you run, the smarter it gets
       estimatedDuration: 1,
       resources: [
         {
-          label: "Plan 15: Adaptive Learning & Prompt Evolution",
+          title: "Plan 15: Adaptive Learning & Prompt Evolution",
           url: "file:///D:/qontinui-root/qontinui-dev-notes/session-prompts/15-adaptive-learning-prompt-evolution.md",
         },
       ],

@@ -62,7 +62,7 @@ interface ProfileSummary {
 }
 
 interface SecuritySettingsProps {
-  onLog: (level: string, message: string) => void;
+  onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
 }
 
 interface AuditEvent {
