@@ -181,7 +181,7 @@ impl Mutator {
             MutationStrategy::QLearning => {
                 let mut q_router = super::q_router::QRouter::new();
                 // Use PG Q-table
-                let rows = pg_q_rows.or_else(|| {
+                let rows = pg_q_rows.or({
                     // Fallback: try to load synchronously via block_on (best-effort)
                     None
                 }).or(load_q_table_from_pg(pg).await.ok());

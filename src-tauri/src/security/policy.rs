@@ -46,6 +46,7 @@ pub struct SecurityPolicy {
 /// Paths use glob patterns and are evaluated in order:
 /// denied > read_only > read_write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct FilesystemPolicy {
     /// Glob patterns for paths with read-write access.
     #[serde(default)]
@@ -62,16 +63,6 @@ pub struct FilesystemPolicy {
     pub read_only_root: bool,
 }
 
-impl Default for FilesystemPolicy {
-    fn default() -> Self {
-        Self {
-            read_write_paths: vec![],
-            read_only_paths: vec![],
-            denied_paths: vec![],
-            read_only_root: false,
-        }
-    }
-}
 
 // ============================================================================
 // Network Policy (L4)
@@ -105,6 +96,7 @@ pub struct NetworkPolicy {
 /// Network access mode controlling the default posture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum NetworkMode {
     /// All network access is blocked.
     Disabled,
@@ -113,14 +105,10 @@ pub enum NetworkMode {
     /// All domains except explicitly listed ones are allowed (default allow).
     DenyList,
     /// No network restrictions. Current behavior.
+    #[default]
     Unrestricted,
 }
 
-impl Default for NetworkMode {
-    fn default() -> Self {
-        Self::Unrestricted
-    }
-}
 
 impl Default for NetworkPolicy {
     fn default() -> Self {
@@ -227,8 +215,10 @@ pub struct CredentialPolicy {
 /// How credentials are provided to agent processes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CredentialMode {
     /// Credentials are passed directly as env vars/headers (current behavior).
+    #[default]
     Direct,
     /// Credentials are replaced with placeholders; a host-side proxy injects
     /// real values into outbound requests. Agent never sees real keys.
@@ -237,11 +227,6 @@ pub enum CredentialMode {
     Denied,
 }
 
-impl Default for CredentialMode {
-    fn default() -> Self {
-        Self::Direct
-    }
-}
 
 impl Default for CredentialPolicy {
     fn default() -> Self {

@@ -364,7 +364,7 @@ impl<C: ContextEncoder, P: SelectionPolicy> ContextualBandit<C, P> {
 
         for key in keys_to_update {
             if let Some(entry) = self.q_table.get_mut(&key) {
-                entry.visit_count = entry.visit_count / 2;
+                entry.visit_count /= 2;
                 entry.sum_of_squares /= 2.0;
             }
         }

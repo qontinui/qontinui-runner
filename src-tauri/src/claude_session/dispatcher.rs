@@ -386,7 +386,7 @@ fn auto_register_file(
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             rt.spawn(async move {
                 let conflicts = registry
-                    .register(&[file_path_clone.clone()], &task_run_id, &holder_name)
+                    .register(std::slice::from_ref(&file_path_clone), &task_run_id, &holder_name)
                     .await;
 
                 // Emit real-time event if conflicts detected

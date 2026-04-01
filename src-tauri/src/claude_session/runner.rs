@@ -1279,7 +1279,7 @@ fn run_claude_session_inline(
                                                 fix.file_changed.as_deref(),
                                                 &fix.confidence,
                                                 &related_files_json,
-                                            )).map(|id| id)
+                                            ))
                                         } else {
                                             Err("No PG runtime".to_string())
                                         };

@@ -77,24 +77,22 @@ fn search_findings(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSe
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((id, title, description, category, severity)) = row {
-                let title_matches = title.to_lowercase().contains(
-                    &pattern
-                        .trim_matches('%')
-                        .to_lowercase(),
-                );
-                let score = if title_matches { 1.0 } else { 0.7 };
-                let snippet = format!("[{}][{}] {}", category, severity, truncate_str(&description, 120));
-                collected.push(UnifiedSearchResult {
-                    entity_type: "finding".to_string(),
-                    entity_id: id,
-                    title,
-                    snippet,
-                    relevance_score: score,
-                    source_table: "task_run_findings".to_string(),
-                });
-            }
+        for (id, title, description, category, severity) in rows.flatten() {
+            let title_matches = title.to_lowercase().contains(
+                &pattern
+                    .trim_matches('%')
+                    .to_lowercase(),
+            );
+            let score = if title_matches { 1.0 } else { 0.7 };
+            let snippet = format!("[{}][{}] {}", category, severity, truncate_str(&description, 120));
+            collected.push(UnifiedSearchResult {
+                entity_type: "finding".to_string(),
+                entity_id: id,
+                title,
+                snippet,
+                relevance_score: score,
+                source_table: "task_run_findings".to_string(),
+            });
         }
         Ok(collected)
     });
@@ -123,24 +121,22 @@ fn search_fixes(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearc
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((id, fix_type, fix_description, scope, status)) = row {
-                let type_matches = fix_type.to_lowercase().contains(
-                    &pattern
-                        .trim_matches('%')
-                        .to_lowercase(),
-                );
-                let score = if type_matches { 1.0 } else { 0.7 };
-                let snippet = format!("[{}][{}] {}", scope, status, truncate_str(&fix_description, 120));
-                collected.push(UnifiedSearchResult {
-                    entity_type: "fix".to_string(),
-                    entity_id: id,
-                    title: fix_type,
-                    snippet,
-                    relevance_score: score,
-                    source_table: "reflection_fixes".to_string(),
-                });
-            }
+        for (id, fix_type, fix_description, scope, status) in rows.flatten() {
+            let type_matches = fix_type.to_lowercase().contains(
+                &pattern
+                    .trim_matches('%')
+                    .to_lowercase(),
+            );
+            let score = if type_matches { 1.0 } else { 0.7 };
+            let snippet = format!("[{}][{}] {}", scope, status, truncate_str(&fix_description, 120));
+            collected.push(UnifiedSearchResult {
+                entity_type: "fix".to_string(),
+                entity_id: id,
+                title: fix_type,
+                snippet,
+                relevance_score: score,
+                source_table: "reflection_fixes".to_string(),
+            });
         }
         Ok(collected)
     });
@@ -168,24 +164,22 @@ fn search_knowledge(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedS
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((id, category, content, confidence)) = row {
-                let cat_matches = category.to_lowercase().contains(
-                    &pattern
-                        .trim_matches('%')
-                        .to_lowercase(),
-                );
-                let score = if cat_matches { 1.0 } else { 0.7 };
-                let snippet = format!("[{}][conf:{}] {}", category, confidence, truncate_str(&content, 120));
-                collected.push(UnifiedSearchResult {
-                    entity_type: "knowledge".to_string(),
-                    entity_id: id,
-                    title: format!("{} knowledge", category),
-                    snippet,
-                    relevance_score: score,
-                    source_table: "task_knowledge".to_string(),
-                });
-            }
+        for (id, category, content, confidence) in rows.flatten() {
+            let cat_matches = category.to_lowercase().contains(
+                &pattern
+                    .trim_matches('%')
+                    .to_lowercase(),
+            );
+            let score = if cat_matches { 1.0 } else { 0.7 };
+            let snippet = format!("[{}][conf:{}] {}", category, confidence, truncate_str(&content, 120));
+            collected.push(UnifiedSearchResult {
+                entity_type: "knowledge".to_string(),
+                entity_id: id,
+                title: format!("{} knowledge", category),
+                snippet,
+                relevance_score: score,
+                source_table: "task_knowledge".to_string(),
+            });
         }
         Ok(collected)
     });
@@ -214,30 +208,28 @@ fn search_errors(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSear
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((id, source, severity, message, error_type)) = row {
-                let type_matches = error_type
-                    .as_deref()
-                    .map(|t| {
-                        t.to_lowercase().contains(
-                            &pattern
-                                .trim_matches('%')
-                                .to_lowercase(),
-                        )
-                    })
-                    .unwrap_or(false);
-                let score = if type_matches { 1.0 } else { 0.7 };
-                let title = error_type.unwrap_or_else(|| format!("{} error", source));
-                let snippet = format!("[{}][{}] {}", source, severity, truncate_str(&message, 120));
-                collected.push(UnifiedSearchResult {
-                    entity_type: "error".to_string(),
-                    entity_id: id.to_string(),
-                    title,
-                    snippet,
-                    relevance_score: score,
-                    source_table: "error_events".to_string(),
-                });
-            }
+        for (id, source, severity, message, error_type) in rows.flatten() {
+            let type_matches = error_type
+                .as_deref()
+                .map(|t| {
+                    t.to_lowercase().contains(
+                        &pattern
+                            .trim_matches('%')
+                            .to_lowercase(),
+                    )
+                })
+                .unwrap_or(false);
+            let score = if type_matches { 1.0 } else { 0.7 };
+            let title = error_type.unwrap_or_else(|| format!("{} error", source));
+            let snippet = format!("[{}][{}] {}", source, severity, truncate_str(&message, 120));
+            collected.push(UnifiedSearchResult {
+                entity_type: "error".to_string(),
+                entity_id: id.to_string(),
+                title,
+                snippet,
+                relevance_score: score,
+                source_table: "error_events".to_string(),
+            });
         }
         Ok(collected)
     });
@@ -267,24 +259,22 @@ fn search_rules(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearc
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((id, agent, title, content, severity, status)) = row {
-                let title_matches = title.to_lowercase().contains(
-                    &pattern
-                        .trim_matches('%')
-                        .to_lowercase(),
-                );
-                let score = if title_matches { 1.0 } else { 0.7 };
-                let snippet = format!("[{}][{}][{}] {}", agent, severity, status, truncate_str(&content, 120));
-                collected.push(UnifiedSearchResult {
-                    entity_type: "rule".to_string(),
-                    entity_id: id,
-                    title: format!("{} ({})", title, agent),
-                    snippet,
-                    relevance_score: score,
-                    source_table: "generation_rules".to_string(),
-                });
-            }
+        for (id, agent, title, content, severity, status) in rows.flatten() {
+            let title_matches = title.to_lowercase().contains(
+                &pattern
+                    .trim_matches('%')
+                    .to_lowercase(),
+            );
+            let score = if title_matches { 1.0 } else { 0.7 };
+            let snippet = format!("[{}][{}][{}] {}", agent, severity, status, truncate_str(&content, 120));
+            collected.push(UnifiedSearchResult {
+                entity_type: "rule".to_string(),
+                entity_id: id,
+                title: format!("{} ({})", title, agent),
+                snippet,
+                relevance_score: score,
+                source_table: "generation_rules".to_string(),
+            });
         }
         Ok(collected)
     });
@@ -312,24 +302,22 @@ fn search_workflows(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedS
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((id, name, description, category)) = row {
-                let name_matches = name.to_lowercase().contains(
-                    &pattern
-                        .trim_matches('%')
-                        .to_lowercase(),
-                );
-                let score = if name_matches { 1.0 } else { 0.7 };
-                let snippet = format!("[{}] {}", category, truncate_str(&description, 120));
-                collected.push(UnifiedSearchResult {
-                    entity_type: "workflow".to_string(),
-                    entity_id: id,
-                    title: name,
-                    snippet,
-                    relevance_score: score,
-                    source_table: "unified_workflows".to_string(),
-                });
-            }
+        for (id, name, description, category) in rows.flatten() {
+            let name_matches = name.to_lowercase().contains(
+                &pattern
+                    .trim_matches('%')
+                    .to_lowercase(),
+            );
+            let score = if name_matches { 1.0 } else { 0.7 };
+            let snippet = format!("[{}] {}", category, truncate_str(&description, 120));
+            collected.push(UnifiedSearchResult {
+                entity_type: "workflow".to_string(),
+                entity_id: id,
+                title: name,
+                snippet,
+                relevance_score: score,
+                source_table: "unified_workflows".to_string(),
+            });
         }
         Ok(collected)
     });
@@ -360,37 +348,35 @@ fn search_ui_elements(
         })?;
 
         let mut collected = Vec::new();
-        for row in rows {
-            if let Ok((element_id, element_type, label, text_content)) = row {
-                let clean_pattern = pattern
-                    .trim_start_matches('%')
-                    .trim_end_matches('%')
-                    .to_lowercase();
-                let id_matches = element_id.to_lowercase().contains(&clean_pattern);
-                let label_matches = label
+        for (element_id, element_type, label, text_content) in rows.flatten() {
+            let clean_pattern = pattern
+                .trim_start_matches('%')
+                .trim_end_matches('%')
+                .to_lowercase();
+            let id_matches = element_id.to_lowercase().contains(&clean_pattern);
+            let label_matches = label
+                .as_deref()
+                .is_some_and(|l| l.to_lowercase().contains(&clean_pattern));
+            let score = if id_matches { 1.0 } else if label_matches { 0.8 } else { 0.6 };
+
+            let title = label.unwrap_or_else(|| element_id.clone());
+            let snippet = format!(
+                "[{}] {}",
+                element_type.as_deref().unwrap_or("unknown"),
+                text_content
                     .as_deref()
-                    .map_or(false, |l| l.to_lowercase().contains(&clean_pattern));
-                let score = if id_matches { 1.0 } else if label_matches { 0.8 } else { 0.6 };
+                    .map(|t| truncate_str(t, 120))
+                    .unwrap_or_default()
+            );
 
-                let title = label.unwrap_or_else(|| element_id.clone());
-                let snippet = format!(
-                    "[{}] {}",
-                    element_type.as_deref().unwrap_or("unknown"),
-                    text_content
-                        .as_deref()
-                        .map(|t| truncate_str(t, 120))
-                        .unwrap_or_default()
-                );
-
-                collected.push(UnifiedSearchResult {
-                    entity_type: "ui_element".to_string(),
-                    entity_id: element_id,
-                    title,
-                    snippet,
-                    relevance_score: score,
-                    source_table: "ui_bridge_elements".to_string(),
-                });
-            }
+            collected.push(UnifiedSearchResult {
+                entity_type: "ui_element".to_string(),
+                entity_id: element_id,
+                title,
+                snippet,
+                relevance_score: score,
+                source_table: "ui_bridge_elements".to_string(),
+            });
         }
         Ok(collected)
     });

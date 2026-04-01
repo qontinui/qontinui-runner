@@ -257,7 +257,7 @@ pub fn start_zombie_sweep(
     let _ = (session_manager, app_handle);
     info!("Stale task sweep: disabled (SQLite CheckpointDb removed, PG support pending)");
     return;
-    #[allow(unreachable_code)]
+    #[allow(unreachable_code, clippy::diverging_sub_expression)]
     let db: Arc<CheckpointDb> = unreachable!();
     let orphan_tracker = Arc::new(Mutex::new(OrphanTracker::new()));
 

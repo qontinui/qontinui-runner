@@ -725,7 +725,7 @@ impl PgDb {
                 let severity: String = r.get(2);
                 let message: String = r.get(3);
                 let error_type: Option<String> = r.get(4);
-                let score = if error_type.as_deref().map_or(false, |t| t.to_lowercase().contains(&query_lower)) { 1.0 } else { 0.7 };
+                let score = if error_type.as_deref().is_some_and(|t| t.to_lowercase().contains(&query_lower)) { 1.0 } else { 0.7 };
                 results.push(UnifiedSearchResult {
                     entity_type: "error".to_string(),
                     entity_id: id.to_string(),
@@ -803,12 +803,12 @@ impl PgDb {
                 let label: Option<String> = r.get(2);
                 let text_content: Option<String> = r.get(3);
                 let id_matches = element_id.to_lowercase().contains(&query_lower);
-                let label_matches = label.as_deref().map_or(false, |l| l.to_lowercase().contains(&query_lower));
+                let label_matches = label.as_deref().is_some_and(|l| l.to_lowercase().contains(&query_lower));
                 let score = if id_matches { 1.0 } else if label_matches { 0.8 } else { 0.6 };
                 results.push(UnifiedSearchResult {
                     entity_type: "ui_element".to_string(),
                     entity_id: element_id.clone(),
-                    title: label.unwrap_or_else(|| element_id),
+                    title: label.unwrap_or(element_id),
                     snippet: format!("[{}] {}", element_type.as_deref().unwrap_or("unknown"),
                         text_content.as_deref().map(|t| truncate_str(t, 120)).unwrap_or_default()),
                     relevance_score: score,

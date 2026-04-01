@@ -24,8 +24,10 @@ use crate::doctor::DoctorHandle;
 /// How to score exploration candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CandidateScorer {
     /// Fast heuristic scoring (no AI calls)
+    #[default]
     QuickHeuristic,
     /// Tier 1 deterministic evaluation only
     DeterministicEval,
@@ -33,11 +35,6 @@ pub enum CandidateScorer {
     FullEval,
 }
 
-impl Default for CandidateScorer {
-    fn default() -> Self {
-        CandidateScorer::QuickHeuristic
-    }
-}
 
 /// Configuration for the exploration engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]

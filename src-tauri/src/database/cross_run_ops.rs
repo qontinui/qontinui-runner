@@ -263,7 +263,7 @@ pub fn detect_recurring_findings(
     for (signature_hash, run_count, run_ids, _first_seen, _last_seen) in rows {
         // Extract first and last task_run_id from the comma-separated list
         let run_id_list: Vec<&str> = run_ids.split(',').collect();
-        let last_task_run_id = run_id_list.last().map(|s| *s);
+        let last_task_run_id = run_id_list.last().copied();
 
         let pattern_data = serde_json::json!({
             "run_count": run_count,

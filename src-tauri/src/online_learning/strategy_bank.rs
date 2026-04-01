@@ -68,6 +68,7 @@ impl Default for StrategyApplicability {
 
 /// What the strategy configures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct StrategyComponents {
     /// Preferred workflow architecture (Traditional, AgenticVerification, MultiAgentPipeline).
     pub preferred_architecture: Option<String>,
@@ -83,18 +84,6 @@ pub struct StrategyComponents {
     pub parameter_overrides: HashMap<String, serde_json::Value>,
 }
 
-impl Default for StrategyComponents {
-    fn default() -> Self {
-        Self {
-            preferred_architecture: None,
-            preferred_model: None,
-            skill_chain: Vec::new(),
-            step_type_overrides: HashMap::new(),
-            prompt_variant_preferences: HashMap::new(),
-            parameter_overrides: HashMap::new(),
-        }
-    }
-}
 
 /// Performance statistics for a strategy.
 #[derive(Debug, Clone, Serialize, Deserialize)]

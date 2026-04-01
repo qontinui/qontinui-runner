@@ -58,7 +58,7 @@ impl EpsilonGreedy {
 
     /// Compute effective epsilon given total visit count.
     fn effective_epsilon(&self, total_visits: u32) -> f64 {
-        let eps = self.epsilon_base * (-1.0 * total_visits as f64 / self.decay_rate).exp();
+        let eps = self.epsilon_base * (-(total_visits as f64) / self.decay_rate).exp();
         eps.max(self.epsilon_min)
     }
 

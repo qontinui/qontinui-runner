@@ -856,7 +856,7 @@ async fn memory_search_handler(
     let want_graph = params
         .sources
         .as_ref()
-        .map_or(true, |s| s.contains(&MemorySource::GraphNode));
+        .is_none_or(|s| s.contains(&MemorySource::GraphNode));
 
     let graph = if want_graph {
         get_or_build_graph(&state, None).await.ok()

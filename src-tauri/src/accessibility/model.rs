@@ -17,7 +17,7 @@ pub type Ref = String;
 ///
 /// Superset of WAI-ARIA 1.2 roles plus Windows UIA and macOS AX extensions.
 /// Matches the Python `AccessibilityRole` enum values for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnifiedRole {
     // Document structure
@@ -97,6 +97,7 @@ pub enum UnifiedRole {
     Generic,
     StaticText,
     None,
+    #[default]
     Unknown,
 
     // Windows UIA specific
@@ -229,20 +230,16 @@ impl UnifiedRole {
     }
 }
 
-impl Default for UnifiedRole {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 /// Tri-state boolean for accessibility states that may not apply to an element.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriBool {
     True,
     False,
     /// State is not applicable to this element type.
     #[serde(rename = "n/a")]
+    #[default]
     NotApplicable,
 }
 
@@ -265,12 +262,6 @@ impl TriBool {
 
     pub fn is_true(self) -> bool {
         self == Self::True
-    }
-}
-
-impl Default for TriBool {
-    fn default() -> Self {
-        Self::NotApplicable
     }
 }
 

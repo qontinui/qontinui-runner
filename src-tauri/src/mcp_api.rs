@@ -362,7 +362,7 @@ pub fn create_router(
             // Wait for server to start and auth to be available
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&*sync_pg_db).await {
+            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&sync_pg_db).await {
                 Ok(count) => {
                     if count > 0 {
                         info!("Synced {} workflows from web backend", count);

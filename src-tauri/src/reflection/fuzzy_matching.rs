@@ -111,19 +111,17 @@ pub fn find_similar_errors(
             })
             .map_err(|e| format!("Failed to iterate errors: {}", e))?;
 
-        for row_result in rows {
-            if let Ok((id, sig, msg, emb_blob)) = row_result {
-                if let Some(candidate_emb) = blob_to_vector(&emb_blob) {
-                    if candidate_emb.len() == query_emb.len() {
-                        let sim = cosine_similarity(query_emb, &candidate_emb) as f64;
-                        if sim >= min_similarity {
-                            results.push(SimilarError {
-                                error_id: id,
-                                signature_hash: sig,
-                                message: msg,
-                                similarity: sim,
-                            });
-                        }
+        for (id, sig, msg, emb_blob) in rows.flatten() {
+            if let Some(candidate_emb) = blob_to_vector(&emb_blob) {
+                if candidate_emb.len() == query_emb.len() {
+                    let sim = cosine_similarity(query_emb, &candidate_emb) as f64;
+                    if sim >= min_similarity {
+                        results.push(SimilarError {
+                            error_id: id,
+                            signature_hash: sig,
+                            message: msg,
+                            similarity: sim,
+                        });
                     }
                 }
             }
@@ -154,20 +152,18 @@ pub fn find_similar_errors(
             })
             .map_err(|e| format!("Failed to iterate: {}", e))?;
 
-        for row_result in rows {
-            if let Ok((id, sig, msg)) = row_result {
-                if existing_ids.contains(&id) {
-                    continue;
-                }
-                let sim = trigram_similarity(error_description, &msg);
-                if sim >= min_similarity {
-                    results.push(SimilarError {
-                        error_id: id,
-                        signature_hash: sig,
-                        message: msg,
-                        similarity: sim,
-                    });
-                }
+        for (id, sig, msg) in rows.flatten() {
+            if existing_ids.contains(&id) {
+                continue;
+            }
+            let sim = trigram_similarity(error_description, &msg);
+            if sim >= min_similarity {
+                results.push(SimilarError {
+                    error_id: id,
+                    signature_hash: sig,
+                    message: msg,
+                    similarity: sim,
+                });
             }
         }
     }

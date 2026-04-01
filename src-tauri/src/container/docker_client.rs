@@ -249,13 +249,11 @@ impl DockerManager {
                     &container_id,
                     None::<WaitContainerOptions<String>>,
                 );
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(response) => return Ok(response.status_code),
-                        Err(e) => return Err(format!("Wait error: {}", e)),
-                    }
+                match stream.next().await {
+                    Some(Ok(response)) => Ok(response.status_code),
+                    Some(Err(e)) => Err(format!("Wait error: {}", e)),
+                    None => Err("Container wait stream ended without result".to_string()),
                 }
-                Err("Container wait stream ended without result".to_string())
             },
         )
         .await;

@@ -526,19 +526,16 @@ mod tests {
 
 /// Compression mode for iteration history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum IterationCompressionMode {
     /// Character-based truncation/merging (existing behavior, always available).
+    #[default]
     CharBased,
     /// LLM-driven summarization using a Simple-tier model.
     /// Falls back to CharBased if the LLM call fails.
     LlmSummarized,
 }
 
-impl Default for IterationCompressionMode {
-    fn default() -> Self {
-        Self::CharBased
-    }
-}
 
 /// Summarize a list of iteration descriptions using an LLM.
 ///

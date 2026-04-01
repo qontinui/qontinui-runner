@@ -155,7 +155,7 @@ impl CredentialProxy {
     /// Check if a header name is one we should scan for placeholders.
     pub fn should_scan_header(&self, header_name: &str) -> bool {
         let lower = header_name.to_lowercase();
-        self.header_patterns.iter().any(|p| lower == *p)
+        self.header_patterns.contains(&lower)
     }
 
     /// Get the list of all placeholder tokens (for logging/debugging).

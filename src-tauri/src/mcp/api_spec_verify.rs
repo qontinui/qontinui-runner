@@ -477,7 +477,7 @@ pub async fn list_api_specs(
                                 .get("metadata")
                                 .and_then(|m| m.get("apiAssertions"))
                                 .and_then(|a| a.as_array())
-                                .map_or(false, |a| !a.is_empty())
+                                .is_some_and(|a| !a.is_empty())
                             {
                                 let name = path
                                     .file_stem()

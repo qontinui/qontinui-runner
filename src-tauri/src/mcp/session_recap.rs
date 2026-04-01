@@ -725,7 +725,7 @@ fn extract_components(diff_content: &str, repo_name: &str) -> Vec<ComponentInfo>
 
             if let Some(name) = name {
                 // Must start with uppercase (React component convention)
-                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                     components.push(ComponentInfo {
                         name,
                         file: current_file.clone(),

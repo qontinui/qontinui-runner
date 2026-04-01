@@ -651,7 +651,7 @@ impl EscalationPolicy {
         self.rethink_after
             .map(|threshold| {
                 iterations_without_progress >= threshold
-                    && (iterations_without_progress - threshold) % 3 == 0
+                    && (iterations_without_progress - threshold).is_multiple_of(3)
             })
             .unwrap_or(false)
     }

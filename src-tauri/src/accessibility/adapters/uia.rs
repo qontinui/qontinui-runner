@@ -258,7 +258,7 @@ impl UiaState {
 
             // Recurse into children using the control view walker.
             let mut children = Vec::new();
-            if max_depth.map_or(true, |m| current_depth < m) {
+            if max_depth.is_none_or(|m| current_depth < m) {
                 if let Ok(child) = self.walker.GetFirstChildElement(element) {
                     let mut current_child = Some(child);
                     while let Some(ref child_elem) = current_child {
@@ -308,6 +308,12 @@ pub struct UiaAdapter {
     connected: Arc<AtomicBool>,
 }
 
+impl Default for UiaAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UiaAdapter {
     pub fn new() -> Self {
         Self {
@@ -332,6 +338,7 @@ impl UiaAdapter {
                 .ControlViewWalker()
                 .context("Failed to get ControlViewWalker")?;
 
+            #[allow(clippy::arc_with_non_send_sync)] // UiaState has unsafe Send+Sync impls
             let state = UiaState {
                 automation,
                 walker,

@@ -291,7 +291,7 @@ fn score_specificity(step: &Value) -> DimensionScore {
     let expected_output = get_str(step, "expected_output");
 
     let mut evidence: Vec<String> = Vec::new();
-    let explanation: String;
+    
 
     // Prompt steps are inherently imprecise
     if step_type == "prompt" {
@@ -403,7 +403,7 @@ fn score_specificity(step: &Value) -> DimensionScore {
         }
     }
 
-    explanation = "Step has adequate specificity".to_string();
+    let explanation: String = "Step has adequate specificity".to_string();
 
     DimensionScore {
         dimension: EvaluationDimension::Specificity,

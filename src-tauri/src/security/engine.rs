@@ -320,7 +320,7 @@ impl PolicyEngine {
 
 /// Extract the base command name (first word) from a shell command string.
 fn extract_command_base(command: &str) -> &str {
-    command.trim().split_whitespace().next().unwrap_or("")
+    command.split_whitespace().next().unwrap_or("")
 }
 
 /// Cached compiled regexes for destructive command detection.
@@ -390,7 +390,7 @@ fn is_metadata_endpoint(domain: &str) -> bool {
         "metadata.google.internal",
         "metadata.goog",
     ];
-    metadata_addresses.iter().any(|&addr| domain == addr)
+    metadata_addresses.contains(&domain)
 }
 
 /// Check if a domain matches any pattern in a list.

@@ -43,9 +43,7 @@ impl SearchContext {
         // PG is the primary DB — use global singleton
         let pg = crate::database::pg::PgDb::try_global();
         // Need at least one backend
-        if pg.is_none() {
-            return None;
-        }
+        pg.as_ref()?;
         Some(Self {
             db: None,
             pg,

@@ -824,8 +824,6 @@ pub async fn generate_unified_workflow_handler(
         tracing::warn!("Failed to save pipeline artifact to PG: {}", e);
     }
 
-    let result = result;
-
     if result.success {
         info!(
             "Successfully generated workflow: {}",

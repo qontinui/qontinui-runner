@@ -191,7 +191,7 @@ impl OutputProcessor {
             if let Some(ref tx) = error_monitor_tx {
                 if tx.try_send(line).is_err() {
                     dropped_count += 1;
-                    if dropped_count % 100 == 0 {
+                    if dropped_count.is_multiple_of(100) {
                         warn!(
                             "Error monitor channel full: {} stderr lines dropped so far",
                             dropped_count

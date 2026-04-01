@@ -6605,7 +6605,8 @@ pub async fn analytics_recommendations_handler(
     Ok(Json(ApiResponse::success(typed)))
 }
 
-/// Create routes for this module.
+// Create routes for this module.
+
 // ============================================================================
 // Health signals endpoint (combined idle + stuck screen diagnosis)
 // ============================================================================

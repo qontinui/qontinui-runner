@@ -267,12 +267,12 @@ pub fn playbooks_for_context<'a>(
                 triggers.iter().any(|trigger| {
                     match trigger.trigger_type.as_str() {
                         "app_name" => {
-                            app_name.map_or(false, |name| {
+                            app_name.is_some_and(|name| {
                                 name.to_lowercase().contains(&trigger.value.to_lowercase())
                             })
                         }
                         "url_pattern" => {
-                            url.map_or(false, |u| {
+                            url.is_some_and(|u| {
                                 // Simple glob matching: split on * and check segments
                                 // appear in order within the URL.
                                 // e.g., "*.salesforce.com/*" splits to ["", ".salesforce.com/", ""]

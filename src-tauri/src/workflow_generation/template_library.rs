@@ -96,7 +96,7 @@ pub fn save_template(conn: &Connection, template: &StepTemplate) -> Result<(), S
         .map_err(|e| format!("Failed to serialize template_steps: {e}"))?;
     let params_json = serde_json::to_string(&template.parameters)
         .map_err(|e| format!("Failed to serialize parameters: {e}"))?;
-    let domain_str = serde_json::to_value(&template.domain)
+    let domain_str = serde_json::to_value(template.domain)
         .map_err(|e| format!("Failed to serialize domain: {e}"))?;
     let domain_str = domain_str.as_str().unwrap_or("general");
     let source_str = serde_json::to_value(&template.source)
@@ -169,7 +169,7 @@ pub fn load_templates_for_domain(
     conn: &Connection,
     domain: VerificationDomain,
 ) -> Result<Vec<StepTemplate>, String> {
-    let domain_str = serde_json::to_value(&domain)
+    let domain_str = serde_json::to_value(domain)
         .map_err(|e| format!("Failed to serialize domain: {e}"))?;
     let domain_str = domain_str.as_str().unwrap_or("general");
 
@@ -811,7 +811,7 @@ pub fn seed_database(conn: &Connection) -> Result<usize, String> {
             .map_err(|e| format!("Failed to serialize template_steps: {e}"))?;
         let params_json = serde_json::to_string(&template.parameters)
             .map_err(|e| format!("Failed to serialize parameters: {e}"))?;
-        let domain_str = serde_json::to_value(&template.domain)
+        let domain_str = serde_json::to_value(template.domain)
             .map_err(|e| format!("Failed to serialize domain: {e}"))?;
         let domain_str = domain_str.as_str().unwrap_or("general");
         let source_str = serde_json::to_value(&template.source)

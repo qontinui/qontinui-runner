@@ -103,7 +103,7 @@ pub trait DomainGenerator: Send + Sync {
             for ap in anti {
                 prompt.push_str(&format!("- {}\n", ap));
             }
-            prompt.push_str("\n");
+            prompt.push('\n');
         }
 
         // ---- 3. Template injection ----
@@ -122,7 +122,7 @@ pub trait DomainGenerator: Send + Sync {
                     t.id, t.pattern_description, t.confidence * 100.0, cmd_summary
                 ));
             }
-            prompt.push_str("\n");
+            prompt.push('\n');
         }
 
         // ---- 4. Discovery & resolved context ----

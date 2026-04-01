@@ -12,6 +12,7 @@ use tracing::debug;
 /// Which constrained decoding backend to use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConstrainedDecodingBackend {
     /// Claude's server-side output_format
     ClaudeOutputFormat,
@@ -26,14 +27,10 @@ pub enum ConstrainedDecodingBackend {
     /// llama.cpp / llama-server grammar-based constrained decoding
     LlamaCppGrammar { base_url: String },
     /// No constrained decoding — use prompt + parse + fixer
+    #[default]
     None,
 }
 
-impl Default for ConstrainedDecodingBackend {
-    fn default() -> Self {
-        ConstrainedDecodingBackend::None
-    }
-}
 
 /// Detect the best available constrained decoding backend based on provider.
 ///
@@ -385,14 +382,13 @@ pub fn validate_against_schema(workflow_json: &Value) -> Vec<String> {
     let mut errors = Vec::new();
 
     // 1. Check required top-level fields
-    if !workflow_json.get("name").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+    if workflow_json.get("name").and_then(|v| v.as_str()).is_none_or(|s| s.is_empty()) {
         errors.push("Missing or empty required field: 'name'".to_string());
     }
 
-    if !workflow_json
+    if workflow_json
         .get("description")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+        .and_then(|v| v.as_str()).is_none_or(|s| s.is_empty())
     {
         errors.push("Missing or empty required field: 'description'".to_string());
     }
@@ -463,10 +459,9 @@ fn validate_steps_array(steps: &[Value], array_name: &str, errors: &mut Vec<Stri
         };
 
         // 3. Each step must have name and step_type
-        if !obj
+        if obj
             .get("name")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
+            .and_then(|v| v.as_str()).is_none_or(|s| s.is_empty())
         {
             errors.push(format!("{prefix}: missing or empty required field 'name'"));
         }

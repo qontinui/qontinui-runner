@@ -848,7 +848,7 @@ pub fn session_digest(
             })
             .unwrap_or(u64::MAX);
 
-        let is_in_frozen_window = age_secs >= 5 * 60 && age_secs < 4 * 3600;
+        let is_in_frozen_window = (5 * 60..4 * 3600).contains(&age_secs);
 
         is_in_frozen_window
             && ((last_msg_type == "assistant" && last_assistant_had_tool_use)

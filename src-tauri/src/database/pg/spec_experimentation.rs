@@ -1236,7 +1236,7 @@ impl PgDb {
             .ok()
             .flatten()
             .and_then(|r| r.get(0))
-            .or_else(|| {
+            .or({
                 // Fallback: check agentic_steps
                 // Note: this is best-effort; if it fails, we just return None
                 None

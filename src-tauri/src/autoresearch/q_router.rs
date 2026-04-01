@@ -465,7 +465,7 @@ impl QRouter {
         .sum();
 
         let epsilon =
-            DEFAULT_EPSILON_BASE * (-1.0 * total_visits as f64 / EPSILON_DECAY_RATE).exp();
+            DEFAULT_EPSILON_BASE * (-(total_visits as f64) / EPSILON_DECAY_RATE).exp();
         epsilon.max(DEFAULT_EPSILON_MIN)
     }
 

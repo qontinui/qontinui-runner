@@ -223,7 +223,7 @@ impl QueryRoot {
         let mut connections = Vec::new();
         let active_url = manager.active_url.clone();
 
-        for (_key, conn) in &manager.connections {
+        for conn in manager.connections.values() {
             connections.push(SdkConnectionInfo {
                 app_id: conn.app_info.app_id.clone(),
                 app_name: conn.app_info.app_name.clone(),

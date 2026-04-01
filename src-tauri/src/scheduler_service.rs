@@ -829,7 +829,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
 /// Parse a human-friendly lookback window string (e.g., "15 minutes", "1 hour", "30 seconds")
 /// into an absolute cutoff DateTime. Returns None if the string cannot be parsed.
 fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    let parts: Vec<&str> = window.trim().split_whitespace().collect();
+    let parts: Vec<&str> = window.split_whitespace().collect();
     if parts.len() != 2 {
         warn!("Cannot parse lookback_window '{}': expected '<number> <unit>'", window);
         return None;

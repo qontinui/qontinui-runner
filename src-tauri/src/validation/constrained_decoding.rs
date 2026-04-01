@@ -271,7 +271,7 @@ fn emit_schema_rule(ctx: &mut GbnfContext, node: &Value, root: &Value) -> String
             ));
             name
         }
-        "object" | _ => {
+        _ => {
             let props = match node.get("properties").and_then(|v| v.as_object()) {
                 Some(p) => p,
                 None => return "json-object".to_string(),

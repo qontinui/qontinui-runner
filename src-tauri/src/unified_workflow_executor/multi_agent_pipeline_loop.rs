@@ -1535,7 +1535,7 @@ Only output the JSON array, nothing else."#,
         // This evaluates live I/O from each agent against any configured judge
         // assertions (hallucination, relevance, factuality, content safety).
         if !config.is_dev_mode {
-            self.run_llm_judge_evaluations(&config, &result);
+            self.run_llm_judge_evaluations(config, &result);
         }
 
         // Record canary outcomes for any agent types that were A/B split.

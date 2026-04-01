@@ -350,7 +350,6 @@ pub async fn get_exploration_prompt(
 // DOM capture handler functions removed — see crate::mcp::dom_capture
 // Saved API request handler functions removed — see crate::mcp::saved_api_requests
 
-/// Create routes for this module.
 // ============================================================================
 // Cross-Run State Diff
 // ============================================================================

@@ -576,7 +576,7 @@ pub async fn query_memory(
     let sources = &params.sources;
 
     fn source_enabled(sources: &Option<Vec<MemorySource>>, s: MemorySource) -> bool {
-        sources.as_ref().map_or(true, |list| list.contains(&s))
+        sources.as_ref().is_none_or(|list| list.contains(&s))
     }
 
     // Determine which sources to query
@@ -634,7 +634,7 @@ pub async fn query_memory(
     let sqlite_limit = params.limit * 3;
     let sqlite_fut = async move {
         if want_sqlite {
-            retrieve_pg_unified(&pg_for_sqlite, &sqlite_query, sqlite_limit).await
+            retrieve_pg_unified(pg_for_sqlite, &sqlite_query, sqlite_limit).await
         } else {
             Vec::new()
         }
@@ -673,10 +673,10 @@ pub async fn query_memory(
 
     // Apply temporal filters
     if let Some(from) = params.from {
-        fused.retain(|r| r.timestamp.map_or(true, |t| t >= from));
+        fused.retain(|r| r.timestamp.is_none_or(|t| t >= from));
     }
     if let Some(to) = params.to {
-        fused.retain(|r| r.timestamp.map_or(true, |t| t <= to));
+        fused.retain(|r| r.timestamp.is_none_or(|t| t <= to));
     }
 
     // Apply score threshold

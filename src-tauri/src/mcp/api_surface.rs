@@ -614,7 +614,7 @@ fn scan_clorinde_queries(src_tauri: &Path) -> Vec<ClorindeQuery> {
     if let Ok(entries) = std::fs::read_dir(&queries_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(true, |e| e != "sql") {
+            if path.extension().is_none_or(|e| e != "sql") {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
@@ -1109,7 +1109,7 @@ fn walk_files_with_ext(dir: &Path, ext: &str, callback: &mut impl FnMut(&Path, &
 
     for entry in walker.flatten() {
         let path = entry.path();
-        if path.is_file() && path.extension().map_or(false, |e| e == ext) {
+        if path.is_file() && path.extension().is_some_and(|e| e == ext) {
             if let Ok(content) = std::fs::read_to_string(path) {
                 callback(path, &content);
             }

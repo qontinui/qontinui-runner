@@ -89,7 +89,7 @@ pub fn extract_step_lessons(reflection: &StepReflection) -> Vec<StepLesson> {
         && reflection
             .error_type
             .as_deref()
-            .map_or(false, |e| e.contains("timeout"))
+            .is_some_and(|e| e.contains("timeout"))
     {
         let content = format!(
             "Step '{}' timed out after {}ms. Consider reducing scope, \

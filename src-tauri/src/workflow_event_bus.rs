@@ -53,6 +53,7 @@ pub struct WorkflowEvent {
 
 /// Identifies the source of an event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct EventSource {
     /// Task run ID that produced the event (if any).
     pub task_run_id: Option<String>,
@@ -62,15 +63,6 @@ pub struct EventSource {
     pub workflow_name: Option<String>,
 }
 
-impl Default for EventSource {
-    fn default() -> Self {
-        Self {
-            task_run_id: None,
-            workflow_id: None,
-            workflow_name: None,
-        }
-    }
-}
 
 /// A subscription that triggers when a matching event is emitted.
 #[derive(Debug, Clone)]

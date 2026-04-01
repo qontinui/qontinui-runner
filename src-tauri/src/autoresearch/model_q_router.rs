@@ -273,7 +273,7 @@ impl PhaseModelRouter {
             .map(|t| self.get_q(state, phase, t).visit_count)
             .sum();
 
-        let epsilon = EPSILON_BASE * (-1.0 * total_visits as f64 / EPSILON_DECAY).exp();
+        let epsilon = EPSILON_BASE * (-(total_visits as f64) / EPSILON_DECAY).exp();
         epsilon.max(EPSILON_MIN)
     }
 

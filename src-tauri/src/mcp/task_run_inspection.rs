@@ -240,7 +240,7 @@ pub async fn get_state(
                 "iteration": es.iteration,
                 "updated_at": es.updated_at,
                 "checkpoints": checkpoints,
-                "step_progress": step_progress.map(|sp| serde_json::to_value(&sp).ok()).flatten(),
+                "step_progress": step_progress.and_then(|sp| serde_json::to_value(&sp).ok()),
             }
         }),
         None => serde_json::json!({
@@ -251,7 +251,7 @@ pub async fn get_state(
                 "iteration": null,
                 "updated_at": null,
                 "checkpoints": checkpoints,
-                "step_progress": step_progress.map(|sp| serde_json::to_value(&sp).ok()).flatten(),
+                "step_progress": step_progress.and_then(|sp| serde_json::to_value(&sp).ok()),
             }
         }),
     };

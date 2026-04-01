@@ -547,15 +547,9 @@ pub fn detect_regression(
         } else {
             None
         };
-        match pg_result {
-            Some(v) => v,
-            None => None,
-        }
+        pg_result.unwrap_or_default()
     };
-    let prev_result = match prev_result {
-        Some(val) => val,
-        None => return None,
-    };
+    let prev_result = prev_result?;
 
     // Extract previous step results
     let prev_step_results = prev_result.get("step_results").and_then(|v| v.as_array())?;

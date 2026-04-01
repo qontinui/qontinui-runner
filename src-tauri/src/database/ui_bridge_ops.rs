@@ -374,7 +374,7 @@ pub fn get_element_reliability(
     );
 
     match result {
-        Ok((total, _)) if total == 0 => Ok(None),
+        Ok((0, _)) => Ok(None),
         Ok((total, successes)) => {
             let rate = successes as f64 / total as f64;
 
