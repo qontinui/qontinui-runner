@@ -4,7 +4,6 @@
 //! rates, and user feedback to build context that improves future generations.
 //! This is the planned-but-never-created module referenced in the codebase.
 
-use crate::database::Connection;
 use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -41,7 +40,7 @@ pub struct SelfImprovementContext {
 ///
 /// Queries across `task_run_findings`, `learning_outcomes`, `learning_patterns`,
 /// and `workflow_generation_feedback` to build a comprehensive improvement context.
-pub fn analyze_generation_patterns(conn: &Connection) -> Result<SelfImprovementContext, String> {
+pub fn analyze_generation_patterns() -> Result<SelfImprovementContext, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -127,27 +126,27 @@ impl SelfImprovementContext {
 // Query helpers
 // ============================================================================
 
-fn query_common_verifier_issues(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
+fn query_common_verifier_issues() -> Result<Vec<(String, i64)>, String> {
     Err("SQLite removed".to_string())
 }
 
-fn query_fixer_failures(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
+fn query_fixer_failures() -> Result<Vec<(String, i64)>, String> {
     Err("SQLite removed".to_string())
 }
 
-fn query_success_rates(conn: &Connection) -> Result<Vec<(String, i64, i64)>, String> {
+fn query_success_rates() -> Result<Vec<(String, i64, i64)>, String> {
     Err("SQLite removed".to_string())
 }
 
-fn query_commonly_edited_fields(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
+fn query_commonly_edited_fields() -> Result<Vec<(String, i64)>, String> {
     Err("SQLite removed".to_string())
 }
 
-fn query_delete_rate(conn: &Connection) -> Result<(i64, i64), String> {
+fn query_delete_rate() -> Result<(i64, i64), String> {
     Err("SQLite removed".to_string())
 }
 
-fn query_avg_rating(conn: &Connection) -> Result<Option<f64>, String> {
+fn query_avg_rating() -> Result<Option<f64>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -156,8 +155,9 @@ fn query_avg_rating(conn: &Connection) -> Result<Option<f64>, String> {
 // ============================================================================
 
 /// Load per-agent insights from prompt analysis, returning (spec, verification, hardener, builder).
-fn load_agent_insights(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    todo!("SQLite removed")
+fn load_agent_insights() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    // SQLite removed — return empty insights
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
 }
 
 // ============================================================================
@@ -232,7 +232,6 @@ pub fn format_builder_insights(context: &SelfImprovementContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_format_specification_insights_empty() {

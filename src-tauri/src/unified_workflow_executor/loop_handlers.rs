@@ -996,6 +996,7 @@ impl LoopController {
                 agentic_phase_ran: false,
                 agentic_phase_success: None,
                 blame_json: None,
+                contingent_on: Vec::new(),
             };
             ctx.iteration_results.push(iter_result);
 
@@ -1021,6 +1022,7 @@ impl LoopController {
                 agentic_phase_ran: false,
                 agentic_phase_success: None,
                 blame_json: None,
+                contingent_on: Vec::new(),
             };
             ctx.iteration_results.push(iter_result);
 
@@ -1997,6 +1999,7 @@ impl LoopController {
             agentic_phase_ran: !matches!(agentic_outcome, AgenticOutcome::Skipped),
             agentic_phase_success: Some(agentic_outcome.is_success()),
             blame_json: ctx.blame_json.take(),
+            contingent_on: ctx.active_contingencies.clone(),
         };
         ctx.iteration_results.push(iter_result);
 
@@ -2160,6 +2163,10 @@ impl LoopController {
 
     /// If approval enabled: build diff context, request approval, poll for response, handle abort/reject.
     ///
+    /// Default behavior is non-blocking (deferred): questions are displayed and
+    /// recorded but execution continues autonomously. Only when `blocking_approval`
+    /// is explicitly set to `true` does the system pause for a human response.
+    ///
     /// Original lines: 3656-3897
     async fn handle_approval_gate(
         &self,
@@ -2167,15 +2174,172 @@ impl LoopController {
         config: &mut LoopConfig,
         outcome: &AgenticOutcome,
     ) -> LoopState {
-        // APPROVAL GATE (optional human-in-the-loop pause)
+        // APPROVAL GATE (optional human-in-the-loop)
         // If the workflow has approval_gate enabled, or if the AI output
-        // contains the [APPROVAL_GATE] marker, pause for human review.
+        // contains the [APPROVAL_GATE] marker, process approval.
         let needs_approval = config.approval_gate
             || outcome
                 .output()
                 .map(|o| o.contains("[APPROVAL_GATE]"))
                 .unwrap_or(false);
 
+        // =====================================================================
+        // NON-BLOCKING DEFERRED PATH (default)
+        // =====================================================================
+        // When blocking_approval is false (the default), approval gates are
+        // handled non-blockingly. The system records a deferred question,
+        // displays it (in case a user is watching), and continues immediately.
+        if needs_approval && outcome.is_success() && !config.blocking_approval {
+            use crate::unified_workflow_executor::deferred_feedback::{
+                classify_risk, compute_decision_confidence, should_emit_question,
+                AutoDecision, DeferredQuestion, RiskLevel,
+            };
+
+            // Load learned confidence threshold if available
+            let effective_threshold = match self.app_state.pg_db
+                .get_deferred_confidence_threshold(&config.workflow_id)
+                .await
+            {
+                Ok(Some(learned)) => {
+                    debug!("Using learned confidence threshold {:.2} for workflow {}", learned, config.workflow_id);
+                    learned
+                }
+                _ => config.confidence_threshold,
+            };
+
+            // Collect git diff context (same as blocking path)
+            let diff_for_risk = match crate::process_helpers::tokio_no_window("git")
+                .args(["diff", "--stat"])
+                .output()
+                .await
+            {
+                Ok(o) if o.status.success() => {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                }
+                _ => None,
+            };
+
+            let files_modified = outcome
+                .parsed()
+                .map(|p| p.files_modified.iter().map(|f| f.path.clone()).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            let ai_output = outcome.output();
+
+            // Determine convergence health from the last iteration results
+            let convergence_healthy = ctx.iteration_results.last()
+                .map(|r| r.failed_checks < r.passed_checks || r.verification_passed)
+                .unwrap_or(true);
+
+            // Compute confidence and risk
+            let confidence = compute_decision_confidence(
+                &ctx.iteration_results,
+                convergence_healthy,
+            );
+            let risk_level = classify_risk(
+                diff_for_risk.as_deref(),
+                ai_output,
+                &files_modified,
+            );
+
+            if should_emit_question(confidence, risk_level, effective_threshold) {
+                // Build and record the deferred question
+                let summary = outcome
+                    .parsed()
+                    .map(|p| p.summary.clone())
+                    .unwrap_or_else(|| format!("Agentic phase completed (iteration {})", ctx.iteration));
+
+                let context = super::approval::ApprovalContext {
+                    summary: summary.clone(),
+                    files_modified: files_modified.clone(),
+                    git_diff_stat: diff_for_risk.clone(),
+                    git_diff: None, // Skip full diff for deferred (saves DB space)
+                };
+
+                let question_text = format!(
+                    "The AI has completed iteration {}. Review the changes and approve to continue.\n\
+                     Summary: {}",
+                    ctx.iteration, summary
+                );
+
+                let dq = DeferredQuestion::new(
+                    &config.execution_id,
+                    ctx.iteration,
+                    &question_text,
+                    context,
+                    AutoDecision::Proceeded,
+                    confidence,
+                    risk_level,
+                    ctx.commit_before.clone(),
+                );
+
+                // Display the question in terminal output (visible if user is watching)
+                let display_block = dq.display_block();
+                let _ = self.app_state.pg_db.append_task_output_ex(
+                    &config.execution_id,
+                    &display_block,
+                    false,
+                    false,
+                ).await;
+
+                // Store to database
+                let context_json = serde_json::to_string(&dq.context).unwrap_or_else(|_| "{}".to_string());
+                let auto_decision_detail = match &dq.auto_decision {
+                    AutoDecision::Proceeded => None,
+                    AutoDecision::BestGuess { chosen, reasoning } => {
+                        Some(serde_json::json!({ "chosen": chosen, "reasoning": reasoning }).to_string())
+                    }
+                };
+                let _ = self.app_state.pg_db.insert_deferred_question(
+                    &dq.id,
+                    &config.execution_id,
+                    ctx.iteration as i32,
+                    &dq.question,
+                    &context_json,
+                    match &dq.auto_decision {
+                        AutoDecision::Proceeded => "proceeded",
+                        AutoDecision::BestGuess { .. } => "best_guess",
+                    },
+                    auto_decision_detail.as_deref(),
+                    dq.confidence,
+                    dq.risk_level.as_str(),
+                    dq.git_checkpoint.as_deref(),
+                ).await;
+
+                // Emit event for real-time frontend visibility
+                let broadcaster = crate::event_system::EventBroadcaster::new(self.app_handle.clone());
+                broadcaster.deferred_question_created(
+                    &config.execution_id,
+                    &dq.id,
+                    ctx.iteration,
+                    &dq.question,
+                    dq.confidence,
+                    dq.risk_level.as_str(),
+                );
+
+                // Track as contingency for downstream iterations
+                ctx.active_contingencies.push(dq.id.clone());
+
+                info!(
+                    "Deferred question {} recorded (iteration {}, confidence={:.2}, risk={})",
+                    dq.id, ctx.iteration, confidence, risk_level.as_str()
+                );
+            } else {
+                debug!(
+                    "Auto-approved (confidence={:.2}, risk={}) on iteration {}",
+                    confidence, risk_level.as_str(), ctx.iteration
+                );
+            }
+
+            return LoopState::AdvanceIteration;
+        }
+
+        // =====================================================================
+        // BLOCKING PATH (opt-in interactive mode)
+        // =====================================================================
+        // When blocking_approval is true, the legacy behavior is used:
+        // execution pauses and waits for a human response.
         if needs_approval && outcome.is_success() {
             info!(
                 "Approval gate triggered on iteration {} - pausing for human review",
@@ -2529,6 +2693,17 @@ impl LoopController {
                 _ => {
                     debug!("Git diff capture skipped (git not available or not in repo)");
                 }
+            }
+        }
+
+        // Backfill contingent iterations on deferred questions.
+        // Each active contingency (deferred question) needs to know which iterations
+        // ran after the decision was made, for targeted rework on rejection.
+        if !ctx.active_contingencies.is_empty() {
+            for question_id in &ctx.active_contingencies {
+                let _ = self.app_state.pg_db
+                    .append_deferred_question_contingent_iteration(question_id, ctx.iteration as i32)
+                    .await;
             }
         }
 

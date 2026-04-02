@@ -6,7 +6,6 @@
 //! - `run_claude_session_interactive` — bidirectional session via `ClaudeSession`
 //! - `run_claude_session_interactive_with_retry` — interactive with retry
 
-use crate::database::CheckpointDb;
 use std::sync::Arc;
 use tauri::Emitter;
 use tracing::{debug, info, warn};
@@ -57,7 +56,6 @@ pub struct CliSessionRetryOutput {
 /// so that output survives runner restarts.
 #[derive(Clone)]
 pub struct DbFlushContext {
-    pub db: Arc<CheckpointDb>,
     pub task_run_id: String,
     pub iteration: i32,
 }
@@ -538,7 +536,6 @@ fn run_claude_session_inline(
     let session_done_flush = session_done.clone();
     let (flush_stop_tx, flush_stop_rx) = mpsc::channel::<()>();
     let db_flush_handle = if let Some(flush_ctx) = db_flush_ctx {
-        let db = flush_ctx.db.clone();
         let task_run_id = flush_ctx.task_run_id.clone();
         let iteration = flush_ctx.iteration;
         let flush_buf = shared_output_for_flush;
@@ -2226,7 +2223,6 @@ pub fn run_claude_session_interactive_with_retry(
 ) -> Result<CliSessionRetryOutput, String> {
     use std::thread;
     use std::time::Duration;
-use crate::database::CheckpointDb;
 
     // If no retry config or retry disabled, just run once
     let config = match retry_config {

@@ -5,7 +5,6 @@
 
 pub mod types;
 
-use crate::database::CheckpointDb;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -818,7 +817,6 @@ impl McpClientManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_transport_default() {

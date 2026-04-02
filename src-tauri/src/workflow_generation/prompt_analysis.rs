@@ -4,7 +4,6 @@
 //! opportunities. Groups reflection fixes by agent, identifies recurring
 //! patterns, and generates actionable insights for prompt optimization.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -47,7 +46,6 @@ struct FixPattern {
 ///
 /// Fixes that recur 3+ times with "effective" status become insights.
 pub fn analyze_reflection_fixes(
-    conn: &Connection,
     agent: &str,
     min_count: u32,
 ) -> Result<Vec<PromptInsight>, String> {
@@ -58,28 +56,27 @@ pub fn analyze_reflection_fixes(
 ///
 /// Compares specification criteria against verification phase results to find
 /// criteria that don't translate to effective verification steps.
-pub fn analyze_specification_gaps(conn: &Connection) -> Result<Vec<PromptInsight>, String> {
+pub fn analyze_specification_gaps() -> Result<Vec<PromptInsight>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Analyze verification blind spots — issues that verification missed
 /// but were caught by reflection or user feedback.
-pub fn analyze_verification_blind_spots(conn: &Connection) -> Result<Vec<PromptInsight>, String> {
+pub fn analyze_verification_blind_spots() -> Result<Vec<PromptInsight>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Run all analysis functions and return combined insights for all agents.
-pub fn analyze_all(conn: &Connection) -> Result<Vec<PromptInsight>, String> {
+pub fn analyze_all() -> Result<Vec<PromptInsight>, String> {
     Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

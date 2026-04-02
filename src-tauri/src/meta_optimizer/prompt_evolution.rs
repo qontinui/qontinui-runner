@@ -38,7 +38,6 @@ pub struct PromptEvolutionEntry {
 /// Compute SHA256 hash of a prompt string for baseline drift detection.
 pub fn compute_prompt_hash(prompt: &str) -> String {
     use sha2::{Digest, Sha256};
-use crate::database::CheckpointDb;
     let mut hasher = Sha256::new();
     hasher.update(prompt.as_bytes());
     format!("{:x}", hasher.finalize())

@@ -4,7 +4,6 @@
 //! detects recurring issues, auto-disables ineffective rules, and auto-applies
 //! known-good fixes for recurring findings.
 
-use crate::database::Connection;
 use crate::database::{cross_run_ops, graph_ops};
 use tracing::{info, warn};
 
@@ -22,7 +21,6 @@ use tracing::{info, warn};
 /// Also returns extracted skills via the `extracted_skills` out-parameter so
 /// the async caller can emit `skill.created` events on the workflow event bus.
 pub fn post_run_analysis(
-    conn: &Connection,
     workflow_name: &str,
     task_run_id: &str,
 ) -> Result<(u32, u32, u32), String> {
@@ -31,7 +29,6 @@ pub fn post_run_analysis(
 
 /// Same as `post_run_analysis` but also returns extracted skills for event emission.
 pub fn post_run_analysis_with_skills(
-    conn: &Connection,
     workflow_name: &str,
     task_run_id: &str,
 ) -> Result<(u32, u32, u32, Vec<ExtractedSkill>), String> {
@@ -48,7 +45,6 @@ pub fn post_run_analysis_with_skills(
 ///
 /// This closes feedback loop break point #3: "ineffective rules stay active forever"
 pub fn auto_disable_ineffective_rules(
-    conn: &Connection,
     threshold: u32,
 ) -> Result<u32, String> {
     Err("SQLite removed".to_string())
@@ -60,7 +56,6 @@ pub fn auto_disable_ineffective_rules(
 ///
 /// This closes feedback loop break point #7: "selector/config fixes not auto-applied"
 fn auto_apply_recurring_fixes(
-    conn: &Connection,
     workflow_name: &str,
     recurring_patterns: &[cross_run_ops::CrossRunPattern],
 ) -> Result<u32, String> {
@@ -69,7 +64,6 @@ fn auto_apply_recurring_fixes(
 
 /// Get the effectiveness of the reflection fix that created a generation rule.
 fn get_rule_source_fix_effectiveness(
-    conn: &Connection,
     rule_id: &str,
 ) -> Result<Option<String>, String> {
     Err("SQLite removed".to_string())
@@ -85,7 +79,6 @@ fn get_rule_source_fix_effectiveness(
 ///
 /// Returns `Some((generating_agent, phase))` if a provenance match is found.
 pub fn provenance_based_fix_routing(
-    conn: &Connection,
     fix_description: &str,
     file_changed: Option<&str>,
     workflow_id: Option<&str>,
@@ -118,7 +111,6 @@ pub struct ExtractedSkill {
 ///
 /// Returns the number of skills created.
 pub fn extract_procedural_skills(
-    conn: &Connection,
     workflow_name: &str,
     task_run_id: &str,
     min_iterations: i64,
@@ -129,7 +121,6 @@ pub fn extract_procedural_skills(
 /// Same as `extract_procedural_skills` but returns details of each created skill
 /// so the caller can emit `skill.created` events on the workflow event bus.
 pub fn extract_procedural_skills_detailed(
-    conn: &Connection,
     workflow_name: &str,
     task_run_id: &str,
     min_iterations: i64,
@@ -140,11 +131,10 @@ pub fn extract_procedural_skills_detailed(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     /// Create an in-memory SQLite database with all tables needed by cross_run_learning.
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

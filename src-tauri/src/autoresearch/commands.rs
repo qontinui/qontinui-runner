@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
-use crate::database::CheckpointDb;
 
 /// Shared autoresearch engine state, managed by Tauri.
 pub type SharedResearchEngine = Arc<Mutex<ResearchEngine>>;
@@ -18,7 +17,6 @@ pub type SharedResearchEngine = Arc<Mutex<ResearchEngine>>;
 pub async fn start_autoresearch(
     config_json: String,
     engine: State<'_, SharedResearchEngine>,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<String, String> {
     Err("SQLite removed".to_string())
@@ -62,7 +60,6 @@ pub async fn get_autoresearch_results_tsv(
 #[tauri::command]
 pub async fn get_autoresearch_campaign_history(
     filter: Option<String>,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<CampaignSummary>, String> {
     Err("SQLite removed".to_string())
@@ -72,7 +69,6 @@ pub async fn get_autoresearch_campaign_history(
 #[tauri::command]
 pub async fn get_autoresearch_campaign_experiments(
     campaign_id: String,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<(u32, ExperimentResult)>, String> {
     Err("SQLite removed".to_string())
@@ -87,7 +83,6 @@ pub async fn get_autoresearch_campaign_experiments(
 pub async fn rerun_autoresearch_campaign(
     campaign_id: String,
     engine: State<'_, SharedResearchEngine>,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<String, String> {
     Err("SQLite removed".to_string())
@@ -108,7 +103,6 @@ pub struct CampaignComparison {
 pub async fn compare_autoresearch_campaigns(
     campaign_id_a: String,
     campaign_id_b: String,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<CampaignComparison, String> {
     Err("SQLite removed".to_string())
@@ -128,7 +122,6 @@ pub struct WorkflowListItem {
 /// List unified workflows (id + name only) for campaign configuration.
 #[tauri::command]
 pub async fn list_unified_workflows(
-    db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<Vec<WorkflowListItem>, String> {
     Err("SQLite removed".to_string())
 }
@@ -139,7 +132,6 @@ pub async fn list_unified_workflows(
 
 /// Load Q-table rows from PG.
 async fn load_q_rows_pg_first(
-    _db: &CheckpointDb,
     app_state: &crate::commands::AppState,
 ) -> Vec<(String, String, f64, u32)> {
     Vec::new()
@@ -147,7 +139,6 @@ async fn load_q_rows_pg_first(
 
 /// Load overrides from PG.
 async fn load_overrides_pg_first(
-    _db: &CheckpointDb,
     app_state: &crate::commands::AppState,
 ) -> Vec<(String, String)> {
     Vec::new()
@@ -156,7 +147,6 @@ async fn load_overrides_pg_first(
 /// Get the full Q-routing table as JSON. Prefers PG.
 #[tauri::command]
 pub async fn get_q_routing_table(
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<super::q_router::QTableRow>, String> {
     Err("SQLite removed".to_string())
@@ -165,7 +155,6 @@ pub async fn get_q_routing_table(
 /// Get the greedy Q-routing policy (best architecture per state). Prefers PG.
 #[tauri::command]
 pub async fn get_q_routing_policy(
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<super::q_router::PolicyEntry>, String> {
     Err("SQLite removed".to_string())
@@ -174,7 +163,6 @@ pub async fn get_q_routing_policy(
 /// Get Q-routing convergence stats. Prefers PG.
 #[tauri::command]
 pub async fn get_q_routing_stats(
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<super::q_router::QRoutingStats, String> {
     Err("SQLite removed".to_string())
@@ -183,7 +171,6 @@ pub async fn get_q_routing_stats(
 /// Get all Q-routing overrides. Prefers PG.
 #[tauri::command]
 pub async fn get_q_routing_overrides(
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<Vec<super::q_router::OverrideEntry>, String> {
     Err("SQLite removed".to_string())
@@ -195,7 +182,6 @@ pub async fn get_q_routing_overrides(
 pub async fn set_q_routing_override(
     state_key: String,
     forced_action: String,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<(), String> {
     Err("SQLite removed".to_string())
@@ -206,7 +192,6 @@ pub async fn set_q_routing_override(
 #[tauri::command]
 pub async fn remove_q_routing_override(
     state_key: String,
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<bool, String> {
     Err("SQLite removed".to_string())
@@ -218,7 +203,6 @@ pub async fn remove_q_routing_override(
 /// Clears both PG and SQLite. Overrides are preserved.
 #[tauri::command]
 pub async fn reset_q_routing_table(
-    db: State<'_, Arc<CheckpointDb>>,
     app_state: State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<serde_json::Value, String> {
     Err("SQLite removed".to_string())
@@ -244,7 +228,6 @@ pub struct WorktreeListEntry {
 /// List all managed worktrees from the database.
 #[tauri::command]
 pub async fn list_worktree_records(
-    db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<Vec<WorktreeListEntry>, String> {
     Err("SQLite removed".to_string())
 }
@@ -260,7 +243,6 @@ pub struct WorktreeDiffResult {
 #[tauri::command]
 pub async fn get_worktree_diff(
     branch_name: String,
-    db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<WorktreeDiffResult, String> {
     Err("SQLite removed".to_string())
 }
@@ -270,7 +252,6 @@ pub async fn get_worktree_diff(
 pub async fn merge_worktree_branch(
     branch_name: String,
     ai_resolve: bool,
-    db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<serde_json::Value, String> {
     Err("SQLite removed".to_string())
 }
@@ -279,7 +260,6 @@ pub async fn merge_worktree_branch(
 #[tauri::command]
 pub async fn remove_worktree_branch(
     branch_name: String,
-    db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<serde_json::Value, String> {
     Err("SQLite removed".to_string())
 }
@@ -287,14 +267,12 @@ pub async fn remove_worktree_branch(
 /// Compare all active worktree branches.
 #[tauri::command]
 pub async fn compare_worktree_branches(
-    db: State<'_, Arc<CheckpointDb>>,
 ) -> Result<serde_json::Value, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Helper: find a worktree record by branch name.
 fn find_worktree_by_branch(
-    db: &CheckpointDb,
     branch_name: &str,
 ) -> Result<worktree::WorktreeRecord, String> {
     Err("SQLite removed".to_string())

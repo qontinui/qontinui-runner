@@ -139,7 +139,7 @@ fn default_fail_on_error() -> bool {
 // ============================================================================
 
 /// Ensures the shell_commands and shell_command_results tables exist
-fn ensure_shell_commands_tables(conn: &crate::database::Connection) -> Result<(), String> {
+fn ensure_shell_commands_tables() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -743,7 +743,6 @@ pub async fn generate_shell_command_with_ai(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
-use crate::database::Connection;
 
     info!(
         "Generating shell command with AI: {}",

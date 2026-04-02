@@ -58,7 +58,6 @@ impl UrlLockManager {
         url: &str,
         task_run_id: &str,
         holder_name: &str,
-        db: Option<&crate::database::CheckpointDb>,
     ) {
         // SQLite removed - no-op
     }
@@ -214,7 +213,7 @@ impl UrlLockManager {
     ///
     /// Reads the lock state, checks each holder's task run status in the DB,
     /// and removes entries whose task run is no longer "running".
-    pub async fn cleanup_stale_locks(&self, db: &crate::database::CheckpointDb) {
+    pub async fn cleanup_stale_locks(&self) {
         // SQLite removed - no-op
     }
 
@@ -280,7 +279,6 @@ fn normalize_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[tokio::test]
     async fn test_acquire_and_release() {

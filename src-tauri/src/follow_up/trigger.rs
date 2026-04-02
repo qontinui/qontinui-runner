@@ -8,7 +8,6 @@
 //! 2. `is_follow_up` column check on source task run
 //! 3. `is_reflection` column check on source task run
 
-use crate::database::Connection;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -150,7 +149,7 @@ async fn should_launch_follow_up_pg(
 ///
 /// Returns true if any of the known signal patterns are found in the
 /// tail of the source run's output.
-fn check_has_unfixed_signal(conn: &Connection, task_run_id: &str) -> Result<bool, String> {
+fn check_has_unfixed_signal(task_run_id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -277,17 +276,16 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
-    fn insert_completed_run(conn: &Connection, id: &str, workflow_name: &str) {
+    fn insert_completed_run(id: &str, workflow_name: &str) {
         // SQLite removed - no-op
     }
 
-    fn add_output_chunks(conn: &Connection, task_run_id: &str, chunks: &[&str]) {
+    fn add_output_chunks(task_run_id: &str, chunks: &[&str]) {
         // SQLite removed - no-op
     }
 

@@ -9,7 +9,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::{CheckpointDb, Connection};
 use crate::tiered_info::{
     update_statistics_after_run, Anomaly, AnomalySeverity, AnomalyType, RunDetails, RunStatus,
     ScreenshotRecord, TemplateMatchRecord, TransitionRecord,
@@ -468,7 +467,7 @@ impl RunRecorder {
     ///
     /// # Returns
     /// The run ID on success
-    pub fn finish_success(self, conn: &Connection) -> Result<String, String> {
+    pub fn finish_success(self) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -480,7 +479,7 @@ impl RunRecorder {
     ///
     /// # Returns
     /// The run ID on success
-    pub fn finish_failure(self, conn: &Connection, error: &str) -> Result<String, String> {
+    pub fn finish_failure(self, error: &str) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -491,7 +490,7 @@ impl RunRecorder {
     ///
     /// # Returns
     /// The run ID on success
-    pub fn finish_timeout(self, conn: &Connection) -> Result<String, String> {
+    pub fn finish_timeout(self) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -502,42 +501,38 @@ impl RunRecorder {
     ///
     /// # Returns
     /// The run ID on success
-    pub fn finish_cancelled(self, conn: &Connection) -> Result<String, String> {
+    pub fn finish_cancelled(self) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Save the run statistics to the database.
     /// Note: The run_details table has been removed. This method now only updates statistics.
     /// For full run recording, use the `save_to_task_run_automation` path via `finish_*_with_db`.
-    fn save_run(self, conn: &Connection, run: RunDetails) -> Result<String, String> {
+    fn save_run(self, run: RunDetails) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
     // ========================================================================
-    // New methods for unified TaskRun architecture (using CheckpointDb)
+    // Methods for unified TaskRun architecture (stubs, pending PG port)
     // ========================================================================
 
     /// Finish recording with success status and save to database.
-    /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
-    pub fn finish_success_with_db(self, db: &CheckpointDb) -> Result<String, String> {
+    pub fn finish_success_with_db(self) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Finish recording with failure status and save to database.
-    /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
-    pub fn finish_failure_with_db(self, db: &CheckpointDb, error: &str) -> Result<String, String> {
+    pub fn finish_failure_with_db(self, error: &str) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Finish recording with timeout status and save to database.
-    /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
-    pub fn finish_timeout_with_db(self, db: &CheckpointDb) -> Result<String, String> {
+    pub fn finish_timeout_with_db(self) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Finish recording with cancelled status and save to database.
-    /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
-    pub fn finish_cancelled_with_db(self, db: &CheckpointDb) -> Result<String, String> {
+    pub fn finish_cancelled_with_db(self) -> Result<String, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -561,7 +556,6 @@ impl RunRecorder {
     /// Save automation metrics to task_run_automation table.
     fn save_to_task_run_automation(
         self,
-        db: &CheckpointDb,
         task_run_id: String,
         success: bool,
         error_message: Option<String>,

@@ -480,6 +480,13 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_tags: Vec<String>,
 
+    /// Per-workflow security profile override.
+    /// When set, overrides the default security profile from settings for this workflow.
+    /// Values: "permissive", "standard", "strict", or "custom".
+    /// If None, uses the default from Settings > Security.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_profile: Option<String>,
+
     /// Run the workflow in an isolated git worktree.
     /// When true, a new branch and worktree are created before execution.
     /// Changes stay on the worktree branch and can be merged back after review.

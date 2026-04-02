@@ -6,7 +6,6 @@
 //! playbook: deduplicating entries, retiring underperformers, and selecting
 //! relevant lessons for prompt injection into future generation runs.
 
-use crate::database::Connection;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -182,12 +181,12 @@ pub struct CurationResult {
 // ============================================================================
 
 /// Ensure the playbook_entries table exists.
-fn ensure_table(conn: &Connection) -> Result<(), String> {
+fn ensure_table() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Insert a new playbook entry into the database.
-fn insert_entry(conn: &Connection, entry: &PlaybookEntry) -> Result<(), String> {
+fn insert_entry(entry: &PlaybookEntry) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -195,7 +194,6 @@ fn insert_entry(conn: &Connection, entry: &PlaybookEntry) -> Result<(), String> 
 
 /// Query active entries, optionally filtered by domain.
 fn query_active_entries(
-    conn: &Connection,
     domain: Option<&str>,
     limit: usize,
 ) -> Result<Vec<PlaybookEntry>, String> {
@@ -203,13 +201,12 @@ fn query_active_entries(
 }
 
 /// Query all non-retired entries (for dedup during curation).
-fn query_non_retired_entries(conn: &Connection) -> Result<Vec<PlaybookEntry>, String> {
+fn query_non_retired_entries() -> Result<Vec<PlaybookEntry>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Merge a new entry into an existing one: bump `times_applied`, escalate severity if needed.
 fn merge_into_existing(
-    conn: &Connection,
     existing_id: &str,
     new_severity: LessonSeverity,
 ) -> Result<(), String> {
@@ -218,14 +215,13 @@ fn merge_into_existing(
 
 /// Retire entries that have been applied 10+ times but helped less than the threshold ratio.
 fn retire_underperforming_entries(
-    conn: &Connection,
     threshold: f64,
 ) -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Count the total number of active entries.
-fn count_active_entries(conn: &Connection) -> Result<usize, String> {
+fn count_active_entries() -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -245,7 +241,6 @@ pub fn reflect_on_run(
     overall_score: f64,
     iterations: u32,
     step_evaluations: &[StepEvaluationSummary],
-    conn: &Connection,
 ) -> Result<Vec<PlaybookEntry>, String> {
     Err("SQLite removed".to_string())
 }
@@ -357,7 +352,6 @@ impl PlaybookCurator {
     pub fn curate(
         &self,
         new_entries: Vec<PlaybookEntry>,
-        conn: &Connection,
     ) -> Result<CurationResult, String> {
         Err("SQLite removed".to_string())
     }
@@ -366,7 +360,6 @@ impl PlaybookCurator {
     /// the `retirement_threshold` ratio.
     pub fn retire_underperforming(
         &self,
-        conn: &Connection,
     ) -> Result<usize, String> {
         Err("SQLite removed".to_string())
     }
@@ -379,7 +372,6 @@ impl PlaybookCurator {
         &self,
         domain: Option<&str>,
         max_lessons: usize,
-        conn: &Connection,
     ) -> Result<Vec<PlaybookEntry>, String> {
         Err("SQLite removed".to_string())
     }
@@ -427,7 +419,7 @@ fn find_similar_entry<'a>(
 
 /// Force-retire the lowest-value active entries to bring count under the cap.
 /// Retires entries with the lowest `times_helped` first.
-fn force_retire_lowest(conn: &Connection, count: usize) -> Result<usize, String> {
+fn force_retire_lowest(count: usize) -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 

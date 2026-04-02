@@ -3,7 +3,6 @@
 //! Analyzes all successful workflows in the database to extract recurring
 //! patterns and automatically generate rules for the rules engine.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -121,7 +120,7 @@ fn parse_steps(data: &serde_json::Value, phase: &str) -> Vec<serde_json::Value> 
 // ============================================================================
 
 /// Analyze all workflows in the database to extract patterns.
-pub fn mine_patterns(conn: &Connection) -> Result<MiningReport, String> {
+pub fn mine_patterns() -> Result<MiningReport, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -130,7 +129,6 @@ pub fn mine_patterns(conn: &Connection) -> Result<MiningReport, String> {
 /// Only patterns with `occurrence_count >= min_occurrences` are promoted to rules.
 /// Returns the count of newly created rules.
 pub fn patterns_to_rules(
-    conn: &Connection,
     patterns: &[MinedPattern],
     min_occurrences: u32,
 ) -> Result<u32, String> {
@@ -414,7 +412,6 @@ fn mine_anti_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_extract_step_signature_basic() {

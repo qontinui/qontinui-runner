@@ -1,4 +1,3 @@
-use crate::database::CheckpointDb;
 use std::sync::Arc;
 
 use crate::database::embedding_client::EmbeddingClient;
@@ -182,7 +181,8 @@ async fn ingest_single(
     pg: Option<&Arc<PgDb>>,
     embedding_client: &EmbeddingClient,
 ) -> IngestOutcome {
-    todo!("SQLite removed")
+    // SQLite removed — this code path should use PG-based ingestion
+    IngestOutcome::Failed { error: "SQLite removed — use PG-based ingestion".to_string() }
 }
 
 /// Build evidence JSON from a search result
@@ -215,7 +215,6 @@ fn build_evidence(result: &KnowledgeResult) -> String {
 mod tests {
     use super::*;
     use crate::knowledge_acquisition::types::{KnowledgeMetadata, SearchProvider};
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_build_evidence_full() {

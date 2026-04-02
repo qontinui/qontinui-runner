@@ -12,7 +12,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::CheckpointDb;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -457,7 +456,6 @@ impl CompressionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_estimate_tokens() {

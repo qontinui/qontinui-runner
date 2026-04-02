@@ -4,7 +4,6 @@
 //! workflows for use as few-shot examples in the generation prompt.
 //! The example library starts empty and grows organically as workflows succeed.
 
-use crate::database::Connection;
 use serde::Serialize;
 
 /// Reference to a workflow used as an example in the generation prompt.
@@ -23,7 +22,6 @@ pub struct ExampleWorkflowRef {
 ///
 /// Returns up to `limit` examples sorted by relevance.
 pub fn find_relevant_examples(
-    conn: &Connection,
     query_embedding: Option<&[f32]>,
     category: Option<&str>,
     limit: usize,
@@ -45,7 +43,6 @@ type EmbeddingRow = (
 // map_embedding_row removed (SQLite dead code)
 
 fn find_by_embedding(
-    conn: &Connection,
     query_embedding: &[f32],
     category: Option<&str>,
     limit: usize,
@@ -58,7 +55,6 @@ type RecencyRow = (String, String, String, String, String, String, String);
 // map_recency_row removed (SQLite dead code)
 
 fn find_by_recency(
-    conn: &Connection,
     category: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ExampleWorkflowRef>, String> {
@@ -85,17 +81,17 @@ pub fn format_examples_for_prompt(examples: &[ExampleWorkflowRef], max_count: us
 }
 
 /// Promote a workflow to the example library (set example_status = 'active').
-pub fn promote_workflow_to_example(conn: &Connection, workflow_id: &str) -> Result<(), String> {
+pub fn promote_workflow_to_example(workflow_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Exclude a workflow from ever being added to the example library.
-pub fn exclude_workflow_from_examples(conn: &Connection, workflow_id: &str) -> Result<(), String> {
+pub fn exclude_workflow_from_examples(workflow_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Remove a workflow from the example library (back to pending, allows re-add on next success).
-pub fn remove_workflow_from_examples(conn: &Connection, workflow_id: &str) -> Result<(), String> {
+pub fn remove_workflow_from_examples(workflow_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -107,7 +103,7 @@ pub fn remove_workflow_from_examples(conn: &Connection, workflow_id: &str) -> Re
 /// - category is not 'meta' (not a meta-generation workflow)
 ///
 /// This is fire-and-forget — errors are logged but never propagated.
-pub fn try_promote_on_success(conn: &Connection, workflow_id: &str) {
+pub fn try_promote_on_success(workflow_id: &str) {
     // SQLite removed - no-op
 }
 

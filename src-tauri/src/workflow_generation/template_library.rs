@@ -4,7 +4,6 @@
 //! Templates are matched to criteria via keyword similarity and injected
 //! into generation prompts to improve first-pass quality.
 
-use crate::database::Connection;
 use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -69,12 +68,12 @@ pub enum TemplateSource {
 // === Database Operations ===
 
 /// Ensure the step_templates table exists.
-pub fn ensure_table(conn: &Connection) -> Result<(), String> {
+pub fn ensure_table() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Save a template to the database.
-pub fn save_template(conn: &Connection, template: &StepTemplate) -> Result<(), String> {
+pub fn save_template(template: &StepTemplate) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -82,14 +81,13 @@ pub fn save_template(conn: &Connection, template: &StepTemplate) -> Result<(), S
 
 /// Load all templates for a domain.
 pub fn load_templates_for_domain(
-    conn: &Connection,
     domain: VerificationDomain,
 ) -> Result<Vec<StepTemplate>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Load all templates from the database.
-pub fn load_all_templates(conn: &Connection) -> Result<Vec<StepTemplate>, String> {
+pub fn load_all_templates() -> Result<Vec<StepTemplate>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -110,12 +108,12 @@ fn compute_confidence(success: u32, failure: u32) -> f64 {
 }
 
 /// Increment success count and update confidence.
-pub fn record_success(conn: &Connection, template_id: &str) -> Result<(), String> {
+pub fn record_success(template_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Increment failure count and update confidence.
-pub fn record_failure(conn: &Connection, template_id: &str) -> Result<(), String> {
+pub fn record_failure(template_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -632,7 +630,7 @@ pub fn seed_templates() -> Vec<StepTemplate> {
 }
 
 /// Seed the database with initial templates (idempotent -- skips existing).
-pub fn seed_database(conn: &Connection) -> Result<usize, String> {
+pub fn seed_database() -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 

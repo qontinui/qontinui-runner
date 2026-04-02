@@ -6,8 +6,6 @@
 //! - Format test results for AI context
 //! - Create findings for failed critical tests
 
-use crate::database::Connection;
-use crate::database::CheckpointDb;
 use crate::database::{CreateTestResultInput, TestResultStatus, TriggerPoint};
 use crate::test_executor::{
     execute_test, RepoTestConfig, TestCategory, TestDefinition, TestExecutionResult, TestStatus,
@@ -44,7 +42,6 @@ pub struct TriggerTestsResult {
 /// # Returns
 /// Result containing test execution summary and AI-formatted context
 pub fn execute_tests_for_trigger(
-    _db: &CheckpointDb,
     _config_id: &str,
     _trigger: &TriggerPoint,
     _task_run_id: Option<&str>,
@@ -62,7 +59,6 @@ pub fn execute_tests_for_trigger(
 /// * `results` - Test execution results
 /// * `test_definitions` - Map of test IDs to their definitions for is_critical check
 pub fn create_findings_for_failures(
-    db: &CheckpointDb,
     task_run_id: &str,
     session_num: i32,
     tests_result: &TriggerTestsResult,
@@ -74,7 +70,6 @@ pub fn create_findings_for_failures(
 /// Insert a test failure finding into the database via PG.
 /// Uses block_in_place to call the async PG method from sync context.
 fn insert_test_failure_finding(
-    _db: &CheckpointDb,
     task_run_id: &str,
     session_num: i32,
     title: &str,
@@ -165,7 +160,6 @@ fn executor_status_to_db(status: &TestStatus) -> TestResultStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_default_result() {

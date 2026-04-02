@@ -46,7 +46,6 @@ pub async fn list_automation_runs(
 
 /// Helper to get recent runs across all configs from task_run_automation.
 pub fn get_all_recent_runs(
-    conn: &crate::database::Connection,
     limit: u32,
 ) -> Result<Vec<RunDetails>, String> {
     Err("SQLite removed".to_string())

@@ -8,7 +8,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
-use crate::database::Connection;
 
 /// Type of feedback on a generated workflow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +34,6 @@ pub enum FeedbackType {
 ///
 /// Only records if the workflow has a `generated_by_task_run_id` (i.e., was AI-generated).
 pub fn record_workflow_feedback(
-    conn: &Connection,
     workflow_id: &str,
     task_run_id: Option<&str>,
     workflow_category: Option<&str>,
@@ -58,7 +56,6 @@ pub struct FeedbackSummary {
 
 /// Get aggregated feedback summary for a category or all workflows.
 pub fn get_workflow_feedback_summary(
-    conn: &Connection,
     category: Option<&str>,
 ) -> Result<FeedbackSummary, String> {
     Err("SQLite removed".to_string())

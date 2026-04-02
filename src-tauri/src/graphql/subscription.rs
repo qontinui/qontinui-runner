@@ -96,6 +96,9 @@ impl SubscriptionRoot {
                         Some(event)
                     }
                     RunnerEvent::AiOutputChunk(e) if e.task_run_id == task_run_id => Some(event),
+                    RunnerEvent::CostUpdate(e) if e.task_run_id == task_run_id => Some(event),
+                    RunnerEvent::BudgetWarning(e) if e.task_run_id == task_run_id => Some(event),
+                    RunnerEvent::CostAnomaly(e) if e.task_run_id == task_run_id => Some(event),
                     _ => None,
                 }
             }
@@ -295,6 +298,39 @@ impl SubscriptionRoot {
             }
         })
     }
+
+    /// Cost event stream — pushes cost updates, budget warnings, and anomalies.
+    /// Optional filter to receive only events for a specific task run.
+    async fn cost_events(
+        &self,
+        ctx: &Context<'_>,
+        task_run_id: Option<String>,
+    ) -> Result<impl futures_util::Stream<Item = CostEvent>> {
+        let state = ctx.data::<Arc<ApiState>>()?;
+        let rx = state.app_state.event_broadcast.subscribe();
+
+        Ok(BroadcastStream::new(rx).filter_map(move |result| {
+            let task_run_id = task_run_id.clone();
+            async move {
+                let raw = result.ok()?;
+                let event = convert_raw_event_to_cost_event(&raw)?;
+
+                // Optional task_run_id filter
+                if let Some(ref filter_id) = task_run_id {
+                    let event_task_id = match &event {
+                        CostEvent::CostUpdate(e) => &e.task_run_id,
+                        CostEvent::BudgetWarning(e) => &e.task_run_id,
+                        CostEvent::CostAnomaly(e) => &e.task_run_id,
+                    };
+                    if event_task_id != filter_id {
+                        return None;
+                    }
+                }
+
+                Some(event)
+            }
+        }))
+    }
 }
 
 /// Convert a raw broadcast event (serde_json::Value) to a typed RunnerEvent.
@@ -396,6 +432,103 @@ fn convert_raw_event_to_runner_event(raw: &serde_json::Value) -> Option<RunnerEv
                     .unwrap_or(0) as i32,
             }))
         }
+        "CostUpdate" => {
+            let data = payload.get("data")?;
+            Some(RunnerEvent::CostUpdate(GqlCostUpdateEvent {
+                task_run_id: data.get("task_run_id")?.as_str()?.to_string(),
+                phase: data
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
+                input_tokens: data
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                output_tokens: data
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                cache_creation_tokens: data
+                    .get("cache_creation_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                cache_read_tokens: data
+                    .get("cache_read_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                cost_usd: data.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                cumulative_cost_usd: data
+                    .get("cumulative_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                cache_hit_rate: data
+                    .get("cache_hit_rate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                timestamp: data
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+            }))
+        }
+        "BudgetWarning" => {
+            let data = payload.get("data")?;
+            Some(RunnerEvent::BudgetWarning(GqlBudgetWarningEvent {
+                task_run_id: data.get("task_run_id")?.as_str()?.to_string(),
+                remaining_fraction: data
+                    .get("remaining_fraction")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                total_cost_usd: data
+                    .get("total_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                budget_limit_usd: data
+                    .get("budget_limit_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                message: data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp: data
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+            }))
+        }
+        "CostAnomaly" => {
+            let data = payload.get("data")?;
+            Some(RunnerEvent::CostAnomaly(GqlCostAnomalyEvent {
+                task_run_id: data.get("task_run_id")?.as_str()?.to_string(),
+                cost_usd: data.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                mean_cost_usd: data
+                    .get("mean_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                std_dev: data.get("std_dev").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                z_score: data.get("z_score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                message: data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp: data
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+            }))
+        }
         _ => {
             // Wrap unknown event types as GenericRunnerEvent
             Some(RunnerEvent::GenericEvent(GenericRunnerEvent {
@@ -415,6 +548,119 @@ fn runner_event_type_name(event: &RunnerEvent) -> &'static str {
         RunnerEvent::FindingDetected(_) => "FindingDetected",
         RunnerEvent::FindingResolved(_) => "FindingResolved",
         RunnerEvent::AiOutputChunk(_) => "AiOutputChunk",
+        RunnerEvent::CostUpdate(_) => "CostUpdate",
+        RunnerEvent::BudgetWarning(_) => "BudgetWarning",
+        RunnerEvent::CostAnomaly(_) => "CostAnomaly",
         RunnerEvent::GenericEvent(_) => "GenericEvent",
+    }
+}
+
+/// Convert a raw broadcast event to a typed CostEvent (returns None for non-cost events).
+fn convert_raw_event_to_cost_event(raw: &serde_json::Value) -> Option<CostEvent> {
+    let payload = raw.get("payload").unwrap_or(raw);
+    let event_type = payload
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match event_type {
+        "CostUpdate" => {
+            let data = payload.get("data")?;
+            Some(CostEvent::CostUpdate(GqlCostUpdateEvent {
+                task_run_id: data.get("task_run_id")?.as_str()?.to_string(),
+                phase: data
+                    .get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
+                input_tokens: data
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                output_tokens: data
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                cache_creation_tokens: data
+                    .get("cache_creation_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                cache_read_tokens: data
+                    .get("cache_read_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .to_string(),
+                cost_usd: data.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                cumulative_cost_usd: data
+                    .get("cumulative_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                cache_hit_rate: data
+                    .get("cache_hit_rate")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                timestamp: data
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+            }))
+        }
+        "BudgetWarning" => {
+            let data = payload.get("data")?;
+            Some(CostEvent::BudgetWarning(GqlBudgetWarningEvent {
+                task_run_id: data.get("task_run_id")?.as_str()?.to_string(),
+                remaining_fraction: data
+                    .get("remaining_fraction")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                total_cost_usd: data
+                    .get("total_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                budget_limit_usd: data
+                    .get("budget_limit_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                message: data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp: data
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+            }))
+        }
+        "CostAnomaly" => {
+            let data = payload.get("data")?;
+            Some(CostEvent::CostAnomaly(GqlCostAnomalyEvent {
+                task_run_id: data.get("task_run_id")?.as_str()?.to_string(),
+                cost_usd: data.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                mean_cost_usd: data
+                    .get("mean_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                std_dev: data.get("std_dev").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                z_score: data.get("z_score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                message: data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                timestamp: data
+                    .get("timestamp")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+            }))
+        }
+        _ => None,
     }
 }

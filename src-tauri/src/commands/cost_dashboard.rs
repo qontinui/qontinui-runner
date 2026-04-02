@@ -95,6 +95,13 @@ pub async fn get_cost_dashboard(
         cache_hit_rate,
         cache_savings_usd,
         per_phase_breakdown: per_phase,
-        budget_utilization: None, // TODO: integrate with BudgetTracker
+        // Get budget utilization from any active run
+        budget_utilization: {
+            let trackers = state.run_cost_trackers.lock().await;
+            trackers
+                .values()
+                .next()
+                .map(|t| 1.0 - t.budget.remaining_fraction())
+        },
     })
 }

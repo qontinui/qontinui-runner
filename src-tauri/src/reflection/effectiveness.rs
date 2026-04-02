@@ -4,7 +4,6 @@
 //! the issue it targeted. Compares finding signature hashes before and after
 //! the fix was applied across subsequent workflow runs.
 
-use crate::database::Connection;
 use tracing::{debug, info, warn};
 
 use super::causal;
@@ -47,7 +46,6 @@ fn is_structural_fix_type(fix_type: &str) -> bool {
 /// Returns None if no verification data exists for the run (e.g., the run
 /// didn't have a verification phase or the table doesn't exist yet).
 fn get_verification_metrics(
-    conn: &Connection,
     task_run_id: &str,
 ) -> Result<Option<VerificationMetrics>, String> {
     Err("SQLite removed".to_string())
@@ -61,7 +59,6 @@ fn get_verification_metrics(
 /// old check was rewritten so the old signature will never recur, falsely appearing
 /// "effective". Instead, we compare verification pass rates before and after the fix.
 fn evaluate_structural_fix(
-    conn: &Connection,
     fix: &ReflectionFix,
     _workflow_name: &str,
     subsequent_run_ids: &[String],
@@ -76,13 +73,12 @@ fn evaluate_structural_fix(
 /// 2. Find subsequent runs of the same workflow that completed after fix.applied_at
 /// 3. Check if the same signature_hash recurs in those runs
 /// 4. Check for new findings that could indicate a regression
-pub fn evaluate_fix(conn: &Connection, fix: &ReflectionFix) -> Result<EvaluationResult, String> {
+pub fn evaluate_fix(fix: &ReflectionFix) -> Result<EvaluationResult, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Evaluate a fix by checking if its source finding's signature recurs.
 fn evaluate_by_finding_signature(
-    conn: &Connection,
     fix: &ReflectionFix,
     finding_id: &str,
     subsequent_run_ids: &[String],
@@ -92,18 +88,17 @@ fn evaluate_by_finding_signature(
 
 /// When a fix is evaluated as Effective, link it to any matching error events
 /// and record a fix application for accumulation monotonicity tracking.
-fn link_effective_fix_to_error(conn: &Connection, fix: &ReflectionFix, signature_hash: &str) {
+fn link_effective_fix_to_error(fix: &ReflectionFix, signature_hash: &str) {
     // SQLite removed - no-op
 }
 
 /// When a fix causes a regression, create a causal link recording the relationship.
-fn link_regression_fix(conn: &Connection, fix: &ReflectionFix) {
+fn link_regression_fix(fix: &ReflectionFix) {
     // SQLite removed - no-op
 }
 
 /// Check if any new findings appeared in subsequent runs that weren't present before the fix.
 fn check_for_regression(
-    conn: &Connection,
     fix: &ReflectionFix,
     subsequent_run_ids: &[String],
 ) -> Result<bool, String> {
@@ -116,7 +111,6 @@ fn check_for_regression(
 /// runs have fewer findings than the source run. This is a weaker signal than
 /// signature-based tracking but better than permanent "inconclusive".
 fn evaluate_by_workflow_outcome(
-    conn: &Connection,
     fix: &ReflectionFix,
     _workflow_name: &str,
     subsequent_run_ids: &[String],
@@ -130,7 +124,6 @@ fn evaluate_by_workflow_outcome(
 ///
 /// Called during the completion phase of each reflection run.
 pub fn evaluate_pending_fixes(
-    conn: &Connection,
     workflow_name: &str,
 ) -> Result<Vec<EvaluationResult>, String> {
     Err("SQLite removed".to_string())
@@ -140,17 +133,16 @@ pub fn evaluate_pending_fixes(
 ///
 /// When the same fix (by content_hash) independently proves effective in
 /// multiple projects, it's a strong signal that the pattern is universal.
-pub fn check_cross_project_promotion(conn: &Connection) -> Result<Vec<String>, String> {
+pub fn check_cross_project_promotion() -> Result<Vec<String>, String> {
     Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]
@@ -235,7 +227,6 @@ use crate::database::Connection;
 
     /// Helper to insert verification results for a task run.
     fn insert_verification(
-        conn: &Connection,
         id: &str,
         task_run_id: &str,
         iteration: u32,

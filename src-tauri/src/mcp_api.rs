@@ -571,6 +571,7 @@ pub fn create_router(
         .merge(crate::mcp::api_surface::routes())
         .merge(crate::mcp::api_surface_diff::routes())
         .merge(crate::mcp::prm_export::routes())
+        .merge(crate::mcp::restate_api::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(axum::middleware::from_fn(

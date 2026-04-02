@@ -688,6 +688,42 @@ impl StepHandler for UiBridgeHandler {
             step.ui_bridge_timeout_ms
                 .unwrap_or(if action == "compare" { 120000 } else { 30000 });
 
+        let step_name = step.name.as_deref().unwrap_or("UI Bridge");
+
+        // Security: audit UI Bridge action
+        context.audit_logger.log(
+            crate::security::audit::SecurityAuditEvent::new(
+                crate::security::audit::AuditEventType::PolicyEvaluation,
+                format!("UI Bridge {}: {}", action, raw_url),
+                crate::security::audit::AuditDecision::Allowed,
+            )
+            .with_step(step_name)
+            .with_metadata(serde_json::json!({
+                "action": action,
+                "url": raw_url,
+                "profile": context.security_policy.profile_name,
+            })),
+        );
+
+        // Security: check network policy for UI Bridge URLs (when not unrestricted)
+        if context.security_policy.network.mode != crate::security::policy::NetworkMode::Unrestricted {
+            let (domain, protocol) = extract_domain_from_url(raw_url);
+            if !domain.is_empty() {
+                if let Err(denial) = crate::security::PolicyEngine::evaluate_network(
+                    &context.security_policy,
+                    &domain,
+                    &protocol,
+                ) {
+                    warn!("UI Bridge step '{}' URL blocked by network policy: {}", step_name, denial);
+                    context.audit_logger.log_denial(&denial, context.task_run_id.as_deref(), Some(step_name));
+                    return StepHandlerResult::failure(format!(
+                        "Security policy violation: {}",
+                        denial.reason
+                    ));
+                }
+            }
+        }
+
         info!(
             "UI Bridge step: action={}, url={}, base={}",
             action, raw_url, base_url
@@ -695,11 +731,10 @@ impl StepHandler for UiBridgeHandler {
 
         // (#7) Clean up stale locks before acquiring — only in workflow context
         if let Some(ref task_run_id) = context.task_run_id {
-            let stub_db = crate::database::CheckpointDb;
             context
                 .app_state
                 .url_lock_manager
-                .cleanup_stale_locks(&stub_db)
+                .cleanup_stale_locks()
                 .await;
 
             // Acquire per-URL lock if running inside a workflow (has task_run_id).
@@ -713,7 +748,6 @@ impl StepHandler for UiBridgeHandler {
                     base_url,
                     task_run_id,
                     workflow_name,
-                    Some(&stub_db),
                 )
                 .await;
         }
@@ -2147,4 +2181,17 @@ mod tests {
         let recent = tracker.get_recent_errors("http://localhost:9876", 10).await;
         assert!(recent.is_empty());
     }
+}
+
+/// Extract domain and protocol from a URL string.
+fn extract_domain_from_url(url: &str) -> (String, String) {
+    let (protocol, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https".to_string(), rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http".to_string(), rest)
+    } else {
+        ("http".to_string(), url)
+    };
+    let domain = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+    (domain, protocol)
 }

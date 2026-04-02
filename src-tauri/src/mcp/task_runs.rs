@@ -368,11 +368,14 @@ pub async fn generate_task_summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     info!("MCP API: Generating summary for task run: {}", id);
 
-    // Summary generation requires CheckpointDb — stubbed until ported to PgDb
-    let _db = state.app_state.pg_db.clone();
-    let _doctor_handle = state.doctor_handle.clone();
-    let result: Result<summary_generator::SummaryResult, String> =
-        Err("generate_task_summary not yet ported to PgDb".to_string());
+    let doctor_handle = state.doctor_handle.clone();
+    let result = summary_generator::generate_task_summary_async(
+        id.clone(),
+        doctor_handle,
+        None,
+        None,
+    )
+    .await;
 
     match result {
         Ok(summary_result) => Ok(Json(serde_json::json!({
@@ -602,6 +605,8 @@ pub async fn resume_task_run(
         max_sessions: Some(workflow.max_iterations),
         auto_run_generated: false,
         approval_gate: workflow.approval_gate,
+        blocking_approval: false,
+        confidence_threshold: 0.85,
         max_context_tokens: 100_000,
         enforce_token_budget: workflow.enforce_token_budget,
         cross_workflow_learning: true,
@@ -2459,10 +2464,168 @@ pub async fn get_approval_gates(
 }
 
 // ============================================================================
+// Deferred Question API Handlers
+// ============================================================================
+
+/// List deferred questions for a task run.
+pub async fn list_deferred_questions(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(task_run_id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let questions = if let Some(status) = params.get("status") {
+        state.app_state.pg_db.get_deferred_questions_by_status(&task_run_id, status).await
+    } else {
+        state.app_state.pg_db.get_deferred_questions_for_task_run(&task_run_id).await
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+
+    Ok(Json(serde_json::json!(questions)))
+}
+
+/// Get a single deferred question by ID.
+pub async fn get_deferred_question(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((_task_run_id, question_id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let question = state.app_state.pg_db.get_deferred_question_by_id(&question_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+
+    match question {
+        Some(q) => Ok(Json(q)),
+        None => Err((StatusCode::NOT_FOUND, format!("Deferred question '{}' not found", question_id))),
+    }
+}
+
+/// Review a deferred question (approve or reject).
+#[derive(serde::Deserialize)]
+pub struct ReviewDeferredQuestionRequest {
+    pub status: String,    // "approved" or "rejected"
+    pub comment: Option<String>,
+}
+
+pub async fn review_deferred_question(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((task_run_id, question_id)): axum::extract::Path<(String, String)>,
+    Json(body): Json<ReviewDeferredQuestionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Validate status
+    if body.status != "approved" && body.status != "rejected" {
+        return Err((StatusCode::BAD_REQUEST, "Status must be 'approved' or 'rejected'".to_string()));
+    }
+
+    state.app_state.pg_db.review_deferred_question(
+        &question_id,
+        &body.status,
+        body.comment.as_deref(),
+    ).await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+
+    // Emit event for frontend
+    {
+        let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+        broadcaster.deferred_question_reviewed(
+            &task_run_id,
+            &question_id,
+            &body.status,
+            body.status == "rejected",
+        );
+    }
+
+    // If rejected, trigger rework
+    let mut rework_id = None;
+    if body.status == "rejected" {
+        if let Ok(Some(dq)) = state
+            .app_state
+            .pg_db
+            .get_deferred_question_by_id(&question_id)
+            .await
+        {
+            match crate::rework::trigger::trigger_rework(
+                state.app_state.clone(),
+                state.app_handle.clone(),
+                &task_run_id,
+                &dq,
+                body.comment.as_deref(),
+            )
+            .await
+            {
+                Ok(id) => {
+                    tracing::info!(
+                        "Rework run {} triggered for rejected question {}",
+                        id,
+                        question_id
+                    );
+                    rework_id = Some(id);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to trigger rework for question {}: {}",
+                        question_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": question_id,
+        "status": body.status,
+        "reviewed": true,
+        "rework_task_run_id": rework_id,
+    })))
+}
+
+/// Bulk review deferred questions.
+#[derive(serde::Deserialize)]
+pub struct BulkReviewRequest {
+    pub question_ids: Vec<String>,
+    pub status: String,
+    pub comment: Option<String>,
+}
+
+pub async fn bulk_review_deferred_questions(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(task_run_id): axum::extract::Path<String>,
+    Json(body): Json<BulkReviewRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.status != "approved" && body.status != "rejected" {
+        return Err((StatusCode::BAD_REQUEST, "Status must be 'approved' or 'rejected'".to_string()));
+    }
+
+    let mut reviewed = 0;
+    for qid in &body.question_ids {
+        if let Ok(()) = state.app_state.pg_db.review_deferred_question(
+            qid,
+            &body.status,
+            body.comment.as_deref(),
+        ).await {
+            reviewed += 1;
+
+            {
+                let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+                broadcaster.deferred_question_reviewed(
+                    &task_run_id,
+                    qid,
+                    &body.status,
+                    body.status == "rejected",
+                );
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "reviewed": reviewed,
+        "total": body.question_ids.len(),
+        "status": body.status,
+    })))
+}
+
+// ============================================================================
 // End Task Run HTTP API Handlers
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
-use crate::database::CheckpointDb;
     axum::Router::new()
         .route("/task-runs", get(list_task_runs).post(create_task_run))
         .route("/task-runs/running", get(list_running_task_runs))
@@ -2535,6 +2698,10 @@ use crate::database::CheckpointDb;
             post(respond_to_approval),
         )
         .route("/task-runs/{id}/approval-gates", get(get_approval_gates))
+        .route("/task-runs/{id}/deferred-questions", get(list_deferred_questions))
+        .route("/task-runs/{id}/deferred-questions/{qid}", get(get_deferred_question))
+        .route("/task-runs/{id}/deferred-questions/{qid}/review", post(review_deferred_question))
+        .route("/task-runs/{id}/deferred-questions/bulk-review", post(bulk_review_deferred_questions))
         .route("/current-execution/steps", get(get_current_execution_steps))
         .route("/current-execution/batch", get(get_current_execution_batch))
         .route("/task-runs/{id}/usage", get(get_task_run_usage))

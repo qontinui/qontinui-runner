@@ -5,7 +5,6 @@
 //! This closes feedback loop break point #6 (universal fix underutilization)
 //! and break point #7 (by enabling fuzzy fix prediction).
 
-use crate::database::Connection;
 use serde::Serialize;
 use std::collections::HashSet;
 use tracing::info;
@@ -80,7 +79,6 @@ pub fn trigram_similarity(a: &str, b: &str) -> f64 {
 /// Find errors similar to the given one.
 /// Uses embedding cosine similarity when available, falls back to trigram similarity.
 pub fn find_similar_errors(
-    conn: &Connection,
     error_description: &str,
     error_embedding: Option<&[f32]>,
     min_similarity: f64,
@@ -96,7 +94,6 @@ pub fn find_similar_errors(
 /// Find fixes that resolved similar errors.
 /// This extends the exact-match predict_fix_for_error with fuzzy matching.
 pub fn predict_fix_fuzzy(
-    conn: &Connection,
     error_description: &str,
     error_embedding: Option<&[f32]>,
 ) -> Result<Option<FuzzyPredictedFix>, String> {
@@ -109,7 +106,7 @@ pub fn predict_fix_fuzzy(
 
 /// Broaden an effective fix's applicability_context by analyzing similar errors.
 /// When a fix has been effective 2+ times, look for other error patterns it could help with.
-pub fn generalize_fix(conn: &Connection, fix_id: &str) -> Result<Option<String>, String> {
+pub fn generalize_fix(fix_id: &str) -> Result<Option<String>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -120,7 +117,6 @@ pub fn generalize_fix(conn: &Connection, fix_id: &str) -> Result<Option<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_trigram_identical() {

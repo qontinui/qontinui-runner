@@ -5,7 +5,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::Connection;
 use crate::tiered_info::{get_flaky_templates, get_flaky_transitions, FlakyItem};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -82,7 +81,7 @@ impl FlakinessCache {
     ///
     /// # Returns
     /// A new `FlakinessCache` with the loaded data.
-    pub fn load(conn: &Connection, config_id: &str, threshold: f64) -> Result<Self, String> {
+    pub fn load(config_id: &str, threshold: f64) -> Result<Self, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -262,7 +261,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_severity_from_success_rate() {

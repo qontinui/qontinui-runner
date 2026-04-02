@@ -3,7 +3,6 @@
 //! Provides types and functions for building, storing, and querying causal chains
 //! that connect events like findings, fixes, errors, and verifications.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info};
@@ -59,7 +58,6 @@ pub struct CausalSummary {
 /// Deduplicates by (cause_type, cause_id, effect_type, effect_id) using a UNIQUE
 /// index and `INSERT OR IGNORE`. If a duplicate exists, the existing ID is returned.
 pub fn insert_causal_event(
-    conn: &Connection,
     cause_type: &str,
     cause_id: &str,
     effect_type: &str,
@@ -88,7 +86,6 @@ pub fn insert_causal_event(
 ///
 /// Returns the count of new links created.
 pub fn build_automated_causal_links(
-    conn: &Connection,
     task_run_id: &str,
     workflow_name: &str,
 ) -> Result<u32, String> {
@@ -103,7 +100,6 @@ pub fn build_automated_causal_links(
 ///
 /// BFS traversal with cycle detection and max depth.
 pub fn trace_causal_chain_forward(
-    conn: &Connection,
     event_type: &str,
     event_id: &str,
     max_depth: u32,
@@ -115,7 +111,6 @@ pub fn trace_causal_chain_forward(
 ///
 /// BFS traversal following cause links backward.
 pub fn trace_causal_chain_backward(
-    conn: &Connection,
     event_type: &str,
     event_id: &str,
     max_depth: u32,
@@ -129,7 +124,6 @@ pub fn trace_causal_chain_backward(
 
 /// Get all causal events for a workflow, ordered by created_at desc.
 pub fn get_causal_events_for_workflow(
-    conn: &Connection,
     workflow_name: &str,
     limit: u32,
 ) -> Result<Vec<CausalEvent>, String> {
@@ -137,17 +131,16 @@ pub fn get_causal_events_for_workflow(
 }
 
 /// Get aggregate causal statistics for a workflow.
-pub fn get_causal_summary(conn: &Connection, workflow_name: &str) -> Result<CausalSummary, String> {
+pub fn get_causal_summary(workflow_name: &str) -> Result<CausalSummary, String> {
     Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

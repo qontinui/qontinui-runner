@@ -16,7 +16,7 @@ mod tests {
         };
 
         fn setup_db() -> CheckpointDb {
-            todo!("SQLite removed")
+            panic!("SQLite tests disabled — use PG-based tests instead")
         }
 
         /// Insert a minimal recommendation row so canary foreign keys work.
@@ -211,7 +211,7 @@ mod tests {
         };
 
         fn setup_db() -> CheckpointDb {
-            todo!("SQLite removed")
+            panic!("SQLite tests disabled — use PG-based tests instead")
         }
 
         fn make_spec(id: &str, name: &str, agent: Option<&str>) -> EvalSpec {
@@ -1055,7 +1055,7 @@ prompt_content: content here
         };
 
         fn setup_db() -> CheckpointDb {
-            todo!("SQLite removed")
+            panic!("SQLite tests disabled — use PG-based tests instead")
         }
 
         fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
@@ -1129,7 +1129,7 @@ prompt_content: content here
         };
 
         fn setup_db() -> CheckpointDb {
-            todo!("SQLite removed")
+            panic!("SQLite tests disabled — use PG-based tests instead")
         }
 
         fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
@@ -1147,13 +1147,12 @@ prompt_content: content here
     // =========================================================================
     mod golden_dataset {
         use crate::meta_optimizer::golden_dataset::{
-use crate::database::CheckpointDb;
             delete_golden_dataset, list_golden_datasets, save_golden_dataset, GoldenDataset,
             GoldenEntry, GoldenEntryMetrics,
         };
 
         fn setup_db() -> CheckpointDb {
-            todo!("SQLite removed")
+            panic!("SQLite tests disabled — use PG-based tests instead")
         }
 
         #[test]

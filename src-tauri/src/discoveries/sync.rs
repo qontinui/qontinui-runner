@@ -3,7 +3,6 @@
 //! Handles the HTTP communication with the backend API for submitting
 //! discoveries. Supports offline operation via the queue in storage.rs.
 
-use crate::database::Connection;
 use crate::auth::AuthManager;
 use tracing::{debug, error, info, warn};
 
@@ -159,7 +158,7 @@ pub struct SingleSyncResult {
 /// Returns the discoveries that should be synced. Call this first,
 /// then call `sync_discoveries_batch` with the data, then call
 /// `apply_sync_results` to update the database.
-pub fn extract_discoveries_for_sync(conn: &Connection) -> Result<Vec<DiscoveryToSync>, String> {
+pub fn extract_discoveries_for_sync() -> Result<Vec<DiscoveryToSync>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -192,7 +191,6 @@ pub async fn sync_discoveries_batch(discoveries: Vec<DiscoveryToSync>) -> Vec<Si
 ///
 /// Updates the database based on what succeeded and failed.
 pub fn apply_sync_results(
-    conn: &Connection,
     results: Vec<SingleSyncResult>,
 ) -> Result<SyncResult, String> {
     Err("SQLite removed".to_string())
@@ -208,7 +206,7 @@ pub fn apply_sync_results(
 /// NOTE: This function cannot be used in Tauri commands due to Send requirements.
 /// Use the phased approach instead (extract -> batch -> apply).
 #[allow(dead_code)]
-pub async fn sync_pending_discoveries(conn: &Connection) -> Result<SyncResult, String> {
+pub async fn sync_pending_discoveries() -> Result<SyncResult, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -224,14 +222,13 @@ pub struct SyncStatus {
 }
 
 /// Get current sync status.
-pub fn get_sync_status(conn: &Connection) -> Result<SyncStatus, String> {
+pub fn get_sync_status() -> Result<SyncStatus, String> {
     Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_sync_result() {

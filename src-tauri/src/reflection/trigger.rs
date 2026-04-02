@@ -12,7 +12,6 @@ use tracing::{debug, info};
 
 use crate::config_storage::ConfigStorage;
 use crate::AppState;
-use crate::database::Connection;
 
 /// Number of consecutive successful runs (zero findings) before suppressing reflection.
 const CONVERGENCE_THRESHOLD: u32 = 5;

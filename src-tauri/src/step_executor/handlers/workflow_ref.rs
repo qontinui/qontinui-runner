@@ -217,6 +217,8 @@ impl StepHandler for WorkflowRefHandler {
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated: false,
             approval_gate: false,
+            blocking_approval: false,
+            confidence_threshold: 0.85,
             max_context_tokens: 100_000,
             enforce_token_budget: false,
             cross_workflow_learning: false, // Nested workflows don't need cross-workflow learning

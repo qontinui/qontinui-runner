@@ -19,7 +19,6 @@
 //! - Similar existing workflows as structural references
 //! - Past successful fixes for the fixer agent
 
-use crate::database::Connection;
 use serde_json::json;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -49,7 +48,6 @@ pub struct HistoricalContext {
 ///
 /// Returns None if there's no useful data or if queries fail.
 pub fn build_historical_context(
-    conn: &Connection,
     description: &str,
     query_embedding: Option<&[f32]>,
     category: Option<&str>,
@@ -310,6 +308,7 @@ pub fn build_meta_workflow_template(
         workflow_architecture: None,
         flow_control_json: None,
         phase_timeouts_json: None,
+        security_profile: None,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -1010,14 +1009,13 @@ Output ONLY the complete, valid UnifiedWorkflow JSON. No markdown, no code fence
 }
 
 /// Build the "past fixes" section from resolved findings on meta task runs.
-fn build_past_fixes_section(conn: &Connection) -> String {
+fn build_past_fixes_section() -> String {
     String::new()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_extract_name_strips_markdown_heading() {

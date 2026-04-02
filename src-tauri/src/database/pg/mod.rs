@@ -8,6 +8,7 @@ pub mod agentic_metrics;
 pub mod cached_specs;
 pub mod graph_ops;
 pub mod approval_gates;
+pub mod deferred_questions;
 pub mod error_monitor;
 pub mod canary;
 pub mod checks;
@@ -59,6 +60,7 @@ pub mod adaptive_learning;
 pub mod entailment_cache;
 pub mod triggers;
 pub mod online_learning;
+pub mod restate;
 pub mod security_audit;
 
 use std::sync::{Arc, OnceLock};
@@ -1169,6 +1171,29 @@ impl PgDb {
                 auto_fix_session_id TEXT
             )",
             "CREATE INDEX IF NOT EXISTS idx_scheduler_history_task ON scheduler_history(task_id)",
+            // Restate durable execution tables
+            "CREATE TABLE IF NOT EXISTS restate_workflow_executions (
+                execution_id          TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+                restate_workflow_id   TEXT NOT NULL,
+                restate_invocation_id TEXT,
+                status                TEXT NOT NULL DEFAULT 'pending',
+                launched_via_restate  BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_rwe_status ON restate_workflow_executions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_rwe_restate_wf ON restate_workflow_executions(restate_workflow_id)",
+            "CREATE TABLE IF NOT EXISTS restate_awakeables (
+                awakeable_id   TEXT PRIMARY KEY,
+                execution_id   TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+                awakeable_type TEXT NOT NULL,
+                type_data      TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at    TIMESTAMPTZ
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_ra_execution ON restate_awakeables(execution_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ra_status ON restate_awakeables(status)",
         ];
 
         for sql in &ddl {

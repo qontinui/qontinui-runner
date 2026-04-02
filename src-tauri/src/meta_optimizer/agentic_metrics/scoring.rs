@@ -8,7 +8,6 @@
 //! time. They're bootstrapped from the first 20+ successful runs per workflow
 //! and recalculated periodically.
 
-use crate::database::Connection;
 use tracing::{debug, info};
 
 use super::step_efficiency::StepBaseline;
@@ -23,7 +22,6 @@ const MIN_SAMPLES_FOR_BASELINE: i64 = 20;
 /// P25 is conservative — it sets the baseline at the efficient end, so runs
 /// taking more than this are penalized by step_efficiency scoring.
 pub fn compute_step_baseline(
-    conn: &Connection,
     workflow_id: Option<&str>,
 ) -> Result<Option<StepBaseline>, String> {
     Err("SQLite removed".to_string())
@@ -33,7 +31,6 @@ pub fn compute_step_baseline(
 ///
 /// Takes the union of all tools_used across successful runs.
 pub fn compute_tool_baseline(
-    conn: &Connection,
     workflow_id: Option<&str>,
 ) -> Result<Option<ToolBaseline>, String> {
     Err("SQLite removed".to_string())
@@ -41,7 +38,6 @@ pub fn compute_tool_baseline(
 
 /// Load a previously persisted step baseline from the DB.
 pub fn load_step_baseline(
-    conn: &Connection,
     workflow_id: Option<&str>,
 ) -> Result<Option<StepBaseline>, String> {
     Err("SQLite removed".to_string())
@@ -49,7 +45,6 @@ pub fn load_step_baseline(
 
 /// Load a previously persisted tool baseline from the DB.
 pub fn load_tool_baseline(
-    conn: &Connection,
     workflow_id: Option<&str>,
 ) -> Result<Option<ToolBaseline>, String> {
     Err("SQLite removed".to_string())
@@ -58,7 +53,7 @@ pub fn load_tool_baseline(
 /// Recompute all baselines (global + per-workflow) and persist them.
 ///
 /// Call this periodically (e.g., after every N runs or on a timer).
-pub fn recompute_all_baselines(conn: &Connection) -> Result<u32, String> {
+pub fn recompute_all_baselines() -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -66,7 +61,6 @@ pub fn recompute_all_baselines(conn: &Connection) -> Result<u32, String> {
 
 /// Query iteration and step count data from successful runs.
 fn query_step_data(
-    conn: &Connection,
     workflow_id: Option<&str>,
 ) -> Result<(Vec<f64>, Vec<f64>, i64), String> {
     Err("SQLite removed".to_string())
@@ -74,7 +68,6 @@ fn query_step_data(
 
 /// Query tools_used from successful runs.
 fn query_tool_data(
-    conn: &Connection,
     workflow_id: Option<&str>,
 ) -> Result<(Vec<String>, i64), String> {
     Err("SQLite removed".to_string())
@@ -87,7 +80,6 @@ const GLOBAL_BASELINE_SENTINEL: &str = "__global__";
 
 /// Persist a baseline value to the agentic_metric_baselines table.
 fn persist_baseline(
-    conn: &Connection,
     workflow_id: Option<&str>,
     metric_type: &str,
     baseline_value: &str,
@@ -98,7 +90,6 @@ fn persist_baseline(
 
 /// Load a baseline value from the DB.
 fn load_baseline_value(
-    conn: &Connection,
     workflow_id: Option<&str>,
     metric_type: &str,
 ) -> Result<Option<String>, String> {
@@ -120,7 +111,6 @@ fn percentile_25(data: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_percentile_25_empty() {

@@ -890,6 +890,9 @@ pub struct Settings {
     /// Memory consolidation settings (importance decay, grouping, LLM model)
     #[serde(default)]
     pub memory_consolidation: MemoryConsolidationSettings,
+    /// Restate durable execution settings (journal replay, exactly-once, saga compensation)
+    #[serde(default)]
+    pub restate: crate::restate::config::RestateSettings,
 }
 
 // ============================================================================

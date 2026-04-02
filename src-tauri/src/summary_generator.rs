@@ -9,12 +9,11 @@
 
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
+use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 use crate::findings::types::{Finding, FindingStatus};
 use crate::str_utils::truncate_str;
-use std::sync::Arc;
 use tracing::{debug, error, info, warn};
-use crate::database::CheckpointDb;
 
 /// Maximum output length to include in summary prompt (characters)
 /// Too much output can exceed context limits
@@ -203,20 +202,139 @@ pub(crate) fn format_findings_for_summary(findings: &[Finding]) -> String {
 /// For unified workflow runs, the AI conversation output is stored in task_run_events
 /// (event_type='ai_output') rather than in the output_log field. This function
 /// reconstructs the output from those events for summary generation.
-fn assemble_output_from_events(db: &CheckpointDb, task_run_id: &str) -> String {
-    String::new()
+async fn assemble_output_from_events(pg: &PgDb, task_run_id: &str) -> String {
+    let events = pg
+        .get_task_run_events(task_run_id, Some("ai_output"), None)
+        .await
+        .unwrap_or_default();
+
+    if events.is_empty() {
+        return String::new();
+    }
+
+    let mut parts = Vec::new();
+    for event in &events {
+        let phase = event.event_subtype.as_deref().unwrap_or("unknown");
+        let iteration_label = &event.message;
+
+        // Extract the "output" field from the event's JSON data
+        if let Some(ref data_str) = event.data {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
+                if let Some(output) = data.get("output").and_then(|v| v.as_str()) {
+                    let iteration = data.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+                    parts.push(format!(
+                        "[SESSION_START:{} - {} phase]\n{}",
+                        iteration, phase, output
+                    ));
+                } else {
+                    // Fallback: use the message as context
+                    parts.push(format!("[SESSION: {}]", iteration_label));
+                }
+            }
+        }
+    }
+
+    parts.join("\n\n")
 }
 
 /// Build a workflow metadata section for the summary prompt.
 ///
 /// Includes verification phase results and transition history so the summary AI
 /// has structured context beyond just the raw output log.
-fn build_workflow_metadata(
-    db: &CheckpointDb,
+async fn build_workflow_metadata(
+    pg: &PgDb,
     task_run_id: &str,
     task: &crate::database::TaskRun,
 ) -> String {
-    String::new()
+    let mut parts = Vec::new();
+
+    // Add verification phase results (structured data from database)
+    let verification_results = pg
+        .get_all_verification_phase_results(task_run_id)
+        .await
+        .unwrap_or_default();
+
+    if !verification_results.is_empty() {
+        let last_iteration_idx = verification_results.len() - 1;
+        parts.push("\n## Verification Results\n".to_string());
+        for (idx, result) in verification_results.iter().enumerate() {
+            let iteration = result
+                .get("iteration")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let all_passed = result
+                .get("all_passed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let passed = result
+                .get("passed_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let failed = result
+                .get("failed_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let total = result
+                .get("total_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let status = if all_passed { "PASSED" } else { "FAILED" };
+            parts.push(format!(
+                "- Iteration {}: {} ({} passed, {} failed out of {} steps)",
+                iteration, status, passed, failed, total
+            ));
+
+            let is_last = idx == last_iteration_idx;
+
+            if let Some(step_results) = result.get("step_results").and_then(|v| v.as_array()) {
+                for sr in step_results {
+                    let success = sr.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let name = sr
+                        .get("step_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+
+                    if !success {
+                        let err = sr.get("error").and_then(|v| v.as_str()).unwrap_or("");
+                        let truncated = if err.len() > 150 {
+                            truncate_str(err, 150)
+                        } else {
+                            err
+                        };
+                        parts.push(format!("  - FAILED: {} - {}", name, truncated));
+                    } else if is_last {
+                        parts.push(format!("  - PASSED: {}", name));
+                    }
+                }
+            }
+        }
+        parts.push(String::new());
+    }
+
+    // Add transition history (phases that ran and in what order)
+    if let Some(ref history_json) = task.transition_history_json {
+        if let Ok(transitions) = serde_json::from_str::<Vec<serde_json::Value>>(history_json) {
+            if !transitions.is_empty() {
+                parts.push("## Workflow Phases Executed\n".to_string());
+                for t in &transitions {
+                    let phase = t.get("stage").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let iteration = t.get("iteration").and_then(|v| v.as_u64());
+                    let iter_str = iteration
+                        .map(|i| format!(" (iteration {})", i))
+                        .unwrap_or_default();
+                    parts.push(format!("- {}{}", phase, iter_str));
+                }
+                parts.push(String::new());
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n")
+    }
 }
 
 /// Generate a summary for a completed task run
@@ -235,14 +353,144 @@ fn build_workflow_metadata(
 ///
 /// # Returns
 /// Ok(SummaryResult) on success, Err on failure
-pub fn generate_task_summary(
-    db: &CheckpointDb,
+pub async fn generate_task_summary(
     task_run_id: &str,
     doctor_handle: Option<&DoctorHandle>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
 ) -> Result<SummaryResult, String> {
-    Err("SQLite removed".to_string())
+    info!("Generating summary for task run: {}", task_run_id);
+
+    let pg = PgDb::try_global()
+        .ok_or_else(|| "PgDb not initialized".to_string())?;
+
+    // Get the task run from the database
+    let task = pg
+        .get_task_run(task_run_id)
+        .await?
+        .ok_or_else(|| format!("Task run not found: {}", task_run_id))?;
+
+    // Determine if this is a failed/stopped task (affects prompt template choice)
+    let is_failure = task.status == "failed" || task.status == "stopped";
+
+    // Fetch findings for this task run
+    let findings = pg.get_findings_for_task(task_run_id).await.unwrap_or_else(|e| {
+        warn!("Failed to fetch findings for summary: {}", e);
+        Vec::new()
+    });
+    let findings_section = format_findings_for_summary(&findings);
+
+    // Build structured workflow metadata (verification results, transition history)
+    let workflow_metadata = build_workflow_metadata(&pg, task_run_id, &task).await;
+
+    // Prepare the output for summarization.
+    // For unified workflow runs, output_log is often empty because AI output is stored
+    // in task_run_events instead. Fall back to assembling from events.
+    let raw_output = if task.output_log.trim().is_empty() {
+        info!("output_log is empty, assembling from task_run_events");
+        assemble_output_from_events(&pg, task_run_id).await
+    } else {
+        task.output_log.clone()
+    };
+
+    let cleaned_output = strip_output_markers(&raw_output);
+    let truncated_output = if cleaned_output.len() > MAX_OUTPUT_FOR_SUMMARY {
+        // Take the last N characters (most recent output is usually most relevant)
+        let start = cleaned_output.len() - MAX_OUTPUT_FOR_SUMMARY;
+        format!("...[truncated]...\n{}", &cleaned_output[start..])
+    } else {
+        cleaned_output
+    };
+
+    // Get the task prompt (may be empty for some task types)
+    let task_prompt = task.prompt.as_deref().unwrap_or("(No prompt recorded)");
+
+    // Build the summary prompt using appropriate template
+    let prompt = if is_failure {
+        let error_message = task
+            .error_message
+            .as_deref()
+            .unwrap_or("(No error message recorded)");
+        FAILURE_SUMMARY_PROMPT_TEMPLATE
+            .replace("{task_name}", &task.task_name)
+            .replace("{task_status}", &task.status)
+            .replace("{error_message}", error_message)
+            .replace("{task_prompt}", task_prompt)
+            .replace("{workflow_metadata}", &workflow_metadata)
+            .replace("{findings_section}", &findings_section)
+            .replace("{output_chars}", &truncated_output.len().to_string())
+            .replace("{task_output}", &truncated_output)
+    } else {
+        SUMMARY_PROMPT_TEMPLATE
+            .replace("{task_name}", &task.task_name)
+            .replace("{task_prompt}", task_prompt)
+            .replace("{workflow_metadata}", &workflow_metadata)
+            .replace("{findings_section}", &findings_section)
+            .replace("{output_chars}", &truncated_output.len().to_string())
+            .replace("{task_output}", &truncated_output)
+    };
+
+    debug!(
+        "Summary prompt length: {} chars, output length: {} chars, findings: {}",
+        prompt.len(),
+        truncated_output.len(),
+        findings.len()
+    );
+
+    // Build task context for routing (summary generation is typically simple)
+    let task_context = TaskContext::from_prompt(&prompt);
+
+    // Use the AI provider module to run the prompt with model override support
+    // run_prompt_with_model_override is sync, so run in spawn_blocking
+    let prompt_clone = prompt.clone();
+    let doctor_clone = doctor_handle.cloned();
+    let model_clone = model_override.map(|s| s.to_string());
+    let provider_clone = provider_override.map(|s| s.to_string());
+
+    let response = tokio::task::spawn_blocking(move || {
+        ai_provider::run_prompt_with_model_override(
+            &prompt_clone,
+            &task_context,
+            doctor_clone.as_ref(),
+            model_clone.as_deref(),
+            provider_clone.as_deref(),
+            None,
+            None,
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|e| format!("Task spawn error: {}", e))?;
+
+    if !response.success {
+        let err = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        error!("AI provider failed for summary generation: {}", err);
+        return Err(err);
+    }
+
+    // Parse the JSON response
+    let result = parse_summary_response(&response.output)?;
+
+    // Update the database
+    let now = chrono::Utc::now().to_rfc3339();
+    pg.update_task_summary(
+        task_run_id,
+        Some(&result.summary),
+        Some(result.goal_achieved),
+        result.remaining_work.as_deref(),
+        &now,
+    )
+    .await?;
+
+    info!(
+        "Generated summary for task {}: goal_achieved={}",
+        task_run_id, result.goal_achieved
+    );
+
+    Ok(result)
 }
 
 /// Parse the JSON response from the AI
@@ -286,5 +534,56 @@ fn parse_summary_response(response: &str) -> Result<SummaryResult, String> {
 
 /// Extract JSON from a response that might contain markdown or other text
 fn extract_json_from_response(response: &str) -> Result<String, String> {
-    Err("SQLite removed".to_string())
+    // Try to find JSON in code blocks first
+    if let Some(start) = response.find("```json") {
+        let json_start = start + 7;
+        if let Some(end) = response[json_start..].find("```") {
+            return Ok(response[json_start..json_start + end].trim().to_string());
+        }
+    }
+
+    // Try to find JSON in generic code blocks
+    if let Some(start) = response.find("```") {
+        let block_start = start + 3;
+        // Skip any language identifier on the same line
+        let content_start = response[block_start..]
+            .find('\n')
+            .map(|i| block_start + i + 1)
+            .unwrap_or(block_start);
+        if let Some(end) = response[content_start..].find("```") {
+            let json_candidate = response[content_start..content_start + end].trim();
+            if json_candidate.starts_with('{') {
+                return Ok(json_candidate.to_string());
+            }
+        }
+    }
+
+    // Try to find raw JSON object
+    if let Some(start) = response.find('{') {
+        if let Some(end) = response.rfind('}') {
+            if end > start {
+                return Ok(response[start..=end].to_string());
+            }
+        }
+    }
+
+    Err("Could not find JSON in response".to_string())
+}
+
+/// Async entry point for generate_task_summary, using PgDb::global().
+///
+/// Called from loop_controller.rs and unified_workflows.rs.
+pub async fn generate_task_summary_async(
+    task_run_id: String,
+    doctor_handle: Option<DoctorHandle>,
+    model_override: Option<String>,
+    provider_override: Option<String>,
+) -> Result<SummaryResult, String> {
+    generate_task_summary(
+        &task_run_id,
+        doctor_handle.as_ref(),
+        model_override.as_deref(),
+        provider_override.as_deref(),
+    )
+    .await
 }

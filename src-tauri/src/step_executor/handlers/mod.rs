@@ -14,7 +14,7 @@
 //!             └── handler.execute(step, context)
 //! ```
 //!
-//! ## Available Handlers (8 active)
+//! ## Available Handlers (9 active)
 //!
 //! | Category | Handlers |
 //! |----------|----------|
@@ -24,6 +24,7 @@
 //! | **Artifact** | save_workflow_artifact |
 //! | **Fixup** | workflow_fixup (deterministic autofix, harden, validate_criteria) |
 //! | **Process** | restart_process |
+//! | **Playbook** | execute_playbook (drives state machine through recorded transitions) |
 //! | **Composition** | workflow (runs a saved workflow inline), workflow_ref |
 //!
 //! ## Adding a New Step Type
@@ -79,6 +80,7 @@ pub(crate) mod shell_command;
 pub(super) mod test;
 // Active handlers
 mod command;
+mod execute_playbook;
 mod native_accessibility;
 pub mod restart_process;
 mod save_workflow_artifact;
@@ -90,6 +92,7 @@ mod workflow_ref;
 
 // Re-export handlers for registration
 use command::CommandHandler;
+use execute_playbook::ExecutePlaybookHandler;
 use native_accessibility::NativeAccessibilityHandler;
 use restart_process::RestartProcessHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
@@ -467,11 +470,12 @@ impl HandlerRegistry {
     /// Create a registry pre-populated with all standard handlers.
     ///
     /// This is the recommended way to create a registry for production use.
-    /// 8 active handlers: command (incl. test dispatch), ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref
+    /// 9 active handlers: command, execute_playbook, ui_bridge, prompt, restart_process, save_workflow_artifact, workflow_fixup, workflow, workflow_ref
     pub fn with_standard_handlers() -> Self {
         let mut registry = Self::new();
 
         registry.register(CommandHandler);
+        registry.register(ExecutePlaybookHandler);
         registry.register(NativeAccessibilityHandler);
         registry.register(PromptStepHandler);
         registry.register(RestartProcessHandler);
@@ -541,6 +545,23 @@ impl StepHandler for PromptStepHandler {
         if prompt_content.is_empty() {
             return StepHandlerResult::success();
         }
+
+        let step_name = step.name.as_deref().unwrap_or("Prompt");
+
+        // Security: audit AI session start
+        context.audit_logger.log(
+            crate::security::audit::SecurityAuditEvent::new(
+                crate::security::audit::AuditEventType::PolicyEvaluation,
+                format!("AI verification session: {}", step_name),
+                crate::security::audit::AuditDecision::Allowed,
+            )
+            .with_step(step_name)
+            .with_metadata(serde_json::json!({
+                "phase": "verification",
+                "prompt_length": prompt_content.len(),
+                "profile": context.security_policy.profile_name,
+            })),
+        );
 
         tracing::info!(
             "Evaluating verification prompt: {}",

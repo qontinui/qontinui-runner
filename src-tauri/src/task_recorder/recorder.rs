@@ -4,7 +4,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::CheckpointDb;
 use crate::database::CreateTaskRunInput;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -266,7 +265,6 @@ impl TaskRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_task_type_as_str() {

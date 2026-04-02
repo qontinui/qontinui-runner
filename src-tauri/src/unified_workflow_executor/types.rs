@@ -114,6 +114,10 @@ pub struct IterationResult {
     /// Contains BlameReport with per-step attributions, oscillating files, and revert patterns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blame_json: Option<String>,
+    /// IDs of deferred questions whose auto-decisions this iteration depends on.
+    /// Populated from `LoopContext.active_contingencies` at the end of each iteration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contingent_on: Vec<String>,
 }
 
 /// Final result of the entire verification-agentic loop.
@@ -303,6 +307,23 @@ pub struct LoopConfig {
     /// When true, the loop controller registers an approval request and waits
     /// for a human response before continuing to the next verification iteration.
     pub approval_gate: bool,
+    /// Whether approval gates should block execution (opt-in interactive mode).
+    ///
+    /// Default: `false` — approval gates are non-blocking. Questions are displayed
+    /// immediately and recorded as deferred questions, but execution continues
+    /// autonomously. Users can review decisions post-run.
+    ///
+    /// When `true`, the legacy blocking behavior is used: execution pauses and
+    /// waits for a human response via the approval registry.
+    pub blocking_approval: bool,
+    /// Confidence threshold for deferred approval gates (0.0-1.0).
+    ///
+    /// When confidence exceeds this threshold and the risk level is not
+    /// Irreversible, the system silently auto-approves without emitting
+    /// a deferred question. Below threshold, a question is recorded.
+    ///
+    /// Default: 0.85
+    pub confidence_threshold: f64,
     /// Maximum token budget for iteration context building.
     /// Context sections are added in priority order until this budget is reached.
     /// Default: 100_000 (~400K chars). Set lower to reduce prompt size.
@@ -421,6 +442,8 @@ impl LoopConfig {
             max_sessions: Some(workflow.max_iterations),
             auto_run_generated,
             approval_gate: workflow.approval_gate,
+            blocking_approval: false,
+            confidence_threshold: 0.85,
             max_context_tokens: 100_000,
             enforce_token_budget: workflow.enforce_token_budget,
             cross_workflow_learning: true,

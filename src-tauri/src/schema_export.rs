@@ -338,6 +338,20 @@ pub enum AppEvent {
         approved: bool,
         action: String,
     },
+    DeferredQuestionCreated {
+        task_run_id: String,
+        question_id: String,
+        iteration: u32,
+        question: String,
+        confidence: f64,
+        risk_level: String,
+    },
+    DeferredQuestionReviewed {
+        task_run_id: String,
+        question_id: String,
+        status: String,
+        rework_triggered: bool,
+    },
     CanvasUpdate {
         action: String,
         panel_id: String,
@@ -425,8 +439,14 @@ mod tests {
         let obj = schemas.as_object().unwrap();
 
         // Verify all expected types are present
-        assert!(obj.contains_key("WorkerOutput"), "Missing WorkerOutput schema");
-        assert!(obj.contains_key("AgenticPhaseOutput"), "Missing AgenticPhaseOutput schema");
+        assert!(
+            obj.contains_key("WorkerOutput"),
+            "Missing WorkerOutput schema"
+        );
+        assert!(
+            obj.contains_key("AgenticPhaseOutput"),
+            "Missing AgenticPhaseOutput schema"
+        );
         assert!(obj.contains_key("AppEvent"), "Missing AppEvent schema");
         assert!(obj.contains_key("FlowEvent"), "Missing FlowEvent schema");
         assert_eq!(obj.len(), 12, "Expected 12 schema entries");

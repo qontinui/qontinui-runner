@@ -3,7 +3,6 @@
 //! Scans `qontinui-claude-config/.claude/commands/*.md` for command files,
 //! parses each into a workflow, and syncs with the database (create/update/delete).
 
-use crate::database::{CheckpointDb, Connection};
 use crate::unified_workflows::{CreateUnifiedWorkflowRequest, UpdateUnifiedWorkflowRequest};
 use regex::Regex;
 use serde::Serialize;
@@ -238,14 +237,13 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
 ///
 /// Scans the commands directory, compares with existing DB entries,
 /// and creates/updates/deletes as needed.
-pub fn sync_slash_commands(db: &CheckpointDb) -> Result<SyncResult, String> {
+pub fn sync_slash_commands() -> Result<SyncResult, String> {
     Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_extract_description() {

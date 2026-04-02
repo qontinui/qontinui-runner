@@ -4,7 +4,6 @@
 //! knowledge into a queryable graph of components and their relationships.
 //! Provides health scoring, impact analysis, and component detail queries.
 
-use crate::database::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{info, warn};
@@ -132,7 +131,6 @@ pub fn infer_component_type(path: &str) -> &str {
 /// Deletes existing data and re-extracts from reflection_fixes, causal_events,
 /// and task_knowledge tables.
 pub fn rebuild_architecture_model(
-    conn: &Connection,
     workflow_name: &str,
 ) -> Result<RebuildResult, String> {
     Err("SQLite removed".to_string())
@@ -155,7 +153,6 @@ struct ComponentData {
 
 /// Get the full component graph for a workflow.
 pub fn get_component_graph(
-    conn: &Connection,
     workflow_name: &str,
 ) -> Result<ComponentGraph, String> {
     Err("SQLite removed".to_string())
@@ -163,7 +160,6 @@ pub fn get_component_graph(
 
 /// Get detailed info for a single component.
 pub fn get_component_details(
-    conn: &Connection,
     workflow_name: &str,
     component_path: &str,
 ) -> Result<ComponentDetails, String> {
@@ -172,7 +168,6 @@ pub fn get_component_details(
 
 /// BFS impact analysis from a component (max 3 hops).
 pub fn get_impact_analysis(
-    conn: &Connection,
     workflow_name: &str,
     component_path: &str,
 ) -> Result<ImpactAnalysis, String> {
@@ -186,7 +181,6 @@ pub fn get_impact_analysis(
 /// Extended impact analysis that supplements the BFS-on-component_relationships approach
 /// with additional relationship data from step_finding_links and step_provenance tables.
 pub fn rebuild_architecture_with_graph(
-    conn: &Connection,
     workflow_name: &str,
 ) -> Result<RebuildResult, String> {
     Err("SQLite removed".to_string())
@@ -194,7 +188,6 @@ pub fn rebuild_architecture_with_graph(
 
 /// Graph-enhanced impact analysis.
 pub fn get_impact_analysis_with_graph(
-    conn: &Connection,
     workflow_name: &str,
     component_path: &str,
 ) -> Result<ImpactAnalysis, String> {
@@ -208,14 +201,13 @@ pub fn get_impact_analysis_with_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     /// Insert a test task_run and return its ID.
-    fn insert_test_run(conn: &Connection, id: &str, workflow_name: &str) {
+    fn insert_test_run(id: &str, workflow_name: &str) {
         // SQLite removed - no-op
     }
 

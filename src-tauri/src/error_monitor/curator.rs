@@ -6,7 +6,6 @@
 //! - Formatted context for the debug agent
 //! - Priority scoring for errors
 
-use crate::database::Connection;
 use std::collections::HashMap;
 
 
@@ -140,7 +139,6 @@ impl DebugContextCurator {
     /// Build debug context from the database.
     pub fn build_context(
         &self,
-        conn: &Connection,
         task_run_id: Option<&str>,
     ) -> Result<DebugContext, String> {
         Err("SQLite removed".to_string())
@@ -148,10 +146,10 @@ impl DebugContextCurator {
 
     /// Build a map of source name -> description from the log_sources table.
     fn build_source_descriptions(
-        conn: &Connection,
         errors: &[StoredErrorEvent],
     ) -> HashMap<String, String> {
-        todo!("SQLite removed")
+        // SQLite removed — returns empty map
+        HashMap::new()
     }
 
     /// Enrich curated errors with past resolution hints from the findings database.
@@ -159,7 +157,7 @@ impl DebugContextCurator {
     /// For each critical/error-level error, queries task_run_findings for resolved
     /// entries with similar messages and appends the resolution approach to
     /// investigation_hints. Falls back gracefully if no matches are found.
-    fn enrich_with_past_resolutions(conn: &Connection, errors: &mut [CuratedError]) {
+    fn enrich_with_past_resolutions(errors: &mut [CuratedError]) {
         // SQLite removed - no-op
     }
 
@@ -418,7 +416,6 @@ impl DebugContextCurator {
     /// This requires database access to read the message_embedding column.
     pub fn detect_embedding_patterns(
         &self,
-        conn: &Connection,
         error_ids: &[i64],
     ) -> Vec<ErrorPattern> {
         Vec::new()
@@ -676,7 +673,6 @@ impl Default for DebugContextCurator {
 mod tests {
     use super::*;
     use crate::error_monitor::types::ErrorLocation;
-use crate::database::Connection;
 
     fn make_test_error(
         id: i64,
@@ -777,7 +773,7 @@ use crate::database::Connection;
 
     /// Create a minimal in-memory database with the error_events table for embedding tests.
     fn create_embedding_test_db() -> crate::database::Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     /// Create a 384-dim f32 embedding as a little-endian byte blob, normalized to unit length.
@@ -796,7 +792,6 @@ use crate::database::Connection;
 
     /// Insert an error event with an embedding into the test DB and return its id.
     fn insert_error_with_embedding(
-        conn: &crate::database::Connection,
         message: &str,
         embedding: &[u8],
     ) -> i64 {

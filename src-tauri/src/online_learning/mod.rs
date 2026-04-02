@@ -21,6 +21,7 @@ pub mod bandit;
 pub mod context;
 pub mod coordinator;
 pub mod credit_assignment;
+pub mod deferred_learning;
 pub mod model_router;
 pub mod policies;
 pub mod reflection;
@@ -128,8 +129,9 @@ pub async fn run_post_completion(
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     // Skip meta-optimizer/fixer/reflection runs
-    if let Ok(Some(task_run)) = pg.get_task_run(task_run_id).await {
-        if task_run.is_meta_optimizer || task_run.is_fixer || task_run.is_reflection {
+    let task_run_record = pg.get_task_run(task_run_id).await.ok().flatten();
+    if let Some(ref tr) = task_run_record {
+        if tr.is_meta_optimizer || tr.is_fixer || tr.is_reflection {
             return;
         }
     }
@@ -406,6 +408,14 @@ pub async fn run_post_completion(
                 persisted,
                 task_run_id
             );
+        }
+    }
+
+    // Phase 3: Deferred question confidence learning
+    // Adjust confidence thresholds based on human approval/rejection patterns.
+    if let Some(ref tr) = task_run_record {
+        if let Some(ref wf_id) = tr.workflow_id {
+            deferred_learning::update_confidence_threshold(pg, wf_id).await;
         }
     }
 }

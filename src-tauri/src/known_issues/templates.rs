@@ -3,7 +3,6 @@
 //! These templates provide reusable detection strategies that can be
 //! referenced by known issues to standardize how they are verified.
 
-use crate::database::Connection;
 use chrono::Utc;
 use tracing::info;
 
@@ -324,7 +323,7 @@ pub fn get_built_in_templates() -> Vec<IssuePatternTemplate> {
 }
 
 /// Seed built-in templates into the database (INSERT OR IGNORE).
-pub fn seed_templates(conn: &Connection) -> Result<(), String> {
+pub fn seed_templates() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -332,7 +331,6 @@ pub fn seed_templates(conn: &Connection) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::known_issues::storage::ensure_tables;
-use crate::database::Connection;
 
     #[test]
     fn test_get_built_in_templates_returns_six() {

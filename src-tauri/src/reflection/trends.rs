@@ -3,7 +3,6 @@
 //! Queries convergence_snapshots and component_health_snapshots to provide
 //! time-series trend data for workflow convergence and component health.
 
-use crate::database::Connection;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -69,7 +68,6 @@ fn parse_time_cutoff(time_range: Option<&str>) -> Option<String> {
 
 /// Query workflow-level trend data from convergence_snapshots.
 pub fn get_workflow_trends(
-    conn: &Connection,
     workflow_name: &str,
     time_range: Option<&str>,
 ) -> Result<WorkflowTrends, String> {
@@ -82,7 +80,6 @@ pub fn get_workflow_trends(
 
 /// Query per-component trend data from component_health_snapshots.
 pub fn get_component_trend(
-    conn: &Connection,
     workflow_name: &str,
     component_path: &str,
     time_range: Option<&str>,
@@ -116,7 +113,6 @@ pub struct EffectivenessOverTime {
 /// `bucket_type`: "week" (default) or "month".
 /// `time_range`: "7d", "30d", "all", etc.
 pub fn get_effectiveness_over_time(
-    conn: &Connection,
     workflow_name: &str,
     bucket_type: &str,
     time_range: Option<&str>,
@@ -131,7 +127,6 @@ pub fn get_effectiveness_over_time(
 /// Store component health snapshots during architecture model rebuild.
 /// Each tuple is (component_path, health_score, fix_count, effective_fix_count, change_velocity).
 pub fn store_component_health_snapshots(
-    conn: &Connection,
     workflow_name: &str,
     components: &[(String, f64, i32, i32, f64)],
 ) -> Result<usize, String> {
@@ -146,14 +141,12 @@ pub fn store_component_health_snapshots(
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     fn insert_convergence_snapshot(
-        conn: &Connection,
         workflow: &str,
         score: f64,
         fix_rate: f64,

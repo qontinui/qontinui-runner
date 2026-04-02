@@ -1,33 +1,31 @@
 //! SQLite CRUD operations for state machine configs, states, and transitions.
 
 use super::types::*;
-use crate::database::Connection;
 
 // =============================================================================
 // Config CRUD
 // =============================================================================
 
-pub fn list_configs(conn: &Connection) -> Result<Vec<SmConfig>, String> {
+pub fn list_configs() -> Result<Vec<SmConfig>, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn get_config(conn: &Connection, id: &str) -> Result<Option<SmConfig>, String> {
+pub fn get_config(id: &str) -> Result<Option<SmConfig>, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn insert_config(conn: &Connection, req: &CreateSmConfigRequest) -> Result<SmConfig, String> {
+pub fn insert_config(req: &CreateSmConfigRequest) -> Result<SmConfig, String> {
     Err("SQLite removed".to_string())
 }
 
 pub fn update_config(
-    conn: &Connection,
     id: &str,
     req: &UpdateSmConfigRequest,
 ) -> Result<SmConfig, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn delete_config(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_config(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -35,7 +33,7 @@ pub fn delete_config(conn: &Connection, id: &str) -> Result<bool, String> {
 // Config Full (with states + transitions)
 // =============================================================================
 
-pub fn get_config_full(conn: &Connection, id: &str) -> Result<Option<SmConfigFull>, String> {
+pub fn get_config_full(id: &str) -> Result<Option<SmConfigFull>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -45,16 +43,15 @@ pub fn get_config_full(conn: &Connection, id: &str) -> Result<Option<SmConfigFul
 
 // row_to_state removed (SQLite dead code)
 
-pub fn list_states(conn: &Connection, config_id: &str) -> Result<Vec<SmState>, String> {
+pub fn list_states(config_id: &str) -> Result<Vec<SmState>, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn get_state(conn: &Connection, id: &str) -> Result<Option<SmState>, String> {
+pub fn get_state(id: &str) -> Result<Option<SmState>, String> {
     Err("SQLite removed".to_string())
 }
 
 pub fn insert_state(
-    conn: &Connection,
     config_id: &str,
     req: &CreateSmStateRequest,
 ) -> Result<SmState, String> {
@@ -62,14 +59,13 @@ pub fn insert_state(
 }
 
 pub fn update_state(
-    conn: &Connection,
     id: &str,
     req: &UpdateSmStateRequest,
 ) -> Result<SmState, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn delete_state(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_state(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -79,16 +75,15 @@ pub fn delete_state(conn: &Connection, id: &str) -> Result<bool, String> {
 
 // row_to_transition removed (SQLite dead code)
 
-pub fn list_transitions(conn: &Connection, config_id: &str) -> Result<Vec<SmTransition>, String> {
+pub fn list_transitions(config_id: &str) -> Result<Vec<SmTransition>, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn get_transition(conn: &Connection, id: &str) -> Result<Option<SmTransition>, String> {
+pub fn get_transition(id: &str) -> Result<Option<SmTransition>, String> {
     Err("SQLite removed".to_string())
 }
 
 pub fn insert_transition(
-    conn: &Connection,
     config_id: &str,
     req: &CreateSmTransitionRequest,
 ) -> Result<SmTransition, String> {
@@ -96,14 +91,13 @@ pub fn insert_transition(
 }
 
 pub fn update_transition(
-    conn: &Connection,
     id: &str,
     req: &UpdateSmTransitionRequest,
 ) -> Result<SmTransition, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn delete_transition(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_transition(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -115,6 +109,6 @@ pub fn delete_transition(conn: &Connection, id: &str) -> Result<bool, String> {
 ///
 /// The export format has `config`, `states`, and `transitions` as nested objects.
 /// This creates a new config with all its states and transitions.
-pub fn import_config(conn: &Connection, req: &SmImportRequest) -> Result<SmConfigFull, String> {
+pub fn import_config(req: &SmImportRequest) -> Result<SmConfigFull, String> {
     Err("SQLite removed".to_string())
 }

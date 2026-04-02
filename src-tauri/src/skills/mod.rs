@@ -13,7 +13,6 @@
 
 pub mod playbook_parser;
 
-use crate::database::Connection;
 use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -232,7 +231,7 @@ fn load_builtin_skills() -> Vec<SkillDefinition> {
 /// This mirrors `CheckpointDb::list_user_skills()` but works with the raw
 /// `Connection` passed through the generator pipeline (same pattern as
 /// `rules::load_rules`).
-pub fn load_user_skills_from_conn(conn: &Connection) -> Vec<SkillDefinition> {
+pub fn load_user_skills_from_conn() -> Vec<SkillDefinition> {
     Vec::new()
 }
 
@@ -264,8 +263,9 @@ impl SkillRegistry {
     /// Create a registry with built-in skills + user skills loaded from DB.
     ///
     /// If `conn` is None or the query fails, only built-in skills are loaded.
-    pub fn with_db(conn: Option<&Connection>) -> Self {
-        todo!("SQLite removed")
+    pub fn with_db() -> Self {
+        // SQLite removed — fall back to built-in skills only
+        Self::new()
     }
 
     /// Create a registry with built-in skills + user skills loaded from PG.
@@ -875,7 +875,6 @@ pub fn annotate_skill_origins(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_load_builtin_skills() {

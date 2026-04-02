@@ -4,7 +4,6 @@
 //! waits for all to complete, then triggers AI comparison analysis.
 
 use serde::{Deserialize, Serialize};
-use crate::database::CheckpointDb;
 
 
 // =============================================================================
@@ -329,7 +328,6 @@ pub fn all_entries_done(entries: &[ComparisonEntry]) -> bool {
 /// Build a comparison summary for the AI comparison prompt.
 pub fn build_entry_summaries(
     entries: &[ComparisonEntry],
-    db: &CheckpointDb,
 ) -> Vec<(String, String, String)> {
     Vec::new()
 }

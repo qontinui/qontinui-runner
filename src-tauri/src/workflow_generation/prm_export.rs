@@ -5,7 +5,6 @@
 //! (pass/fail, fixer diffs, iteration counts) as ground-truth labels —
 //! the FoVer insight that the runner IS a formal verifier.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -100,14 +99,13 @@ pub struct PrmExportStats {
 /// - Fixer diffs from fixer_snapshots
 /// - Acceptance criteria from specification_criteria
 pub fn export_prm_training_data(
-    conn: &Connection,
     min_runs: usize,
 ) -> Result<(Vec<PrmTrainingExample>, PrmExportStats), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Lightweight stats query — counts runs and domains without materializing examples.
-pub fn export_prm_stats_only(conn: &Connection) -> Result<PrmExportStats, String> {
+pub fn export_prm_stats_only() -> Result<PrmExportStats, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -472,7 +470,6 @@ pub fn examples_to_jsonl(examples: &[PrmTrainingExample]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_parse_steps_from_workflow() {

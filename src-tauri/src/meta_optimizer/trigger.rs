@@ -594,7 +594,7 @@ mod tests {
     use super::*;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

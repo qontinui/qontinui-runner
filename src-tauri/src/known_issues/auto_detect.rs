@@ -4,7 +4,6 @@
 //! distinct task runs, this module automatically promotes it to a
 //! persistent `KnownIssue`.
 
-use crate::database::Connection;
 use tracing::{debug, info, warn};
 
 use crate::known_issues::storage::insert_known_issue;
@@ -18,7 +17,6 @@ use crate::known_issues::types::{
 ///
 /// Returns the IDs of any newly created known issues.
 pub fn check_and_promote_recurring_findings(
-    conn: &Connection,
     task_run_id: &str,
 ) -> Result<Vec<String>, String> {
     Err("SQLite removed".to_string())
@@ -60,10 +58,9 @@ fn map_finding_severity(severity: &str) -> IssueSeverity {
 mod tests {
     use super::*;
     use crate::known_issues::storage::ensure_tables;
-use crate::database::Connection;
 
     fn create_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

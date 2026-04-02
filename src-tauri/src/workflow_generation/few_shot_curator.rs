@@ -5,7 +5,6 @@
 //! workflow runs and manages a per-domain example bank that can be injected
 //! into generation prompts as few-shot demonstrations.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -38,18 +37,17 @@ pub struct CuratedExample {
 // ============================================================================
 
 /// Ensure the curated_examples table and indices exist.
-fn ensure_table(conn: &Connection) -> Result<(), String> {
+fn ensure_table() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Insert a new curated example.
-fn insert_example(conn: &Connection, example: &CuratedExample) -> Result<(), String> {
+fn insert_example(example: &CuratedExample) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Query examples for a given domain, ordered by quality descending.
 fn query_by_domain(
-    conn: &Connection,
     domain: &str,
     limit: usize,
 ) -> Result<Vec<CuratedExample>, String> {
@@ -57,13 +55,12 @@ fn query_by_domain(
 }
 
 /// Count how many curated examples exist for a domain.
-fn count_by_domain(conn: &Connection, domain: &str) -> Result<usize, String> {
+fn count_by_domain(domain: &str) -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get the weakest (lowest quality_score) example for a domain.
 fn get_weakest_by_domain(
-    conn: &Connection,
     domain: &str,
 ) -> Result<Option<CuratedExample>, String> {
     Err("SQLite removed".to_string())
@@ -71,7 +68,6 @@ fn get_weakest_by_domain(
 
 /// Replace an existing example (by id) with a new one.
 fn replace_example(
-    conn: &Connection,
     old_id: &str,
     new_example: &CuratedExample,
 ) -> Result<(), String> {
@@ -79,7 +75,7 @@ fn replace_example(
 }
 
 /// Increment the times_used counter for an example.
-fn increment_times_used(conn: &Connection, id: &str) -> Result<(), String> {
+fn increment_times_used(id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -150,7 +146,6 @@ impl FewShotCurator {
         iterations: u32,
         step_evaluations: &[(String, String, f64, String)], // (step_id, criterion_desc, score, steps_json)
         domain: &str,
-        conn: &Connection,
     ) -> Result<usize, String> {
         Err("SQLite removed".to_string())
     }
@@ -163,7 +158,6 @@ impl FewShotCurator {
         &self,
         domain: &str,
         max_examples: usize,
-        conn: &Connection,
     ) -> Result<Vec<CuratedExample>, String> {
         Err("SQLite removed".to_string())
     }

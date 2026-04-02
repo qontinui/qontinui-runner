@@ -4,7 +4,6 @@
 //! and track step provenance during workflow generation. These functions
 //! are called from hook points in generator.rs.
 
-use crate::database::Connection;
 use crate::database::graph_ops;
 use serde_json::Value;
 use tracing::{info, warn};
@@ -13,7 +12,6 @@ use tracing::{info, warn};
 /// Called at the end of each pipeline phase (discovery, builder, fixer, hardener, etc.).
 /// Silently logs warnings on failure — pipeline events are telemetry, not critical path.
 pub fn emit_pipeline_event(
-    conn: &Connection,
     task_run_id: &str,
     workflow_id: Option<&str>,
     event_type: &str,
@@ -31,7 +29,6 @@ pub fn emit_pipeline_event(
 /// Create a new workflow version snapshot, computing diff from the previous version.
 /// Returns the version ID on success, or None if versioning fails (non-fatal).
 pub fn create_workflow_version(
-    conn: &Connection,
     workflow_id: &str,
     generation_task_run_id: Option<&str>,
     workflow_json: &Value,
@@ -45,7 +42,6 @@ pub fn create_workflow_version(
 /// and creates a step_provenance entry for each.
 /// Returns count of entries created.
 pub fn record_all_step_provenance(
-    conn: &Connection,
     workflow_id: &str,
     version_id: Option<&str>,
     workflow_json: &Value,
@@ -58,7 +54,6 @@ pub fn record_all_step_provenance(
 /// After a fixer iteration, diff old and new steps and record provenance for changed steps.
 /// Compares steps by index within each phase. If a step changed, records with original_step_json.
 pub fn record_fixer_provenance(
-    conn: &Connection,
     workflow_id: &str,
     version_id: Option<&str>,
     old_workflow: &Value,
@@ -70,7 +65,6 @@ pub fn record_fixer_provenance(
 
 /// Record rule influence entries for all rules that were loaded during generation.
 pub fn record_rule_influences(
-    conn: &Connection,
     rules: &[(String, String, String)], // Vec of (rule_id, agent, section)
     task_run_id: &str,
     workflow_id: Option<&str>,
@@ -85,7 +79,7 @@ pub fn record_rule_influences(
 /// 2. Ineffective rules to exclude from the prompt
 /// 3. Phase stats showing which phases are bottlenecks
 /// Returns a formatted string to include in the builder prompt.
-pub fn build_graph_context(conn: &Connection, workflow_name: Option<&str>) -> String {
+pub fn build_graph_context(workflow_name: Option<&str>) -> String {
     String::new()
 }
 
@@ -136,11 +130,10 @@ fn compute_diff_summary(old_json: &str, new_json: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-use crate::database::Connection;
 
     /// Create an in-memory SQLite database with all tables needed by instrumentation.
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

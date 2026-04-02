@@ -201,6 +201,9 @@ pub enum RunnerEvent {
     FindingDetected(FindingDetectedEvent),
     FindingResolved(FindingResolvedEvent),
     AiOutputChunk(AiOutputChunkEvent),
+    CostUpdate(GqlCostUpdateEvent),
+    BudgetWarning(GqlBudgetWarningEvent),
+    CostAnomaly(GqlCostAnomalyEvent),
     GenericEvent(GenericRunnerEvent),
 }
 
@@ -253,6 +256,61 @@ pub struct AiOutputChunkEvent {
 pub struct GenericRunnerEvent {
     pub event_type: String,
     pub data: Json<serde_json::Value>,
+}
+
+// ==========================================================================
+// Cost Event Types
+// ==========================================================================
+
+/// Real-time cost update after each AI call.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlCostUpdateEvent {
+    pub task_run_id: String,
+    pub phase: String,
+    pub iteration: Option<i32>,
+    /// Input tokens (u64 as string for GraphQL BigInt compat).
+    pub input_tokens: String,
+    /// Output tokens (u64 as string for GraphQL BigInt compat).
+    pub output_tokens: String,
+    /// Cache creation tokens (u64 as string for GraphQL BigInt compat).
+    pub cache_creation_tokens: String,
+    /// Cache read tokens (u64 as string for GraphQL BigInt compat).
+    pub cache_read_tokens: String,
+    pub cost_usd: f64,
+    pub cumulative_cost_usd: f64,
+    pub cache_hit_rate: f64,
+    pub timestamp: String,
+}
+
+/// Budget warning when consumption exceeds a threshold.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlBudgetWarningEvent {
+    pub task_run_id: String,
+    pub remaining_fraction: f64,
+    pub total_cost_usd: f64,
+    pub budget_limit_usd: f64,
+    pub message: String,
+    pub timestamp: String,
+}
+
+/// Cost anomaly detected via statistical analysis.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct GqlCostAnomalyEvent {
+    pub task_run_id: String,
+    pub cost_usd: f64,
+    pub mean_cost_usd: f64,
+    pub std_dev: f64,
+    pub z_score: f64,
+    pub message: String,
+    pub timestamp: String,
+}
+
+/// Union of all cost-related events for the `costEvents` subscription.
+#[derive(Union, Clone, Debug)]
+pub enum CostEvent {
+    CostUpdate(GqlCostUpdateEvent),
+    BudgetWarning(GqlBudgetWarningEvent),
+    CostAnomaly(GqlCostAnomalyEvent),
 }
 
 // ==========================================================================

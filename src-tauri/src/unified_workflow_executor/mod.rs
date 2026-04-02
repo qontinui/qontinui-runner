@@ -63,6 +63,7 @@ pub(crate) mod auto_run;
 pub mod blame;
 mod canvas_panels;
 pub mod compensation;
+pub mod deferred_feedback;
 pub mod conditional_routing;
 pub mod convergence;
 mod health_monitor;

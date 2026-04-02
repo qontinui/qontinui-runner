@@ -1711,6 +1711,7 @@ pub async fn execute_inline_workflow(
         workflow_architecture: None,
         flow_control_json: None,
         phase_timeouts_json: None,
+        security_profile: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1842,6 +1843,8 @@ pub async fn execute_inline_workflow(
             agentic_verification_config: None,
             multi_agent_pipeline_config: None,
             approval_gate: workflow.approval_gate,
+            blocking_approval: false,
+            confidence_threshold: 0.85,
             max_context_tokens: 100_000,
             enforce_token_budget: workflow.enforce_token_budget,
             cross_workflow_learning: true,
@@ -2301,6 +2304,8 @@ pub async fn run_composed_workflow(
                 multi_agent_pipeline_config: None,
                 auto_run_generated: false,
                 approval_gate: false,
+                blocking_approval: false,
+                confidence_threshold: 0.85,
                 max_context_tokens: 100_000,
                 enforce_token_budget: false,
                 cross_workflow_learning: true,
@@ -2347,8 +2352,18 @@ pub async fn run_composed_workflow(
                     .await;
             }
 
-            // Summary generation skipped — generate_task_summary_async expects CheckpointDb
-            // TODO: port generate_task_summary_async to PgDb
+            // Generate task summary (fire-and-forget)
+            {
+                let exec_id = execution_id_clone.clone();
+                tokio::spawn(async move {
+                    match crate::summary_generator::generate_task_summary_async(
+                        exec_id.clone(), None, None, None,
+                    ).await {
+                        Ok(result) => tracing::info!("Summary generated for composed workflow {}: goal_achieved={}", exec_id, result.goal_achieved),
+                        Err(e) => tracing::warn!("Summary generation failed for composed workflow {}: {}", exec_id, e),
+                    }
+                });
+            }
         },
     );
 
@@ -2519,7 +2534,6 @@ async fn get_exploration_stats_handler(
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
-use crate::database::CheckpointDb;
     axum::Router::new()
         .route(
             "/unified-workflows",

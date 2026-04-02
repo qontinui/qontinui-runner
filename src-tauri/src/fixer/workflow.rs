@@ -40,6 +40,8 @@ pub fn build_fixer_config(
         max_sessions: Some(5),
         auto_run_generated: false,
         approval_gate: false,
+        blocking_approval: false,
+        confidence_threshold: 0.85,
         max_context_tokens: 500_000,
         enforce_token_budget: false,
         cross_workflow_learning: true,

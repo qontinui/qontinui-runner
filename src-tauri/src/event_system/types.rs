@@ -215,6 +215,38 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Deferred Feedback Events
+    // ========================================================================
+    /// A deferred question was created during autonomous execution.
+    /// The system continued without waiting — this is for real-time visibility.
+    DeferredQuestionCreated {
+        /// Task run ID
+        task_run_id: String,
+        /// Deferred question ID
+        question_id: String,
+        /// Iteration when the question was raised
+        iteration: u32,
+        /// The question text
+        question: String,
+        /// Confidence score (0.0-1.0)
+        confidence: f64,
+        /// Risk level
+        risk_level: String,
+    },
+
+    /// A deferred question was reviewed by a human (post-run or mid-run).
+    DeferredQuestionReviewed {
+        /// Task run ID
+        task_run_id: String,
+        /// Deferred question ID
+        question_id: String,
+        /// Review status: "approved" or "rejected"
+        status: String,
+        /// Whether rework was triggered
+        rework_triggered: bool,
+    },
+
+    // ========================================================================
     // Canvas Events
     // ========================================================================
     /// Canvas panel created, updated, or removed.
@@ -322,6 +354,45 @@ pub enum AppEvent {
     },
 
     // ========================================================================
+    // Cost Management Events
+    // ========================================================================
+    /// Real-time cost update after each AI call.
+    CostUpdate {
+        task_run_id: String,
+        phase: String,
+        iteration: Option<u32>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+        cost_usd: f64,
+        cumulative_cost_usd: f64,
+        cache_hit_rate: f64,
+        timestamp: i64,
+    },
+
+    /// Budget warning when consumption exceeds 80%.
+    BudgetWarning {
+        task_run_id: String,
+        remaining_fraction: f64,
+        total_cost_usd: f64,
+        budget_limit_usd: f64,
+        message: String,
+        timestamp: i64,
+    },
+
+    /// Cost anomaly detected via statistical analysis.
+    CostAnomaly {
+        task_run_id: String,
+        cost_usd: f64,
+        mean_cost_usd: f64,
+        std_dev: f64,
+        z_score: f64,
+        message: String,
+        timestamp: i64,
+    },
+
+    // ========================================================================
     // Generic Events
     // ========================================================================
     /// Generic error event.
@@ -376,6 +447,10 @@ impl AppEvent {
             AppEvent::ApprovalRequired { .. } => "approval-required",
             AppEvent::ApprovalResolved { .. } => "approval-resolved",
 
+            // Deferred feedback events
+            AppEvent::DeferredQuestionCreated { .. } => "deferred-question-created",
+            AppEvent::DeferredQuestionReviewed { .. } => "deferred-question-reviewed",
+
             // Canvas events
             AppEvent::CanvasUpdate { .. } => "canvas-update",
 
@@ -394,6 +469,11 @@ impl AppEvent {
             // Queue events
             AppEvent::WorkflowQueued { .. } => "workflow-queued",
             AppEvent::WorkflowDequeued { .. } => "workflow-dequeued",
+
+            // Cost management events
+            AppEvent::CostUpdate { .. } => "cost-update",
+            AppEvent::BudgetWarning { .. } => "budget-warning",
+            AppEvent::CostAnomaly { .. } => "cost-anomaly",
 
             // Generic events
             AppEvent::Error { .. } => "error",
@@ -669,6 +749,80 @@ impl AppEvent {
         }
     }
 
+    /// Create a cost update event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_update(
+        task_run_id: impl Into<String>,
+        phase: impl Into<String>,
+        iteration: Option<u32>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+        cost_usd: f64,
+        cumulative_cost_usd: f64,
+    ) -> Self {
+        let cache_total = cache_read_tokens + cache_creation_tokens + input_tokens;
+        let cache_hit_rate = if cache_total > 0 {
+            cache_read_tokens as f64 / cache_total as f64
+        } else {
+            0.0
+        };
+        AppEvent::CostUpdate {
+            task_run_id: task_run_id.into(),
+            phase: phase.into(),
+            iteration,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            cost_usd,
+            cumulative_cost_usd,
+            cache_hit_rate,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Create a budget warning event.
+    pub fn budget_warning(
+        task_run_id: impl Into<String>,
+        remaining_fraction: f64,
+        total_cost_usd: f64,
+        budget_limit_usd: f64,
+        message: impl Into<String>,
+    ) -> Self {
+        AppEvent::BudgetWarning {
+            task_run_id: task_run_id.into(),
+            remaining_fraction,
+            total_cost_usd,
+            budget_limit_usd,
+            message: message.into(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Create a cost anomaly event.
+    pub fn cost_anomaly(
+        task_run_id: impl Into<String>,
+        cost_usd: f64,
+        mean_cost_usd: f64,
+        std_dev: f64,
+        z_score: f64,
+    ) -> Self {
+        AppEvent::CostAnomaly {
+            task_run_id: task_run_id.into(),
+            cost_usd,
+            mean_cost_usd,
+            std_dev,
+            z_score,
+            message: format!(
+                "Cost anomaly: ${:.4} is {:.1} std devs above mean ${:.4}",
+                cost_usd, z_score, mean_cost_usd
+            ),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
     /// Create a generic error event.
     pub fn error(message: impl Into<String>) -> Self {
         AppEvent::Error {
@@ -712,6 +866,40 @@ impl AppEvent {
             approval_id: approval_id.into(),
             approved,
             action: action.into(),
+        }
+    }
+
+    /// Create a deferred question created event.
+    pub fn deferred_question_created(
+        task_run_id: impl Into<String>,
+        question_id: impl Into<String>,
+        iteration: u32,
+        question: impl Into<String>,
+        confidence: f64,
+        risk_level: impl Into<String>,
+    ) -> Self {
+        AppEvent::DeferredQuestionCreated {
+            task_run_id: task_run_id.into(),
+            question_id: question_id.into(),
+            iteration,
+            question: question.into(),
+            confidence,
+            risk_level: risk_level.into(),
+        }
+    }
+
+    /// Create a deferred question reviewed event.
+    pub fn deferred_question_reviewed(
+        task_run_id: impl Into<String>,
+        question_id: impl Into<String>,
+        status: impl Into<String>,
+        rework_triggered: bool,
+    ) -> Self {
+        AppEvent::DeferredQuestionReviewed {
+            task_run_id: task_run_id.into(),
+            question_id: question_id.into(),
+            status: status.into(),
+            rework_triggered,
         }
     }
 

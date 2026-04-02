@@ -3,7 +3,6 @@
 //! Combines SQL text search + vector similarity for findings, fixes,
 //! knowledge, errors, rules, and components into a single ranked result list.
 
-use crate::database::Connection;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -19,39 +18,37 @@ pub struct UnifiedSearchResult {
 /// Search across all data stores with a text query.
 /// Results are ranked by text match relevance.
 pub fn unified_search(
-    conn: &Connection,
     query: &str,
     limit: usize,
 ) -> Result<Vec<UnifiedSearchResult>, String> {
     Err("SQLite removed".to_string())
 }
 
-fn search_findings(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
+fn search_findings(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
-fn search_fixes(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
+fn search_fixes(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
-fn search_knowledge(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
+fn search_knowledge(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
-fn search_errors(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
+fn search_errors(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
-fn search_rules(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
+fn search_rules(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
-fn search_workflows(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
+fn search_workflows(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
 fn search_ui_elements(
-    conn: &Connection,
     pattern: &str,
     results: &mut Vec<UnifiedSearchResult>,
 ) {

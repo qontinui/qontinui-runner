@@ -4,7 +4,6 @@
 //! It queries 16+ tables to build nodes and edges, then provides traversal queries
 //! for causal reasoning, impact analysis, pattern detection, and unified search.
 
-use crate::database::Connection;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
@@ -45,7 +44,7 @@ impl KnowledgeGraph {
     ///
     /// Queries 16+ tables, creates nodes for each entity type, then wires up
     /// directed edges representing relationships (causal, structural, temporal).
-    pub fn build_from_db(conn: &Connection, workflow_name: Option<&str>) -> Result<Self, String> {
+    pub fn build_from_db(workflow_name: Option<&str>) -> Result<Self, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -85,7 +84,6 @@ impl KnowledgeGraph {
 
     fn load_workflows(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -93,7 +91,6 @@ impl KnowledgeGraph {
 
     fn load_workflow_versions(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -101,7 +98,6 @@ impl KnowledgeGraph {
 
     fn load_task_runs(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -109,7 +105,6 @@ impl KnowledgeGraph {
 
     fn load_findings(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -117,7 +112,6 @@ impl KnowledgeGraph {
 
     fn load_fixes(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -125,7 +119,6 @@ impl KnowledgeGraph {
 
     fn load_errors(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -133,19 +126,17 @@ impl KnowledgeGraph {
 
     fn load_components(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_rules(&mut self, conn: &Connection) -> Result<(), String> {
+    fn load_rules(&mut self) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     fn load_patterns(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -153,7 +144,6 @@ impl KnowledgeGraph {
 
     fn load_knowledge(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -161,7 +151,6 @@ impl KnowledgeGraph {
 
     fn load_step_defs(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -171,7 +160,6 @@ impl KnowledgeGraph {
     /// Capped at 100 elements per workflow to respect memory budgets.
     fn load_ui_elements(
         &mut self,
-        conn: &Connection,
         _workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -184,7 +172,6 @@ impl KnowledgeGraph {
     /// were procedurally generated from cross-run learning.
     fn load_skills(
         &mut self,
-        conn: &Connection,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
@@ -193,7 +180,6 @@ impl KnowledgeGraph {
     /// data stored in step provenance and fix applications.
     fn link_skills(
         &mut self,
-        conn: &Connection,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
@@ -280,7 +266,6 @@ impl KnowledgeGraph {
     /// Link task runs to UI elements via InteractedWith edges.
     fn link_ui_interactions(
         &mut self,
-        conn: &Connection,
         _workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -399,7 +384,6 @@ impl KnowledgeGraph {
     /// task_runs.workflow_name → BelongsTo → workflow
     fn link_task_runs_to_workflows(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -408,7 +392,6 @@ impl KnowledgeGraph {
     /// task_run_findings.task_run_id → DetectedDuring → task_run
     fn link_findings_to_task_runs(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -418,7 +401,6 @@ impl KnowledgeGraph {
     /// reflection_fixes where effective → Resolved (fix → finding)
     fn link_fixes_to_findings(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -427,7 +409,6 @@ impl KnowledgeGraph {
     /// causal_events → Caused / Resolved edges based on relationship type
     fn link_causal_events(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -436,7 +417,6 @@ impl KnowledgeGraph {
     /// workflow_versions parent → EvolvedFrom, generation_task_run_id → GeneratedBy
     fn link_workflow_versions(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -445,7 +425,6 @@ impl KnowledgeGraph {
     /// step_provenance → BuiltBy (step → pipeline_agent)
     fn link_step_provenance(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -454,7 +433,6 @@ impl KnowledgeGraph {
     /// step_finding_links → DetectedDuring (step → finding)
     fn link_step_finding_links(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -463,7 +441,6 @@ impl KnowledgeGraph {
     /// rule_influence_log → InfluencedBy (rule → workflow)
     fn link_rule_influence(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -472,7 +449,6 @@ impl KnowledgeGraph {
     /// component_relationships → ImpactsComponent
     fn link_component_relationships(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -481,7 +457,6 @@ impl KnowledgeGraph {
     /// fix_applications → AppliedIn (fix → task_run)
     fn link_fix_applications(
         &mut self,
-        conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
@@ -514,7 +489,6 @@ impl KnowledgeGraph {
     /// Returns the count of new nodes added.
     pub fn ingest_task_run(
         &mut self,
-        conn: &Connection,
         task_run_id: &str,
     ) -> Result<u32, String> {
         Err("SQLite removed".to_string())

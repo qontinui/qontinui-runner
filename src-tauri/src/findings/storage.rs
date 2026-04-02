@@ -4,7 +4,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::Connection;
 
 use super::types::{
     Finding, FindingActionType, FindingCategory, FindingCodeContext, FindingSeverity,
@@ -13,7 +12,6 @@ use super::types::{
 
 /// Insert a new finding into the database
 pub fn insert_finding(
-    conn: &Connection,
     task_run_id: &str,
     session_num: u32,
     parsed: &ParsedFinding,
@@ -23,7 +21,6 @@ pub fn insert_finding(
 
 /// Find a finding by signature hash (for deduplication)
 pub fn find_by_signature(
-    conn: &Connection,
     task_run_id: &str,
     signature_hash: &str,
 ) -> Result<Option<Finding>, String> {
@@ -31,18 +28,17 @@ pub fn find_by_signature(
 }
 
 /// Get a finding by ID
-pub fn get_finding(conn: &Connection, id: &str) -> Result<Option<Finding>, String> {
+pub fn get_finding(id: &str) -> Result<Option<Finding>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get all findings for a task run
-pub fn get_findings_for_task(conn: &Connection, task_run_id: &str) -> Result<Vec<Finding>, String> {
+pub fn get_findings_for_task(task_run_id: &str) -> Result<Vec<Finding>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get findings by status for a task run
 pub fn get_findings_by_status(
-    conn: &Connection,
     task_run_id: &str,
     status: &FindingStatus,
 ) -> Result<Vec<Finding>, String> {
@@ -51,7 +47,6 @@ pub fn get_findings_by_status(
 
 /// Update finding status
 pub fn update_finding_status(
-    conn: &Connection,
     id: &str,
     status: &FindingStatus,
     resolution: Option<&str>,
@@ -61,7 +56,7 @@ pub fn update_finding_status(
 }
 
 /// Set user response for a finding
-pub fn set_user_response(conn: &Connection, id: &str, response: &str) -> Result<(), String> {
+pub fn set_user_response(id: &str, response: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -75,7 +70,6 @@ pub fn set_user_response(conn: &Connection, id: &str, response: &str) -> Result<
 /// This prevents the AI from re-detecting already-resolved issues and
 /// provides context about what work remains.
 pub fn format_findings_for_continuation_prompt(
-    conn: &Connection,
     task_run_id: &str,
 ) -> Result<String, String> {
     Err("SQLite removed".to_string())
@@ -111,7 +105,7 @@ fn truncate_description(desc: &str, max_len: usize) -> String {
 }
 
 /// Get summary statistics for a task run
-pub fn get_finding_summary(conn: &Connection, task_run_id: &str) -> Result<FindingSummary, String> {
+pub fn get_finding_summary(task_run_id: &str) -> Result<FindingSummary, String> {
     Err("SQLite removed".to_string())
 }
 

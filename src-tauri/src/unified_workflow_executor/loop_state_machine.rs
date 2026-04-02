@@ -147,6 +147,11 @@ pub(crate) struct LoopContext {
 
     // Wall-clock start time for escalation time limit checks.
     pub loop_start_time: Instant,
+
+    // Deferred feedback: IDs of deferred questions whose auto-decisions
+    // affect the current and future iterations. Accumulated as deferred
+    // questions are created; propagated into each IterationResult.
+    pub active_contingencies: Vec<String>,
 }
 
 impl LoopContext {
@@ -220,6 +225,7 @@ impl LoopContext {
             reflection_was_forced: false,
             blame_json: None,
             loop_start_time: Instant::now(),
+            active_contingencies: Vec::new(),
         }
     }
 
@@ -384,6 +390,7 @@ mod tests {
             reflection_was_forced: false,
             blame_json: None,
             loop_start_time: Instant::now(),
+            active_contingencies: Vec::new(),
         }
     }
 
@@ -527,6 +534,7 @@ mod tests {
             agentic_phase_ran: true,
             agentic_phase_success: Some(true),
             blame_json: None,
+            contingent_on: Vec::new(),
         });
         ctx.iteration_results.push(IterationResult {
             iteration: 2,
@@ -538,6 +546,7 @@ mod tests {
             agentic_phase_ran: true,
             agentic_phase_success: Some(true),
             blame_json: None,
+            contingent_on: Vec::new(),
         });
         ctx.iteration_results.push(IterationResult {
             iteration: 3,
@@ -549,6 +558,7 @@ mod tests {
             agentic_phase_ran: false,
             agentic_phase_success: None,
             blame_json: None,
+            contingent_on: Vec::new(),
         });
 
         let result = CompletionReason::VerificationPassed.into_loop_result(&ctx);

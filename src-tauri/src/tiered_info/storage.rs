@@ -3,7 +3,6 @@
 //! Provides CRUD operations for task_run_automation and config_statistics tables.
 
 use crate::str_utils::truncate_str;
-use crate::database::Connection;
 
 use super::types::{
     ConfigStatistics, DebuggingContext, FlakyItem, RunDetails, RunFailureSummary, RunStatus,
@@ -16,7 +15,6 @@ use super::types::{
 /// Get recent automation runs from task_run_automation table for a config.
 /// Joins with task_runs to get config_id.
 pub fn get_recent_automation_runs(
-    conn: &Connection,
     config_id: &str,
     limit: u32,
 ) -> Result<Vec<RunDetails>, String> {
@@ -25,7 +23,6 @@ pub fn get_recent_automation_runs(
 
 /// Get failed automation runs from task_run_automation table for a config.
 pub fn get_failed_automation_runs(
-    conn: &Connection,
     config_id: &str,
     limit: u32,
 ) -> Result<Vec<RunDetails>, String> {
@@ -34,7 +31,6 @@ pub fn get_failed_automation_runs(
 
 /// Get all recent runs from task_run_automation.
 pub fn get_all_recent_runs(
-    conn: &Connection,
     config_id: &str,
     limit: u32,
 ) -> Result<Vec<RunDetails>, String> {
@@ -43,7 +39,6 @@ pub fn get_all_recent_runs(
 
 /// Get all failed runs from task_run_automation.
 pub fn get_all_failed_runs(
-    conn: &Connection,
     config_id: &str,
     limit: u32,
 ) -> Result<Vec<RunDetails>, String> {
@@ -56,7 +51,6 @@ pub fn get_all_failed_runs(
 
 /// Get or create config statistics.
 pub fn get_or_create_config_statistics(
-    conn: &Connection,
     config_id: &str,
 ) -> Result<ConfigStatistics, String> {
     Err("SQLite removed".to_string())
@@ -64,25 +58,24 @@ pub fn get_or_create_config_statistics(
 
 /// Get config statistics by config_id.
 pub fn get_config_statistics(
-    conn: &Connection,
     config_id: &str,
 ) -> Result<Option<ConfigStatistics>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Insert new config statistics.
-pub fn insert_config_statistics(conn: &Connection, stats: &ConfigStatistics) -> Result<(), String> {
+pub fn insert_config_statistics(stats: &ConfigStatistics) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Update config statistics.
-pub fn update_config_statistics(conn: &Connection, stats: &ConfigStatistics) -> Result<(), String> {
+pub fn update_config_statistics(stats: &ConfigStatistics) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Update statistics after a run completes.
 /// This is the main entry point for updating Tier 4 data.
-pub fn update_statistics_after_run(conn: &Connection, run: &RunDetails) -> Result<(), String> {
+pub fn update_statistics_after_run(run: &RunDetails) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -92,7 +85,6 @@ pub fn update_statistics_after_run(conn: &Connection, run: &RunDetails) -> Resul
 
 /// Get flaky transitions with details.
 pub fn get_flaky_transitions(
-    conn: &Connection,
     config_id: &str,
     threshold: f64,
 ) -> Result<Vec<FlakyItem>, String> {
@@ -101,7 +93,6 @@ pub fn get_flaky_transitions(
 
 /// Get flaky templates with details.
 pub fn get_flaky_templates(
-    conn: &Connection,
     config_id: &str,
     threshold: f64,
 ) -> Result<Vec<FlakyItem>, String> {
@@ -112,7 +103,6 @@ pub fn get_flaky_templates(
 /// This formats Tier 4 data in a way that's useful for AI analysis.
 /// Uses data from task_run_automation table.
 pub fn get_debugging_context(
-    conn: &Connection,
     config_id: &str,
     config_name: Option<String>,
 ) -> Result<DebuggingContext, String> {
@@ -217,7 +207,7 @@ pub fn format_debugging_context_for_prompt(context: &DebuggingContext) -> String
 
 /// Get a single run by ID from run_details table (used by tests).
 /// This function works with the legacy run_details table schema.
-pub fn get_run_details(conn: &Connection, run_id: &str) -> Result<Option<RunDetails>, String> {
+pub fn get_run_details(run_id: &str) -> Result<Option<RunDetails>, String> {
     Err("SQLite removed".to_string())
 }
 

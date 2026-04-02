@@ -91,7 +91,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Store a knowledge embedding (stub -- SQLite removed).
 pub fn store_knowledge_embedding(
-    _conn: &super::Connection,
     _knowledge_id: &str,
     _embedding: &[f32],
 ) -> Result<(), String> {

@@ -59,7 +59,6 @@ impl ResearchEngine {
     pub async fn start(
         &mut self,
         config: ResearchConfig,
-        db: Arc<crate::database::CheckpointDb>,
         pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     ) -> Result<String, String> {
         Err("SQLite removed".to_string())
@@ -191,7 +190,6 @@ async fn run_campaign_loop(
     campaign_id: String,
     state: Arc<Mutex<ResearchState>>,
     stop_rx: watch::Receiver<bool>,
-    db: Arc<crate::database::CheckpointDb>,
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
 ) {
     // SQLite removed - no-op
@@ -422,7 +420,6 @@ async fn run_single_trial(
 
 /// Record experiment results into the learning_outcomes and learning_patterns tables.
 fn record_learning(
-    db: &crate::database::CheckpointDb,
     config: &ResearchConfig,
     result: &ExperimentResult,
     experiment_number: u32,
@@ -438,7 +435,6 @@ fn record_learning(
 /// Returns a channel receiver that emits new ResearchConfig on file changes.
 fn start_config_watcher(config_path: &str) -> Option<std::sync::mpsc::Receiver<ResearchConfig>> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
-use crate::database::CheckpointDb;
 
     let path = PathBuf::from(config_path);
     if !path.exists() {
@@ -513,7 +509,6 @@ use crate::database::CheckpointDb;
 }
 
 fn update_campaign_status(
-    db: &crate::database::CheckpointDb,
     campaign_id: &str,
     status: &str,
     campaign_status: &CampaignStatus,

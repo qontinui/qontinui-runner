@@ -3,7 +3,6 @@
 //! Automatically promotes high-quality AI-generated workflows into
 //! parameterized templates that can be reused for similar tasks.
 
-use crate::database::Connection;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -65,7 +64,7 @@ pub struct PromotionResult {
 // ============================================================================
 
 /// Ensure the promoted_templates table exists.
-fn ensure_table(conn: &Connection) -> Result<(), String> {
+fn ensure_table() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -74,13 +73,12 @@ fn ensure_table(conn: &Connection) -> Result<(), String> {
 // ============================================================================
 
 /// Evaluate workflows for template promotion and promote qualifying ones.
-pub fn evaluate_and_promote(conn: &Connection) -> Result<PromotionResult, String> {
+pub fn evaluate_and_promote() -> Result<PromotionResult, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Find promoted templates relevant to a description.
 pub fn find_relevant_templates(
-    conn: &Connection,
     description: &str,
 ) -> Result<Vec<PromotedTemplate>, String> {
     Err("SQLite removed".to_string())
@@ -360,7 +358,7 @@ fn extract_tags(workflow_json: &serde_json::Value, description: &str) -> Vec<Str
 }
 
 /// Store a promoted template in the database.
-fn store_template(conn: &Connection, template: &PromotedTemplate) -> Result<(), String> {
+fn store_template(template: &PromotedTemplate) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -371,7 +369,6 @@ fn store_template(conn: &Connection, template: &PromotedTemplate) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_is_url_pattern() {

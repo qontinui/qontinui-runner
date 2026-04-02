@@ -4,16 +4,13 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use super::types::*;
-use crate::database::CheckpointDb;
 
 /// Storage layer for recording persistence
-pub struct RecordingStorage {
-    db: Arc<CheckpointDb>,
-}
+pub struct RecordingStorage;
 
 impl RecordingStorage {
-    pub fn new(db: Arc<CheckpointDb>) -> Self {
-        todo!("SQLite removed")
+    pub fn new() -> Self {
+        Self
     }
 
     /// Create a new recording session

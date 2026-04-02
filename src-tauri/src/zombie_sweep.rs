@@ -27,7 +27,6 @@ use tracing::{info, warn};
 
 use crate::claude_session::manager::SessionManager;
 use crate::doctor::strategies::is_process_alive;
-use crate::database::CheckpointDb;
 
 /// How often to run the sweep.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -102,7 +101,6 @@ impl OrphanTracker {
 
 /// Run a single sweep cycle: detect potentially stale task runs and notify.
 async fn sweep_once(
-    db: &Arc<CheckpointDb>,
     session_manager: &Arc<SessionManager>,
     app_handle: &AppHandle,
     orphan_tracker: &mut OrphanTracker,
@@ -120,10 +118,9 @@ pub fn start_zombie_sweep(
 ) {
     // Zombie sweep: SQLite-dependent. Skipping until PG migration.
     let _ = (session_manager, app_handle);
-    info!("Stale task sweep: disabled (SQLite CheckpointDb removed, PG support pending)");
+    info!("Stale task sweep: disabled (pending PG port)");
     return;
-    #[allow(unreachable_code, clippy::diverging_sub_expression)]
-    let db: Arc<CheckpointDb> = unreachable!();
+    #[allow(unreachable_code)]
     let orphan_tracker = Arc::new(Mutex::new(OrphanTracker::new()));
 
     tokio::spawn(async move {
@@ -138,7 +135,7 @@ pub fn start_zombie_sweep(
         loop {
             {
                 let mut tracker = orphan_tracker.lock().await;
-                sweep_once(&db, &session_manager, &app_handle, &mut tracker).await;
+                sweep_once(&session_manager, &app_handle, &mut tracker).await;
             }
             tokio::time::sleep(SWEEP_INTERVAL).await;
         }

@@ -106,7 +106,6 @@ pub struct UniversalFixResult {
 
 /// Hybrid search knowledge (stub -- SQLite removed).
 pub fn hybrid_search_knowledge(
-    _conn: &super::Connection,
     _query_embedding: &[f32],
     _category: Option<&str>,
     _config: &HybridSearchConfig,

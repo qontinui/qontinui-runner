@@ -214,6 +214,14 @@ pub async fn resume_interrupted_workflows(
     let mut processed_count = 0;
 
     for task_run in &running_workflows {
+        // Skip Restate-managed workflows — Restate handles their resume automatically
+        if crate::settings::load_settings().restate.enabled {
+            if app_state.pg_db.is_restate_workflow(&task_run.id).await.unwrap_or(false) {
+                info!("Skipping Restate-managed workflow {} — Restate handles resume", task_run.id);
+                continue;
+            }
+        }
+
         // Check if the workflow state is actually complete but the task_run status
         // wasn't updated (e.g., runner crashed after workflow finished but before
         // the status was persisted).
@@ -387,6 +395,8 @@ pub async fn resume_interrupted_workflows(
                                 max_sessions: Some(workflow.max_iterations),
                                 auto_run_generated: false,
                                 approval_gate: workflow.approval_gate,
+                                blocking_approval: false,
+                                confidence_threshold: 0.85,
                                 max_context_tokens: 100_000,
                                 enforce_token_budget: workflow.enforce_token_budget,
                                 cross_workflow_learning: true,
@@ -594,6 +604,8 @@ pub async fn resume_interrupted_workflows(
                                 max_sessions: Some(workflow.max_iterations),
                                 auto_run_generated: false,
                                 approval_gate: workflow.approval_gate,
+                                blocking_approval: false,
+                                confidence_threshold: 0.85,
                                 max_context_tokens: 100_000,
                                 enforce_token_budget: workflow.enforce_token_budget,
                                 cross_workflow_learning: true,

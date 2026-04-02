@@ -8,7 +8,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::CheckpointDb;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -317,7 +316,6 @@ impl ErrorMonitorHandle {
 
 /// Error monitoring service
 pub struct ErrorMonitorService {
-    db: Arc<CheckpointDb>,
     pg_db: Arc<crate::database::pg::PgDb>,
     config: ErrorMonitorConfig,
     /// Currently monitored files with their state
@@ -360,7 +358,6 @@ impl ErrorMonitorService {
         };
 
         let service = Self {
-            db: Arc::new(CheckpointDb),
             pg_db,
             config,
             file_states: HashMap::new(),
@@ -865,7 +862,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
-use crate::database::CheckpointDb;
 
     /// Helper to create a test service via the public constructor.
     /// Requires DATABASE_URL env var for PgDb connection.
@@ -874,7 +870,7 @@ use crate::database::CheckpointDb;
         ErrorMonitorHandle,
         Receiver<ServiceCommand>,
     ) {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[tokio::test]

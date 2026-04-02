@@ -259,7 +259,6 @@ pub fn evaluate_rag_sync(input: &RagJudgeInput) -> Vec<MetricResult> {
 ///
 /// Uses event_type='retrieval' so they can be queried later by the RAG judge.
 pub fn persist_retrieval_event(
-    conn: &crate::database::Connection,
     task_run_id: &str,
     event: &RetrievalEvent,
 ) -> Result<(), String> {
@@ -268,7 +267,6 @@ pub fn persist_retrieval_event(
 
 /// Load retrieval events for a task run (for RAG judge input).
 pub fn load_retrieval_events(
-    conn: &crate::database::Connection,
     task_run_id: &str,
 ) -> Result<Vec<RetrievalEvent>, String> {
     Err("SQLite removed".to_string())
@@ -308,7 +306,6 @@ pub fn capture_retrieval_event<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_parse_rag_judge_response_valid() {

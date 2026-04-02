@@ -81,6 +81,9 @@ pub struct StepExecutor {
     pub(crate) pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     /// Path scope policy for working directory resolution boundary enforcement.
     pub(crate) path_scope_policy: crate::paths::PathScopePolicy,
+    /// Per-workflow security profile override (e.g., "standard", "strict").
+    /// When set, overrides the default profile from settings.
+    pub(crate) workflow_security_profile: Option<String>,
 }
 
 impl StepExecutor {
@@ -97,6 +100,7 @@ impl StepExecutor {
             handler_registry: HandlerRegistry::with_standard_handlers(),
             pid_tracker: None,
             path_scope_policy: crate::paths::PathScopePolicy::default(),
+            workflow_security_profile: None,
         }
     }
 
@@ -117,6 +121,7 @@ impl StepExecutor {
             handler_registry: HandlerRegistry::with_standard_handlers(),
             pid_tracker: None,
             path_scope_policy: crate::paths::PathScopePolicy::default(),
+            workflow_security_profile: None,
         }
     }
 
@@ -132,6 +137,11 @@ impl StepExecutor {
     /// Set the path scope policy for working directory boundary enforcement.
     pub fn set_path_scope_policy(&mut self, policy: crate::paths::PathScopePolicy) {
         self.path_scope_policy = policy;
+    }
+
+    /// Set the per-workflow security profile override.
+    pub fn set_workflow_security_profile(&mut self, profile: Option<String>) {
+        self.workflow_security_profile = profile;
     }
 
     /// Set the task run ID for database logging (mutable setter).
@@ -169,8 +179,11 @@ impl StepExecutor {
     /// This shares the executor's state (runtime_context, shared_variables)
     /// with the handlers to maintain consistency during step execution.
     pub(crate) async fn create_handler_context(&self) -> HandlerContext {
-        // Resolve the security policy from settings (workflow overrides will be added later)
-        let security_settings = crate::settings::get_security_settings();
+        // Resolve the security policy: workflow profile override > settings default
+        let mut security_settings = crate::settings::get_security_settings();
+        if let Some(ref wf_profile) = self.workflow_security_profile {
+            security_settings.default_profile = wf_profile.clone();
+        }
         let security_policy =
             crate::security::PolicyEngine::resolve(None, &security_settings);
         let audit_logger =

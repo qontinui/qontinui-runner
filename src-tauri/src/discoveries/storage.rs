@@ -3,7 +3,6 @@
 //! Provides persistent queue storage for discoveries that need to be synced
 //! to qontinui-web. Supports offline operation with retry capability.
 
-use crate::database::Connection;
 
 use super::types::{DiscoveryPayload, PendingDiscovery};
 
@@ -12,14 +11,14 @@ use super::types::{DiscoveryPayload, PendingDiscovery};
 /// The discovery is stored locally and will be synced when connectivity
 /// is available. Duplicates are detected by checking for similar discoveries
 /// within a recent timeframe.
-pub fn queue_discovery(conn: &Connection, payload: DiscoveryPayload) -> Result<String, String> {
+pub fn queue_discovery(payload: DiscoveryPayload) -> Result<String, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get all pending discoveries awaiting sync.
 ///
 /// Returns discoveries ordered by creation time (oldest first).
-pub fn get_pending_discoveries(conn: &Connection) -> Result<Vec<PendingDiscovery>, String> {
+pub fn get_pending_discoveries() -> Result<Vec<PendingDiscovery>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -30,13 +29,12 @@ pub fn get_pending_discoveries(conn: &Connection) -> Result<Vec<PendingDiscovery
 ///
 /// Backoff: 2^attempt_count minutes (1, 2, 4, 8, 16...)
 /// Max attempts: 10
-pub fn get_discoveries_for_retry(conn: &Connection) -> Result<Vec<PendingDiscovery>, String> {
+pub fn get_discoveries_for_retry() -> Result<Vec<PendingDiscovery>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get a specific pending discovery by ID.
 pub fn get_pending_discovery(
-    conn: &Connection,
     id: &str,
 ) -> Result<Option<PendingDiscovery>, String> {
     Err("SQLite removed".to_string())
@@ -45,32 +43,32 @@ pub fn get_pending_discovery(
 /// Mark a discovery as successfully sent.
 ///
 /// This removes the discovery from the pending queue.
-pub fn mark_discovery_sent(conn: &Connection, id: &str) -> Result<(), String> {
+pub fn mark_discovery_sent(id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Record a failed sync attempt for a discovery.
-pub fn record_sync_failure(conn: &Connection, id: &str, error: &str) -> Result<(), String> {
+pub fn record_sync_failure(id: &str, error: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Delete a discovery from the queue (manually cleared or expired).
-pub fn delete_discovery(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_discovery(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Delete all discoveries that have exceeded max retry attempts.
-pub fn cleanup_failed_discoveries(conn: &Connection) -> Result<u32, String> {
+pub fn cleanup_failed_discoveries() -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get the count of pending discoveries.
-pub fn get_pending_count(conn: &Connection) -> Result<u32, String> {
+pub fn get_pending_count() -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Delete old discoveries (older than N days) regardless of attempt count.
-pub fn cleanup_old_discoveries(conn: &Connection, days_old: i64) -> Result<u32, String> {
+pub fn cleanup_old_discoveries(days_old: i64) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 

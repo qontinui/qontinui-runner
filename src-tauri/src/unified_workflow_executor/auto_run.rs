@@ -157,6 +157,8 @@ pub fn launch_generated_workflow(
         max_sessions: Some(workflow.max_iterations),
         auto_run_generated: false, // Don't cascade auto-run
         approval_gate: workflow.approval_gate,
+        blocking_approval: false,
+        confidence_threshold: 0.85,
         max_context_tokens: 100_000,
         enforce_token_budget: workflow.enforce_token_budget,
         cross_workflow_learning: true,

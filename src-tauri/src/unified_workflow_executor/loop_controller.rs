@@ -88,7 +88,7 @@ impl LoopController {
                 app_handle.clone(),
                 pid_tracker.clone(),
             ),
-            knowledge_base: KnowledgeBase::new(Arc::new(crate::database::CheckpointDb)),
+            knowledge_base: KnowledgeBase::new(),
             canvas_manager: tokio::sync::Mutex::new(CanvasPanelManager::new(
                 app_state.canvas_state.clone(),
                 app_handle.clone(),
@@ -200,6 +200,15 @@ impl LoopController {
             }
             self.completion_executor.set_path_scope_policy(policy);
         }
+
+        // =====================================================================
+        // REGISTER COST TRACKERS for budget tracking and anomaly detection
+        // =====================================================================
+        let cost_trackers = self
+            .app_state
+            .register_cost_trackers(&config.execution_id)
+            .await;
+        self.agentic_executor.set_cost_trackers(cost_trackers);
 
         // =====================================================================
         // PROPAGATE MIDDLEWARE CHAIN to phase executors
@@ -1211,6 +1220,8 @@ impl LoopController {
                     max_sessions: config.max_sessions,
                     auto_run_generated: false,
                     approval_gate: config.approval_gate,
+                    blocking_approval: false,
+                    confidence_threshold: 0.85,
                     max_context_tokens: config.max_context_tokens,
                     enforce_token_budget: config.enforce_token_budget,
                     cross_workflow_learning: config.cross_workflow_learning,
@@ -1626,7 +1637,21 @@ impl LoopController {
                     .await;
             }
 
-            // Summary generation skipped — generate_task_summary_async not yet ported to PG
+            // Generate task summary (fire-and-forget)
+            {
+                let exec_id = config.execution_id.clone();
+                let dh = self.doctor_handle.clone();
+                let model = config.model_override.clone();
+                let provider = config.provider_override.clone();
+                tokio::spawn(async move {
+                    match crate::summary_generator::generate_task_summary_async(
+                        exec_id.clone(), dh, model, provider,
+                    ).await {
+                        Ok(result) => info!("Summary generated for {}: goal_achieved={}", exec_id, result.goal_achieved),
+                        Err(e) => warn!("Summary generation failed for {}: {}", exec_id, e),
+                    }
+                });
+            }
 
             info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
         } else {
@@ -1689,7 +1714,21 @@ impl LoopController {
                     .await;
             }
 
-            // Summary generation skipped — generate_task_summary_async not yet ported to PG
+            // Generate task summary for failed workflow (fire-and-forget)
+            {
+                let exec_id = config.execution_id.clone();
+                let dh = self.doctor_handle.clone();
+                let model = config.model_override.clone();
+                let provider = config.provider_override.clone();
+                tokio::spawn(async move {
+                    match crate::summary_generator::generate_task_summary_async(
+                        exec_id.clone(), dh, model, provider,
+                    ).await {
+                        Ok(result) => info!("Summary generated for failed workflow {}: goal_achieved={}", exec_id, result.goal_achieved),
+                        Err(e) => warn!("Summary generation failed for {}: {}", exec_id, e),
+                    }
+                });
+            }
 
             info!("=== WORKFLOW FAILED ===");
         }
@@ -1863,9 +1902,8 @@ impl LoopController {
                 }
             });
 
-            // LLM-as-judge and RAG judge (fire-and-forget, stubs with CheckpointDb)
+            // LLM-as-judge and RAG judge (fire-and-forget, stubs pending PG port)
             crate::orchestrator::learning_recorder::spawn_llm_judge_if_eligible(
-                Arc::new(crate::database::CheckpointDb),
                 judge_task_run_id.clone(),
                 judge_iterations,
                 judge_verification_passed,
@@ -1873,7 +1911,6 @@ impl LoopController {
             );
 
             crate::orchestrator::learning_recorder::spawn_rag_judge_if_eligible(
-                Arc::new(crate::database::CheckpointDb),
                 judge_task_run_id,
             );
 
@@ -2457,6 +2494,11 @@ impl LoopController {
 
         // Record flow control end for concurrency tracking
         flow_enforcer.record_end(&config.workflow_id, None).await;
+
+        // Clean up cost trackers for this run
+        self.app_state
+            .remove_cost_trackers(&config.execution_id)
+            .await;
 
         WorkflowResult {
             success: overall_passed,

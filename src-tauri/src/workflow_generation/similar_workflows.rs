@@ -7,7 +7,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::database::embeddings::{blob_to_vector, cosine_similarity};
-use crate::database::Connection;
 
 /// A similar workflow found by vector search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +29,6 @@ pub struct SimilarWorkflow {
 /// Uses the description embedding column for cosine similarity.
 /// Filters by category if provided and excludes meta-workflows.
 pub fn find_similar_workflows(
-    conn: &Connection,
     query_embedding: &[f32],
     category: Option<&str>,
     limit: usize,
@@ -44,7 +42,6 @@ pub fn find_similar_workflows(
 /// without the embedding service. If embeddings are available, they boost
 /// the score. GT workflows have category = 'ground_truth'.
 pub fn find_gt_reference_workflows(
-    conn: &Connection,
     description: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,

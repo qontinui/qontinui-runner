@@ -267,6 +267,42 @@ impl EventBroadcaster {
         ));
     }
 
+    /// Broadcast a deferred question created event.
+    pub fn deferred_question_created(
+        &self,
+        task_run_id: &str,
+        question_id: &str,
+        iteration: u32,
+        question: &str,
+        confidence: f64,
+        risk_level: &str,
+    ) {
+        self.broadcast_or_warn(AppEvent::deferred_question_created(
+            task_run_id,
+            question_id,
+            iteration,
+            question,
+            confidence,
+            risk_level,
+        ));
+    }
+
+    /// Broadcast a deferred question reviewed event.
+    pub fn deferred_question_reviewed(
+        &self,
+        task_run_id: &str,
+        question_id: &str,
+        status: &str,
+        rework_triggered: bool,
+    ) {
+        self.broadcast_or_warn(AppEvent::deferred_question_reviewed(
+            task_run_id,
+            question_id,
+            status,
+            rework_triggered,
+        ));
+    }
+
     /// Broadcast an AI output chunk event for real-time streaming.
     pub fn ai_output_chunk(&self, task_run_id: &str, chunk: &str, accumulated_length: usize) {
         self.broadcast_or_warn(AppEvent::ai_output_chunk(
@@ -347,6 +383,73 @@ impl EventBroadcaster {
     /// Broadcast an error event with context.
     pub fn error_with_context(&self, message: impl Into<String>, context: impl Into<String>) {
         self.broadcast_or_warn(AppEvent::error_with_context(message, context));
+    }
+
+    // ========================================================================
+    // Cost Management Convenience Methods
+    // ========================================================================
+
+    /// Broadcast a cost update event after an AI call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cost_update(
+        &self,
+        task_run_id: &str,
+        phase: &str,
+        iteration: Option<u32>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+        cost_usd: f64,
+        cumulative_cost_usd: f64,
+    ) {
+        self.broadcast_or_warn(AppEvent::cost_update(
+            task_run_id,
+            phase,
+            iteration,
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+            cost_usd,
+            cumulative_cost_usd,
+        ));
+    }
+
+    /// Broadcast a budget warning event.
+    pub fn budget_warning(
+        &self,
+        task_run_id: &str,
+        remaining_fraction: f64,
+        total_cost_usd: f64,
+        budget_limit_usd: f64,
+        message: &str,
+    ) {
+        self.broadcast_or_warn(AppEvent::budget_warning(
+            task_run_id,
+            remaining_fraction,
+            total_cost_usd,
+            budget_limit_usd,
+            message,
+        ));
+    }
+
+    /// Broadcast a cost anomaly event.
+    pub fn cost_anomaly(
+        &self,
+        task_run_id: &str,
+        cost_usd: f64,
+        mean_cost_usd: f64,
+        std_dev: f64,
+        z_score: f64,
+    ) {
+        self.broadcast_or_warn(AppEvent::cost_anomaly(
+            task_run_id,
+            cost_usd,
+            mean_cost_usd,
+            std_dev,
+            z_score,
+        ));
     }
 
     // ========================================================================

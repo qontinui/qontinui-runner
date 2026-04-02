@@ -3,7 +3,6 @@
 //! This module provides functionality to generate a unified workflow
 //! that uses the debug agent to analyze and fix detected errors.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -79,7 +78,7 @@ impl ErrorFixWorkflowGenerator {
     }
 
     /// Generate a unified workflow for fixing errors.
-    pub fn generate(&self, conn: &Connection) -> Result<GeneratedWorkflow, String> {
+    pub fn generate(&self) -> Result<GeneratedWorkflow, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -298,7 +297,6 @@ impl ErrorFixWorkflowGenerator {
     /// Generate a quick-fix workflow for a single error.
     pub fn generate_for_single_error(
         &self,
-        conn: &Connection,
         error_id: i64,
     ) -> Result<GeneratedWorkflow, String> {
         Err("SQLite removed".to_string())
@@ -316,7 +314,6 @@ impl Default for ErrorFixWorkflowGenerator {
 /// Note: The generator uses SQLite connection internally for complex curator queries.
 #[tauri::command]
 pub async fn generate_error_fix_workflow(
-    db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
     config: Option<ErrorFixWorkflowConfig>,
 ) -> Result<GeneratedWorkflow, String> {
     Err("SQLite removed".to_string())
@@ -327,7 +324,6 @@ pub async fn generate_error_fix_workflow(
 /// Note: The generator uses SQLite connection internally for complex curator queries.
 #[tauri::command]
 pub async fn generate_single_error_fix_workflow(
-    db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
     error_id: i64,
 ) -> Result<GeneratedWorkflow, String> {
     Err("SQLite removed".to_string())
@@ -412,8 +408,6 @@ pub struct FixableErrorsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_default_config() {

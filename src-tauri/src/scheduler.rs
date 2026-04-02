@@ -7,7 +7,6 @@
 // but are part of the complete scheduler interface
 #![allow(dead_code)]
 
-use crate::database::{CheckpointDb, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -480,19 +479,18 @@ pub struct NextTaskInfo {
 // ============================================================================
 
 /// Get all scheduled tasks
-pub fn get_all_tasks(db: &CheckpointDb) -> Vec<ScheduledTask> {
+pub fn get_all_tasks() -> Vec<ScheduledTask> {
     Vec::new()
 }
 
 /// Get a task by ID
-pub fn get_task(db: &CheckpointDb, id: &str) -> Option<ScheduledTask> {
+pub fn get_task(id: &str) -> Option<ScheduledTask> {
     None
 }
 
 /// Create a new scheduled task
 #[allow(clippy::too_many_arguments)]
 pub fn create_task(
-    db: &CheckpointDb,
     name: String,
     description: Option<String>,
     schedule: ScheduleExpression,
@@ -508,7 +506,6 @@ pub fn create_task(
 /// Update an existing task
 #[allow(clippy::too_many_arguments)]
 pub fn update_task(
-    db: &CheckpointDb,
     id: &str,
     name: Option<String>,
     description: Option<Option<String>>,
@@ -524,13 +521,12 @@ pub fn update_task(
 }
 
 /// Delete a task
-pub fn delete_task(db: &CheckpointDb, id: &str) -> Result<(), String> {
+pub fn delete_task(id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Record an execution
 pub fn record_execution(
-    db: &CheckpointDb,
     task_id: &str,
     record: TaskExecutionRecord,
 ) -> Result<(), String> {
@@ -538,13 +534,12 @@ pub fn record_execution(
 }
 
 /// Get execution history for a task
-pub fn get_task_history(db: &CheckpointDb, task_id: &str) -> Vec<TaskExecutionRecord> {
+pub fn get_task_history(task_id: &str) -> Vec<TaskExecutionRecord> {
     Vec::new()
 }
 
 /// Update the condition status for a task
 pub fn update_task_condition_status(
-    db: &CheckpointDb,
     task_id: &str,
     status: ConditionStatus,
 ) -> Result<(), String> {
@@ -552,26 +547,37 @@ pub fn update_task_condition_status(
 }
 
 /// Clear the condition status for a task (after execution or timeout)
-pub fn clear_task_condition_status(db: &CheckpointDb, task_id: &str) -> Result<(), String> {
+pub fn clear_task_condition_status(task_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get scheduler settings
-pub fn get_scheduler_settings(db: &CheckpointDb) -> SchedulerSettings {
-    todo!("SQLite removed")
+pub fn get_scheduler_settings() -> SchedulerSettings {
+    // SQLite removed — return defaults
+    SchedulerSettings {
+        enabled: false,
+        max_concurrent: 1,
+        default_auto_fix_on_failure: false,
+        timezone: None,
+    }
 }
 
 /// Update scheduler settings
 pub fn update_scheduler_settings(
-    db: &CheckpointDb,
     settings: SchedulerSettings,
 ) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get current scheduler status
-pub fn get_scheduler_status(db: &CheckpointDb) -> SchedulerStatus {
-    todo!("SQLite removed")
+pub fn get_scheduler_status() -> SchedulerStatus {
+    // SQLite removed — return empty status
+    SchedulerStatus {
+        enabled: false,
+        running_tasks: 0,
+        pending_tasks: 0,
+        next_task: None,
+    }
 }
 
 // ============================================================================
@@ -618,7 +624,7 @@ pub fn compute_next_run(
 }
 
 /// Update next_run for all tasks
-pub fn update_all_next_runs(db: &CheckpointDb) -> Result<(), String> {
+pub fn update_all_next_runs() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -629,7 +635,6 @@ pub fn update_all_next_runs(db: &CheckpointDb) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_cron_parsing() {

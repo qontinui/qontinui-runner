@@ -23,7 +23,6 @@ use crate::settings;
 // Re-export AiSessionContext from the canonical location
 pub use crate::execution_context::AiSessionContext;
 use crate::runtime_env::{AiSessionContextExt, ExecutionContextExt};
-use crate::database::CheckpointDb;
 
 // ============================================================================
 // Inline Python Execution Types
@@ -318,20 +317,19 @@ pub async fn restart_runner(
 /// NOTE: This is a synchronous function that blocks. For async contexts,
 /// use has_running_ai_tasks_async() or wrap this in spawn_blocking.
 #[allow(dead_code)]
-pub fn has_running_ai_tasks(db: &Arc<CheckpointDb>) -> bool {
+pub fn has_running_ai_tasks() -> bool {
     false
 }
 
 /// Check if any AI analysis tasks are currently running (async version).
 /// Uses spawn_blocking to avoid blocking the async runtime.
-pub async fn has_running_ai_tasks_async(db: Arc<CheckpointDb>) -> bool {
+pub async fn has_running_ai_tasks_async() -> bool {
     false
 }
 
 /// Migrate JSONL logs to SQLite for a completed task run.
 /// This should be called after a task completes (success or failure) to persist logs.
 pub async fn migrate_logs_for_task(
-    db: Arc<CheckpointDb>,
     task_id: &str,
     workflow_name: Option<String>,
 ) {
@@ -341,10 +339,9 @@ pub async fn migrate_logs_for_task(
 /// Helper function to mark a task run as complete with retry logic.
 /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
 /// Returns true if successfully marked complete, false otherwise.
-/// Also triggers log migration to persist JSONL logs to SQLite.
 ///
 /// Uses gated function - unified workflows have status managed by LoopController only.
-pub async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> bool {
+pub async fn complete_task_run_with_retry(task_id: &str) -> bool {
     false
 }
 

@@ -12,7 +12,6 @@ use tokio::runtime::Handle;
 use super::types::WorkflowCategory;
 use crate::database::pg::PgDb;
 use tracing::debug;
-use crate::database::Connection;
 
 // ── Data Structures ──────────────────────────────────────────────────────
 
@@ -133,15 +132,14 @@ pub fn get_failure_analysis_with_pg(
 // ── Private Query Functions ──────────────────────────────────────────────
 
 fn query_run_totals(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> (i64, i64) {
-    todo!("SQLite removed")
+    // SQLite removed — return zero totals
+    (0, 0)
 }
 
 fn query_abort_reasons(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> Vec<AbortReason> {
@@ -149,7 +147,6 @@ fn query_abort_reasons(
 }
 
 fn query_verification_failures(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> Vec<VerificationFailurePattern> {
@@ -157,7 +154,6 @@ fn query_verification_failures(
 }
 
 fn query_finding_distribution(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> Vec<CategoryCount> {
@@ -165,7 +161,6 @@ fn query_finding_distribution(
 }
 
 fn query_severity_distribution(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> Vec<CategoryCount> {
@@ -173,18 +168,24 @@ fn query_severity_distribution(
 }
 
 fn query_fix_effectiveness(
-    conn: &crate::database::Connection,
     since: &str,
 ) -> Vec<FixEffectivenessRecord> {
     Vec::new()
 }
 
-fn query_generation_quality(conn: &crate::database::Connection, since: &str) -> GenerationQualityMetrics {
-    todo!("SQLite removed")
+fn query_generation_quality(since: &str) -> GenerationQualityMetrics {
+    // SQLite removed — return empty metrics
+    GenerationQualityMetrics {
+        total_feedback: 0,
+        edits: 0,
+        deletes: 0,
+        avg_rating: None,
+        most_edited_fields: Vec::new(),
+        delete_reasons: Vec::new(),
+    }
 }
 
 fn query_pipeline_agent_failures(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> Vec<PipelineAgentFailureRecord> {
@@ -192,7 +193,6 @@ fn query_pipeline_agent_failures(
 }
 
 fn query_recurring_issues(
-    conn: &crate::database::Connection,
     since: &str,
     category: WorkflowCategory,
 ) -> Vec<RecurringIssue> {

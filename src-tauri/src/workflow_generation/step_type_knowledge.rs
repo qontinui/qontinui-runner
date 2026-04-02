@@ -7,7 +7,6 @@
 //! Knowledge is stored in SQLite, injected into the Builder Agent's prompt
 //! filtered to only the relevant step types.
 
-use crate::database::Connection;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,7 +76,6 @@ pub struct ListKnowledgeQuery {
 
 /// Load active knowledge entries for the given step types, ordered by priority DESC.
 pub fn load_knowledge_for_step_types(
-    conn: &Connection,
     step_types: &[&str],
 ) -> Vec<StepTypeKnowledge> {
     Vec::new()
@@ -130,14 +128,13 @@ pub fn format_knowledge_as_markdown(entries: &[StepTypeKnowledge]) -> String {
 
 /// List knowledge entries with optional filters.
 pub fn list_knowledge(
-    conn: &Connection,
     query: &ListKnowledgeQuery,
 ) -> Result<Vec<StepTypeKnowledge>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get a single knowledge entry by ID.
-pub fn get_knowledge(conn: &Connection, id: &str) -> Result<Option<StepTypeKnowledge>, String> {
+pub fn get_knowledge(id: &str) -> Result<Option<StepTypeKnowledge>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -145,7 +142,6 @@ pub fn get_knowledge(conn: &Connection, id: &str) -> Result<Option<StepTypeKnowl
 /// If `source_fix_id` is provided and an entry with that source already exists, returns the
 /// existing entry instead of creating a duplicate.
 pub fn insert_knowledge(
-    conn: &Connection,
     input: &InsertKnowledgeInput,
 ) -> Result<StepTypeKnowledge, String> {
     Err("SQLite removed".to_string())
@@ -153,7 +149,6 @@ pub fn insert_knowledge(
 
 /// Update an existing knowledge entry.
 pub fn update_knowledge(
-    conn: &Connection,
     id: &str,
     input: &UpdateKnowledgeInput,
 ) -> Result<StepTypeKnowledge, String> {
@@ -161,7 +156,7 @@ pub fn update_knowledge(
 }
 
 /// Delete a knowledge entry (hard delete).
-pub fn delete_knowledge(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_knowledge(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -246,10 +241,9 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn create_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! `template_promotion` (which handles workflow-to-template extraction)
 //! and `verification_templates` (which defines static template types).
 
-use crate::database::Connection;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -132,7 +131,7 @@ pub struct LifecycleEvent {
 // ============================================================================
 
 /// Ensure the template_performance and template_lifecycle_events tables exist.
-fn ensure_tables(conn: &Connection) -> Result<(), String> {
+fn ensure_tables() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -181,7 +180,6 @@ impl TemplateLifecycleManager {
         template_name: &str,
         passed: bool,
         quality_score: f64,
-        conn: &Connection,
     ) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
@@ -194,7 +192,6 @@ impl TemplateLifecycleManager {
     /// - Any source + failure_count >= retirement_after_failures + zero successes → Retired
     pub fn check_lifecycle_transitions(
         &self,
-        conn: &Connection,
     ) -> Result<LifecycleResult, String> {
         Err("SQLite removed".to_string())
     }
@@ -202,7 +199,6 @@ impl TemplateLifecycleManager {
     /// Get performance data for all tracked templates.
     pub fn get_all_performance(
         &self,
-        conn: &Connection,
     ) -> Result<Vec<TemplatePerformance>, String> {
         Err("SQLite removed".to_string())
     }
@@ -211,7 +207,6 @@ impl TemplateLifecycleManager {
     pub fn get_template_history(
         &self,
         template_id: &str,
-        conn: &Connection,
     ) -> Result<Vec<LifecycleEvent>, String> {
         Err("SQLite removed".to_string())
     }
@@ -223,7 +218,6 @@ impl TemplateLifecycleManager {
     /// Apply a source transition: update the performance row and record an event.
     fn transition_template(
         &self,
-        conn: &Connection,
         template_id: &str,
         old_source: TemplateSource,
         new_source: TemplateSource,
@@ -240,7 +234,6 @@ impl TemplateLifecycleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

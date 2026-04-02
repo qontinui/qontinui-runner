@@ -5,7 +5,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::Connection;
 
 use super::types::{
     CreateKnownIssueRequest, CreatePatternTemplateRequest, DetectionMethod, IssueCategory,
@@ -14,13 +13,12 @@ use super::types::{
 };
 
 /// Ensure the known_issues and issue_pattern_templates tables exist.
-pub fn ensure_tables(conn: &Connection) -> Result<(), String> {
+pub fn ensure_tables() -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Insert a new known issue. Returns the created KnownIssue.
 pub fn insert_known_issue(
-    conn: &Connection,
     req: &CreateKnownIssueRequest,
 ) -> Result<KnownIssue, String> {
     Err("SQLite removed".to_string())
@@ -28,7 +26,6 @@ pub fn insert_known_issue(
 
 /// Update an existing known issue.
 pub fn update_known_issue(
-    conn: &Connection,
     id: &str,
     req: &UpdateKnownIssueRequest,
 ) -> Result<KnownIssue, String> {
@@ -36,26 +33,24 @@ pub fn update_known_issue(
 }
 
 /// Get a known issue by ID.
-pub fn get_known_issue(conn: &Connection, id: &str) -> Result<Option<KnownIssue>, String> {
+pub fn get_known_issue(id: &str) -> Result<Option<KnownIssue>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// List known issues with optional filters.
 pub fn list_known_issues(
-    conn: &Connection,
     query: &ListKnownIssuesQuery,
 ) -> Result<Vec<KnownIssue>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Delete a known issue by ID. Returns true if a row was deleted.
-pub fn delete_known_issue(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_known_issue(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Resolve a known issue (set status to resolved + resolved_at).
 pub fn resolve_known_issue(
-    conn: &Connection,
     id: &str,
     resolution: Option<&str>,
 ) -> Result<(), String> {
@@ -63,26 +58,25 @@ pub fn resolve_known_issue(
 }
 
 /// Increment times_detected and update last_detected_at.
-pub fn increment_detected(conn: &Connection, id: &str) -> Result<(), String> {
+pub fn increment_detected(id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Increment times_checked and update last_checked_at.
-pub fn increment_checked(conn: &Connection, id: &str) -> Result<(), String> {
+pub fn increment_checked(id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Decay confidence when a regression check passes (issue was NOT detected).
 /// Confidence decays toward 0.0 by multiplying by a decay factor.
 /// If confidence drops below the threshold (0.1), auto-resolve the issue.
-pub fn decay_confidence_on_pass(conn: &Connection, id: &str) -> Result<(), String> {
+pub fn decay_confidence_on_pass(id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Find issues relevant to a spec (by spec_id, URL, or global).
 /// Returns active issues ordered by severity (critical first).
 pub fn find_issues_for_spec(
-    conn: &Connection,
     spec_id: &str,
     page_url: Option<&str>,
 ) -> Result<Vec<KnownIssue>, String> {
@@ -90,13 +84,12 @@ pub fn find_issues_for_spec(
 }
 
 /// List all pattern templates.
-pub fn list_pattern_templates(conn: &Connection) -> Result<Vec<IssuePatternTemplate>, String> {
+pub fn list_pattern_templates() -> Result<Vec<IssuePatternTemplate>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get a pattern template by ID.
 pub fn get_pattern_template(
-    conn: &Connection,
     id: &str,
 ) -> Result<Option<IssuePatternTemplate>, String> {
     Err("SQLite removed".to_string())
@@ -104,7 +97,6 @@ pub fn get_pattern_template(
 
 /// Insert a new pattern template. Returns the created IssuePatternTemplate.
 pub fn insert_pattern_template(
-    conn: &Connection,
     req: &CreatePatternTemplateRequest,
 ) -> Result<IssuePatternTemplate, String> {
     Err("SQLite removed".to_string())
@@ -116,7 +108,6 @@ pub fn insert_pattern_template(
 /// - "thorough": only critical + high severity
 /// - "regression": all active issues
 pub fn find_relevant_issues_for_generation(
-    conn: &Connection,
     depth: &str,
 ) -> Result<Vec<KnownIssue>, String> {
     Err("SQLite removed".to_string())
@@ -202,7 +193,6 @@ pub fn sort_issues_by_relevance(issues: &mut Vec<KnownIssue>, task_description: 
 /// - Sorts by relevance score (descending), then severity, then times_detected.
 /// - Issues with a positive relevance score appear before those with zero score.
 pub fn find_relevant_issues_for_generation_with_context(
-    conn: &Connection,
     depth: &str,
     task_description: &str,
 ) -> Result<Vec<KnownIssue>, String> {

@@ -80,6 +80,7 @@ pub mod queue;
 pub mod rag;
 pub mod recordings;
 pub mod reflection_api;
+pub mod restate_api;
 pub mod saved_api_requests;
 pub mod scheduler;
 pub mod sdk_client;

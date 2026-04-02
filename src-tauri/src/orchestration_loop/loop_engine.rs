@@ -1605,7 +1605,7 @@ async fn run_pipeline_loop(
                     generated_workflow_id,
                     fixes_implemented,
                     rebuild_triggered,
-                    None,
+                    stall_detected_this_iteration,
                     None,
                     diagnostic_result_this_iteration,
                 )

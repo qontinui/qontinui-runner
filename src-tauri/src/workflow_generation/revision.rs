@@ -846,6 +846,7 @@ mod tests {
             ai_reviewed: true,
             flow_control_json: None,
             phase_timeouts_json: None,
+            security_profile: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

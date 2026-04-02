@@ -380,6 +380,7 @@ impl AgenticVerificationResult {
                         None
                     },
                     blame_json: None,
+                    contingent_on: Vec::new(),
                 })
                 .collect(),
             total_tokens: self.total_tokens,
@@ -1188,6 +1189,7 @@ impl MultiAgentPipelineResult {
                             agentic_phase_ran: true,
                             agentic_phase_success: Some(lr.passed),
                             blame_json: None,
+                            contingent_on: Vec::new(),
                         }
                     })
                 })

@@ -4,7 +4,6 @@
 //! are stored in the `generation_rules` table. This allows the reflection system
 //! to create/modify rules at runtime without Rust recompilation.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -89,7 +88,7 @@ pub struct ListRulesQuery {
 // ============================================================================
 
 /// Load active rules for a specific agent and section, ordered by rule_number.
-pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<GenerationRule> {
+pub fn load_rules(agent: &str, section: &str) -> Vec<GenerationRule> {
     Vec::new()
 }
 
@@ -99,7 +98,6 @@ pub fn load_rules(conn: &Connection, agent: &str, section: &str) -> Vec<Generati
 /// - `Important` loads `'critical'` and `'important'` rules
 /// - `Full` loads all severities (`'critical'`, `'important'`, `'normal'`, `'hint'`)
 pub fn load_rules_progressive(
-    conn: &Connection,
     agent: &str,
     section: &str,
     tier: RuleTier,
@@ -108,20 +106,19 @@ pub fn load_rules_progressive(
 }
 
 /// Load all active rules for an agent, grouped by section.
-pub fn load_rules_by_agent(conn: &Connection, agent: &str) -> HashMap<String, Vec<GenerationRule>> {
+pub fn load_rules_by_agent(agent: &str) -> HashMap<String, Vec<GenerationRule>> {
     HashMap::new()
 }
 
 /// List rules with optional filters.
 pub fn list_rules(
-    conn: &Connection,
     query: &ListRulesQuery,
 ) -> Result<Vec<GenerationRule>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get a single rule by ID.
-pub fn get_rule(conn: &Connection, id: &str) -> Result<Option<GenerationRule>, String> {
+pub fn get_rule(id: &str) -> Result<Option<GenerationRule>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -195,20 +192,19 @@ pub fn format_rules_as_markdown_with_examples(
 // ============================================================================
 
 /// Get the next rule_number for a given agent + section.
-pub fn next_rule_number(conn: &Connection, agent: &str, section: &str) -> i32 {
+pub fn next_rule_number(agent: &str, section: &str) -> i32 {
     0
 }
 
 /// Insert a new generation rule.
 /// If `source_fix_id` is provided and a rule with that source already exists, returns the
 /// existing rule instead of creating a duplicate.
-pub fn insert_rule(conn: &Connection, input: &InsertRuleInput) -> Result<GenerationRule, String> {
+pub fn insert_rule(input: &InsertRuleInput) -> Result<GenerationRule, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Update an existing generation rule.
 pub fn update_rule(
-    conn: &Connection,
     id: &str,
     input: &UpdateRuleInput,
 ) -> Result<GenerationRule, String> {
@@ -216,7 +212,7 @@ pub fn update_rule(
 }
 
 /// Delete a generation rule (hard delete).
-pub fn delete_rule(conn: &Connection, id: &str) -> Result<bool, String> {
+pub fn delete_rule(id: &str) -> Result<bool, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -228,7 +224,6 @@ pub fn delete_rule(conn: &Connection, id: &str) -> Result<bool, String> {
 /// Creates a `rule_applications` row for each active rule, linking it to the
 /// generated workflow and (optionally) the task run that triggered generation.
 pub fn record_rule_applications(
-    conn: &Connection,
     rules: &[GenerationRule],
     workflow_id: Option<&str>,
     task_run_id: Option<&str>,
@@ -312,7 +307,6 @@ pub fn truncate_to_title(description: &str) -> String {
 ///
 /// Returns the number of newly created rules.
 pub fn create_rules_from_reflection_fixes(
-    conn: &Connection,
     fixes: &[ReflectionFix],
 ) -> Result<u32, String> {
     Err("SQLite removed".to_string())
@@ -331,7 +325,6 @@ pub fn create_rules_from_reflection_fixes(
 ///
 /// Returns the number of newly created rules.
 pub fn promote_insights_to_rules(
-    conn: &Connection,
     insights: &[super::prompt_analysis::PromptInsight],
 ) -> Result<u32, String> {
     Err("SQLite removed".to_string())
@@ -367,13 +360,13 @@ fn map_insight_to_rule_location(agent: &str, insight_type: &str) -> (String, Str
 // ============================================================================
 
 /// Increment the failure_count of a rule and auto-promote to 'critical' if threshold reached.
-pub fn increment_rule_failure_count(conn: &Connection, rule_id: &str) -> Result<(), String> {
+pub fn increment_rule_failure_count(rule_id: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Identify which rules were violated by a generation/verification error.
 /// Returns IDs of rules whose content keywords appear in the error message.
-pub fn identify_violated_rules(conn: &Connection, error_message: &str, agent: &str) -> Vec<String> {
+pub fn identify_violated_rules(error_message: &str, agent: &str) -> Vec<String> {
     Vec::new()
 }
 
@@ -385,7 +378,7 @@ pub fn identify_violated_rules(conn: &Connection, error_message: &str, agent: &s
 ///
 /// Each known issue with a `verification_step_template` becomes an "important" rule
 /// in the verification agent. Deduplicates by `source_fix_id` (using the known issue ID).
-pub fn sync_rules_from_known_issues(conn: &Connection) -> Result<u32, String> {
+pub fn sync_rules_from_known_issues() -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -613,6 +606,6 @@ mod tests {
 /// Ensure seed rules are present in the database.
 /// These are hardcoded quality rules that prevent known anti-patterns.
 /// Deduplicates by matching on provenance='seed' and title — safe to call repeatedly.
-pub fn ensure_seed_rules(conn: &Connection) {
+pub fn ensure_seed_rules() {
     // SQLite removed - no-op
 }

@@ -12,8 +12,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::Connection;
-use crate::database::CheckpointDb;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -149,12 +147,24 @@ impl AgentType {
 /// Provides methods for storing, querying, and building context from
 /// accumulated knowledge during task execution.
 pub struct KnowledgeBase {
-    db: Arc<CheckpointDb>,
+    db: KnowledgeDbStub,
+}
+
+/// Zero-cost stub that returns errors for all SQLite-era methods.
+struct KnowledgeDbStub;
+
+impl KnowledgeDbStub {
+    #[allow(clippy::too_many_arguments)]
+    fn create_task_knowledge(&self, _task_run_id: &str, _category: &str, _agent: &str, _iteration: u32, _content: &str, _evidence: Option<&str>, _confidence: &str, _related: &[String]) -> Result<crate::database::types::StoredTaskKnowledge, String> { Err("SQLite removed".into()) }
+    fn list_task_knowledge(&self, _task_run_id: &str, _category: Option<&str>, _active_only: bool) -> Result<Vec<crate::database::types::StoredTaskKnowledge>, String> { Err("SQLite removed".into()) }
+    fn resolve_task_knowledge(&self, _id: &str, _notes: Option<&str>) -> Result<(), String> { Err("SQLite removed".into()) }
+    fn get_iteration_verification_results(&self, _task_run_id: &str, _iteration: u32) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> { Err("SQLite removed".into()) }
+    fn get_latest_verification_results(&self, _task_run_id: &str) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> { Err("SQLite removed".into()) }
 }
 
 impl KnowledgeBase {
-    pub fn new(db: Arc<CheckpointDb>) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self { db: KnowledgeDbStub }
     }
 
     /// Compress knowledge if needed based on the provided configuration.
@@ -786,7 +796,6 @@ pub fn process_worker_output_full(
 
 /// Query execution spans for a task run from the database.
 fn query_execution_spans(
-    db: &CheckpointDb,
     task_run_id: &str,
 ) -> Result<Vec<ExecutionSpan>, String> {
     Err("SQLite removed".to_string())
@@ -1368,7 +1377,7 @@ pub fn build_iteration_context_with_compression(
     }
 
     // Add execution timing information if spans exist
-    if let Ok(spans) = query_execution_spans(&kb.db, task_run_id) {
+    if let Ok(spans) = query_execution_spans(task_run_id) {
         if let Some(timing_section) = build_timing_section(&spans) {
             context.push_str(&timing_section);
         }
@@ -1487,7 +1496,6 @@ pub struct TaskKnowledgeExport {
 /// Uses hybrid search: SQL filter by category + vector re-rank by content_embedding.
 /// Enables questions like "Has this root cause been identified before?"
 pub fn search_similar_knowledge(
-    conn: &crate::database::Connection,
     query_embedding: &[f32],
     category: Option<&str>,
     limit: usize,
@@ -1505,7 +1513,6 @@ pub fn search_similar_knowledge(
     };
 
     crate::database::hybrid_search::hybrid_search_knowledge(
-        conn,
         query_embedding,
         category,
         &config,
@@ -1545,8 +1552,6 @@ pub fn format_cross_task_knowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_parse_findings_single() {

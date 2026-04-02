@@ -36,6 +36,7 @@ pub struct AgenticExecutor {
     ai_executor: UnifiedAiSessionExecutor,
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
     step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
+    cost_trackers: std::sync::Mutex<Option<Arc<crate::cost_management::RunCostTrackers>>>,
 }
 
 impl AgenticExecutor {
@@ -50,6 +51,7 @@ impl AgenticExecutor {
             app_handle,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
+            cost_trackers: std::sync::Mutex::new(None),
         }
     }
 
@@ -77,6 +79,12 @@ impl AgenticExecutor {
         ctx: crate::step_injection::types::StepInjectionContext,
     ) {
         self.step_injection_ctx = Some(ctx);
+    }
+
+    /// Set cost trackers for budget tracking and anomaly detection.
+    /// Uses interior mutability so it can be called after Arc wrapping.
+    pub fn set_cost_trackers(&self, trackers: Arc<crate::cost_management::RunCostTrackers>) {
+        *self.cost_trackers.lock().unwrap() = Some(trackers);
     }
 
     /// Run the AI with the given prompt and failure context.
@@ -294,6 +302,9 @@ impl AgenticExecutor {
                                     0.0
                                 };
 
+                                let cumulative = self.cost_trackers.lock().unwrap().as_ref()
+                                    .map(|t| t.budget.snapshot().total_cost_usd).unwrap_or(0.0);
+
                                 crate::orchestrator::realtime_events::emit_cost_update(
                                     &self.app_handle,
                                     &config.execution_id,
@@ -304,8 +315,60 @@ impl AgenticExecutor {
                                     resp.cache_creation_tokens.unwrap_or(0),
                                     resp.cache_read_tokens.unwrap_or(0),
                                     cost_usd,
-                                    0.0, // cumulative_cost_usd - would need aggregation
+                                    cumulative,
                                 );
+
+                                // Record cost in budget tracker and check safety limits
+                                let trackers = self.cost_trackers.lock().unwrap().clone();
+                                if let Some(ref trackers) = trackers {
+                                    let total_tokens = resp.input_tokens.unwrap_or(0) + resp.output_tokens.unwrap_or(0);
+                                    let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
+
+                                    match budget_result {
+                                        crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
+                                            warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
+                                            crate::orchestrator::realtime_events::emit_budget_warning(
+                                                &self.app_handle,
+                                                &config.execution_id,
+                                                remaining_fraction,
+                                                trackers.budget.snapshot().total_cost_usd,
+                                                trackers.budget.snapshot().max_cost_usd,
+                                                &message,
+                                            );
+                                        }
+                                        crate::cost_management::budget::BudgetResult::Exceeded { ref phase, overage_usd } => {
+                                            tracing::error!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                                        }
+                                        crate::cost_management::budget::BudgetResult::Ok { .. } => {}
+                                    }
+
+                                    // Check circuit breaker
+                                    let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
+                                    if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
+                                        tracing::error!("Cost circuit breaker tripped: {}", reason);
+                                    }
+
+                                    // Check cache health
+                                    let cache_create = resp.cache_creation_tokens.unwrap_or(0);
+                                    let cache_read = resp.cache_read_tokens.unwrap_or(0);
+                                    trackers.circuit_breaker.record_cache_metrics(cache_create, cache_read);
+
+                                    // Anomaly detection
+                                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                                        if let Some(anomaly) = detector.check(cost_usd) {
+                                            warn!("Cost anomaly detected: ${:.4} (z-score: {:.2})", anomaly.cost_usd, anomaly.z_score);
+                                            crate::orchestrator::realtime_events::emit_cost_anomaly(
+                                                &self.app_handle,
+                                                &config.execution_id,
+                                                anomaly.cost_usd,
+                                                anomaly.mean,
+                                                anomaly.std_dev,
+                                                anomaly.z_score,
+                                            );
+                                        }
+                                        detector.update(cost_usd);
+                                    }
+                                }
                             }
                         }
                         let resp_llm_metrics = build_llm_metrics(
@@ -935,7 +998,6 @@ impl AgenticExecutor {
 
         // Attach DB flush context for periodic output persistence
         ai_config.db_flush_ctx = Some(crate::claude_session::runner::DbFlushContext {
-            db: Arc::new(crate::database::CheckpointDb),
             task_run_id: parent_task_id.clone(),
             iteration: iteration as i32,
         });
@@ -1115,6 +1177,9 @@ impl AgenticExecutor {
                     0.0
                 };
 
+                let cumulative = self.cost_trackers.lock().unwrap().as_ref()
+                    .map(|t| t.budget.snapshot().total_cost_usd).unwrap_or(0.0);
+
                 crate::orchestrator::realtime_events::emit_cost_update(
                     &self.app_handle,
                     &config.execution_id,
@@ -1125,8 +1190,55 @@ impl AgenticExecutor {
                     0,
                     0,
                     cost_usd,
-                    0.0,
+                    cumulative,
                 );
+
+                // Record cost in budget tracker and check safety limits
+                let trackers = self.cost_trackers.lock().unwrap().clone();
+                if let Some(ref trackers) = trackers {
+                    let total_tokens = session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
+                    let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
+
+                    match budget_result {
+                        crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
+                            warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
+                            crate::orchestrator::realtime_events::emit_budget_warning(
+                                &self.app_handle,
+                                &config.execution_id,
+                                remaining_fraction,
+                                trackers.budget.snapshot().total_cost_usd,
+                                trackers.budget.snapshot().max_cost_usd,
+                                &message,
+                            );
+                        }
+                        crate::cost_management::budget::BudgetResult::Exceeded { ref phase, overage_usd } => {
+                            tracing::error!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                        }
+                        crate::cost_management::budget::BudgetResult::Ok { .. } => {}
+                    }
+
+                    // Check circuit breaker
+                    let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
+                    if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
+                        tracing::error!("Cost circuit breaker tripped: {}", reason);
+                    }
+
+                    // Anomaly detection
+                    if let Ok(mut detector) = trackers.anomaly_detector.lock() {
+                        if let Some(anomaly) = detector.check(cost_usd) {
+                            warn!("Cost anomaly detected: ${:.4} (z-score: {:.2})", anomaly.cost_usd, anomaly.z_score);
+                            crate::orchestrator::realtime_events::emit_cost_anomaly(
+                                &self.app_handle,
+                                &config.execution_id,
+                                anomaly.cost_usd,
+                                anomaly.mean,
+                                anomaly.std_dev,
+                                anomaly.z_score,
+                            );
+                        }
+                        detector.update(cost_usd);
+                    }
+                }
             }
         }
         let session_llm_metrics = build_llm_metrics(
@@ -1276,7 +1388,6 @@ impl AgenticExecutor {
             is_resume: false,
         });
         ai_config.db_flush_ctx = Some(crate::claude_session::runner::DbFlushContext {
-            db: Arc::new(crate::database::CheckpointDb),
             task_run_id: parent_task_id.clone(),
             iteration: iteration as i32,
         });

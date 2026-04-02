@@ -5,7 +5,6 @@
 //! This enables prompt optimization by identifying which agents produce the
 //! most issues and what patterns correlate with high/low quality.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -151,7 +150,6 @@ pub fn score_agent(agent: &str, factors: &ScoreFactors) -> f64 {
 
 /// Collect score factors for a specific agent and artifact.
 pub fn collect_score_factors(
-    conn: &Connection,
     artifact_id: &str,
     workflow_id: Option<&str>,
     agent: &str,
@@ -161,7 +159,6 @@ pub fn collect_score_factors(
 
 /// Count reflection fixes attributed to a specific agent for a workflow.
 fn count_attributed_fixes(
-    conn: &Connection,
     workflow_id: &str,
     agent: &str,
 ) -> Result<(u32, u32), String> {
@@ -170,7 +167,6 @@ fn count_attributed_fixes(
 
 /// Get user feedback for a workflow.
 fn get_user_feedback(
-    conn: &Connection,
     workflow_id: &str,
 ) -> Result<(u32, bool, Option<f64>), String> {
     Err("SQLite removed".to_string())
@@ -182,7 +178,6 @@ fn get_user_feedback(
 
 /// Export scored training examples for a specific agent.
 pub fn export_training_data(
-    conn: &Connection,
     agent: &str,
     min_score: f64,
     limit: u32,
@@ -193,7 +188,6 @@ pub fn export_training_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     /// Returns a ScoreFactors with all zeros/None — the neutral baseline.
     fn default_factors() -> ScoreFactors {
@@ -398,7 +392,7 @@ use crate::database::Connection;
 
     /// Create all required tables in an in-memory SQLite database.
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

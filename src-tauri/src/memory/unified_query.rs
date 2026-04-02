@@ -2,7 +2,6 @@
 //!
 //! Queries all memory stores in parallel and fuses results using RRF scoring.
 
-use crate::database::CheckpointDb;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -763,7 +762,6 @@ mod tests {
     #[test]
     fn test_temporal_filter_to() {
         use chrono::TimeZone;
-use crate::database::CheckpointDb;
 
         let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();

@@ -9,7 +9,6 @@
 
 #![allow(dead_code)]
 
-use crate::database::CheckpointDb;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -659,7 +658,6 @@ impl OrchestratorState {
 /// The main orchestrator that coordinates task execution.
 pub struct Orchestrator {
     pub config: OrchestratorConfig,
-    pub db: Arc<CheckpointDb>,
     pub knowledge_base: KnowledgeBase,
     pub verifier: VerificationOrchestrator,
     /// Optional app handle for emitting AI output events.
@@ -681,21 +679,19 @@ impl Orchestrator {
     /// Create a new orchestrator without output capabilities.
     pub fn new(
         config: OrchestratorConfig,
-        db: Arc<CheckpointDb>,
         doctor_handle: Option<DoctorHandle>,
     ) -> Self {
-        todo!("SQLite removed")
+        unreachable!("SQLite removed — use PG-based Orchestrator constructor instead")
     }
 
     /// Create a new orchestrator with output capabilities.
     pub fn new_with_output(
         config: OrchestratorConfig,
-        db: Arc<CheckpointDb>,
         app_handle: tauri::AppHandle,
         session_ctx: Option<AiSessionContext>,
         doctor_handle: Option<DoctorHandle>,
     ) -> Self {
-        todo!("SQLite removed")
+        unreachable!("SQLite removed — use PG-based Orchestrator constructor instead")
     }
 
     /// Set the PostgreSQL database for unified memory queries.
@@ -1144,7 +1140,6 @@ impl Orchestrator {
             }
 
             let plan_result = create_simple_plan(
-                &self.db,
                 task_run_id,
                 goal,
                 &self.config.working_directory,
@@ -1566,7 +1561,6 @@ impl Orchestrator {
         if let Some(ref pg) = self.pg_db {
             let mem = super::memory::MemorySystem::new();
             let pg = Arc::clone(pg);
-            let db = Arc::clone(&self.db);
             let task_desc = base_prompt.to_string();
             let mem_ctx = tokio::runtime::Handle::current().block_on(async {
                 mem.build_context_unified(20, &task_desc, &pg).await
@@ -1697,7 +1691,6 @@ impl Orchestrator {
         if let Some(ref pg) = self.pg_db {
             let mem = super::memory::MemorySystem::new();
             let pg = Arc::clone(pg);
-            let db = Arc::clone(&self.db);
             let task_desc = base_prompt.to_string();
             let mem_ctx = tokio::runtime::Handle::current().block_on(async {
                 mem.build_context_unified(20, &task_desc, &pg).await
@@ -2052,7 +2045,6 @@ impl Orchestrator {
         );
 
         let plan_result = create_replan(
-            &self.db,
             &state.task_run_id,
             &self.config.working_directory,
             reason,
@@ -3061,7 +3053,6 @@ pub enum WorkerOutputAction {
 /// In practice, the session loop in mcp_api.rs will call these methods
 /// individually to integrate with the existing execution flow.
 pub async fn run_orchestrated_task(
-    db: Arc<CheckpointDb>,
     task_run_id: &str,
     goal: &str,
     base_prompt: &str,
@@ -3083,7 +3074,6 @@ pub async fn run_orchestrated_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_orchestrator_config_default() {

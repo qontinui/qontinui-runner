@@ -4,7 +4,7 @@
 //! This enables historical queries on events while keeping JSONL for real-time streaming.
 
 use crate::database::{
-    CheckpointDb, CreateTaskRunApiRequestInput, CreateTaskRunEventInput,
+    CreateTaskRunApiRequestInput, CreateTaskRunEventInput,
     CreateTaskRunPlaywrightResultInput, CreateTaskRunScreenshotInput,
 };
 use crate::iteration_bundle::{ActionEvent, ImageRecognitionEvent, PlaywrightLogs};
@@ -90,7 +90,6 @@ struct ApiRequestEvent {
 /// * `dev_logs_dir` - Path to .dev-logs/ directory
 /// * `workflow_name` - Optional workflow name for context
 pub fn migrate_logs_to_sqlite(
-    db: &CheckpointDb,
     task_run_id: &str,
     dev_logs_dir: &Path,
     workflow_name: Option<&str>,
@@ -100,7 +99,6 @@ pub fn migrate_logs_to_sqlite(
 
 /// Migrate general events from runner-general.jsonl
 fn migrate_general_events(
-    db: &CheckpointDb,
     task_run_id: &str,
     path: &Path,
     workflow_name: Option<&str>,
@@ -110,7 +108,6 @@ fn migrate_general_events(
 
 /// Migrate action events from runner-actions.jsonl
 fn migrate_action_events(
-    db: &CheckpointDb,
     task_run_id: &str,
     path: &Path,
     workflow_name: Option<&str>,
@@ -120,7 +117,6 @@ fn migrate_action_events(
 
 /// Migrate image recognition events from runner-image-recognition.jsonl
 fn migrate_image_recognition_events(
-    db: &CheckpointDb,
     task_run_id: &str,
     path: &Path,
     workflow_name: Option<&str>,
@@ -130,7 +126,6 @@ fn migrate_image_recognition_events(
 
 /// Migrate Playwright results from runner-playwright.jsonl
 fn migrate_playwright_results(
-    db: &CheckpointDb,
     task_run_id: &str,
     path: &Path,
 ) -> Result<usize, String> {
@@ -139,7 +134,6 @@ fn migrate_playwright_results(
 
 /// Migrate AI output events from ai-output.jsonl
 fn migrate_ai_output_events(
-    db: &CheckpointDb,
     task_run_id: &str,
     path: &Path,
     workflow_name: Option<&str>,
@@ -149,7 +143,6 @@ fn migrate_ai_output_events(
 
 /// Migrate API request events from runner-api-requests.jsonl
 fn migrate_api_request_events(
-    db: &CheckpointDb,
     task_run_id: &str,
     path: &Path,
 ) -> Result<usize, String> {
@@ -159,7 +152,6 @@ fn migrate_api_request_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_parse_general_event() {

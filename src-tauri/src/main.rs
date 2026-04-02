@@ -85,6 +85,8 @@ mod prompts;
 mod rag;
 mod recording;
 mod reflection;
+mod rework;
+mod restate;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
@@ -347,6 +349,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             crate::orchestration_loop::loop_engine::MultiLoopManager::new(),
         )),
         container_executor: TokioMutex::new(None), // Initialized via container settings when enabled
+        run_cost_trackers: TokioMutex::new(std::collections::HashMap::new()),
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -1452,6 +1455,40 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Inject Restate server if durable execution is enabled
+                let restate_settings = settings::load_settings().restate.clone();
+                if restate_settings.enabled {
+                    info!("Restate durable execution enabled — preparing server");
+                    let app_data_dir = dirs::data_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("qontinui-runner");
+                    match restate::lifecycle::ensure_restate_binary(
+                        &restate_settings,
+                        &app_data_dir,
+                    )
+                    .await
+                    {
+                        Ok(binary_path) => {
+                            let restate_config =
+                                restate::lifecycle::build_restate_process_config(
+                                    &restate_settings,
+                                    &binary_path,
+                                    &app_data_dir,
+                                );
+                            info!(
+                                "Restate server config: binary={}, health_port={:?}, group={}",
+                                restate_config.command,
+                                restate_config.health_port,
+                                restate_config.start_group
+                            );
+                            configs.push(restate_config);
+                        }
+                        Err(e) => {
+                            error!("Failed to prepare Restate binary: {} — workflows will use legacy execution", e);
+                        }
+                    }
+                }
+
                 // Filter out dev_only services in production
                 let is_dev = dev_services::is_dev_mode();
                 for config in configs {
@@ -1470,8 +1507,76 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Store the manager
                 let mut manager_lock = app_state_for_pcm.process_capture_manager.lock().await;
-                *manager_lock = Some(manager);
+                *manager_lock = Some(manager.clone());
                 info!("Process capture manager initialized");
+
+                // After processes are started, start Restate HTTP endpoint and register with server
+                if restate_settings.enabled {
+                    // Start the Restate service HTTP endpoint (where Restate calls back into)
+                    #[cfg(feature = "restate")]
+                    {
+                        let endpoint_port = restate_settings.service_endpoint_port;
+                        let restate_app_state = app_state_for_pcm.clone();
+                        let restate_config_storage = match crate::config_storage::ConfigStorage::new() {
+                            Ok(cs) => Arc::new(tokio::sync::Mutex::new(cs)),
+                            Err(e) => {
+                                warn!("ConfigStorage init for Restate failed, using degraded: {}", e);
+                                Arc::new(tokio::sync::Mutex::new(
+                                    crate::config_storage::ConfigStorage::new_degraded()
+                                ))
+                            }
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = restate::http_endpoint::start_restate_endpoint(
+                                endpoint_port,
+                                restate_app_state,
+                                restate_config_storage,
+                            ).await {
+                                error!("Restate HTTP endpoint failed: {}", e);
+                            }
+                        });
+                    }
+
+                    // Register our endpoint with the Restate server once both are ready
+                    let rs = restate_settings.clone();
+                    tokio::spawn(async move {
+                        // Wait for Restate admin port to be ready
+                        if crate::process_capture::health::wait_for_port_ready(
+                            rs.admin_port,
+                            std::time::Duration::from_secs(60),
+                        )
+                        .await
+                        {
+                            // Also wait for our service endpoint to be ready
+                            if crate::process_capture::health::wait_for_port_ready(
+                                rs.service_endpoint_port,
+                                std::time::Duration::from_secs(30),
+                            )
+                            .await
+                            {
+                                // Register the runner's service endpoint with Restate
+                                if let Err(e) = restate::lifecycle::register_service_endpoint(
+                                    rs.admin_port,
+                                    rs.service_endpoint_port,
+                                )
+                                .await
+                                {
+                                    error!("Failed to register Restate service endpoint: {}", e);
+                                }
+                            } else {
+                                error!("Restate service endpoint port {} not ready after 30s", rs.service_endpoint_port);
+                            }
+                        } else {
+                            error!("Restate admin port {} not ready after 60s", rs.admin_port);
+                        }
+                    });
+
+                    // Start health watchdog
+                    restate::lifecycle::spawn_restate_watchdog(
+                        manager.clone(),
+                        restate_settings.clone(),
+                    );
+                }
             });
 
             // Start Doctor health monitoring service in background
@@ -1633,6 +1738,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 "runner-instances-restored",
                                 &serde_json::json!({ "count": restored }),
                             );
+                        }
+                    });
+                }
+            }
+
+            // Clean up old security audit events based on retention policy
+            {
+                let security_settings = crate::settings::get_security_settings();
+                if security_settings.audit_enabled {
+                    let pg_for_audit = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                    let retention_days = security_settings.audit_retention_days;
+                    tauri::async_runtime::spawn(async move {
+                        match pg_for_audit.cleanup_old_audit_events(retention_days).await {
+                            Ok(deleted) if deleted > 0 => {
+                                info!("Audit cleanup: deleted {} events older than {} days", deleted, retention_days);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("Audit cleanup failed: {}", e);
+                            }
                         }
                     });
                 }

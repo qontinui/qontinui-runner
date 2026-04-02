@@ -62,6 +62,8 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         max_sessions: Some(3),
         auto_run_generated: false,
         approval_gate: false,
+        blocking_approval: false,
+        confidence_threshold: 0.85,
         max_context_tokens: 200_000,
         enforce_token_budget: false,
         cross_workflow_learning: false,

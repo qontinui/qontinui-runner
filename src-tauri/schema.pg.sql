@@ -795,6 +795,28 @@ CREATE TABLE IF NOT EXISTS approval_gates (
 CREATE INDEX IF NOT EXISTS idx_ag_task_run_id ON approval_gates(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_ag_status ON approval_gates(status);
 
+-- Deferred Questions (non-blocking human-in-the-loop feedback for autonomous workflows)
+CREATE TABLE IF NOT EXISTS deferred_questions (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    question TEXT NOT NULL,
+    context_json TEXT DEFAULT '{}',
+    auto_decision_type TEXT NOT NULL,
+    auto_decision_detail TEXT,
+    confidence DOUBLE PRECISION NOT NULL,
+    risk_level TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    git_checkpoint TEXT,
+    contingent_iterations TEXT DEFAULT '[]',
+    reviewer_comment TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_dq_task_run_id ON deferred_questions(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_dq_status ON deferred_questions(status);
+
 -- Settings (key-value store with JSON values)
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -3413,3 +3435,33 @@ CREATE INDEX IF NOT EXISTS idx_phase_model_routing_state
 
 -- Phase 1A: Add model_used tracking to learning_outcomes
 ALTER TABLE learning_outcomes ADD COLUMN IF NOT EXISTS model_used TEXT;
+
+-- ============================================================================
+-- Restate Durable Execution Tables
+-- ============================================================================
+
+-- Maps task_run executions to Restate workflow invocations
+CREATE TABLE IF NOT EXISTS restate_workflow_executions (
+    execution_id TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+    restate_workflow_id TEXT NOT NULL,
+    restate_invocation_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    launched_via_restate BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rwe_status ON restate_workflow_executions(status);
+CREATE INDEX IF NOT EXISTS idx_rwe_restate_wf ON restate_workflow_executions(restate_workflow_id);
+
+-- Pending awakeables for external resolution (approval gates, deferred HITL)
+CREATE TABLE IF NOT EXISTS restate_awakeables (
+    awakeable_id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    awakeable_type TEXT NOT NULL,
+    type_data TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_ra_execution ON restate_awakeables(execution_id);
+CREATE INDEX IF NOT EXISTS idx_ra_status ON restate_awakeables(status);

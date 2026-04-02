@@ -354,17 +354,16 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
-    fn insert_completed_run(conn: &Connection, id: &str, workflow_name: &str) {
+    fn insert_completed_run(id: &str, workflow_name: &str) {
         // SQLite removed - no-op
     }
 
-    fn add_output_chunks(conn: &Connection, task_run_id: &str, chunks: &[&str]) {
+    fn add_output_chunks(task_run_id: &str, chunks: &[&str]) {
         // SQLite removed - no-op
     }
 

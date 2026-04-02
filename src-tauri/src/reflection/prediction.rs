@@ -5,7 +5,6 @@
 //! - **Convergence gradient**: Compute continuous 0.0–1.0 score instead of binary threshold
 //! - **Relevance decay**: Score knowledge by effectiveness × recency × stability
 
-use crate::database::Connection;
 use serde::Serialize;
 use tracing::{debug, info};
 
@@ -62,7 +61,6 @@ pub struct ScoredKnowledge {
 /// Queries `fix_applications` for previous fixes applied to the same error signature,
 /// filters to resolved outcomes, and scores candidates by reuse_count × effective_rate × recency.
 pub fn predict_fix_for_error(
-    conn: &Connection,
     error_signature_hash: &str,
 ) -> Result<Option<PredictedFix>, String> {
     Err("SQLite removed".to_string())
@@ -82,7 +80,6 @@ pub fn predict_fix_for_error(
 /// - `effective_fix_rate`: effective / (effective + ineffective + regression)
 /// - `change_velocity`: fixes per run in sliding window
 pub fn compute_convergence_score(
-    conn: &Connection,
     workflow_name: &str,
     scope: &str,
 ) -> Result<ConvergenceMetrics, String> {
@@ -91,7 +88,6 @@ pub fn compute_convergence_score(
 
 /// Store a convergence snapshot for time-series analysis.
 pub fn store_convergence_snapshot(
-    conn: &Connection,
     workflow_name: &str,
     project_path: Option<&str>,
     scope: &str,
@@ -100,16 +96,15 @@ pub fn store_convergence_snapshot(
     Err("SQLite removed".to_string())
 }
 
-fn count_consecutive_clean_runs(conn: &Connection, workflow_name: &str) -> Result<u32, String> {
+fn count_consecutive_clean_runs(workflow_name: &str) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
-fn compute_novelty_score(conn: &Connection, workflow_name: &str) -> Result<f64, String> {
+fn compute_novelty_score(workflow_name: &str) -> Result<f64, String> {
     Err("SQLite removed".to_string())
 }
 
 fn compute_effective_fix_rate(
-    conn: &Connection,
     workflow_name: &str,
     scope: &str,
 ) -> Result<(u32, u32, f64), String> {
@@ -117,7 +112,6 @@ fn compute_effective_fix_rate(
 }
 
 fn compute_change_velocity_for_workflow(
-    conn: &Connection,
     workflow_name: &str,
     window_size: u32,
 ) -> Result<f64, String> {
@@ -133,7 +127,6 @@ fn compute_change_velocity_for_workflow(
 /// Returns fixes per run targeting `component_path` over the last `window_size` runs.
 /// Higher values indicate more volatile areas whose knowledge decays faster.
 pub fn compute_change_velocity(
-    conn: &Connection,
     component_path: &str,
     window_size: u32,
 ) -> Result<f64, String> {
@@ -154,7 +147,6 @@ pub fn compute_change_velocity(
 ///
 /// Returns entries sorted by relevance_score descending.
 pub fn score_knowledge_relevance(
-    conn: &Connection,
     workflow_name: &str,
     limit: u32,
 ) -> Result<Vec<ScoredKnowledge>, String> {
@@ -170,7 +162,6 @@ pub fn score_knowledge_relevance(
 /// Called when the prediction engine's suggested fix is applied, or when
 /// effectiveness evaluation links a fix to a resolved error.
 pub fn record_fix_application(
-    conn: &Connection,
     fix_id: &str,
     task_run_id: &str,
     error_signature_hash: Option<&str>,
@@ -181,7 +172,6 @@ pub fn record_fix_application(
 
 /// Update the outcome of a fix application after evaluation.
 pub fn update_fix_application_outcome(
-    conn: &Connection,
     application_id: &str,
     outcome: &str,
 ) -> Result<(), String> {
@@ -195,10 +185,9 @@ pub fn update_fix_application_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        todo!("SQLite removed")
+        panic!("SQLite tests disabled — use PG-based tests instead")
     }
 
     #[test]

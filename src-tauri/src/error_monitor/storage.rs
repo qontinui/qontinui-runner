@@ -2,7 +2,6 @@
 //!
 //! Provides database access for log sources and error events.
 
-use crate::database::Connection;
 use super::types::*;
 use std::collections::HashMap;
 
@@ -11,42 +10,42 @@ pub struct LogSourceStorage;
 
 impl LogSourceStorage {
     /// Insert a new log source configuration
-    pub fn insert(conn: &Connection, config: &LogSourceConfig) -> Result<i64, String> {
+    pub fn insert(config: &LogSourceConfig) -> Result<i64, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Update an existing log source configuration
-    pub fn update(conn: &Connection, id: i64, config: &LogSourceConfig) -> Result<(), String> {
+    pub fn update(id: i64, config: &LogSourceConfig) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// Delete a log source configuration
-    pub fn delete(conn: &Connection, id: i64) -> Result<(), String> {
+    pub fn delete(id: i64) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// Get a log source by ID
-    pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<LogSourceConfig>, String> {
+    pub fn get_by_id(id: i64) -> Result<Option<LogSourceConfig>, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Get all log sources
-    pub fn get_all(conn: &Connection) -> Result<Vec<LogSourceConfig>, String> {
+    pub fn get_all() -> Result<Vec<LogSourceConfig>, String> {
         Err("SQLite removed".to_string())
     }
 
     /// List log sources with optional enabled filter
-    pub fn list(conn: &Connection, enabled_only: bool) -> Result<Vec<LogSourceConfig>, String> {
+    pub fn list(enabled_only: bool) -> Result<Vec<LogSourceConfig>, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Delete a log source by name
-    pub fn delete_by_name(conn: &Connection, name: &str) -> Result<(), String> {
+    pub fn delete_by_name(name: &str) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// Get enabled log sources
-    pub fn get_enabled(conn: &Connection) -> Result<Vec<LogSourceConfig>, String> {
+    pub fn get_enabled() -> Result<Vec<LogSourceConfig>, String> {
         Err("SQLite removed".to_string())
     }
 }
@@ -57,7 +56,6 @@ pub struct ErrorEventStorage;
 impl ErrorEventStorage {
     /// Insert a new error event and return the stored event
     pub fn insert(
-        conn: &Connection,
         event: &ErrorEvent,
         task_run_id: Option<&str>,
         workflow_name: Option<&str>,
@@ -67,7 +65,6 @@ impl ErrorEventStorage {
 
     /// Insert a new error event or increment occurrence count if duplicate
     pub fn insert_or_increment(
-        conn: &Connection,
         event: &ErrorEvent,
         log_source_id: Option<i64>,
         task_run_id: Option<&str>,
@@ -77,18 +74,17 @@ impl ErrorEventStorage {
     }
 
     /// Get an error event by ID
-    pub fn get_by_id(conn: &Connection, id: i64) -> Result<Option<StoredErrorEvent>, String> {
+    pub fn get_by_id(id: i64) -> Result<Option<StoredErrorEvent>, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Query error events with filters
-    pub fn query(conn: &Connection, query: &ErrorQuery) -> Result<Vec<StoredErrorEvent>, String> {
+    pub fn query(query: &ErrorQuery) -> Result<Vec<StoredErrorEvent>, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Get unresolved errors (for debug agent context)
     pub fn get_unresolved(
-        conn: &Connection,
         task_run_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<StoredErrorEvent>, String> {
@@ -97,7 +93,6 @@ impl ErrorEventStorage {
 
     /// Update error status
     pub fn update_status(
-        conn: &Connection,
         id: i64,
         status: ErrorStatus,
         resolution_notes: Option<&str>,
@@ -107,7 +102,6 @@ impl ErrorEventStorage {
 
     /// Link an error event to a finding
     pub fn link_to_finding(
-        conn: &Connection,
         error_id: i64,
         finding_id: i64,
     ) -> Result<(), String> {
@@ -116,7 +110,6 @@ impl ErrorEventStorage {
 
     /// Mark an error as resolved by a task run
     pub fn mark_resolved_by_task(
-        conn: &Connection,
         error_id: i64,
         task_run_id: &str,
         resolution_notes: Option<&str>,
@@ -130,7 +123,7 @@ impl ErrorEventStorage {
     /// not application errors. The JSONL preprocessor now filters them out, but older
     /// events may still exist in the database from before the filter was added.
     /// This cleans them up on startup.
-    pub fn auto_resolve_spec_events(conn: &Connection) -> Result<usize, String> {
+    pub fn auto_resolve_spec_events() -> Result<usize, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -142,7 +135,6 @@ impl ErrorEventStorage {
     ///
     /// Returns the count of resolved errors.
     pub fn resolve_errors_by_task_run(
-        conn: &Connection,
         task_run_id: &str,
         resolved_by_task_run_id: &str,
     ) -> Result<usize, String> {
@@ -151,7 +143,6 @@ impl ErrorEventStorage {
 
     /// Get error summary statistics
     pub fn get_summary(
-        conn: &Connection,
         task_run_id: Option<&str>,
     ) -> Result<ErrorSummary, String> {
         Err("SQLite removed".to_string())
@@ -159,7 +150,6 @@ impl ErrorEventStorage {
 
     /// Get count breakdown by a column
     fn get_count_by_column(
-        conn: &Connection,
         column: &str,
         task_run_id: Option<&str>,
     ) -> Result<HashMap<String, u32>, String> {
@@ -168,7 +158,6 @@ impl ErrorEventStorage {
 
     /// Search errors by message content (FTS)
     pub fn search(
-        conn: &Connection,
         query: &str,
         limit: usize,
     ) -> Result<Vec<StoredErrorEvent>, String> {

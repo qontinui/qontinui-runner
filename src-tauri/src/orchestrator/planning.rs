@@ -579,7 +579,6 @@ pub struct PlanCreationResult {
 /// # Returns
 /// `PlanCreationResult` with the plan and storage info, or error string
 pub fn create_verification_plan(
-    db: &crate::database::CheckpointDb,
     task_run_id: &str,
     context: &PlanningContext,
     doctor_handle: Option<&DoctorHandle>,
@@ -598,7 +597,6 @@ pub fn create_verification_plan(
 /// * `workspace_root` - Path to workspace for project detection
 /// * `replan_reason` - Why the replan was requested
 pub fn create_replan(
-    db: &crate::database::CheckpointDb,
     task_run_id: &str,
     workspace_root: &str,
     replan_reason: &str,
@@ -611,7 +609,6 @@ pub fn create_replan(
 ///
 /// This is a convenience function for creating a plan from just a goal string.
 pub fn create_simple_plan(
-    db: &crate::database::CheckpointDb,
     task_run_id: &str,
     goal: &str,
     workspace_root: &str,
@@ -714,7 +711,6 @@ pub fn inject_plan_context(prompt: &str, plan: &VerificationPlan) -> String {
 ///
 /// This is the main entry point for integrating planning into task execution.
 pub fn ensure_verification_plan(
-    db: &crate::database::CheckpointDb,
     task_run_id: &str,
     goal: &str,
     workspace_root: &str,
@@ -726,7 +722,6 @@ pub fn ensure_verification_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::CheckpointDb;
 
     #[test]
     fn test_parse_planning_response() {

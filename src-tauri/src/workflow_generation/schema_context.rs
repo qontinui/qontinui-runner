@@ -4,7 +4,6 @@
 //! Documentation is auto-generated from the step type metadata registry
 //! rather than hardcoded static strings.
 
-use crate::database::Connection;
 use crate::database::pg::PgDb;
 use std::sync::Arc;
 

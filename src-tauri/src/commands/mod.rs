@@ -41,6 +41,7 @@ use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -209,6 +210,41 @@ pub struct AppState {
     /// When `Some` and `is_available()`, shell commands are executed in isolated containers
     /// instead of on the host. Falls back to host execution when `None` or unavailable.
     pub container_executor: TokioMutex<Option<IsolatedExecutor>>,
+    /// Per-run cost management trackers.
+    /// Keyed by execution_id. Created at run start, removed on completion.
+    pub run_cost_trackers: TokioMutex<HashMap<String, Arc<crate::cost_management::RunCostTrackers>>>,
+}
+
+impl AppState {
+    /// Register cost trackers for a new run.
+    pub async fn register_cost_trackers(
+        &self,
+        execution_id: &str,
+    ) -> Arc<crate::cost_management::RunCostTrackers> {
+        let trackers = Arc::new(crate::cost_management::RunCostTrackers::new());
+        self.run_cost_trackers
+            .lock()
+            .await
+            .insert(execution_id.to_string(), trackers.clone());
+        trackers
+    }
+
+    /// Get cost trackers for an active run.
+    pub async fn get_cost_trackers(
+        &self,
+        execution_id: &str,
+    ) -> Option<Arc<crate::cost_management::RunCostTrackers>> {
+        self.run_cost_trackers
+            .lock()
+            .await
+            .get(execution_id)
+            .cloned()
+    }
+
+    /// Remove cost trackers after run completion.
+    pub async fn remove_cost_trackers(&self, execution_id: &str) {
+        self.run_cost_trackers.lock().await.remove(execution_id);
+    }
 }
 
 /// Standard response structure for command handlers.

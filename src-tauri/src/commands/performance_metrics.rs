@@ -10,7 +10,6 @@
 //! - config_statistics table (aggregated transition/template statistics)
 //! - task_run_automation table (run-level metrics)
 
-use crate::database::Connection;
 use crate::commands::AppState;
 use crate::tiered_info;
 use chrono::{DateTime, Duration, Utc};
@@ -319,7 +318,6 @@ pub async fn get_success_rate_trend(
 
 /// Aggregate summary metrics for the dashboard header.
 fn aggregate_summary(
-    conn: &Connection,
     config_id: &str,
     range: &TimeRange,
 ) -> Result<PerformanceSummary, String> {
@@ -328,7 +326,6 @@ fn aggregate_summary(
 
 /// Count actions within the time range.
 fn count_actions_in_range(
-    conn: &Connection,
     config_id: &str,
     range: &TimeRange,
 ) -> Result<u32, String> {
@@ -337,7 +334,6 @@ fn count_actions_in_range(
 
 /// Aggregate action performance metrics from task_run_events.
 fn aggregate_action_performance(
-    conn: &Connection,
     config_id: &str,
     range: &TimeRange,
 ) -> Result<Vec<ActionPerformanceMetrics>, String> {
@@ -369,7 +365,6 @@ fn calculate_percentiles(durations: &[u64]) -> (u64, u64, u64) {
 
 /// Get transition metrics from config_statistics.
 fn get_transition_metrics(
-    conn: &Connection,
     config_id: &str,
 ) -> Result<Vec<StateTransitionMetrics>, String> {
     Err("SQLite removed".to_string())
@@ -377,7 +372,6 @@ fn get_transition_metrics(
 
 /// Get element resolution metrics from config_statistics.
 fn get_element_metrics(
-    conn: &Connection,
     config_id: &str,
 ) -> Result<Vec<ElementResolutionMetrics>, String> {
     Err("SQLite removed".to_string())
@@ -385,7 +379,6 @@ fn get_element_metrics(
 
 /// Aggregate success rate trend over time.
 fn aggregate_success_rate_trend(
-    conn: &Connection,
     config_id: &str,
     range: &TimeRange,
 ) -> Result<Vec<TimeSeriesDataPoint>, String> {
@@ -394,7 +387,6 @@ fn aggregate_success_rate_trend(
 
 /// Aggregate duration trend over time.
 fn aggregate_duration_trend(
-    conn: &Connection,
     config_id: &str,
     range: &TimeRange,
 ) -> Result<Vec<TimeSeriesDataPoint>, String> {
@@ -404,7 +396,6 @@ fn aggregate_duration_trend(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_calculate_percentiles_empty() {

@@ -2,7 +2,6 @@
 //!
 //! Provides CRUD operations and queries for the reflection_fixes table.
 
-use crate::database::Connection;
 
 use super::types::{CreateReflectionFixInput, EffectivenessReport, ReflectionFix};
 
@@ -72,20 +71,18 @@ fn compute_content_hash(
 /// Deduplicates by content hash — if an identical fix already exists with status 'applied',
 /// the existing fix is returned instead of creating a duplicate.
 pub fn insert_fix(
-    conn: &Connection,
     input: &CreateReflectionFixInput,
 ) -> Result<ReflectionFix, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get a single reflection fix by ID.
-pub fn get_fix(conn: &Connection, id: &str) -> Result<Option<ReflectionFix>, String> {
+pub fn get_fix(id: &str) -> Result<Option<ReflectionFix>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get all fixes created by analyzing a specific source run.
 pub fn get_fixes_for_source_run(
-    conn: &Connection,
     source_task_run_id: &str,
 ) -> Result<Vec<ReflectionFix>, String> {
     Err("SQLite removed".to_string())
@@ -93,7 +90,6 @@ pub fn get_fixes_for_source_run(
 
 /// Get all fixes for runs of a specific workflow, with optional status and effectiveness filters.
 pub fn get_fixes_by_workflow_name(
-    conn: &Connection,
     workflow_name: &str,
     status_filter: Option<&str>,
     effectiveness_filter: Option<&str>,
@@ -103,7 +99,6 @@ pub fn get_fixes_by_workflow_name(
 
 /// Get all project-scoped fixes for a given project path, with optional filters.
 pub fn get_fixes_by_project_path(
-    conn: &Connection,
     project_path: &str,
     status_filter: Option<&str>,
 ) -> Result<Vec<ReflectionFix>, String> {
@@ -111,13 +106,12 @@ pub fn get_fixes_by_project_path(
 }
 
 /// Get universal-scoped fixes ordered by reuse_count (SQL-only fallback when embeddings unavailable).
-pub fn get_universal_fixes(conn: &Connection, limit: usize) -> Result<Vec<ReflectionFix>, String> {
+pub fn get_universal_fixes(limit: usize) -> Result<Vec<ReflectionFix>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Promote a fix to universal scope with optional applicability context.
 pub fn promote_to_universal(
-    conn: &Connection,
     fix_id: &str,
     applicability_context: Option<&str>,
 ) -> Result<(), String> {
@@ -125,13 +119,12 @@ pub fn promote_to_universal(
 }
 
 /// Update the status of a reflection fix (applied/reverted/superseded).
-pub fn update_fix_status(conn: &Connection, id: &str, status: &str) -> Result<(), String> {
+pub fn update_fix_status(id: &str, status: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Update the effectiveness evaluation of a reflection fix.
 pub fn update_fix_effectiveness(
-    conn: &Connection,
     id: &str,
     effectiveness: &str,
     evidence: Option<&str>,
@@ -141,7 +134,6 @@ pub fn update_fix_effectiveness(
 
 /// Generate an aggregated effectiveness report for a workflow.
 pub fn get_effectiveness_report(
-    conn: &Connection,
     workflow_name: &str,
 ) -> Result<EffectivenessReport, String> {
     Err("SQLite removed".to_string())
@@ -149,7 +141,6 @@ pub fn get_effectiveness_report(
 
 /// Get all reflection task runs for a workflow (history).
 pub fn get_reflection_history(
-    conn: &Connection,
     workflow_name: &str,
 ) -> Result<Vec<ReflectionRunSummary>, String> {
     Err("SQLite removed".to_string())

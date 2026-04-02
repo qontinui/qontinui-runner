@@ -8,7 +8,6 @@
 //! The only remaining caller of this SQLite path is `autoresearch::engine::record_learning`.
 //! Once autoresearch is migrated to PG, this module can be removed.
 
-use crate::database::{CheckpointDb, Connection};
 use chrono::Utc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -260,7 +259,6 @@ pub fn categorize_error(msg: &str) -> String {
 /// optionally computes a context embedding for semantic retrieval.
 /// Automatically enriches error_type from error_message if not already set.
 pub fn record_learning_outcome(
-    conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<String, String> {
     Err("SQLite removed".to_string())
@@ -279,7 +277,6 @@ pub struct PatternInput {
 /// If a pattern with the same type and description already exists,
 /// increments its occurrence count. Otherwise creates a new pattern.
 pub fn record_learning_pattern(
-    conn: &Connection,
     pattern: &PatternInput,
 ) -> Result<String, String> {
     Err("SQLite removed".to_string())
@@ -292,7 +289,6 @@ pub fn record_learning_pattern(
 /// - Iteration count patterns
 /// - Common error types
 pub fn extract_and_record_patterns(
-    conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<Vec<String>, String> {
     Err("SQLite removed".to_string())
@@ -304,7 +300,6 @@ pub fn extract_and_record_patterns(
 /// a workflow completes. It records both the outcome, extracted patterns,
 /// and deterministic agentic metric scores.
 pub fn record_workflow_learning(
-    conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
     Err("SQLite removed".to_string())
@@ -316,7 +311,6 @@ pub fn record_workflow_learning(
 /// composite agentic score, and performs a Q-value update for the
 /// (state, architecture) pair.
 fn update_q_routing_table(
-    conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
     Err("SQLite removed".to_string())
@@ -389,7 +383,6 @@ pub async fn update_q_routing_table_pg(
 /// Runs synchronously after recording the learning outcome. Cost: zero LLM
 /// calls, milliseconds of wall time.
 fn score_and_persist_agentic_metrics(
-    conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
     Err("SQLite removed".to_string())
@@ -404,7 +397,6 @@ fn score_and_persist_agentic_metrics(
 /// Call this after `record_workflow_learning()` completes. It checks eligibility
 /// internally via `should_llm_judge()`.
 pub fn spawn_llm_judge_if_eligible(
-    db: std::sync::Arc<crate::database::CheckpointDb>,
     task_run_id: String,
     iterations: u32,
     verification_passed: bool,
@@ -415,7 +407,6 @@ pub fn spawn_llm_judge_if_eligible(
 
 /// PG-aware variant of spawn_llm_judge_if_eligible.
 pub fn spawn_llm_judge_if_eligible_pg(
-    db: std::sync::Arc<crate::database::CheckpointDb>,
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     task_run_id: String,
     iterations: u32,
@@ -426,7 +417,6 @@ pub fn spawn_llm_judge_if_eligible_pg(
 }
 
 fn spawn_llm_judge_if_eligible_inner(
-    db: std::sync::Arc<crate::database::CheckpointDb>,
     pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
     task_run_id: String,
     iterations: u32,
@@ -436,32 +426,14 @@ fn spawn_llm_judge_if_eligible_inner(
     // SQLite removed - no-op
 }
 
-/// Gather input data for the LLM judge from the database.
-fn gather_llm_judge_input(
-    db: &crate::database::CheckpointDb,
-    task_run_id: &str,
-) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
-    Err("SQLite removed".to_string())
-}
-
 /// Spawn async RAG judge evaluation for runs that captured retrieval events.
 ///
 /// Fire-and-forget: loads retrieval events from task_run_events, calls the RAG
 /// LLM judge, persists scores. Only runs if the task has retrieval events.
 pub fn spawn_rag_judge_if_eligible(
-    db: std::sync::Arc<crate::database::CheckpointDb>,
     task_run_id: String,
 ) {
     // SQLite removed - no-op
-}
-
-/// Persist judge scores via PG (sync wrapper for use in spawn_blocking).
-fn persist_judge_scores_sqlite(
-    _db: &crate::database::CheckpointDb,
-    task_run_id: &str,
-    results: &[crate::meta_optimizer::agentic_metrics::MetricResult],
-) -> Result<(), String> {
-    Err("SQLite removed".to_string())
 }
 
 /// Persist judge scores to PG.

@@ -638,7 +638,66 @@ type QueryRoot {
 Typed runner event for the `runnerEvents` subscription.
 Replaces untyped serde_json::Value events from /ws/events.
 """
-union RunnerEvent = OrchestratorStateChangeEvent | StepProgressEvent | TaskRunUpdateEvent | FindingDetectedEvent | FindingResolvedEvent | AiOutputChunkEvent | GenericRunnerEvent
+union RunnerEvent = OrchestratorStateChangeEvent | StepProgressEvent | TaskRunUpdateEvent | FindingDetectedEvent | FindingResolvedEvent | AiOutputChunkEvent | GqlCostUpdateEvent | GqlBudgetWarningEvent | GqlCostAnomalyEvent | GenericRunnerEvent
+
+"""
+Union of all cost-related events for the `costEvents` subscription.
+"""
+union CostEvent = GqlCostUpdateEvent | GqlBudgetWarningEvent | GqlCostAnomalyEvent
+
+"""
+Real-time cost update after each AI call.
+"""
+type GqlCostUpdateEvent {
+	taskRunId: String!
+	phase: String!
+	iteration: Int
+	"""
+	Input tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	inputTokens: String!
+	"""
+	Output tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	outputTokens: String!
+	"""
+	Cache creation tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	cacheCreationTokens: String!
+	"""
+	Cache read tokens (u64 as string for GraphQL BigInt compat).
+	"""
+	cacheReadTokens: String!
+	costUsd: Float!
+	cumulativeCostUsd: Float!
+	cacheHitRate: Float!
+	timestamp: String!
+}
+
+"""
+Budget warning when consumption exceeds a threshold.
+"""
+type GqlBudgetWarningEvent {
+	taskRunId: String!
+	remainingFraction: Float!
+	totalCostUsd: Float!
+	budgetLimitUsd: Float!
+	message: String!
+	timestamp: String!
+}
+
+"""
+Cost anomaly detected via statistical analysis.
+"""
+type GqlCostAnomalyEvent {
+	taskRunId: String!
+	costUsd: Float!
+	meanCostUsd: Float!
+	stdDev: Float!
+	zScore: Float!
+	message: String!
+	timestamp: String!
+}
 
 """
 Information about an external SDK app connection.
@@ -708,6 +767,11 @@ type SubscriptionRoot {
 	Auto-closes after all loops complete/stop/error or after 2 hours.
 	"""
 	multiOrchestrationLoopStatusStream(intervalMs: Int! = 2000): GqlMultiLoopStatus!
+	"""
+	Cost event stream — pushes cost updates, budget warnings, and anomalies.
+	Optional filter to receive only events for a specific task run.
+	"""
+	costEvents(taskRunId: String): CostEvent!
 }
 
 type TaskRunUpdateEvent {

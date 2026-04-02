@@ -92,6 +92,7 @@ macro_rules! row_to_workflow {
             phase_timeouts_json: non_empty($r.phase_timeouts_json),
             use_worktree: false,
             targeted_error_ids: vec![],
+            security_profile: None, // TODO: read from DB once column is added
         }
     }};
 }

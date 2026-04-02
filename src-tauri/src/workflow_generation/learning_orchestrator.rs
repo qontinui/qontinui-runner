@@ -11,7 +11,6 @@
 //!
 //! All learning is async and non-blocking — it never delays workflow execution.
 
-use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -116,16 +115,15 @@ impl LearningOrchestrator {
     pub fn on_run_complete(
         &mut self,
         run_context: &RunContext,
-        conn: &Connection,
     ) -> LearningActions {
-        todo!("SQLite removed")
+        // SQLite removed — return empty actions (no-op)
+        LearningActions::default()
     }
 
     /// Reflect on a run and curate any lessons learned.
     fn reflect_and_curate(
         &self,
         ctx: &RunContext,
-        conn: &Connection,
     ) -> Result<CurationResult, String> {
         Err("SQLite removed".to_string())
     }
@@ -216,7 +214,6 @@ pub fn build_learning_context(
     domain: Option<&str>,
     max_lessons: usize,
     max_examples: usize,
-    conn: &Connection,
 ) -> String {
     String::new()
 }
@@ -228,7 +225,6 @@ pub fn build_learning_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-use crate::database::Connection;
 
     #[test]
     fn test_default_config() {
