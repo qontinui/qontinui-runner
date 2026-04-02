@@ -21,14 +21,17 @@ impl LoopController {
         // check the parent task instead since children don't have their own task_run records
         let task_id_to_check = get_parent_task_id(execution_id);
 
-        // PG-primary: use block_on to call async PG from sync context
+        // PG-primary: use block_in_place + block_on to call async PG from sync context
+        // block_in_place tells tokio to move other tasks off this thread before blocking
         let task_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let pg = self.app_state.pg_db.clone();
             let id = task_id_to_check.clone();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { pg.get_task_run(&id).await })
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move { pg.get_task_run(&id).await })
+                })
             }))
-            .unwrap_or_else(|_| Err("block_on panicked".to_string()))
+            .unwrap_or_else(|_| Err("block_in_place panicked".to_string()))
         } else {
             Err("no tokio runtime".to_string())
         };
@@ -77,14 +80,16 @@ impl LoopController {
     pub(crate) fn is_task_paused(&self, execution_id: &str) -> bool {
         let task_id_to_check = get_parent_task_id(execution_id);
 
-        // PG-primary: use block_on to call async PG from sync context
+        // PG-primary: use block_in_place + block_on to call async PG from sync context
         let task_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let pg = self.app_state.pg_db.clone();
             let id = task_id_to_check.clone();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { pg.get_task_run(&id).await })
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move { pg.get_task_run(&id).await })
+                })
             }))
-            .unwrap_or_else(|_| Err("block_on panicked".to_string()))
+            .unwrap_or_else(|_| Err("block_in_place panicked".to_string()))
         } else {
             Err("no tokio runtime".to_string())
         };

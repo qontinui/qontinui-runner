@@ -105,3 +105,52 @@ pub async fn get_cost_dashboard(
         },
     })
 }
+
+/// Active budget status for the Cost Control panel.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveBudgetStatus {
+    pub execution_id: String,
+    pub total_cost_usd: f64,
+    pub max_cost_usd: f64,
+    pub remaining_fraction: f64,
+    pub total_tokens: u64,
+    pub max_tokens: u64,
+    pub circuit_breaker_tripped: bool,
+    pub anomaly_detector_sample_count: u32,
+    pub anomaly_detector_mean: f64,
+}
+
+/// Get the active budget status for the Cost Control panel.
+///
+/// Returns the budget snapshot, circuit breaker state, and anomaly detector
+/// stats for any currently active run. Returns None if no run is active.
+#[tauri::command]
+pub async fn get_active_budget_status(
+    state: tauri::State<'_, std::sync::Arc<crate::commands::AppState>>,
+) -> Result<Option<ActiveBudgetStatus>, String> {
+    let trackers = state.run_cost_trackers.lock().await;
+
+    // Return the first active run's status (most common case: single run)
+    for (execution_id, t) in trackers.iter() {
+        let snapshot = t.budget.snapshot();
+        let remaining = t.budget.remaining_fraction();
+        let (anomaly_count, anomaly_mean) = match t.anomaly_detector.lock() {
+            Ok(d) => (d.sample_count(), d.mean()),
+            Err(_) => (0, 0.0),
+        };
+
+        return Ok(Some(ActiveBudgetStatus {
+            execution_id: execution_id.clone(),
+            total_cost_usd: snapshot.total_cost_usd,
+            max_cost_usd: snapshot.max_cost_usd,
+            remaining_fraction: remaining,
+            total_tokens: snapshot.total_tokens,
+            max_tokens: snapshot.max_tokens,
+            circuit_breaker_tripped: t.circuit_breaker.is_tripped(),
+            anomaly_detector_sample_count: anomaly_count,
+            anomaly_detector_mean: anomaly_mean,
+        }));
+    }
+
+    Ok(None)
+}

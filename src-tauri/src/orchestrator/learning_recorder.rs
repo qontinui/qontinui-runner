@@ -9,7 +9,7 @@
 //! Once autoresearch is migrated to PG, this module can be removed.
 
 use chrono::Utc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Outcome of a workflow execution for learning purposes.
@@ -397,33 +397,52 @@ fn score_and_persist_agentic_metrics(
 /// Call this after `record_workflow_learning()` completes. It checks eligibility
 /// internally via `should_llm_judge()`.
 pub fn spawn_llm_judge_if_eligible(
-    task_run_id: String,
-    iterations: u32,
-    verification_passed: bool,
-    was_stopped: bool,
-) {
-    // SQLite removed - no-op
-}
-
-/// PG-aware variant of spawn_llm_judge_if_eligible.
-pub fn spawn_llm_judge_if_eligible_pg(
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     task_run_id: String,
     iterations: u32,
     verification_passed: bool,
     was_stopped: bool,
 ) {
-    // SQLite removed - no-op
-}
+    use crate::meta_optimizer::agentic_metrics::llm_judge;
 
-fn spawn_llm_judge_if_eligible_inner(
-    pg_db: Option<std::sync::Arc<crate::database::pg::PgDb>>,
-    task_run_id: String,
-    iterations: u32,
-    verification_passed: bool,
-    was_stopped: bool,
-) {
-    // SQLite removed - no-op
+    if !llm_judge::should_llm_judge(iterations, verification_passed, was_stopped) {
+        debug!("LLM judge: skipping task {} (not eligible)", task_run_id);
+        return;
+    }
+
+    info!("LLM judge: spawning evaluation for task {}", task_run_id);
+
+    tokio::spawn(async move {
+        // 1. Gather input from PG
+        let input = match gather_llm_judge_input_pg(&pg_db, &task_run_id).await {
+            Ok(input) => input,
+            Err(e) => {
+                warn!("LLM judge: failed to gather input for {}: {}", task_run_id, e);
+                return;
+            }
+        };
+
+        // 2. Call the LLM judge (blocking AI call)
+        let results = match tokio::task::spawn_blocking(move || {
+            llm_judge::evaluate_sync(&input)
+        }).await {
+            Ok(results) => results,
+            Err(e) => {
+                warn!("LLM judge: spawn_blocking panicked for {}: {}", task_run_id, e);
+                return;
+            }
+        };
+
+        if results.is_empty() {
+            debug!("LLM judge: no results for task {}", task_run_id);
+            return;
+        }
+
+        // 3. Persist scores to PG
+        if let Err(e) = persist_judge_scores_pg(&pg_db, &task_run_id, &results).await {
+            warn!("LLM judge: failed to persist scores for {}: {}", task_run_id, e);
+        }
+    });
 }
 
 /// Spawn async RAG judge evaluation for runs that captured retrieval events.
@@ -431,9 +450,67 @@ fn spawn_llm_judge_if_eligible_inner(
 /// Fire-and-forget: loads retrieval events from task_run_events, calls the RAG
 /// LLM judge, persists scores. Only runs if the task has retrieval events.
 pub fn spawn_rag_judge_if_eligible(
+    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     task_run_id: String,
 ) {
-    // SQLite removed - no-op
+
+    info!("RAG judge: spawning evaluation for task {}", task_run_id);
+
+    tokio::spawn(async move {
+        // 1. Load retrieval events from PG
+        let retrieval_events = match pg_db.load_retrieval_events(&task_run_id).await {
+            Ok(events) => events,
+            Err(e) => {
+                warn!("RAG judge: failed to load retrieval events for {}: {}", task_run_id, e);
+                return;
+            }
+        };
+
+        if retrieval_events.is_empty() {
+            debug!("RAG judge: no retrieval events for task {}, skipping", task_run_id);
+            return;
+        }
+
+        // 2. Get task prompt for context
+        let task_prompt = match pg_db.get_task_prompt(&task_run_id).await {
+            Ok(prompt) => prompt,
+            Err(e) => {
+                warn!("RAG judge: failed to get task prompt for {}: {}", task_run_id, e);
+                return;
+            }
+        };
+
+        // 3. Get outcome summary as the generated output
+        let generated_output = pg_db.get_execution_trace_summary(&task_run_id).await.ok().flatten();
+
+        let input = crate::meta_optimizer::agentic_metrics::rag_judge::RagJudgeInput {
+            task_run_id: task_run_id.clone(),
+            task_prompt,
+            retrieval_events,
+            generated_output,
+        };
+
+        // 4. Call the RAG judge (blocking AI call)
+        let results = match tokio::task::spawn_blocking(move || {
+            crate::meta_optimizer::agentic_metrics::rag_judge::evaluate_rag_sync(&input)
+        }).await {
+            Ok(results) => results,
+            Err(e) => {
+                warn!("RAG judge: spawn_blocking panicked for {}: {}", task_run_id, e);
+                return;
+            }
+        };
+
+        if results.is_empty() {
+            debug!("RAG judge: no results for task {}", task_run_id);
+            return;
+        }
+
+        // 5. Persist scores to PG
+        if let Err(e) = persist_judge_scores_pg(&pg_db, &task_run_id, &results).await {
+            warn!("RAG judge: failed to persist scores for {}: {}", task_run_id, e);
+        }
+    });
 }
 
 /// Persist judge scores to PG.

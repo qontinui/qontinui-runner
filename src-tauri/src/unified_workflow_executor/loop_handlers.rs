@@ -2325,6 +2325,30 @@ impl LoopController {
                     "Deferred question {} recorded (iteration {}, confidence={:.2}, risk={})",
                     dq.id, ctx.iteration, confidence, risk_level.as_str()
                 );
+
+                // Sync deferred questions to web backend (best-effort, non-blocking)
+                {
+                    let pg = self.app_state.pg_db.clone();
+                    let exec_id = config.execution_id.clone();
+                    tokio::spawn(async move {
+                        if let Ok(questions) = pg.get_deferred_questions_for_task_run(&exec_id).await {
+                            let sync_questions: Vec<_> = questions
+                                .iter()
+                                .map(crate::commands::task_sync::json_to_deferred_question_sync)
+                                .collect();
+                            let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                            if let Err(e) = sync_service
+                                .sync_deferred_questions(&exec_id, sync_questions)
+                                .await
+                            {
+                                tracing::debug!(
+                                    "Deferred questions backend sync failed (non-fatal): {}",
+                                    e
+                                );
+                            }
+                        }
+                    });
+                }
             } else {
                 debug!(
                     "Auto-approved (confidence={:.2}, risk={}) on iteration {}",

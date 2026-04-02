@@ -289,6 +289,36 @@ pub struct AITaskFindingsBatchRequest {
     pub findings: Vec<AITaskFindingCreateRequest>,
 }
 
+/// Request to sync a single deferred question
+#[derive(Debug, Serialize)]
+pub struct DeferredQuestionSyncRequest {
+    pub id: String,
+    pub iteration: i32,
+    pub question: String,
+    pub context_json: String,
+    pub auto_decision_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_decision_detail: Option<String>,
+    pub confidence: f64,
+    pub risk_level: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_checkpoint: Option<String>,
+    pub contingent_iterations: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer_comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+}
+
+/// Request to batch sync deferred questions
+#[derive(Debug, Serialize)]
+pub struct DeferredQuestionBatchRequest {
+    pub questions: Vec<DeferredQuestionSyncRequest>,
+}
+
 /// Response from syncing findings
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AITaskFindingSyncResponse {
@@ -358,6 +388,38 @@ impl From<&Finding> for AITaskFindingCreateRequest {
             question: finding.user_input.as_ref().map(|u| u.question.clone()),
             input_options: finding.user_input.as_ref().and_then(|u| u.options.clone()),
         }
+    }
+}
+
+/// Convert a JSON row from PgDb into a DeferredQuestionSyncRequest.
+pub fn json_to_deferred_question_sync(q: &serde_json::Value) -> DeferredQuestionSyncRequest {
+    DeferredQuestionSyncRequest {
+        id: q["id"].as_str().unwrap_or("").to_string(),
+        iteration: q["iteration"].as_i64().unwrap_or(0) as i32,
+        question: q["question"].as_str().unwrap_or("").to_string(),
+        context_json: q["context_json"]
+            .as_str()
+            .unwrap_or("{}")
+            .to_string(),
+        auto_decision_type: q["auto_decision_type"]
+            .as_str()
+            .unwrap_or("proceeded")
+            .to_string(),
+        auto_decision_detail: q["auto_decision_detail"].as_str().map(String::from),
+        confidence: q["confidence"].as_f64().unwrap_or(0.0),
+        risk_level: q["risk_level"]
+            .as_str()
+            .unwrap_or("low")
+            .to_string(),
+        status: q["status"].as_str().unwrap_or("pending").to_string(),
+        git_checkpoint: q["git_checkpoint"].as_str().map(String::from),
+        contingent_iterations: q["contingent_iterations"]
+            .as_str()
+            .unwrap_or("[]")
+            .to_string(),
+        reviewer_comment: q["reviewer_comment"].as_str().map(String::from),
+        created_at: q["created_at"].as_str().map(String::from),
+        reviewed_at: q["reviewed_at"].as_str().map(String::from),
     }
 }
 
@@ -646,6 +708,65 @@ impl AITaskSyncService {
         Ok(result)
     }
 
+    /// Sync deferred questions to the backend.
+    pub async fn sync_deferred_questions(
+        &self,
+        task_id: &str,
+        questions: Vec<DeferredQuestionSyncRequest>,
+    ) -> Result<(), String> {
+        if questions.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Syncing {} deferred questions for task {}",
+            questions.len(),
+            task_id
+        );
+
+        let access_token = self.check_auth()?;
+
+        let batch = DeferredQuestionBatchRequest { questions };
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/v1/task-runs/{}/deferred-questions",
+                get_api_base_url(),
+                task_id
+            ))
+            .bearer_auth(&access_token)
+            .json(&batch)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to sync deferred questions: {}", e);
+                format!("Network error: {}", e)
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!(
+                "Sync deferred questions failed with status {}: {}",
+                status, error_text
+            );
+            return Err(format!(
+                "Failed to sync deferred questions: {}",
+                error_text
+            ));
+        }
+
+        info!(
+            "Deferred questions synced successfully for task {}",
+            task_id
+        );
+        Ok(())
+    }
+
     /// Sync a verification phase result to the backend.
     pub async fn sync_verification_result(
         &self,
@@ -794,9 +915,22 @@ impl AITaskSyncService {
             self.sync_findings(task_id, &findings).await?;
         }
 
-        // 3. Verification results sync removed — was checkpoint_db-only
+        // 3. Sync all deferred questions
+        let dq_rows = db
+            .get_deferred_questions_for_task_run(task_id)
+            .await
+            .unwrap_or_default();
+        if !dq_rows.is_empty() {
+            let sync_questions: Vec<DeferredQuestionSyncRequest> = dq_rows
+                .iter()
+                .map(json_to_deferred_question_sync)
+                .collect();
+            self.sync_deferred_questions(task_id, sync_questions).await?;
+        }
 
-        // 4. If task is complete, sync completion status
+        // 4. Verification results sync removed — was checkpoint_db-only
+
+        // 5. If task is complete, sync completion status
         if task.status != "running" {
             self.sync_task_completed(&task).await?;
         }
@@ -877,6 +1011,32 @@ pub async fn sync_ai_findings(
 
     let service = AITaskSyncService::new();
     service.sync_findings(&task_id, &findings).await
+}
+
+/// Sync deferred questions to the backend.
+#[tauri::command]
+pub async fn sync_deferred_questions(
+    task_id: String,
+    app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
+) -> Result<(), String> {
+    let questions = app_state
+        .pg_db
+        .get_deferred_questions_for_task_run(&task_id)
+        .await?;
+
+    if questions.is_empty() {
+        return Ok(());
+    }
+
+    let sync_questions: Vec<DeferredQuestionSyncRequest> = questions
+        .iter()
+        .map(json_to_deferred_question_sync)
+        .collect();
+
+    let service = AITaskSyncService::new();
+    service
+        .sync_deferred_questions(&task_id, sync_questions)
+        .await
 }
 
 /// Sync task completion to the backend.

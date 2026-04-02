@@ -304,7 +304,7 @@ pub async fn execute_workflow(
 
     while iteration <= max_iterations {
         // Check for stop request
-        if is_stop_requested(app_state).await {
+        if is_stop_requested(app_state, execution_id).await {
             info!("Stop requested at iteration {}", iteration);
             was_stopped = true;
             break;
@@ -444,12 +444,23 @@ pub async fn execute_workflow(
 /// The stop mechanism uses the existing execution control flow:
 /// the frontend calls `stop_execution` which signals the executor.
 /// For Restate workflows, we check if the execution status was updated to "stopped".
-async fn is_stop_requested(app_state: &AppState) -> bool {
-    // In the Restate model, stop requests are communicated via the
-    // QontinuiWorkflow::request_stop shared handler which sets a flag
-    // in the Restate Virtual Object state. This function serves as a
-    // fallback check via the existing execution control mechanism.
-    false // TODO: Implement proper stop detection via Restate state or PG flag
+async fn is_stop_requested(app_state: &AppState, execution_id: &str) -> bool {
+    // Query PG for the current task run status. The frontend sets
+    // the status to 'stopped' or 'cancelling' via the stop_execution command.
+    match app_state.pg_db.get_task_run(execution_id).await {
+        Ok(Some(task_run)) => {
+            let status = task_run.status.as_str();
+            status == "stopped" || status == "cancelling"
+        }
+        Ok(None) => {
+            warn!("is_stop_requested: task run {} not found", execution_id);
+            false
+        }
+        Err(e) => {
+            warn!("is_stop_requested: failed to query task run {}: {}", execution_id, e);
+            false
+        }
+    }
 }
 
 /// Get the current git HEAD commit hash for compensation tracking.

@@ -1286,20 +1286,66 @@ impl PgDb {
         self.get_verification_phase_result(task_run_id, iteration).await
     }
 
-    /// Get execution spans for a task run.
+    /// Get execution spans for a task run with optional server-side filtering.
     pub async fn get_execution_spans(
         &self,
         execution_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
+        self.get_execution_spans_filtered(execution_id, None, None, None).await
+    }
+
+    /// Get execution spans with optional filtering pushed down to SQL.
+    ///
+    /// - `name_pattern`: ILIKE pattern for span_type (e.g. "workflow.%")
+    /// - `min_duration_ms`: only spans with duration_ms >= this value
+    /// - `limit`: max rows returned (default unlimited)
+    pub async fn get_execution_spans_filtered(
+        &self,
+        execution_id: &str,
+        name_pattern: Option<&str>,
+        min_duration_ms: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
+
+        // Build dynamic query with optional WHERE clauses
+        let mut query = String::from(
             r#"SELECT id, execution_id, span_type, phase, iteration, step_index,
                       started_at, completed_at, duration_ms, metadata_json
                FROM execution_spans
-               WHERE execution_id = $1
-               ORDER BY started_at ASC"#,
-            &[&execution_id],
-        ).await.map_err(|e| format!("PG get_execution_spans: {}", e))?;
+               WHERE execution_id = $1"#,
+        );
+
+        let mut param_idx = 2u32;
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
+            Box::new(execution_id.to_string()),
+        ];
+
+        if let Some(pattern) = name_pattern {
+            query.push_str(&format!(" AND span_type ILIKE ${}", param_idx));
+            params.push(Box::new(pattern.to_string()));
+            param_idx += 1;
+        }
+
+        if let Some(min_dur) = min_duration_ms {
+            query.push_str(&format!(" AND duration_ms >= ${}", param_idx));
+            params.push(Box::new(min_dur));
+            param_idx += 1;
+        }
+
+        query.push_str(" ORDER BY started_at ASC");
+
+        if let Some(lim) = limit {
+            query.push_str(&format!(" LIMIT ${}", param_idx));
+            params.push(Box::new(lim as i64));
+        }
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+
+        let rows = conn.query(&query, &param_refs)
+            .await
+            .map_err(|e| format!("PG get_execution_spans_filtered: {}", e))?;
 
         Ok(rows.iter().map(|r| {
             serde_json::json!({

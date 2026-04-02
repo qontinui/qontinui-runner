@@ -1736,40 +1736,25 @@ pub struct ExecutionSpansQuery {
     limit: Option<u32>,
 }
 
-/// Get execution spans from SQLite (tracing data).
+/// Get execution spans (tracing data) with server-side filtering via PG.
 ///
 /// Supports filtering by execution_id, name pattern, and minimum duration.
-// TODO: Wire to PG when get_execution_spans PG wrapper is implemented
 pub async fn get_execution_spans(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ExecutionSpansQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let execution_id = query.execution_id.as_deref().unwrap_or("");
-    let all_spans = state
+    let spans = state
         .app_state
         .pg_db
-        .get_execution_spans(execution_id)
+        .get_execution_spans_filtered(
+            execution_id,
+            query.name_pattern.as_deref(),
+            query.min_duration_ms,
+            Some(query.limit.unwrap_or(100)),
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    // Apply filters in memory since PG only supports execution_id filter
-    let limit = query.limit.unwrap_or(100) as usize;
-    let spans: Vec<_> = all_spans.into_iter()
-        .filter(|s| {
-            if let Some(ref pattern) = query.name_pattern {
-                if let Some(name) = s.get("span_type").and_then(|v| v.as_str()) {
-                    if !name.contains(pattern.trim_matches('%')) { return false; }
-                }
-            }
-            if let Some(min_dur) = query.min_duration_ms {
-                if let Some(dur) = s.get("duration_ms").and_then(|v| v.as_i64()) {
-                    if dur < min_dur { return false; }
-                }
-            }
-            true
-        })
-        .take(limit)
-        .collect();
 
     Ok(Json(serde_json::json!({
         "spans": spans,
@@ -2532,6 +2517,30 @@ pub async fn review_deferred_question(
         );
     }
 
+    // Sync updated deferred questions to web backend (best-effort, non-blocking)
+    {
+        let pg = state.app_state.pg_db.clone();
+        let tr_id = task_run_id.clone();
+        tokio::spawn(async move {
+            if let Ok(questions) = pg.get_deferred_questions_for_task_run(&tr_id).await {
+                let sync_questions: Vec<_> = questions
+                    .iter()
+                    .map(crate::commands::task_sync::json_to_deferred_question_sync)
+                    .collect();
+                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                if let Err(e) = sync_service
+                    .sync_deferred_questions(&tr_id, sync_questions)
+                    .await
+                {
+                    tracing::debug!(
+                        "Deferred questions backend sync after review failed (non-fatal): {}",
+                        e
+                    );
+                }
+            }
+        });
+    }
+
     // If rejected, trigger rework
     let mut rework_id = None;
     if body.status == "rejected" {
@@ -2613,6 +2622,30 @@ pub async fn bulk_review_deferred_questions(
                 );
             }
         }
+    }
+
+    // Sync updated deferred questions to web backend (best-effort, non-blocking)
+    if reviewed > 0 {
+        let pg = state.app_state.pg_db.clone();
+        let tr_id = task_run_id.clone();
+        tokio::spawn(async move {
+            if let Ok(questions) = pg.get_deferred_questions_for_task_run(&tr_id).await {
+                let sync_questions: Vec<_> = questions
+                    .iter()
+                    .map(crate::commands::task_sync::json_to_deferred_question_sync)
+                    .collect();
+                let sync_service = crate::commands::task_sync::AITaskSyncService::new();
+                if let Err(e) = sync_service
+                    .sync_deferred_questions(&tr_id, sync_questions)
+                    .await
+                {
+                    tracing::debug!(
+                        "Deferred questions backend sync after bulk review failed (non-fatal): {}",
+                        e
+                    );
+                }
+            }
+        });
     }
 
     Ok(Json(serde_json::json!({

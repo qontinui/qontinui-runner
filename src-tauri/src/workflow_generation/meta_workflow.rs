@@ -44,15 +44,59 @@ pub struct HistoricalContext {
     pub gt_reference_section: String,
 }
 
-/// Build historical context from the database.
+/// Build historical context from the database (sync stub — use `build_historical_context_pg` instead).
 ///
-/// Returns None if there's no useful data or if queries fail.
+/// Returns None; kept for API compatibility.
 pub fn build_historical_context(
-    description: &str,
-    query_embedding: Option<&[f32]>,
-    category: Option<&str>,
+    _description: &str,
+    _query_embedding: Option<&[f32]>,
+    _category: Option<&str>,
 ) -> Option<HistoricalContext> {
     None
+}
+
+/// Build historical context from PostgreSQL.
+///
+/// Queries self-improvement patterns, similar workflows, and ground truth
+/// references. Returns None if there's no useful data or if queries fail.
+pub async fn build_historical_context_pg(
+    pg: &std::sync::Arc<crate::database::pg::PgDb>,
+    description: &str,
+    category: Option<&str>,
+) -> Option<HistoricalContext> {
+    // 1. Self-improvement context (common issues, success rates)
+    let improvement_section = match self_improve::analyze_generation_patterns_pg(pg).await {
+        Ok(ctx) if !ctx.is_empty() => self_improve::format_improvement_context(&ctx),
+        _ => String::new(),
+    };
+
+    // 2. Similar workflows (text-based, no pgvector)
+    let similar_section = match similar_workflows::find_similar_workflows_pg(pg, description, category, 5).await {
+        Ok(similar) if !similar.is_empty() => similar_workflows::format_similar_workflows(&similar),
+        _ => String::new(),
+    };
+
+    // 3. Ground truth reference workflows
+    let (gt_reference_section, verifier_focus_items) = match similar_workflows::find_gt_reference_workflows_pg(pg, description, 3).await {
+        Ok(gt) if !gt.is_empty() => (similar_workflows::format_gt_references(&gt), vec![]),
+        _ => (String::new(), vec![]),
+    };
+
+    // 4. Past fixes section (extracted from self-improvement common verifier issues)
+    let past_fixes_section = String::new(); // Covered by improvement_section
+
+    // Only return Some if we have at least some useful data
+    if improvement_section.is_empty() && similar_section.is_empty() && gt_reference_section.is_empty() {
+        return None;
+    }
+
+    Some(HistoricalContext {
+        improvement_section,
+        similar_section,
+        verifier_focus_items,
+        past_fixes_section,
+        gt_reference_section,
+    })
 }
 
 /// Build a meta-workflow that generates a workflow from a natural language description.

@@ -3,7 +3,7 @@
 //! Scans `qontinui-claude-config/.claude/commands/*.md` for command files,
 //! parses each into a workflow, and syncs with the database (create/update/delete).
 
-use crate::unified_workflows::{CreateUnifiedWorkflowRequest, UpdateUnifiedWorkflowRequest};
+use crate::unified_workflows::CreateUnifiedWorkflowRequest;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
@@ -233,12 +233,123 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
     }
 }
 
-/// Sync slash commands from disk to the database.
+/// Sync slash commands from disk to the database (PG-backed).
 ///
 /// Scans the commands directory, compares with existing DB entries,
 /// and creates/updates/deletes as needed.
-pub fn sync_slash_commands() -> Result<SyncResult, String> {
-    Err("SQLite removed".to_string())
+pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>) -> Result<SyncResult, String> {
+    let (workspace_root, commands_dir) = find_commands_directory()?;
+
+    // Parse all command files from disk
+    let mut disk_commands: HashMap<String, SlashCommandParsed> = HashMap::new();
+    let entries = std::fs::read_dir(&commands_dir)
+        .map_err(|e| format!("Failed to read commands directory: {}", e))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map_or(false, |ext| ext == "md") {
+            match parse_command_file(&path, &workspace_root) {
+                Ok(parsed) => {
+                    disk_commands.insert(parsed.relative_path.clone(), parsed);
+                }
+                Err(e) => {
+                    warn!("Failed to parse command file {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    // Get existing slash command workflows from PG
+    let existing = pg.list_slash_command_sources().await.unwrap_or_default();
+    let existing_map: HashMap<String, (String, String)> = existing
+        .into_iter()
+        .filter_map(|(id, _name, source)| {
+            if source.is_empty() { None } else { Some((source, (id, _name))) }
+        })
+        .collect();
+
+    let mut result = SyncResult {
+        created: 0,
+        updated: 0,
+        deleted: 0,
+        unchanged: 0,
+        errors: vec![],
+    };
+
+    // Create or update workflows for commands on disk
+    for (rel_path, parsed) in &disk_commands {
+        if let Some((existing_id, _)) = existing_map.get(rel_path) {
+            // Check if content hash changed — if so, update
+            let conn = pg.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+            let current_hash: Option<String> = conn.query_opt(
+                "SELECT source_content_hash FROM unified_workflows WHERE id = $1",
+                &[existing_id],
+            ).await.ok().flatten().and_then(|r| r.get(0));
+
+            if current_hash.as_deref() == Some(&parsed.content_hash) {
+                result.unchanged += 1;
+            } else {
+                // Update the workflow content via direct SQL (simpler than full UpdateRequest)
+                let req = build_workflow_request(parsed);
+                let agentic_json = serde_json::to_string(&req.agentic_steps).unwrap_or_else(|_| "[]".to_string());
+                let tags_json = serde_json::to_string(&req.tags).unwrap_or_else(|_| "[]".to_string());
+                match conn.execute(
+                    r#"UPDATE unified_workflows
+                       SET name = $2, description = $3, agentic_steps = $4, tags = $5,
+                           source_file_path = $6, source_content_hash = $7, updated_at = NOW()
+                       WHERE id = $1"#,
+                    &[existing_id, &parsed.title, &parsed.description, &agentic_json,
+                      &tags_json, &parsed.relative_path, &parsed.content_hash],
+                ).await {
+                    Ok(_) => {
+                        result.updated += 1;
+                        info!("Updated slash command workflow: {}", parsed.title);
+                    }
+                    Err(e) => result.errors.push(format!("Update {}: {}", parsed.command_name, e)),
+                }
+            }
+        } else {
+            // Create new workflow
+            let req = build_workflow_request(parsed);
+            match pg.create_unified_workflow(&req).await {
+                Ok(wf) => {
+                    // Set source tracking fields
+                    if let Ok(conn) = pg.pool().get().await {
+                        let _ = conn.execute(
+                            "UPDATE unified_workflows SET source_file_path = $2, source_content_hash = $3 WHERE id = $1",
+                            &[&wf.id, &parsed.relative_path, &parsed.content_hash],
+                        ).await;
+                    }
+                    result.created += 1;
+                    info!("Created slash command workflow: {}", parsed.title);
+                }
+                Err(e) => result.errors.push(format!("Create {}: {}", parsed.command_name, e)),
+            }
+        }
+    }
+
+    // Delete workflows for commands no longer on disk
+    for (rel_path, (existing_id, name)) in &existing_map {
+        if !disk_commands.contains_key(rel_path) {
+            match pg.delete_unified_workflow(existing_id).await {
+                Ok(true) => {
+                    result.deleted += 1;
+                    info!("Deleted slash command workflow: {} ({})", name, rel_path);
+                }
+                Ok(false) => {
+                    warn!("Slash command workflow {} not found for deletion", existing_id);
+                }
+                Err(e) => result.errors.push(format!("Delete {}: {}", name, e)),
+            }
+        }
+    }
+
+    info!(
+        "Slash command sync: {} created, {} updated, {} deleted, {} unchanged, {} errors",
+        result.created, result.updated, result.deleted, result.unchanged, result.errors.len()
+    );
+
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -883,9 +883,12 @@ pub async fn generate_unified_workflow_async_handler(
         }
     }
 
-    // TODO: migrate build_historical_context sub-queries (self_improve, similar_workflows,
-    // gt_references, past_fixes) to PG, then re-enable. Until then, skip historical context.
-    let historical_context: Option<crate::workflow_generation::meta_workflow::HistoricalContext> = None;
+    // Build historical context from PG (self-improvement patterns, similar workflows, GT refs)
+    let historical_context = crate::workflow_generation::meta_workflow::build_historical_context_pg(
+        &state.app_state.pg_db,
+        &request.description,
+        request.category.as_deref(),
+    ).await;
 
     // Build the meta-workflow
     let meta_workflow =
@@ -2451,10 +2454,7 @@ async fn sync_slash_commands_handler(
 {
     info!("Manual slash command sync requested");
 
-    // checkpoint_db removed — slash_commands::sync_slash_commands requires CheckpointDb
-    let _ = &state;
-    let result_placeholder: Result<crate::slash_commands::SyncResult, String> = Err("SQLite removed".to_string());
-    match result_placeholder {
+    match crate::slash_commands::sync_slash_commands(&state.app_state.pg_db).await {
         Ok(result) => {
             info!(
                 "Slash command sync complete: {} created, {} updated, {} deleted, {} unchanged",

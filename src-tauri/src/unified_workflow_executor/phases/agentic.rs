@@ -37,6 +37,7 @@ pub struct AgenticExecutor {
     reflection_fix_ctx: Option<crate::mcp::shared::ReflectionFixContext>,
     step_injection_ctx: Option<crate::step_injection::types::StepInjectionContext>,
     cost_trackers: std::sync::Mutex<Option<Arc<crate::cost_management::RunCostTrackers>>>,
+    broadcaster: crate::event_system::SharedEventBroadcaster,
 }
 
 impl AgenticExecutor {
@@ -48,6 +49,7 @@ impl AgenticExecutor {
         Self {
             app_state: app_state.clone(),
             ai_executor: UnifiedAiSessionExecutor::new(app_state, app_handle.clone(), pid_tracker),
+            broadcaster: crate::event_system::shared_broadcaster(app_handle.clone()),
             app_handle,
             reflection_fix_ctx: None,
             step_injection_ctx: None,
@@ -305,8 +307,7 @@ impl AgenticExecutor {
                                 let cumulative = self.cost_trackers.lock().unwrap().as_ref()
                                     .map(|t| t.budget.snapshot().total_cost_usd).unwrap_or(0.0);
 
-                                crate::orchestrator::realtime_events::emit_cost_update(
-                                    &self.app_handle,
+                                self.broadcaster.cost_update(
                                     &config.execution_id,
                                     "agentic",
                                     Some(iteration),
@@ -327,8 +328,7 @@ impl AgenticExecutor {
                                     match budget_result {
                                         crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
                                             warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
-                                            crate::orchestrator::realtime_events::emit_budget_warning(
-                                                &self.app_handle,
+                                            self.broadcaster.budget_warning(
                                                 &config.execution_id,
                                                 remaining_fraction,
                                                 trackers.budget.snapshot().total_cost_usd,
@@ -357,8 +357,7 @@ impl AgenticExecutor {
                                     if let Ok(mut detector) = trackers.anomaly_detector.lock() {
                                         if let Some(anomaly) = detector.check(cost_usd) {
                                             warn!("Cost anomaly detected: ${:.4} (z-score: {:.2})", anomaly.cost_usd, anomaly.z_score);
-                                            crate::orchestrator::realtime_events::emit_cost_anomaly(
-                                                &self.app_handle,
+                                            self.broadcaster.cost_anomaly(
                                                 &config.execution_id,
                                                 anomaly.cost_usd,
                                                 anomaly.mean,
@@ -1180,8 +1179,7 @@ impl AgenticExecutor {
                 let cumulative = self.cost_trackers.lock().unwrap().as_ref()
                     .map(|t| t.budget.snapshot().total_cost_usd).unwrap_or(0.0);
 
-                crate::orchestrator::realtime_events::emit_cost_update(
-                    &self.app_handle,
+                self.broadcaster.cost_update(
                     &config.execution_id,
                     "agentic",
                     Some(iteration),
@@ -1202,8 +1200,7 @@ impl AgenticExecutor {
                     match budget_result {
                         crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
                             warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
-                            crate::orchestrator::realtime_events::emit_budget_warning(
-                                &self.app_handle,
+                            self.broadcaster.budget_warning(
                                 &config.execution_id,
                                 remaining_fraction,
                                 trackers.budget.snapshot().total_cost_usd,
@@ -1227,8 +1224,7 @@ impl AgenticExecutor {
                     if let Ok(mut detector) = trackers.anomaly_detector.lock() {
                         if let Some(anomaly) = detector.check(cost_usd) {
                             warn!("Cost anomaly detected: ${:.4} (z-score: {:.2})", anomaly.cost_usd, anomaly.z_score);
-                            crate::orchestrator::realtime_events::emit_cost_anomaly(
-                                &self.app_handle,
+                            self.broadcaster.cost_anomaly(
                                 &config.execution_id,
                                 anomaly.cost_usd,
                                 anomaly.mean,

@@ -727,6 +727,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::task_sync::sync_ai_session_started,
             commands::task_sync::sync_ai_session_ended,
             commands::task_sync::sync_ai_findings,
+            commands::task_sync::sync_deferred_questions,
             commands::task_sync::sync_ai_task_completed,
             commands::task_sync::full_sync_ai_task,
             commands::task_sync::sync_all_pending_ai_tasks,
@@ -1267,6 +1268,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::security_settings::get_security_profiles,
             // Cost dashboard commands (unified token/cache/budget overview)
             commands::cost_dashboard::get_cost_dashboard,
+            commands::cost_dashboard::get_active_budget_status,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

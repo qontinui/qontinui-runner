@@ -342,54 +342,224 @@ pub async fn import_all_data(
         }
     }
 
-    // checkpoint_db removed — prompts, settings, unified_workflows, learning_outcomes,
-    // and learning_patterns import was SQLite-only. These are no-ops now.
-    // TODO: Migrate import logic to PG.
-    let _ = conflict_mode;
+    let is_overwrite = conflict_mode == "overwrite";
 
+    // Import prompts via PG upsert
     if opts.prompts && !data.prompts.is_empty() {
-        total_skipped += data.prompts.len();
-        results.insert("prompts".to_string(), ImportResult {
-            imported: 0,
-            skipped: data.prompts.len(),
-            errors: vec![],
-        });
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+
+        for item in &data.prompts {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let category = item.get("category").and_then(|v| v.as_str()).unwrap_or("general");
+            let content = item.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            let variables = item.get("variables").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+
+            if id.is_empty() || name.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let sql = if is_overwrite {
+                r#"INSERT INTO prompts (id, name, category, content, variables)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (id) DO UPDATE SET name = $2, category = $3, content = $4, variables = $5, updated_at = NOW()"#
+            } else {
+                r#"INSERT INTO prompts (id, name, category, content, variables)
+                   VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (id) DO NOTHING"#
+            };
+
+            match state.pg_db.pool().get().await {
+                Ok(conn) => match conn.execute(sql, &[&id, &name, &category, &content, &variables]).await {
+                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                    Err(e) => errors.push(format!("Prompt {}: {}", id, e)),
+                },
+                Err(e) => errors.push(format!("PG pool: {}", e)),
+            }
+        }
+        total_imported += imported;
+        total_skipped += skipped;
+        total_errors += errors.len();
+        results.insert("prompts".to_string(), ImportResult { imported, skipped, errors });
     }
 
+    // Import settings via PG upsert
     if opts.settings && !data.settings.is_empty() {
-        total_skipped += data.settings.len();
-        results.insert("settings".to_string(), ImportResult {
-            imported: 0,
-            skipped: data.settings.len(),
-            errors: vec![],
-        });
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+
+        for item in &data.settings {
+            let key = item.get("key").and_then(|v| v.as_str()).unwrap_or_default();
+            let value = item.get("value").map(|v| {
+                if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() }
+            }).unwrap_or_default();
+
+            if key.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let sql = if is_overwrite {
+                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()"
+            } else {
+                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING"
+            };
+
+            match state.pg_db.pool().get().await {
+                Ok(conn) => match conn.execute(sql, &[&key, &value]).await {
+                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                    Err(e) => errors.push(format!("Setting {}: {}", key, e)),
+                },
+                Err(e) => errors.push(format!("PG pool: {}", e)),
+            }
+        }
+        total_imported += imported;
+        total_skipped += skipped;
+        total_errors += errors.len();
+        results.insert("settings".to_string(), ImportResult { imported, skipped, errors });
     }
 
+    // Import unified_workflows via PG upsert
     if opts.unified_workflows && !data.unified_workflows.is_empty() {
-        total_skipped += data.unified_workflows.len();
-        results.insert("unified_workflows".to_string(), ImportResult {
-            imported: 0,
-            skipped: data.unified_workflows.len(),
-            errors: vec![],
-        });
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+
+        for item in &data.unified_workflows {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+
+            if id.is_empty() || name.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let desc = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let category = item.get("category").and_then(|v| v.as_str()).unwrap_or("general");
+            let tags = item.get("tags").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+            let setup = item.get("setup_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+            let verif = item.get("verification_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+            let agentic = item.get("agentic_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+            let completion = item.get("completion_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+            let max_iters = item.get("max_iterations").and_then(|v| v.as_i64()).unwrap_or(10);
+
+            let sql = if is_overwrite {
+                r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   ON CONFLICT (id) DO UPDATE SET
+                     name = $2, description = $3, category = $4, tags = $5,
+                     setup_steps = $6, verification_steps = $7, agentic_steps = $8,
+                     completion_steps = $9, max_iterations = $10, updated_at = NOW()"#
+            } else {
+                r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   ON CONFLICT (id) DO NOTHING"#
+            };
+
+            match state.pg_db.pool().get().await {
+                Ok(conn) => match conn.execute(sql, &[&id, &name, &desc, &category, &tags, &setup, &verif, &agentic, &completion, &max_iters]).await {
+                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                    Err(e) => errors.push(format!("Workflow {}: {}", id, e)),
+                },
+                Err(e) => errors.push(format!("PG pool: {}", e)),
+            }
+        }
+        total_imported += imported;
+        total_skipped += skipped;
+        total_errors += errors.len();
+        results.insert("unified_workflows".to_string(), ImportResult { imported, skipped, errors });
     }
 
+    // Import learning_outcomes via PG upsert
     if opts.learning_outcomes && !data.learning_outcomes.is_empty() {
-        total_skipped += data.learning_outcomes.len();
-        results.insert("learning_outcomes".to_string(), ImportResult {
-            imported: 0,
-            skipped: data.learning_outcomes.len(),
-            errors: vec![],
-        });
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+
+        for item in &data.learning_outcomes {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let task_id = item.get("task_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or_default();
+
+            if id.is_empty() || task_id.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let duration_secs: Option<f64> = item.get("duration_secs").and_then(|v| v.as_f64());
+            let iterations: Option<i32> = item.get("iterations").and_then(|v| v.as_i64()).map(|n| n as i32);
+            let strategy = item.get("strategy").and_then(|v| v.as_str()).unwrap_or_default();
+
+            let sql = if is_overwrite {
+                r#"INSERT INTO learning_outcomes (id, task_id, status, duration_secs, iterations, strategy)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (id) DO UPDATE SET task_id = $2, status = $3, duration_secs = $4, iterations = $5, strategy = $6"#
+            } else {
+                r#"INSERT INTO learning_outcomes (id, task_id, status, duration_secs, iterations, strategy)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (id) DO NOTHING"#
+            };
+
+            match state.pg_db.pool().get().await {
+                Ok(conn) => match conn.execute(sql, &[&id, &task_id, &status, &duration_secs, &iterations, &strategy]).await {
+                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                    Err(e) => errors.push(format!("LO {}: {}", id, e)),
+                },
+                Err(e) => errors.push(format!("PG pool: {}", e)),
+            }
+        }
+        total_imported += imported;
+        total_skipped += skipped;
+        total_errors += errors.len();
+        results.insert("learning_outcomes".to_string(), ImportResult { imported, skipped, errors });
     }
 
+    // Import learning_patterns via PG upsert
     if opts.learning_patterns && !data.learning_patterns.is_empty() {
-        total_skipped += data.learning_patterns.len();
-        results.insert("learning_patterns".to_string(), ImportResult {
-            imported: 0,
-            skipped: data.learning_patterns.len(),
-            errors: vec![],
-        });
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = Vec::new();
+
+        for item in &data.learning_patterns {
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let pattern_type = item.get("pattern_type").and_then(|v| v.as_str()).unwrap_or_default();
+            let description = item.get("description").and_then(|v| v.as_str()).unwrap_or_default();
+            let confidence = item.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let occurrences = item.get("occurrences").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+            let context = item.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            if id.is_empty() || pattern_type.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let sql = if is_overwrite {
+                r#"INSERT INTO learning_patterns (id, pattern_type, description, confidence, occurrences, context)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (id) DO UPDATE SET
+                     pattern_type = $2, description = $3, confidence = $4, occurrences = $5, context = $6, updated_at = NOW()"#
+            } else {
+                r#"INSERT INTO learning_patterns (id, pattern_type, description, confidence, occurrences, context)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (id) DO NOTHING"#
+            };
+
+            match state.pg_db.pool().get().await {
+                Ok(conn) => match conn.execute(sql, &[&id, &pattern_type, &description, &confidence, &occurrences, &context.as_deref()]).await {
+                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                    Err(e) => errors.push(format!("LP {}: {}", id, e)),
+                },
+                Err(e) => errors.push(format!("PG pool: {}", e)),
+            }
+        }
+        total_imported += imported;
+        total_skipped += skipped;
+        total_errors += errors.len();
+        results.insert("learning_patterns".to_string(), ImportResult { imported, skipped, errors });
     }
 
     let success = total_errors == 0;

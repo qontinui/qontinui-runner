@@ -38,6 +38,21 @@ impl LoopController {
                         warn!("Failed to sync task completion to backend: {}", e);
                     }
                 }
+                // Also sync deferred questions at completion
+                if let Ok(questions) = pg.get_deferred_questions_for_task_run(&eid).await {
+                    if !questions.is_empty() {
+                        let sync_questions: Vec<_> = questions
+                            .iter()
+                            .map(crate::commands::task_sync::json_to_deferred_question_sync)
+                            .collect();
+                        if let Err(e) = sync_service
+                            .sync_deferred_questions(&eid, sync_questions)
+                            .await
+                        {
+                            warn!("Failed to sync deferred questions at completion: {}", e);
+                        }
+                    }
+                }
             });
 
             // Fire-and-forget: try to promote workflow to example library

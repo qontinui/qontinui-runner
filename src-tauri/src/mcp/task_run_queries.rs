@@ -1096,40 +1096,25 @@ pub async fn get_task_run_screenshots(
     })))
 }
 
-/// Get execution spans from SQLite (tracing data).
+/// Get execution spans (tracing data) with server-side filtering via PG.
 ///
 /// Supports filtering by execution_id, name pattern, and minimum duration.
-// TODO: Wire to PG when get_execution_spans PG wrapper is implemented
 pub async fn get_execution_spans(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ExecutionSpansQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let execution_id = query.execution_id.as_deref().unwrap_or("");
-    let all_spans = state
+    let spans = state
         .app_state
         .pg_db
-        .get_execution_spans(execution_id)
+        .get_execution_spans_filtered(
+            execution_id,
+            query.name_pattern.as_deref(),
+            query.min_duration_ms,
+            Some(query.limit.unwrap_or(100)),
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    // Apply filters in memory since PG only supports execution_id filter
-    let limit = query.limit.unwrap_or(100) as usize;
-    let spans: Vec<_> = all_spans.into_iter()
-        .filter(|s| {
-            if let Some(ref pattern) = query.name_pattern {
-                if let Some(name) = s.get("span_type").and_then(|v| v.as_str()) {
-                    if !name.contains(pattern.trim_matches('%')) { return false; }
-                }
-            }
-            if let Some(min_dur) = query.min_duration_ms {
-                if let Some(dur) = s.get("duration_ms").and_then(|v| v.as_i64()) {
-                    if dur < min_dur { return false; }
-                }
-            }
-            true
-        })
-        .take(limit)
-        .collect();
 
     Ok(Json(serde_json::json!({
         "spans": spans,

@@ -16,7 +16,7 @@ use crate::executor::with_default_bridge;
 use crate::mcp::misc::{generate_id_from_path, path_to_name};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, GoToStateRequest, GoToStateResult};
 use crate::settings;
-use crate::task_recorder::{TaskConfig, TaskRecorder};
+use crate::database::CreateTaskRunInput;
 use crate::timeout_config::Timeouts;
 
 // ============================================================================
@@ -571,24 +571,22 @@ pub async fn run_workflow(
         .ok()
         .and_then(|guard| guard.clone());
 
-    // Create a TaskRun for this automation execution
-    // This ensures ALL automation runs go through the unified TaskRun system
-    // TODO: TaskRecorder needs PG migration — checkpoint_db removed
-    let task_recorder = TaskRecorder::new();
-    let task_config = TaskConfig::automation_task(
-        &format!("Workflow: {}", request.workflow_name),
-        config_id.as_deref().unwrap_or("unknown"),
-        Some(&request.workflow_name),
-    );
+    // Create a TaskRun for this automation execution via PG directly.
+    // This ensures ALL automation runs go through the unified TaskRun system.
+    let task_run_id = uuid::Uuid::new_v4().to_string();
+    let mut input = CreateTaskRunInput::new(&task_run_id, format!("Workflow: {}", request.workflow_name));
+    input.task_type = Some("automation".to_string());
+    input.config_id = config_id.clone();
+    input.workflow_name = Some(request.workflow_name.clone());
 
-    let task_handle = match task_recorder.start_task(task_config) {
-        Ok(handle) => {
+    let task_run = match state.app_state.pg_db.create_task_run(&input).await {
+        Ok(tr) => {
             info!(
                 "MCP API: Created TaskRun {} for workflow {}",
-                handle.id(),
+                tr.id,
                 request.workflow_name
             );
-            handle
+            tr
         }
         Err(e) => {
             error!("MCP API: Failed to create TaskRun: {}", e);
@@ -605,7 +603,7 @@ pub async fn run_workflow(
     state
         .app_state
         .run_recording_handler
-        .set_task_run(task_handle.id().to_string(), 1, 1)
+        .set_task_run(task_run.id.clone(), 1, 1)
         .await;
 
     // Use UnifiedActionService for deterministic execution
@@ -633,7 +631,7 @@ pub async fn run_workflow(
 
             // Update task run status based on workflow result
             if workflow_result.success {
-                if let Err(e) = task_handle.complete() {
+                if let Err(e) = state.app_state.pg_db.complete_task_run(&task_run.id).await {
                     warn!("MCP API: Failed to complete task run: {}", e);
                 }
             } else {
@@ -641,7 +639,7 @@ pub async fn run_workflow(
                     .error
                     .as_deref()
                     .unwrap_or("Workflow failed");
-                if let Err(e) = task_handle.fail(error_msg) {
+                if let Err(e) = state.app_state.pg_db.fail_task_run(&task_run.id, error_msg).await {
                     warn!("MCP API: Failed to mark task run as failed: {}", e);
                 }
             }
@@ -656,7 +654,7 @@ pub async fn run_workflow(
             error!("MCP API: Workflow execution failed: {}", e);
 
             // Mark task run as failed
-            if let Err(fail_err) = task_handle.fail(&e.to_string()) {
+            if let Err(fail_err) = state.app_state.pg_db.fail_task_run(&task_run.id, &e.to_string()).await {
                 warn!("MCP API: Failed to mark task run as failed: {}", fail_err);
             }
 

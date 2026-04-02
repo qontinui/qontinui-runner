@@ -1902,8 +1902,9 @@ impl LoopController {
                 }
             });
 
-            // LLM-as-judge and RAG judge (fire-and-forget, stubs pending PG port)
+            // LLM-as-judge and RAG judge (fire-and-forget via PG)
             crate::orchestrator::learning_recorder::spawn_llm_judge_if_eligible(
+                self.app_state.pg_db.clone(),
                 judge_task_run_id.clone(),
                 judge_iterations,
                 judge_verification_passed,
@@ -1911,6 +1912,7 @@ impl LoopController {
             );
 
             crate::orchestrator::learning_recorder::spawn_rag_judge_if_eligible(
+                self.app_state.pg_db.clone(),
                 judge_task_run_id,
             );
 
