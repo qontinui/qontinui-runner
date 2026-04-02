@@ -1,11 +1,11 @@
 {
   "version": "1.0.0",
-  "description": "Run Traces page — a multi-view execution trace analysis tool showing parent-child span relationships, operation durations, phase groupings, and performance insights. Provides three visualization modes: a waterfall timeline, a flamechart showing where time is spent (with gap collapsing), and a cross-run comparison view for regression detection. All views are powered by the execution_spans API (GET /execution-spans?execution_id={id}&order=asc) which returns TraceSpan records with trace_id, span_id, parent_span_id, duration_ms, and phase information. Data is polled every 2 seconds for live updates via React Query. The page is mounted inside RunSelectionProvider, which supplies the selected run ID from the RunSelector dropdown in RunPageLayout.",
+  "description": "Run Traces page — a multi-view execution trace analysis tool showing parent-child span relationships, operation durations, phase groupings, and performance insights. Provides five visualization modes: a waterfall timeline, a flamechart showing where time is spent (with gap collapsing), a cross-run comparison view for regression detection, an agent communication graph (conditional on agent pipeline spans), and a step-through replay mode for debugging. Additional features include token/cost heatmap overlay on waterfall and flamechart, AI session drill-down with GenAI (OpenTelemetry) attributes, a trace timeline minimap for large traces, comparison filtering with name search and delta thresholds, and visual design coverage for dark theme consistency. All views are powered by the execution_spans API (GET /execution-spans?execution_id={id}&order=asc) which returns TraceSpan records with trace_id, span_id, parent_span_id, duration_ms, and phase information. Data is polled every 2 seconds for live updates via React Query. The page is mounted inside RunSelectionProvider, which supplies the selected run ID from the RunSelector dropdown in RunPageLayout.",
   "groups": [
     {
       "id": "traces-view-mode-navigation",
       "name": "View Mode Navigation",
-      "description": "The Traces page offers three visualization modes via tab buttons: Waterfall (default, timeline-positioned spans), Flamechart (gap-collapsed, duration-proportional), and Comparison (cross-run diff). Users switch between modes using the tab bar at the top of the widget. The active tab is visually highlighted. Each mode shares the same underlying span data from useTraceViewerData but presents it differently. The Waterfall and Flamechart views share the SpanDetailPanel sidebar and PerformanceInsights footer; the Comparison view has its own summary bar and inline detail expansion.",
+      "description": "The Traces page offers four visualization modes via tab buttons: Waterfall (default, timeline-positioned spans), Flamechart (gap-collapsed, duration-proportional), Comparison (cross-run diff), and Agent Graph (conditional — only when agent pipeline spans exist). Users switch between modes using the tab bar at the top of the widget. The active tab is visually highlighted. Each mode shares the same underlying span data from useTraceViewerData but presents it differently. The Waterfall and Flamechart views share the SpanDetailPanel sidebar and PerformanceInsights footer; the Comparison view has its own summary bar and inline detail expansion; the Agent Graph view shows multi-agent pipeline topology.",
       "category": "navigation",
       "assertions": [
         {
@@ -57,6 +57,24 @@
           },
           "source": "manual",
           "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "traces-agent-graph-tab-conditional",
+          "description": "The Agent Graph tab appears in the tab bar only when the current trace contains agent pipeline spans. It is hidden for non-agent runs",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Agent Graph"
+            },
+            "label": "Agent Graph view tab"
+          },
+          "expected": "The Agent Graph tab is visible when agent pipeline spans exist in the trace, and hidden when no agent pipeline spans are present",
+          "source": "ai-generated",
+          "reviewed": false,
           "enabled": true
         },
         {
@@ -715,14 +733,14 @@
         },
         {
           "id": "traces-detail-close",
-          "description": "Users can close the detail panel by clicking the close button (✕), which deselects the span and hides the panel",
+          "description": "Users can close the detail panel by clicking the close button (\u2715), which deselects the span and hides the panel",
           "category": "interaction",
           "severity": "warning",
           "assertionType": "exists",
           "target": {
             "type": "search",
             "criteria": {
-              "textContent": "✕"
+              "textContent": "\u2715"
             },
             "label": "Detail panel close button"
           },
@@ -829,13 +847,681 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "traces-token-overlay",
+      "name": "Token/Cost Heatmap Overlay",
+      "description": "Token and cost heatmap overlay on waterfall and flamechart views. A dropdown selector in the toolbar offers four options: 'No token overlay', 'Input tokens', 'Output tokens', and 'Cost'. When an overlay mode is active, span bars (waterfall) and rectangles (flamechart) are tinted red proportional to their token usage or cost relative to the maximum in the trace. The PerformanceInsights footer shows aggregate token counts and cost when any token overlay is active.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-token-overlay-dropdown-exists",
+          "description": "A token overlay dropdown selector exists in the toolbar with options for no overlay, input tokens, output tokens, and cost",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No token overlay"
+            },
+            "label": "Token overlay dropdown"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-token-overlay-waterfall-tint",
+          "description": "Selecting 'Input tokens' from the token overlay dropdown changes waterfall span bar colors to a red tint proportional to each span's input token count",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Input tokens"
+            },
+            "label": "Input tokens overlay option"
+          },
+          "expected": "Waterfall span bars change from phase colors to red-tinted colors where intensity is proportional to the span's input token count relative to the maximum input tokens in the trace",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-token-overlay-flamechart-tint",
+          "description": "When a token overlay mode is active, flamechart rectangles are also tinted red proportional to token usage, matching the waterfall behavior",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Flamechart token overlay"
+          },
+          "expected": "Flamechart canvas rectangles change from phase colors to red-tinted colors proportional to token usage when any token overlay mode is selected",
+          "precondition": "Flamechart tab is active and a token overlay mode is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-token-overlay-footer-stats",
+          "description": "When a token overlay is active, the PerformanceInsights footer shows aggregate token counts (total input tokens, total output tokens) and total cost",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "tokens"
+            },
+            "label": "Token stats in footer"
+          },
+          "expected": "Footer displays total input tokens, total output tokens, and total cost when any token overlay mode is active",
+          "precondition": "A token overlay mode other than 'No token overlay' is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "traces-ai-session-drilldown",
+      "name": "AI Session Drill-Down",
+      "description": "When an AI session span is selected, the SpanDetailPanel shows expanded information specific to AI operations: a token usage grid displaying input tokens, output tokens, and cost; a child tool call list showing all tool invocations within the session; and a GenAI (OpenTelemetry) attributes section that separates gen_ai.* attributes from generic span attributes, displaying them with the 'gen_ai.' prefix stripped for readability.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-ai-session-token-usage-grid",
+          "description": "When an AI session span is selected, the SpanDetailPanel shows a token usage section with input tokens, output tokens, and cost values",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Token Usage"
+            },
+            "label": "Token usage grid in detail panel"
+          },
+          "precondition": "An AI session span is selected in Waterfall or Flamechart view",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-ai-session-tool-calls",
+          "description": "When an AI session span is selected, the SpanDetailPanel lists child tool calls made during the session",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Tool Calls"
+            },
+            "label": "Tool calls list in detail panel"
+          },
+          "precondition": "An AI session span with child tool call spans is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-ai-session-genai-attributes",
+          "description": "GenAI (OpenTelemetry) attributes are shown in a separate section with the 'gen_ai.' prefix stripped from attribute names for readability",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "GenAI Attributes"
+            },
+            "label": "GenAI attributes section"
+          },
+          "precondition": "An AI session span with gen_ai.* attributes is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-ai-session-generic-excludes-genai",
+          "description": "The generic Attributes section excludes keys that start with 'gen_ai.' since those are shown in the dedicated GenAI Attributes section",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Attributes"
+            },
+            "label": "Generic attributes section"
+          },
+          "expected": "The generic Attributes section does not contain any keys starting with 'gen_ai.' — those appear only in the GenAI Attributes section",
+          "precondition": "An AI session span with both gen_ai.* and non-gen_ai attributes is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "traces-agent-graph",
+      "name": "Agent Communication Graph",
+      "description": "A ReactFlow-based directed graph showing multi-agent pipeline topology. The Agent Graph tab only appears when the current trace contains agent pipeline spans (conditional rendering). Nodes represent agent roles and display duration and token counts. Edges represent data flow between agents. The graph uses dark mode compatible colors (rgba values). When no agent pipeline spans exist, an empty state message is shown. Clicking a node selects the corresponding span.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-agent-graph-conditional-tab",
+          "description": "The Agent Graph tab only appears in the view mode tabs when the current trace contains agent pipeline spans",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Agent Graph"
+            },
+            "label": "Agent Graph tab conditional visibility"
+          },
+          "expected": "The Agent Graph tab is present when agent pipeline spans exist in the trace data. It is absent when no agent pipeline spans are found",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-agent-graph-nodes-edges",
+          "description": "The Agent Graph renders nodes representing agent roles with duration and token information, connected by directed edges showing data flow",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "group"
+            },
+            "label": "ReactFlow graph container with nodes and edges"
+          },
+          "precondition": "Agent Graph tab is active and agent pipeline spans exist",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-agent-graph-empty-state",
+          "description": "When the Agent Graph tab is shown but the current run has no agent pipeline spans, an empty state message is displayed",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No agent pipeline"
+            },
+            "label": "Agent graph empty state message"
+          },
+          "precondition": "Agent Graph tab is active but no agent pipeline spans exist in the trace",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-agent-graph-node-click-selects-span",
+          "description": "Clicking a node in the agent graph selects the corresponding span, showing its details in the SpanDetailPanel",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "group"
+            },
+            "label": "Clickable agent graph node"
+          },
+          "expected": "Clicking an agent node in the graph selects the corresponding span and opens the SpanDetailPanel with that span's details",
+          "precondition": "Agent Graph tab is active with agent pipeline spans rendered as nodes",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "traces-replay",
+      "name": "Step-Through Replay",
+      "description": "Step-through replay mode for debugging execution traces. A Replay button in the toolbar activates replay mode. When active, a ReplayController bar appears with transport controls: skip to start, step backward, play/pause, step forward, skip to end, and a scrub slider. The SpanDetailPanel is replaced by a ReplayPanel showing step context (current span details, step number, and surrounding context). The current span is highlighted with a blue pulsing ring. Keyboard shortcuts support navigation (left/right arrows for step, space for play/pause). Exiting replay returns to normal trace viewing mode.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "traces-replay-button-exists",
+          "description": "A Replay button exists in the toolbar to activate step-through replay mode",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Replay"
+            },
+            "label": "Replay button in toolbar"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-replay-controller-bar",
+          "description": "When replay mode is active, a ReplayController bar appears with transport controls (skip to start, step back, play/pause, step forward, skip to end, scrub slider)",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "toolbar"
+            },
+            "label": "Replay controller bar"
+          },
+          "precondition": "Replay mode is active (Replay button has been clicked)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-replay-step-navigation",
+          "description": "Step forward and step backward buttons navigate through spans one at a time in execution order",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Step navigation buttons"
+          },
+          "expected": "Clicking step forward advances to the next span in execution order. Clicking step backward returns to the previous span. The current span indicator updates accordingly",
+          "precondition": "Replay mode is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-replay-panel-shows-context",
+          "description": "The ReplayPanel replaces SpanDetailPanel during replay and shows step context including current span details, step number, and surrounding execution context",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Step"
+            },
+            "label": "Replay panel with step context"
+          },
+          "precondition": "Replay mode is active and at least one span is in the trace",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-replay-keyboard-shortcuts",
+          "description": "Keyboard shortcuts work during replay: left arrow for step backward, right arrow for step forward, space for play/pause",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "toolbar"
+            },
+            "label": "Replay keyboard shortcut handler"
+          },
+          "expected": "Left arrow key steps backward, right arrow key steps forward, space bar toggles play/pause during active replay mode",
+          "precondition": "Replay mode is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-replay-exit-returns-normal",
+          "description": "Exiting replay mode (via close/exit button) returns the trace viewer to normal viewing mode with SpanDetailPanel restored",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Exit"
+            },
+            "label": "Exit replay button"
+          },
+          "expected": "Clicking exit/close removes the ReplayController bar, restores SpanDetailPanel, removes the blue pulsing ring highlight, and returns to standard trace viewing mode",
+          "precondition": "Replay mode is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "traces-minimap",
+      "name": "Trace Timeline Minimap",
+      "description": "A 40px-tall canvas overview rendered above the waterfall and flamechart views for traces with 10 or more spans. The minimap shows phase-colored bars representing all spans in a compressed timeline, a viewport indicator with a blue border showing the currently visible region, and dimmed areas outside the viewport. Clicking or dragging the minimap scrolls the waterfall/flamechart to the corresponding position. Scrolling the waterfall/flamechart updates the minimap viewport indicator bidirectionally.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "traces-minimap-appears-10-plus",
+          "description": "The trace timeline minimap appears above the waterfall/flamechart when the trace has 10 or more spans",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Minimap canvas for 10+ span traces"
+          },
+          "precondition": "A trace with 10 or more spans is loaded in Waterfall or Flamechart view",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-minimap-hidden-under-10",
+          "description": "The minimap is not shown when the trace has fewer than 10 spans, avoiding visual clutter for simple traces",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Minimap absence for small traces"
+          },
+          "expected": "No minimap canvas element is rendered above the waterfall/flamechart when the trace has fewer than 10 spans",
+          "precondition": "A trace with fewer than 10 spans is loaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-minimap-click-scrolls-waterfall",
+          "description": "Clicking a position on the minimap scrolls the waterfall/flamechart to show the corresponding portion of the trace",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Minimap click-to-scroll"
+          },
+          "expected": "Clicking on the minimap canvas centers the waterfall/flamechart viewport on the clicked position. Dragging on the minimap continuously scrolls the waterfall/flamechart",
+          "precondition": "Minimap is visible (10+ spans) in Waterfall or Flamechart view",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-minimap-phase-colors",
+          "description": "Minimap bars use the same phase color palette as the waterfall and flamechart views for visual consistency",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Minimap phase-colored bars"
+          },
+          "expected": "Minimap span bars use the same phase colors (setup=blue, verification=amber, agentic=purple, completion=emerald, ai=green, python=orange) as the main views",
+          "precondition": "Minimap is visible with spans from multiple phases",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-minimap-viewport-indicator",
+          "description": "The minimap displays a viewport indicator with a blue border showing which portion of the trace is currently visible in the waterfall/flamechart, with dimmed areas outside the viewport",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "canvas"
+            },
+            "label": "Minimap viewport indicator"
+          },
+          "expected": "A rectangular region with a blue border indicates the currently visible portion. Areas outside this region are dimmed with a semi-transparent overlay",
+          "precondition": "Minimap is visible (10+ spans)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "traces-comparison-filtering",
+      "name": "Comparison View Filtering",
+      "description": "Extended filtering for the comparison view with three controls: a name search input for filtering matched spans by name, a minimum delta threshold input for hiding small differences, and a phase filter dropdown. The filter bar is positioned between the status category tabs and the match list. All three filters work together (AND logic) to reduce the match list to relevant entries.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "traces-comparison-filter-name-input",
+          "description": "A name search input exists in the comparison filter bar for filtering matched span pairs by name",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Search"
+            },
+            "label": "Comparison name search input"
+          },
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-filter-min-delta",
+          "description": "A minimum delta threshold input exists for hiding span pairs with differences below a specified percentage",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Min delta"
+            },
+            "label": "Minimum delta threshold input"
+          },
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-filter-phase-dropdown",
+          "description": "A phase filter dropdown exists for filtering comparison matches by workflow phase",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "All Phases"
+            },
+            "label": "Comparison phase filter dropdown"
+          },
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-filters-reduce-list",
+          "description": "Applying any filter reduces the number of visible match rows in the comparison list",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run A"
+            },
+            "label": "Filtered comparison match list"
+          },
+          "expected": "Entering a name filter, setting a minimum delta, or selecting a specific phase reduces the displayed match rows. Only rows matching all active filter criteria are shown",
+          "precondition": "Comparison tab is active with two runs selected and matches visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-comparison-filters-combine",
+          "description": "All three comparison filters (name, min delta, phase) work together with AND logic so users can precisely narrow results",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Run A"
+            },
+            "label": "Combined comparison filters"
+          },
+          "expected": "Setting a name filter, minimum delta, and phase filter simultaneously shows only matches that satisfy all three criteria. Clearing any filter expands the results accordingly",
+          "precondition": "Comparison tab is active with two runs selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "traces-visual-design",
+      "name": "Visual Design Coverage",
+      "description": "Visual design assertions for the trace viewer covering dark theme colors, spacing, and typography. Verifies the zinc-based dark theme (background zinc-900, borders zinc-700, text hierarchy zinc-300/400/500), phase color palette consistency across all views, and input styling consistency for filter controls.",
+      "category": "design",
+      "assertions": [
+        {
+          "id": "traces-design-root-background",
+          "description": "The trace viewer root container uses a zinc-900 dark background consistent with the application theme",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "cssProperty",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "region"
+            },
+            "label": "Trace viewer root container"
+          },
+          "expected": "Background color is zinc-900 (#18181b) or equivalent dark background",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-design-border-color",
+          "description": "Borders and dividers throughout the trace viewer use zinc-700 for consistent separation of sections",
+          "category": "design",
+          "severity": "info",
+          "assertionType": "cssProperty",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "separator"
+            },
+            "label": "Section borders and dividers"
+          },
+          "expected": "Border color is zinc-700 (#3f3f46) for all section dividers and container borders",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-design-text-hierarchy",
+          "description": "Text uses a three-level zinc hierarchy: primary text in zinc-300, secondary text in zinc-400, and tertiary/muted text in zinc-500",
+          "category": "design",
+          "severity": "info",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Name"
+            },
+            "label": "Text color hierarchy"
+          },
+          "expected": "Primary labels and span names use zinc-300 (#d4d4d8). Secondary information like timestamps use zinc-400 (#a1a1aa). Tertiary hints use zinc-500 (#71717a)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-design-phase-badge-colors",
+          "description": "Phase badges use consistent colors across waterfall, flamechart, minimap, and comparison views",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "setup|verification|agentic|completion|ai|python"
+            },
+            "label": "Phase badge color consistency"
+          },
+          "expected": "Phase badge colors are consistent: setup=blue-400/900, verification=amber-400/900, agentic=purple-400/900, completion=emerald-400/900, ai=green-400/900, python=orange-400/900 across all views",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "traces-design-input-styling",
+          "description": "All filter inputs and dropdowns use consistent styling: zinc-800 background, zinc-600 border, zinc-300 text, rounded corners",
+          "category": "design",
+          "severity": "info",
+          "assertionType": "cssProperty",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Search spans"
+            },
+            "label": "Filter input styling"
+          },
+          "expected": "Filter inputs have bg-zinc-800 background, border-zinc-600 border, text-zinc-300 text color, and rounded-md border radius",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "metadata": {
     "component": "TraceViewerPage",
     "author": "Claude",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-26T00:00:00.000Z",
+    "updatedAt": "2026-04-01T00:00:00.000Z",
     "pageUrl": "/runs/traces",
     "elementSource": "sdk",
     "tags": [
@@ -847,7 +1533,14 @@
       "critical-path",
       "performance",
       "execution-spans",
-      "observe"
+      "observe",
+      "token-overlay",
+      "agent-graph",
+      "replay",
+      "minimap",
+      "genai-attributes",
+      "ai-session",
+      "visual-design"
     ],
     "backendFiles": [
       "src/components/widgets/trace-viewer/TraceViewerWidget.tsx",
