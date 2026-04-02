@@ -63,10 +63,7 @@ fn default_webview_class_patterns() -> Vec<String> {
 
 /// Default AT-SPI role patterns for webview detection on Linux.
 fn default_webview_role_patterns() -> Vec<String> {
-    vec![
-        "document frame".to_string(),
-        "document web".to_string(),
-    ]
+    vec!["document frame".to_string(), "document web".to_string()]
 }
 
 /// Fusion engine for merging accessibility trees from multiple sources.
@@ -121,11 +118,7 @@ impl FusionEngine {
     /// Attempt to graft additional children into the webview container.
     ///
     /// Returns true if a webview container was found and grafted.
-    fn graft_into_native(
-        &self,
-        node: &mut UnifiedNode,
-        additional_tree: UnifiedNode,
-    ) -> bool {
+    fn graft_into_native(&self, node: &mut UnifiedNode, additional_tree: UnifiedNode) -> bool {
         // Check if this node IS the webview container
         if self.is_webview_container(node) {
             self.perform_graft(node, additional_tree);
@@ -407,9 +400,6 @@ mod tests {
             webview_node.children[0].name.as_deref(),
             Some("Native child")
         );
-        assert_eq!(
-            webview_node.children[1].name.as_deref(),
-            Some("Web Button")
-        );
+        assert_eq!(webview_node.children[1].name.as_deref(), Some("Web Button"));
     }
 }

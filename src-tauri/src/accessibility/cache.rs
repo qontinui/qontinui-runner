@@ -184,33 +184,23 @@ impl TreeCache {
                                 debug!("Updated description on {}", ref_id);
                             }
                             "is_focused" => {
-                                node.state.is_focused =
-                                    new_value.as_deref() == Some("true");
+                                node.state.is_focused = new_value.as_deref() == Some("true");
                             }
                             "is_disabled" => {
-                                node.state.is_disabled =
-                                    new_value.as_deref() == Some("true");
+                                node.state.is_disabled = new_value.as_deref() == Some("true");
                             }
                             "is_hidden" => {
-                                node.state.is_hidden =
-                                    new_value.as_deref() == Some("true");
+                                node.state.is_hidden = new_value.as_deref() == Some("true");
                             }
                             "is_readonly" => {
-                                node.state.is_readonly =
-                                    new_value.as_deref() == Some("true");
+                                node.state.is_readonly = new_value.as_deref() == Some("true");
                             }
                             other => {
-                                debug!(
-                                    "Unhandled property update '{}' on {}",
-                                    other, ref_id
-                                );
+                                debug!("Unhandled property update '{}' on {}", other, ref_id);
                             }
                         }
                     } else {
-                        warn!(
-                            "PropertyChanged target not found in tree: {}",
-                            ref_id
-                        );
+                        warn!("PropertyChanged target not found in tree: {}", ref_id);
                     }
                 }
             }
@@ -696,7 +686,10 @@ mod tests {
                 Err(_) => break,
             }
         }
-        assert!(got_tree_replaced, "Expected TreeReplaced event from dirty batch");
+        assert!(
+            got_tree_replaced,
+            "Expected TreeReplaced event from dirty batch"
+        );
 
         // Dirty set should have been drained
         assert!(!cache.has_dirty().await);

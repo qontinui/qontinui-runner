@@ -230,7 +230,6 @@ impl UnifiedRole {
     }
 }
 
-
 /// Tri-state boolean for accessibility states that may not apply to an element.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -450,13 +449,22 @@ fn default_node_source() -> NodeSource {
 impl UnifiedNode {
     /// Count total nodes in the subtree (including self).
     pub fn total_node_count(&self) -> u32 {
-        1 + self.children.iter().map(|c| c.total_node_count()).sum::<u32>()
+        1 + self
+            .children
+            .iter()
+            .map(|c| c.total_node_count())
+            .sum::<u32>()
     }
 
     /// Count interactive nodes in the subtree (including self).
     pub fn interactive_node_count(&self) -> u32 {
         let self_count = if self.is_interactive { 1 } else { 0 };
-        self_count + self.children.iter().map(|c| c.interactive_node_count()).sum::<u32>()
+        self_count
+            + self
+                .children
+                .iter()
+                .map(|c| c.interactive_node_count())
+                .sum::<u32>()
     }
 
     /// Find a node by ref ID in the subtree.
@@ -627,7 +635,12 @@ mod tests {
                     name: Some("OK".into()),
                     value: None,
                     description: None,
-                    bounds: Some(UnifiedBounds { x: 10, y: 20, width: 80, height: 30 }),
+                    bounds: Some(UnifiedBounds {
+                        x: 10,
+                        y: 20,
+                        width: 80,
+                        height: 30,
+                    }),
                     state: UnifiedState::default(),
                     is_interactive: true,
                     level: None,
@@ -637,7 +650,7 @@ mod tests {
                     url: None,
                     source: NodeSource::Uia,
                     platform_handle: None,
-        
+
                     supported_patterns: vec![InteractionPattern::Invoke],
                     generation: 0,
                     children: vec![],
@@ -658,7 +671,7 @@ mod tests {
                     url: None,
                     source: NodeSource::Uia,
                     platform_handle: None,
-        
+
                     supported_patterns: vec![],
                     generation: 0,
                     children: vec![],
@@ -674,12 +687,22 @@ mod tests {
 
     #[test]
     fn test_unified_bounds_center() {
-        let bounds = UnifiedBounds { x: 100, y: 200, width: 80, height: 40 };
+        let bounds = UnifiedBounds {
+            x: 100,
+            y: 200,
+            width: 80,
+            height: 40,
+        };
         assert_eq!(bounds.center_x(), 140);
         assert_eq!(bounds.center_y(), 220);
         assert!(!bounds.is_empty());
 
-        let empty = UnifiedBounds { x: 0, y: 0, width: 0, height: 0 };
+        let empty = UnifiedBounds {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
         assert!(empty.is_empty());
     }
 
@@ -692,7 +715,12 @@ mod tests {
             name: Some("Submit".into()),
             value: None,
             description: None,
-            bounds: Some(UnifiedBounds { x: 10, y: 20, width: 100, height: 30 }),
+            bounds: Some(UnifiedBounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 30,
+            }),
             state: UnifiedState {
                 is_focused: true,
                 is_disabled: false,

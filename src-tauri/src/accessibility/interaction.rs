@@ -47,7 +47,10 @@ impl InteractionEngine {
     /// Choose the best interaction pattern for focusing.
     pub fn best_focus_pattern(node: &UnifiedNode) -> InteractionPattern {
         // Focus is typically done via click at coordinates or native invoke
-        if node.supported_patterns.contains(&InteractionPattern::Invoke) {
+        if node
+            .supported_patterns
+            .contains(&InteractionPattern::Invoke)
+        {
             InteractionPattern::Invoke
         } else {
             InteractionPattern::CoordinateClick

@@ -27,7 +27,9 @@ use super::super::events::A11yEvent;
 use super::super::model::{
     InteractionPattern, NodeSource, UnifiedBounds, UnifiedNode, UnifiedRole, UnifiedState,
 };
-use super::super::traits::{ConnectionTarget, InteractionParams, InteractionResult, PlatformAdapter};
+use super::super::traits::{
+    ConnectionTarget, InteractionParams, InteractionResult, PlatformAdapter,
+};
 
 // ---------------------------------------------------------------------------
 // FFI declarations
@@ -177,8 +179,9 @@ impl HandleTable {
 fn ax_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
     let attr_cf = CFString::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
-    let err =
-        unsafe { AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value) };
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value)
+    };
     if err != AX_ERROR_SUCCESS || value.is_null() {
         return None;
     }
@@ -197,8 +200,9 @@ fn ax_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
 fn ax_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
     let attr_cf = CFString::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
-    let err =
-        unsafe { AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value) };
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value)
+    };
     if err != AX_ERROR_SUCCESS || value.is_null() {
         return None;
     }
@@ -256,8 +260,9 @@ fn ax_bounds(element: AXUIElementRef) -> Option<UnifiedBounds> {
 fn ax_raw_value(element: AXUIElementRef, attr_name: &str) -> Option<CFTypeRef> {
     let attr_cf = CFString::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
-    let err =
-        unsafe { AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value) };
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value)
+    };
     if err != AX_ERROR_SUCCESS || value.is_null() {
         None
     } else {
@@ -269,8 +274,9 @@ fn ax_raw_value(element: AXUIElementRef, attr_name: &str) -> Option<CFTypeRef> {
 fn ax_number_attr(element: AXUIElementRef, attr_name: &str) -> Option<f64> {
     let attr_cf = CFString::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
-    let err =
-        unsafe { AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value) };
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value)
+    };
     if err != AX_ERROR_SUCCESS || value.is_null() {
         return None;
     }
@@ -289,8 +295,9 @@ fn ax_number_attr(element: AXUIElementRef, attr_name: &str) -> Option<f64> {
 fn ax_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     let attr_cf = CFString::new("AXChildren");
     let mut value: CFTypeRef = std::ptr::null();
-    let err =
-        unsafe { AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value) };
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value)
+    };
     if err != AX_ERROR_SUCCESS || value.is_null() {
         return vec![];
     }
@@ -390,8 +397,8 @@ fn build_tree(
     let role = map_ax_role(&role_str);
 
     // Name: prefer AXTitle, fall back to AXDescription
-    let name = ax_string_attr(element, "AXTitle")
-        .or_else(|| ax_string_attr(element, "AXDescription"));
+    let name =
+        ax_string_attr(element, "AXTitle").or_else(|| ax_string_attr(element, "AXDescription"));
 
     let value = ax_string_attr(element, "AXValue");
     let description = ax_string_attr(element, "AXRoleDescription");
@@ -519,10 +526,7 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
     const K_CG_NULL_WINDOW_ID: u32 = 0;
 
     let info_list = unsafe {
-        CGWindowListCopyWindowInfo(
-            K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY,
-            K_CG_NULL_WINDOW_ID,
-        )
+        CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, K_CG_NULL_WINDOW_ID)
     };
     if info_list.is_null() {
         bail!("CGWindowListCopyWindowInfo returned null");
@@ -544,9 +548,7 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
         let name_key = CFString::new("kCGWindowName");
 
         let pid_val = unsafe {
-            core_foundation::dictionary::CFDictionary::wrap_under_get_rule(
-                dict_ref as *const _,
-            )
+            core_foundation::dictionary::CFDictionary::wrap_under_get_rule(dict_ref as *const _)
         };
 
         // Use find() on the dictionary
@@ -594,8 +596,8 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
                         if win.is_null() {
                             continue;
                         }
-                        let win_title = ax_string_attr(win as AXUIElementRef, "AXTitle")
-                            .unwrap_or_default();
+                        let win_title =
+                            ax_string_attr(win as AXUIElementRef, "AXTitle").unwrap_or_default();
                         if win_title.to_lowercase().contains(&title_lower) {
                             // Found it — retain the window element, release the app
                             unsafe { CFRetain(win as CFTypeRef) };
@@ -609,10 +611,7 @@ fn find_window_by_title(title: &str) -> anyhow::Result<AXUIElementRef> {
         }
     }
 
-    bail!(
-        "no on-screen window found matching title {:?}",
-        title
-    )
+    bail!("no on-screen window found matching title {:?}", title)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,11 +644,7 @@ impl PlatformAdapter for AxAdapter {
         "ax"
     }
 
-    async fn connect(
-        &mut self,
-        target: ConnectionTarget,
-        _timeout_ms: u64,
-    ) -> anyhow::Result<()> {
+    async fn connect(&mut self, target: ConnectionTarget, _timeout_ms: u64) -> anyhow::Result<()> {
         let root_arc = self.root.clone();
         let connected = self.connected.clone();
         let handles = self.handles.clone();
@@ -675,10 +670,7 @@ impl PlatformAdapter for AxAdapter {
                 ConnectionTarget::ProcessId(pid) => {
                     let el = unsafe { AXUIElementCreateApplication(pid as pid_t) };
                     if el.is_null() {
-                        bail!(
-                            "AXUIElementCreateApplication returned null for pid {}",
-                            pid
-                        );
+                        bail!("AXUIElementCreateApplication returned null for pid {}", pid);
                     }
                     el
                 }
@@ -723,9 +715,7 @@ impl PlatformAdapter for AxAdapter {
 
         tokio::task::spawn_blocking(move || {
             let guard = root_arc.lock().unwrap();
-            let root_el = guard
-                .as_ref()
-                .context("no root element — not connected")?;
+            let root_el = guard.as_ref().context("no root element — not connected")?;
 
             // Clear old handles before building a fresh tree
             handles.clear();
@@ -746,9 +736,7 @@ impl PlatformAdapter for AxAdapter {
         .context("spawn_blocking panicked")?
     }
 
-    async fn subscribe_events(
-        &self,
-    ) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
+    async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
         // AXObserver-based event streaming is deferred to a later phase.
         Ok(None)
     }
@@ -788,7 +776,11 @@ impl PlatformAdapter for AxAdapter {
                     }
                 }
                 InteractionPattern::Value => {
-                    if let InteractionParams::Text { value, clear_first: _ } = params {
+                    if let InteractionParams::Text {
+                        value,
+                        clear_first: _,
+                    } = params
+                    {
                         // Set AXValue
                         let attr = CFString::new("AXValue");
                         let val = CFString::new(&value);
@@ -926,12 +918,10 @@ impl PlatformAdapter for AxAdapter {
                         ))
                     }
                 }
-                InteractionPattern::Text => {
-                    Ok(InteractionResult::err(
-                        pattern,
-                        format!("{:?} pattern is not supported by the AX adapter", pattern),
-                    ))
-                }
+                InteractionPattern::Text => Ok(InteractionResult::err(
+                    pattern,
+                    format!("{:?} pattern is not supported by the AX adapter", pattern),
+                )),
             }
         })
         .await

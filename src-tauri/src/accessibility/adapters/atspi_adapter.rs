@@ -94,10 +94,7 @@ impl AtspiAdapter {
 
     /// Build an AccessibleProxy for a given address. Uses `CacheProperties::No`
     /// to avoid stale D-Bus property caches for dynamic UI elements.
-    async fn accessible_proxy(
-        &self,
-        addr: &AtspiAddress,
-    ) -> anyhow::Result<AccessibleProxy<'_>> {
+    async fn accessible_proxy(&self, addr: &AtspiAddress) -> anyhow::Result<AccessibleProxy<'_>> {
         let conn = self.zbus_conn()?;
         let proxy = AccessibleProxy::builder(conn)
             .destination(addr.bus_name.as_str())?
@@ -348,15 +345,12 @@ impl AtspiAdapter {
             if let Ok(proxy) = self.accessible_proxy(&child_addr).await {
                 // AT-SPI applications expose get_id() or we can check the Application interface.
                 // The accessible application proxy has a method to get the PID.
-                if let Ok(app_proxy) = atspi::proxy::application::ApplicationProxy::builder(
-                    self.zbus_conn()?,
-                )
-                .destination(child_addr.bus_name.as_str())
-                .ok()
-                .and_then(|b| {
-                    b.path(child_addr.object_path.as_str()).ok()
-                })
-                .map(|b| b.cache_properties(CacheProperties::No))
+                if let Ok(app_proxy) =
+                    atspi::proxy::application::ApplicationProxy::builder(self.zbus_conn()?)
+                        .destination(child_addr.bus_name.as_str())
+                        .ok()
+                        .and_then(|b| b.path(child_addr.object_path.as_str()).ok())
+                        .map(|b| b.cache_properties(CacheProperties::No))
                 {
                     if let Ok(app) = app_proxy.build().await {
                         // The `id` property on Application interface is the PID.
@@ -380,11 +374,7 @@ impl PlatformAdapter for AtspiAdapter {
         "atspi"
     }
 
-    async fn connect(
-        &mut self,
-        target: ConnectionTarget,
-        timeout_ms: u64,
-    ) -> anyhow::Result<()> {
+    async fn connect(&mut self, target: ConnectionTarget, timeout_ms: u64) -> anyhow::Result<()> {
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
         // Connect to the AT-SPI accessibility bus with a timeout.
@@ -411,9 +401,7 @@ impl PlatformAdapter for AtspiAdapter {
             ConnectionTarget::WindowTitle(ref title) => {
                 self.find_by_title(&desktop_proxy, title).await?
             }
-            ConnectionTarget::ProcessId(pid) => {
-                self.find_by_pid(&desktop_proxy, pid).await?
-            }
+            ConnectionTarget::ProcessId(pid) => self.find_by_pid(&desktop_proxy, pid).await?,
         };
 
         debug!(
@@ -464,9 +452,7 @@ impl PlatformAdapter for AtspiAdapter {
         Ok(node)
     }
 
-    async fn subscribe_events(
-        &self,
-    ) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
+    async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>> {
         let conn = self
             .connection
             .as_ref()
@@ -577,30 +563,28 @@ impl PlatformAdapter for AtspiAdapter {
         let addr = self.lookup_handle(platform_handle).await?;
 
         match pattern {
-            InteractionPattern::Invoke => {
-                match self.action_proxy(&addr).await {
-                    Ok(action) => match action.do_action(0).await {
-                        Ok(success) => {
-                            if success {
-                                Ok(InteractionResult::ok(pattern))
-                            } else {
-                                Ok(InteractionResult::err(
-                                    pattern,
-                                    "AT-SPI action returned false",
-                                ))
-                            }
+            InteractionPattern::Invoke => match self.action_proxy(&addr).await {
+                Ok(action) => match action.do_action(0).await {
+                    Ok(success) => {
+                        if success {
+                            Ok(InteractionResult::ok(pattern))
+                        } else {
+                            Ok(InteractionResult::err(
+                                pattern,
+                                "AT-SPI action returned false",
+                            ))
                         }
-                        Err(e) => Ok(InteractionResult::err(
-                            pattern,
-                            format!("AT-SPI do_action failed: {e}"),
-                        )),
-                    },
+                    }
                     Err(e) => Ok(InteractionResult::err(
                         pattern,
-                        format!("Failed to create ActionProxy: {e}"),
+                        format!("AT-SPI do_action failed: {e}"),
                     )),
-                }
-            }
+                },
+                Err(e) => Ok(InteractionResult::err(
+                    pattern,
+                    format!("Failed to create ActionProxy: {e}"),
+                )),
+            },
 
             InteractionPattern::Value => {
                 let text = match &params {
@@ -766,12 +750,10 @@ impl PlatformAdapter for AtspiAdapter {
                 }
             }
 
-            InteractionPattern::Text => {
-                Ok(InteractionResult::err(
-                    pattern,
-                    format!("{pattern:?} is not supported by the AT-SPI adapter"),
-                ))
-            }
+            InteractionPattern::Text => Ok(InteractionResult::err(
+                pattern,
+                format!("{pattern:?} is not supported by the AT-SPI adapter"),
+            )),
         }
     }
 

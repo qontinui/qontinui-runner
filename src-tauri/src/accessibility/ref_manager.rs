@@ -140,7 +140,11 @@ impl RefManager {
 
         let json = serde_json::to_string_pretty(&self.fingerprints)?;
         std::fs::write(&path, json)?;
-        debug!("Saved {} ref fingerprints to {:?}", self.fingerprints.len(), path);
+        debug!(
+            "Saved {} ref fingerprints to {:?}",
+            self.fingerprints.len(),
+            path
+        );
         Ok(self.fingerprints.len())
     }
 
@@ -204,7 +208,8 @@ impl RefManager {
             if !matched {
                 if let (Some(role_str), Some(name)) = (&fp.role, &fp.name) {
                     for node in &interactive_nodes {
-                        if node.role.as_str() == role_str && node.name.as_deref() == Some(name.as_str())
+                        if node.role.as_str() == role_str
+                            && node.name.as_deref() == Some(name.as_str())
                         {
                             self.fingerprints
                                 .insert(ref_id.clone(), RefFingerprint::from_node(node));
@@ -274,9 +279,12 @@ mod tests {
     fn test_assign_refs_to_tree() {
         let mut mgr = RefManager::new();
         let mut root = make_test_node("Window", UnifiedRole::Window, false);
-        root.children.push(make_test_node("OK", UnifiedRole::Button, true));
-        root.children.push(make_test_node("Label", UnifiedRole::StaticText, false));
-        root.children.push(make_test_node("Cancel", UnifiedRole::Button, true));
+        root.children
+            .push(make_test_node("OK", UnifiedRole::Button, true));
+        root.children
+            .push(make_test_node("Label", UnifiedRole::StaticText, false));
+        root.children
+            .push(make_test_node("Cancel", UnifiedRole::Button, true));
 
         mgr.assign_refs_to_tree(&mut root, false);
         assert_eq!(root.ref_id, "@e1");
@@ -290,8 +298,10 @@ mod tests {
     fn test_assign_refs_interactive_only() {
         let mut mgr = RefManager::new();
         let mut root = make_test_node("Window", UnifiedRole::Window, false);
-        root.children.push(make_test_node("OK", UnifiedRole::Button, true));
-        root.children.push(make_test_node("Label", UnifiedRole::StaticText, false));
+        root.children
+            .push(make_test_node("OK", UnifiedRole::Button, true));
+        root.children
+            .push(make_test_node("Label", UnifiedRole::StaticText, false));
 
         mgr.assign_refs_to_tree(&mut root, true);
         assert_eq!(root.ref_id, ""); // not interactive
@@ -307,7 +317,12 @@ mod tests {
             role: UnifiedRole::Button,
             name: Some("Submit".into()),
             automation_id: Some("btn_submit".into()),
-            bounds: Some(UnifiedBounds { x: 10, y: 20, width: 80, height: 30 }),
+            bounds: Some(UnifiedBounds {
+                x: 10,
+                y: 20,
+                width: 80,
+                height: 30,
+            }),
             ..make_test_node("Submit", UnifiedRole::Button, true)
         };
 

@@ -29,23 +29,13 @@ pub enum InteractionParams {
     /// No additional parameters (for Invoke, Toggle, CoordinateClick).
     None,
     /// Text input parameters (for Value).
-    Text {
-        value: String,
-        clear_first: bool,
-    },
+    Text { value: String, clear_first: bool },
     /// Scroll direction (for Scroll).
-    ScrollDirection {
-        horizontal: i32,
-        vertical: i32,
-    },
+    ScrollDirection { horizontal: i32, vertical: i32 },
     /// Numeric value (for RangeValue, e.g. slider position).
-    RangeValue {
-        value: f64,
-    },
+    RangeValue { value: f64 },
     /// Expand or collapse (for ExpandCollapse).
-    ExpandCollapse {
-        expand: bool,
-    },
+    ExpandCollapse { expand: bool },
 }
 
 /// Result of an interaction attempt.
@@ -88,11 +78,7 @@ pub trait PlatformAdapter: Send + Sync {
     fn backend_name(&self) -> &'static str;
 
     /// Connect to an accessibility source.
-    async fn connect(
-        &mut self,
-        target: ConnectionTarget,
-        timeout_ms: u64,
-    ) -> anyhow::Result<()>;
+    async fn connect(&mut self, target: ConnectionTarget, timeout_ms: u64) -> anyhow::Result<()>;
 
     /// Disconnect and release resources.
     async fn disconnect(&mut self) -> anyhow::Result<()>;
@@ -115,9 +101,7 @@ pub trait PlatformAdapter: Send + Sync {
     ///
     /// Returns a channel receiver for events, or `None` if the platform does
     /// not support event streaming.
-    async fn subscribe_events(
-        &self,
-    ) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>>;
+    async fn subscribe_events(&self) -> anyhow::Result<Option<mpsc::Receiver<A11yEvent>>>;
 
     /// Perform a native interaction on an element.
     ///
@@ -130,8 +114,5 @@ pub trait PlatformAdapter: Send + Sync {
     ) -> anyhow::Result<InteractionResult>;
 
     /// Get the interaction patterns supported by an element.
-    async fn supported_patterns(
-        &self,
-        platform_handle: u64,
-    ) -> Vec<InteractionPattern>;
+    async fn supported_patterns(&self, platform_handle: u64) -> Vec<InteractionPattern>;
 }

@@ -22,8 +22,8 @@ use windows::Win32::UI::Accessibility::{
     IUIAutomationFocusChangedEventHandler, IUIAutomationFocusChangedEventHandler_Impl,
     IUIAutomationInvokePattern, IUIAutomationRangeValuePattern, IUIAutomationScrollPattern,
     IUIAutomationTogglePattern, IUIAutomationTreeWalker, IUIAutomationValuePattern,
-    ScrollAmount_NoAmount, TreeScope_Children, UIA_CONTROLTYPE_ID, UIA_NamePropertyId,
-    UIA_PATTERN_ID, UIA_ProcessIdPropertyId,
+    ScrollAmount_NoAmount, TreeScope_Children, UIA_NamePropertyId, UIA_ProcessIdPropertyId,
+    UIA_CONTROLTYPE_ID, UIA_PATTERN_ID,
 };
 
 use super::super::events::A11yEvent;
@@ -130,11 +130,7 @@ impl UiaState {
 
     /// Check whether an element supports a given UIA pattern.
     fn has_pattern(&self, element: &IUIAutomationElement, pattern_id: UIA_PATTERN_ID) -> bool {
-        unsafe {
-            element
-                .GetCurrentPattern(pattern_id)
-                .is_ok()
-        }
+        unsafe { element.GetCurrentPattern(pattern_id).is_ok() }
     }
 
     /// Detect which interaction patterns an element supports.
@@ -420,7 +416,6 @@ impl UiaAdapter {
 
                     return Err(anyhow!("No window found matching title '{}'", title));
                 }
-
             };
 
             Ok(SendElement(elem))
@@ -435,11 +430,7 @@ impl PlatformAdapter for UiaAdapter {
         "uia"
     }
 
-    async fn connect(
-        &mut self,
-        target: ConnectionTarget,
-        timeout_ms: u64,
-    ) -> anyhow::Result<()> {
+    async fn connect(&mut self, target: ConnectionTarget, timeout_ms: u64) -> anyhow::Result<()> {
         if self.connected.load(Ordering::Relaxed) {
             self.disconnect().await?;
         }
@@ -554,11 +545,9 @@ impl PlatformAdapter for UiaAdapter {
             None => return vec![],
         };
 
-        tokio::task::spawn_blocking(move || {
-            match state.get_element(platform_handle) {
-                Some(element) => state.detect_patterns(&element),
-                None => vec![],
-            }
+        tokio::task::spawn_blocking(move || match state.get_element(platform_handle) {
+            Some(element) => state.detect_patterns(&element),
+            None => vec![],
         })
         .await
         .unwrap_or_default()
@@ -794,8 +783,7 @@ unsafe fn interact_with_element(
             )),
         },
 
-        InteractionPattern::Text
-        | InteractionPattern::Selection => Ok(InteractionResult::err(
+        InteractionPattern::Text | InteractionPattern::Selection => Ok(InteractionResult::err(
             pattern,
             format!("{:?} not supported by UIA adapter", pattern),
         )),

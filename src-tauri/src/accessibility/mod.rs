@@ -153,7 +153,8 @@ impl AccessibilityManager {
         let source = self.native_adapter_source();
 
         // Assign refs
-        self.ref_manager.assign_refs_to_tree(&mut native_tree, false);
+        self.ref_manager
+            .assign_refs_to_tree(&mut native_tree, false);
 
         // Build snapshot
         let generation = self.cache.next_generation();
@@ -204,11 +205,7 @@ impl AccessibilityManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Element not found: {}", ref_id))?;
 
-        InteractionEngine::click(
-            &node,
-            self.native_adapter.as_ref(),
-        )
-        .await
+        InteractionEngine::click(&node, self.native_adapter.as_ref()).await
     }
 
     /// Type text into an element by ref ID.
@@ -224,13 +221,7 @@ impl AccessibilityManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Element not found: {}", ref_id))?;
 
-        InteractionEngine::type_text(
-            &node,
-            text,
-            clear_first,
-            self.native_adapter.as_ref(),
-        )
-        .await
+        InteractionEngine::type_text(&node, text, clear_first, self.native_adapter.as_ref()).await
     }
 
     /// Focus an element by ref ID.
@@ -241,11 +232,7 @@ impl AccessibilityManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Element not found: {}", ref_id))?;
 
-        InteractionEngine::focus(
-            &node,
-            self.native_adapter.as_ref(),
-        )
-        .await
+        InteractionEngine::focus(&node, self.native_adapter.as_ref()).await
     }
 
     /// Subscribe to accessibility events.
@@ -256,11 +243,7 @@ impl AccessibilityManager {
     /// Generate an AI-friendly text representation of the current tree.
     ///
     /// Matches the output format of the Python `IAccessibilityCapture.to_ai_context()`.
-    pub async fn to_ai_context(
-        &self,
-        max_elements: usize,
-        interactive_only: bool,
-    ) -> String {
+    pub async fn to_ai_context(&self, max_elements: usize, interactive_only: bool) -> String {
         let snapshot = match self.cache.snapshot().await {
             Some(s) => s,
             None => return "## Accessibility Tree\n\nNo tree captured.".to_string(),
@@ -354,10 +337,7 @@ impl AccessibilityManager {
         );
 
         if count >= max_elements {
-            lines.push(format!(
-                "... (truncated, {} total)",
-                snapshot.total_nodes
-            ));
+            lines.push(format!("... (truncated, {} total)", snapshot.total_nodes));
         }
 
         lines.join("\n")

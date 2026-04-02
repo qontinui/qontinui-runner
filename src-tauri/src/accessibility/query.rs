@@ -4,7 +4,7 @@
 //! in a `UnifiedNode` tree by role, label, value, automation ID, and other
 //! criteria. Inspired by `rerun-io/kittest`.
 
-use super::model::{UnifiedNode, UnifiedRole, UnifiedState, TriBool};
+use super::model::{TriBool, UnifiedNode, UnifiedRole, UnifiedState};
 
 /// Filter predicate for matching nodes in an accessibility tree.
 #[derive(Debug, Clone)]
@@ -318,7 +318,9 @@ impl QueryBuilder {
                 if self.case_sensitive {
                     node_name.contains(substr.as_str())
                 } else {
-                    node_name.to_ascii_lowercase().contains(&substr.to_ascii_lowercase())
+                    node_name
+                        .to_ascii_lowercase()
+                        .contains(&substr.to_ascii_lowercase())
                 }
             }
 
@@ -336,7 +338,9 @@ impl QueryBuilder {
                 if self.case_sensitive {
                     node_value.contains(substr.as_str())
                 } else {
-                    node_value.to_ascii_lowercase().contains(&substr.to_ascii_lowercase())
+                    node_value
+                        .to_ascii_lowercase()
+                        .contains(&substr.to_ascii_lowercase())
                 }
             }
 
@@ -480,9 +484,7 @@ mod tests {
     #[test]
     fn test_by_label() {
         let tree = make_tree();
-        let results = QueryBuilder::new()
-            .by_label("Email")
-            .find_all(&tree);
+        let results = QueryBuilder::new().by_label("Email").find_all(&tree);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].role, UnifiedRole::Textbox);
     }

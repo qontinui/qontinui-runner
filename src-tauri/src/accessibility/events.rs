@@ -33,16 +33,10 @@ pub enum A11yEvent {
     },
 
     /// Full tree was re-captured (e.g., after page navigation).
-    TreeReplaced {
-        generation: u64,
-        total_nodes: u32,
-    },
+    TreeReplaced { generation: u64, total_nodes: u32 },
 
     /// Connection status changed.
-    ConnectionChanged {
-        connected: bool,
-        backend: String,
-    },
+    ConnectionChanged { connected: bool, backend: String },
 }
 
 /// Type of structural change in the accessibility tree.

@@ -42,10 +42,7 @@ impl PlatformAdapter for StubAdapter {
         _target: super::traits::ConnectionTarget,
         _timeout_ms: u64,
     ) -> anyhow::Result<()> {
-        anyhow::bail!(
-            "{} adapter not yet implemented (Phase 2-6)",
-            self.backend
-        )
+        anyhow::bail!("{} adapter not yet implemented (Phase 2-6)", self.backend)
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
@@ -61,10 +58,7 @@ impl PlatformAdapter for StubAdapter {
         _max_depth: Option<u32>,
         _include_hidden: bool,
     ) -> anyhow::Result<super::model::UnifiedNode> {
-        anyhow::bail!(
-            "{} adapter not yet implemented (Phase 2-6)",
-            self.backend
-        )
+        anyhow::bail!("{} adapter not yet implemented (Phase 2-6)", self.backend)
     }
 
     async fn subscribe_events(
@@ -117,4 +111,3 @@ pub fn create_platform_adapter() -> Box<dyn PlatformAdapter> {
         Box::new(StubAdapter::new("unsupported"))
     }
 }
-
