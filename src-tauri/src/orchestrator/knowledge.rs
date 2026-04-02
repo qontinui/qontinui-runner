@@ -154,7 +154,7 @@ pub struct KnowledgeBase {
 
 impl KnowledgeBase {
     pub fn new(db: Arc<CheckpointDb>) -> Self {
-        todo!("SQLite removed")
+        Self { db }
     }
 
     /// Compress knowledge if needed based on the provided configuration.

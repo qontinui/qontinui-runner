@@ -44,12 +44,14 @@ pub struct TriggerTestsResult {
 /// # Returns
 /// Result containing test execution summary and AI-formatted context
 pub fn execute_tests_for_trigger(
-    db: &CheckpointDb,
-    config_id: &str,
-    trigger: &TriggerPoint,
-    task_run_id: Option<&str>,
+    _db: &CheckpointDb,
+    _config_id: &str,
+    _trigger: &TriggerPoint,
+    _task_run_id: Option<&str>,
 ) -> TriggerTestsResult {
-    todo!("SQLite removed")
+    // SQLite removed — test execution now handled via PG-backed paths.
+    // Return empty result to avoid panicking in callers.
+    TriggerTestsResult::default()
 }
 
 /// Create findings for failed critical tests

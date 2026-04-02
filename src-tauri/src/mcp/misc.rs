@@ -466,7 +466,77 @@ pub async fn get_debug_errors(
 pub async fn get_findings_summary(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<ApiResponse<serde_json::Value>> {
-    todo!("SQLite removed")
+    let task_run_id_filter = params.get("task_run_id").cloned();
+
+    let pg = match crate::database::pg::PgDb::try_global() {
+        Some(pg) => pg,
+        None => {
+            return Json(ApiResponse::success(serde_json::json!({
+                "total_findings": 0,
+                "code_related_findings": 0,
+                "by_severity": {},
+                "findings": [],
+                "error": "PostgreSQL not available"
+            })));
+        }
+    };
+
+    // Get findings based on filter
+    let mut all_findings = Vec::new();
+    if let Some(task_run_id) = task_run_id_filter {
+        if let Ok(findings) = pg.get_findings_for_task(&task_run_id).await {
+            all_findings.extend(findings);
+        }
+    } else {
+        // Get recent task run IDs
+        if let Ok(task_runs) = pg.get_recent_task_runs(5, None).await {
+            for task_run in &task_runs {
+                if let Ok(findings) = pg.get_findings_for_task(&task_run.id).await {
+                    all_findings.extend(findings);
+                }
+            }
+        }
+    }
+
+    let total = all_findings.len();
+
+    // Count by severity
+    let mut by_severity: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut code_related = 0usize;
+
+    let findings_json: Vec<serde_json::Value> = all_findings
+        .iter()
+        .map(|f| {
+            let severity = f.severity.as_str().to_string();
+            *by_severity.entry(severity.clone()).or_insert(0) += 1;
+            if matches!(
+                f.category,
+                crate::findings::FindingCategory::CodeBug
+                    | crate::findings::FindingCategory::TestIssue
+            ) {
+                code_related += 1;
+            }
+            serde_json::json!({
+                "id": f.id,
+                "task_run_id": f.task_run_id,
+                "category": f.category.as_str(),
+                "severity": f.severity.as_str(),
+                "status": f.status.as_str(),
+                "title": f.title,
+                "description": f.description,
+                "file_path": f.code_context.as_ref().and_then(|c| c.file.as_deref()),
+                "detected_at": f.detected_at,
+            })
+        })
+        .collect();
+
+    Json(ApiResponse::success(serde_json::json!({
+        "total_findings": total,
+        "code_related_findings": code_related,
+        "by_severity": by_severity,
+        "findings": findings_json,
+    })))
 }
 
 /// Launch Chrome with remote debugging enabled

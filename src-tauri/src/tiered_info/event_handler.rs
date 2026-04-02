@@ -67,7 +67,7 @@ impl RunRecordingHandler {
 
     /// Get the database handle.
     fn db(&self) -> Arc<CheckpointDb> {
-        todo!("SQLite removed")
+        Arc::new(CheckpointDb)
     }
 
     /// Set the task run ID for unified task tracking.

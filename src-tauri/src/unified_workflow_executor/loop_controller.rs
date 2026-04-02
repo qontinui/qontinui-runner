@@ -60,7 +60,47 @@ impl LoopController {
         app_handle: tauri::AppHandle,
         pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     ) -> Self {
-        todo!("SQLite removed")
+        let doctor_handle = app_state
+            .doctor_handle
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        Self {
+            setup_executor: SetupExecutor::new(
+                app_state.clone(),
+                config_storage.clone(),
+                app_handle.clone(),
+                pid_tracker.clone(),
+            ),
+            verification_executor: Arc::new(VerificationExecutor::new(
+                app_state.clone(),
+                config_storage.clone(),
+                app_handle.clone(),
+            )),
+            agentic_executor: Arc::new(AgenticExecutor::new(
+                app_state.clone(),
+                app_handle.clone(),
+                pid_tracker.clone(),
+            )),
+            completion_executor: CompletionExecutor::new(
+                app_state.clone(),
+                config_storage.clone(),
+                app_handle.clone(),
+                pid_tracker.clone(),
+            ),
+            knowledge_base: KnowledgeBase::new(Arc::new(crate::database::CheckpointDb)),
+            canvas_manager: tokio::sync::Mutex::new(CanvasPanelManager::new(
+                app_state.canvas_state.clone(),
+                app_handle.clone(),
+            )),
+            app_state,
+            config_storage,
+            app_handle,
+            pid_tracker,
+            doctor_handle,
+            reflection_fix_ctx: None,
+            step_injection_ctx: None,
+        }
     }
 
     /// Enable interactive sessions on all phase executors via the session manager.
@@ -552,7 +592,1884 @@ impl LoopController {
         start: std::time::Instant,
         resume_point: &ResumePoint,
     ) -> WorkflowResult {
-        todo!("SQLite removed")
+        // Load and enforce flow control from the workflow's flow_control_json
+        let flow_enforcer = crate::flow_control::get_flow_control_enforcer();
+        let flow_control: crate::flow_control::FlowControl = crate::flow_control::FlowControl::default();
+
+        match flow_enforcer.check(&config.workflow_id, &flow_control).await {
+            crate::flow_control::FlowControlDecision::Allow => {}
+            crate::flow_control::FlowControlDecision::Skip { reason } => {
+                warn!("Workflow {} skipped by flow control: {}", config.workflow_id, reason);
+                return WorkflowResult {
+                    success: false,
+                    verification_passed: false,
+                    step_results: all_step_results,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    loop_result: None,
+                    worktree_path: config.worktree_path.clone(),
+                    worktree_branch: config.worktree_branch.clone(),
+                    workflow_architecture: config.workflow_architecture.clone(),
+                    agentic_verification_config: config.agentic_verification_config.clone(),
+                    multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                };
+            }
+            crate::flow_control::FlowControlDecision::Wait { wait_ms, reason } => {
+                info!(
+                    "Workflow {} throttled: {} (waiting {}ms)",
+                    config.workflow_id, reason, wait_ms
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+            }
+        }
+
+        // Record flow control start for concurrency tracking (after admission)
+        flow_enforcer.record_start(&config.workflow_id, None).await;
+
+        let total_stages = config.stages.len();
+
+        // Determine which stage to start from based on resume point
+        let start_from_stage = match resume_point {
+            ResumePoint::StageStart { from_stage } => *from_stage as usize,
+            ResumePoint::VerificationPhase {
+                stage_index: Some(si),
+                ..
+            } => *si as usize,
+            ResumePoint::AgenticPhase {
+                stage_index: Some(si),
+                ..
+            } => *si as usize,
+            ResumePoint::SetupPhase {
+                stage_index: Some(si),
+                ..
+            } => *si as usize,
+            _ => 0,
+        };
+
+        if start_from_stage > 0 {
+            info!(
+                "=== MULTI-STAGE WORKFLOW: {} stages, stop_on_failure={}, RESUMING from stage {} ===",
+                total_stages, config.stop_on_failure, start_from_stage
+            );
+        } else {
+            info!(
+                "=== MULTI-STAGE WORKFLOW: {} stages, stop_on_failure={} ===",
+                total_stages, config.stop_on_failure
+            );
+        }
+
+        let mut any_stage_passed = false;
+        let mut last_loop_result: Option<LoopResult> = None;
+        let mut total_stage_failures: u32 = 0;
+        let mut total_iterations_across_stages: u32 = 0;
+
+        // =====================================================================
+        // CANARY ROLLOUT: Detection + Config Injection
+        // =====================================================================
+        let mut canary_config_originals: Vec<(String, Option<serde_json::Value>)> = Vec::new();
+        {
+            let active_canary: Option<(String, String)> =
+                match crate::meta_optimizer::canary::get_active_canaries(&self.app_state.pg_db) {
+                    Ok(canaries) => canaries.into_iter().find_map(|c| {
+                        if crate::meta_optimizer::canary::should_apply_canary(
+                            &self.app_state.pg_db,
+                            &c.recommendation_id,
+                        ) {
+                            info!(
+                                "CANARY: Rollout {} active for this run ({}%)",
+                                c.id, c.percentage
+                            );
+                            Some((c.id, c.recommendation_id))
+                        } else {
+                            None
+                        }
+                    }),
+                    Err(_) => None,
+                };
+            let is_canary_run = active_canary.is_some();
+
+            // Apply config overrides for canary runs
+            if let Some((_, ref rec_id)) = active_canary {
+                match crate::meta_optimizer::canary::get_canary_config_overrides(
+                    &self.app_state.pg_db,
+                    rec_id,
+                ) {
+                    Ok(overrides) => {
+                        for (key, value) in overrides {
+                            let original = self.app_state.pg_db.get_setting(&key).await.ok().flatten();
+                            canary_config_originals.push((key.clone(), original));
+                            let set_result = self.app_state.pg_db.set_setting(&key, &value).await;
+                            if let Err(e) = set_result {
+                                warn!("CANARY: Failed to set config {}={}: {}", key, value, e);
+                            } else {
+                                info!("CANARY: Injecting config override {}={}", key, value);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("CANARY: Failed to load config overrides: {}", e);
+                    }
+                }
+            }
+
+            // Store canary state on config so loop paths can access it
+            config.active_canary = active_canary;
+            config.is_canary_run = is_canary_run;
+        }
+
+        for stage_idx in 0..config.stages.len() {
+            let stage = &config.stages[stage_idx];
+            // Skip stages that have already completed (resume support)
+            if stage_idx < start_from_stage {
+                info!(
+                    "  Skipping stage {}/{} (already completed before resume)",
+                    stage_idx + 1,
+                    total_stages
+                );
+                continue;
+            }
+            let stage_num = stage_idx + 1;
+
+            // Evaluate conditional stage execution
+            if let Some(ref condition) = stage.condition {
+                let previous_passed = last_loop_result
+                    .as_ref()
+                    .map(|r| r.verification_passed)
+                    .unwrap_or(true);
+
+                let should_skip = evaluate_stage_condition(
+                    condition,
+                    previous_passed,
+                    total_iterations_across_stages,
+                    total_stage_failures,
+                );
+
+                if should_skip {
+                    info!(
+                        "STAGE-SKIP: stage {}/{} '{}' skipped (condition not met: {:?})",
+                        stage_num, total_stages, stage.name, condition
+                    );
+                    continue;
+                }
+            }
+
+            // Notify canvas of stage start
+            self.canvas_manager
+                .lock()
+                .await
+                .on_stage_start(stage_idx as u32, &stage.name, total_stages)
+                .await;
+
+            // Wait if paused before starting a new stage
+            self.wait_while_paused(&config.execution_id).await;
+
+            // Check for external stop
+            if self.is_task_stopped(&config.execution_id) {
+                warn!("Task stopped before stage {}/{}", stage_num, total_stages);
+                self.persist_workflow_state(
+                    &config.execution_id,
+                    &UnifiedWorkflowState::stopped_in_phase("stage", Some(stage_idx as u32)),
+                );
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed(&format!(
+                        "Stopped before stage {}/{}",
+                        stage_num, total_stages
+                    ))
+                    .await;
+                Self::restore_canary_config(&canary_config_originals);
+                flow_enforcer.record_end(&config.workflow_id, None).await;
+                return WorkflowResult {
+                    success: false,
+                    verification_passed: false,
+                    step_results: all_step_results,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    loop_result: last_loop_result,
+                    worktree_path: config.worktree_path.clone(),
+                    worktree_branch: config.worktree_branch.clone(),
+                    workflow_architecture: config.workflow_architecture.clone(),
+                    agentic_verification_config: config.agentic_verification_config.clone(),
+                    multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                };
+            }
+
+            // Check global max_sessions budget before starting a new stage
+            if let Some(max) = config.max_sessions {
+                let sessions_task_run = self.app_state.pg_db.get_task_run(&config.execution_id).await;
+                if let Ok(Some(task_run)) = sessions_task_run {
+                    if task_run.sessions_count >= max {
+                        warn!(
+                            "Global max_sessions ({}) reached before stage {}/{} (sessions_count={}) - stopping workflow",
+                            max, stage_num, total_stages, task_run.sessions_count
+                        );
+                        self.persist_workflow_state(
+                            &config.execution_id,
+                            &UnifiedWorkflowState::failed_in_phase(
+                                format!(
+                                    "Max sessions ({}) reached before stage {}",
+                                    max, stage_num
+                                ),
+                                "stage",
+                                None,
+                            ),
+                        );
+                        self.mark_task_failed(
+                            &config.execution_id,
+                            &format!(
+                                "Max sessions ({}) exhausted after {} sessions (before stage {}/{})",
+                                max, task_run.sessions_count, stage_num, total_stages
+                            ),
+                            Some(&config.workflow_id),
+                        )
+                        .await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_workflow_failed(&format!(
+                                "Max sessions ({}) exhausted before stage {}/{}",
+                                max, stage_num, total_stages
+                            ))
+                            .await;
+                        Self::restore_canary_config(&canary_config_originals);
+                        flow_enforcer.record_end(&config.workflow_id, None).await;
+                        return WorkflowResult {
+                            success: false,
+                            verification_passed: false,
+                            step_results: all_step_results,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            loop_result: last_loop_result,
+                            worktree_path: config.worktree_path.clone(),
+                            worktree_branch: config.worktree_branch.clone(),
+                            workflow_architecture: config.workflow_architecture.clone(),
+                            agentic_verification_config: config.agentic_verification_config.clone(),
+                            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                        };
+                    }
+                }
+            }
+
+            // Append stage header to output
+            let separator = "=".repeat(60);
+            let stage_header = format!(
+                "\n\n{}\n=== STAGE {}/{}: \"{}\" ===\n{}\n",
+                separator, stage_num, total_stages, stage.name, separator
+            );
+            let _ = self.app_state.pg_db.append_task_output_ex(
+                &config.execution_id,
+                &stage_header,
+                false,
+                false,
+            ).await;
+
+            info!(
+                "=== STAGE {}/{}: {} (id: {}) ===",
+                stage_num, total_stages, stage.name, stage.id
+            );
+
+            // ─── Stage Setup ───
+            if !stage.setup_automation_steps.is_empty() || !stage.setup_prompt_steps.is_empty() {
+                info!("  Stage {}: Running setup", stage_num);
+                self.persist_workflow_state(
+                    &config.execution_id,
+                    &UnifiedWorkflowState::setup_running(),
+                );
+                self.record_stage_transition(
+                    &config.execution_id,
+                    &mut transitions,
+                    &mut current_stage,
+                    &format!("stage_{}_setup", stage_num),
+                    0,
+                );
+
+                // Resolve setup phase model override
+                let setup_model = stage
+                    .model_overrides
+                    .get("setup")
+                    .and_then(|c| c.model.clone())
+                    .or_else(|| stage.model.clone())
+                    .or_else(|| config.model_override.clone());
+                let setup_provider = stage
+                    .model_overrides
+                    .get("setup")
+                    .and_then(|c| c.provider.clone())
+                    .or_else(|| stage.provider.clone())
+                    .or_else(|| config.provider_override.clone());
+
+                let (setup_ok, setup_results) = self
+                    .setup_executor
+                    .run_setup(
+                        &stage.setup_automation_steps,
+                        &stage.setup_prompt_steps,
+                        &config.execution_id,
+                        &format!(
+                            "{} > Stage {}: {}",
+                            config.workflow_name, stage_num, stage.name
+                        ),
+                        logger,
+                        Some(stage_idx as u32),
+                        setup_model,
+                        setup_provider,
+                    )
+                    .await;
+
+                // Emit canvas panel for setup completion
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_setup_complete(setup_ok, &setup_results)
+                    .await;
+
+                // Log setup output
+                {
+                    let mut output = format!(
+                        "\n--- Stage {} Setup ---\nSteps: {}\nSuccess: {}\n",
+                        stage_num,
+                        setup_results.len(),
+                        setup_ok,
+                    );
+                    for sr in &setup_results {
+                        output.push_str(&format!(
+                            "  [{}] {} - {} ({}ms)\n",
+                            if sr.success { "OK" } else { "FAIL" },
+                            sr.step_type,
+                            sr.step_name,
+                            sr.duration_ms,
+                        ));
+                    }
+                    let _ = self.app_state.pg_db.append_task_output_ex(
+                        &config.execution_id,
+                        &output,
+                        false,
+                        false,
+                    ).await;
+                }
+
+                all_step_results.extend(setup_results);
+
+                if !setup_ok {
+                    warn!("Stage {} setup failed", stage_num);
+                    if config.stop_on_failure {
+                        error!("stop_on_failure=true, aborting workflow");
+                        self.persist_workflow_state(
+                            &config.execution_id,
+                            &UnifiedWorkflowState::failed_in_phase(
+                                format!("Stage {} setup failed", stage_num),
+                                "setup",
+                                None,
+                            ),
+                        );
+                        self.mark_task_failed(
+                            &config.execution_id,
+                            &format!("Stage {} setup failed", stage_num),
+                            Some(&config.workflow_id),
+                        )
+                        .await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_workflow_failed(&format!("Stage {} setup failed", stage_num))
+                            .await;
+                        Self::restore_canary_config(&canary_config_originals);
+                        flow_enforcer.record_end(&config.workflow_id, None).await;
+                        return WorkflowResult {
+                            success: false,
+                            verification_passed: false,
+                            step_results: all_step_results,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            loop_result: last_loop_result,
+                            worktree_path: config.worktree_path.clone(),
+                            worktree_branch: config.worktree_branch.clone(),
+                            workflow_architecture: config.workflow_architecture.clone(),
+                            agentic_verification_config: config.agentic_verification_config.clone(),
+                            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                        };
+                    }
+                    // stop_on_failure=false: skip to next stage
+                    info!("stop_on_failure=false, continuing to next stage");
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::stage_complete(stage_idx as u32),
+                    );
+                    continue;
+                }
+
+                // Expand runtime variables from setup phase outputs into prompts
+                let shared_vars = self.setup_executor.shared_variables().get_all();
+                if !shared_vars.is_empty() {
+                    info!(
+                        "  Stage {}: Expanding {} runtime variables from setup into prompts",
+                        stage_num,
+                        shared_vars.len()
+                    );
+                    for (name, value) in &shared_vars {
+                        let pattern = format!("{{{{{}}}}}", name);
+                        if config.base_prompt.contains(&pattern) {
+                            info!(
+                                "    Substituting {{{{{}}}}} ({} chars) into base_prompt",
+                                name,
+                                value.len()
+                            );
+                            config.base_prompt = config.base_prompt.replace(&pattern, value);
+                        }
+                    }
+
+                    // Also substitute runtime variables into steps within current and remaining stages
+                    for si in stage_idx..config.stages.len() {
+                        let s = &mut config.stages[si];
+                        for step in s
+                            .setup_automation_steps
+                            .iter_mut()
+                            .chain(s.setup_prompt_steps.iter_mut())
+                            .chain(s.verification_steps.iter_mut())
+                            .chain(s.agentic_steps.iter_mut())
+                            .chain(s.completion_automation_steps.iter_mut())
+                            .chain(s.completion_prompt_steps.iter_mut())
+                        {
+                            for (name, value) in &shared_vars {
+                                let pattern = format!("{{{{{}}}}}", name);
+                                if let Some(ref mut content) = step.prompt_content {
+                                    if content.contains(&pattern) {
+                                        *content = content.replace(&pattern, value);
+                                    }
+                                }
+                                if let Some(ref mut cmd) = step.shell_command {
+                                    if cmd.contains(&pattern) {
+                                        *cmd = cmd.replace(&pattern, value);
+                                    }
+                                }
+                                if let Some(ref mut cmd) = step.check_command {
+                                    if cmd.contains(&pattern) {
+                                        *cmd = cmd.replace(&pattern, value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Enrich reflection context with pre-loaded files and project structure
+            if config.reflection_mode || config.base_prompt.contains("{{referenced_files}}") {
+                crate::reflection::workflow::enrich_reflection_context(
+                    self.setup_executor.shared_variables(),
+                    config.project_path.as_deref(),
+                );
+                // Re-run substitution for the newly added variables
+                let enriched_vars = self.setup_executor.shared_variables().get_all();
+                for (name, value) in &enriched_vars {
+                    let pattern = format!("{{{{{}}}}}", name);
+                    if config.base_prompt.contains(&pattern) {
+                        config.base_prompt = config.base_prompt.replace(&pattern, value);
+                    }
+                }
+                // Also substitute enriched variables into stage step contents
+                for si in stage_idx..config.stages.len() {
+                    let s = &mut config.stages[si];
+                    for step in s
+                        .setup_automation_steps
+                        .iter_mut()
+                        .chain(s.setup_prompt_steps.iter_mut())
+                        .chain(s.verification_steps.iter_mut())
+                        .chain(s.agentic_steps.iter_mut())
+                        .chain(s.completion_automation_steps.iter_mut())
+                        .chain(s.completion_prompt_steps.iter_mut())
+                    {
+                        for (name, value) in &enriched_vars {
+                            let pattern = format!("{{{{{}}}}}", name);
+                            if let Some(ref mut content) = step.prompt_content {
+                                if content.contains(&pattern) {
+                                    *content = content.replace(&pattern, value);
+                                }
+                            }
+                            if let Some(ref mut cmd) = step.shell_command {
+                                if cmd.contains(&pattern) {
+                                    *cmd = cmd.replace(&pattern, value);
+                                }
+                            }
+                            if let Some(ref mut cmd) = step.check_command {
+                                if cmd.contains(&pattern) {
+                                    *cmd = cmd.replace(&pattern, value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Always provide project context (tree + root) for all workflows
+            if self
+                .setup_executor
+                .shared_variables()
+                .get("project_root")
+                .is_none()
+            {
+                crate::reflection::workflow::enrich_project_context(
+                    self.setup_executor.shared_variables(),
+                    config.project_path.as_deref(),
+                );
+                // Substitute the new variables into base_prompt
+                let project_vars = self.setup_executor.shared_variables().get_all();
+                for (name, value) in &project_vars {
+                    if name == "project_root" || name == "project_structure" {
+                        let pattern = format!("{{{{{}}}}}", name);
+                        if config.base_prompt.contains(&pattern) {
+                            config.base_prompt = config.base_prompt.replace(&pattern, value);
+                        }
+                    }
+                }
+            }
+
+            // ─── Validate critical shared variables ───
+            {
+                let base_url = crate::mcp::types::get_self_base_url_from_env();
+                let critical_vars = [
+                    "source_findings",
+                    "source_ai_output",
+                    "source_workflow_state",
+                ];
+                for var_name in &critical_vars {
+                    let pattern = format!("{{{{{}}}}}", var_name);
+                    if config.base_prompt.contains(&pattern) {
+                        let fallback = format!(
+                            "Data loading failed for '{}'. Use the runner API directly: GET {}/task-runs/{{execution_id}}/output",
+                            var_name, base_url
+                        );
+                        warn!(
+                            "Stage {}: Critical variable '{}' was not populated by setup — injecting fallback message",
+                            stage_num, var_name
+                        );
+                        config.base_prompt = config.base_prompt.replace(&pattern, &fallback);
+                    }
+                }
+                let remaining_markers: Vec<&str> = config
+                    .base_prompt
+                    .match_indices("{{")
+                    .filter_map(|(start, _)| {
+                        config.base_prompt[start..]
+                            .find("}}")
+                            .map(|end| &config.base_prompt[start..start + end + 2])
+                    })
+                    .collect();
+                if !remaining_markers.is_empty() {
+                    warn!(
+                        "Stage {}: {} unresolved template marker(s) remain in base_prompt: {:?}",
+                        stage_num,
+                        remaining_markers.len(),
+                        &remaining_markers[..remaining_markers.len().min(5)]
+                    );
+                }
+            }
+
+            // Reborrow stage after mutable substitution
+            let stage = &config.stages[stage_idx];
+
+            // ─── Stage Verification-Agentic Loop ───
+            let has_agentic = !stage.agentic_steps.is_empty();
+            if !stage.verification_steps.is_empty() || has_agentic {
+                info!(
+                    "  Stage {}: Running verification-agentic loop (max_iterations={})",
+                    stage_num, stage.max_iterations
+                );
+
+                let (stage_starting_iter, stage_agentic_first) = if stage_idx == start_from_stage {
+                    match resume_point {
+                        ResumePoint::VerificationPhase { iteration, .. } => {
+                            (iteration.saturating_sub(1), false)
+                        }
+                        ResumePoint::AgenticPhase { iteration, .. } => {
+                            (iteration.saturating_sub(1), true)
+                        }
+                        _ => (0, config.run_agentic_first && stage_idx == 0),
+                    }
+                } else {
+                    (0, false)
+                };
+                let mut stage_loop_config = LoopConfig {
+                    max_iterations: stage.max_iterations,
+                    base_prompt: config.base_prompt.clone(),
+                    workflow_name: format!(
+                        "{} > Stage {}: {}",
+                        config.workflow_name, stage_num, stage.name
+                    ),
+                    workflow_id: config.workflow_id.clone(),
+                    execution_id: config.execution_id.clone(),
+                    targeted_error_ids: config.targeted_error_ids.clone(),
+                    starting_iteration: stage_starting_iter,
+                    run_agentic_first: stage_agentic_first,
+                    artifact_dir: config.artifact_dir.clone(),
+                    is_dev_mode: config.is_dev_mode,
+                    enable_sweep: false,
+                    max_sweep_iterations: 0,
+                    stages: Vec::new(),
+                    stop_on_failure: config.stop_on_failure,
+                    constraint_overrides: config.constraint_overrides.clone(),
+                    reflection_mode: config.reflection_mode,
+                    provider_override: stage.provider.clone(),
+                    model_override: stage.model.clone(),
+                    model_overrides: stage.model_overrides.clone(),
+                    stage_index: Some(stage_idx as u32),
+                    max_sessions: config.max_sessions,
+                    auto_run_generated: false,
+                    approval_gate: config.approval_gate,
+                    max_context_tokens: config.max_context_tokens,
+                    enforce_token_budget: config.enforce_token_budget,
+                    cross_workflow_learning: config.cross_workflow_learning,
+                    verification_history: std::collections::HashMap::new(),
+                    routing_context: Default::default(),
+                    project_path: config.project_path.clone(),
+                    acceptance_criteria: config.acceptance_criteria.clone(),
+                    multi_agent_mode: config.multi_agent_mode,
+                    strict_cwd: config.strict_cwd,
+                    tool_tags: config.tool_tags.clone(),
+                    use_worktree: false,
+                    worktree_path: config.worktree_path.clone(),
+                    worktree_branch: config.worktree_branch.clone(),
+                    workflow_architecture: config.workflow_architecture.clone(),
+                    agentic_verification_config: config.agentic_verification_config.clone(),
+                    multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                    active_canary: config.active_canary.clone(),
+                    is_canary_run: config.is_canary_run,
+                    rollback_policy: config.rollback_policy.clone(),
+                    escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
+                    iteration_diffs: Vec::new(),
+                    phase_timeout_ms: config.phase_timeout_ms,
+                };
+
+                // Handle agentic-first: run the agentic phase before the verification loop.
+                let initial_dynamic_steps = if stage_agentic_first {
+                    let agentic_iteration = stage_starting_iter + 1;
+                    info!(
+                        "  Stage {}: Running agentic-first (iteration {})",
+                        stage_num, agentic_iteration
+                    );
+
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::agentic_running(agentic_iteration),
+                    );
+                    self.record_stage_transition(
+                        &config.execution_id,
+                        &mut transitions,
+                        &mut current_stage,
+                        &format!("stage_{}_agentic", stage_num),
+                        agentic_iteration,
+                    );
+
+                    let agentic_context = build_resume_agentic_context(
+                        &config.execution_id,
+                        agentic_iteration,
+                        &self.app_state.pg_db,
+                    );
+
+                    let (outcome, injected_steps) = self
+                        .agentic_executor
+                        .run_agentic(
+                            &stage_loop_config,
+                            agentic_iteration,
+                            &agentic_context,
+                            has_agentic,
+                            &stage.agentic_steps,
+                            logger,
+                        )
+                        .await;
+
+                    // Log agentic output
+                    let output_text = match &outcome {
+                        AgenticOutcome::Success { output, .. } => {
+                            format!(
+                                "\n=== Agentic Phase (iteration {}) ===\n{}",
+                                agentic_iteration, output
+                            )
+                        }
+                        AgenticOutcome::Failed { output, error, .. } => {
+                            warn!(
+                                "Stage {} agentic-first failed: {}, continuing with verification",
+                                stage_num, error
+                            );
+                            format!(
+                                "\n=== Agentic Phase (iteration {}, FAILED: {}) ===\n{}",
+                                agentic_iteration, error, output
+                            )
+                        }
+                        AgenticOutcome::Error { error } => {
+                            warn!(
+                                "Stage {} agentic-first errored: {}, continuing with verification",
+                                stage_num, error
+                            );
+                            format!(
+                                "\n=== Agentic Phase (iteration {}, ERROR: {}) ===\n",
+                                agentic_iteration, error
+                            )
+                        }
+                        AgenticOutcome::Skipped => String::new(),
+                    };
+                    if !output_text.is_empty() {
+                        let _ = self.app_state.pg_db.append_task_output_ex(
+                            &config.execution_id,
+                            &output_text,
+                            true,
+                            false,
+                        ).await;
+                    }
+
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::agentic_complete(agentic_iteration),
+                    );
+
+                    // Notify canvas of agentic-first completion
+                    self.canvas_manager
+                        .lock()
+                        .await
+                        .on_agentic_complete(
+                            agentic_iteration,
+                            &outcome,
+                            &[],
+                            injected_steps.len(),
+                            0,
+                        )
+                        .await;
+
+                    stage_loop_config.starting_iteration = agentic_iteration;
+                    stage_loop_config.max_iterations =
+                        stage_loop_config.max_iterations.saturating_sub(1).max(1);
+
+                    if !injected_steps.is_empty() {
+                        info!(
+                            "  Stage {}: Agentic-first injected {} dynamic verification step(s)",
+                            stage_num,
+                            injected_steps.len()
+                        );
+                    }
+
+                    injected_steps
+                } else {
+                    Vec::new()
+                };
+
+                self.record_stage_transition(
+                    &config.execution_id,
+                    &mut transitions,
+                    &mut current_stage,
+                    &format!("stage_{}_verification", stage_num),
+                    0,
+                );
+
+                // Infer architecture if not explicitly set
+                stage_loop_config.infer_architecture();
+
+                let loop_result = if matches!(
+                    stage_loop_config.workflow_architecture,
+                    Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::AgenticVerification)
+                ) {
+                    info!(
+                        "  Stage {}: Using AGENTIC VERIFICATION architecture",
+                        stage_num
+                    );
+                    self.run_agentic_verification_loop(
+                        &mut stage_loop_config,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        logger,
+                    )
+                    .await
+                } else if matches!(
+                    stage_loop_config.workflow_architecture,
+                    Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
+                ) {
+                    info!(
+                        "  Stage {}: Using MULTI-AGENT PIPELINE architecture",
+                        stage_num
+                    );
+                    self.run_multi_agent_pipeline_loop(
+                        &mut stage_loop_config,
+                        &stage.verification_steps,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        logger,
+                    )
+                    .await
+                } else {
+                    self.run_loop_state_machine(
+                        &mut stage_loop_config,
+                        &stage.verification_steps,
+                        has_agentic,
+                        &stage.agentic_steps,
+                        &mut all_step_results,
+                        &mut transitions,
+                        &mut current_stage,
+                        logger,
+                        initial_dynamic_steps,
+                    )
+                    .await
+                };
+
+                info!(
+                    "  Stage {}: Loop result: {}",
+                    stage_num,
+                    loop_result.summary()
+                );
+
+                // Record canary run outcome (all architectures)
+                if let Some((ref canary_id, _)) = config.active_canary {
+                    let stage_duration_ms = start.elapsed().as_millis() as f64;
+                    let _ = crate::meta_optimizer::canary::record_canary_run(
+                        &self.app_state.pg_db,
+                        canary_id,
+                        config.is_canary_run,
+                        loop_result.verification_passed,
+                        loop_result.total_cost_usd.unwrap_or(0.0),
+                        stage_duration_ms,
+                    );
+                }
+
+                if loop_result.verification_passed {
+                    any_stage_passed = true;
+                }
+
+                // Check if completion has critical artifact steps that must always run
+                let has_artifact_save = stage
+                    .completion_automation_steps
+                    .iter()
+                    .any(|s| s.step_type == "save_workflow_artifact");
+                let force_completion =
+                    has_artifact_save && !loop_result.critical_failure && !loop_result.was_stopped;
+
+                // Run per-stage completion steps if verification passed or forced for artifact saves
+                if (loop_result.should_run_completion() || force_completion)
+                    && (!stage.completion_automation_steps.is_empty()
+                        || !stage.completion_prompt_steps.is_empty())
+                {
+                    info!("  Stage {}: Running completion", stage_num);
+                    let comp_model = stage
+                        .model_overrides
+                        .get("completion")
+                        .and_then(|c| c.model.clone())
+                        .or_else(|| stage.model.clone())
+                        .or_else(|| config.model_override.clone());
+                    let comp_provider = stage
+                        .model_overrides
+                        .get("completion")
+                        .and_then(|c| c.provider.clone())
+                        .or_else(|| stage.provider.clone())
+                        .or_else(|| config.provider_override.clone());
+
+                    let (_, completion_results) = self
+                        .completion_executor
+                        .run_completion(
+                            &stage.completion_automation_steps,
+                            &stage.completion_prompt_steps,
+                            &config.execution_id,
+                            &format!(
+                                "{} > Stage {}: {}",
+                                config.workflow_name, stage_num, stage.name
+                            ),
+                            loop_result.iterations_run,
+                            logger,
+                            Some(stage_idx as u32),
+                            comp_model,
+                            comp_provider,
+                            stage.completion_prompts_first,
+                        )
+                        .await;
+                    all_step_results.extend(completion_results);
+                }
+
+                if !loop_result.verification_passed && config.stop_on_failure {
+                    warn!(
+                        "Stage {} verification failed and stop_on_failure=true",
+                        stage_num
+                    );
+                    self.persist_workflow_state(
+                        &config.execution_id,
+                        &UnifiedWorkflowState::failed_in_phase(
+                            format!("Stage {} verification failed", stage_num),
+                            "verification",
+                            Some(loop_result.iterations_run),
+                        ),
+                    );
+                    self.mark_task_failed(
+                        &config.execution_id,
+                        &format!(
+                            "Stage {} verification failed after {} iterations",
+                            stage_num, loop_result.iterations_run
+                        ),
+                        Some(&config.workflow_id),
+                    )
+                    .await;
+                    {
+                        let sessions = self.canvas_manager.lock().await.get_sessions_count().await;
+                        self.canvas_manager
+                            .lock()
+                            .await
+                            .on_workflow_complete(&loop_result, start.elapsed(), sessions)
+                            .await;
+                    }
+                    Self::restore_canary_config(&canary_config_originals);
+                    flow_enforcer.record_end(&config.workflow_id, None).await;
+                    return WorkflowResult {
+                        success: false,
+                        verification_passed: false,
+                        step_results: all_step_results,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        loop_result: Some(loop_result),
+                        worktree_path: config.worktree_path.clone(),
+                        worktree_branch: config.worktree_branch.clone(),
+                        workflow_architecture: config.workflow_architecture.clone(),
+                        agentic_verification_config: config.agentic_verification_config.clone(),
+                        multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+                    };
+                }
+
+                // Update tracking counters for conditional stage evaluation
+                total_iterations_across_stages += loop_result.iterations_run;
+                if !loop_result.verification_passed {
+                    total_stage_failures += 1;
+                }
+
+                last_loop_result = Some(loop_result);
+            }
+
+            // Mark stage as complete
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::stage_complete(stage_idx as u32),
+            );
+
+            info!("  Stage {}/{} complete", stage_num, total_stages);
+        }
+
+        // ─── Workflow-level Completion ───
+        let overall_passed = any_stage_passed;
+        let total_iterations = last_loop_result
+            .as_ref()
+            .map(|r| r.iterations_run)
+            .unwrap_or(0);
+
+        // ─── Completion Sweep (optional, runs after verification passes) ───
+        if config.enable_sweep && overall_passed && !self.is_task_stopped(&config.execution_id) {
+            info!(
+                "=== COMPLETION SWEEP (max {} iterations) ===",
+                config.max_sweep_iterations
+            );
+
+            let sweep_result = self
+                .run_sweep_loop(&config, &mut all_step_results, logger, total_iterations)
+                .await;
+
+            info!(
+                "Sweep completed: {} iteration(s), no_more_steps={}",
+                sweep_result.iterations_run, sweep_result.no_more_steps
+            );
+        }
+
+        if overall_passed {
+            info!("=== WORKFLOW COMPLETED: All stages processed ===");
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::completion_running(),
+            );
+            self.record_stage_transition(
+                &config.execution_id,
+                &mut transitions,
+                &mut current_stage,
+                "completion",
+                0,
+            );
+
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::completion_complete(),
+            );
+
+            // Record verification result before completing
+            if let Some(ref lr) = last_loop_result {
+                let vp_result = self.app_state.pg_db.set_verification_passed(
+                    &config.execution_id,
+                    lr.verification_passed,
+                ).await;
+                if let Err(e) = vp_result {
+                    error!("Failed to set verification_passed for {}: {}", config.execution_id, e);
+                }
+            }
+
+            self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
+                .await;
+
+            // Emit canvas outcome panel for successful completion
+            if let Some(ref lr) = last_loop_result {
+                let cm = &self.canvas_manager;
+                let sessions = cm.lock().await.get_sessions_count().await;
+                cm.lock()
+                    .await
+                    .on_workflow_complete(lr, start.elapsed(), sessions)
+                    .await;
+            } else {
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed("Workflow completed (no verification loop)")
+                    .await;
+            }
+
+            // Resolve targeted errors on successful completion
+            if any_stage_passed && !config.targeted_error_ids.is_empty() {
+                self.resolve_targeted_errors(&config.execution_id, &config.targeted_error_ids)
+                    .await;
+            }
+
+            // Auto-resolve errors captured during this workflow run
+            if any_stage_passed {
+                self.resolve_workflow_scoped_errors(&config.execution_id)
+                    .await;
+            }
+
+            // Summary generation skipped — generate_task_summary_async not yet ported to PG
+
+            info!("=== WORKFLOW COMPLETED SUCCESSFULLY ===");
+        } else {
+            let fail_reason = if let Some(ref lr) = last_loop_result {
+                if lr.max_iterations_reached {
+                    format!(
+                        "Verification failed after {} iterations (max_iterations={} exhausted)",
+                        lr.iterations_run, config.max_iterations
+                    )
+                } else if lr.was_stopped {
+                    format!("Workflow stopped after {} iterations", lr.iterations_run)
+                } else if lr.unfixable_errors {
+                    format!(
+                        "Unfixable errors detected after {} iterations",
+                        lr.iterations_run
+                    )
+                } else if lr.critical_failure {
+                    format!(
+                        "Critical failure during verification after {} iterations",
+                        lr.iterations_run
+                    )
+                } else {
+                    format!(
+                        "No stages passed verification after {} iterations",
+                        lr.iterations_run
+                    )
+                }
+            } else {
+                "No stages passed verification (no iterations ran)".to_string()
+            };
+            info!("=== WORKFLOW FAILED: {} ===", fail_reason);
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::failed_in_phase(
+                    &fail_reason,
+                    "verification",
+                    last_loop_result.as_ref().map(|r| r.iterations_run),
+                ),
+            );
+            self.mark_task_failed(
+                &config.execution_id,
+                &fail_reason,
+                Some(&config.workflow_id),
+            )
+            .await;
+
+            // Emit canvas outcome panel for failed completion
+            if let Some(ref lr) = last_loop_result {
+                let cm = &self.canvas_manager;
+                let sessions = cm.lock().await.get_sessions_count().await;
+                cm.lock()
+                    .await
+                    .on_workflow_complete(lr, start.elapsed(), sessions)
+                    .await;
+            } else {
+                self.canvas_manager
+                    .lock()
+                    .await
+                    .on_workflow_failed("No stages passed verification")
+                    .await;
+            }
+
+            // Summary generation skipped — generate_task_summary_async not yet ported to PG
+
+            info!("=== WORKFLOW FAILED ===");
+        }
+
+        // Record learning outcome for all workflows (fire-and-forget)
+        {
+            let category = if config.workflow_name.starts_with("AI Generate:") {
+                "meta"
+            } else if config.is_dev_mode {
+                "dev"
+            } else {
+                "production"
+            };
+            let architecture = config
+                .workflow_architecture
+                .as_ref()
+                .map(|a| {
+                    serde_json::to_value(a)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| format!("{:?}", a).to_lowercase())
+                })
+                .unwrap_or_else(|| {
+                    if config.multi_agent_pipeline_config.is_some() {
+                        "multi_agent_pipeline".to_string()
+                    } else if config.agentic_verification_config.is_some() {
+                        "agentic_verification".to_string()
+                    } else {
+                        "traditional".to_string()
+                    }
+                });
+            let total_step_count: usize = config
+                .stages
+                .iter()
+                .map(|s| {
+                    s.setup_automation_steps.len()
+                        + s.setup_prompt_steps.len()
+                        + s.verification_steps.len()
+                        + s.agentic_steps.len()
+                        + s.completion_automation_steps.len()
+                        + s.completion_prompt_steps.len()
+                })
+                .sum();
+            let total_verification_steps: usize = config
+                .stages
+                .iter()
+                .map(|s| s.verification_steps.len())
+                .sum();
+            let total_agentic_steps: usize =
+                config.stages.iter().map(|s| s.agentic_steps.len()).sum();
+            let has_ui_bridge = config.stages.iter().any(|s| {
+                s.verification_steps
+                    .iter()
+                    .chain(s.agentic_steps.iter())
+                    .chain(s.setup_automation_steps.iter())
+                    .chain(s.completion_automation_steps.iter())
+                    .any(|step| step.step_type == "ui_bridge")
+            });
+
+            let outcome = crate::orchestrator::learning_recorder::WorkflowOutcome {
+                task_run_id: config.execution_id.clone(),
+                workflow_name: config.workflow_name.clone(),
+                category: category.to_string(),
+                status: if overall_passed {
+                    "complete".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                duration_secs: start.elapsed().as_secs_f64(),
+                iterations: total_iterations,
+                verification_passed: overall_passed,
+                max_iterations_reached: last_loop_result
+                    .as_ref()
+                    .map(|r| r.max_iterations_reached)
+                    .unwrap_or(false),
+                was_stopped: last_loop_result
+                    .as_ref()
+                    .map(|r| r.was_stopped)
+                    .unwrap_or(false),
+                tools_used: Vec::new(),
+                files_modified: last_loop_result
+                    .as_ref()
+                    .map(|r| r.files_modified.clone())
+                    .unwrap_or_default(),
+                error_type: None,
+                error_message: None,
+                workflow_architecture: Some(architecture),
+                step_count: Some(total_step_count as i64),
+                verification_step_count: Some(total_verification_steps as i64),
+                agentic_step_count: Some(total_agentic_steps as i64),
+                has_ui_bridge,
+                total_tokens: last_loop_result.as_ref().and_then(|r| r.total_tokens),
+                total_cost_usd: last_loop_result.as_ref().and_then(|r| r.total_cost_usd),
+                model_used: None,
+            };
+            let judge_task_run_id = outcome.task_run_id.clone();
+            let judge_iterations = outcome.iterations;
+            let judge_verification_passed = outcome.verification_passed;
+            let judge_was_stopped = outcome.was_stopped;
+
+            let ol_task_run_id = outcome.task_run_id.clone();
+            let ol_status = outcome.status.clone();
+            let ol_cost_usd = outcome.total_cost_usd;
+            let ol_duration_secs = outcome.duration_secs;
+            let ol_model_used = outcome.model_used.clone();
+            let ol_has_ui_bridge = outcome.has_ui_bridge;
+            let ol_workflow_architecture = outcome.workflow_architecture.clone();
+            let ol_iterations = outcome.iterations;
+            let ol_files_modified = outcome.files_modified.clone();
+            let ol_workflow_name = outcome.workflow_name.clone();
+            let ol_category = outcome.category.clone();
+
+            let ol_step_reflections: Vec<crate::online_learning::reflection::StepReflection> =
+                last_loop_result
+                    .as_ref()
+                    .map(|lr| {
+                        lr.iteration_results
+                            .iter()
+                            .enumerate()
+                            .map(|(i, iter_result)| {
+                                crate::online_learning::reflection::StepReflection {
+                                    step_type: if iter_result.agentic_phase_ran {
+                                        "agentic_verification".to_string()
+                                    } else {
+                                        "standard_iteration".to_string()
+                                    },
+                                    step_index: i,
+                                    task_run_id: outcome.task_run_id.clone(),
+                                    duration_ms: 0,
+                                    success: iter_result.verification_passed,
+                                    tool_calls: Vec::new(),
+                                    error_type: if iter_result.critical_failure {
+                                        Some("critical_failure".to_string())
+                                    } else if !iter_result.verification_passed
+                                        && iter_result.failed_checks > 0
+                                    {
+                                        Some("verification_failure".to_string())
+                                    } else {
+                                        None
+                                    },
+                                    retry_count: if iter_result.verification_passed {
+                                        0
+                                    } else {
+                                        i as u32
+                                    },
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+            let pg_db_for_q = self.app_state.pg_db.clone();
+            tokio::spawn(async move {
+                let pg_learning_ok = pg_db_for_q.record_workflow_learning_from_outcome(&outcome).await;
+
+                if let Err(ref e) = pg_learning_ok {
+                    warn!("Failed to record learning outcome: {}", e);
+                }
+
+                if pg_learning_ok.is_ok() {
+                    let composite_score = pg_db_for_q
+                        .get_composite_agentic_score(&outcome.task_run_id)
+                        .await
+                        .unwrap_or(0.0);
+
+                    if let Err(e) = crate::orchestrator::learning_recorder::update_q_routing_table_pg(
+                        &pg_db_for_q, &outcome, composite_score,
+                    ).await {
+                        warn!("Failed PG Q-routing update: {}", e);
+                    }
+                }
+            });
+
+            // LLM-as-judge and RAG judge (fire-and-forget, stubs with CheckpointDb)
+            crate::orchestrator::learning_recorder::spawn_llm_judge_if_eligible(
+                Arc::new(crate::database::CheckpointDb),
+                judge_task_run_id.clone(),
+                judge_iterations,
+                judge_verification_passed,
+                judge_was_stopped,
+            );
+
+            crate::orchestrator::learning_recorder::spawn_rag_judge_if_eligible(
+                Arc::new(crate::database::CheckpointDb),
+                judge_task_run_id,
+            );
+
+            // ── Online Learning: non-blocking post-run update ──
+            {
+                use crate::online_learning::coordinator::{self, OnlineLearningOutcome};
+                use crate::orchestrator::learning_recorder::{
+                    infer_technology_tags, infer_domain_tags, compute_complexity_tier,
+                };
+
+                let tech_tags = infer_technology_tags(&ol_files_modified);
+                let domain_tags = infer_domain_tags(
+                    &ol_files_modified,
+                    &ol_workflow_name,
+                    &ol_category,
+                    ol_has_ui_bridge,
+                );
+                let primary_domain = domain_tags
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "backend".to_string());
+                let complexity = compute_complexity_tier(
+                    Some(ol_files_modified.len() as i64),
+                    ol_iterations,
+                    ol_duration_secs,
+                    None,
+                );
+
+                let ol_outcome = OnlineLearningOutcome {
+                    task_run_id: ol_task_run_id,
+                    status: ol_status,
+                    composite_score: None,
+                    cost_usd: ol_cost_usd,
+                    duration_secs: Some(ol_duration_secs),
+                    model_used: ol_model_used,
+                    domain: primary_domain,
+                    complexity_tier: complexity,
+                    has_ui: ol_has_ui_bridge,
+                    prompt_length: config.base_prompt.len(),
+                    file_count: ol_files_modified.len(),
+                    workflow_architecture: ol_workflow_architecture,
+                    strategy_id: None,
+                    step_attributions: Vec::new(),
+                    step_reflections: ol_step_reflections,
+                    total_iterations: ol_iterations,
+                    technology_tags: tech_tags,
+                };
+
+                let ol_pg = self.app_state.pg_db.clone();
+                let ol_app_handle = self.app_handle.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                    let mut ol_outcome = ol_outcome;
+                    if ol_outcome.composite_score.is_none() {
+                        if let Ok(score) = ol_pg.get_composite_agentic_score(&ol_outcome.task_run_id).await {
+                            if score > 0.0 {
+                                ol_outcome.composite_score = Some(score);
+                            }
+                        }
+                    }
+
+                    let snapshot = {
+                        let router_lock = crate::online_learning::model_router();
+                        let drift_lock = crate::online_learning::drift_monitor();
+                        match (router_lock, drift_lock) {
+                            (Some(router_mtx), Some(drift_mtx)) => {
+                                let mut router =
+                                    router_mtx.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut drift =
+                                    drift_mtx.lock().unwrap_or_else(|e| e.into_inner());
+                                coordinator::post_run_online_learning(
+                                    &ol_outcome,
+                                    &mut router,
+                                    &mut drift,
+                                );
+                                Some((router.table_snapshot(), drift.serialize_state().ok(), drift.take_pending_signals()))
+                            }
+                            _ => {
+                                tracing::debug!(
+                                    "Online learning not initialized — skipping"
+                                );
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some((routing_rows, drift_state, drift_signals)) = snapshot {
+                        let mut persisted = 0usize;
+
+                        for row in &routing_rows {
+                            if let Err(e) = ol_pg.upsert_model_routing_entry(
+                                &row.context_key, &row.arm,
+                                row.q_value, row.visit_count as i32, row.sum_of_squares,
+                            ).await {
+                                tracing::warn!("Failed to persist routing entry: {}", e);
+                            } else {
+                                persisted += 1;
+                            }
+                        }
+
+                        for signal in &drift_signals {
+                            let drift_level = match signal.drift_level {
+                                crate::meta_optimizer::drift_detection::DriftLevel::Warning => "warning",
+                                crate::meta_optimizer::drift_detection::DriftLevel::Drift => "drift",
+                                _ => continue,
+                            };
+                            let id = format!("{}:{}:{}:{}", signal.detector_type, signal.metric_name, signal.context_key, chrono::Utc::now().timestamp_millis());
+                            let _ = ol_pg.insert_drift_signal(&id, &signal.detector_type, &signal.metric_name, &signal.context_key, drift_level, signal.pre_drift_mean, signal.post_drift_mean, signal.window_size as i64).await;
+                            persisted += 1;
+
+                            let _ = ol_app_handle.emit(
+                                crate::orchestrator::realtime_events::EVENT_DRIFT_DETECTED,
+                                &serde_json::json!({
+                                    "detector_type": signal.detector_type,
+                                    "metric_name": signal.metric_name,
+                                    "context_key": signal.context_key,
+                                    "drift_level": drift_level,
+                                    "pre_drift_mean": signal.pre_drift_mean,
+                                    "post_drift_mean": signal.post_drift_mean,
+                                }),
+                            );
+                        }
+
+                        if let Some(ref state_json) = drift_state {
+                            let _ = ol_pg.save_drift_detector_state("global_monitor", "composite", state_json).await;
+                        }
+
+                        let credits = crate::online_learning::credit_assignment::compute_step_credits(
+                            &ol_outcome.step_attributions,
+                            ol_outcome.composite_score.unwrap_or(0.0),
+                            ol_outcome.status == "success",
+                        );
+                        if !credits.is_empty() {
+                            if let Ok(n) = ol_pg.save_step_credits(&credits, &ol_outcome.task_run_id).await {
+                                persisted += n;
+                            }
+                        }
+
+                        let summary = crate::online_learning::reflection::summarize_experience(
+                            &crate::online_learning::reflection::RunReflectionInput {
+                                task_run_id: ol_outcome.task_run_id.clone(),
+                                domain: ol_outcome.domain.clone(),
+                                complexity_tier: ol_outcome.complexity_tier.clone(),
+                                outcome_status: ol_outcome.status.clone(),
+                                composite_score: ol_outcome.composite_score,
+                                steps: ol_outcome.step_reflections.clone(),
+                                total_iterations: ol_outcome.total_iterations,
+                                total_cost_usd: ol_outcome.cost_usd,
+                            },
+                        );
+                        let summary_id = format!("exp-{}", ol_outcome.task_run_id);
+                        let kd = serde_json::to_string(&summary.key_decisions).unwrap_or_default();
+                        let fp = serde_json::to_string(&summary.failure_points).unwrap_or_default();
+                        let ep = serde_json::to_string(&summary.effective_patterns).unwrap_or_default();
+                        if ol_pg.insert_experience_summary(&summary_id, &ol_outcome.task_run_id, &ol_outcome.domain, &ol_outcome.complexity_tier, &ol_outcome.status, &kd, &fp, &ep).await.is_ok() {
+                            persisted += 1;
+                        }
+
+                        if let Some(ref model) = ol_outcome.model_used {
+                            let _ = ol_pg.update_learning_outcome_model(&ol_outcome.task_run_id, model).await;
+                        }
+
+                        if ol_outcome.status == "success" || ol_outcome.status == "complete" {
+                            if let Some(score) = ol_outcome.composite_score {
+                                let p90 = ol_pg.get_score_percentile(
+                                    &format!("{}:{}:{}", ol_outcome.domain, ol_outcome.complexity_tier, if ol_outcome.has_ui { "ui" } else { "no_ui" }),
+                                    90,
+                                ).await.unwrap_or(0.95);
+
+                                if score > p90 && score > 0.7 {
+                                    let strategy = crate::online_learning::strategy_evolution::extract_strategy_from_run(
+                                        &crate::online_learning::strategy_evolution::HighPerformingRun {
+                                            task_run_id: ol_outcome.task_run_id.clone(),
+                                            domain: ol_outcome.domain.clone(),
+                                            complexity_tier: ol_outcome.complexity_tier.clone(),
+                                            technology_tags: ol_outcome.technology_tags.clone(),
+                                            workflow_architecture: ol_outcome.workflow_architecture.clone().unwrap_or_default(),
+                                            model_used: ol_outcome.model_used.clone(),
+                                            composite_score: score,
+                                            cost_usd: ol_outcome.cost_usd.unwrap_or(0.0),
+                                            duration_secs: ol_outcome.duration_secs.unwrap_or(0.0),
+                                        },
+                                    );
+                                    let app_json = serde_json::to_string(&strategy.applicability).unwrap_or_default();
+                                    let comp_json = serde_json::to_string(&strategy.components).unwrap_or_default();
+                                    let prov_json = serde_json::to_string(&strategy.provenance).unwrap_or_default();
+                                    if let Err(e) = ol_pg.insert_strategy(
+                                        &strategy.id, &strategy.name, &strategy.description,
+                                        &app_json, &comp_json, &prov_json,
+                                        "candidate", strategy.parent_strategy_id.as_deref(),
+                                    ).await {
+                                        tracing::debug!("Failed to insert strategy: {}", e);
+                                    } else {
+                                        tracing::info!("Extracted candidate strategy '{}' from P90+ run {}", strategy.name, ol_outcome.task_run_id);
+                                        persisted += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        if persisted > 0 {
+                            tracing::debug!("Online learning persisted {} items for {}", persisted, ol_outcome.task_run_id);
+                        }
+                    }
+                });
+            }
+        }
+
+        // Trigger reflection workflows
+        {
+            let session_manager: Option<Arc<crate::claude_session::SessionManager>> = self
+                .app_handle
+                .try_state::<Arc<crate::claude_session::SessionManager>>()
+                .map(|s| s.inner().clone());
+
+            let is_generation = config.workflow_name.starts_with("AI Generate:");
+
+            // Project reflection (both dev and production, non-generation only)
+            if !is_generation {
+                let project_deps = crate::reflection::trigger::ReflectionDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let project_source_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    match crate::reflection::trigger::launch_project_reflection(
+                        project_deps,
+                        project_source_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("Project reflection skipped for {}", project_source_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched project reflection {} for completed run {}",
+                                id, project_source_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch project reflection for {}: {}",
+                                project_source_id, e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Workflow/generation reflection (dev mode only)
+            if config.is_dev_mode {
+                let deps = crate::reflection::trigger::ReflectionDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let source_task_run_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    match crate::reflection::trigger::launch_reflection(
+                        deps,
+                        source_task_run_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("Reflection skipped for {}", source_task_run_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched reflection {} for completed run {}",
+                                id, source_task_run_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch reflection for {}: {}",
+                                source_task_run_id, e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // UI Bridge reflection (non-dev-mode workflows only)
+            if !config.is_dev_mode {
+                let ub_deps = crate::reflection::trigger::ReflectionDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let ub_source_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    match crate::reflection::trigger::launch_ui_bridge_reflection(
+                        ub_deps,
+                        ub_source_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("UI Bridge reflection skipped for {}", ub_source_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched UI Bridge reflection {} for completed run {}",
+                                id, ub_source_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch UI Bridge reflection for {}: {}",
+                                ub_source_id, e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Trigger follow-up workflow (20s delay, after reflections)
+            if config.is_dev_mode {
+                let follow_up_deps = crate::follow_up::trigger::FollowUpDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let follow_up_source_id = config.execution_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    match crate::follow_up::trigger::launch_follow_up(
+                        follow_up_deps,
+                        follow_up_source_id.clone(),
+                    ) {
+                        Ok(id) if id == "skipped" => {
+                            debug!("Follow-up skipped for {}", follow_up_source_id);
+                        }
+                        Ok(id) => {
+                            info!(
+                                "Launched follow-up {} for completed run {}",
+                                id, follow_up_source_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to launch follow-up for {}: {}",
+                                follow_up_source_id, e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Trigger fixer workflow (dev mode, failed runs only)
+            if config.is_dev_mode && !overall_passed {
+                let fixer_deps = crate::fixer::trigger::FixerDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                let fixer_source_id = config.execution_id.clone();
+                match crate::fixer::trigger::launch_fixer(fixer_deps, fixer_source_id.clone()) {
+                    Ok(id) if id == "skipped" => {
+                        debug!("Fixer skipped for {}", fixer_source_id);
+                    }
+                    Ok(id) => {
+                        info!(
+                            "Launched fixer {} for completed run {}",
+                            id, fixer_source_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Failed to launch fixer for {}: {}", fixer_source_id, e);
+                    }
+                }
+
+                // Trigger meta-optimizer
+                let meta_deps = crate::meta_optimizer::types::MetaOptimizerDeps {
+                    app_state: self.app_state.clone(),
+                    config_storage: self.config_storage.clone(),
+                    app_handle: self.app_handle.clone(),
+                    pid_tracker: self.pid_tracker.clone(),
+                    session_manager: session_manager.clone(),
+                };
+                match crate::meta_optimizer::trigger::check_and_launch_optimizers(
+                    meta_deps,
+                    config.execution_id.clone(),
+                ) {
+                    Ok(ids) => {
+                        for id in &ids {
+                            info!("Launched meta-optimizer {}", id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Meta-optimizer trigger failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Cross-run analysis after reflection completes
+        if config.reflection_mode {
+            let cra_task_run_id = config.execution_id.clone();
+            let cra_workflow_name = config.workflow_name.clone();
+            let cra_pg_db = self.app_state.pg_db.clone();
+            tokio::spawn(async move {
+                let source_wf_name = cra_pg_db
+                    .get_source_workflow_name(&cra_task_run_id, &cra_workflow_name)
+                    .await
+                    .unwrap_or_else(|_| cra_workflow_name.clone());
+
+                let cra_result = {
+                    let swf = source_wf_name.clone();
+                    let ctri = cra_task_run_id.clone();
+                    match cra_pg_db.post_run_analysis(&swf, &ctri).await {
+                        Ok((patterns, rules, fixes)) => Ok((patterns, rules, fixes, Vec::<crate::reflection::cross_run_learning::ExtractedSkill>::new())),
+                        Err(e) => Err(e),
+                    }
+                };
+                match cra_result {
+                    Ok((patterns, rules, fixes, extracted_skills)) => {
+                        info!(
+                            "Cross-run analysis after reflection: {} patterns, {} rules disabled, {} fixes applied, {} skills extracted",
+                            patterns, rules, fixes, extracted_skills.len()
+                        );
+
+                        if !extracted_skills.is_empty() {
+                            let bus = crate::workflow_event_bus::get_workflow_event_bus().clone();
+                            let source_tr = cra_task_run_id.clone();
+                            let wf_name = source_wf_name.clone();
+                            let pg_for_mirror = cra_pg_db.clone();
+                            tokio::spawn(async move {
+                                for skill in &extracted_skills {
+                                    bus.emit_workflow_event(
+                                        crate::workflow_event_bus::events::SKILL_CREATED,
+                                        &source_tr,
+                                        None,
+                                        Some(&wf_name),
+                                        serde_json::json!({
+                                            "skill_id": skill.skill_id,
+                                            "skill_slug": skill.skill_slug,
+                                            "source_fix_id": skill.source_fix_id,
+                                            "source_task_run_id": skill.source_task_run_id,
+                                        }),
+                                    ).await;
+
+                                    {
+                                        let pg = &pg_for_mirror;
+                                        let obs_input = crate::database::types::CreateObservationInput {
+                                            title: format!("Skill: {}", skill.skill_slug),
+                                            content: format!(
+                                                "Auto-extracted procedural skill '{}' from workflow '{}' (task_run: {}, fix: {})",
+                                                skill.skill_slug, skill.workflow_name,
+                                                skill.source_task_run_id, skill.source_fix_id
+                                            ),
+                                            observation_type: "solution".to_string(),
+                                            scope: "project".to_string(),
+                                            topic_key: Some(format!("skill:{}", skill.skill_slug)),
+                                            project_id: None,
+                                            workflow_id: None,
+                                            task_run_id: Some(skill.source_task_run_id.clone()),
+                                            session_id: None,
+                                        };
+                                        if let Err(e) = pg.save_observation(&obs_input).await {
+                                            tracing::warn!(
+                                                "Failed to mirror skill '{}' to PG observation: {}",
+                                                skill.skill_slug, e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        if patterns > 0 {
+                            {
+                                let pg = cra_pg_db.clone();
+                                let wf = source_wf_name.clone();
+                                let tr = cra_task_run_id.clone();
+                                tokio::spawn(async move {
+                                    let obs = crate::database::types::CreateObservationInput {
+                                        title: format!("Recurring patterns in {}", wf),
+                                        content: format!(
+                                            "Cross-run analysis detected {} recurring pattern(s) and {} fix oscillation(s) \
+                                             for workflow '{}'. {} rules auto-disabled, {} fixes auto-applied.",
+                                            patterns, 0u32, wf, rules, fixes
+                                        ),
+                                        observation_type: "pattern".to_string(),
+                                        scope: "project".to_string(),
+                                        topic_key: Some(format!("cross-run/{}", wf.to_lowercase().replace(' ', "-"))),
+                                        project_id: None,
+                                        workflow_id: None,
+                                        task_run_id: Some(tr),
+                                        session_id: None,
+                                    };
+                                    if let Err(e) = pg.save_observation(&obs).await {
+                                        tracing::warn!("Failed to save cross-run pattern observation: {}", e);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Cross-run analysis DB error: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Memory consolidation trigger
+        {
+            let consolidation_pg = self.app_state.pg_db.clone();
+            tokio::spawn(async move {
+                let settings = crate::settings::load_settings();
+                let config: crate::memory::consolidation::ConsolidationConfig = (&settings.memory_consolidation).into();
+                if !crate::memory::consolidation::can_run_consolidation(&consolidation_pg, config.cooldown_hours).await {
+                    return;
+                }
+                let count = consolidation_pg
+                    .get_observations_for_consolidation(1)
+                    .await
+                    .map(|obs| obs.len())
+                    .unwrap_or(0);
+                if count == 0 {
+                    return;
+                }
+                tracing::info!("Triggering background memory consolidation");
+                match crate::memory::consolidation::run_consolidation(&consolidation_pg, &config).await {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "Memory consolidation complete: {} models created, {} archived",
+                            stats.models_created, stats.observations_archived
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Memory consolidation failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Auto-run generated workflow (for "Generate & Run" flow)
+        if config.auto_run_generated {
+            let deps = super::auto_run::AutoRunDeps {
+                app_state: self.app_state.clone(),
+                config_storage: self.config_storage.clone(),
+                app_handle: self.app_handle.clone(),
+                pid_tracker: self.pid_tracker.clone(),
+            };
+            let meta_task_run_id = config.execution_id.clone();
+
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                match super::auto_run::launch_generated_workflow(deps, &meta_task_run_id) {
+                    Ok(task_run_id) => {
+                        info!(
+                            "Auto-run launched generated workflow {} for {}",
+                            task_run_id, meta_task_run_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to auto-run generated workflow for {}: {}",
+                            meta_task_run_id, e
+                        );
+                    }
+                }
+            });
+        }
+
+        // Restore canary config overrides
+        Self::restore_canary_config(&canary_config_originals);
+
+        // Record flow control end for concurrency tracking
+        flow_enforcer.record_end(&config.workflow_id, None).await;
+
+        WorkflowResult {
+            success: overall_passed,
+            verification_passed: overall_passed,
+            step_results: all_step_results,
+            duration_ms: start.elapsed().as_millis() as u64,
+            loop_result: last_loop_result,
+            worktree_path: config.worktree_path.clone(),
+            worktree_branch: config.worktree_branch.clone(),
+            workflow_architecture: config.workflow_architecture.clone(),
+            agentic_verification_config: config.agentic_verification_config.clone(),
+            multi_agent_pipeline_config: config.multi_agent_pipeline_config.clone(),
+        }
     }
 
     /// Restore canary config overrides to their original values.

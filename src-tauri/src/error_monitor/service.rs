@@ -342,7 +342,39 @@ impl ErrorMonitorService {
         pg_db: Arc<crate::database::pg::PgDb>,
         config: ErrorMonitorConfig,
     ) -> (Self, ErrorMonitorHandle, Receiver<ServiceCommand>) {
-        todo!("SQLite removed")
+        let (command_tx, command_rx) = mpsc::channel::<ServiceCommand>(64);
+        let (event_tx, event_rx) = mpsc::channel::<ErrorMonitorEvent>(config.max_queue_size);
+
+        let current_task_run_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let current_workflow_name: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+
+        let sqlite_exporter = SqliteExporter::new(
+            current_task_run_id.clone(),
+            current_workflow_name.clone(),
+        );
+        let event_bus_exporter = EventBusExporter::new(event_tx.clone());
+
+        let handle = ErrorMonitorHandle {
+            command_tx,
+            event_rx: Arc::new(RwLock::new(Some(event_rx))),
+        };
+
+        let service = Self {
+            db: Arc::new(CheckpointDb),
+            pg_db,
+            config,
+            file_states: HashMap::new(),
+            current_task_run_id,
+            current_workflow_name,
+            event_tx,
+            jsonl_preprocessor: JsonlPreprocessor,
+            parser_processor: ParserProcessor::new(),
+            dedup_processor: DedupProcessor::new(10_000),
+            sqlite_exporter,
+            event_bus_exporter,
+        };
+
+        (service, handle, command_rx)
     }
 
     /// Start the error monitor service.
@@ -352,7 +384,76 @@ impl ErrorMonitorService {
     /// 2. Start watching files for changes
     /// 3. Process commands from the handle
     pub async fn run(mut self, mut command_rx: Receiver<ServiceCommand>) {
-        // SQLite removed - no-op
+        tracing::info!("Error monitor service starting");
+        let _ = self.event_tx.send(ErrorMonitorEvent::Started).await;
+
+        // Load sources from settings on startup
+        if let Err(e) = self.load_sources_from_settings().await {
+            tracing::error!("Failed to load error monitor sources: {}", e);
+        }
+
+        // Set up file watcher
+        let (watch_tx, mut watch_rx) = mpsc::channel::<PathBuf>(256);
+        let _watcher = self.setup_watcher(watch_tx);
+
+        let poll_interval = self.config.poll_interval;
+
+        loop {
+            tokio::select! {
+                Some(cmd) = command_rx.recv() => {
+                    match cmd {
+                        ServiceCommand::Stop => {
+                            tracing::info!("Error monitor service stopping");
+                            break;
+                        }
+                        ServiceCommand::AddSource(source) => {
+                            self.add_source(*source).await;
+                        }
+                        ServiceCommand::RemoveSource(name) => {
+                            self.remove_source(&name).await;
+                        }
+                        ServiceCommand::SetWorkflowContext { task_run_id, workflow_name } => {
+                            *self.current_task_run_id.write().await = task_run_id;
+                            *self.current_workflow_name.write().await = workflow_name;
+                        }
+                        ServiceCommand::ClearWorkflowContext => {
+                            *self.current_task_run_id.write().await = None;
+                            *self.current_workflow_name.write().await = None;
+                        }
+                        ServiceCommand::ScanAll => {
+                            self.scan_all_sources().await;
+                        }
+                        ServiceCommand::IngestStreamErrors { source_name, errors } => {
+                            use crate::error_monitor::pipeline::types::{LogRecord, SourceMeta};
+                            let records: Vec<LogRecord> = errors
+                                .into_iter()
+                                .map(|e| {
+                                    LogRecord::new(
+                                        e.raw_entry.clone(),
+                                        source_name.clone(),
+                                        SourceMeta {
+                                            parser_type: crate::error_monitor::types::ParserType::Generic,
+                                            format: crate::error_monitor::types::LogFormat::Plaintext,
+                                            path: None,
+                                        },
+                                    )
+                                })
+                                .collect();
+                            self.process_records(records).await;
+                        }
+                    }
+                }
+                Some(path) = watch_rx.recv() => {
+                    self.handle_file_change(&path).await;
+                }
+                _ = tokio::time::sleep(poll_interval) => {
+                    self.poll_all_sources().await;
+                }
+            }
+        }
+
+        let _ = self.event_tx.send(ErrorMonitorEvent::Stopped).await;
+        tracing::info!("Error monitor service stopped");
     }
 
     /// Load configured sources from global settings (single source of truth).
