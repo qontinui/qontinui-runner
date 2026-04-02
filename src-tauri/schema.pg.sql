@@ -3371,5 +3371,45 @@ CREATE TABLE IF NOT EXISTS strategy_bank (
 CREATE INDEX IF NOT EXISTS idx_strategy_status ON strategy_bank(status);
 CREATE INDEX IF NOT EXISTS idx_strategy_parent ON strategy_bank(parent_strategy_id);
 
+-- =============================================================================
+-- Security Audit Events
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS security_audit_events (
+    id          TEXT PRIMARY KEY,
+    timestamp   TEXT NOT NULL,
+    task_run_id TEXT,
+    step_name   TEXT,
+    workflow_id TEXT,
+    event_type  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    decision    TEXT NOT NULL,
+    reason      TEXT,
+    metadata    TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sec_audit_task_run
+    ON security_audit_events(task_run_id) WHERE task_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sec_audit_type
+    ON security_audit_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_sec_audit_decision
+    ON security_audit_events(decision);
+CREATE INDEX IF NOT EXISTS idx_sec_audit_created
+    ON security_audit_events(created_at);
+
+-- =============================================================================
+-- Phase Model Routing (Q-learning state for model tier selection)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS phase_model_routing (
+    state_key    TEXT NOT NULL,
+    phase        TEXT NOT NULL,
+    model_tier   TEXT NOT NULL,
+    q_value      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    visit_count  INTEGER NOT NULL DEFAULT 0,
+    last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (state_key, phase, model_tier)
+);
+CREATE INDEX IF NOT EXISTS idx_phase_model_routing_state
+    ON phase_model_routing(state_key);
+
 -- Phase 1A: Add model_used tracking to learning_outcomes
 ALTER TABLE learning_outcomes ADD COLUMN IF NOT EXISTS model_used TEXT;

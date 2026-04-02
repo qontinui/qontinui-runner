@@ -858,10 +858,7 @@ impl Orchestrator {
 
         match serde_json::to_string(&state.transition_history) {
             Ok(json) => {
-                if let Err(e) = self
-                    .db
-                    .update_task_run_transition_history(&state.task_run_id, &json)
-                {
+                if let Err(e) = Err::<(), String>("SQLite removed".into()) {
                     warn!(
                         "Failed to persist transition history for {}: {}",
                         state.task_run_id, e
@@ -949,15 +946,8 @@ impl Orchestrator {
             "initializing"
         };
 
-        // Save to database
-        if let Err(e) = self.db.save_orchestrator_checkpoint(
-            &checkpoint_id,
-            &state.task_run_id,
-            state.iteration,
-            &trigger_str,
-            &state_json,
-            name,
-        ) {
+        // SQLite removed — checkpoint not persisted
+        if let Err(e) = Err::<(), String>("SQLite removed".into()) {
             warn!("Failed to save checkpoint: {}", e);
         } else {
             info!(
@@ -1408,13 +1398,8 @@ impl Orchestrator {
                     .map(|c| c.is_critical)
                     .unwrap_or(true);
 
-                let _ = self.db.create_orchestrator_verification_result(
-                    &state.task_run_id,
-                    plan_id,
-                    0, // Iteration 0 = initial verification
-                    result,
-                    is_critical,
-                );
+                // SQLite removed — verification result not persisted
+                let _ = (&state.task_run_id, plan_id, result, is_critical);
             }
         }
 
@@ -1969,13 +1954,8 @@ impl Orchestrator {
                     .map(|c| c.is_critical)
                     .unwrap_or(true);
 
-                let _ = self.db.create_orchestrator_verification_result(
-                    &state.task_run_id,
-                    plan_id,
-                    state.iteration,
-                    result,
-                    is_critical,
-                );
+                // SQLite removed — verification result not persisted
+                let _ = (&state.task_run_id, plan_id, result, is_critical);
             }
 
             for result in &results.ai_results {
@@ -1986,13 +1966,8 @@ impl Orchestrator {
                     .map(|c| c.is_critical)
                     .unwrap_or(true);
 
-                let _ = self.db.create_orchestrator_verification_result(
-                    &state.task_run_id,
-                    plan_id,
-                    state.iteration,
-                    result,
-                    is_critical,
-                );
+                // SQLite removed — verification result not persisted
+                let _ = (&state.task_run_id, plan_id, result, is_critical);
             }
         }
 
@@ -2297,30 +2272,8 @@ impl Orchestrator {
             .clone()
             .unwrap_or_else(|| "traditional".to_string());
 
-        // Record to database
-        if let Err(e) = self.db.record_learning_outcome(
-            &state.task_run_id,
-            status,
-            duration_secs,
-            Some(iterations),
-            strategy.as_deref(),
-            None, // tools_used - not tracked at worker level
-            if files_modified.is_empty() {
-                None
-            } else {
-                Some(&files_modified)
-            },
-            None, // error_type
-            error_message.as_deref(),
-            feedback_json.as_ref(),
-            Some(&inferred_architecture),
-            None,  // step_count
-            None,  // verification_step_count
-            None,  // agentic_step_count
-            false, // has_ui_bridge
-            None,  // total_tokens
-            None,  // total_cost_usd
-        ) {
+        // SQLite removed — learning outcome recorded via PG path
+        if let Err(e) = Err::<(), String>("SQLite removed".into()) {
             warn!("Failed to record learning outcome: {}", e);
         } else {
             info!(

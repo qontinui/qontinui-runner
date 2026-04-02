@@ -1,28 +1,28 @@
 //! SQLite exporter for persisting error events to the database.
+//! SQLite has been removed — this exporter is a no-op stub.
 
 use crate::error_monitor::pipeline::traits::Exporter;
 use crate::error_monitor::pipeline::types::LogRecord;
-use crate::error_monitor::storage::ErrorEventStorage;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::database::CheckpointDb;
 
-/// Exporter that writes parsed error events to SQLite.
+/// Exporter that previously wrote parsed error events to SQLite.
+/// Now a no-op stub — all persistence goes through PostgreSQL.
 pub struct SqliteExporter {
-    db: Arc<CheckpointDb>,
-    /// Current workflow context for error association.
-    task_run_id: Arc<RwLock<Option<String>>>,
-    workflow_name: Arc<RwLock<Option<String>>>,
+    _task_run_id: Arc<RwLock<Option<String>>>,
+    _workflow_name: Arc<RwLock<Option<String>>>,
 }
 
 impl SqliteExporter {
     pub fn new(
-        db: Arc<CheckpointDb>,
         task_run_id: Arc<RwLock<Option<String>>>,
         workflow_name: Arc<RwLock<Option<String>>>,
     ) -> Self {
-        todo!("SQLite removed")
+        Self {
+            _task_run_id: task_run_id,
+            _workflow_name: workflow_name,
+        }
     }
 }
 
@@ -32,34 +32,8 @@ impl Exporter for SqliteExporter {
         "sqlite"
     }
 
-    async fn export(&self, records: &[LogRecord]) -> Result<(), String> {
-        let task_run_id = self.task_run_id.read().await.clone();
-        let workflow_name = self.workflow_name.read().await.clone();
-        let db = self.db.clone();
-
-        let events: Vec<_> = records.iter().filter_map(|r| r.parsed.clone()).collect();
-
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        tokio::task::spawn_blocking(move || {
-            let conn = db
-                .get_conn_string()
-                .map_err(|e| format!("DB connection error: {}", e))?;
-            for event in &events {
-                if let Err(e) = ErrorEventStorage::insert(
-                    &conn,
-                    event,
-                    task_run_id.as_deref(),
-                    workflow_name.as_deref(),
-                ) {
-                    tracing::warn!(error = %e, "Failed to store error event");
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
+    async fn export(&self, _records: &[LogRecord]) -> Result<(), String> {
+        // SQLite removed — no-op
+        Ok(())
     }
 }

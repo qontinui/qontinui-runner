@@ -1121,6 +1121,18 @@ impl PgDb {
                 ON security_audit_events(decision)",
             "CREATE INDEX IF NOT EXISTS idx_sec_audit_created
                 ON security_audit_events(created_at)",
+            // Phase model routing (Q-learning state for model tier selection)
+            "CREATE TABLE IF NOT EXISTS phase_model_routing (
+                state_key    TEXT NOT NULL,
+                phase        TEXT NOT NULL,
+                model_tier   TEXT NOT NULL,
+                q_value      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                visit_count  INTEGER NOT NULL DEFAULT 0,
+                last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (state_key, phase, model_tier)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_phase_model_routing_state
+                ON phase_model_routing(state_key)",
             // Schema compliance tracking columns on pipeline_agent_traces (v172)
             "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS schema_valid_first_attempt BOOLEAN",
             "ALTER TABLE pipeline_agent_traces ADD COLUMN IF NOT EXISTS validation_retries INTEGER",
@@ -1247,77 +1259,10 @@ impl PgDb {
     }
 
     /// One-time migration of token usage data from SQLite to PostgreSQL.
-    /// Skips if PG already has data. Called once on startup.
-    pub async fn migrate_token_data_from_sqlite(
-        &self,
-        sqlite_db: &crate::database::CheckpointDb,
-    ) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-
-        // Skip if PG already has data
-        let count: i64 = conn
-            .query_one("SELECT COUNT(*) FROM phase_token_usage", &[])
-            .await
-            .map_err(|e| format!("PG count query failed: {}", e))?
-            .get(0);
-
-        if count > 0 {
-            info!("PG phase_token_usage already has {} rows, skipping migration", count);
-            return Ok(0);
-        }
-
-        // Read all token usage from SQLite
-        let sqlite_rows = sqlite_db.get_all_phase_token_usage_for_migration()
-            .unwrap_or_else(|e| {
-                warn!("Failed to read SQLite token data for migration: {}", e);
-                Vec::new()
-            });
-
-        if sqlite_rows.is_empty() {
-            info!("No SQLite token data to migrate");
-            return Ok(0);
-        }
-
-        // Ensure task_run stubs exist in PG
-        let mut task_run_ids = std::collections::HashSet::new();
-        for row in &sqlite_rows {
-            task_run_ids.insert(row.task_run_id.as_str());
-        }
-        for task_run_id in &task_run_ids {
-            conn.execute(
-                "INSERT INTO task_runs (id) VALUES ($1) ON CONFLICT DO NOTHING",
-                &[task_run_id],
-            )
-            .await
-            .map_err(|e| format!("PG insert task_run stub: {}", e))?;
-        }
-
-        // Batch insert token usage
-        let mut migrated = 0u64;
-        for row in &sqlite_rows {
-            let stage_i = row.stage_index.map(|v| v as i32);
-            let iter_i = row.iteration.map(|v| v as i32);
-            let input_i = row.input_tokens as i64;
-            let output_i = row.output_tokens as i64;
-            let cost_i = row.cost_cents as i64;
-            let dur_i = row.duration_ms.map(|v| v as i64);
-
-            conn.execute(
-                "INSERT INTO phase_token_usage (task_run_id, phase, stage_index, iteration, model_used, provider_used, input_tokens, output_tokens, cost_cents, duration_ms, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz)",
-                &[
-                    &row.task_run_id, &row.phase, &stage_i, &iter_i,
-                    &row.model_used, &row.provider_used,
-                    &input_i, &output_i, &cost_i, &dur_i,
-                    &row.created_at,
-                ],
-            )
-            .await
-            .map_err(|e| format!("PG insert migration row: {}", e))?;
-            migrated += 1;
-        }
-
-        info!("Migrated {} token usage rows from SQLite to PostgreSQL", migrated);
-        Ok(migrated)
+    /// SQLite has been removed — this is now a no-op.
+    pub async fn migrate_token_data_from_sqlite(&self) -> Result<u64, String> {
+        info!("SQLite removed — token data migration is a no-op");
+        Ok(0)
     }
 
     /// Blocking helper for tests: create a PgDb using DATABASE_URL.

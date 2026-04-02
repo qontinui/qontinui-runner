@@ -1,6 +1,6 @@
 //! ProcessCaptureManager: orchestrator for managed processes.
 
-use crate::database::{CheckpointDb, Connection};
+// CheckpointDb/Connection removed — all persistence is via PG
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,10 +36,7 @@ impl ProcessCaptureManager {
         }
     }
 
-    /// Get the database handle.
-    fn db(&self) -> Arc<CheckpointDb> {
-        todo!("SQLite removed")
-    }
+    // SQLite database handle removed — session tracking is now PG-only.
 
     /// Register a process config without starting it.
     pub async fn register(&self, config: ProcessConfig) {
@@ -64,26 +61,14 @@ impl ProcessCaptureManager {
         let output_buffer = process.output_buffer.clone();
         let buffer_size = process.config.buffer_size;
 
-        // Create a database session record
+        // Create a database session record (SQLite removed — PG handles this)
         let session_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = self
-            .db()
-            .create_process_session(&session_id, &config_id, &process_name)
-        {
-            warn!("Failed to create process session record: {}", e);
-        }
-        // Prune old sessions (keep 10)
-        if let Err(e) = self.db().prune_old_process_sessions(&config_id, 10) {
-            warn!("Failed to prune old sessions: {}", e);
-        }
         process.runtime.session_id = Some(session_id.clone());
 
         // Clone handles for the event loop
         let processes_ref = self.processes.clone();
         let error_monitor = self.error_monitor.clone();
         let app_handle = self.app_handle.clone();
-        let db = self.db();
-
         // Spawn the event loop for this process
         tokio::spawn(async move {
             Self::process_event_loop(
@@ -96,7 +81,6 @@ impl ProcessCaptureManager {
                 processes_ref,
                 error_monitor,
                 app_handle,
-                db,
                 session_id,
             )
             .await;
@@ -298,7 +282,6 @@ impl ProcessCaptureManager {
         processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
         error_monitor: Arc<RwLock<Option<ErrorMonitorHandle>>>,
         app_handle: tauri::AppHandle,
-        db: Arc<CheckpointDb>,
         session_id: String,
     ) {
         // SQLite removed - no-op
@@ -609,7 +592,6 @@ use crate::database::CheckpointDb;
 async fn auto_discover_specs(
     port: u16,
     process_name: &str,
-    db: &Arc<CheckpointDb>,
     app_handle: &tauri::AppHandle,
 ) {
     // SQLite removed - no-op

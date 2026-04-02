@@ -168,7 +168,7 @@ impl KnowledgeBase {
         task_run_id: &str,
         config: &CompressionConfig,
     ) -> Result<Option<CompressionResult>, String> {
-        let service = CompressionService::new(Arc::clone(&self.db), config.clone());
+        let service = CompressionService::new(config.clone());
         service.compress_if_needed(task_run_id)
     }
 

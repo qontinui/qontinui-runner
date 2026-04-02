@@ -562,7 +562,7 @@ fn run_claude_session_inline(
                         flush_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
                     if !output_snapshot.is_empty() {
                         if let Err(e) =
-                            db.flush_partial_ai_output(&task_run_id, &output_snapshot, iteration)
+                            Err::<(), String>("SQLite removed".into())
                         {
                             warn!("Failed to flush partial AI output: {}", e);
                         } else {

@@ -182,11 +182,6 @@ impl std::fmt::Debug for TaskRunHandle {
 }
 
 impl TaskRunHandle {
-    /// Get the database handle.
-    fn db(&self) -> Arc<CheckpointDb> {
-        todo!("SQLite removed")
-    }
-
     /// Get the task run ID.
     pub fn id(&self) -> &str {
         &self.id
@@ -195,41 +190,40 @@ impl TaskRunHandle {
     /// Append output to the task log.
     ///
     /// Returns true if [TASK_COMPLETE] was detected in the output.
-    pub fn append_output(&self, output: &str) -> Result<bool, String> {
-        self.db().append_task_output(&self.id, output, false)
+    pub fn append_output(&self, _output: &str) -> Result<bool, String> {
+        Err("SQLite removed".into())
     }
 
     /// Append output to the task log and increment the session count.
     ///
     /// Returns true if [TASK_COMPLETE] was detected in the output.
-    pub fn append_output_with_session_increment(&self, output: &str) -> Result<bool, String> {
-        self.db().append_task_output(&self.id, output, true)
+    pub fn append_output_with_session_increment(&self, _output: &str) -> Result<bool, String> {
+        Err("SQLite removed".into())
     }
 
     /// Complete the task with success.
     pub fn complete(&self) -> Result<(), String> {
-        self.db().complete_task_run(&self.id)
+        Err("SQLite removed".into())
     }
 
     /// Complete the task with failure.
-    pub fn fail(&self, error_message: &str) -> Result<(), String> {
-        self.db().fail_task_run(&self.id, error_message)
+    pub fn fail(&self, _error_message: &str) -> Result<(), String> {
+        Err("SQLite removed".into())
     }
 
     /// Stop the task.
     pub fn stop(&self) -> Result<(), String> {
-        self.db().stop_task_run(&self.id)
+        Err("SQLite removed".into())
     }
 
     /// Update the task summary.
     pub fn set_summary(
         &self,
-        summary: &str,
-        goal_achieved: bool,
-        remaining_work: Option<&str>,
+        _summary: &str,
+        _goal_achieved: bool,
+        _remaining_work: Option<&str>,
     ) -> Result<(), String> {
-        self.db()
-            .update_task_summary(&self.id, summary, goal_achieved, remaining_work)
+        Err("SQLite removed".into())
     }
 }
 
@@ -246,92 +240,26 @@ impl TaskRecorder {
         Self
     }
 
-    /// Get the database handle.
-    fn db(&self) -> Arc<CheckpointDb> {
-        todo!("SQLite removed")
-    }
-
     /// Start a new task run.
     ///
     /// Returns a handle that can be used to update the task as it executes.
-    pub fn start_task(&self, config: TaskConfig) -> Result<TaskRunHandle, String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.start_task_with_id(&id, config)
+    /// SQLite removed — returns Err.
+    pub fn start_task(&self, _config: TaskConfig) -> Result<TaskRunHandle, String> {
+        Err("SQLite removed".into())
     }
 
     /// Start a new task run with a specific ID.
-    ///
-    /// Use this when you need to control the task ID (e.g., for session-based tasks).
     pub fn start_task_with_id(
         &self,
-        id: &str,
-        config: TaskConfig,
+        _id: &str,
+        _config: TaskConfig,
     ) -> Result<TaskRunHandle, String> {
-        info!(
-            "Starting task run: id={}, name={}, type={:?}, workspace_id={:?}, triggered_by={:?}",
-            id, config.task_name, config.task_type, config.workspace_id, config.triggered_by
-        );
-
-        // Create the task run in the database with all fields including web context
-        let mut input = CreateTaskRunInput::new(id, &config.task_name)
-            .with_task_type(config.task_type.as_str())
-            .with_auto_continue(config.auto_continue);
-        if let Some(ref p) = config.prompt {
-            input = input.with_prompt(p);
-        }
-        if let Some(ref cid) = config.config_id {
-            input = input.with_config_id(cid);
-        }
-        if let Some(ref wn) = config.workflow_name {
-            input = input.with_workflow_name(wn);
-        }
-        if let Some(ms) = config.max_sessions {
-            input = input.with_max_sessions(ms);
-        }
-        if let Some(esj) = config.execution_steps_json {
-            input = input.with_execution_steps_json(esj);
-        }
-        if let Some(lsj) = config.log_sources_json {
-            input = input.with_log_sources_json(lsj);
-        }
-        if let Some(ref wid) = config.workspace_id {
-            input = input.with_workspace_id(wid);
-        }
-        if let Some(ref tb) = config.triggered_by {
-            input = input.with_triggered_by(tb);
-        }
-        if let Some(ref bid) = config.bridge_id {
-            input = input.with_bridge_id(bid);
-        }
-        self.db().create_task_run(&input)?;
-
-        debug!("Created task run in database: {}", id);
-
-        Ok(TaskRunHandle {
-            id: id.to_string(),
-        })
+        Err("SQLite removed".into())
     }
 
     /// Get an existing task run handle.
-    ///
-    /// Use this to resume interacting with a task that was previously started.
-    pub fn get_task_handle(&self, id: &str) -> Result<TaskRunHandle, String> {
-        // Verify the task exists
-        if self.db().get_task_run(id)?.is_none() {
-            return Err(format!("Task run not found: {}", id));
-        }
-
-        Ok(TaskRunHandle {
-            id: id.to_string(),
-        })
-    }
-
-    /// Get the database reference.
-    ///
-    /// This is useful for operations that need direct database access,
-    /// such as reading task run data for display.
-    pub fn checkpoint_db(&self) -> Arc<CheckpointDb> {
-        todo!("SQLite removed")
+    pub fn get_task_handle(&self, _id: &str) -> Result<TaskRunHandle, String> {
+        Err("SQLite removed".into())
     }
 }
 

@@ -109,7 +109,7 @@ async fn query_handler(
         None
     };
 
-    match unified_query::query_memory(&params, pg, None, graph.as_deref()).await {
+    match unified_query::query_memory(&params, pg, graph.as_deref()).await {
         Ok(results) => {
             let total = results.len();
             Ok(Json(ApiResponse::success(QueryMemoryResponse {

@@ -214,20 +214,21 @@ pub struct KnowledgeSummary {
 // ============================================================================
 
 /// Service for managing context compression.
+/// SQLite removed — all methods are stubs.
 pub struct CompressionService {
-    db: Arc<CheckpointDb>,
     config: CompressionConfig,
 }
 
 impl CompressionService {
     /// Create a new compression service.
-    pub fn new(db: Arc<CheckpointDb>, config: CompressionConfig) -> Self {
-        todo!("SQLite removed")
+    /// SQLite removed — stub.
+    pub fn new(_config: CompressionConfig) -> Self {
+        Self { config: _config }
     }
 
     /// Estimate the token count for a task's current context.
     pub fn estimate_context_tokens(&self, task_run_id: &str) -> Result<TokenCount, String> {
-        let all_knowledge = self.db.list_task_knowledge(task_run_id, None, false)?;
+        let all_knowledge: Vec<StoredTaskKnowledge> = Vec::new(); // SQLite removed
 
         let mut count = TokenCount::empty();
         count.entry_count = all_knowledge.len();
@@ -344,9 +345,7 @@ impl CompressionService {
         task_run_id: &str,
         category: &str,
     ) -> Result<(usize, usize), String> {
-        let entries = self
-            .db
-            .list_task_knowledge(task_run_id, Some(category), false)?;
+        let entries: Vec<StoredTaskKnowledge> = Vec::new(); // SQLite removed
 
         if entries.len() <= self.config.keep_recent_items {
             debug!(
@@ -384,27 +383,14 @@ impl CompressionService {
         // Mark old entries as resolved (effectively archiving them)
         let mut archived_count = 0;
         for entry in to_compress {
-            if let Err(e) = self
-                .db
-                .resolve_task_knowledge(&entry.id, Some("Compressed into summary"))
-            {
+            if let Err(e) = Err::<(), String>("SQLite removed".into()) {
                 warn!("Failed to archive knowledge entry {}: {}", entry.id, e);
             } else {
                 archived_count += 1;
             }
         }
 
-        // Create the summary entry
-        self.db.create_task_knowledge(
-            task_run_id,
-            category,
-            "system",
-            summary.covered_iterations.last().copied().unwrap_or(1),
-            &summary_content,
-            None,
-            "medium",
-            &[],
-        )?;
+        // SQLite removed — summary entry not persisted
 
         info!(
             "Compressed {} {} entries into summary for task {}",

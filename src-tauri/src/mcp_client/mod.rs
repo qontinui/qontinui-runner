@@ -78,96 +78,70 @@ impl McpClientManager {
         }
     }
 
-    /// Get the database handle.
-    fn db(&self) -> Arc<CheckpointDb> {
-        todo!("SQLite removed")
-    }
+    // SQLite database removed — MCP server CRUD methods return Err.
 
     /// Get all configured MCP servers
     pub async fn list_servers(&self) -> Result<Vec<McpServerConfig>, String> {
-        self.db().list_mcp_servers()
+        Err("SQLite removed".into())
     }
 
     /// Get a specific MCP server by ID
-    pub async fn get_server(&self, server_id: &str) -> Result<Option<McpServerConfig>, String> {
-        self.db().get_mcp_server(server_id)
+    pub async fn get_server(&self, _server_id: &str) -> Result<Option<McpServerConfig>, String> {
+        Err("SQLite removed".into())
     }
 
     /// Create a new MCP server configuration
     pub async fn create_server(
         &self,
-        input: CreateMcpServerInput,
+        _input: CreateMcpServerInput,
     ) -> Result<McpServerConfig, String> {
-        self.db().create_mcp_server(input)
+        Err("SQLite removed".into())
     }
 
     /// Update an MCP server configuration
     pub async fn update_server(
         &self,
         server_id: &str,
-        input: UpdateMcpServerInput,
+        _input: UpdateMcpServerInput,
     ) -> Result<McpServerConfig, String> {
-        // Disconnect if currently connected (kills stdio process if any)
         self.disconnect(server_id).await?;
-
-        self.db().update_mcp_server(server_id, input)
+        Err("SQLite removed".into())
     }
 
     /// Delete an MCP server configuration
     pub async fn delete_server(&self, server_id: &str) -> Result<(), String> {
-        // Disconnect if currently connected (kills stdio process if any)
         self.disconnect(server_id).await?;
-
-        self.db().delete_mcp_server(server_id)
+        Err("SQLite removed".into())
     }
 
     /// Get the status of all servers
     pub async fn get_all_status(&self) -> Vec<McpServerStatus> {
+        // SQLite removed — return status for currently-connected servers only
         let connections = self.connections.read().await;
-        let servers = self.db().list_mcp_servers().unwrap_or_default();
-
-        servers
-            .into_iter()
-            .map(|config| {
-                if let Some(conn) = connections.get(&config.id) {
-                    McpServerStatus {
-                        server_id: config.id,
-                        connected: conn.connected,
-                        error: conn.last_error.clone(),
-                        tools: if conn.connected {
-                            Some(conn.tools.clone())
-                        } else {
-                            None
-                        },
-                        last_connect_attempt: conn.last_connect_attempt.clone(),
-                        last_connected: conn.last_connected.clone(),
-                    }
+        connections
+            .iter()
+            .map(|(id, conn)| McpServerStatus {
+                server_id: id.clone(),
+                connected: conn.connected,
+                error: conn.last_error.clone(),
+                tools: if conn.connected {
+                    Some(conn.tools.clone())
                 } else {
-                    McpServerStatus {
-                        server_id: config.id,
-                        connected: false,
-                        error: None,
-                        tools: None,
-                        last_connect_attempt: None,
-                        last_connected: None,
-                    }
-                }
+                    None
+                },
+                last_connect_attempt: conn.last_connect_attempt.clone(),
+                last_connected: conn.last_connected.clone(),
             })
             .collect()
     }
 
     /// Get the status of a specific server
     pub async fn get_server_status(&self, server_id: &str) -> Result<McpServerStatus, String> {
-        let config = self
-            .db()
-            .get_mcp_server(server_id)?
-            .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
-
         let connections = self.connections.read().await;
 
         if let Some(conn) = connections.get(server_id) {
             Ok(McpServerStatus {
-                server_id: config.id,
+                server_id: server_id.to_string(),
                 connected: conn.connected,
                 error: conn.last_error.clone(),
                 tools: if conn.connected {
@@ -179,87 +153,14 @@ impl McpClientManager {
                 last_connected: conn.last_connected.clone(),
             })
         } else {
-            Ok(McpServerStatus {
-                server_id: config.id,
-                connected: false,
-                error: None,
-                tools: None,
-                last_connect_attempt: None,
-                last_connected: None,
-            })
+            Err(format!("MCP server not found: {}", server_id))
         }
     }
 
-    /// Connect to an MCP server
-    pub async fn connect(&self, server_id: &str) -> Result<Vec<McpToolInfo>, String> {
-        let config = self
-            .db()
-            .get_mcp_server(server_id)?
-            .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
-
-        if !config.enabled {
-            return Err(format!("MCP server is disabled: {}", server_id));
-        }
-
-        info!("Connecting to MCP server: {} ({})", config.name, server_id);
-
-        let now = chrono::Utc::now().to_rfc3339();
-        let result = match config.transport {
-            McpTransport::Http => self.connect_http(&config).await.map(|tools| (tools, None)),
-            McpTransport::Stdio => self.connect_stdio(&config).await,
-        };
-
-        let mut connections = self.connections.write().await;
-
-        match result {
-            Ok((tools, stdio_handle)) => {
-                info!(
-                    "Connected to MCP server: {} with {} tools",
-                    config.name,
-                    tools.len()
-                );
-
-                // Cache tools in database
-                if let Ok(tools_json) = serde_json::to_string(&tools) {
-                    let _ = self
-                        .db()
-                        .update_mcp_server_tools_cache(server_id, &tools_json, &now);
-                }
-
-                connections.insert(
-                    server_id.to_string(),
-                    McpConnection {
-                        config,
-                        connected: true,
-                        tools: tools.clone(),
-                        last_connect_attempt: Some(now.clone()),
-                        last_connected: Some(now),
-                        last_error: None,
-                        stdio_handle,
-                    },
-                );
-
-                Ok(tools)
-            }
-            Err(e) => {
-                error!("Failed to connect to MCP server {}: {}", config.name, e);
-
-                connections.insert(
-                    server_id.to_string(),
-                    McpConnection {
-                        config,
-                        connected: false,
-                        tools: vec![],
-                        last_connect_attempt: Some(now),
-                        last_connected: None,
-                        last_error: Some(e.clone()),
-                        stdio_handle: None,
-                    },
-                );
-
-                Err(e)
-            }
-        }
+    /// Connect to an MCP server.
+    /// SQLite removed — server config not available via this path.
+    pub async fn connect(&self, _server_id: &str) -> Result<Vec<McpToolInfo>, String> {
+        Err("SQLite removed — MCP server config not available".into())
     }
 
     /// Disconnect from an MCP server
@@ -907,23 +808,10 @@ impl McpClientManager {
     // Auto-start servers
     // =========================================================================
 
-    /// Start all servers marked for auto-start
+    /// Start all servers marked for auto-start.
+    /// SQLite removed — no-op (PG-based auto-start not yet wired).
     pub async fn start_auto_start_servers(&self) {
-        match self.db().list_mcp_servers() {
-            Ok(servers) => {
-                for server in servers {
-                    if server.enabled && server.auto_start {
-                        info!("Auto-starting MCP server: {}", server.name);
-                        if let Err(e) = self.connect(&server.id).await {
-                            warn!("Failed to auto-start MCP server {}: {}", server.name, e);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to load MCP servers for auto-start: {}", e);
-            }
-        }
+        // SQLite removed — MCP server list not available
     }
 }
 

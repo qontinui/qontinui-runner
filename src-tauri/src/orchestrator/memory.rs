@@ -872,7 +872,7 @@ impl MemorySystem {
             min_score: Some(0.3),
         };
 
-        match unified_query::query_memory(&params, pg, None, None).await {
+        match unified_query::query_memory(&params, pg, None).await {
             Ok(results) if !results.is_empty() => {
                 context.push_str("\n## Unified Memory\n");
                 for r in results.iter().take(10) {

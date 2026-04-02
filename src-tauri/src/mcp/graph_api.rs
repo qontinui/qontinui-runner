@@ -864,7 +864,7 @@ async fn memory_search_handler(
         None
     };
 
-    let results = unified_query::query_memory(&params, pg, None, graph.as_deref())
+    let results = unified_query::query_memory(&params, pg, graph.as_deref())
         .await
         .map_err(|e| {
             (

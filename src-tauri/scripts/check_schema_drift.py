@@ -99,8 +99,14 @@ def main():
 
     # --- Extract table sets ---
     pg_tables = extract_tables(PG_SCHEMA)
-    sqlite_tables = extract_tables(SQLITE_SCHEMA)
-    migration_tables = extract_tables(MIGRATIONS) - MIGRATION_TEMP_TABLES
+    try:
+        sqlite_tables = extract_tables(SQLITE_SCHEMA)
+    except FileNotFoundError:
+        sqlite_tables = set()  # SQLite schema removed
+    try:
+        migration_tables = extract_tables(MIGRATIONS) - MIGRATION_TEMP_TABLES
+    except FileNotFoundError:
+        migration_tables = set()  # migrations.rs removed
     ensure_tables = extract_tables(PG_MOD)
 
     sqlite_all = sqlite_tables | migration_tables
@@ -146,8 +152,14 @@ def main():
 
     for tbl in key_tables:
         pg_cols = extract_columns(PG_SCHEMA, tbl)
-        sqlite_cols_base = extract_columns(SQLITE_SCHEMA, tbl)
-        sqlite_cols_mig = extract_columns(MIGRATIONS, tbl)
+        try:
+            sqlite_cols_base = extract_columns(SQLITE_SCHEMA, tbl)
+        except FileNotFoundError:
+            sqlite_cols_base = None
+        try:
+            sqlite_cols_mig = extract_columns(MIGRATIONS, tbl)
+        except FileNotFoundError:
+            sqlite_cols_mig = None
 
         # Merge SQLite base + migration columns
         if sqlite_cols_base and sqlite_cols_mig:

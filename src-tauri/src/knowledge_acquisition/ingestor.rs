@@ -170,17 +170,15 @@ pub enum IngestOutcome {
 pub async fn ingest_results(
     results: &[KnowledgeResult],
     task_run_id: &str,
-    db: Option<&Arc<CheckpointDb>>,
     pg: Option<&Arc<PgDb>>,
 ) -> Vec<IngestOutcome> {
     Vec::new()
 }
 
-/// Ingest a single result. Prefers PG when available, falls back to SQLite.
+/// Ingest a single result into PG.
 async fn ingest_single(
     result: &KnowledgeResult,
     task_run_id: &str,
-    db: Option<&Arc<CheckpointDb>>,
     pg: Option<&Arc<PgDb>>,
     embedding_client: &EmbeddingClient,
 ) -> IngestOutcome {
