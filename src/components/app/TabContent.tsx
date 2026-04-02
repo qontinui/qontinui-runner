@@ -71,6 +71,7 @@ import { GeneratorEvalPage } from "@/pages/GeneratorEvalPage";
 import { OrchestrationLoopPanel } from "@/components/orchestration-loop/OrchestrationLoopPanel";
 import { AutoresearchPage } from "@/pages/AutoresearchPage";
 import { MetaOptimizerPage } from "@/pages/MetaOptimizerPage";
+import { OnlineLearningDashboard } from "@/components/online-learning/OnlineLearningDashboard";
 import { SpecsPage } from "@/pages/specs/SpecsPage";
 import { UIBridgeIntegrationPage } from "@/pages/ui-bridge-integration/UIBridgeIntegrationPage";
 import { UIBridgeStateMachinePage } from "@/pages/state-machine";
@@ -81,6 +82,9 @@ import { Loader2 } from "lucide-react";
 
 const LlmObservabilityDashboard = lazy(
   () => import("../llm-observability/LlmObservabilityDashboard"),
+);
+const CostControlPanel = lazy(
+  () => import("../cost-control/CostControlPanel"),
 );
 const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard"));
 const SkillApprovalPanel = lazy(() =>
@@ -129,6 +133,9 @@ const DecisionTrailPage = lazy(() =>
 );
 const MemorySearchPanel = lazy(() =>
   import("../memory-search").then((m) => ({ default: m.MemorySearchPanel })),
+);
+const AccessibilityExplorer = lazy(
+  () => import("@/components/accessibility-explorer/AccessibilityExplorer"),
 );
 
 /** Register the active page with UI Bridge for AI discoverability */
@@ -412,6 +419,13 @@ export function TabContent({
       return (
         <div className="h-full overflow-hidden">
           <MetaOptimizerPage />
+        </div>
+      );
+
+    case "online-learning":
+      return (
+        <div className="h-full overflow-hidden">
+          <OnlineLearningDashboard />
         </div>
       );
 
@@ -886,6 +900,29 @@ export function TabContent({
         <div className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <LlmObservabilityDashboard />
+          </Suspense>
+        </div>
+      );
+
+    case "cost-control":
+      return (
+        <div className="h-full overflow-hidden">
+          <Suspense fallback={<LazyFallback />}>
+            <CostControlPanel />
+          </Suspense>
+        </div>
+      );
+
+    case "accessibility-explorer":
+      return (
+        <div className="h-full overflow-hidden">
+          <PageRegistration
+            id="accessibility-explorer"
+            name="Accessibility Explorer"
+            description="Inspect and interact with native desktop accessibility trees via UIA, AT-SPI, or AX APIs"
+          />
+          <Suspense fallback={<LazyFallback />}>
+            <AccessibilityExplorer />
           </Suspense>
         </div>
       );

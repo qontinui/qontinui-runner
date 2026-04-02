@@ -1,0 +1,179 @@
+{
+  "version": "1.0.0",
+  "description": "Accessibility Explorer -- inspect and interact with native desktop accessibility trees from any running application. Connect to a window by title or PID, capture the accessibility tree, browse elements in a hierarchical tree view, query by role/label, and perform actions (click, type, focus) on elements. Shows the AI context output that workflow agents receive when using native_accessibility steps.",
+  "groups": [
+    {
+      "id": "a11y-connection",
+      "name": "Connection and Target Selection",
+      "description": "Users connect to a desktop application by entering its window title (e.g., 'Notepad'), process ID (e.g., 'pid:1234'), or 'Desktop' for the entire desktop. The Connect button establishes the accessibility bridge. A status indicator shows the connection state and which backend (UIA, AT-SPI, or AX) is active.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "a11y-target-input",
+          "description": "Users can enter a target window title, process ID, or 'Desktop' to specify which application to inspect",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "role": "textbox" },
+            "label": "Target input field"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "a11y-connect-btn",
+          "description": "Users can connect to the specified target application",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Connect" },
+            "label": "Connect button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "a11y-status-indicator",
+          "description": "Users can see whether they are connected or disconnected and which accessibility backend is in use",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Disconnected" },
+            "label": "Connection status indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "a11y-tree-view",
+      "name": "Accessibility Tree Viewer",
+      "description": "After connecting and capturing, users see a hierarchical tree of accessibility nodes. Each node displays its role (button, textbox, etc.), accessible name, and ref ID. Nodes can be expanded/collapsed. Clicking a node selects it and shows its full details in the properties panel. Interactive elements are visually distinguished.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "a11y-capture-btn",
+          "description": "Users can capture/refresh the accessibility tree from the connected application",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Capture" },
+            "label": "Capture/Refresh button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "a11y-node-count",
+          "description": "Users can see the total number of nodes and interactive nodes captured",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "nodes" },
+            "label": "Node count display"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "a11y-element-details",
+      "name": "Element Properties and Actions",
+      "description": "When a node is selected in the tree, users see its full properties (role, name, value, bounds, state flags, automation ID, supported patterns) and can perform actions on it: Click, Focus, or Type text. Action results are shown inline.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "a11y-click-action",
+          "description": "Users can click a selected element using its native accessibility pattern",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Click" },
+            "label": "Click action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "a11y-focus-action",
+          "description": "Users can focus a selected element",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Focus" },
+            "label": "Focus action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "a11y-query-and-context",
+      "name": "Query and AI Context",
+      "description": "Users can search the captured tree by role and label, filtering to interactive elements. A separate tab shows the AI Context -- the exact text representation that AI agents receive when automating via native_accessibility steps.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "a11y-query-tab",
+          "description": "Users can switch to the Query tab to search the accessibility tree by role, label, or interactivity",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "Query" },
+            "label": "Query tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "a11y-ai-context-tab",
+          "description": "Users can view the AI Context output that workflow agents receive",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContent": "AI Context" },
+            "label": "AI Context tab"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "component": "AccessibilityExplorer",
+    "author": "Qontinui",
+    "pageUrl": "/accessibility-explorer",
+    "tags": ["accessibility", "debug", "automation", "native", "UIA", "AT-SPI", "AX"]
+  }
+}

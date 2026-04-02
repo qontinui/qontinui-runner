@@ -69,11 +69,13 @@ export type MainTabId =
   | "settings-instances"
   | "settings-debug"
   | "settings-security"
+  | "accessibility-explorer"
   | "settings-updates"
   | "orchestration-loop"
   | "image-quality-tests"
   | "terminal"
   | "llm-analytics"
+  | "cost-control"
   | "evaluation"
   | "skills"
   | "help"
@@ -88,7 +90,8 @@ export type MainTabId =
   | "session-recap"
   | "api-surface"
   | "decision-trail"
-  | "memory-search";
+  | "memory-search"
+  | "online-learning";
 
 const VALID_TAB_IDS: MainTabId[] = [
   "gui-automation",
@@ -159,11 +162,13 @@ const VALID_TAB_IDS: MainTabId[] = [
   "settings-instances",
   "settings-debug",
   "settings-security",
+  "accessibility-explorer",
   "settings-updates",
   "orchestration-loop",
   "image-quality-tests",
   "terminal",
   "llm-analytics",
+  "cost-control",
   "evaluation",
   "skills",
   "help",
@@ -179,6 +184,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "api-surface",
   "decision-trail",
   "memory-search",
+  "online-learning",
 ];
 
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
