@@ -1310,8 +1310,8 @@ impl PgDb {
 
         // Build dynamic query with optional WHERE clauses
         let mut query = String::from(
-            r#"SELECT id, execution_id, span_type, phase, iteration, step_index,
-                      started_at, completed_at, duration_ms, metadata_json
+            r#"SELECT id, execution_id, name, phase, iteration,
+                      start_ts, end_ts, duration_ms, attributes
                FROM execution_spans
                WHERE execution_id = $1"#,
         );
@@ -1322,7 +1322,7 @@ impl PgDb {
         ];
 
         if let Some(pattern) = name_pattern {
-            query.push_str(&format!(" AND span_type ILIKE ${}", param_idx));
+            query.push_str(&format!(" AND name ILIKE ${}", param_idx));
             params.push(Box::new(pattern.to_string()));
             param_idx += 1;
         }
@@ -1333,7 +1333,7 @@ impl PgDb {
             param_idx += 1;
         }
 
-        query.push_str(" ORDER BY started_at ASC");
+        query.push_str(" ORDER BY start_ts ASC");
 
         if let Some(lim) = limit {
             query.push_str(&format!(" LIMIT ${}", param_idx));
@@ -1349,16 +1349,15 @@ impl PgDb {
 
         Ok(rows.iter().map(|r| {
             serde_json::json!({
-                "id": r.get::<_, String>(0),
-                "execution_id": r.get::<_, String>(1),
+                "id": r.get::<_, i64>(0),
+                "execution_id": r.get::<_, Option<String>>(1),
                 "span_type": r.get::<_, String>(2),
                 "phase": r.get::<_, Option<String>>(3),
                 "iteration": r.get::<_, Option<i32>>(4),
-                "step_index": r.get::<_, Option<i32>>(5),
-                "started_at": r.get::<_, Option<String>>(6),
-                "completed_at": r.get::<_, Option<String>>(7),
-                "duration_ms": r.get::<_, Option<i64>>(8),
-                "metadata_json": r.get::<_, Option<String>>(9),
+                "started_at": r.get::<_, String>(5),
+                "completed_at": r.get::<_, Option<String>>(6),
+                "duration_ms": r.get::<_, Option<i64>>(7),
+                "metadata": r.get::<_, Option<String>>(8),
             })
         }).collect())
     }
