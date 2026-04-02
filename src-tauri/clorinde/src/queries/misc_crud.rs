@@ -785,7 +785,7 @@ where
 pub struct GetShellCommandStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_shell_command() -> GetShellCommandStmt {
     GetShellCommandStmt(
-        "SELECT id, name, description, command, working_directory, timeout_seconds, fail_on_error, category, tags, enabled, created_at, updated_at FROM shell_commands WHERE id = $1",
+        "SELECT id, name, COALESCE(description, '') as description, command, COALESCE(working_directory, '') as working_directory, COALESCE(timeout_seconds, 30) as timeout_seconds, fail_on_error, category, tags, enabled, created_at, updated_at FROM shell_commands WHERE id = $1",
         None,
     )
 }
@@ -966,7 +966,7 @@ impl DeleteShellCommandStmt {
 pub struct ListSavedApiRequestsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_saved_api_requests() -> ListSavedApiRequestsStmt {
     ListSavedApiRequestsStmt(
-        "SELECT id, name, description, category, tags, method, url, headers, body, body_content_type, timeout_ms, follow_redirects, variable_extractions, assertions, credential_id, created_at, updated_at FROM saved_api_requests ORDER BY updated_at DESC",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, '') as category, COALESCE(tags, '[]') as tags, method, url, COALESCE(headers, '{}') as headers, COALESCE(body, '') as body, COALESCE(body_content_type, '') as body_content_type, COALESCE(timeout_ms, 30000) as timeout_ms, COALESCE(follow_redirects, true) as follow_redirects, COALESCE(variable_extractions, '[]') as variable_extractions, COALESCE(assertions, '[]') as assertions, COALESCE(credential_id, '') as credential_id, created_at, updated_at FROM saved_api_requests ORDER BY updated_at DESC",
         None,
     )
 }
@@ -1017,7 +1017,7 @@ impl ListSavedApiRequestsStmt {
 pub struct GetSavedApiRequestStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_saved_api_request() -> GetSavedApiRequestStmt {
     GetSavedApiRequestStmt(
-        "SELECT id, name, description, category, tags, method, url, headers, body, body_content_type, timeout_ms, follow_redirects, variable_extractions, assertions, credential_id, created_at, updated_at FROM saved_api_requests WHERE id = $1",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(category, '') as category, COALESCE(tags, '[]') as tags, method, url, COALESCE(headers, '{}') as headers, COALESCE(body, '') as body, COALESCE(body_content_type, '') as body_content_type, COALESCE(timeout_ms, 30000) as timeout_ms, COALESCE(follow_redirects, true) as follow_redirects, COALESCE(variable_extractions, '[]') as variable_extractions, COALESCE(assertions, '[]') as assertions, COALESCE(credential_id, '') as credential_id, created_at, updated_at FROM saved_api_requests WHERE id = $1",
         None,
     )
 }
@@ -1128,7 +1128,7 @@ impl GetSavedApiRequestTagsStmt {
 pub struct ListMcpServersStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_mcp_servers() -> ListMcpServersStmt {
     ListMcpServersStmt(
-        "SELECT id, name, description, transport, stdio_config, http_config, enabled, auto_start, timeout_seconds, cached_tools, tools_cached_at, created_at, updated_at FROM mcp_servers ORDER BY name ASC",
+        "SELECT id, name, COALESCE(description, '') as description, transport, COALESCE(stdio_config, '{}') as stdio_config, COALESCE(http_config, '{}') as http_config, enabled, auto_start, COALESCE(timeout_seconds, 30) as timeout_seconds, COALESCE(cached_tools, '[]') as cached_tools, COALESCE(tools_cached_at::TEXT, '') as tools_cached_at, created_at, updated_at FROM mcp_servers ORDER BY name ASC",
         None,
     )
 }
@@ -1175,7 +1175,7 @@ impl ListMcpServersStmt {
 pub struct GetMcpServerStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_mcp_server() -> GetMcpServerStmt {
     GetMcpServerStmt(
-        "SELECT id, name, description, transport, stdio_config, http_config, enabled, auto_start, timeout_seconds, cached_tools, tools_cached_at, created_at, updated_at FROM mcp_servers WHERE id = $1",
+        "SELECT id, name, COALESCE(description, '') as description, transport, COALESCE(stdio_config, '{}') as stdio_config, COALESCE(http_config, '{}') as http_config, enabled, auto_start, COALESCE(timeout_seconds, 30) as timeout_seconds, COALESCE(cached_tools, '[]') as cached_tools, COALESCE(tools_cached_at::TEXT, '') as tools_cached_at, created_at, updated_at FROM mcp_servers WHERE id = $1",
         None,
     )
 }

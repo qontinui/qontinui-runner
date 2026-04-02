@@ -3,7 +3,7 @@
 //! Scans `qontinui-claude-config/.claude/commands/*.md` for command files,
 //! parses each into a workflow, and syncs with the database (create/update/delete).
 
-use crate::database::CheckpointDb;
+use crate::database::{CheckpointDb, Connection};
 use crate::unified_workflows::{CreateUnifiedWorkflowRequest, UpdateUnifiedWorkflowRequest};
 use regex::Regex;
 use serde::Serialize;
@@ -239,192 +239,13 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
 /// Scans the commands directory, compares with existing DB entries,
 /// and creates/updates/deletes as needed.
 pub fn sync_slash_commands(db: &CheckpointDb) -> Result<SyncResult, String> {
-    let (workspace_root, commands_dir) = find_commands_directory()?;
-
-    // Scan for .md files
-    let pattern = commands_dir.join("*.md");
-    let pattern_str = pattern.to_string_lossy().replace('\\', "/");
-
-    let files: Vec<PathBuf> = glob::glob(&pattern_str)
-        .map_err(|e| format!("Failed to glob commands: {}", e))?
-        .filter_map(|entry| entry.ok())
-        .collect();
-
-    info!(
-        "Found {} slash command files in {}",
-        files.len(),
-        commands_dir.display()
-    );
-
-    // Parse all files
-    let mut parsed_commands: Vec<SlashCommandParsed> = Vec::new();
-    let mut parse_errors: Vec<String> = Vec::new();
-
-    for file_path in &files {
-        match parse_command_file(file_path, &workspace_root) {
-            Ok(parsed) => parsed_commands.push(parsed),
-            Err(e) => parse_errors.push(e),
-        }
-    }
-
-    // Get existing slash command workflows from DB
-    let existing = db.list_slash_command_sources()?;
-    let mut existing_map: HashMap<String, (String, String)> = HashMap::new(); // path → (id, hash)
-    for (id, path, hash) in &existing {
-        existing_map.insert(path.clone(), (id.clone(), hash.clone()));
-    }
-
-    let mut result = SyncResult {
-        created: 0,
-        updated: 0,
-        deleted: 0,
-        unchanged: 0,
-        errors: parse_errors,
-    };
-
-    // Track which existing entries we've seen (for deletion detection)
-    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Process each parsed command
-    for parsed in &parsed_commands {
-        seen_paths.insert(parsed.relative_path.clone());
-
-        if let Some((existing_id, existing_hash)) = existing_map.get(&parsed.relative_path) {
-            if existing_hash == &parsed.content_hash {
-                // Unchanged
-                result.unchanged += 1;
-            } else {
-                // Content changed — update
-                let update_request = UpdateUnifiedWorkflowRequest {
-                    name: Some(parsed.title.clone()),
-                    description: Some(parsed.description.clone()),
-                    tags: Some({
-                        let mut tags =
-                            vec!["slash-command".to_string(), parsed.command_name.clone()];
-                        if parsed.has_arguments {
-                            tags.push("requires-arguments".to_string());
-                        } else {
-                            tags.push("no-arguments".to_string());
-                        }
-                        tags
-                    }),
-                    agentic_steps: Some(vec![json!({
-                        "type": "prompt",
-                        "name": parsed.command_name,
-                        "phase": "agentic",
-                        "content": parsed.full_content
-                    })]),
-                    // Leave all other fields unchanged
-                    category: None,
-                    setup_steps: None,
-                    verification_steps: None,
-                    completion_steps: None,
-                    max_iterations: None,
-                    timeout_seconds: None,
-                    provider: None,
-                    model: None,
-                    skip_ai_summary: None,
-                    log_source_selection: None,
-                    context_ids: None,
-                    disabled_context_ids: None,
-                    auto_include_contexts: None,
-                    prompt_template: None,
-                    log_watch_enabled: None,
-                    health_check_enabled: None,
-                    health_check_urls: None,
-                    preflight_check_enabled: None,
-                    enable_sweep: None,
-                    max_sweep_iterations: None,
-                    stages: None,
-                    stop_on_failure: None,
-                    constraint_overrides: None,
-                    approval_gate: None,
-                    reflection_mode: None,
-                    completion_prompts_first: None,
-                    model_overrides: None,
-                    dependency_graph: None,
-                    cost_annotations: None,
-                    quality_report: None,
-                    acceptance_criteria: None,
-                    ai_reviewed: None,
-                    workflow_architecture: None,
-                    enforce_token_budget: None,
-                    strict_cwd: None,
-                    tool_tags: None,
-                    flow_control_json: None,
-                    phase_timeouts_json: None,
-                    rollback_policy: None,
-                };
-
-                match db.update_slash_command_content(
-                    existing_id,
-                    &update_request,
-                    &parsed.content_hash,
-                ) {
-                    Ok(_) => {
-                        info!(
-                            "Updated slash command: {} ({})",
-                            parsed.command_name, parsed.relative_path
-                        );
-                        result.updated += 1;
-                    }
-                    Err(e) => {
-                        result
-                            .errors
-                            .push(format!("Failed to update {}: {}", parsed.command_name, e));
-                    }
-                }
-            }
-        } else {
-            // New command — create
-            let request = build_workflow_request(parsed);
-            match db.create_slash_command_workflow(
-                &request,
-                &parsed.relative_path,
-                &parsed.content_hash,
-            ) {
-                Ok(wf) => {
-                    info!(
-                        "Created slash command workflow: {} ({})",
-                        wf.name, parsed.relative_path
-                    );
-                    result.created += 1;
-                }
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to create {}: {}", parsed.command_name, e));
-                }
-            }
-        }
-    }
-
-    // Delete workflows whose source files no longer exist
-    for (path, (id, _)) in &existing_map {
-        if !seen_paths.contains(path) {
-            match db.delete_unified_workflow(id) {
-                Ok(true) => {
-                    info!("Deleted slash command workflow for removed file: {}", path);
-                    result.deleted += 1;
-                }
-                Ok(false) => {
-                    warn!("Slash command workflow already gone: {}", path);
-                }
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to delete workflow for {}: {}", path, e));
-                }
-            }
-        }
-    }
-
-    Ok(result)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_extract_description() {

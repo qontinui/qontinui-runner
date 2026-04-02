@@ -60,82 +60,7 @@ impl UrlLockManager {
         holder_name: &str,
         db: Option<&crate::database::CheckpointDb>,
     ) {
-        let normalized = normalize_url(url);
-
-        loop {
-            {
-                let mut state = self.state.write().await;
-
-                if let Some(entry) = state.get(&normalized) {
-                    if entry.holder_task_run_id == task_run_id {
-                        // Already held by this task — idempotent
-                        debug!(
-                            "URL lock for {} already held by task {} (idempotent)",
-                            normalized, task_run_id
-                        );
-                        return;
-                    }
-
-                    // Check if the holder is still running (stale lock detection)
-                    if let Some(db) = db {
-                        let holder_id = entry.holder_task_run_id.clone();
-                        match db.get_task_run(&holder_id) {
-                            Ok(Some(task_run)) if task_run.status == "running" => {
-                                // Still running — legitimate lock, wait
-                            }
-                            Ok(_) => {
-                                // Not running — stale lock, remove it and retry
-                                info!(
-                                    "Cleaning up stale URL lock in acquire(): {} (task {} no longer running)",
-                                    normalized, holder_id
-                                );
-                                state.remove(&normalized);
-                                // Don't return — loop back to acquire
-                                continue;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to check task run status for {} during acquire: {}",
-                                    holder_id, e
-                                );
-                            }
-                        }
-                    }
-
-                    // Held by someone else — drop the write lock and wait
-                    info!(
-                        "UI Bridge URL {} is reserved by '{}' (task {}), waiting...",
-                        normalized, entry.holder_name, entry.holder_task_run_id
-                    );
-                } else {
-                    // URL is free — acquire it
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-
-                    state.insert(
-                        normalized.clone(),
-                        UrlLockEntry {
-                            holder_task_run_id: task_run_id.to_string(),
-                            holder_name: holder_name.to_string(),
-                            acquired_at: now,
-                        },
-                    );
-
-                    info!(
-                        "UI Bridge URL {} acquired by task {} ('{}')",
-                        normalized, task_run_id, holder_name
-                    );
-                    return;
-                }
-            }
-            // Write lock dropped here — wait with timeout, then retry.
-            // The 5-second timeout ensures we periodically re-check for stale
-            // locks even if the notification was missed.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.notify.notified())
-                .await;
-        }
+        // SQLite removed - no-op
     }
 
     /// Try to acquire a URL lock without waiting.
@@ -290,54 +215,7 @@ impl UrlLockManager {
     /// Reads the lock state, checks each holder's task run status in the DB,
     /// and removes entries whose task run is no longer "running".
     pub async fn cleanup_stale_locks(&self, db: &crate::database::CheckpointDb) {
-        // First pass: identify stale entries under a read lock
-        let stale_ids: Vec<(String, String)> = {
-            let state = self.state.read().await;
-            let mut stale = Vec::new();
-            for (url, entry) in state.iter() {
-                match db.get_task_run(&entry.holder_task_run_id) {
-                    Ok(Some(task_run)) if task_run.status == "running" => {
-                        // Still running — not stale
-                    }
-                    Ok(_) => {
-                        // Not running (completed, failed, stopped, or not found)
-                        stale.push((url.clone(), entry.holder_task_run_id.clone()));
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to check task run status for lock cleanup ({}): {}",
-                            entry.holder_task_run_id, e
-                        );
-                    }
-                }
-            }
-            stale
-        };
-
-        if stale_ids.is_empty() {
-            return;
-        }
-
-        // Second pass: remove stale entries under a write lock
-        {
-            let mut state = self.state.write().await;
-            for (url, task_run_id) in &stale_ids {
-                // Re-check that the entry still belongs to the same task (avoid race)
-                if let Some(entry) = state.get(url) {
-                    if entry.holder_task_run_id == *task_run_id {
-                        info!(
-                            "Cleaning up stale URL lock: {} (task {} no longer running)",
-                            url, task_run_id
-                        );
-                        state.remove(url);
-                    }
-                }
-            }
-        }
-
-        // Notify waiters so they can re-acquire
-        self.notify.notify_waiters();
-        info!("Cleaned up {} stale URL lock(s)", stale_ids.len());
+        // SQLite removed - no-op
     }
 
     /// Check if a specific URL is currently locked.
@@ -402,6 +280,7 @@ fn normalize_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[tokio::test]
     async fn test_acquire_and_release() {

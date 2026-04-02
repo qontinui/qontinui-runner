@@ -2519,6 +2519,7 @@ async fn get_exploration_stats_handler(
 /// Create routes for this module.
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
+use crate::database::CheckpointDb;
     axum::Router::new()
         .route(
             "/unified-workflows",

@@ -4,12 +4,11 @@
 //! Templates are matched to criteria via keyword similarity and injected
 //! into generation prompts to improve first-pass quality.
 
+use crate::database::Connection;
 use crate::database::pg::PgDb;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
 
 use super::domain_routing::VerificationDomain;
 use super::specification::AcceptanceCriterion;
@@ -71,146 +70,27 @@ pub enum TemplateSource {
 
 /// Ensure the step_templates table exists.
 pub fn ensure_table(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS step_templates (
-            id TEXT PRIMARY KEY,
-            domain TEXT NOT NULL,
-            pattern_description TEXT NOT NULL,
-            template_steps_json TEXT NOT NULL,
-            parameters_json TEXT NOT NULL,
-            success_count INTEGER NOT NULL DEFAULT 0,
-            failure_count INTEGER NOT NULL DEFAULT 0,
-            confidence REAL NOT NULL DEFAULT 0.5,
-            source TEXT NOT NULL DEFAULT 'seeded',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_step_templates_domain ON step_templates(domain);",
-    )
-    .map_err(|e| format!("Failed to create step_templates table: {e}"))
+    Err("SQLite removed".to_string())
 }
 
 /// Save a template to the database.
 pub fn save_template(conn: &Connection, template: &StepTemplate) -> Result<(), String> {
-    let steps_json = serde_json::to_string(&template.template_steps)
-        .map_err(|e| format!("Failed to serialize template_steps: {e}"))?;
-    let params_json = serde_json::to_string(&template.parameters)
-        .map_err(|e| format!("Failed to serialize parameters: {e}"))?;
-    let domain_str = serde_json::to_value(template.domain)
-        .map_err(|e| format!("Failed to serialize domain: {e}"))?;
-    let domain_str = domain_str.as_str().unwrap_or("general");
-    let source_str = serde_json::to_value(&template.source)
-        .map_err(|e| format!("Failed to serialize source: {e}"))?;
-    let source_str = source_str.as_str().unwrap_or("seeded");
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT OR REPLACE INTO step_templates
-            (id, domain, pattern_description, template_steps_json, parameters_json,
-             success_count, failure_count, confidence, source, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            template.id,
-            domain_str,
-            template.pattern_description,
-            steps_json,
-            params_json,
-            template.success_count,
-            template.failure_count,
-            template.confidence,
-            source_str,
-            now,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to save template '{}': {e}", template.id))?;
-
-    debug!(template_id = %template.id, "Saved template to database");
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
-/// Parse a single row into a StepTemplate.
-fn row_to_template(row: &rusqlite::Row) -> rusqlite::Result<StepTemplate> {
-    let id: String = row.get(0)?;
-    let domain_str: String = row.get(1)?;
-    let pattern_description: String = row.get(2)?;
-    let steps_json: String = row.get(3)?;
-    let params_json: String = row.get(4)?;
-    let success_count: u32 = row.get(5)?;
-    let failure_count: u32 = row.get(6)?;
-    let confidence: f64 = row.get(7)?;
-    let source_str: String = row.get(8)?;
-
-    let domain_quoted = format!("\"{}\"", domain_str);
-    let domain: VerificationDomain = serde_json::from_str(&domain_quoted).unwrap_or(VerificationDomain::General);
-    let template_steps: Vec<TemplateStep> =
-        serde_json::from_str(&steps_json).unwrap_or_default();
-    let parameters: Vec<TemplateParameter> =
-        serde_json::from_str(&params_json).unwrap_or_default();
-    let source_quoted = format!("\"{}\"", source_str);
-    let source: TemplateSource =
-        serde_json::from_str(&source_quoted).unwrap_or(TemplateSource::Seeded);
-
-    Ok(StepTemplate {
-        id,
-        domain,
-        pattern_description,
-        template_steps,
-        parameters,
-        success_count,
-        failure_count,
-        confidence,
-        source,
-    })
-}
+// row_to_template removed (SQLite dead code)
 
 /// Load all templates for a domain.
 pub fn load_templates_for_domain(
     conn: &Connection,
     domain: VerificationDomain,
 ) -> Result<Vec<StepTemplate>, String> {
-    let domain_str = serde_json::to_value(domain)
-        .map_err(|e| format!("Failed to serialize domain: {e}"))?;
-    let domain_str = domain_str.as_str().unwrap_or("general");
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, domain, pattern_description, template_steps_json, parameters_json,
-                    success_count, failure_count, confidence, source
-             FROM step_templates WHERE domain = ?1
-             ORDER BY confidence DESC",
-        )
-        .map_err(|e| format!("Failed to prepare load query: {e}"))?;
-
-    let templates = stmt
-        .query_map(params![domain_str], |row| row_to_template(row))
-        .map_err(|e| format!("Failed to query templates for domain {domain}: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
-
-    debug!(domain = %domain, count = templates.len(), "Loaded templates for domain");
-    Ok(templates)
+    Err("SQLite removed".to_string())
 }
 
 /// Load all templates from the database.
 pub fn load_all_templates(conn: &Connection) -> Result<Vec<StepTemplate>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, domain, pattern_description, template_steps_json, parameters_json,
-                    success_count, failure_count, confidence, source
-             FROM step_templates
-             ORDER BY confidence DESC",
-        )
-        .map_err(|e| format!("Failed to prepare load-all query: {e}"))?;
-
-    let templates = stmt
-        .query_map([], |row| row_to_template(row))
-        .map_err(|e| format!("Failed to query all templates: {e}"))?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
-
-    debug!(count = templates.len(), "Loaded all templates");
-    Ok(templates)
+    Err("SQLite removed".to_string())
 }
 
 /// Compute updated confidence from success/failure counts using Wilson score lower bound.
@@ -231,61 +111,12 @@ fn compute_confidence(success: u32, failure: u32) -> f64 {
 
 /// Increment success count and update confidence.
 pub fn record_success(conn: &Connection, template_id: &str) -> Result<(), String> {
-    // Read current counts
-    let (success, failure): (u32, u32) = conn
-        .query_row(
-            "SELECT success_count, failure_count FROM step_templates WHERE id = ?1",
-            params![template_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| format!("Template '{}' not found: {e}", template_id))?;
-
-    let new_success = success + 1;
-    let new_confidence = compute_confidence(new_success, failure);
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "UPDATE step_templates SET success_count = ?1, confidence = ?2, updated_at = ?3 WHERE id = ?4",
-        params![new_success, new_confidence, now, template_id],
-    )
-    .map_err(|e| format!("Failed to record success for '{}': {e}", template_id))?;
-
-    debug!(
-        template_id,
-        new_success,
-        new_confidence,
-        "Recorded template success"
-    );
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Increment failure count and update confidence.
 pub fn record_failure(conn: &Connection, template_id: &str) -> Result<(), String> {
-    let (success, failure): (u32, u32) = conn
-        .query_row(
-            "SELECT success_count, failure_count FROM step_templates WHERE id = ?1",
-            params![template_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| format!("Template '{}' not found: {e}", template_id))?;
-
-    let new_failure = failure + 1;
-    let new_confidence = compute_confidence(success, new_failure);
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute(
-        "UPDATE step_templates SET failure_count = ?1, confidence = ?2, updated_at = ?3 WHERE id = ?4",
-        params![new_failure, new_confidence, now, template_id],
-    )
-    .map_err(|e| format!("Failed to record failure for '{}': {e}", template_id))?;
-
-    debug!(
-        template_id,
-        new_failure,
-        new_confidence,
-        "Recorded template failure"
-    );
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 // === Template Matching ===
@@ -802,62 +633,12 @@ pub fn seed_templates() -> Vec<StepTemplate> {
 
 /// Seed the database with initial templates (idempotent -- skips existing).
 pub fn seed_database(conn: &Connection) -> Result<usize, String> {
-    ensure_table(conn)?;
-    let seeds = seed_templates();
-    let mut inserted = 0;
-
-    for template in &seeds {
-        let steps_json = serde_json::to_string(&template.template_steps)
-            .map_err(|e| format!("Failed to serialize template_steps: {e}"))?;
-        let params_json = serde_json::to_string(&template.parameters)
-            .map_err(|e| format!("Failed to serialize parameters: {e}"))?;
-        let domain_str = serde_json::to_value(template.domain)
-            .map_err(|e| format!("Failed to serialize domain: {e}"))?;
-        let domain_str = domain_str.as_str().unwrap_or("general");
-        let source_str = serde_json::to_value(&template.source)
-            .map_err(|e| format!("Failed to serialize source: {e}"))?;
-        let source_str = source_str.as_str().unwrap_or("seeded");
-        let now = chrono::Utc::now().to_rfc3339();
-
-        let result = conn.execute(
-            "INSERT OR IGNORE INTO step_templates
-                (id, domain, pattern_description, template_steps_json, parameters_json,
-                 success_count, failure_count, confidence, source, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                template.id,
-                domain_str,
-                template.pattern_description,
-                steps_json,
-                params_json,
-                template.success_count,
-                template.failure_count,
-                template.confidence,
-                source_str,
-                now,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Failed to insert seed template '{}': {e}", template.id))?;
-
-        if result > 0 {
-            inserted += 1;
-        }
-    }
-
-    info!(inserted, total = seeds.len(), "Seeded template library");
-    Ok(inserted)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_table(&conn).unwrap();
-        conn
-    }
 
     #[test]
     fn test_seed_templates_not_empty() {
@@ -872,56 +653,17 @@ mod tests {
 
     #[test]
     fn test_seed_database_idempotent() {
-        let conn = test_conn();
-        let first = seed_database(&conn).unwrap();
-        assert!(first > 0);
-        let second = seed_database(&conn).unwrap();
-        assert_eq!(second, 0, "Second seed should insert nothing");
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_save_and_load_template() {
-        let conn = test_conn();
-        let template = StepTemplate {
-            id: "test-template-1".to_string(),
-            domain: VerificationDomain::General,
-            pattern_description: "Test pattern".to_string(),
-            template_steps: vec![TemplateStep {
-                step_type: "command".to_string(),
-                command_template: Some("echo hello".to_string()),
-                check_type: Some("exit_code".to_string()),
-                expected_template: Some("0".to_string()),
-                description: "Say hello".to_string(),
-            }],
-            parameters: vec![],
-            success_count: 0,
-            failure_count: 0,
-            confidence: 0.5,
-            source: TemplateSource::Extracted,
-        };
-
-        save_template(&conn, &template).unwrap();
-        let loaded = load_templates_for_domain(&conn, VerificationDomain::General).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "test-template-1");
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_record_success_updates_confidence() {
-        let conn = test_conn();
-        seed_database(&conn).unwrap();
-
-        let before = load_templates_for_domain(&conn, VerificationDomain::Compilation).unwrap();
-        let template_id = &before[0].id;
-        let old_confidence = before[0].confidence;
-
-        record_success(&conn, template_id).unwrap();
-
-        let after = load_templates_for_domain(&conn, VerificationDomain::Compilation).unwrap();
-        let updated = after.iter().find(|t| t.id == *template_id).unwrap();
-        assert!(updated.success_count > before[0].success_count);
-        // Confidence should change (likely increase with more successes)
-        assert!((updated.confidence - old_confidence).abs() < 0.5);
+        // SQLite removed - no-op
     }
 
     #[test]

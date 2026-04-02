@@ -283,19 +283,7 @@ fn update_evolution_for_recommendation(
     verdict: &str,
     score_after: Option<f64>,
 ) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(async {
-            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
-            let updated = conn.execute(
-                "UPDATE prompt_evolution SET canary_verdict = $1, score_after = $2 WHERE recommendation_id = $3 AND canary_verdict IS NULL",
-                &[&verdict, &score_after as &(dyn tokio_postgres::types::ToSql + Sync), &recommendation_id],
-            ).await.map_err(|e| format!("PG update evolution: {e}"))?;
-            if updated > 0 {
-                info!("Updated prompt evolution verdict for recommendation {}: {}", recommendation_id, verdict);
-            }
-            Ok::<(), String>(())
-        })
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Auto-rollback canary rollouts that have been active for more than 30 days

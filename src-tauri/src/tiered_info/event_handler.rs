@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use crate::database::{CheckpointDb, TriggerPoint};
+use crate::database::TriggerPoint;
 use crate::safe_eprintln;
 use crate::test_executor::{
     create_findings_for_failures, execute_tests_for_trigger, format_results_for_ai,
@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use crate::database::CheckpointDb;
 
 /// Handles run recording events from the Python executor.
 ///
@@ -66,7 +67,7 @@ impl RunRecordingHandler {
 
     /// Get the database handle.
     fn db(&self) -> Arc<CheckpointDb> {
-        CheckpointDb::global()
+        todo!("SQLite removed")
     }
 
     /// Set the task run ID for unified task tracking.

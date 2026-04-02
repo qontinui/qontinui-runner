@@ -8,8 +8,8 @@
 //! The only remaining caller of this SQLite path is `autoresearch::engine::record_learning`.
 //! Once autoresearch is migrated to PG, this module can be removed.
 
+use crate::database::{CheckpointDb, Connection};
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -263,110 +263,7 @@ pub fn record_learning_outcome(
     conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<String, String> {
-    let id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-
-    let status = if outcome.verification_passed {
-        "success"
-    } else if outcome.was_stopped {
-        "partial"
-    } else {
-        "failure"
-    };
-
-    let tools_json = serde_json::to_string(&outcome.tools_used).unwrap_or_else(|_| "[]".into());
-    let files_json = serde_json::to_string(&outcome.files_modified).unwrap_or_else(|_| "[]".into());
-
-    // Build a strategy description from the execution parameters
-    let strategy = format!(
-        "{}:{} (max_iter={}, cat={})",
-        outcome.workflow_name,
-        if outcome.verification_passed {
-            "pass"
-        } else {
-            "fail"
-        },
-        outcome.iterations,
-        outcome.category,
-    );
-
-    // Auto-enrich error_type from error_message if not already set
-    let error_type = outcome.error_type.clone().or_else(|| {
-        outcome
-            .error_message
-            .as_ref()
-            .filter(|msg| !msg.is_empty())
-            .map(|msg| categorize_error(msg))
-    });
-
-    // Ensure workflow_architecture is never NULL — default to "traditional"
-    let architecture = outcome
-        .workflow_architecture
-        .as_deref()
-        .unwrap_or("traditional");
-
-    // Auto-enrich technology and domain tags from files_modified and workflow metadata
-    let technology_tags = infer_technology_tags(&outcome.files_modified);
-    let technology_tags_json =
-        serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
-
-    let domain_tags = infer_domain_tags(
-        &outcome.files_modified,
-        &outcome.workflow_name,
-        &outcome.category,
-        outcome.has_ui_bridge,
-    );
-    let domain_tags_json = serde_json::to_string(&domain_tags).unwrap_or_else(|_| "[]".into());
-
-    // Compute complexity tier from step counts, iterations, and duration
-    let complexity_tier = compute_complexity_tier(
-        outcome.step_count,
-        outcome.iterations,
-        outcome.duration_secs,
-        outcome.agentic_step_count,
-    );
-
-    conn.execute(
-        r#"INSERT INTO learning_outcomes
-            (id, task_id, status, duration_secs, iterations, strategy,
-             tools_used, files_modified, error_type, error_message, feedback,
-             workflow_architecture, step_count, verification_step_count,
-             agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd,
-             technology_tags, domain_tags, complexity_tier, created_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"#,
-        params![
-            id,
-            outcome.task_run_id,
-            status,
-            outcome.duration_secs,
-            outcome.iterations as i64,
-            strategy,
-            tools_json,
-            files_json,
-            error_type,
-            outcome.error_message,
-            "[]", // feedback starts empty, populated later via feedback.rs
-            architecture,
-            outcome.step_count,
-            outcome.verification_step_count,
-            outcome.agentic_step_count,
-            outcome.has_ui_bridge as i32,
-            outcome.total_tokens.map(|t| t as i64),
-            outcome.total_cost_usd,
-            technology_tags_json,
-            domain_tags_json,
-            complexity_tier,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to record learning outcome: {}", e))?;
-
-    info!(
-        "Recorded learning outcome {} for task {} (status={})",
-        id, outcome.task_run_id, status
-    );
-
-    Ok(id)
+    Err("SQLite removed".to_string())
 }
 
 /// A pattern extracted from workflow execution analysis.
@@ -385,62 +282,7 @@ pub fn record_learning_pattern(
     conn: &Connection,
     pattern: &PatternInput,
 ) -> Result<String, String> {
-    let now = Utc::now().to_rfc3339();
-
-    // Try to find an existing pattern with same type and description
-    let existing_id: Option<String> = conn
-        .query_row(
-            "SELECT id FROM learning_patterns WHERE pattern_type = ?1 AND description = ?2",
-            params![pattern.pattern_type, pattern.description],
-            |row| row.get(0),
-        )
-        .ok();
-
-    if let Some(id) = existing_id {
-        // Update occurrence count and confidence
-        conn.execute(
-            r#"UPDATE learning_patterns
-               SET occurrences = occurrences + 1,
-                   confidence = MAX(confidence, ?1),
-                   updated_at = ?2
-               WHERE id = ?3"#,
-            params![pattern.confidence, now, id],
-        )
-        .map_err(|e| format!("Failed to update learning pattern: {}", e))?;
-
-        debug!("Updated learning pattern {} (incremented occurrences)", id);
-        return Ok(id);
-    }
-
-    // Create new pattern
-    let id = Uuid::new_v4().to_string();
-    let context_json = pattern
-        .context
-        .as_ref()
-        .map(|c| serde_json::to_string(c).unwrap_or_else(|_| "{}".into()));
-
-    conn.execute(
-        r#"INSERT INTO learning_patterns
-            (id, pattern_type, description, confidence, occurrences, context, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)"#,
-        params![
-            id,
-            pattern.pattern_type,
-            pattern.description,
-            pattern.confidence,
-            context_json,
-            now,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to record learning pattern: {}", e))?;
-
-    info!(
-        "Recorded new learning pattern {} (type={})",
-        id, pattern.pattern_type
-    );
-
-    Ok(id)
+    Err("SQLite removed".to_string())
 }
 
 /// Extract and record patterns from a workflow outcome.
@@ -453,69 +295,7 @@ pub fn extract_and_record_patterns(
     conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<Vec<String>, String> {
-    let mut pattern_ids = Vec::new();
-
-    // Pattern: category success/failure rate
-    let category_pattern = PatternInput {
-        pattern_type: if outcome.verification_passed {
-            "success".to_string()
-        } else {
-            "failure".to_string()
-        },
-        description: format!(
-            "Workflow category '{}' {}",
-            outcome.category,
-            if outcome.verification_passed {
-                "succeeded"
-            } else {
-                "failed"
-            }
-        ),
-        confidence: 0.5, // Low confidence for single observation
-        context: Some(serde_json::json!({
-            "category": outcome.category,
-            "iterations": outcome.iterations,
-            "duration_secs": outcome.duration_secs,
-        })),
-    };
-    pattern_ids.push(record_learning_pattern(conn, &category_pattern)?);
-
-    // Pattern: max iterations exhausted (indicates problem areas)
-    if outcome.max_iterations_reached {
-        let exhaustion_pattern = PatternInput {
-            pattern_type: "iteration_exhaustion".to_string(),
-            description: format!(
-                "Category '{}' exhausted max iterations ({})",
-                outcome.category, outcome.iterations,
-            ),
-            confidence: 0.7,
-            context: Some(serde_json::json!({
-                "category": outcome.category,
-                "workflow_name": outcome.workflow_name,
-            })),
-        };
-        pattern_ids.push(record_learning_pattern(conn, &exhaustion_pattern)?);
-    }
-
-    // Pattern: error type tracking
-    if let Some(ref error_type) = outcome.error_type {
-        let error_pattern = PatternInput {
-            pattern_type: "error_type".to_string(),
-            description: format!(
-                "Error type '{}' in category '{}'",
-                error_type, outcome.category
-            ),
-            confidence: 0.6,
-            context: Some(serde_json::json!({
-                "error_type": error_type,
-                "error_message": outcome.error_message,
-                "category": outcome.category,
-            })),
-        };
-        pattern_ids.push(record_learning_pattern(conn, &error_pattern)?);
-    }
-
-    Ok(pattern_ids)
+    Err("SQLite removed".to_string())
 }
 
 /// Record a complete learning observation from a workflow run.
@@ -527,34 +307,7 @@ pub fn record_workflow_learning(
     conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
-    let outcome_id = record_learning_outcome(conn, outcome)?;
-    let pattern_ids = extract_and_record_patterns(conn, outcome)?;
-
-    // Compute and persist deterministic agentic metrics (zero LLM cost)
-    if let Err(e) = score_and_persist_agentic_metrics(conn, outcome) {
-        // Non-fatal: metrics are supplementary to the core learning outcome
-        tracing::warn!(
-            "Failed to compute agentic metrics for task {}: {}",
-            outcome.task_run_id,
-            e
-        );
-    }
-
-    // Update Q-routing table with this outcome (non-fatal on failure)
-    if let Err(e) = update_q_routing_table(conn, outcome) {
-        tracing::warn!(
-            "Failed to update Q-routing table for task {}: {}",
-            outcome.task_run_id,
-            e
-        );
-    }
-
-    debug!(
-        "Recorded learning for task {}: outcome={}, patterns={:?}",
-        outcome.task_run_id, outcome_id, pattern_ids
-    );
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Update the Q-routing table after a workflow outcome.
@@ -566,84 +319,7 @@ fn update_q_routing_table(
     conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
-    use crate::autoresearch::q_router::{QRouter, TaskState};
-
-    // Need architecture, tags, and composite score to do a Q-update
-    let architecture = match outcome.workflow_architecture.as_deref() {
-        Some(arch) if !arch.is_empty() => arch,
-        _ => return Ok(()), // No architecture recorded — skip
-    };
-
-    // Infer tags (same logic used in record_learning_outcome)
-    let technology_tags = infer_technology_tags(&outcome.files_modified);
-    let technology_tags_json =
-        serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
-    let domain_tags = infer_domain_tags(
-        &outcome.files_modified,
-        &outcome.workflow_name,
-        &outcome.category,
-        outcome.has_ui_bridge,
-    );
-    let domain_tags_json = serde_json::to_string(&domain_tags).unwrap_or_else(|_| "[]".into());
-    let complexity_tier = compute_complexity_tier(
-        outcome.step_count,
-        outcome.iterations,
-        outcome.duration_secs,
-        outcome.agentic_step_count,
-    );
-
-    let task_state = TaskState::from_outcome_tags(&technology_tags_json, &domain_tags_json, &complexity_tier);
-
-    // Load the composite agentic score from the DB (just persisted by score_and_persist_agentic_metrics)
-    let composite_score: f64 = conn
-        .query_row(
-            "SELECT COALESCE(composite_agentic_score, 0.0) FROM learning_outcomes WHERE task_id = ?1",
-            params![outcome.task_run_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0.0);
-
-    if composite_score < 0.0 {
-        return Ok(()); // Invalid score — skip
-    }
-    // Note: composite_score == 0.0 (failures) intentionally updates Q-table
-    // so that architectures that fail are penalized.
-
-    let reward = QRouter::compute_reward(composite_score, outcome.total_cost_usd);
-    let state_key = task_state.to_key();
-
-    // Load current Q-entry from SQLite
-    let (current_q, current_visits): (f64, u32) = conn
-        .query_row(
-            "SELECT q_value, visit_count FROM q_routing_table WHERE state_key = ?1 AND action = ?2",
-            params![state_key, architecture],
-            |row| Ok((row.get(0)?, row.get::<_, i32>(1)? as u32)),
-        )
-        .unwrap_or((0.0, 0));
-
-    // Q-update: Q(s,a) ← Q(s,a) + α * (reward - Q(s,a))
-    let alpha = 0.1;
-    let new_q = current_q + alpha * (reward - current_q);
-    let new_visits = current_visits + 1;
-    let now = Utc::now().to_rfc3339();
-
-    conn.execute(
-        r#"INSERT INTO q_routing_table (state_key, action, q_value, visit_count, last_updated)
-           VALUES (?1, ?2, ?3, ?4, ?5)
-           ON CONFLICT(state_key, action) DO UPDATE SET
-               q_value = ?3,
-               visit_count = ?4,
-               last_updated = ?5"#,
-        params![state_key, architecture, new_q, new_visits as i32, now],
-    )
-    .map_err(|e| format!("Failed to upsert Q-routing entry: {}", e))?;
-
-    info!(
-        "Q-routing update: state={}, arch={}, reward={:.3}, Q={:.3}→{:.3}, visits={}",
-        task_state, architecture, reward, current_q, new_q, new_visits
-    );
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Update the Q-routing table in PostgreSQL (PG-first strategy).
@@ -716,105 +392,7 @@ fn score_and_persist_agentic_metrics(
     conn: &Connection,
     outcome: &WorkflowOutcome,
 ) -> Result<(), String> {
-    use crate::meta_optimizer::agentic_metrics::scoring;
-    use crate::meta_optimizer::agentic_metrics::{self, DeterministicInput, LearnedBaselines};
-
-    // Load pipeline traces to extract schema compliance data (if available).
-    let schema_compliance_inputs = {
-        use crate::meta_optimizer::agentic_metrics::schema_compliance::compliance_inputs_from_traces;
-        match crate::database::pipeline_traces::get_traces_for_task_run(&outcome.task_run_id) {
-            Ok(traces) => compliance_inputs_from_traces(&traces),
-            Err(_) => vec![],
-        }
-    };
-
-    let input = DeterministicInput {
-        task_run_id: outcome.task_run_id.clone(),
-        status: outcome.status.clone(),
-        verification_passed: outcome.verification_passed,
-        was_stopped: outcome.was_stopped,
-        iterations: outcome.iterations,
-        step_count: outcome.step_count,
-        verification_step_count: outcome.verification_step_count,
-        agentic_step_count: outcome.agentic_step_count,
-        max_iterations_reached: outcome.max_iterations_reached,
-        duration_secs: outcome.duration_secs,
-        error_type: outcome.error_type.clone(),
-        tools_used: outcome.tools_used.clone(),
-        agent_traces: vec![], // Pipeline traces loaded separately in Phase 2 backfill
-        schema_compliance_inputs,
-    };
-
-    // Load learned baselines (falls back to defaults if none persisted yet)
-    let baselines = LearnedBaselines {
-        step_baseline: scoring::load_step_baseline(conn, None).unwrap_or(None),
-        tool_baseline: scoring::load_tool_baseline(conn, None).unwrap_or(None),
-    };
-
-    let scores = agentic_metrics::compute_deterministic(&input, &baselines);
-    let composite = agentic_metrics::composite_score(&scores);
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Insert each metric score
-    for score in &scores {
-        let id = format!("ams-{}", Uuid::new_v4());
-        conn.execute(
-            r#"INSERT OR REPLACE INTO agentic_metric_scores
-                (id, task_run_id, metric_type, score, confidence,
-                 rationale, is_llm_judged, model_used, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-            params![
-                id,
-                outcome.task_run_id,
-                score.metric.as_str(),
-                score.score,
-                score.confidence,
-                score.rationale,
-                score.is_llm_judged as i32,
-                score.model_used,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Failed to insert agentic metric score: {}", e))?;
-    }
-
-    // Update the cached composite score on learning_outcomes
-    conn.execute(
-        "UPDATE learning_outcomes SET composite_agentic_score = ?1 WHERE task_id = ?2",
-        params![composite, outcome.task_run_id],
-    )
-    .map_err(|e| format!("Failed to update composite agentic score: {}", e))?;
-
-    // Backfill pipeline_agent_traces quality columns if traces exist for this run.
-    // Sets downstream_success from verification_passed and output_quality_score from composite.
-    let trace_updates = conn
-        .execute(
-            r#"UPDATE pipeline_agent_traces
-               SET downstream_success = COALESCE(downstream_success, ?1),
-                   output_quality_score = COALESCE(output_quality_score, ?2)
-               WHERE task_run_id = ?3
-                 AND (downstream_success IS NULL OR output_quality_score IS NULL)"#,
-            params![
-                outcome.verification_passed as i32,
-                composite,
-                outcome.task_run_id,
-            ],
-        )
-        .unwrap_or(0);
-
-    info!(
-        "Scored agentic metrics for task {}: composite={:.3}, metrics={}, trace_backfills={}",
-        outcome.task_run_id,
-        composite,
-        scores
-            .iter()
-            .map(|s| format!("{}={:.2}", s.metric, s.score))
-            .collect::<Vec<_>>()
-            .join(", "),
-        trace_updates,
-    );
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Spawn async LLM-as-judge evaluation for a completed workflow run.
@@ -832,8 +410,7 @@ pub fn spawn_llm_judge_if_eligible(
     verification_passed: bool,
     was_stopped: bool,
 ) {
-    // PG variant preferred — if pg_db available in caller, use spawn_llm_judge_if_eligible_pg
-    spawn_llm_judge_if_eligible_inner(db, None, task_run_id, iterations, verification_passed, was_stopped);
+    // SQLite removed - no-op
 }
 
 /// PG-aware variant of spawn_llm_judge_if_eligible.
@@ -845,7 +422,7 @@ pub fn spawn_llm_judge_if_eligible_pg(
     verification_passed: bool,
     was_stopped: bool,
 ) {
-    spawn_llm_judge_if_eligible_inner(db, Some(pg_db), task_run_id, iterations, verification_passed, was_stopped);
+    // SQLite removed - no-op
 }
 
 fn spawn_llm_judge_if_eligible_inner(
@@ -856,78 +433,7 @@ fn spawn_llm_judge_if_eligible_inner(
     verification_passed: bool,
     was_stopped: bool,
 ) {
-    use crate::meta_optimizer::agentic_metrics::llm_judge;
-
-    if !llm_judge::should_llm_judge(iterations, verification_passed, was_stopped) {
-        return;
-    }
-
-    tokio::spawn(async move {
-        // Gather input data from PG if available, fallback to SQLite
-        let judge_input = if let Some(ref pg) = pg_db {
-            match gather_llm_judge_input_pg(pg, &task_run_id).await {
-                Ok(input) => input,
-                Err(_) => match tokio::task::spawn_blocking({
-                    let db = db.clone();
-                    let tid = task_run_id.clone();
-                    move || gather_llm_judge_input(&db, &tid)
-                }).await {
-                    Ok(Ok(input)) => input,
-                    Ok(Err(e)) => {
-                        tracing::warn!("Failed to gather LLM judge input for {}: {}", task_run_id, e);
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("LLM judge gather panicked for {}: {}", task_run_id, e);
-                        return;
-                    }
-                },
-            }
-        } else {
-            match tokio::task::spawn_blocking({
-                let db = db.clone();
-                let tid = task_run_id.clone();
-                move || gather_llm_judge_input(&db, &tid)
-            }).await {
-                Ok(Ok(input)) => input,
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to gather LLM judge input for {}: {}", task_run_id, e);
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!("LLM judge gather panicked for {}: {}", task_run_id, e);
-                    return;
-                }
-            }
-        };
-
-        // Run the LLM judge in a blocking task (it uses synchronous HTTP)
-        let results =
-            match tokio::task::spawn_blocking(move || llm_judge::evaluate_sync(&judge_input)).await
-            {
-                Ok(results) => results,
-                Err(e) => {
-                    tracing::warn!("LLM judge task panicked for {}: {}", task_run_id, e);
-                    return;
-                }
-            };
-
-        // Persist the LLM-judged scores via PG or spawn_blocking SQLite
-        if let Some(ref pg) = pg_db {
-            if let Err(e) = persist_judge_scores_pg(pg, &task_run_id, &results).await {
-                tracing::warn!("Failed to persist LLM judge scores for {}: {}", task_run_id, e);
-            }
-        } else {
-            let db2 = db.clone();
-            let tid = task_run_id.clone();
-            let results_c = results.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                persist_judge_scores_sqlite(&db2, &tid, &results_c)
-            }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string())) {
-                tracing::warn!("Failed to persist LLM judge scores for {}: {}", task_run_id, e);
-            }
-        }
-    });
+    // SQLite removed - no-op
 }
 
 /// Gather input data for the LLM judge from the database.
@@ -935,11 +441,7 @@ fn gather_llm_judge_input(
     db: &crate::database::CheckpointDb,
     task_run_id: &str,
 ) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
-    // PG-primary: sync function (called from spawn_blocking)
-    let pg = crate::database::pg::PgDb::global();
-    tokio::runtime::Handle::current().block_on(async {
-        pg.gather_llm_judge_input(task_run_id).await
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Spawn async RAG judge evaluation for runs that captured retrieval events.
@@ -950,57 +452,7 @@ pub fn spawn_rag_judge_if_eligible(
     db: std::sync::Arc<crate::database::CheckpointDb>,
     task_run_id: String,
 ) {
-    tokio::spawn(async move {
-        // PG-primary: load retrieval events and prompt
-        let pg = crate::database::pg::PgDb::global();
-        let load_result = pg.load_retrieval_events(&task_run_id).await;
-        let retrieval_events = match load_result {
-            Ok(events) if !events.is_empty() => events,
-            _ => return, // No retrieval events or error — skip
-        };
-        let task_prompt = pg.get_workflow_name_for_task_run(&task_run_id).await.unwrap_or_default();
-
-        let rag_input = crate::meta_optimizer::agentic_metrics::rag_judge::RagJudgeInput {
-            task_run_id: task_run_id.clone(),
-            task_prompt,
-            retrieval_events,
-            generated_output: None, // Could be enriched from task output
-        };
-
-        // Run RAG judge in blocking task
-        let results = match tokio::task::spawn_blocking(move || {
-            crate::meta_optimizer::agentic_metrics::rag_judge::evaluate_rag_sync(&rag_input)
-        })
-        .await
-        {
-            Ok(results) if !results.is_empty() => results,
-            _ => return,
-        };
-
-        // Persist RAG scores and recompute composite
-        let db_c = db.clone();
-        let tid_c = task_run_id.clone();
-        let results_c = results.clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            persist_judge_scores_sqlite(&db_c, &tid_c, &results_c)
-        }).await.unwrap_or_else(|_| Err("spawn_blocking panicked".to_string())) {
-            tracing::warn!(
-                "Failed to persist RAG judge scores for {}: {}",
-                task_run_id,
-                e
-            );
-        } else {
-            info!(
-                "RAG judge completed for {}: {}",
-                task_run_id,
-                results
-                    .iter()
-                    .map(|r| format!("{}={:.2}", r.metric, r.score))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-        }
-    });
+    // SQLite removed - no-op
 }
 
 /// Persist judge scores via PG (sync wrapper for use in spawn_blocking).
@@ -1009,11 +461,7 @@ fn persist_judge_scores_sqlite(
     task_run_id: &str,
     results: &[crate::meta_optimizer::agentic_metrics::MetricResult],
 ) -> Result<(), String> {
-    // PG-primary: sync function (called from spawn_blocking)
-    let pg = crate::database::pg::PgDb::global();
-    tokio::runtime::Handle::current().block_on(async {
-        pg.persist_judge_scores(task_run_id, results).await
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Persist judge scores to PG.

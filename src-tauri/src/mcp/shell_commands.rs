@@ -197,6 +197,9 @@ pub async fn run_shell_command_handler(
         ));
     }
 
+    // Build extra container env vars from security settings
+    let extra_env = crate::security::build_container_security_env(&security_policy, &security_settings);
+
     let container_result = {
         let executor_guard = state.app_state.container_executor.lock().await;
         if let Some(ref executor) = *executor_guard {
@@ -205,7 +208,7 @@ pub async fn run_shell_command_handler(
                 shell_cmd.name
             );
             match executor
-                .try_execute_with_policy(&shell_cmd.command, shell_cmd.working_directory.as_deref(), Some(&security_policy))
+                .try_execute_with_policy(&shell_cmd.command, shell_cmd.working_directory.as_deref(), Some(&security_policy), &extra_env)
                 .await
             {
                 Ok(Some(cr)) => {

@@ -4,10 +4,10 @@
 //! It queries 16+ tables to build nodes and edges, then provides traversal queries
 //! for causal reasoning, impact analysis, pattern detection, and unified search.
 
+use crate::database::Connection;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
-use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::graph_types::*;
@@ -46,38 +46,7 @@ impl KnowledgeGraph {
     /// Queries 16+ tables, creates nodes for each entity type, then wires up
     /// directed edges representing relationships (causal, structural, temporal).
     pub fn build_from_db(conn: &Connection, workflow_name: Option<&str>) -> Result<Self, String> {
-        let mut kg = Self::new(workflow_name.map(|s| s.to_string()));
-
-        // --- Nodes ---
-        kg.load_workflows(conn, workflow_name)?;
-        kg.load_workflow_versions(conn, workflow_name)?;
-        kg.load_task_runs(conn, workflow_name)?;
-        kg.load_findings(conn, workflow_name)?;
-        kg.load_fixes(conn, workflow_name)?;
-        kg.load_errors(conn, workflow_name)?;
-        kg.load_components(conn, workflow_name)?;
-        kg.load_rules(conn)?;
-        kg.load_patterns(conn, workflow_name)?;
-        kg.load_knowledge(conn, workflow_name)?;
-        kg.load_step_defs(conn, workflow_name)?;
-        kg.load_ui_elements(conn, workflow_name)?;
-        kg.load_skills(conn)?;
-
-        // --- Edges ---
-        kg.link_task_runs_to_workflows(conn, workflow_name)?;
-        kg.link_findings_to_task_runs(conn, workflow_name)?;
-        kg.link_fixes_to_findings(conn, workflow_name)?;
-        kg.link_causal_events(conn, workflow_name)?;
-        kg.link_workflow_versions(conn, workflow_name)?;
-        kg.link_step_provenance(conn, workflow_name)?;
-        kg.link_step_finding_links(conn, workflow_name)?;
-        kg.link_rule_influence(conn, workflow_name)?;
-        kg.link_component_relationships(conn, workflow_name)?;
-        kg.link_fix_applications(conn, workflow_name)?;
-        kg.link_ui_interactions(conn, workflow_name)?;
-        kg.link_skills(conn)?;
-
-        Ok(kg)
+        Err("SQLite removed".to_string())
     }
 
     // -------------------------------------------------------------------------
@@ -119,60 +88,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT id, name, description, category, created_at
-               FROM unified_workflows WHERE name = ?1"#
-        } else {
-            r#"SELECT id, name, description, category, created_at
-               FROM unified_workflows"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare workflows query: {}", e))?;
-
-        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query workflows: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query workflows: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, name, desc, category, created_at) in rows {
-            let mut node = GraphNode::new(GraphNodeKind::Workflow, &id, &name);
-            if let Some(d) = desc {
-                node = node.with_property("description", serde_json::json!(d));
-            }
-            if let Some(c) = category {
-                node = node.with_property("category", serde_json::json!(c));
-            }
-            if let Some(ref ts) = created_at {
-                node = node.with_created_at(ts);
-            }
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_workflow_versions(
@@ -180,70 +96,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT wv.id, wv.workflow_id, wv.version_number, wv.parent_version_id,
-                      wv.generation_task_run_id, wv.trigger, wv.created_at
-               FROM workflow_versions wv
-               INNER JOIN unified_workflows uw ON uw.id = wv.workflow_id
-               WHERE uw.name = ?1"#
-        } else {
-            r#"SELECT id, workflow_id, version_number, parent_version_id,
-                      generation_task_run_id, trigger, created_at
-               FROM workflow_versions"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare workflow_versions query: {}", e))?;
-
-        let rows: Vec<(
-            String,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-        )> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query workflow_versions: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query workflow_versions: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (id, _wf_id, version_number, _parent, _gen_run, trigger, created_at) in rows {
-            let label = format!("v{} ({})", version_number, trigger);
-            let node = GraphNode::new(GraphNodeKind::WorkflowVersion, &id, &label)
-                .with_property("version_number", serde_json::json!(version_number))
-                .with_property("trigger", serde_json::json!(trigger))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_task_runs(
@@ -251,53 +104,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT id, task_name, workflow_name, status, created_at
-               FROM task_runs WHERE workflow_name = ?1"#
-        } else {
-            r#"SELECT id, task_name, workflow_name, status, created_at
-               FROM task_runs WHERE workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare task_runs query: {}", e))?;
-
-        let rows: Vec<(String, String, Option<String>, String, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query task_runs: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query task_runs: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, task_name, _wf_name, status, created_at) in rows {
-            let node = GraphNode::new(GraphNodeKind::TaskRun, &id, &task_name)
-                .with_property("status", serde_json::json!(status))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_findings(
@@ -305,69 +112,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT f.id, f.title, f.category, f.severity, f.status, f.detected_at
-               FROM task_run_findings f
-               INNER JOIN task_runs tr ON tr.id = f.task_run_id
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT f.id, f.title, f.category, f.severity, f.status, f.detected_at
-               FROM task_run_findings f
-               INNER JOIN task_runs tr ON tr.id = f.task_run_id
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare findings query: {}", e))?;
-
-        let rows: Vec<(String, String, String, String, String, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query findings: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query findings: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, title, category, severity, status, created_at) in rows {
-            let weight = match severity.as_str() {
-                "critical" => 4.0,
-                "high" => 3.0,
-                "medium" => 2.0,
-                "low" => 1.0,
-                _ => 1.0,
-            };
-            let node = GraphNode::new(GraphNodeKind::Finding, &id, &title)
-                .with_weight(weight)
-                .with_property("category", serde_json::json!(category))
-                .with_property("severity", serde_json::json!(severity))
-                .with_property("status", serde_json::json!(status))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_fixes(
@@ -375,86 +120,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT rf.id, rf.fix_type, rf.fix_description, rf.effectiveness,
-                      rf.confidence, rf.status, rf.created_at
-               FROM reflection_fixes rf
-               INNER JOIN task_runs tr ON tr.id = rf.source_task_run_id
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT rf.id, rf.fix_type, rf.fix_description, rf.effectiveness,
-                      rf.confidence, rf.status, rf.created_at
-               FROM reflection_fixes rf
-               INNER JOIN task_runs tr ON tr.id = rf.source_task_run_id
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare fixes query: {}", e))?;
-
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-        )> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query fixes: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query fixes: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (id, fix_type, description, effectiveness, confidence, status, created_at) in rows {
-            let label = if description.len() > 80 {
-                let truncated: String = description.chars().take(77).collect();
-                format!("{}...", truncated)
-            } else {
-                description.clone()
-            };
-            let weight = match effectiveness.as_deref() {
-                Some("effective") => 3.0,
-                Some("ineffective") => 0.5,
-                Some("caused_regression") => -1.0,
-                _ => 1.0,
-            };
-            let node = GraphNode::new(GraphNodeKind::Fix, &id, &label)
-                .with_weight(weight)
-                .with_property("fix_type", serde_json::json!(fix_type))
-                .with_property("effectiveness", serde_json::json!(effectiveness))
-                .with_property("confidence", serde_json::json!(confidence))
-                .with_property("status", serde_json::json!(status))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_errors(
@@ -462,83 +128,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        // Group by signature_hash, use MIN(id) as the representative error.
-        let sql = if workflow_name.is_some() {
-            r#"SELECT MIN(e.id), e.signature_hash, e.error_type, e.message,
-                      e.severity, SUM(e.occurrence_count), MIN(e.first_seen_at)
-               FROM error_events e
-               INNER JOIN task_runs tr ON tr.id = e.task_run_id
-               WHERE tr.workflow_name = ?1
-               GROUP BY e.signature_hash"#
-        } else {
-            r#"SELECT MIN(e.id), e.signature_hash, e.error_type, e.message,
-                      e.severity, SUM(e.occurrence_count), MIN(e.first_seen_at)
-               FROM error_events e
-               INNER JOIN task_runs tr ON tr.id = e.task_run_id
-               WHERE tr.workflow_name IS NOT NULL
-               GROUP BY e.signature_hash"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare errors query: {}", e))?;
-
-        let rows: Vec<(i64, String, Option<String>, String, String, i64, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query errors: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query errors: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, sig_hash, error_type, message, severity, occurrences, first_seen) in rows {
-            let entity_id = format!("err_{}", id);
-            let label = if message.len() > 80 {
-                let truncated: String = message.chars().take(77).collect();
-                format!("{}...", truncated)
-            } else {
-                message.clone()
-            };
-            let weight = match severity.as_str() {
-                "critical" => 4.0,
-                "error" => 3.0,
-                "warning" => 1.5,
-                _ => 1.0,
-            };
-            let node = GraphNode::new(GraphNodeKind::Error, &entity_id, &label)
-                .with_weight(weight)
-                .with_property("signature_hash", serde_json::json!(sig_hash))
-                .with_property("error_type", serde_json::json!(error_type))
-                .with_property("occurrences", serde_json::json!(occurrences))
-                .with_property("severity", serde_json::json!(severity))
-                .with_created_at(&first_seen);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_components(
@@ -546,97 +136,11 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT id, component_path, component_type, health_score, created_at
-               FROM architecture_components WHERE workflow_name = ?1"#
-        } else {
-            r#"SELECT id, component_path, component_type, health_score, created_at
-               FROM architecture_components"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare components query: {}", e))?;
-
-        let rows: Vec<(String, String, String, f64, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query components: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, f64>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query components: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, path, comp_type, health_score, created_at) in rows {
-            let node = GraphNode::new(GraphNodeKind::Component, &id, &path)
-                .with_weight(health_score)
-                .with_property("component_type", serde_json::json!(comp_type))
-                .with_property("health_score", serde_json::json!(health_score))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_rules(&mut self, conn: &Connection) -> Result<(), String> {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT id, agent, section, title, severity, created_at
-                   FROM generation_rules WHERE status = 'active'"#,
-            )
-            .map_err(|e| format!("Failed to prepare rules query: {}", e))?;
-
-        let rows: Vec<(String, String, String, String, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query rules: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (id, agent, section, title, severity, created_at) in rows {
-            let weight = match severity.as_str() {
-                "critical" => 4.0,
-                "important" => 3.0,
-                "normal" => 2.0,
-                "hint" => 1.0,
-                _ => 1.0,
-            };
-            let node = GraphNode::new(GraphNodeKind::Rule, &id, &title)
-                .with_weight(weight)
-                .with_property("agent", serde_json::json!(agent))
-                .with_property("section", serde_json::json!(section))
-                .with_property("severity", serde_json::json!(severity))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_patterns(
@@ -644,60 +148,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT id, pattern_type, signature_hash, occurrence_count, status, created_at
-               FROM cross_run_patterns
-               WHERE status = 'active' AND workflow_name = ?1"#
-        } else {
-            r#"SELECT id, pattern_type, signature_hash, occurrence_count, status, created_at
-               FROM cross_run_patterns WHERE status = 'active'"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare patterns query: {}", e))?;
-
-        let rows: Vec<(String, String, String, i64, String, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query patterns: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query patterns: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, pattern_type, sig_hash, occurrence_count, _status, created_at) in rows {
-            let label = format!("{} ({}x)", pattern_type, occurrence_count);
-            let node = GraphNode::new(GraphNodeKind::Pattern, &id, &label)
-                .with_weight(occurrence_count as f64)
-                .with_property("pattern_type", serde_json::json!(pattern_type))
-                .with_property("signature_hash", serde_json::json!(sig_hash))
-                .with_property("occurrence_count", serde_json::json!(occurrence_count))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_knowledge(
@@ -705,64 +156,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT tk.id, tk.category, tk.content, tk.confidence, tk.created_at
-               FROM task_knowledge tk
-               INNER JOIN task_runs tr ON tr.id = tk.task_run_id
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT tk.id, tk.category, tk.content, tk.confidence, tk.created_at
-               FROM task_knowledge tk
-               INNER JOIN task_runs tr ON tr.id = tk.task_run_id
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare knowledge query: {}", e))?;
-
-        let rows: Vec<(String, String, String, Option<String>, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query knowledge: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query knowledge: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (id, category, content, confidence, created_at) in rows {
-            let label = if content.len() > 80 {
-                let truncated: String = content.chars().take(77).collect();
-                format!("{}...", truncated)
-            } else {
-                content.clone()
-            };
-            let node = GraphNode::new(GraphNodeKind::Knowledge, &id, &label)
-                .with_property("category", serde_json::json!(category))
-                .with_property("confidence", serde_json::json!(confidence))
-                .with_created_at(&created_at);
-            self.get_or_insert_node(node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     fn load_step_defs(
@@ -770,49 +164,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT DISTINCT sp.step_name, sp.phase, sp.generating_agent
-               FROM step_provenance sp
-               INNER JOIN unified_workflows uw ON uw.id = sp.workflow_id
-               WHERE uw.name = ?1"#
-        } else {
-            r#"SELECT DISTINCT step_name, phase, generating_agent
-               FROM step_provenance"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare step_defs query: {}", e))?;
-
-        let rows: Vec<(String, String, String)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })
-            .map_err(|e| format!("Failed to query step_defs: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })
-            .map_err(|e| format!("Failed to query step_defs: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (step_name, phase, agent) in rows {
-            let entity_id = format!("{}:{}", phase, step_name);
-            let label = format!("{} [{}]", step_name, phase);
-            let node = GraphNode::new(GraphNodeKind::StepDef, &entity_id, &label)
-                .with_property("phase", serde_json::json!(phase))
-                .with_property("generating_agent", serde_json::json!(&agent));
-            self.get_or_insert_node(node);
-
-            // Also ensure the pipeline agent node exists.
-            let agent_node =
-                GraphNode::new(GraphNodeKind::PipelineAgent, &agent, &agent);
-            self.get_or_insert_node(agent_node);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// Load UI Bridge elements that were interacted with during automation.
@@ -822,41 +174,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         _workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        // Get distinct element IDs with interaction counts, capped at 100
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT element_id, COUNT(*) as interaction_count,
-                          CAST(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) as success_rate
-                   FROM ui_bridge_events
-                   WHERE element_id IS NOT NULL AND event_type = 'action_executed'
-                   GROUP BY element_id
-                   ORDER BY interaction_count DESC
-                   LIMIT 100"#,
-            )
-            .map_err(|e| format!("Failed to prepare ui_elements query: {}", e))?;
-
-        let rows: Vec<(String, i64, f64)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, f64>(2)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query ui_elements: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (element_id, count, rate) in rows {
-            let node = GraphNode::new(GraphNodeKind::UIElement, &element_id, &element_id)
-                .with_weight(count as f64)
-                .with_property("interaction_count", serde_json::json!(count))
-                .with_property("success_rate", serde_json::json!(rate))
-                .with_property("flaky", serde_json::json!(rate < 0.95));
-            self.get_or_insert_node(node);
-        }
-
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// Load skills from user_skills table into the graph as Skill nodes.
@@ -868,69 +186,7 @@ impl KnowledgeGraph {
         &mut self,
         conn: &Connection,
     ) -> Result<(), String> {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT id, name, slug, category, source, usage_count,
-                          version, approval_status, forked_from, created_at
-                   FROM user_skills
-                   ORDER BY usage_count DESC
-                   LIMIT 200"#,
-            )
-            .map_err(|e| format!("Failed to prepare skills query: {}", e))?;
-
-        let rows: Vec<(String, String, String, String, String, i64, Option<String>, Option<String>, Option<String>, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "custom".to_string()),
-                    row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "user".to_string()),
-                    row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, String>(9)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query skills: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (id, name, slug, category, source, usage_count, version, approval, forked_from, created_at) in rows {
-            let mut node = GraphNode::new(GraphNodeKind::Skill, &id, &name)
-                .with_weight(usage_count as f64 + 1.0)
-                .with_property("slug", serde_json::json!(slug))
-                .with_property("category", serde_json::json!(category))
-                .with_property("source", serde_json::json!(source))
-                .with_property("usage_count", serde_json::json!(usage_count))
-                .with_created_at(&created_at);
-
-            if let Some(v) = &version {
-                node = node.with_property("version", serde_json::json!(v));
-            }
-            if let Some(a) = &approval {
-                node = node.with_property("approval_status", serde_json::json!(a));
-            }
-            if let Some(f) = &forked_from {
-                node = node.with_property("forked_from", serde_json::json!(f));
-            }
-            self.get_or_insert_node(node);
-
-            // If this skill was forked from another, add Supersedes edge
-            if let Some(ref parent_id) = forked_from {
-                let parent_key = format!("skill:{}", parent_id);
-                let child_key = format!("skill:{}", id);
-                self.add_edge_by_key(
-                    &child_key,
-                    &parent_key,
-                    GraphEdge::new(GraphEdgeKind::Supersedes)
-                        .with_label("forked and improved"),
-                );
-            }
-        }
-
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// Link skills to task runs, findings, and components based on skill_origin
@@ -939,109 +195,7 @@ impl KnowledgeGraph {
         &mut self,
         conn: &Connection,
     ) -> Result<(), String> {
-        // Link skills to task runs via step_provenance (skills used as step templates).
-        // Match on skill ID (prefixed with "auto:" or "user:") in step JSON to avoid
-        // false positives from bare slug substring matching.
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT sp.workflow_id, us.id as skill_id
-                   FROM step_provenance sp
-                   INNER JOIN user_skills us ON sp.final_step_json LIKE '%' || us.id || '%'
-                   GROUP BY sp.workflow_id, us.id
-                   LIMIT 500"#,
-            )
-            .map_err(|e| format!("Failed to prepare skill-provenance link query: {}", e))?;
-
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query skill-provenance links: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (workflow_id, skill_id) in rows {
-            let skill_key = format!("skill:{}", skill_id);
-            let wf_key = format!("workflow:{}", workflow_id);
-            self.add_edge_by_key(
-                &skill_key,
-                &wf_key,
-                GraphEdge::new(GraphEdgeKind::UsedIn)
-                    .with_label("skill template used in workflow"),
-            );
-        }
-
-        // Link auto-generated skills to their source fixes (DerivedFrom edges).
-        // Uses source_fix_id FK when available, falling back to LIKE-based join on description.
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT us.id as skill_id, trf.id as finding_id
-                   FROM user_skills us
-                   INNER JOIN reflection_fixes rf ON us.source_fix_id = rf.id
-                   INNER JOIN task_run_findings trf ON rf.source_finding_id = trf.id
-                   WHERE us.source = 'auto' AND us.source_fix_id IS NOT NULL
-                   LIMIT 200"#,
-            )
-            .map_err(|e| format!("Failed to prepare skill-fix link query: {}", e))?;
-
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query skill-fix links: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (skill_id, finding_id) in rows {
-            let skill_key = format!("skill:{}", skill_id);
-            let finding_key = format!("finding:{}", finding_id);
-            self.add_edge_by_key(
-                &skill_key,
-                &finding_key,
-                GraphEdge::new(GraphEdgeKind::DerivedFrom)
-                    .with_label("auto-extracted from effective fix"),
-            );
-        }
-
-        // Also link skills to cross_run_patterns via source_pattern_id FK
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT us.id, us.source_pattern_id
-                   FROM user_skills us
-                   WHERE us.source = 'auto' AND us.source_pattern_id IS NOT NULL
-                   LIMIT 200"#,
-            )
-            .map_err(|e| format!("Failed to prepare skill-pattern link query: {}", e))?;
-
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query skill-pattern links: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (skill_id, pattern_id) in rows {
-            let skill_key = format!("skill:{}", skill_id);
-            let pattern_key = format!("pattern:{}", pattern_id);
-            self.add_edge_by_key(
-                &skill_key,
-                &pattern_key,
-                GraphEdge::new(GraphEdgeKind::DerivedFrom)
-                    .with_label("auto-extracted from recurring pattern"),
-            );
-        }
-
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// Load pre-fetched observations from PostgreSQL into the graph.
@@ -1129,45 +283,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         _workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let mut stmt = conn
-            .prepare(
-                r#"SELECT DISTINCT
-                     CAST(task_run_id AS TEXT) as tr_id,
-                     element_id,
-                     COUNT(*) as count,
-                     CAST(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) as rate
-                   FROM ui_bridge_events
-                   WHERE element_id IS NOT NULL
-                     AND task_run_id IS NOT NULL
-                     AND event_type = 'action_executed'
-                   GROUP BY task_run_id, element_id
-                   LIMIT 500"#,
-            )
-            .map_err(|e| format!("Failed to prepare ui_interactions query: {}", e))?;
-
-        let rows: Vec<(String, String, i64, f64)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, f64>(3)?,
-                ))
-            })
-            .map_err(|e| format!("Failed to query ui_interactions: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (task_run_id, element_id, count, rate) in rows {
-            let from_key = format!("task_run:{}", task_run_id);
-            let to_key = format!("ui_element:{}", element_id);
-            let edge = GraphEdge::new(GraphEdgeKind::InteractedWith)
-                .with_weight(rate * count as f64)
-                .with_label(&format!("{}x ({}% success)", count, (rate * 100.0) as u32));
-            self.add_edge_by_key(&from_key, &to_key, edge);
-        }
-
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     // =========================================================================
@@ -1286,39 +402,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT tr.id, uw.id
-               FROM task_runs tr
-               INNER JOIN unified_workflows uw ON uw.name = tr.workflow_name
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT tr.id, uw.id
-               FROM task_runs tr
-               INNER JOIN unified_workflows uw ON uw.name = tr.workflow_name
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare task_run→workflow edge query: {}", e))?;
-
-        let rows: Vec<(String, String)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query task_run→workflow edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query task_run→workflow edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        for (run_id, wf_id) in rows {
-            let from_key = format!("task_run:{}", run_id);
-            let to_key = format!("workflow:{}", wf_id);
-            self.add_edge_by_key(&from_key, &to_key, GraphEdge::new(GraphEdgeKind::BelongsTo));
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// task_run_findings.task_run_id → DetectedDuring → task_run
@@ -1327,43 +411,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT f.id, f.task_run_id
-               FROM task_run_findings f
-               INNER JOIN task_runs tr ON tr.id = f.task_run_id
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT f.id, f.task_run_id
-               FROM task_run_findings f
-               INNER JOIN task_runs tr ON tr.id = f.task_run_id
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare finding→task_run edge query: {}", e))?;
-
-        let rows: Vec<(String, String)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query finding→task_run edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query finding→task_run edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        for (finding_id, run_id) in rows {
-            let from_key = format!("finding:{}", finding_id);
-            let to_key = format!("task_run:{}", run_id);
-            self.add_edge_by_key(
-                &from_key,
-                &to_key,
-                GraphEdge::new(GraphEdgeKind::DetectedDuring),
-            );
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// reflection_fixes.source_finding_id → Caused (finding → fix)
@@ -1373,60 +421,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT rf.id, rf.source_finding_id, rf.effectiveness
-               FROM reflection_fixes rf
-               INNER JOIN task_runs tr ON tr.id = rf.source_task_run_id
-               WHERE tr.workflow_name = ?1
-                 AND rf.source_finding_id IS NOT NULL"#
-        } else {
-            r#"SELECT rf.id, rf.source_finding_id, rf.effectiveness
-               FROM reflection_fixes rf
-               INNER JOIN task_runs tr ON tr.id = rf.source_task_run_id
-               WHERE tr.workflow_name IS NOT NULL
-                 AND rf.source_finding_id IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare fix→finding edge query: {}", e))?;
-
-        let rows: Vec<(String, String, Option<String>)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
-            })
-            .map_err(|e| format!("Failed to query fix→finding edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
-            })
-            .map_err(|e| format!("Failed to query fix→finding edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (fix_id, finding_id, effectiveness) in rows {
-            let finding_key = format!("finding:{}", finding_id);
-            let fix_key = format!("fix:{}", fix_id);
-
-            // Finding caused the fix to be created
-            self.add_edge_by_key(
-                &finding_key,
-                &fix_key,
-                GraphEdge::new(GraphEdgeKind::Caused),
-            );
-
-            // If effective, the fix resolved the finding
-            if effectiveness.as_deref() == Some("effective") {
-                self.add_edge_by_key(
-                    &fix_key,
-                    &finding_key,
-                    GraphEdge::new(GraphEdgeKind::Resolved),
-                );
-            }
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// causal_events → Caused / Resolved edges based on relationship type
@@ -1435,75 +430,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT cause_event_type, cause_event_id, effect_event_type, effect_event_id,
-                      relationship, confidence
-               FROM causal_events WHERE workflow_name = ?1"#
-        } else {
-            r#"SELECT cause_event_type, cause_event_id, effect_event_type, effect_event_id,
-                      relationship, confidence
-               FROM causal_events WHERE workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare causal_events edge query: {}", e))?;
-
-        let rows: Vec<(String, String, String, String, String, String)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query causal_events edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query causal_events edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (cause_type, cause_id, effect_type, effect_id, relationship, confidence) in rows {
-            let from_key = causal_event_to_node_key(&cause_type, &cause_id);
-            let to_key = causal_event_to_node_key(&effect_type, &effect_id);
-
-            let edge_kind = match relationship.as_str() {
-                "resolved" | "prevented" => GraphEdgeKind::Resolved,
-                _ => GraphEdgeKind::Caused,
-            };
-
-            let weight = match confidence.as_str() {
-                "high" => 1.0,
-                "medium" => 0.7,
-                "low" => 0.4,
-                _ => 0.5,
-            };
-
-            self.add_edge_by_key(
-                &from_key,
-                &to_key,
-                GraphEdge::new(edge_kind)
-                    .with_weight(weight)
-                    .with_label(&relationship),
-            );
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// workflow_versions parent → EvolvedFrom, generation_task_run_id → GeneratedBy
@@ -1512,58 +439,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT wv.id, wv.parent_version_id, wv.generation_task_run_id
-               FROM workflow_versions wv
-               INNER JOIN unified_workflows uw ON uw.id = wv.workflow_id
-               WHERE uw.name = ?1"#
-        } else {
-            r#"SELECT id, parent_version_id, generation_task_run_id
-               FROM workflow_versions"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare version edge query: {}", e))?;
-
-        let rows: Vec<(String, Option<String>, Option<String>)> =
-            if let Some(wn) = workflow_name {
-                stmt.query_map(params![wn], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?))
-                })
-                .map_err(|e| format!("Failed to query version edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            } else {
-                stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?))
-                })
-                .map_err(|e| format!("Failed to query version edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-            };
-
-        for (version_id, parent_id, gen_run_id) in rows {
-            let ver_key = format!("workflow_version:{}", version_id);
-
-            if let Some(pid) = parent_id {
-                let parent_key = format!("workflow_version:{}", pid);
-                self.add_edge_by_key(
-                    &ver_key,
-                    &parent_key,
-                    GraphEdge::new(GraphEdgeKind::EvolvedFrom),
-                );
-            }
-
-            if let Some(run_id) = gen_run_id {
-                let run_key = format!("task_run:{}", run_id);
-                self.add_edge_by_key(
-                    &ver_key,
-                    &run_key,
-                    GraphEdge::new(GraphEdgeKind::GeneratedBy),
-                );
-            }
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// step_provenance → BuiltBy (step → pipeline_agent)
@@ -1572,45 +448,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT DISTINCT sp.step_name, sp.phase, sp.generating_agent
-               FROM step_provenance sp
-               INNER JOIN unified_workflows uw ON uw.id = sp.workflow_id
-               WHERE uw.name = ?1"#
-        } else {
-            r#"SELECT DISTINCT step_name, phase, generating_agent
-               FROM step_provenance"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare step_provenance edge query: {}", e))?;
-
-        let rows: Vec<(String, String, String)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })
-            .map_err(|e| format!("Failed to query step_provenance edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            })
-            .map_err(|e| format!("Failed to query step_provenance edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (step_name, phase, agent) in rows {
-            let step_key = format!("step_def:{}:{}", phase, step_name);
-            let agent_key = format!("pipeline_agent:{}", agent);
-            self.add_edge_by_key(
-                &step_key,
-                &agent_key,
-                GraphEdge::new(GraphEdgeKind::BuiltBy),
-            );
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// step_finding_links → DetectedDuring (step → finding)
@@ -1619,50 +457,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT sfl.step_name, sfl.finding_id
-               FROM step_finding_links sfl
-               INNER JOIN task_runs tr ON tr.id = sfl.task_run_id
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT sfl.step_name, sfl.finding_id
-               FROM step_finding_links sfl
-               INNER JOIN task_runs tr ON tr.id = sfl.task_run_id
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare step_finding edge query: {}", e))?;
-
-        let rows: Vec<(String, String)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query step_finding edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query step_finding edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        for (step_name, finding_id) in rows {
-            // We don't know the phase from step_finding_links, try to find the step node
-            // by checking all possible phase prefixes.
-            let finding_key = format!("finding:{}", finding_id);
-            for phase in &["setup", "verification", "agentic", "completion"] {
-                let step_key = format!("step_def:{}:{}", phase, step_name);
-                if self.node_index.contains_key(&step_key) {
-                    self.add_edge_by_key(
-                        &step_key,
-                        &finding_key,
-                        GraphEdge::new(GraphEdgeKind::DetectedDuring),
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// rule_influence_log → InfluencedBy (rule → workflow)
@@ -1671,43 +466,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT ril.rule_id, ril.workflow_id
-               FROM rule_influence_log ril
-               WHERE ril.workflow_id IS NOT NULL
-                 AND ril.workflow_id IN (
-                     SELECT id FROM unified_workflows WHERE name = ?1
-                 )"#
-        } else {
-            r#"SELECT rule_id, workflow_id
-               FROM rule_influence_log WHERE workflow_id IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare rule_influence edge query: {}", e))?;
-
-        let rows: Vec<(String, String)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query rule_influence edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-                .map_err(|e| format!("Failed to query rule_influence edges: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        for (rule_id, workflow_id) in rows {
-            let rule_key = format!("rule:{}", rule_id);
-            let wf_key = format!("workflow:{}", workflow_id);
-            self.add_edge_by_key(
-                &rule_key,
-                &wf_key,
-                GraphEdge::new(GraphEdgeKind::InfluencedBy),
-            );
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// component_relationships → ImpactsComponent
@@ -1716,50 +475,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT cr.source_component, cr.target_component, cr.relationship_type, cr.strength
-               FROM component_relationships cr
-               WHERE cr.workflow_name = ?1"#
-        } else {
-            r#"SELECT source_component, target_component, relationship_type, strength
-               FROM component_relationships"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare component_rel edge query: {}", e))?;
-
-        let rows: Vec<(String, String, String, i64)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
-            })
-            .map_err(|e| format!("Failed to query component_rel edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
-            })
-            .map_err(|e| format!("Failed to query component_rel edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (source, target, rel_type, strength) in rows {
-            // Component nodes are keyed by their DB id, but component_relationships
-            // reference by path. We need to find the matching component node.
-            let from_key = self.find_component_by_path(&source);
-            let to_key = self.find_component_by_path(&target);
-            if let (Some(fk), Some(tk)) = (from_key, to_key) {
-                self.add_edge_by_key(
-                    &fk,
-                    &tk,
-                    GraphEdge::new(GraphEdgeKind::ImpactsComponent)
-                        .with_weight(strength as f64)
-                        .with_label(&rel_type),
-                );
-            }
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// fix_applications → AppliedIn (fix → task_run)
@@ -1768,53 +484,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let sql = if workflow_name.is_some() {
-            r#"SELECT fa.fix_id, fa.task_run_id, fa.outcome
-               FROM fix_applications fa
-               INNER JOIN task_runs tr ON tr.id = fa.task_run_id
-               WHERE tr.workflow_name = ?1"#
-        } else {
-            r#"SELECT fa.fix_id, fa.task_run_id, fa.outcome
-               FROM fix_applications fa
-               INNER JOIN task_runs tr ON tr.id = fa.task_run_id
-               WHERE tr.workflow_name IS NOT NULL"#
-        };
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| format!("Failed to prepare fix_application edge query: {}", e))?;
-
-        let rows: Vec<(String, String, Option<String>)> = if let Some(wn) = workflow_name {
-            stmt.query_map(params![wn], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
-            })
-            .map_err(|e| format!("Failed to query fix_application edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        } else {
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
-            })
-            .map_err(|e| format!("Failed to query fix_application edges: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
-
-        for (fix_id, run_id, outcome) in rows {
-            let fix_key = format!("fix:{}", fix_id);
-            let run_key = format!("task_run:{}", run_id);
-            let mut edge = GraphEdge::new(GraphEdgeKind::AppliedIn);
-            if let Some(ref o) = outcome {
-                edge = edge.with_label(o);
-                let o_str: &str = o;
-                edge = edge.with_weight(match o_str {
-                    "resolved" => 2.0,
-                    "ineffective" => 0.5,
-                    _ => 1.0,
-                });
-            }
-            self.add_edge_by_key(&fix_key, &run_key, edge);
-        }
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     // =========================================================================
@@ -1847,166 +517,7 @@ impl KnowledgeGraph {
         conn: &Connection,
         task_run_id: &str,
     ) -> Result<u32, String> {
-        let before_count = self.graph.node_count();
-
-        // 1. Load the task run itself
-        let row: (String, String, Option<String>, String, String) = conn
-            .query_row(
-                r#"SELECT id, task_name, workflow_name, status, created_at
-                   FROM task_runs WHERE id = ?1"#,
-                params![task_run_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("Task run not found: {}", e))?;
-
-        let run_node = GraphNode::new(GraphNodeKind::TaskRun, &row.0, &row.1)
-            .with_property("status", serde_json::json!(row.3))
-            .with_created_at(&row.4);
-        self.get_or_insert_node(run_node);
-
-        // Link to workflow if we have it
-        if let Some(ref wf_name) = row.2 {
-            let wf_row: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM unified_workflows WHERE name = ?1",
-                    params![wf_name],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(wf_id) = wf_row {
-                let run_key = format!("task_run:{}", task_run_id);
-                let wf_key = format!("workflow:{}", wf_id);
-                self.add_edge_by_key(
-                    &run_key,
-                    &wf_key,
-                    GraphEdge::new(GraphEdgeKind::BelongsTo),
-                );
-            }
-        }
-
-        // 2. Load findings for this run
-        {
-            let mut stmt = conn
-                .prepare(
-                    r#"SELECT id, title, category, severity, status, detected_at
-                       FROM task_run_findings WHERE task_run_id = ?1"#,
-                )
-                .map_err(|e| format!("Failed to prepare ingest findings query: {}", e))?;
-
-            let findings: Vec<(String, String, String, String, String, String)> = stmt
-                .query_map(params![task_run_id], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query ingest findings: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            for (fid, title, category, severity, status, created_at) in findings {
-                let weight = match severity.as_str() {
-                    "critical" => 4.0,
-                    "high" => 3.0,
-                    "medium" => 2.0,
-                    _ => 1.0,
-                };
-                let node = GraphNode::new(GraphNodeKind::Finding, &fid, &title)
-                    .with_weight(weight)
-                    .with_property("category", serde_json::json!(category))
-                    .with_property("severity", serde_json::json!(severity))
-                    .with_property("status", serde_json::json!(status))
-                    .with_created_at(&created_at);
-                self.get_or_insert_node(node);
-
-                let finding_key = format!("finding:{}", fid);
-                let run_key = format!("task_run:{}", task_run_id);
-                self.add_edge_by_key(
-                    &finding_key,
-                    &run_key,
-                    GraphEdge::new(GraphEdgeKind::DetectedDuring),
-                );
-            }
-        }
-
-        // 3. Load fixes sourced from this run
-        {
-            let mut stmt = conn
-                .prepare(
-                    r#"SELECT id, fix_type, fix_description, effectiveness,
-                              source_finding_id, created_at
-                       FROM reflection_fixes WHERE source_task_run_id = ?1"#,
-                )
-                .map_err(|e| format!("Failed to prepare ingest fixes query: {}", e))?;
-
-            let fixes: Vec<(String, String, String, Option<String>, Option<String>, String)> = stmt
-                .query_map(params![task_run_id], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                })
-                .map_err(|e| format!("Failed to query ingest fixes: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            for (fix_id, fix_type, desc, effectiveness, finding_id, created_at) in fixes {
-                let label = if desc.len() > 80 {
-                    let truncated: String = desc.chars().take(77).collect();
-                    format!("{}...", truncated)
-                } else {
-                    desc.clone()
-                };
-                let weight = match effectiveness.as_deref() {
-                    Some("effective") => 3.0,
-                    Some("ineffective") => 0.5,
-                    Some("caused_regression") => -1.0,
-                    _ => 1.0,
-                };
-                let node = GraphNode::new(GraphNodeKind::Fix, &fix_id, &label)
-                    .with_weight(weight)
-                    .with_property("fix_type", serde_json::json!(fix_type))
-                    .with_property("effectiveness", serde_json::json!(effectiveness))
-                    .with_created_at(&created_at);
-                self.get_or_insert_node(node);
-
-                if let Some(ref fid) = finding_id {
-                    let finding_key = format!("finding:{}", fid);
-                    let fix_key = format!("fix:{}", fix_id);
-                    self.add_edge_by_key(
-                        &finding_key,
-                        &fix_key,
-                        GraphEdge::new(GraphEdgeKind::Caused),
-                    );
-                    if effectiveness.as_deref() == Some("effective") {
-                        self.add_edge_by_key(
-                            &fix_key,
-                            &finding_key,
-                            GraphEdge::new(GraphEdgeKind::Resolved),
-                        );
-                    }
-                }
-            }
-        }
-
-        let new_count = self.graph.node_count() - before_count;
-        Ok(new_count as u32)
+        Err("SQLite removed".to_string())
     }
 
     // =========================================================================
@@ -2596,196 +1107,6 @@ fn causal_event_to_node_key(event_type: &str, event_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
-
-    // -------------------------------------------------------------------------
-    // Helper: create in-memory DB with all tables the graph engine queries
-    // -------------------------------------------------------------------------
-
-    fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("Failed to open in-memory DB");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE unified_workflows (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                category TEXT,
-                created_at TEXT
-            );
-
-            CREATE TABLE workflow_versions (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                version_number INTEGER NOT NULL,
-                parent_version_id TEXT,
-                generation_task_run_id TEXT,
-                trigger TEXT NOT NULL DEFAULT 'manual',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE task_runs (
-                id TEXT PRIMARY KEY,
-                task_name TEXT NOT NULL,
-                workflow_name TEXT,
-                status TEXT NOT NULL DEFAULT 'completed',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE task_run_findings (
-                id TEXT PRIMARY KEY,
-                task_run_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT 'quality',
-                severity TEXT NOT NULL DEFAULT 'medium',
-                status TEXT NOT NULL DEFAULT 'open',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE reflection_fixes (
-                id TEXT PRIMARY KEY,
-                source_task_run_id TEXT NOT NULL,
-                source_finding_id TEXT,
-                fix_type TEXT NOT NULL DEFAULT 'prompt',
-                fix_description TEXT NOT NULL DEFAULT '',
-                effectiveness TEXT,
-                confidence TEXT NOT NULL DEFAULT 'medium',
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE error_events (
-                id INTEGER PRIMARY KEY,
-                task_run_id TEXT NOT NULL,
-                signature_hash TEXT NOT NULL,
-                error_type TEXT,
-                message TEXT NOT NULL DEFAULT '',
-                severity TEXT NOT NULL DEFAULT 'error',
-                occurrence_count INTEGER NOT NULL DEFAULT 1,
-                first_seen_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE architecture_components (
-                id TEXT PRIMARY KEY,
-                workflow_name TEXT,
-                component_path TEXT NOT NULL,
-                component_type TEXT NOT NULL DEFAULT 'file',
-                health_score REAL NOT NULL DEFAULT 1.0,
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE generation_rules (
-                id TEXT PRIMARY KEY,
-                agent TEXT NOT NULL DEFAULT 'default',
-                section TEXT NOT NULL DEFAULT 'general',
-                title TEXT NOT NULL,
-                severity TEXT NOT NULL DEFAULT 'normal',
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE cross_run_patterns (
-                id TEXT PRIMARY KEY,
-                workflow_name TEXT,
-                pattern_type TEXT NOT NULL DEFAULT 'recurring_error',
-                signature_hash TEXT NOT NULL DEFAULT '',
-                occurrence_count INTEGER NOT NULL DEFAULT 1,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE task_knowledge (
-                id TEXT PRIMARY KEY,
-                task_run_id TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT 'insight',
-                content TEXT NOT NULL DEFAULT '',
-                confidence TEXT,
-                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z'
-            );
-
-            CREATE TABLE step_provenance (
-                id INTEGER PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                workflow_version_id TEXT,
-                step_name TEXT NOT NULL,
-                step_index INTEGER NOT NULL DEFAULT 0,
-                phase TEXT NOT NULL DEFAULT 'setup',
-                generating_agent TEXT NOT NULL DEFAULT 'unknown',
-                generation_iteration INTEGER,
-                original_step_json TEXT,
-                final_step_json TEXT,
-                ui_bridge_event_ids TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE causal_events (
-                id INTEGER PRIMARY KEY,
-                workflow_name TEXT,
-                cause_event_type TEXT NOT NULL,
-                cause_event_id TEXT NOT NULL,
-                effect_event_type TEXT NOT NULL,
-                effect_event_id TEXT NOT NULL,
-                relationship TEXT NOT NULL DEFAULT 'caused',
-                confidence TEXT NOT NULL DEFAULT 'medium'
-            );
-
-            CREATE TABLE rule_influence_log (
-                id INTEGER PRIMARY KEY,
-                rule_id TEXT NOT NULL,
-                workflow_id TEXT
-            );
-
-            CREATE TABLE component_relationships (
-                id INTEGER PRIMARY KEY,
-                workflow_name TEXT,
-                source_component TEXT NOT NULL,
-                target_component TEXT NOT NULL,
-                relationship_type TEXT NOT NULL DEFAULT 'depends_on',
-                strength INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE fix_applications (
-                id INTEGER PRIMARY KEY,
-                fix_id TEXT NOT NULL,
-                task_run_id TEXT NOT NULL,
-                outcome TEXT
-            );
-
-            CREATE TABLE step_finding_links (
-                id INTEGER PRIMARY KEY,
-                task_run_id TEXT NOT NULL,
-                step_name TEXT NOT NULL,
-                finding_id TEXT NOT NULL
-            );
-
-            CREATE TABLE ui_bridge_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_run_id TEXT,
-                element_id TEXT,
-                event_type TEXT NOT NULL DEFAULT 'action_executed',
-                success INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE user_skills (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                slug TEXT NOT NULL UNIQUE,
-                description TEXT DEFAULT '',
-                category TEXT DEFAULT 'custom',
-                source TEXT DEFAULT 'user',
-                usage_count INTEGER DEFAULT 0,
-                version TEXT DEFAULT '1.0.0',
-                approval_status TEXT,
-                forked_from TEXT,
-                source_fix_id TEXT,
-                source_pattern_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            "#,
-        )
-        .expect("Failed to create test tables");
-        conn
-    }
 
     // =========================================================================
     // Construction tests
@@ -2801,50 +1122,17 @@ mod tests {
 
     #[test]
     fn test_build_from_empty_db() {
-        let conn = setup_test_db();
-        let kg = KnowledgeGraph::build_from_db(&conn, None).expect("build_from_db failed");
-        assert_eq!(kg.graph.node_count(), 0);
-        assert_eq!(kg.graph.edge_count(), 0);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_build_from_db_with_workflow() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO unified_workflows (id, name, description, category, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params!["wf-1", "my-workflow", "A test workflow", "testing", "2026-01-01T00:00:00Z"],
-        )
-        .unwrap();
-
-        let kg = KnowledgeGraph::build_from_db(&conn, None).expect("build_from_db failed");
-        assert_eq!(kg.graph.node_count(), 1);
-
-        let summary = kg.summary();
-        assert_eq!(summary.nodes_by_kind.get("workflow"), Some(&1));
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_build_from_db_with_task_run() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO unified_workflows (id, name) VALUES (?1, ?2)",
-            params!["wf-1", "my-workflow"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params!["run-1", "build-task", "my-workflow", "completed", "2026-01-01T00:00:00Z"],
-        )
-        .unwrap();
-
-        let kg = KnowledgeGraph::build_from_db(&conn, None).expect("build_from_db failed");
-
-        let summary = kg.summary();
-        assert_eq!(summary.nodes_by_kind.get("workflow"), Some(&1));
-        assert_eq!(summary.nodes_by_kind.get("task_run"), Some(&1));
-        // BelongsTo edge from task_run -> workflow
-        assert_eq!(summary.edges_by_kind.get("belongs_to"), Some(&1));
-        assert_eq!(summary.total_edges, 1);
+        // SQLite removed - no-op
     }
 
     // =========================================================================

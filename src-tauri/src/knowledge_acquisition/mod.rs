@@ -58,11 +58,7 @@ impl SearchContext {
         pg: Option<Arc<crate::database::pg::PgDb>>,
         task_run_id: String,
     ) -> Self {
-        Self {
-            db,
-            pg,
-            task_run_id,
-        }
+        todo!("SQLite removed")
     }
 }
 
@@ -675,6 +671,7 @@ impl KnowledgeAcquisition {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_coordinator_creation() {

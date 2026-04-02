@@ -5,7 +5,7 @@
 //! (pass/fail, fixer diffs, iteration counts) as ground-truth labels —
 //! the FoVer insight that the runner IS a formal verifier.
 
-use rusqlite::Connection;
+use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -103,147 +103,12 @@ pub fn export_prm_training_data(
     conn: &Connection,
     min_runs: usize,
 ) -> Result<(Vec<PrmTrainingExample>, PrmExportStats), String> {
-    info!("Exporting PRM training data (min_runs={})", min_runs);
-
-    // Query completed task runs that have pipeline artifacts with verification data
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT
-                tr.id AS run_id,
-                tr.workflow_id,
-                tr.task_name,
-                tr.status AS run_status,
-                tr.verification_passed,
-                gpa.final_json,
-                gpa.verification_iterations,
-                gpa.fixer_snapshots,
-                gpa.specification_criteria,
-                gpa.category
-            FROM task_runs tr
-            INNER JOIN generation_pipeline_artifacts gpa
-                ON gpa.task_run_id = tr.id
-                OR (gpa.task_run_id IS NULL AND gpa.workflow_id = tr.workflow_id)
-            WHERE tr.status IN ('complete', 'failed')
-              AND gpa.final_json IS NOT NULL
-            ORDER BY tr.created_at DESC
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare PRM export query: {e}"))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(RawExportRow {
-                run_id: row.get(0)?,
-                workflow_id: row.get(1)?,
-                task_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                run_status: row.get(3)?,
-                verification_passed: row.get::<_, Option<i32>>(4)?.unwrap_or(0),
-                final_json: row.get(5)?,
-                verification_iterations: row.get(6)?,
-                fixer_snapshots: row.get(7)?,
-                specification_criteria: row.get(8)?,
-                category: row.get(9)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query PRM export data: {e}"))?;
-
-    let mut all_examples = Vec::new();
-    let mut runs_processed = 0;
-    let mut domains_set = std::collections::HashSet::new();
-
-    for row_result in rows {
-        let row = row_result.map_err(|e| format!("Row error: {e}"))?;
-        runs_processed += 1;
-
-        let domain = row.category.clone();
-        if let Some(ref d) = domain {
-            domains_set.insert(d.clone());
-        }
-
-        let examples = extract_examples_from_row(&row);
-        all_examples.extend(examples);
-    }
-
-    if runs_processed < min_runs {
-        return Err(format!(
-            "Only {runs_processed} runs found, need at least {min_runs}"
-        ));
-    }
-
-    let passed_count = all_examples
-        .iter()
-        .filter(|e| matches!(e.execution_result, ExecutionResult::Passed))
-        .count();
-    let failed_count = all_examples
-        .iter()
-        .filter(|e| matches!(e.execution_result, ExecutionResult::Failed { .. }))
-        .count();
-    let fixed_count = all_examples
-        .iter()
-        .filter(|e| matches!(e.final_outcome, FinalOutcome::StepFixedLater))
-        .count();
-
-    let stats = PrmExportStats {
-        total_examples: all_examples.len(),
-        passed_count,
-        failed_count,
-        fixed_count,
-        runs_processed,
-        domains: domains_set.into_iter().collect(),
-    };
-
-    info!(
-        "PRM export: {} examples from {} runs ({} passed, {} failed, {} fixed)",
-        stats.total_examples, stats.runs_processed, stats.passed_count, stats.failed_count, stats.fixed_count
-    );
-
-    Ok((all_examples, stats))
+    Err("SQLite removed".to_string())
 }
 
 /// Lightweight stats query — counts runs and domains without materializing examples.
 pub fn export_prm_stats_only(conn: &Connection) -> Result<PrmExportStats, String> {
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT
-                COUNT(DISTINCT tr.id) AS run_count,
-                COUNT(*) AS artifact_count,
-                SUM(CASE WHEN tr.verification_passed = 1 AND tr.status = 'complete' THEN 1 ELSE 0 END) AS passed_runs,
-                SUM(CASE WHEN tr.status = 'failed' THEN 1 ELSE 0 END) AS failed_runs,
-                GROUP_CONCAT(DISTINCT gpa.category) AS domains
-            FROM task_runs tr
-            INNER JOIN generation_pipeline_artifacts gpa
-                ON gpa.task_run_id = tr.id
-                OR (gpa.task_run_id IS NULL AND gpa.workflow_id = tr.workflow_id)
-            WHERE tr.status IN ('complete', 'failed')
-              AND gpa.final_json IS NOT NULL
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare PRM stats query: {e}"))?;
-
-    let result = stmt
-        .query_row([], |row| {
-            let run_count: i64 = row.get(0)?;
-            let artifact_count: i64 = row.get(1)?;
-            let passed_runs: i64 = row.get(2)?;
-            let failed_runs: i64 = row.get(3)?;
-            let domains_csv: Option<String> = row.get(4)?;
-
-            Ok(PrmExportStats {
-                total_examples: artifact_count as usize, // Approximate (1 artifact ≈ N steps)
-                passed_count: passed_runs as usize,
-                failed_count: failed_runs as usize,
-                fixed_count: 0, // Not available without full parse
-                runs_processed: run_count as usize,
-                domains: domains_csv
-                    .map(|csv| csv.split(',').map(String::from).collect())
-                    .unwrap_or_default(),
-            })
-        })
-        .map_err(|e| format!("PRM stats query failed: {e}"))?;
-
-    Ok(result)
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -607,6 +472,7 @@ pub fn examples_to_jsonl(examples: &[PrmTrainingExample]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_parse_steps_from_workflow() {

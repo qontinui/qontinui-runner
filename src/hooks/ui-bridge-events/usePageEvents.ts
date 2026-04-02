@@ -417,9 +417,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            const el = index
-              ? document.querySelectorAll<HTMLElement>(selector)[index]
-              : document.querySelector<HTMLElement>(selector);
+            const el =
+              index != null
+                ? document.querySelectorAll<HTMLElement>(selector)[index]
+                : document.querySelector<HTMLElement>(selector);
             if (!el) {
               await sendResponse({
                 requestId,
@@ -470,6 +471,16 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                 type,
                 success: false,
                 error: "text is required",
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+            if (!label && !selector) {
+              await sendResponse({
+                requestId,
+                type,
+                success: false,
+                error: "Either label or selector is required",
                 timestamp: Date.now(),
               });
               return true;
@@ -683,8 +694,19 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               });
               return true;
             }
-            window.location.href =
-              page.startsWith("/") || page.startsWith("http") ? page : "/" + page;
+            const target = page.startsWith("/") || page.startsWith("http") ? page : "/" + page;
+            // Use history.pushState + popstate for SPA-friendly navigation
+            // (avoids full page reload that would destroy React state)
+            if (target.startsWith("http") && !target.startsWith(window.location.origin)) {
+              // External URL — full navigation required
+              window.location.href = target;
+            } else {
+              const path = target.startsWith("http")
+                ? new URL(target).pathname
+                : target;
+              window.history.pushState({}, "", path);
+              window.dispatchEvent(new PopStateEvent("popstate"));
+            }
             await sendResponse({
               requestId,
               type,

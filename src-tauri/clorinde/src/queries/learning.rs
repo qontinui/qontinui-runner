@@ -713,7 +713,7 @@ impl<
 pub struct GetLearningOutcomesStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_learning_outcomes() -> GetLearningOutcomesStmt {
     GetLearningOutcomesStmt(
-        "SELECT id, task_id, status, duration_secs, iterations, strategy, tools_used, files_modified, error_type, error_message, feedback, created_at, workflow_architecture, step_count, verification_step_count, agentic_step_count, has_ui_bridge, total_tokens, total_cost_usd, composite_agentic_score, technology_tags, domain_tags, complexity_tier FROM learning_outcomes ORDER BY created_at DESC LIMIT $1",
+        "SELECT id, task_id, status, COALESCE(duration_secs, 0) as duration_secs, COALESCE(iterations, 0) as iterations, COALESCE(strategy, '') as strategy, COALESCE(tools_used, '') as tools_used, COALESCE(files_modified, '') as files_modified, COALESCE(error_type, '') as error_type, COALESCE(error_message, '') as error_message, COALESCE(feedback, '') as feedback, created_at, COALESCE(workflow_architecture, '') as workflow_architecture, COALESCE(step_count, 0) as step_count, COALESCE(verification_step_count, 0) as verification_step_count, COALESCE(agentic_step_count, 0) as agentic_step_count, COALESCE(has_ui_bridge, false) as has_ui_bridge, COALESCE(total_tokens, 0) as total_tokens, COALESCE(total_cost_usd, 0) as total_cost_usd, COALESCE(composite_agentic_score, 0) as composite_agentic_score, COALESCE(technology_tags, '') as technology_tags, COALESCE(domain_tags, '') as domain_tags, COALESCE(complexity_tier, '') as complexity_tier FROM learning_outcomes ORDER BY created_at DESC LIMIT $1",
         None,
     )
 }
@@ -857,7 +857,7 @@ impl<
 pub struct GetLearningPatternsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_learning_patterns() -> GetLearningPatternsStmt {
     GetLearningPatternsStmt(
-        "SELECT id, pattern_type, description, confidence, occurrences, context, created_at, updated_at FROM learning_patterns ORDER BY confidence DESC",
+        "SELECT id, pattern_type, description, confidence, occurrences, COALESCE(context, '') as context, created_at, updated_at FROM learning_patterns ORDER BY confidence DESC",
         None,
     )
 }

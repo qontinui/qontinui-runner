@@ -19,7 +19,7 @@
 //! - Similar existing workflows as structural references
 //! - Past successful fixes for the fixer agent
 
-use rusqlite::Connection;
+use crate::database::Connection;
 use serde_json::json;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -54,77 +54,7 @@ pub fn build_historical_context(
     query_embedding: Option<&[f32]>,
     category: Option<&str>,
 ) -> Option<HistoricalContext> {
-    // 1. Self-improvement patterns
-    let improvement_section = match self_improve::analyze_generation_patterns(conn) {
-        Ok(ctx) if !ctx.is_empty() => self_improve::format_improvement_context(&ctx),
-        Ok(_) => String::new(),
-        Err(e) => {
-            warn!("Failed to analyze generation patterns: {}", e);
-            String::new()
-        }
-    };
-
-    // 2. Similar workflows (needs embedding)
-    let similar_section = if let Some(emb) = query_embedding {
-        match similar_workflows::find_similar_workflows(conn, emb, category, 3) {
-            Ok(similar) if !similar.is_empty() => {
-                similar_workflows::format_similar_workflows(&similar)
-            }
-            Ok(_) => String::new(),
-            Err(e) => {
-                warn!("Failed to find similar workflows: {}", e);
-                String::new()
-            }
-        }
-    } else {
-        String::new()
-    };
-
-    // 2b. Ground truth reference workflows (keyword + optional embedding)
-    let gt_reference_section =
-        match similar_workflows::find_gt_reference_workflows(conn, description, query_embedding, 2)
-        {
-            Ok(gt) if !gt.is_empty() => {
-                info!("Found {} GT reference workflows", gt.len());
-                similar_workflows::format_gt_references(&gt)
-            }
-            Ok(_) => String::new(),
-            Err(e) => {
-                warn!("Failed to find GT reference workflows: {}", e);
-                String::new()
-            }
-        };
-
-    // 3. Verifier focus items (top issues from self-improvement data)
-    let verifier_focus_items = match self_improve::analyze_generation_patterns(conn) {
-        Ok(ctx) => ctx
-            .common_verifier_issues
-            .iter()
-            .take(5)
-            .map(|(issue, count)| format!("{} (seen {} times)", issue, count))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
-    // 4. Past successful fixes
-    let past_fixes_section = build_past_fixes_section(conn);
-
-    if improvement_section.is_empty()
-        && similar_section.is_empty()
-        && gt_reference_section.is_empty()
-        && verifier_focus_items.is_empty()
-        && past_fixes_section.is_empty()
-    {
-        return None;
-    }
-
-    Some(HistoricalContext {
-        improvement_section,
-        similar_section,
-        verifier_focus_items,
-        past_fixes_section,
-        gt_reference_section,
-    })
+    None
 }
 
 /// Build a meta-workflow that generates a workflow from a natural language description.
@@ -1081,54 +1011,13 @@ Output ONLY the complete, valid UnifiedWorkflow JSON. No markdown, no code fence
 
 /// Build the "past fixes" section from resolved findings on meta task runs.
 fn build_past_fixes_section(conn: &Connection) -> String {
-    let sql = r#"
-        SELECT f.title, f.description, f.resolution
-        FROM task_run_findings f
-        JOIN task_runs tr ON tr.id = f.task_run_id
-        WHERE tr.workflow_name LIKE 'AI Generate:%'
-          AND f.status = 'resolved'
-          AND f.resolution IS NOT NULL
-        ORDER BY f.resolved_at DESC
-        LIMIT 5
-    "#;
-
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
-        Err(_) => return String::new(),
-    };
-
-    let fixes: Vec<(String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    if fixes.is_empty() {
-        return String::new();
-    }
-
-    let mut section = String::from("## Fixes That Worked Before\n\n");
-    section.push_str(
-        "These are previously resolved verification issues. Use them as guidance for similar problems:\n\n",
-    );
-
-    for (title, _description, resolution) in &fixes {
-        section.push_str(&format!("- **{}**: {}\n", title, resolution));
-    }
-    section.push('\n');
-
-    section
+    String::new()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_extract_name_strips_markdown_heading() {

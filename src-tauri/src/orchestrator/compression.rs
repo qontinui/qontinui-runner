@@ -12,11 +12,12 @@
 
 #![allow(dead_code)]
 
+use crate::database::CheckpointDb;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::database::{CheckpointDb, StoredTaskKnowledge};
+use crate::database::StoredTaskKnowledge;
 
 // ============================================================================
 // Configuration
@@ -221,7 +222,7 @@ pub struct CompressionService {
 impl CompressionService {
     /// Create a new compression service.
     pub fn new(db: Arc<CheckpointDb>, config: CompressionConfig) -> Self {
-        Self { db, config }
+        todo!("SQLite removed")
     }
 
     /// Estimate the token count for a task's current context.
@@ -470,6 +471,7 @@ impl CompressionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_estimate_tokens() {

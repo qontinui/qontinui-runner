@@ -5,12 +5,12 @@
 //! pass (no AI session needed) and appends results to the recommendation
 //! table alongside other optimizer outputs.
 
+use crate::database::CheckpointDb;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::recommendations;
 use super::types::Recommendation;
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 
 // ---------------------------------------------------------------------------
@@ -548,114 +548,7 @@ pub fn generate_cache_efficiency_recommendations(
     pg_db: &Arc<PgDb>,
     existing_recommendations: &[Recommendation],
 ) -> Vec<Recommendation> {
-    let mut results: Vec<Recommendation> = Vec::new();
-
-    // Collect recent titles (last 7 days) to avoid duplicates
-    let recent_titles: Vec<String> = existing_recommendations
-        .iter()
-        .filter(|r| {
-            if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&r.created_at) {
-                let age = chrono::Utc::now().signed_duration_since(created);
-                age.num_days() < 7
-            } else {
-                false
-            }
-        })
-        .map(|r| r.title.clone())
-        .collect();
-
-    let has_recent = |title: &str| recent_titles.iter().any(|t| t == title);
-
-    // Query cache stats from SQLite phase_token_usage (last 30 days)
-    let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-    let cache_stats = match query_cache_stats(db, &since) {
-        Ok(stats) => stats,
-        Err(e) => {
-            warn!("Cache efficiency: failed to query cache stats: {}", e);
-            return results;
-        }
-    };
-
-    let (total_input, total_cache_creation, total_cache_read, run_count) = cache_stats;
-
-    if run_count < 10 {
-        debug!(
-            "Cache efficiency: insufficient data ({} runs, need 10+)",
-            run_count
-        );
-        return results;
-    }
-
-    let denominator = total_cache_read as f64 + total_cache_creation as f64 + total_input as f64;
-    if denominator <= 0.0 {
-        debug!("Cache efficiency: no token data to analyze");
-        return results;
-    }
-
-    let cache_hit_rate = total_cache_read as f64 / denominator;
-
-    info!(
-        "Cache efficiency: hit_rate={:.2}%, creation={}, read={}, input={}, runs={}",
-        cache_hit_rate * 100.0,
-        total_cache_creation,
-        total_cache_read,
-        total_input,
-        run_count,
-    );
-
-    if cache_hit_rate < 0.5 {
-        let title = "Low prompt cache hit rate".to_string();
-        if has_recent(&title) {
-            return results;
-        }
-
-        let confidence = compute_confidence(run_count, 10, 30);
-        let description = format!(
-            "Prompt cache hit rate is **{:.1}%** (target: ≥50%).\n\n\
-             - Cache read tokens: {}\n\
-             - Cache creation tokens: {}\n\
-             - Regular input tokens: {}\n\
-             - Runs analyzed: {}\n\n\
-             Low cache hit rates mean the model re-processes prompts that could be cached. \
-             Consider structuring system prompts as stable prefixes so they remain in cache \
-             across calls, or increasing the cache TTL window.",
-            cache_hit_rate * 100.0,
-            total_cache_read,
-            total_cache_creation,
-            total_input,
-            run_count,
-        );
-        let evidence = serde_json::json!({
-            "cache_hit_rate": cache_hit_rate,
-            "total_cache_read": total_cache_read,
-            "total_cache_creation": total_cache_creation,
-            "total_input_tokens": total_input,
-            "run_count": run_count,
-        })
-        .to_string();
-
-        match recommendations::create_recommendation(
-            pg_db,
-            "pipeline_prompt",
-            "cost_optimization",
-            None,
-            &title,
-            &description,
-            None,
-            None,
-            Some(&evidence),
-            confidence,
-            None,
-        ) {
-            Ok(rec) => {
-                info!("Cache efficiency recommendation created: {}", title);
-                results.push(rec);
-            }
-            Err(e) => warn!("Failed to create cache recommendation: {}", e),
-        }
-    }
-
-    results
+    Vec::new()
 }
 
 /// Detect duplicate or near-duplicate prompts across pipeline agents.
@@ -667,141 +560,7 @@ pub fn detect_duplicate_prompts(
     db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
 ) -> Vec<Recommendation> {
-    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
-
-    // Query phase_token_usage for (phase, model_used) pairs with high repetition
-    let conn = match db.get_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            debug!("Duplicate prompt detection: failed to get DB conn: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let mut stmt = match conn.prepare(
-        r#"SELECT phase, model_used,
-                  COUNT(*) as run_count,
-                  AVG(input_tokens) as avg_input,
-                  MIN(input_tokens) as min_input,
-                  MAX(input_tokens) as max_input
-           FROM phase_token_usage
-           WHERE created_at > ?1
-             AND model_used IS NOT NULL
-             AND input_tokens > 0
-           GROUP BY phase, model_used
-           HAVING COUNT(*) >= 10
-           ORDER BY run_count DESC"#,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("Duplicate prompt detection: query prep failed: {}", e);
-            return Vec::new();
-        }
-    };
-
-    struct PhaseRepetition {
-        phase: String,
-        model_used: String,
-        run_count: i64,
-        avg_input: f64,
-        min_input: i64,
-        max_input: i64,
-    }
-
-    let rows: Vec<PhaseRepetition> = match stmt.query_map(rusqlite::params![since], |row| {
-        Ok(PhaseRepetition {
-            phase: row.get(0)?,
-            model_used: row.get(1)?,
-            run_count: row.get(2)?,
-            avg_input: row.get(3)?,
-            min_input: row.get(4)?,
-            max_input: row.get(5)?,
-        })
-    }) {
-        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-        Err(e) => {
-            debug!("Duplicate prompt detection: query failed: {}", e);
-            return Vec::new();
-        }
-    };
-
-    if rows.is_empty() {
-        return Vec::new();
-    }
-
-    let mut results = Vec::new();
-
-    for row in &rows {
-        // If min and max input tokens are within 10% of each other,
-        // the prompts are likely near-identical (same template, same content).
-        let range = row.max_input - row.min_input;
-        let avg = row.avg_input;
-        if avg <= 0.0 {
-            continue;
-        }
-        let variation = range as f64 / avg;
-
-        // Low variation (<10%) across many runs suggests duplicate prompts
-        if variation < 0.10 && row.run_count >= 10 {
-            let title = format!(
-                "Duplicate prompts: {} phase ({} identical runs)",
-                row.phase, row.run_count
-            );
-
-            let confidence = compute_confidence(row.run_count, 10, 30);
-            let description = format!(
-                "**{}** phase sent ~{:.0} input tokens per call across {} runs with <10% variation \
-                 (min={}, max={}, model={}).\n\n\
-                 This strongly suggests the same prompt is being sent repeatedly. \
-                 Consider enabling prompt caching or deduplicating redundant calls.",
-                row.phase,
-                avg,
-                row.run_count,
-                row.min_input,
-                row.max_input,
-                row.model_used,
-            );
-            let evidence = serde_json::json!({
-                "phase": row.phase,
-                "model_used": row.model_used,
-                "run_count": row.run_count,
-                "avg_input_tokens": avg,
-                "min_input_tokens": row.min_input,
-                "max_input_tokens": row.max_input,
-                "variation_pct": variation * 100.0,
-            })
-            .to_string();
-
-            info!(
-                "Duplicate prompt detected: phase={}, runs={}, variation={:.1}%",
-                row.phase,
-                row.run_count,
-                variation * 100.0,
-            );
-
-            match recommendations::create_recommendation(
-                pg_db,
-                "pipeline_prompt",
-                "cost_optimization",
-                None,
-                &title,
-                &description,
-                None,
-                None,
-                Some(&evidence),
-                confidence,
-                None,
-            ) {
-                Ok(rec) => results.push(rec),
-                Err(e) => warn!("Failed to create duplicate prompt recommendation: {}", e),
-            }
-
-            // One recommendation per run is enough
-            break;
-        }
-    }
-
-    results
+    Vec::new()
 }
 
 /// Identify phases where a cheaper model achieves similar pass rates.
@@ -813,170 +572,7 @@ pub fn detect_model_downgrade_opportunities(
     db: &CheckpointDb,
     pg_db: &Arc<PgDb>,
 ) -> Vec<Recommendation> {
-    let conn = match db.get_conn() {
-        Ok(c) => c,
-        Err(e) => {
-            debug!("Model downgrade detection: failed to get DB conn: {}", e);
-            return Vec::new();
-        }
-    };
-
-    // Query phase_model_routing for phases with multiple model tiers
-    let mut stmt = match conn.prepare(
-        r#"SELECT phase, model_tier, q_value, visit_count
-           FROM phase_model_routing
-           WHERE visit_count >= 3
-           ORDER BY phase, q_value DESC"#,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            debug!("Model downgrade detection: query prep failed: {}", e);
-            return Vec::new();
-        }
-    };
-
-    struct RoutingRow {
-        phase: String,
-        model_tier: String,
-        q_value: f64,
-        visit_count: i64,
-    }
-
-    let rows: Vec<RoutingRow> = match stmt.query_map([], |row| {
-        Ok(RoutingRow {
-            phase: row.get(0)?,
-            model_tier: row.get(1)?,
-            q_value: row.get(2)?,
-            visit_count: row.get(3)?,
-        })
-    }) {
-        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-        Err(e) => {
-            debug!("Model downgrade detection: query failed: {}", e);
-            return Vec::new();
-        }
-    };
-
-    if rows.is_empty() {
-        return Vec::new();
-    }
-
-    // Group by phase
-    use std::collections::HashMap;
-    let mut by_phase: HashMap<String, Vec<&RoutingRow>> = HashMap::new();
-    for row in &rows {
-        by_phase.entry(row.phase.clone()).or_default().push(row);
-    }
-
-    // Model tier cost ranking (higher index = more expensive).
-    // Tiers in phase_model_routing are stored as "simple"/"medium"/"complex"
-    // (from model_q_router.rs tier_to_str()), not model family names.
-    let tier_cost_rank = |tier: &str| -> u32 {
-        match tier.to_lowercase().as_str() {
-            "simple" => 0,
-            "medium" => 1,
-            "complex" => 2,
-            _ => 1, // default to medium
-        }
-    };
-
-    let mut results = Vec::new();
-
-    for (phase, tiers) in &by_phase {
-        if tiers.len() < 2 {
-            continue;
-        }
-
-        // Find the most-used (highest visit_count) tier
-        let dominant = tiers.iter().max_by_key(|t| t.visit_count).unwrap();
-        let dominant_rank = tier_cost_rank(&dominant.model_tier);
-
-        // Look for cheaper tiers with comparable Q-values (within 15%)
-        for tier in tiers {
-            let tier_rank = tier_cost_rank(&tier.model_tier);
-            if tier_rank >= dominant_rank {
-                continue; // Not cheaper
-            }
-            if tier.visit_count < 3 {
-                continue; // Insufficient data
-            }
-
-            // Q-value comparison: cheaper tier within 15% of dominant
-            let q_gap = if dominant.q_value.abs() > 0.001 {
-                (dominant.q_value - tier.q_value).abs() / dominant.q_value.abs()
-            } else {
-                // Both near zero — comparable
-                0.0
-            };
-
-            if q_gap <= 0.15 {
-                let title = format!(
-                    "Model downgrade opportunity: {} phase ({}→{})",
-                    phase, dominant.model_tier, tier.model_tier
-                );
-
-                let total_visits: i64 = tiers.iter().map(|t| t.visit_count).sum();
-                let confidence = compute_confidence(total_visits, 10, 30);
-                let description = format!(
-                    "**{}** phase primarily uses **{}** (Q={:.3}, {} visits) but **{}** \
-                     has comparable quality (Q={:.3}, {} visits, {:.1}% gap).\n\n\
-                     Switching to the cheaper tier could reduce cost without \
-                     meaningful quality loss. Consider adjusting model routing \
-                     to prefer the cheaper tier for this phase.",
-                    phase,
-                    dominant.model_tier,
-                    dominant.q_value,
-                    dominant.visit_count,
-                    tier.model_tier,
-                    tier.q_value,
-                    tier.visit_count,
-                    q_gap * 100.0,
-                );
-                let evidence = serde_json::json!({
-                    "phase": phase,
-                    "dominant_tier": dominant.model_tier,
-                    "dominant_q_value": dominant.q_value,
-                    "dominant_visits": dominant.visit_count,
-                    "cheaper_tier": tier.model_tier,
-                    "cheaper_q_value": tier.q_value,
-                    "cheaper_visits": tier.visit_count,
-                    "q_gap_pct": q_gap * 100.0,
-                })
-                .to_string();
-
-                info!(
-                    "Model downgrade opportunity: phase={}, {}→{}, q_gap={:.1}%",
-                    phase, dominant.model_tier, tier.model_tier, q_gap * 100.0,
-                );
-
-                match recommendations::create_recommendation(
-                    pg_db,
-                    "pipeline_prompt",
-                    "cost_optimization",
-                    None,
-                    &title,
-                    &description,
-                    Some(&dominant.model_tier),
-                    Some(&tier.model_tier),
-                    Some(&evidence),
-                    confidence,
-                    None,
-                ) {
-                    Ok(rec) => results.push(rec),
-                    Err(e) => warn!("Failed to create model downgrade recommendation: {}", e),
-                }
-
-                break; // One recommendation per phase
-            }
-        }
-
-        // Limit total recommendations
-        if results.len() >= 3 {
-            break;
-        }
-    }
-
-    results
+    Vec::new()
 }
 
 /// Query aggregate cache token stats from SQLite phase_token_usage.
@@ -986,36 +582,13 @@ fn query_cache_stats(
     db: &CheckpointDb,
     since: &str,
 ) -> Result<(i64, i64, i64, i64), String> {
-    let conn = db.get_conn()?;
-    let mut stmt = conn
-        .prepare(
-            r#"SELECT
-                COALESCE(SUM(input_tokens), 0) as total_input,
-                COALESCE(SUM(cache_creation_tokens), 0) as total_creation,
-                COALESCE(SUM(cache_read_tokens), 0) as total_read,
-                COUNT(DISTINCT task_run_id) as run_count
-            FROM phase_token_usage
-            WHERE created_at > ?1"#,
-        )
-        .map_err(|e| format!("Failed to prepare cache stats query: {}", e))?;
-
-    let row = stmt
-        .query_row(rusqlite::params![since], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map_err(|e| format!("Failed to query cache stats: {}", e))?;
-
-    Ok(row)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_compute_confidence() {

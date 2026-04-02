@@ -5,8 +5,8 @@
 
 #![allow(dead_code)]
 
+use crate::database::Connection;
 use crate::tiered_info::{get_flaky_templates, get_flaky_transitions, FlakyItem};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -83,18 +83,7 @@ impl FlakinessCache {
     /// # Returns
     /// A new `FlakinessCache` with the loaded data.
     pub fn load(conn: &Connection, config_id: &str, threshold: f64) -> Result<Self, String> {
-        let transitions = get_flaky_transitions(conn, config_id, threshold)?;
-        let templates = get_flaky_templates(conn, config_id, threshold)?;
-
-        Ok(Self {
-            config_id: config_id.to_string(),
-            flaky_transitions: transitions
-                .into_iter()
-                .map(|f| (f.name.clone(), f))
-                .collect(),
-            flaky_templates: templates.into_iter().map(|f| (f.name.clone(), f)).collect(),
-            loaded_at: Instant::now(),
-        })
+        Err("SQLite removed".to_string())
     }
 
     /// Check if the cache is stale (older than 5 minutes).
@@ -273,6 +262,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_severity_from_success_rate() {

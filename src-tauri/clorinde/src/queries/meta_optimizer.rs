@@ -335,7 +335,7 @@ where
 pub struct GetRecommendationStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_recommendation() -> GetRecommendationStmt {
     GetRecommendationStmt(
-        "SELECT id, optimizer_type, recommendation_type, target_agent, title, description, current_value, recommended_value, evidence, confidence, status, applied_at, outcome_after_apply, optimizer_run_id, created_at, content_hash, eval_result_id, eval_status FROM meta_optimizer_recommendations WHERE id = $1",
+        "SELECT id, optimizer_type, recommendation_type, target_agent, title, description, current_value, recommended_value, evidence, confidence, status, COALESCE(applied_at, NOW()) as applied_at, COALESCE(outcome_after_apply, '') as outcome_after_apply, COALESCE(optimizer_run_id, '') as optimizer_run_id, created_at, COALESCE(content_hash, '') as content_hash, COALESCE(eval_result_id, '') as eval_result_id, COALESCE(eval_status, '') as eval_status FROM meta_optimizer_recommendations WHERE id = $1",
         None,
     )
 }
@@ -447,7 +447,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
 pub struct GetRecommendationAppliedAtStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_recommendation_applied_at() -> GetRecommendationAppliedAtStmt {
     GetRecommendationAppliedAtStmt(
-        "SELECT applied_at FROM meta_optimizer_recommendations WHERE id = $1",
+        "SELECT COALESCE(applied_at, NOW()) as applied_at FROM meta_optimizer_recommendations WHERE id = $1",
         None,
     )
 }

@@ -11,7 +11,9 @@ WHERE id = :id
 RETURNING id;
 
 --! get_approval_gates_for_task_run
-SELECT id, task_run_id, iteration, prompt, context_json, action, comment, status, created_at, resolved_at
+SELECT id, task_run_id, iteration, prompt, context_json,
+       COALESCE(action, '') as action, COALESCE(comment, '') as comment, status,
+       created_at, COALESCE(resolved_at, NOW()) as resolved_at
 FROM approval_gates
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;

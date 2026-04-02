@@ -242,7 +242,7 @@ UPDATE unified_workflows SET sync_pending = false WHERE id = :id;
 UPDATE unified_workflows SET sync_pending = true, updated_at = NOW() WHERE id = :id;
 
 --! list_slash_command_sources
-SELECT id, name, source_file_path FROM unified_workflows
+SELECT id, name, COALESCE(source_file_path, '') as source_file_path FROM unified_workflows
 WHERE source_file_path IS NOT NULL;
 
 --! upsert_slash_command_workflow (description?, source_content_hash?)
@@ -266,12 +266,12 @@ SELECT
     COUNT(*)::bigint as total_runs,
     COUNT(*) FILTER (WHERE status = 'complete')::bigint as success_count,
     COUNT(*) FILTER (WHERE status = 'failed')::bigint as failure_count,
-    MAX(created_at) as last_run_at,
-    (SELECT status FROM task_runs WHERE workflow_name = :workflow_name
-     ORDER BY created_at DESC LIMIT 1) as last_run_status,
-    AVG(CASE WHEN completed_at IS NOT NULL
+    COALESCE(MAX(created_at), NOW()) as last_run_at,
+    COALESCE((SELECT status FROM task_runs WHERE workflow_name = :workflow_name
+     ORDER BY created_at DESC LIMIT 1), '') as last_run_status,
+    COALESCE(AVG(CASE WHEN completed_at IS NOT NULL
         THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000
-        END)::double precision as avg_duration_ms
+        END)::double precision, 0) as avg_duration_ms
 FROM task_runs
 WHERE workflow_name = :workflow_name;
 

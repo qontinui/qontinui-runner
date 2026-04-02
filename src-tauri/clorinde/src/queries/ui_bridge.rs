@@ -1886,7 +1886,7 @@ impl<
 pub struct GetStallEventsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_stall_events() -> GetStallEventsStmt {
     GetStallEventsStmt(
-        "SELECT id, task_run_id, iteration, pattern_type, pattern_details, action_count, intervention_action, intervention_result, created_at FROM stall_events WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, iteration, pattern_type, COALESCE(pattern_details, '') as pattern_details, COALESCE(action_count, 0) as action_count, COALESCE(intervention_action, '') as intervention_action, COALESCE(intervention_result, '') as intervention_result, created_at FROM stall_events WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }

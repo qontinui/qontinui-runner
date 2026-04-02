@@ -2462,6 +2462,7 @@ pub async fn get_approval_gates(
 // End Task Run HTTP API Handlers
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
     use axum::routing::{get, post};
+use crate::database::CheckpointDb;
     axum::Router::new()
         .route("/task-runs", get(list_task_runs).post(create_task_run))
         .route("/task-runs/running", get(list_running_task_runs))

@@ -28,6 +28,17 @@ FROM task_run_events
 WHERE task_run_id = :task_run_id AND event_type = :event_type
 ORDER BY timestamp ASC;
 
+--! get_task_run_events_by_type_limited
+SELECT id, task_run_id, COALESCE(event_type, '') as event_type,
+       COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message,
+       COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name,
+       COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id,
+       COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms
+FROM task_run_events
+WHERE task_run_id = :task_run_id AND event_type = :event_type
+ORDER BY timestamp ASC
+LIMIT :max_results;
+
 --! get_task_run_events_limited
 SELECT id, task_run_id, COALESCE(event_type, '') as event_type,
        COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message,
@@ -57,17 +68,21 @@ VALUES (:id, :task_run_id, :event_id, :file_path, :screenshot_type,
         :width, :height, :file_size_bytes, NOW());
 
 --! get_task_run_screenshots_all
-SELECT id, task_run_id, event_id, file_path, screenshot_type,
-       template_name, confidence, match_location,
-       width, height, file_size_bytes, created_at
+SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type,
+       COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence,
+       COALESCE(match_location, '') as match_location,
+       COALESCE(width, 0) as width, COALESCE(height, 0) as height,
+       COALESCE(file_size_bytes, 0) as file_size_bytes, created_at
 FROM task_run_screenshots
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
 --! get_task_run_screenshots_by_type
-SELECT id, task_run_id, event_id, file_path, screenshot_type,
-       template_name, confidence, match_location,
-       width, height, file_size_bytes, created_at
+SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type,
+       COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence,
+       COALESCE(match_location, '') as match_location,
+       COALESCE(width, 0) as width, COALESCE(height, 0) as height,
+       COALESCE(file_size_bytes, 0) as file_size_bytes, created_at
 FROM task_run_screenshots
 WHERE task_run_id = :task_run_id AND screenshot_type = :screenshot_type
 ORDER BY created_at ASC;
@@ -84,13 +99,27 @@ VALUES (:id, :task_run_id, :test_name, :spec_file, :status, :duration_ms,
         :assertions_passed, :assertions_failed, NOW());
 
 --! get_task_run_playwright_results_all
-SELECT id, task_run_id, test_name, spec_file, status, duration_ms,
-       stdout, stderr, console_output, page_snapshot,
-       error_message, failure_screenshot_path,
+SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status,
+       COALESCE(duration_ms, 0) as duration_ms,
+       COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr,
+       COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot,
+       COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path,
        assertions_passed, assertions_failed, created_at
 FROM task_run_playwright_results
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
+
+--! get_task_run_playwright_results_limited
+SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status,
+       COALESCE(duration_ms, 0) as duration_ms,
+       COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr,
+       COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot,
+       COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path,
+       assertions_passed, assertions_failed, created_at
+FROM task_run_playwright_results
+WHERE task_run_id = :task_run_id
+ORDER BY created_at ASC
+LIMIT :max_results OFFSET :skip_results;
 
 --! create_task_run_api_request (step_name?, request_headers?, request_body?, status_text?, response_headers?, response_body?, response_size_bytes?, extractions?, assertions?, error_message?)
 INSERT INTO task_run_api_requests
@@ -106,14 +135,33 @@ VALUES (:id, :task_run_id, :step_id, :step_name,
         :extractions, :assertions, :success, :error_message, NOW());
 
 --! get_task_run_api_requests_all
-SELECT id, task_run_id, step_id, step_name,
-       method, url, resolved_url, request_headers, request_body,
-       status_code, status_text, response_headers, response_time_ms,
-       response_body_type, response_body, response_size_bytes,
-       extractions, assertions, success, error_message, created_at
+SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name,
+       method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers,
+       COALESCE(request_body, '') as request_body,
+       status_code, COALESCE(status_text, '') as status_text,
+       COALESCE(response_headers, '{}') as response_headers, response_time_ms,
+       response_body_type, COALESCE(response_body, '') as response_body,
+       COALESCE(response_size_bytes, 0) as response_size_bytes,
+       COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions,
+       success, COALESCE(error_message, '') as error_message, created_at
 FROM task_run_api_requests
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
+
+--! get_task_run_api_requests_limited
+SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name,
+       method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers,
+       COALESCE(request_body, '') as request_body,
+       status_code, COALESCE(status_text, '') as status_text,
+       COALESCE(response_headers, '{}') as response_headers, response_time_ms,
+       response_body_type, COALESCE(response_body, '') as response_body,
+       COALESCE(response_size_bytes, 0) as response_size_bytes,
+       COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions,
+       success, COALESCE(error_message, '') as error_message, created_at
+FROM task_run_api_requests
+WHERE task_run_id = :task_run_id
+ORDER BY created_at ASC
+LIMIT :max_results OFFSET :skip_results;
 
 --! create_task_run_awas_step (step_id?, step_name?, url?, action_id?, parameters?, response_data?, error_message?, duration_ms?)
 INSERT INTO task_run_awas_steps
@@ -125,9 +173,20 @@ VALUES (:id, :task_run_id, :step_id, :step_name, :step_type,
         :success, :error_message, :duration_ms, NOW());
 
 --! get_task_run_awas_steps
-SELECT id, task_run_id, step_id, step_name, step_type,
-       url, action_id, parameters, response_data,
-       success, error_message, duration_ms, created_at
+SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type,
+       COALESCE(url, '') as url, COALESCE(action_id, '') as action_id,
+       COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data,
+       success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at
 FROM task_run_awas_steps
 WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
+
+--! get_task_run_awas_steps_limited
+SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type,
+       COALESCE(url, '') as url, COALESCE(action_id, '') as action_id,
+       COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data,
+       success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at
+FROM task_run_awas_steps
+WHERE task_run_id = :task_run_id
+ORDER BY created_at ASC
+LIMIT :max_results OFFSET :skip_results;

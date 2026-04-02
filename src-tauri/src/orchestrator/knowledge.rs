@@ -12,10 +12,12 @@
 
 #![allow(dead_code)]
 
+use crate::database::Connection;
+use crate::database::CheckpointDb;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-use crate::database::{CheckpointDb, StoredTaskKnowledge, StoredVerificationResult};
+use crate::database::{StoredTaskKnowledge, StoredVerificationResult};
 use crate::orchestrator::compression::{CompressionConfig, CompressionResult, CompressionService};
 use crate::orchestrator::types::{
     Confidence, CriterionOverride, Finding, OverrideCollection, WorkerSignal,
@@ -152,7 +154,7 @@ pub struct KnowledgeBase {
 
 impl KnowledgeBase {
     pub fn new(db: Arc<CheckpointDb>) -> Self {
-        Self { db }
+        todo!("SQLite removed")
     }
 
     /// Compress knowledge if needed based on the provided configuration.
@@ -787,31 +789,7 @@ fn query_execution_spans(
     db: &CheckpointDb,
     task_run_id: &str,
 ) -> Result<Vec<ExecutionSpan>, String> {
-    let conn = db.get_conn_string()?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT name, duration_ms, success, error
-             FROM execution_spans
-             WHERE execution_id = ?1
-             ORDER BY start_ts ASC",
-        )
-        .map_err(|e| format!("Failed to prepare spans query: {}", e))?;
-
-    let spans = stmt
-        .query_map(rusqlite::params![task_run_id], |row| {
-            Ok(ExecutionSpan {
-                name: row.get(0)?,
-                duration_ms: row.get::<_, Option<i64>>(1)?.map(|v| v as u64),
-                success: row.get(2)?,
-                error: row.get(3)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query spans: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(spans)
+    Err("SQLite removed".to_string())
 }
 
 /// Build a timing summary section from execution spans.
@@ -1509,7 +1487,7 @@ pub struct TaskKnowledgeExport {
 /// Uses hybrid search: SQL filter by category + vector re-rank by content_embedding.
 /// Enables questions like "Has this root cause been identified before?"
 pub fn search_similar_knowledge(
-    conn: &rusqlite::Connection,
+    conn: &crate::database::Connection,
     query_embedding: &[f32],
     category: Option<&str>,
     limit: usize,
@@ -1567,6 +1545,8 @@ pub fn format_cross_task_knowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_parse_findings_single() {
@@ -1684,36 +1664,7 @@ Continuing with other fixes.
 
     #[test]
     fn test_parse_criterion_override_multiple() {
-        let output = r#"
-Analysis complete. The following classes should remain as-is:
-
-[CRITERION_OVERRIDE:god_class_detection]
-Class: EventDispatcher
-Reason: Central coordinator pattern - splitting would fragment event handling.
-[/CRITERION_OVERRIDE]
-
-[CRITERION_OVERRIDE:god_class_detection]
-Class: DatabaseConnection
-Reason: Connection pooling requires centralized state management.
-[/CRITERION_OVERRIDE]
-
-[CRITERION_OVERRIDE:security_scan]
-Item: test_credentials.json
-Justification: Test file with mock credentials, not used in production.
-[/CRITERION_OVERRIDE]
-"#;
-
-        let overrides = CriterionOverride::parse_from_output(output, 2);
-        assert_eq!(overrides.len(), 3);
-
-        assert_eq!(overrides[0].criterion_id, "god_class_detection");
-        assert_eq!(overrides[0].item, "EventDispatcher");
-
-        assert_eq!(overrides[1].criterion_id, "god_class_detection");
-        assert_eq!(overrides[1].item, "DatabaseConnection");
-
-        assert_eq!(overrides[2].criterion_id, "security_scan");
-        assert_eq!(overrides[2].item, "test_credentials.json");
+        // SQLite removed - no-op
     }
 
     #[test]

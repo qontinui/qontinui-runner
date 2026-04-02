@@ -521,20 +521,6 @@ impl From<crate::rag::storage::RAGStorageError> for AppError {
 // From implementations for external error types
 // =============================================================================
 
-// rusqlite::Error -> AppError
-impl From<rusqlite::Error> for AppError {
-    fn from(err: rusqlite::Error) -> Self {
-        AppError::DatabaseError(err.to_string())
-    }
-}
-
-// r2d2::Error -> AppError (connection pool errors)
-impl From<r2d2::Error> for AppError {
-    fn from(err: r2d2::Error) -> Self {
-        AppError::PoolError(err.to_string())
-    }
-}
-
 // tokio::sync::mpsc::error::SendError -> AppError
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for AppError {
     fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {

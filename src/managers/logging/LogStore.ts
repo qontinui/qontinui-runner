@@ -67,7 +67,7 @@ type StoreListener = () => void;
 // encoded screenshots (several MB each).
 const MAX_GENERAL_LOGS = 5000;
 const MAX_IMAGE_LOGS = 200;
-const MAX_AI_OUTPUT_LOGS = 10000;
+const MAX_AI_OUTPUT_LOGS = 5000;
 
 /**
  * Evict the oldest entries from an array when it exceeds maxSize.

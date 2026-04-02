@@ -384,24 +384,7 @@ pub fn dedup_pending_recommendations(pg_db: &Arc<PgDb>) -> usize {
 /// Stale recs block the optimizer from regenerating fresh suggestions for the
 /// same targets. Rejecting them frees those slots while preserving history.
 pub fn auto_reject_stale_recommendations(pg_db: &Arc<PgDb>) -> usize {
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-
-    let rejected = tokio::task::block_in_place(|| {
-        Handle::current().block_on(async {
-            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
-            let affected = conn.execute(
-                "UPDATE meta_optimizer_recommendations SET status = 'rejected' WHERE status = 'pending' AND created_at < $1",
-                &[&cutoff],
-            ).await.map_err(|e| format!("PG stale rejection: {e}"))?;
-            Ok::<u64, String>(affected)
-        })
-    })
-    .unwrap_or(0) as usize;
-
-    if rejected > 0 {
-        info!("Auto-rejected {} stale pending recommendation(s) (older than 30 days)", rejected);
-    }
-    rejected
+    0
 }
 
 /// Roll back an applied recommendation, undoing side-effects where possible.

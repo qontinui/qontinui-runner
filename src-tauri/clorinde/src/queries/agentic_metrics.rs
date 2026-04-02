@@ -425,7 +425,7 @@ where
 pub struct GetScoresForRunStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_scores_for_run() -> GetScoresForRunStmt {
     GetScoresForRunStmt(
-        "SELECT id, task_run_id, metric_type, score, confidence, rationale, is_llm_judged, model_used, created_at FROM agentic_metric_scores WHERE task_run_id = $1 ORDER BY metric_type",
+        "SELECT id, task_run_id, metric_type, score, confidence, COALESCE(rationale, '') as rationale, is_llm_judged, COALESCE(model_used, '') as model_used, created_at FROM agentic_metric_scores WHERE task_run_id = $1 ORDER BY metric_type",
         None,
     )
 }

@@ -4,8 +4,8 @@
 //! rates, and user feedback to build context that improves future generations.
 //! This is the planned-but-never-created module referenced in the codebase.
 
+use crate::database::Connection;
 use crate::database::pg::PgDb;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -42,31 +42,7 @@ pub struct SelfImprovementContext {
 /// Queries across `task_run_findings`, `learning_outcomes`, `learning_patterns`,
 /// and `workflow_generation_feedback` to build a comprehensive improvement context.
 pub fn analyze_generation_patterns(conn: &Connection) -> Result<SelfImprovementContext, String> {
-    // Load per-agent insights from prompt analysis
-    let (specification_insights, verification_blind_spots, hardener_patterns, builder_insights) =
-        load_agent_insights(conn);
-
-    let ctx = SelfImprovementContext {
-        common_verifier_issues: query_common_verifier_issues(conn)?,
-        fixer_failures: query_fixer_failures(conn)?,
-        success_rates: query_success_rates(conn)?,
-        commonly_edited_fields: query_commonly_edited_fields(conn)?,
-        delete_rate: query_delete_rate(conn)?,
-        avg_rating: query_avg_rating(conn)?,
-        specification_insights,
-        verification_blind_spots,
-        hardener_patterns,
-        builder_insights,
-    };
-
-    debug!(
-        "Self-improvement context: {} verifier issues, {} fixer failures, {} categories tracked",
-        ctx.common_verifier_issues.len(),
-        ctx.fixer_failures.len(),
-        ctx.success_rates.len(),
-    );
-
-    Ok(ctx)
+    Err("SQLite removed".to_string())
 }
 
 /// Format the improvement context as markdown for prompt injection.
@@ -152,145 +128,27 @@ impl SelfImprovementContext {
 // ============================================================================
 
 fn query_common_verifier_issues(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
-    let sql = r#"
-        SELECT f.title, COUNT(*) as cnt
-        FROM task_run_findings f
-        JOIN task_runs tr ON tr.id = f.task_run_id
-        WHERE tr.workflow_name LIKE 'AI Generate:%'
-          AND f.category IN ('verification_issue', 'code_bug', 'structural_issue')
-        GROUP BY f.title
-        ORDER BY cnt DESC
-        LIMIT 10
-    "#;
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to query verifier issues: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|e| format!("Failed to execute verifier issues query: {}", e))?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Err("SQLite removed".to_string())
 }
 
 fn query_fixer_failures(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
-    let sql = r#"
-        SELECT lo.strategy, COUNT(*) as cnt
-        FROM learning_outcomes lo
-        WHERE lo.status = 'failure'
-        GROUP BY lo.strategy
-        ORDER BY cnt DESC
-        LIMIT 10
-    "#;
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to query fixer failures: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|e| format!("Failed to execute fixer failures query: {}", e))?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Err("SQLite removed".to_string())
 }
 
 fn query_success_rates(conn: &Connection) -> Result<Vec<(String, i64, i64)>, String> {
-    let sql = r#"
-        SELECT
-            COALESCE(
-                CASE
-                    WHEN strategy LIKE '%cat=%' THEN
-                        SUBSTR(strategy, INSTR(strategy, 'cat=') + 4,
-                            CASE WHEN INSTR(SUBSTR(strategy, INSTR(strategy, 'cat=') + 4), ')') > 0
-                                THEN INSTR(SUBSTR(strategy, INSTR(strategy, 'cat=') + 4), ')') - 1
-                                ELSE LENGTH(strategy)
-                            END
-                        )
-                    ELSE 'unknown'
-                END,
-                'unknown'
-            ) as category,
-            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
-            COUNT(*) as total_count
-        FROM learning_outcomes
-        GROUP BY category
-        HAVING total_count >= 2
-        ORDER BY total_count DESC
-        LIMIT 10
-    "#;
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to query success rates: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(|e| format!("Failed to execute success rates query: {}", e))?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Err("SQLite removed".to_string())
 }
 
 fn query_commonly_edited_fields(conn: &Connection) -> Result<Vec<(String, i64)>, String> {
-    let sql = r#"
-        SELECT edited_field, COUNT(*) as cnt
-        FROM workflow_generation_feedback
-        WHERE feedback_type = 'edit' AND edited_field IS NOT NULL
-        GROUP BY edited_field
-        ORDER BY cnt DESC
-        LIMIT 5
-    "#;
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to query edited fields: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(|e| format!("Failed to execute edited fields query: {}", e))?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Err("SQLite removed".to_string())
 }
 
 fn query_delete_rate(conn: &Connection) -> Result<(i64, i64), String> {
-    let generated: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT workflow_id) FROM workflow_generation_feedback",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    let deleted: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM workflow_generation_feedback WHERE feedback_type = 'delete'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-
-    Ok((generated, deleted))
+    Err("SQLite removed".to_string())
 }
 
 fn query_avg_rating(conn: &Connection) -> Result<Option<f64>, String> {
-    let avg: Option<f64> = conn
-        .query_row(
-            "SELECT AVG(rating) FROM workflow_generation_feedback WHERE feedback_type = 'rating' AND rating IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
-
-    Ok(avg)
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -299,31 +157,7 @@ fn query_avg_rating(conn: &Connection) -> Result<Option<f64>, String> {
 
 /// Load per-agent insights from prompt analysis, returning (spec, verification, hardener, builder).
 fn load_agent_insights(conn: &Connection) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let all_insights = match prompt_analysis::analyze_all(conn) {
-        Ok(insights) => insights,
-        Err(e) => {
-            warn!("Failed to load prompt analysis insights: {}", e);
-            return (vec![], vec![], vec![], vec![]);
-        }
-    };
-
-    let mut spec = Vec::new();
-    let mut verification = Vec::new();
-    let mut hardener = Vec::new();
-    let mut builder = Vec::new();
-
-    for insight in all_insights {
-        let desc = insight.description.clone();
-        match insight.agent.as_str() {
-            "specification" => spec.push(desc),
-            "verification" => verification.push(desc),
-            "hardener" => hardener.push(desc),
-            "builder" => builder.push(desc),
-            _ => {}
-        }
-    }
-
-    (spec, verification, hardener, builder)
+    todo!("SQLite removed")
 }
 
 // ============================================================================
@@ -398,6 +232,7 @@ pub fn format_builder_insights(context: &SelfImprovementContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_format_specification_insights_empty() {

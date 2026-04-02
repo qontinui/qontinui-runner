@@ -259,61 +259,19 @@ pub fn evaluate_rag_sync(input: &RagJudgeInput) -> Vec<MetricResult> {
 ///
 /// Uses event_type='retrieval' so they can be queried later by the RAG judge.
 pub fn persist_retrieval_event(
-    conn: &rusqlite::Connection,
+    conn: &crate::database::Connection,
     task_run_id: &str,
     event: &RetrievalEvent,
 ) -> Result<(), String> {
-    let id = format!("tre-{}", uuid::Uuid::new_v4());
-    let now = chrono::Utc::now().to_rfc3339();
-    let data_json = serde_json::to_string(event)
-        .map_err(|e| format!("Failed to serialize retrieval event: {}", e))?;
-
-    conn.execute(
-        r#"INSERT INTO task_run_events
-            (id, task_run_id, event_type, event_subtype, message, data, timestamp)
-           VALUES (?1, ?2, 'retrieval', ?3, ?4, ?5, ?6)"#,
-        rusqlite::params![
-            id,
-            task_run_id,
-            event.source_table,
-            format!(
-                "Retrieved {} results from {}",
-                event.result_count, event.source_table
-            ),
-            data_json,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to persist retrieval event: {}", e))?;
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Load retrieval events for a task run (for RAG judge input).
 pub fn load_retrieval_events(
-    conn: &rusqlite::Connection,
+    conn: &crate::database::Connection,
     task_run_id: &str,
 ) -> Result<Vec<RetrievalEvent>, String> {
-    let mut stmt = conn
-        .prepare(
-            r#"SELECT data FROM task_run_events
-               WHERE task_run_id = ?1 AND event_type = 'retrieval'
-               ORDER BY timestamp ASC"#,
-        )
-        .map_err(|e| format!("Failed to prepare retrieval events query: {}", e))?;
-
-    let events: Vec<RetrievalEvent> = stmt
-        .query_map(rusqlite::params![task_run_id], |row| {
-            let data: Option<String> = row.get(0)?;
-            Ok(data)
-        })
-        .map_err(|e| format!("Failed to query retrieval events: {}", e))?
-        .filter_map(|r| r.ok())
-        .flatten()
-        .filter_map(|json| serde_json::from_str(&json).ok())
-        .collect();
-
-    Ok(events)
+    Err("SQLite removed".to_string())
 }
 
 /// Create a RetrievalEvent from any hybrid search results with SearchResult<T>.
@@ -350,6 +308,7 @@ pub fn capture_retrieval_event<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_parse_rag_judge_response_valid() {

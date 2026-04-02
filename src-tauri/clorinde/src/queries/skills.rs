@@ -507,7 +507,7 @@ where
 pub struct ListUserSkillsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_user_skills() -> ListUserSkillsStmt {
     ListUserSkillsStmt(
-        "SELECT id, name, slug, description, category, tags, icon, color, allowed_phases, parameters, template, source, version, author, checksum, depends_on, usage_count, approval_status, forked_from, created_at, updated_at FROM user_skills ORDER BY updated_at DESC",
+        "SELECT id, name, slug, COALESCE(description, '') as description, category, tags, icon, color, allowed_phases, parameters, template, source, version, COALESCE(author, '') as author, COALESCE(checksum, '') as checksum, COALESCE(depends_on, '[]') as depends_on, usage_count, COALESCE(approval_status, 'approved') as approval_status, COALESCE(forked_from, '') as forked_from, created_at, updated_at FROM user_skills ORDER BY updated_at DESC",
         None,
     )
 }
@@ -562,7 +562,7 @@ impl ListUserSkillsStmt {
 pub struct GetUserSkillStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_user_skill() -> GetUserSkillStmt {
     GetUserSkillStmt(
-        "SELECT id, name, slug, description, category, tags, icon, color, allowed_phases, parameters, template, source, version, author, checksum, depends_on, usage_count, approval_status, forked_from, created_at, updated_at FROM user_skills WHERE id = $1",
+        "SELECT id, name, slug, COALESCE(description, '') as description, category, tags, icon, color, allowed_phases, parameters, template, source, version, COALESCE(author, '') as author, COALESCE(checksum, '') as checksum, COALESCE(depends_on, '[]') as depends_on, usage_count, COALESCE(approval_status, 'approved') as approval_status, COALESCE(forked_from, '') as forked_from, created_at, updated_at FROM user_skills WHERE id = $1",
         None,
     )
 }

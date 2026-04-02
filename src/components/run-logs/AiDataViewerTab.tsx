@@ -392,6 +392,8 @@ function AiOutputChunkItem({
   );
 }
 
+const CHUNKS_PAGE_SIZE = 20;
+
 function ConsolidatedAiOutputDisplay({
   chunks,
   totalEntries,
@@ -399,28 +401,39 @@ function ConsolidatedAiOutputDisplay({
   chunks: AiOutputChunk[];
   totalEntries: number;
 }) {
+  const [visibleChunks, setVisibleChunks] = useState(CHUNKS_PAGE_SIZE);
   const LINE_HEIGHT_PX = 18;
   const HEADER_HEIGHT_PX = 45;
   const BASE_UI_HEIGHT_PX = 300;
 
-  const totalLines = chunks.reduce((acc, chunk) => acc + chunk.entry_count, 0);
+  const displayedChunks = chunks.slice(0, visibleChunks);
+  const totalLines = displayedChunks.reduce((acc, chunk) => acc + chunk.entry_count, 0);
   const estimatedTotalHeight =
-    totalLines * LINE_HEIGHT_PX + chunks.length * HEADER_HEIGHT_PX + BASE_UI_HEIGHT_PX;
+    totalLines * LINE_HEIGHT_PX + displayedChunks.length * HEADER_HEIGHT_PX + BASE_UI_HEIGHT_PX;
 
-  const shouldDefaultExpand = chunks.length <= 1 || estimatedTotalHeight < window.innerHeight;
+  const shouldDefaultExpand = displayedChunks.length <= 1 || estimatedTotalHeight < window.innerHeight;
 
   return (
     <div className="space-y-4">
       <div className="text-xs text-muted-foreground mb-2">
-        {chunks.length} chunks from {totalEntries} raw entries
+        Showing {displayedChunks.length} of {chunks.length} chunks from {totalEntries} raw entries
       </div>
-      {chunks.map((chunk, i) => (
+      {displayedChunks.map((chunk, i) => (
         <AiOutputChunkItem
           key={`chunk-${chunk.start_time}-${chunk.source}-${i}`}
           chunk={chunk}
           defaultExpanded={shouldDefaultExpand}
         />
       ))}
+      {visibleChunks < chunks.length && (
+        <button
+          onClick={() => setVisibleChunks((prev) => prev + CHUNKS_PAGE_SIZE)}
+          className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+        >
+          <ChevronDown className="w-3 h-3" />
+          Show more chunks ({chunks.length - visibleChunks} remaining)
+        </button>
+      )}
     </div>
   );
 }
@@ -1166,15 +1179,18 @@ function ApiRequestsSection() {
   );
 }
 
+const AI_OUTPUT_EVENTS_PAGE_SIZE = 100;
+
 function AiOutputSection() {
   const { selectedRunId, selectedRun } = useRunSelection();
   const isCompleted = selectedRun?.completed_at != null;
+  const [aiOutputLimit, setAiOutputLimit] = useState(AI_OUTPUT_EVENTS_PAGE_SIZE);
 
   const {
     data: sqliteEvents,
     isLoading: sqliteLoading,
     error: sqliteError,
-  } = useTaskRunEvents(isCompleted ? selectedRunId : null, "ai_output");
+  } = useTaskRunEvents(isCompleted ? selectedRunId : null, "ai_output", aiOutputLimit);
 
   const {
     data: consolidatedOutput,
@@ -1228,6 +1244,15 @@ function AiOutputSection() {
           <span className="ml-2">{sqliteEvents.count} entries</span>
         </div>
         <EventsDisplay events={sqliteEvents.events} />
+        {sqliteEvents.events.length >= aiOutputLimit && (
+          <button
+            onClick={() => setAiOutputLimit((prev) => prev + AI_OUTPUT_EVENTS_PAGE_SIZE)}
+            className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+          >
+            <ChevronDown className="w-3 h-3" />
+            Load more AI output events
+          </button>
+        )}
       </div>
     );
   }
@@ -1254,16 +1279,19 @@ function AiOutputSection() {
   );
 }
 
+const EVENTS_SERVER_PAGE_SIZE = 200;
+
 function EventsSection() {
   const { selectedRunId, selectedRun } = useRunSelection();
   const isCompleted = selectedRun?.completed_at != null;
   const [eventFilter, setEventFilter] = useState<string | undefined>(undefined);
+  const [eventsLimit, setEventsLimit] = useState(EVENTS_SERVER_PAGE_SIZE);
 
   const {
     data: sqliteEvents,
     isLoading: sqliteLoading,
     error: sqliteError,
-  } = useTaskRunEvents(isCompleted ? selectedRunId : null, eventFilter);
+  } = useTaskRunEvents(isCompleted ? selectedRunId : null, eventFilter, eventsLimit);
 
   const { data: migratedSummary } = useTaskRunMigratedLogsSummary(
     isCompleted ? selectedRunId : null,
@@ -1338,7 +1366,7 @@ function EventsSection() {
           {eventTypes.map(({ type, label, count }) => (
             <button
               key={label}
-              onClick={() => setEventFilter(type)}
+              onClick={() => { setEventFilter(type); setEventsLimit(EVENTS_SERVER_PAGE_SIZE); }}
               className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
                 eventFilter === type
                   ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
@@ -1355,8 +1383,22 @@ function EventsSection() {
       {isCompleted && sqliteEvents ? (
         sqliteEvents.events.length > 0 ? (
           <div className="space-y-2">
-            <div className="text-xs text-muted-foreground">Showing {sqliteEvents.count} events</div>
+            <div className="text-xs text-muted-foreground">
+              Showing {sqliteEvents.count} events
+              {migratedSummary?.events_count != null && sqliteEvents.count < migratedSummary.events_count && (
+                <span className="ml-1">of {migratedSummary.events_count} total</span>
+              )}
+            </div>
             <EventsDisplay events={sqliteEvents.events} />
+            {sqliteEvents.events.length >= eventsLimit && (
+              <button
+                onClick={() => setEventsLimit((prev) => prev + EVENTS_SERVER_PAGE_SIZE)}
+                className="w-full py-2 text-xs text-muted-foreground hover:text-foreground flex items-center justify-center gap-1 border border-border rounded hover:bg-muted/50 transition-colors"
+              >
+                <ChevronDown className="w-3 h-3" />
+                Load more events from server
+              </button>
+            )}
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
@@ -1398,7 +1440,7 @@ function ImageRecognitionSection() {
     data: sqliteEvents,
     isLoading: sqliteLoading,
     error: sqliteError,
-  } = useTaskRunEvents(isCompleted ? selectedRunId : null, "image_recognition");
+  } = useTaskRunEvents(isCompleted ? selectedRunId : null, "image_recognition", 200);
 
   const {
     data: jsonlLogs,

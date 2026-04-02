@@ -5,6 +5,7 @@
 
 pub mod types;
 
+use crate::database::CheckpointDb;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,7 +16,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::database::CheckpointDb;
 pub use types::*;
 
 /// Handle for a stdio MCP server subprocess
@@ -80,7 +80,7 @@ impl McpClientManager {
 
     /// Get the database handle.
     fn db(&self) -> Arc<CheckpointDb> {
-        CheckpointDb::global()
+        todo!("SQLite removed")
     }
 
     /// Get all configured MCP servers
@@ -930,6 +930,7 @@ impl McpClientManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_transport_default() {

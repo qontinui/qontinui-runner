@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 use crate::memory::unified_query::{self, UnifiedMemoryQuery};
 
 // ============================================================================

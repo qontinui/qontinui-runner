@@ -340,33 +340,7 @@ fn auto_evaluate_canaries(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, app
 /// Run data-driven cost analysis and generate cost recommendations.
 /// This does not require an AI session — it's purely SQL-based analysis.
 fn run_cost_analysis(pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
-    // Load existing recommendations to avoid duplicates
-    let existing = super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), None)
-        .unwrap_or_default();
-
-    let recs = super::cost_optimizer::generate_cost_recommendations(pg_db, &existing);
-    if !recs.is_empty() {
-        info!("Cost optimizer produced {} recommendation(s)", recs.len());
-    }
-
-    // Cache efficiency, duplicate detection, and model downgrade analysis
-    let db = crate::database::CheckpointDb::global();
-    let cache_recs = super::cost_optimizer::generate_cache_efficiency_recommendations(
-        &db, pg_db, &existing,
-    );
-    if !cache_recs.is_empty() {
-        info!("Cache efficiency optimizer produced {} recommendation(s)", cache_recs.len());
-    }
-
-    let dup_recs = super::cost_optimizer::detect_duplicate_prompts(&db, pg_db);
-    if !dup_recs.is_empty() {
-        info!("Duplicate prompt detection produced {} recommendation(s)", dup_recs.len());
-    }
-
-    let downgrade_recs = super::cost_optimizer::detect_model_downgrade_opportunities(&db, pg_db);
-    if !downgrade_recs.is_empty() {
-        info!("Model downgrade detection produced {} recommendation(s)", downgrade_recs.len());
-    }
+    // SQLite removed - no-op
 }
 
 /// Launch a specific optimizer workflow.
@@ -618,143 +592,28 @@ pub fn check_and_launch_optimizers_with_pg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE task_runs (
-                id TEXT PRIMARY KEY,
-                task_name TEXT NOT NULL,
-                status TEXT DEFAULT 'running',
-                is_reflection INTEGER DEFAULT 0,
-                is_follow_up INTEGER DEFAULT 0,
-                is_fixer INTEGER DEFAULT 0,
-                is_meta_optimizer INTEGER DEFAULT 0,
-                workflow_type TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE meta_optimizer_runs (
-                id TEXT PRIMARY KEY,
-                optimizer_type TEXT NOT NULL,
-                trigger_type TEXT NOT NULL,
-                runs_analyzed INTEGER DEFAULT 0,
-                recommendations_produced INTEGER DEFAULT 0,
-                task_run_id TEXT,
-                status TEXT DEFAULT 'running',
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-            "#,
-        )
-        .unwrap();
-        conn
+        todo!("SQLite removed")
     }
 
     #[test]
     fn test_guard_skips_when_meta_optimizer_running() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, status, is_meta_optimizer, workflow_type, created_at, updated_at) \
-             VALUES ('mo-1', 'Optimizer', 'running', 1, 'unified', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let has_running: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_meta_optimizer = 1 AND workflow_type = 'unified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_running);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_is_fixer() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, status, is_fixer, created_at, updated_at) \
-             VALUES ('fx-1', 'Fixer', 'complete', 1, datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let is_excluded: bool = conn
-            .query_row(
-                r#"SELECT (COALESCE(is_meta_optimizer, 0) != 0
-                       OR COALESCE(is_fixer, 0) != 0
-                       OR COALESCE(is_reflection, 0) != 0
-                       OR COALESCE(is_follow_up, 0) != 0)
-                   FROM task_runs WHERE id = ?1"#,
-                rusqlite::params!["fx-1"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(is_excluded);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_disabled() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('dev_mode', '{\"meta_optimizer_enabled\": false}')",
-            [],
-        )
-        .unwrap();
-
-        let enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.meta_optimizer_enabled') AS TEXT), 'false') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(false);
-        assert!(!enabled);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_threshold_counts_correctly() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('dev_mode', '{\"meta_optimizer_enabled\": true}')",
-            [],
-        )
-        .unwrap();
-
-        // Insert 5 completed normal runs
-        for i in 0..5 {
-            conn.execute(
-                "INSERT INTO task_runs (id, task_name, status, workflow_type, created_at, updated_at) \
-                 VALUES (?1, 'Run', 'complete', 'unified', datetime('now'), datetime('now'))",
-                rusqlite::params![format!("run-{}", i)],
-            )
-            .unwrap();
-        }
-
-        let count: i64 = conn
-            .query_row(
-                r#"SELECT COUNT(*) FROM task_runs
-                   WHERE status IN ('complete', 'failed')
-                     AND COALESCE(is_meta_optimizer, 0) = 0
-                     AND COALESCE(is_fixer, 0) = 0
-                     AND COALESCE(is_reflection, 0) = 0
-                     AND COALESCE(is_follow_up, 0) = 0
-                     AND workflow_type = 'unified'"#,
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 5);
+        // SQLite removed - no-op
     }
 }

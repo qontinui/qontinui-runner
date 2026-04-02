@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Shield, Check, Info, FileSearch, RefreshCw } from "lucide-react";
+import { getApiBase } from "@/lib/runner-api";
 
 interface SecuritySettingsData {
   default_profile: string;
@@ -185,9 +186,10 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
     setAuditLoading(true);
     try {
       const decisionParam = auditFilter === "all" ? "" : `&decision=${auditFilter}`;
+      const base = getApiBase();
       const [eventsResp, summaryResp] = await Promise.all([
-        fetch(`http://localhost:9876/security/audit/events?limit=50${decisionParam}`),
-        fetch(`http://localhost:9876/security/audit/summary`),
+        fetch(`${base}/security/audit/events?limit=50${decisionParam}`),
+        fetch(`${base}/security/audit/summary`),
       ]);
       if (eventsResp.ok) {
         const eventsData = await eventsResp.json();
@@ -203,6 +205,13 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
       setAuditLoading(false);
     }
   }, [auditFilter]);
+
+  // Auto-load audit data when enabled and filter changes
+  useEffect(() => {
+    if (config.audit_enabled) {
+      loadAuditData();
+    }
+  }, [config.audit_enabled, loadAuditData]);
 
   const saveSettings = async () => {
     try {

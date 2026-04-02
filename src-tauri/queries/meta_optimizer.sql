@@ -3,9 +3,10 @@
 --! get_recommendation
 SELECT id, optimizer_type, recommendation_type, target_agent,
        title, description, current_value, recommended_value,
-       evidence, confidence, status, applied_at,
-       outcome_after_apply, optimizer_run_id,
-       created_at, content_hash, eval_result_id, eval_status
+       evidence, confidence, status, COALESCE(applied_at, NOW()) as applied_at,
+       COALESCE(outcome_after_apply, '') as outcome_after_apply, COALESCE(optimizer_run_id, '') as optimizer_run_id,
+       created_at, COALESCE(content_hash, '') as content_hash, COALESCE(eval_result_id, '') as eval_result_id,
+       COALESCE(eval_status, '') as eval_status
 FROM meta_optimizer_recommendations
 WHERE id = :id;
 
@@ -16,6 +17,6 @@ WHERE id = :id
 RETURNING id, optimizer_type, recommendation_type, status, applied_at;
 
 --! get_recommendation_applied_at
-SELECT applied_at
+SELECT COALESCE(applied_at, NOW()) as applied_at
 FROM meta_optimizer_recommendations
 WHERE id = :id;

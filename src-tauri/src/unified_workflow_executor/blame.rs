@@ -702,7 +702,7 @@ impl EscalationPolicy {
 /// This feeds into `cross_run_learning.rs` — if the same file is blamed across
 /// multiple runs, it's a systemic issue worth surfacing as a pattern.
 pub fn record_blame_as_causal_events(
-    conn: &rusqlite::Connection,
+    conn: &crate::database::Connection,
     task_run_id: &str,
     workflow_name: &str,
     report: &BlameReport,
@@ -783,6 +783,7 @@ pub fn record_blame_as_causal_events(
 mod tests {
     use super::*;
     use crate::step_executor::{StepExecutionConfig, StepExecutionResult, VerificationPhaseResult, VerificationStepDetails};
+use crate::database::Connection;
 
     fn make_step_result(name: &str, success: bool, stdout: Option<&str>, stderr: Option<&str>, error: Option<&str>) -> StepExecutionResult {
         StepExecutionResult {

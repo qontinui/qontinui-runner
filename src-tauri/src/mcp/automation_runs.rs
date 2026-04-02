@@ -46,73 +46,13 @@ pub async fn list_automation_runs(
 
 /// Helper to get recent runs across all configs from task_run_automation.
 pub fn get_all_recent_runs(
-    conn: &rusqlite::Connection,
+    conn: &crate::database::Connection,
     limit: u32,
 ) -> Result<Vec<RunDetails>, String> {
-    use rusqlite::params;
-
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT
-                tra.id, tr.config_id, tra.workflow_name, tra.started_at, tra.ended_at, tra.duration_ms,
-                tra.automation_status, tra.success, tra.error_type, tra.error_message,
-                tra.actions_summary, tra.states_visited, tra.transitions_executed,
-                tra.template_matches, tra.anomalies
-            FROM task_run_automation tra
-            INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-            ORDER BY tra.started_at DESC
-            LIMIT ?1
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let runs = stmt
-        .query_map(params![limit], row_to_run_details_from_automation)
-        .map_err(|e| format!("Failed to query runs: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok(runs)
+    Err("SQLite removed".to_string())
 }
 
-/// Convert a row from task_run_automation to RunDetails.
-pub fn row_to_run_details_from_automation(row: &rusqlite::Row) -> rusqlite::Result<RunDetails> {
-    let status_str: String = row.get(6)?;
-    let actions_json: Option<String> = row.get(10)?;
-    let states_json: Option<String> = row.get(11)?;
-    let transitions_json: Option<String> = row.get(12)?;
-    let templates_json: Option<String> = row.get(13)?;
-    let anomalies_json: Option<String> = row.get(14)?;
-
-    Ok(RunDetails {
-        id: row.get(0)?,
-        config_id: row.get(1)?,
-        workflow_name: row.get(2)?,
-        started_at: row.get(3)?,
-        ended_at: row.get(4)?,
-        duration_ms: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-        status: tiered_info::RunStatus::from_str(&status_str)
-            .unwrap_or(tiered_info::RunStatus::Running),
-        success: row.get(7)?,
-        error_type: row.get(8)?,
-        error_message: row.get(9)?,
-        actions_summary: actions_json.and_then(|j| serde_json::from_str(&j).ok()),
-        states_visited: states_json
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default(),
-        transitions_executed: transitions_json
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default(),
-        template_matches: templates_json
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default(),
-        anomalies: anomalies_json
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default(),
-        screenshots: Vec::new(),
-    })
-}
+// row_to_run_details_from_automation removed (SQLite dead code)
 
 /// Get a specific automation run by ID from task_run_automation.
 pub async fn get_automation_run(

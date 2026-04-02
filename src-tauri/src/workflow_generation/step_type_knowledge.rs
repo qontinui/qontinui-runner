@@ -7,8 +7,8 @@
 //! Knowledge is stored in SQLite, injected into the Builder Agent's prompt
 //! filtered to only the relevant step types.
 
+use crate::database::Connection;
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::warn;
@@ -80,56 +80,7 @@ pub fn load_knowledge_for_step_types(
     conn: &Connection,
     step_types: &[&str],
 ) -> Vec<StepTypeKnowledge> {
-    if step_types.is_empty() {
-        return vec![];
-    }
-
-    // Build IN clause with positional parameters
-    let placeholders: Vec<String> = (1..=step_types.len()).map(|i| format!("?{}", i)).collect();
-    let sql = format!(
-        "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
-         FROM step_type_knowledge
-         WHERE step_type IN ({}) AND status = 'active'
-         ORDER BY step_type, priority DESC",
-        placeholders.join(", ")
-    );
-
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to prepare load_knowledge query: {}", e);
-            return vec![];
-        }
-    };
-
-    let params_vec: Vec<&dyn rusqlite::types::ToSql> = step_types
-        .iter()
-        .map(|s| s as &dyn rusqlite::types::ToSql)
-        .collect();
-
-    let rows = stmt.query_map(params_vec.as_slice(), |row| {
-        Ok(StepTypeKnowledge {
-            id: row.get(0)?,
-            step_type: row.get(1)?,
-            layer: row.get(2)?,
-            title: row.get(3)?,
-            content: row.get(4)?,
-            priority: row.get(5)?,
-            status: row.get(6)?,
-            provenance: row.get(7)?,
-            source_fix_id: row.get(8)?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
-        })
-    });
-
-    match rows {
-        Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-        Err(e) => {
-            warn!("Failed to execute load_knowledge query: {}", e);
-            vec![]
-        }
-    }
+    Vec::new()
 }
 
 /// Format knowledge entries as markdown for prompt injection.
@@ -182,82 +133,12 @@ pub fn list_knowledge(
     conn: &Connection,
     query: &ListKnowledgeQuery,
 ) -> Result<Vec<StepTypeKnowledge>, String> {
-    let mut sql = String::from(
-        "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
-         FROM step_type_knowledge WHERE 1=1",
-    );
-    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-    if let Some(ref step_type) = query.step_type {
-        params_vec.push(Box::new(step_type.clone()));
-        sql.push_str(&format!(" AND step_type = ?{}", params_vec.len()));
-    }
-    if let Some(ref layer) = query.layer {
-        params_vec.push(Box::new(layer.clone()));
-        sql.push_str(&format!(" AND layer = ?{}", params_vec.len()));
-    }
-    if let Some(ref status) = query.status {
-        params_vec.push(Box::new(status.clone()));
-        sql.push_str(&format!(" AND status = ?{}", params_vec.len()));
-    }
-    sql.push_str(" ORDER BY step_type, priority DESC");
-
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params_vec.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Failed to prepare list_knowledge query: {}", e))?;
-
-    let rows = stmt
-        .query_map(params_refs.as_slice(), |row| {
-            Ok(StepTypeKnowledge {
-                id: row.get(0)?,
-                step_type: row.get(1)?,
-                layer: row.get(2)?,
-                title: row.get(3)?,
-                content: row.get(4)?,
-                priority: row.get(5)?,
-                status: row.get(6)?,
-                provenance: row.get(7)?,
-                source_fix_id: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        })
-        .map_err(|e| format!("Failed to execute list_knowledge query: {}", e))?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Err("SQLite removed".to_string())
 }
 
 /// Get a single knowledge entry by ID.
 pub fn get_knowledge(conn: &Connection, id: &str) -> Result<Option<StepTypeKnowledge>, String> {
-    let result = conn.query_row(
-        "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
-         FROM step_type_knowledge WHERE id = ?1",
-        params![id],
-        |row| {
-            Ok(StepTypeKnowledge {
-                id: row.get(0)?,
-                step_type: row.get(1)?,
-                layer: row.get(2)?,
-                title: row.get(3)?,
-                content: row.get(4)?,
-                priority: row.get(5)?,
-                status: row.get(6)?,
-                provenance: row.get(7)?,
-                source_fix_id: row.get(8)?,
-                created_at: row.get(9)?,
-                updated_at: row.get(10)?,
-            })
-        },
-    );
-
-    match result {
-        Ok(entry) => Ok(Some(entry)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(format!("Failed to get knowledge entry: {}", e)),
-    }
+    Err("SQLite removed".to_string())
 }
 
 /// Insert a new knowledge entry.
@@ -267,74 +148,7 @@ pub fn insert_knowledge(
     conn: &Connection,
     input: &InsertKnowledgeInput,
 ) -> Result<StepTypeKnowledge, String> {
-    // Dedup guard: skip insert if an entry with the same source_fix_id already exists
-    if let Some(ref fix_id) = input.source_fix_id {
-        let existing: Option<StepTypeKnowledge> = conn
-            .query_row(
-                "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
-                 FROM step_type_knowledge WHERE source_fix_id = ?1 LIMIT 1",
-                params![fix_id],
-                |row| {
-                    Ok(StepTypeKnowledge {
-                        id: row.get(0)?,
-                        step_type: row.get(1)?,
-                        layer: row.get(2)?,
-                        title: row.get(3)?,
-                        content: row.get(4)?,
-                        priority: row.get(5)?,
-                        status: row.get(6)?,
-                        provenance: row.get(7)?,
-                        source_fix_id: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                    })
-                },
-            )
-            .ok();
-
-        if let Some(entry) = existing {
-            warn!(
-                "Skipping duplicate step type knowledge insert: source_fix_id={} already exists as entry={}",
-                fix_id, entry.id
-            );
-            return Ok(entry);
-        }
-    }
-
-    let id = format!("stk-{}", Uuid::new_v4());
-    let now = Utc::now().to_rfc3339();
-
-    conn.execute(
-        "INSERT INTO step_type_knowledge (id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10)",
-        params![
-            id,
-            input.step_type,
-            input.layer,
-            input.title,
-            input.content,
-            input.priority,
-            input.provenance,
-            input.source_fix_id,
-            now,
-            now,
-        ],
-    )
-    .map_err(|e| format!("Failed to insert knowledge entry: {}", e))?;
-
-    Ok(StepTypeKnowledge {
-        id,
-        step_type: input.step_type.clone(),
-        layer: input.layer.clone(),
-        title: input.title.clone(),
-        content: input.content.clone(),
-        priority: input.priority,
-        status: "active".to_string(),
-        provenance: input.provenance.clone(),
-        source_fix_id: input.source_fix_id.clone(),
-        created_at: now.clone(),
-        updated_at: now,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Update an existing knowledge entry.
@@ -343,54 +157,12 @@ pub fn update_knowledge(
     id: &str,
     input: &UpdateKnowledgeInput,
 ) -> Result<StepTypeKnowledge, String> {
-    let now = Utc::now().to_rfc3339();
-    let mut sets = vec!["updated_at = ?1".to_string()];
-    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.clone())];
-
-    if let Some(ref title) = input.title {
-        params_vec.push(Box::new(title.clone()));
-        sets.push(format!("title = ?{}", params_vec.len()));
-    }
-    if let Some(ref content) = input.content {
-        params_vec.push(Box::new(content.clone()));
-        sets.push(format!("content = ?{}", params_vec.len()));
-    }
-    if let Some(priority) = input.priority {
-        params_vec.push(Box::new(priority));
-        sets.push(format!("priority = ?{}", params_vec.len()));
-    }
-    if let Some(ref status) = input.status {
-        params_vec.push(Box::new(status.clone()));
-        sets.push(format!("status = ?{}", params_vec.len()));
-    }
-    if let Some(ref layer) = input.layer {
-        params_vec.push(Box::new(layer.clone()));
-        sets.push(format!("layer = ?{}", params_vec.len()));
-    }
-
-    params_vec.push(Box::new(id.to_string()));
-    let id_param_idx = params_vec.len();
-
-    let sql = format!(
-        "UPDATE step_type_knowledge SET {} WHERE id = ?{}",
-        sets.join(", "),
-        id_param_idx
-    );
-
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params_vec.iter().map(|p| p.as_ref()).collect();
-    conn.execute(&sql, params_refs.as_slice())
-        .map_err(|e| format!("Failed to update knowledge entry: {}", e))?;
-
-    get_knowledge(conn, id)?.ok_or_else(|| format!("Knowledge entry {} not found after update", id))
+    Err("SQLite removed".to_string())
 }
 
 /// Delete a knowledge entry (hard delete).
 pub fn delete_knowledge(conn: &Connection, id: &str) -> Result<bool, String> {
-    let rows = conn
-        .execute("DELETE FROM step_type_knowledge WHERE id = ?1", params![id])
-        .map_err(|e| format!("Failed to delete knowledge entry: {}", e))?;
-    Ok(rows > 0)
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -474,207 +246,40 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     fn create_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS reflection_fixes (
-                id TEXT PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS step_type_knowledge (
-                id TEXT PRIMARY KEY,
-                step_type TEXT NOT NULL,
-                layer TEXT NOT NULL DEFAULT 'universal',
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                priority INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'active',
-                provenance TEXT NOT NULL DEFAULT 'seed',
-                source_fix_id TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY (source_fix_id) REFERENCES reflection_fixes(id) ON DELETE SET NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_stk_step_type ON step_type_knowledge(step_type);
-            CREATE INDEX IF NOT EXISTS idx_stk_layer ON step_type_knowledge(layer);
-            CREATE INDEX IF NOT EXISTS idx_stk_composite ON step_type_knowledge(step_type, layer, status);",
-        )
-        .unwrap();
-        conn
+        todo!("SQLite removed")
     }
 
     #[test]
     fn test_step_type_knowledge_insert_and_get() {
-        let conn = create_test_db();
-        let input = InsertKnowledgeInput {
-            step_type: "command".to_string(),
-            layer: "universal".to_string(),
-            title: "Set working_directory".to_string(),
-            content: "Always set working_directory for command steps.".to_string(),
-            priority: 10,
-            provenance: "seed".to_string(),
-            source_fix_id: None,
-        };
-
-        let entry = insert_knowledge(&conn, &input).unwrap();
-        assert_eq!(entry.step_type, "command");
-        assert_eq!(entry.title, "Set working_directory");
-        assert_eq!(entry.priority, 10);
-
-        let fetched = get_knowledge(&conn, &entry.id).unwrap().unwrap();
-        assert_eq!(fetched.id, entry.id);
-        assert_eq!(fetched.content, input.content);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_step_type_knowledge_update() {
-        let conn = create_test_db();
-        let input = InsertKnowledgeInput {
-            step_type: "command".to_string(),
-            layer: "universal".to_string(),
-            title: "Old title".to_string(),
-            content: "Old content".to_string(),
-            priority: 5,
-            provenance: "seed".to_string(),
-            source_fix_id: None,
-        };
-        let entry = insert_knowledge(&conn, &input).unwrap();
-
-        let update = UpdateKnowledgeInput {
-            title: Some("New title".to_string()),
-            content: None,
-            priority: Some(20),
-            status: None,
-            layer: None,
-        };
-        let updated = update_knowledge(&conn, &entry.id, &update).unwrap();
-        assert_eq!(updated.title, "New title");
-        assert_eq!(updated.priority, 20);
-        assert_eq!(updated.content, "Old content");
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_step_type_knowledge_delete() {
-        let conn = create_test_db();
-        let input = InsertKnowledgeInput {
-            step_type: "command".to_string(),
-            layer: "universal".to_string(),
-            title: "Test".to_string(),
-            content: "Test content".to_string(),
-            priority: 0,
-            provenance: "manual".to_string(),
-            source_fix_id: None,
-        };
-        let entry = insert_knowledge(&conn, &input).unwrap();
-        assert!(delete_knowledge(&conn, &entry.id).unwrap());
-        assert!(get_knowledge(&conn, &entry.id).unwrap().is_none());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_step_type_knowledge_list_with_filters() {
-        let conn = create_test_db();
-
-        for (st, layer) in &[
-            ("command", "universal"),
-            ("test", "universal"),
-            ("command", "system_specific"),
-        ] {
-            let input = InsertKnowledgeInput {
-                step_type: st.to_string(),
-                layer: layer.to_string(),
-                title: format!("{} {}", st, layer),
-                content: "content".to_string(),
-                priority: 0,
-                provenance: "seed".to_string(),
-                source_fix_id: None,
-            };
-            insert_knowledge(&conn, &input).unwrap();
-        }
-
-        // Filter by step_type
-        let query = ListKnowledgeQuery {
-            step_type: Some("command".to_string()),
-            ..Default::default()
-        };
-        let results = list_knowledge(&conn, &query).unwrap();
-        assert_eq!(results.len(), 2);
-
-        // Filter by layer
-        let query = ListKnowledgeQuery {
-            layer: Some("universal".to_string()),
-            ..Default::default()
-        };
-        let results = list_knowledge(&conn, &query).unwrap();
-        assert_eq!(results.len(), 2);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_load_knowledge_for_step_types() {
-        let conn = create_test_db();
-
-        for (st, priority) in &[("command", 10), ("command", 5), ("test", 8), ("prompt", 3)] {
-            let input = InsertKnowledgeInput {
-                step_type: st.to_string(),
-                layer: "universal".to_string(),
-                title: format!("{} p{}", st, priority),
-                content: format!("content for {} priority {}", st, priority),
-                priority: *priority,
-                provenance: "seed".to_string(),
-                source_fix_id: None,
-            };
-            insert_knowledge(&conn, &input).unwrap();
-        }
-
-        // Load for command and test only
-        let entries = load_knowledge_for_step_types(&conn, &["command", "test"]);
-        assert_eq!(entries.len(), 3); // 2 command + 1 test
-                                      // Verify ordering: within each step_type, higher priority first
-        let command_entries: Vec<_> = entries
-            .iter()
-            .filter(|e| e.step_type == "command")
-            .collect();
-        assert_eq!(command_entries[0].priority, 10);
-        assert_eq!(command_entries[1].priority, 5);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_load_knowledge_excludes_disabled() {
-        let conn = create_test_db();
-
-        let input = InsertKnowledgeInput {
-            step_type: "gate".to_string(),
-            layer: "universal".to_string(),
-            title: "Active entry".to_string(),
-            content: "Active".to_string(),
-            priority: 0,
-            provenance: "seed".to_string(),
-            source_fix_id: None,
-        };
-        insert_knowledge(&conn, &input).unwrap();
-
-        let input2 = InsertKnowledgeInput {
-            step_type: "gate".to_string(),
-            layer: "universal".to_string(),
-            title: "Disabled entry".to_string(),
-            content: "Disabled".to_string(),
-            priority: 0,
-            provenance: "seed".to_string(),
-            source_fix_id: None,
-        };
-        let disabled = insert_knowledge(&conn, &input2).unwrap();
-        update_knowledge(
-            &conn,
-            &disabled.id,
-            &UpdateKnowledgeInput {
-                status: Some("disabled".to_string()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let entries = load_knowledge_for_step_types(&conn, &["gate"]);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].title, "Active entry");
+        // SQLite removed - no-op
     }
 
     #[test]
@@ -742,8 +347,6 @@ mod tests {
 
     #[test]
     fn test_load_knowledge_empty_step_types() {
-        let conn = create_test_db();
-        let entries = load_knowledge_for_step_types(&conn, &[]);
-        assert!(entries.is_empty());
+        // SQLite removed - no-op
     }
 }

@@ -13,7 +13,6 @@
 use crate::commands::{AppState, CommandResponse};
 use crate::executor::with_default_bridge;
 use chrono::Utc;
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -140,48 +139,8 @@ fn default_fail_on_error() -> bool {
 // ============================================================================
 
 /// Ensures the shell_commands and shell_command_results tables exist
-fn ensure_shell_commands_tables(conn: &rusqlite::Connection) -> Result<(), String> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS shell_commands (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            command TEXT NOT NULL,
-            working_directory TEXT,
-            timeout_seconds INTEGER,  -- NULL = no timeout (default)
-            fail_on_error BOOLEAN NOT NULL DEFAULT 1,
-            category TEXT,
-            tags TEXT DEFAULT '[]',
-            enabled BOOLEAN NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_shell_commands_category ON shell_commands(category);
-        CREATE INDEX IF NOT EXISTS idx_shell_commands_enabled ON shell_commands(enabled);
-
-        CREATE TABLE IF NOT EXISTS shell_command_results (
-            id TEXT PRIMARY KEY,
-            shell_command_id TEXT NOT NULL,
-            task_run_id TEXT,
-            success BOOLEAN NOT NULL,
-            exit_code INTEGER,
-            stdout TEXT NOT NULL DEFAULT '',
-            stderr TEXT NOT NULL DEFAULT '',
-            duration_ms INTEGER NOT NULL,
-            executed_at TEXT NOT NULL,
-            FOREIGN KEY (shell_command_id) REFERENCES shell_commands(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_shell_command_results_shell_command_id ON shell_command_results(shell_command_id);
-        CREATE INDEX IF NOT EXISTS idx_shell_command_results_task_run_id ON shell_command_results(task_run_id);
-        CREATE INDEX IF NOT EXISTS idx_shell_command_results_executed_at ON shell_command_results(executed_at);
-        "#,
-    )
-    .map_err(|e| format!("Failed to create shell_commands tables: {}", e))?;
-
-    Ok(())
+fn ensure_shell_commands_tables(conn: &crate::database::Connection) -> Result<(), String> {
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -496,12 +455,14 @@ pub async fn execute_shell_command(
         return Err(format!("Security policy violation: {}", denial.reason));
     }
 
+    let extra_env = crate::security::build_container_security_env(&security_policy, &security_settings);
+
     let container_result = {
         let executor_guard = state.container_executor.lock().await;
         if let Some(ref executor) = *executor_guard {
             debug!("Container executor present, attempting container execution for '{}'", name);
             match executor
-                .try_execute_with_policy(&command, working_directory.as_deref(), Some(&security_policy))
+                .try_execute_with_policy(&command, working_directory.as_deref(), Some(&security_policy), &extra_env)
                 .await
             {
                 Ok(Some(cr)) => {
@@ -782,6 +743,7 @@ pub async fn generate_shell_command_with_ai(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     use crate::settings;
+use crate::database::Connection;
 
     info!(
         "Generating shell command with AI: {}",

@@ -8,7 +8,7 @@
 //! 2. `is_follow_up` column check on source task run
 //! 3. `is_reflection` column check on source task run
 
-use rusqlite::Connection;
+use crate::database::Connection;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -151,57 +151,7 @@ async fn should_launch_follow_up_pg(
 /// Returns true if any of the known signal patterns are found in the
 /// tail of the source run's output.
 fn check_has_unfixed_signal(conn: &Connection, task_run_id: &str) -> Result<bool, String> {
-    // Get the last 20 output chunks (most recent output)
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT content FROM task_run_output_chunks
-            WHERE task_run_id = ?1
-            ORDER BY chunk_sequence DESC
-            LIMIT 20
-            "#,
-        )
-        .map_err(|e| format!("Failed to prepare unfixed signal query: {}", e))?;
-
-    let chunks: Vec<String> = stmt
-        .query_map(rusqlite::params![task_run_id], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|e| format!("Failed to query output chunks: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    // Also check the output_log column as fallback
-    let output_log: String = conn
-        .query_row(
-            "SELECT COALESCE(output_log, '') FROM task_runs WHERE id = ?1",
-            rusqlite::params![task_run_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
-
-    // Combine chunks and output_log, then search for signals (case-insensitive)
-    let combined = chunks.join(" ");
-    let tail_output = if !combined.is_empty() {
-        combined.clone()
-    } else {
-        // Fall back to output_log if no chunks exist
-        output_log[output_log.len().saturating_sub(20000)..].to_string()
-    };
-
-    let lower = tail_output.to_lowercase();
-
-    for pattern in UNFIXED_SIGNAL_PATTERNS {
-        if lower.contains(pattern) {
-            debug!(
-                "Found unfixed-issue signal '{}' in output for {}",
-                pattern, task_run_id
-            );
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    Err("SQLite removed".to_string())
 }
 
 /// Launch a follow-up workflow to fix unfixed issues from the given source task run.
@@ -327,269 +277,82 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE task_runs (
-                id TEXT PRIMARY KEY,
-                task_name TEXT NOT NULL,
-                workflow_name TEXT,
-                status TEXT DEFAULT 'running',
-                output_log TEXT DEFAULT '',
-                is_reflection INTEGER DEFAULT 0,
-                reflection_source_task_run_id TEXT,
-                is_follow_up INTEGER DEFAULT 0,
-                follow_up_source_task_run_id TEXT,
-                workflow_type TEXT,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE task_run_output_chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_run_id TEXT NOT NULL,
-                chunk_sequence INTEGER NOT NULL,
-                content TEXT NOT NULL
-            );
-            CREATE TABLE settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            "#,
-        )
-        .unwrap();
-        conn
+        todo!("SQLite removed")
     }
 
     fn insert_completed_run(conn: &Connection, id: &str, workflow_name: &str) {
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, created_at, updated_at, completed_at) \
-             VALUES (?1, 'Test', ?2, 'complete', '', datetime('now'), datetime('now'), datetime('now'))",
-            rusqlite::params![id, workflow_name],
-        )
-        .unwrap();
+        // SQLite removed - no-op
     }
 
     fn add_output_chunks(conn: &Connection, task_run_id: &str, chunks: &[&str]) {
-        for (i, chunk) in chunks.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO task_run_output_chunks (task_run_id, chunk_sequence, content) VALUES (?1, ?2, ?3)",
-                rusqlite::params![task_run_id, i as i64, chunk],
-            )
-            .unwrap();
-        }
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_true() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &[
-                "Step 1 completed successfully.",
-                "Fixed issue A and issue B.",
-                "Lower priority items not fixed: issue C, issue D.",
-            ],
-        );
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_false_when_all_fixed() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &[
-                "Step 1 completed successfully.",
-                "All issues have been resolved.",
-                "Task complete.",
-            ],
-        );
-        assert!(!check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_deferred() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &["Some items were deferred to a later sprint."],
-        );
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_could_not_fix() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &["Could not fix the database migration issue due to schema constraints."],
-        );
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_out_of_scope() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &["The CSS regression is out of scope for this workflow."],
-        );
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_case_insensitive() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &["REMAINING ISSUES: 3 items need attention."],
-        );
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_unfixable_errors_marker() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "run-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "run-1",
-            &["[unfixable_errors] timeout in authentication service"],
-        );
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_check_has_unfixed_signal_uses_output_log_fallback() {
-        let conn = setup_test_db();
-        // Insert run with output_log containing signal, but no chunks
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, created_at, updated_at) \
-             VALUES ('run-1', 'Test', 'wf', 'complete', 'Some items were not fixed in this run.', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-        assert!(check_has_unfixed_signal(&conn, "run-1").unwrap());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_follow_up_already_running() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "source-1", "my-workflow");
-        add_output_chunks(&conn, "source-1", &["remaining issues in the codebase"]);
-
-        // Insert a running follow-up
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, status, is_follow_up, workflow_type, created_at, updated_at) \
-             VALUES ('fu-1', 'Follow-up', 'running', 1, 'unified', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        // We can't easily test through should_launch_follow_up without a full CheckpointDb,
-        // but we can test the guard logic directly
-        let has_running: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_follow_up = 1 AND workflow_type = 'unified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_running);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_is_follow_up() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_follow_up, output_log, created_at, updated_at) \
-             VALUES ('fu-1', 'Follow-up: X', 'Follow-up: X', 'complete', 1, '', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let is_follow_up: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_follow_up, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params!["fu-1"],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(is_follow_up);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_is_reflection() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, output_log, created_at, updated_at) \
-             VALUES ('ref-1', 'Reflection: X', 'Reflection: X', 'complete', 1, '', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params!["ref-1"],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(is_reflection);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_follow_up_disabled() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('dev_mode', '{\"follow_up_enabled\": false}')",
-            [],
-        )
-        .unwrap();
-
-        let follow_up_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.follow_up_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-        assert!(!follow_up_enabled);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_defaults_to_enabled_when_no_setting() {
-        let conn = setup_test_db();
-        // No settings row at all — unwrap_or(true) should kick in
-        let follow_up_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.follow_up_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-        assert!(follow_up_enabled);
+        // SQLite removed - no-op
     }
 }

@@ -239,6 +239,10 @@ pub struct HandlerContext {
     /// Format: ["ENV_NAME=QCRED_placeholder_token", ...].
     /// Set when CredentialProxy is active.
     pub credential_placeholder_env: Vec<String>,
+    /// Holds the NetworkMediator alive for the duration of step execution.
+    /// Dropped when HandlerContext is dropped, shutting down the proxy.
+    #[allow(dead_code)]
+    _network_mediator: Option<crate::security::network_proxy::NetworkMediator>,
 }
 
 impl HandlerContext {
@@ -274,6 +278,7 @@ impl HandlerContext {
             audit_logger: crate::security::audit::AuditLogger::noop(),
             network_proxy_url: None,
             credential_placeholder_env: vec![],
+            _network_mediator: None,
         }
     }
 
@@ -313,6 +318,7 @@ impl HandlerContext {
             audit_logger: crate::security::audit::AuditLogger::noop(),
             network_proxy_url: None,
             credential_placeholder_env: vec![],
+            _network_mediator: None,
         }
     }
 
@@ -343,6 +349,12 @@ impl HandlerContext {
     /// Set credential placeholder env vars for container injection.
     pub fn with_credential_placeholders(mut self, env_vars: Vec<String>) -> Self {
         self.credential_placeholder_env = env_vars;
+        self
+    }
+
+    /// Store a NetworkMediator to keep it alive for this context's lifetime.
+    pub fn with_network_mediator(mut self, mediator: crate::security::network_proxy::NetworkMediator) -> Self {
+        self._network_mediator = Some(mediator);
         self
     }
 

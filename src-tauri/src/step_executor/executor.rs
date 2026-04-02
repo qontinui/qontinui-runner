@@ -187,42 +187,47 @@ impl StepExecutor {
         )
         .with_path_scope_policy(self.path_scope_policy.clone())
         .with_security_policy(security_policy.clone())
-        .with_audit_logger(audit_logger);
+        .with_audit_logger(audit_logger.clone());
 
-        // Set up credential placeholders when proxy mode is active
-        if security_settings.credential_proxy_enabled
+        // Set up credential proxy when proxy mode is active
+        let credential_proxy = if security_settings.credential_proxy_enabled
             && security_policy.credentials.mode == crate::security::policy::CredentialMode::Proxy
         {
-            let cred_names: Vec<&str> = if security_policy.credentials.allowed_credentials.is_empty()
-            {
-                // Default credentials when no explicit list
-                vec!["claude_api", "openai", "gemini"]
-            } else {
-                security_policy
-                    .credentials
-                    .allowed_credentials
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect()
-            };
+            let cred_names: Vec<&str> =
+                if security_policy.credentials.allowed_credentials.is_empty() {
+                    vec!["claude_api", "openai", "gemini"]
+                } else {
+                    security_policy
+                        .credentials
+                        .allowed_credentials
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect()
+                };
             let cred_proxy =
                 crate::security::credential_proxy::CredentialProxy::new(&cred_names);
             ctx = ctx.with_credential_placeholders(cred_proxy.placeholder_env_vars());
-        }
+            Some(cred_proxy)
+        } else {
+            None
+        };
 
-        // Start network mediation proxy when enabled
+        // Start network mediation proxy when enabled.
+        // The mediator is stored on the HandlerContext so it lives for the step's duration.
         if security_settings.network_proxy_enabled {
             match crate::security::network_proxy::NetworkMediator::start(
                 security_policy.clone(),
-                crate::security::audit::AuditLogger::new(security_settings.audit_enabled),
-                None,
+                audit_logger,
+                credential_proxy,
             )
             .await
             {
                 Ok(mediator) => {
                     let proxy_url = mediator.proxy_url_for_container();
                     info!("Network mediation proxy started at {}", proxy_url);
-                    ctx = ctx.with_network_proxy_url(proxy_url);
+                    ctx = ctx
+                        .with_network_proxy_url(proxy_url)
+                        .with_network_mediator(mediator);
                 }
                 Err(e) => {
                     warn!("Failed to start network mediation proxy: {}", e);

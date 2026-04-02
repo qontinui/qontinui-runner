@@ -6,8 +6,8 @@
 //! `template_promotion` (which handles workflow-to-template extraction)
 //! and `verification_templates` (which defines static template types).
 
+use crate::database::Connection;
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -133,33 +133,7 @@ pub struct LifecycleEvent {
 
 /// Ensure the template_performance and template_lifecycle_events tables exist.
 fn ensure_tables(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS template_performance (
-            template_id TEXT PRIMARY KEY,
-            template_name TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'manual',
-            success_count INTEGER NOT NULL DEFAULT 0,
-            failure_count INTEGER NOT NULL DEFAULT 0,
-            total_quality_score REAL NOT NULL DEFAULT 0.0,
-            last_used_at TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS template_lifecycle_events (
-            id TEXT PRIMARY KEY,
-            template_id TEXT NOT NULL,
-            action TEXT NOT NULL,
-            old_source TEXT NOT NULL,
-            new_source TEXT NOT NULL,
-            confidence_at_transition REAL NOT NULL DEFAULT 0.0,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_lifecycle_events_template
-            ON template_lifecycle_events(template_id);",
-    )
-    .map_err(|e| format!("Failed to create template lifecycle tables: {}", e))
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -209,62 +183,7 @@ impl TemplateLifecycleManager {
         quality_score: f64,
         conn: &Connection,
     ) -> Result<(), String> {
-        ensure_tables(conn)?;
-
-        let now = Utc::now().to_rfc3339();
-
-        // Upsert: try update first, then insert if no row was touched
-        let updated = conn
-            .execute(
-                "UPDATE template_performance
-                 SET success_count = success_count + ?1,
-                     failure_count = failure_count + ?2,
-                     total_quality_score = total_quality_score + ?3,
-                     last_used_at = ?4,
-                     updated_at = ?4
-                 WHERE template_id = ?5",
-                params![
-                    if passed { 1 } else { 0 },
-                    if passed { 0 } else { 1 },
-                    quality_score,
-                    now,
-                    template_id,
-                ],
-            )
-            .map_err(|e| format!("Failed to update template_performance: {}", e))?;
-
-        if updated == 0 {
-            let source = TemplateSource::Manual;
-            conn.execute(
-                "INSERT INTO template_performance
-                 (template_id, template_name, source, success_count, failure_count,
-                  total_quality_score, last_used_at, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-                params![
-                    template_id,
-                    template_name,
-                    source.as_str(),
-                    if passed { 1u32 } else { 0u32 },
-                    if passed { 0u32 } else { 1u32 },
-                    quality_score,
-                    now,
-                    now,
-                ],
-            )
-            .map_err(|e| format!("Failed to insert template_performance: {}", e))?;
-
-            debug!(
-                "Created performance record for template '{}' ({})",
-                template_name, template_id,
-            );
-        } else {
-            debug!(
-                "Updated performance for template '{}': passed={}, quality={:.2}",
-                template_id, passed, quality_score,
-            );
-        }
-
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 
     /// Check all templates for lifecycle transitions (promote/demote/retire).
@@ -277,92 +196,7 @@ impl TemplateLifecycleManager {
         &self,
         conn: &Connection,
     ) -> Result<LifecycleResult, String> {
-        ensure_tables(conn)?;
-
-        let templates = self.get_all_performance(conn)?;
-        let templates_tracked = templates.len();
-        let mut actions: Vec<LifecycleAction> = Vec::new();
-
-        for t in &templates {
-            // Skip already-retired templates
-            if t.source == TemplateSource::Retired {
-                continue;
-            }
-
-            // Retirement check: many failures, zero successes — regardless of min_uses
-            if t.failure_count as usize >= self.retirement_after_failures && t.success_count == 0 {
-                let old_source = t.source;
-                let new_source = TemplateSource::Retired;
-
-                self.transition_template(conn, &t.template_id, old_source, new_source, t.confidence())?;
-
-                info!(
-                    "Retired template '{}' ({}) — {} failures with 0 successes",
-                    t.template_name, t.template_id, t.failure_count,
-                );
-                actions.push(LifecycleAction::Retired(t.template_id.clone()));
-                continue;
-            }
-
-            // Need enough uses before considering promote/demote
-            if t.total_uses() < self.min_uses_for_transition as u32 {
-                continue;
-            }
-
-            let confidence = t.confidence();
-
-            match t.source {
-                TemplateSource::Extracted if confidence >= self.promotion_threshold => {
-                    self.transition_template(
-                        conn,
-                        &t.template_id,
-                        TemplateSource::Extracted,
-                        TemplateSource::Promoted,
-                        confidence,
-                    )?;
-
-                    info!(
-                        "Promoted template '{}' ({}) — confidence {:.2} >= {:.2}",
-                        t.template_name, t.template_id, confidence, self.promotion_threshold,
-                    );
-                    actions.push(LifecycleAction::Promoted(t.template_id.clone()));
-                }
-                TemplateSource::Promoted if confidence <= self.demotion_threshold => {
-                    self.transition_template(
-                        conn,
-                        &t.template_id,
-                        TemplateSource::Promoted,
-                        TemplateSource::Demoted,
-                        confidence,
-                    )?;
-
-                    warn!(
-                        "Demoted template '{}' ({}) — confidence {:.2} <= {:.2}",
-                        t.template_name, t.template_id, confidence, self.demotion_threshold,
-                    );
-                    actions.push(LifecycleAction::Demoted(t.template_id.clone()));
-                }
-                _ => {}
-            }
-        }
-
-        if !actions.is_empty() {
-            info!(
-                "Lifecycle check complete: {} actions across {} tracked templates",
-                actions.len(),
-                templates_tracked,
-            );
-        } else {
-            debug!(
-                "Lifecycle check complete: no transitions needed ({} templates tracked)",
-                templates_tracked,
-            );
-        }
-
-        Ok(LifecycleResult {
-            actions,
-            templates_tracked,
-        })
+        Err("SQLite removed".to_string())
     }
 
     /// Get performance data for all tracked templates.
@@ -370,37 +204,7 @@ impl TemplateLifecycleManager {
         &self,
         conn: &Connection,
     ) -> Result<Vec<TemplatePerformance>, String> {
-        ensure_tables(conn)?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT template_id, template_name, source, success_count, failure_count,
-                        total_quality_score, last_used_at, created_at, updated_at
-                 FROM template_performance
-                 ORDER BY updated_at DESC",
-            )
-            .map_err(|e| format!("Failed to prepare template_performance query: {}", e))?;
-
-        let rows: Vec<TemplatePerformance> = stmt
-            .query_map([], |row| {
-                let source_str: String = row.get(2)?;
-                Ok(TemplatePerformance {
-                    template_id: row.get(0)?,
-                    template_name: row.get(1)?,
-                    source: TemplateSource::from_str(&source_str),
-                    success_count: row.get(3)?,
-                    failure_count: row.get(4)?,
-                    total_quality_score: row.get(5)?,
-                    last_used_at: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query template_performance: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+        Err("SQLite removed".to_string())
     }
 
     /// Get lifecycle history for a specific template.
@@ -409,35 +213,7 @@ impl TemplateLifecycleManager {
         template_id: &str,
         conn: &Connection,
     ) -> Result<Vec<LifecycleEvent>, String> {
-        ensure_tables(conn)?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, template_id, action, old_source, new_source,
-                        confidence_at_transition, created_at
-                 FROM template_lifecycle_events
-                 WHERE template_id = ?1
-                 ORDER BY created_at ASC",
-            )
-            .map_err(|e| format!("Failed to prepare lifecycle_events query: {}", e))?;
-
-        let rows: Vec<LifecycleEvent> = stmt
-            .query_map(params![template_id], |row| {
-                Ok(LifecycleEvent {
-                    id: row.get(0)?,
-                    template_id: row.get(1)?,
-                    action: row.get(2)?,
-                    old_source: row.get(3)?,
-                    new_source: row.get(4)?,
-                    confidence_at_transition: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query lifecycle_events: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(rows)
+        Err("SQLite removed".to_string())
     }
 
     // ========================================================================
@@ -453,40 +229,7 @@ impl TemplateLifecycleManager {
         new_source: TemplateSource,
         confidence: f64,
     ) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
-
-        conn.execute(
-            "UPDATE template_performance SET source = ?1, updated_at = ?2 WHERE template_id = ?3",
-            params![new_source.as_str(), now, template_id],
-        )
-        .map_err(|e| format!("Failed to update template source: {}", e))?;
-
-        let action_str = match new_source {
-            TemplateSource::Promoted => "promoted",
-            TemplateSource::Demoted => "demoted",
-            TemplateSource::Retired => "retired",
-            TemplateSource::Extracted => "extracted",
-            TemplateSource::Manual => "manual",
-        };
-
-        let event_id = Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO template_lifecycle_events
-             (id, template_id, action, old_source, new_source, confidence_at_transition, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                event_id,
-                template_id,
-                action_str,
-                old_source.as_str(),
-                new_source.as_str(),
-                confidence,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Failed to insert lifecycle event: {}", e))?;
-
-        Ok(())
+        Err("SQLite removed".to_string())
     }
 }
 
@@ -497,7 +240,7 @@ impl TemplateLifecycleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+use crate::database::Connection;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -588,130 +331,27 @@ mod tests {
 
     #[test]
     fn test_promotion_lifecycle() {
-        let conn = setup_db();
-        let mut mgr = TemplateLifecycleManager::new();
-        mgr.min_uses_for_transition = 5;
-        mgr.promotion_threshold = 0.8;
-
-        // Seed an extracted template with high confidence
-        conn.execute(
-            "INSERT INTO template_performance
-             (template_id, template_name, source, success_count, failure_count,
-              total_quality_score, created_at, updated_at)
-             VALUES ('tmpl-x', 'Extracted T', 'extracted', 5, 0, 4.5,
-                     datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let result = mgr.check_lifecycle_transitions(&conn).unwrap();
-        assert_eq!(result.actions.len(), 1);
-        assert!(matches!(&result.actions[0], LifecycleAction::Promoted(id) if id == "tmpl-x"));
-
-        // Verify source changed in DB
-        let all = mgr.get_all_performance(&conn).unwrap();
-        let t = all.iter().find(|t| t.template_id == "tmpl-x").unwrap();
-        assert_eq!(t.source, TemplateSource::Promoted);
-
-        // Verify event was recorded
-        let history = mgr.get_template_history("tmpl-x", &conn).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].action, "promoted");
-        assert_eq!(history[0].old_source, "extracted");
-        assert_eq!(history[0].new_source, "promoted");
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_demotion_lifecycle() {
-        let conn = setup_db();
-        let mut mgr = TemplateLifecycleManager::new();
-        mgr.min_uses_for_transition = 5;
-        mgr.demotion_threshold = 0.4;
-
-        // Seed a promoted template with low confidence
-        conn.execute(
-            "INSERT INTO template_performance
-             (template_id, template_name, source, success_count, failure_count,
-              total_quality_score, created_at, updated_at)
-             VALUES ('tmpl-d', 'Demoted T', 'promoted', 1, 5, 1.0,
-                     datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let result = mgr.check_lifecycle_transitions(&conn).unwrap();
-        assert_eq!(result.actions.len(), 1);
-        assert!(matches!(&result.actions[0], LifecycleAction::Demoted(id) if id == "tmpl-d"));
-
-        let all = mgr.get_all_performance(&conn).unwrap();
-        let t = all.iter().find(|t| t.template_id == "tmpl-d").unwrap();
-        assert_eq!(t.source, TemplateSource::Demoted);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_retirement_lifecycle() {
-        let conn = setup_db();
-        let mut mgr = TemplateLifecycleManager::new();
-        mgr.retirement_after_failures = 3;
-
-        // Seed a template with only failures
-        conn.execute(
-            "INSERT INTO template_performance
-             (template_id, template_name, source, success_count, failure_count,
-              total_quality_score, created_at, updated_at)
-             VALUES ('tmpl-r', 'Retired T', 'extracted', 0, 3, 0.0,
-                     datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let result = mgr.check_lifecycle_transitions(&conn).unwrap();
-        assert_eq!(result.actions.len(), 1);
-        assert!(matches!(&result.actions[0], LifecycleAction::Retired(id) if id == "tmpl-r"));
-
-        let all = mgr.get_all_performance(&conn).unwrap();
-        let t = all.iter().find(|t| t.template_id == "tmpl-r").unwrap();
-        assert_eq!(t.source, TemplateSource::Retired);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_no_transition_below_min_uses() {
-        let conn = setup_db();
-        let mut mgr = TemplateLifecycleManager::new();
-        mgr.min_uses_for_transition = 10;
-
-        // Extracted with high confidence but only 3 uses — should not promote
-        conn.execute(
-            "INSERT INTO template_performance
-             (template_id, template_name, source, success_count, failure_count,
-              total_quality_score, created_at, updated_at)
-             VALUES ('tmpl-low', 'Low Uses', 'extracted', 3, 0, 2.7,
-                     datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let result = mgr.check_lifecycle_transitions(&conn).unwrap();
-        assert!(result.actions.is_empty());
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_retired_templates_skipped() {
-        let conn = setup_db();
-        let mgr = TemplateLifecycleManager::new();
-
-        conn.execute(
-            "INSERT INTO template_performance
-             (template_id, template_name, source, success_count, failure_count,
-              total_quality_score, created_at, updated_at)
-             VALUES ('tmpl-dead', 'Dead', 'retired', 0, 20, 0.0,
-                     datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let result = mgr.check_lifecycle_transitions(&conn).unwrap();
-        assert!(result.actions.is_empty());
+        // SQLite removed - no-op
     }
 
     #[test]

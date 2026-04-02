@@ -955,7 +955,7 @@ where
 pub struct GetActivePromptStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_active_prompt() -> GetActivePromptStmt {
     GetActivePromptStmt(
-        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, source_recommendation_id, performance_metrics, created_at, updated_at FROM prompt_registry WHERE agent_type = $1 AND is_active = true LIMIT 1",
+        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, COALESCE(source_recommendation_id, '') as source_recommendation_id, COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at FROM prompt_registry WHERE agent_type = $1 AND is_active = true LIMIT 1",
         None,
     )
 }
@@ -1000,7 +1000,7 @@ impl GetActivePromptStmt {
 pub struct GetPromptByVersionStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_prompt_by_version() -> GetPromptByVersionStmt {
     GetPromptByVersionStmt(
-        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, source_recommendation_id, performance_metrics, created_at, updated_at FROM prompt_registry WHERE agent_type = $1 AND version = $2 LIMIT 1",
+        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, COALESCE(source_recommendation_id, '') as source_recommendation_id, COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at FROM prompt_registry WHERE agent_type = $1 AND version = $2 LIMIT 1",
         None,
     )
 }
@@ -1240,7 +1240,7 @@ impl DeactivateVariantsForAgentStmt {
 pub struct ListVariantsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_variants() -> ListVariantsStmt {
     ListVariantsStmt(
-        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, source_recommendation_id, performance_metrics, created_at, updated_at FROM prompt_registry ORDER BY agent_type, version DESC",
+        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, COALESCE(source_recommendation_id, '') as source_recommendation_id, COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at FROM prompt_registry ORDER BY agent_type, version DESC",
         None,
     )
 }
@@ -1283,7 +1283,7 @@ impl ListVariantsStmt {
 pub struct ListVariantsByAgentStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_variants_by_agent() -> ListVariantsByAgentStmt {
     ListVariantsByAgentStmt(
-        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, source_recommendation_id, performance_metrics, created_at, updated_at FROM prompt_registry WHERE agent_type = $1 ORDER BY version DESC",
+        "SELECT id, agent_type, variant_name, prompt_content, version, is_active, COALESCE(source_recommendation_id, '') as source_recommendation_id, COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at FROM prompt_registry WHERE agent_type = $1 ORDER BY version DESC",
         None,
     )
 }

@@ -3,8 +3,8 @@
 //! Automatically promotes high-quality AI-generated workflows into
 //! parameterized templates that can be reused for similar tasks.
 
+use crate::database::Connection;
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -66,21 +66,7 @@ pub struct PromotionResult {
 
 /// Ensure the promoted_templates table exists.
 fn ensure_table(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS promoted_templates (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            template_json TEXT NOT NULL,
-            parameters TEXT NOT NULL DEFAULT '[]',
-            source_quality_score REAL NOT NULL DEFAULT 0.0,
-            success_count INTEGER NOT NULL DEFAULT 0,
-            source_workflow_id TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            tags TEXT NOT NULL DEFAULT '[]'
-        );",
-    )
-    .map_err(|e| format!("Failed to create promoted_templates table: {}", e))
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -89,164 +75,7 @@ fn ensure_table(conn: &Connection) -> Result<(), String> {
 
 /// Evaluate workflows for template promotion and promote qualifying ones.
 pub fn evaluate_and_promote(conn: &Connection) -> Result<PromotionResult, String> {
-    let start = Instant::now();
-    ensure_table(conn)?;
-
-    // Find workflows that have been executed successfully 2+ times
-    let sql = r#"
-        SELECT w.id, w.name, w.description, w.data,
-               COUNT(tr.id) as success_count,
-               w.quality_report
-        FROM unified_workflows w
-        JOIN task_runs tr ON tr.workflow_id = w.id AND tr.status = 'success'
-        GROUP BY w.id
-        HAVING success_count >= 2
-        ORDER BY success_count DESC
-    "#;
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to prepare promotion candidates query: {}", e))?;
-
-    let candidates: Vec<(String, String, String, String, u32, Option<String>)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, u32>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
-        .map_err(|e| format!("Failed to query promotion candidates: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let candidates_evaluated = candidates.len() as u32;
-    debug!(
-        "Template promotion: evaluating {} candidate workflows",
-        candidates_evaluated
-    );
-
-    // Load already-promoted source workflow IDs to avoid duplicates
-    let existing_sources: std::collections::HashSet<String> = conn
-        .prepare("SELECT source_workflow_id FROM promoted_templates")
-        .map(|mut s| {
-            let ids: Vec<String> = s
-                .query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            ids
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    let mut promoted: Vec<PromotedTemplate> = Vec::new();
-
-    for (wf_id, name, description, data_str, success_count, quality_report_str) in &candidates {
-        // Skip already promoted
-        if existing_sources.contains(wf_id) {
-            debug!("Skipping already-promoted workflow: {}", wf_id);
-            continue;
-        }
-
-        // Quality gate: only pass if quality_report.pass == true or no quality report
-        let quality_score = if let Some(qr_str) = quality_report_str {
-            match serde_json::from_str::<serde_json::Value>(qr_str) {
-                Ok(qr) => {
-                    let pass = qr.get("pass").and_then(|v| v.as_bool()).unwrap_or(true);
-                    if !pass {
-                        debug!(
-                            "Skipping workflow {} — quality report indicates failure",
-                            wf_id
-                        );
-                        continue;
-                    }
-                    qr.get("score").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32
-                }
-                Err(_) => 0.5,
-            }
-        } else {
-            0.5 // No quality report — assume neutral
-        };
-
-        // Parse workflow data
-        let workflow_json = match serde_json::from_str::<serde_json::Value>(data_str) {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("Skipping workflow {} — unparseable data: {}", wf_id, e);
-                continue;
-            }
-        };
-
-        // Extract parameters
-        let params = extract_parameters(&workflow_json);
-
-        // Only promote if 2+ parameters are found (otherwise too specific)
-        if params.len() < 2 {
-            debug!(
-                "Skipping workflow {} — only {} parameters found (need 2+)",
-                wf_id,
-                params.len()
-            );
-            continue;
-        }
-
-        // Build parameterized template JSON
-        let template_json = parameterize_json(&workflow_json, &params);
-
-        // Extract tags from the workflow
-        let tags = extract_tags(&workflow_json, description);
-
-        let template = PromotedTemplate {
-            id: format!("tmpl-{}", Uuid::new_v4()),
-            name: format!("Template: {}", name),
-            description: description.clone(),
-            template_json,
-            parameters: params,
-            source_quality_score: quality_score,
-            success_count: *success_count,
-            source_workflow_id: wf_id.clone(),
-            created_at: Utc::now().to_rfc3339(),
-            tags,
-        };
-
-        // Store in the database
-        match store_template(conn, &template) {
-            Ok(()) => {
-                info!(
-                    "Promoted template '{}' from workflow '{}' ({} params, {} successes)",
-                    template.name,
-                    wf_id,
-                    template.parameters.len(),
-                    success_count,
-                );
-                promoted.push(template);
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to store promoted template for workflow '{}': {}",
-                    wf_id, e
-                );
-            }
-        }
-    }
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    info!(
-        "Template promotion complete: {} promoted from {} candidates in {}ms",
-        promoted.len(),
-        candidates_evaluated,
-        duration_ms,
-    );
-
-    Ok(PromotionResult {
-        promoted,
-        candidates_evaluated,
-        duration_ms,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Find promoted templates relevant to a description.
@@ -254,85 +83,7 @@ pub fn find_relevant_templates(
     conn: &Connection,
     description: &str,
 ) -> Result<Vec<PromotedTemplate>, String> {
-    ensure_table(conn)?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, description, template_json, parameters, \
-             source_quality_score, success_count, source_workflow_id, created_at, tags \
-             FROM promoted_templates \
-             ORDER BY success_count DESC",
-        )
-        .map_err(|e| format!("Failed to prepare promoted_templates query: {}", e))?;
-
-    let all_templates: Vec<PromotedTemplate> = stmt
-        .query_map([], |row| {
-            let template_json_str: String = row.get(3)?;
-            let params_str: String = row.get(4)?;
-            let tags_str: String = row.get(9)?;
-
-            Ok(PromotedTemplate {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                template_json: serde_json::from_str(&template_json_str).unwrap_or_default(),
-                parameters: serde_json::from_str(&params_str).unwrap_or_default(),
-                source_quality_score: row.get(5)?,
-                success_count: row.get(6)?,
-                source_workflow_id: row.get(7)?,
-                created_at: row.get(8)?,
-                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
-            })
-        })
-        .map_err(|e| format!("Failed to query promoted_templates: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    // Simple keyword matching
-    let desc_lower = description.to_lowercase();
-    let desc_words: Vec<&str> = desc_lower
-        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|w| w.len() >= 3)
-        .collect();
-
-    let mut scored: Vec<(f32, PromotedTemplate)> = all_templates
-        .into_iter()
-        .filter_map(|t| {
-            let searchable = format!(
-                "{} {} {}",
-                t.name.to_lowercase(),
-                t.description.to_lowercase(),
-                t.tags.join(" ").to_lowercase(),
-            );
-            let matching = desc_words
-                .iter()
-                .filter(|w| searchable.contains(**w))
-                .count();
-
-            if matching == 0 {
-                return None;
-            }
-
-            let score = matching as f32 / desc_words.len().max(1) as f32;
-            Some((score, t))
-        })
-        .collect();
-
-    // Sort by keyword score descending, then by success_count
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.1.success_count.cmp(&a.1.success_count))
-    });
-
-    let results: Vec<PromotedTemplate> = scored.into_iter().take(5).map(|(_, t)| t).collect();
-
-    debug!(
-        "Found {} relevant templates for description query",
-        results.len()
-    );
-
-    Ok(results)
+    Err("SQLite removed".to_string())
 }
 
 /// Format promoted templates for the builder prompt.
@@ -610,31 +361,7 @@ fn extract_tags(workflow_json: &serde_json::Value, description: &str) -> Vec<Str
 
 /// Store a promoted template in the database.
 fn store_template(conn: &Connection, template: &PromotedTemplate) -> Result<(), String> {
-    let template_json_str = serde_json::to_string(&template.template_json).unwrap_or_default();
-    let params_str = serde_json::to_string(&template.parameters).unwrap_or_default();
-    let tags_str = serde_json::to_string(&template.tags).unwrap_or_default();
-
-    conn.execute(
-        "INSERT INTO promoted_templates \
-         (id, name, description, template_json, parameters, source_quality_score, \
-          success_count, source_workflow_id, created_at, tags) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            template.id,
-            template.name,
-            template.description,
-            template_json_str,
-            params_str,
-            template.source_quality_score,
-            template.success_count,
-            template.source_workflow_id,
-            template.created_at,
-            tags_str,
-        ],
-    )
-    .map_err(|e| format!("Failed to insert promoted template: {}", e))?;
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -644,6 +371,7 @@ fn store_template(conn: &Connection, template: &PromotedTemplate) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_is_url_pattern() {

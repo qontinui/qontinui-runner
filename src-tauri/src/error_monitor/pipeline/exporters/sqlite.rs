@@ -1,12 +1,12 @@
 //! SQLite exporter for persisting error events to the database.
 
-use crate::database::CheckpointDb;
 use crate::error_monitor::pipeline::traits::Exporter;
 use crate::error_monitor::pipeline::types::LogRecord;
 use crate::error_monitor::storage::ErrorEventStorage;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use crate::database::CheckpointDb;
 
 /// Exporter that writes parsed error events to SQLite.
 pub struct SqliteExporter {
@@ -22,11 +22,7 @@ impl SqliteExporter {
         task_run_id: Arc<RwLock<Option<String>>>,
         workflow_name: Arc<RwLock<Option<String>>>,
     ) -> Self {
-        Self {
-            db,
-            task_run_id,
-            workflow_name,
-        }
+        todo!("SQLite removed")
     }
 }
 

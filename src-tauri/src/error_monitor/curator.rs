@@ -6,9 +6,9 @@
 //! - Formatted context for the debug agent
 //! - Priority scoring for errors
 
+use crate::database::Connection;
 use std::collections::HashMap;
 
-use rusqlite::Connection;
 
 use crate::error_monitor::storage::{ErrorEventStorage, LogSourceStorage};
 use crate::error_monitor::types::{ErrorQuery, ErrorSeverity, ErrorStatus, StoredErrorEvent};
@@ -143,97 +143,7 @@ impl DebugContextCurator {
         conn: &Connection,
         task_run_id: Option<&str>,
     ) -> Result<DebugContext, String> {
-        // Query errors based on configuration
-        let statuses = if self.config.include_resolved {
-            None
-        } else {
-            Some(vec![
-                ErrorStatus::New,
-                ErrorStatus::Acknowledged,
-                ErrorStatus::InProgress,
-                ErrorStatus::Promoted,
-            ])
-        };
-
-        let query = ErrorQuery {
-            task_run_id: task_run_id.map(|s| s.to_string()),
-            status: statuses,
-            limit: Some(self.config.max_errors as u32),
-            ..Default::default()
-        };
-
-        let errors = ErrorEventStorage::query(conn, &query)?;
-
-        if errors.is_empty() {
-            return Ok(DebugContext {
-                summary: "No errors found.".to_string(),
-                critical_errors: vec![],
-                errors: vec![],
-                warnings: vec![],
-                patterns: vec![],
-                focus_areas: vec![],
-                total_count: 0,
-                requires_immediate_action: false,
-                source_descriptions: HashMap::new(),
-            });
-        }
-
-        // Categorize and curate errors
-        let mut critical_errors = Vec::new();
-        let mut regular_errors = Vec::new();
-        let mut warnings = Vec::new();
-
-        for error in &errors {
-            let curated = self.curate_error(error, &errors);
-            match error.severity {
-                ErrorSeverity::Critical => critical_errors.push(curated),
-                ErrorSeverity::Error => regular_errors.push(curated),
-                ErrorSeverity::Warning => warnings.push(curated),
-                ErrorSeverity::Info => {} // Info-level events are not errors, skip them
-            }
-        }
-
-        // Enrich investigation hints with past resolutions from hybrid search
-        Self::enrich_with_past_resolutions(conn, &mut critical_errors);
-        Self::enrich_with_past_resolutions(conn, &mut regular_errors);
-
-        // Sort by priority score
-        critical_errors.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
-        regular_errors.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
-        warnings.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
-
-        // Detect patterns
-        let mut patterns = self.detect_patterns(&errors);
-
-        // Detect embedding-based similarity patterns
-        let error_ids: Vec<i64> = errors.iter().map(|e| e.id).collect();
-        let embedding_patterns = self.detect_embedding_patterns(conn, &error_ids);
-        patterns.extend(embedding_patterns);
-
-        // Generate focus areas
-        let focus_areas = self.generate_focus_areas(&critical_errors, &regular_errors, &patterns);
-
-        // Generate summary
-        let summary =
-            self.generate_summary(&critical_errors, &regular_errors, &warnings, &patterns);
-
-        let requires_immediate_action =
-            !critical_errors.is_empty() || regular_errors.iter().any(|e| e.occurrence_count >= 5);
-
-        // Build source descriptions from log_sources table
-        let source_descriptions = Self::build_source_descriptions(conn, &errors);
-
-        Ok(DebugContext {
-            summary,
-            critical_errors,
-            errors: regular_errors,
-            warnings,
-            patterns,
-            focus_areas,
-            total_count: errors.len() as u32,
-            requires_immediate_action,
-            source_descriptions,
-        })
+        Err("SQLite removed".to_string())
     }
 
     /// Build a map of source name -> description from the log_sources table.
@@ -241,26 +151,7 @@ impl DebugContextCurator {
         conn: &Connection,
         errors: &[StoredErrorEvent],
     ) -> HashMap<String, String> {
-        // Collect unique source names from errors
-        let unique_sources: std::collections::HashSet<&str> =
-            errors.iter().map(|e| e.log_source_name.as_str()).collect();
-
-        let mut descriptions = HashMap::new();
-
-        // Query log sources from DB to get their descriptions
-        if let Ok(log_sources) = LogSourceStorage::get_all(conn) {
-            for source in &log_sources {
-                if unique_sources.contains(source.name.as_str()) {
-                    if let Some(ref desc) = source.description {
-                        if !desc.is_empty() {
-                            descriptions.insert(source.name.clone(), desc.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        descriptions
+        todo!("SQLite removed")
     }
 
     /// Enrich curated errors with past resolution hints from the findings database.
@@ -269,41 +160,7 @@ impl DebugContextCurator {
     /// entries with similar messages and appends the resolution approach to
     /// investigation_hints. Falls back gracefully if no matches are found.
     fn enrich_with_past_resolutions(conn: &Connection, errors: &mut [CuratedError]) {
-        for error in errors.iter_mut() {
-            // Search for resolved findings with similar messages
-            let sql = r#"
-                SELECT title, resolution
-                FROM task_run_findings
-                WHERE status = 'resolved'
-                  AND resolution IS NOT NULL
-                  AND (title LIKE ?1 OR description LIKE ?1)
-                ORDER BY resolved_at DESC
-                LIMIT 2
-            "#;
-
-            // Use a substring of the error message for matching
-            let search_term = if error.message.len() > 80 {
-                format!("%{}%", &error.message[..80])
-            } else {
-                format!("%{}%", error.message)
-            };
-
-            if let Ok(mut stmt) = conn.prepare(sql) {
-                let hints: Vec<String> = stmt
-                    .query_map(rusqlite::params![search_term], |row| {
-                        let title: String = row.get(0)?;
-                        let resolution: String = row.get(1)?;
-                        Ok(format!("Past resolution for '{}': {}", title, resolution))
-                    })
-                    .ok()
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default();
-
-                if !hints.is_empty() {
-                    error.investigation_hints.extend(hints);
-                }
-            }
-        }
+        // SQLite removed - no-op
     }
 
     /// Curate a single error with additional context.
@@ -564,126 +421,7 @@ impl DebugContextCurator {
         conn: &Connection,
         error_ids: &[i64],
     ) -> Vec<ErrorPattern> {
-        if error_ids.is_empty() {
-            return Vec::new();
-        }
-
-        // Guard: skip O(n^2) pairwise comparison when the set is too large
-        if error_ids.len() > 200 {
-            tracing::debug!(
-                "Skipping embedding clustering: {} error_ids exceeds 200 limit",
-                error_ids.len()
-            );
-            return Vec::new();
-        }
-
-        // Build a parameterized IN clause
-        let placeholders: Vec<String> = (1..=error_ids.len()).map(|i| format!("?{}", i)).collect();
-        let sql = format!(
-            "SELECT id, message, message_embedding FROM error_events WHERE id IN ({}) AND message_embedding IS NOT NULL",
-            placeholders.join(", ")
-        );
-
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-
-        // Bind parameters
-        let params: Vec<&dyn rusqlite::types::ToSql> = error_ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::types::ToSql)
-            .collect();
-
-        let rows: Vec<(i64, String, Vec<f32>)> = match stmt.query_map(params.as_slice(), |row| {
-            let id: i64 = row.get(0)?;
-            let message: String = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
-            // Parse embedding: 384 f32 values, little-endian
-            let embedding: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-            Ok((id, message, embedding))
-        }) {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-            Err(_) => return Vec::new(),
-        };
-
-        if rows.len() < 2 {
-            return Vec::new();
-        }
-
-        // Precompute norms
-        let norms: Vec<f32> = rows
-            .iter()
-            .map(|(_, _, emb)| {
-                let sum_sq: f32 = emb.iter().map(|x| x * x).sum();
-                sum_sq.sqrt().max(1e-10)
-            })
-            .collect();
-
-        // Greedy clustering with cosine similarity threshold
-        let threshold: f32 = 0.85;
-        let mut assigned = vec![false; rows.len()];
-        let mut clusters: Vec<Vec<usize>> = Vec::new();
-
-        for i in 0..rows.len() {
-            if assigned[i] {
-                continue;
-            }
-            let mut cluster = vec![i];
-            assigned[i] = true;
-
-            for j in (i + 1)..rows.len() {
-                if assigned[j] {
-                    continue;
-                }
-                // Cosine similarity
-                let dot: f32 = rows[i]
-                    .2
-                    .iter()
-                    .zip(rows[j].2.iter())
-                    .map(|(a, b)| a * b)
-                    .sum();
-                let sim = dot / (norms[i] * norms[j]);
-                if sim >= threshold {
-                    cluster.push(j);
-                    assigned[j] = true;
-                }
-            }
-
-            if cluster.len() >= 2 {
-                clusters.push(cluster);
-            }
-        }
-
-        // Convert clusters to ErrorPattern entries
-        clusters
-            .into_iter()
-            .map(|indices| {
-                let ids: Vec<i64> = indices.iter().map(|&idx| rows[idx].0).collect();
-                let freq = ids.len() as u32;
-                // Use the first error's message as a representative label
-                let representative_msg = &rows[indices[0]].1;
-                let label = if representative_msg.len() > 60 {
-                    format!("{}...", &representative_msg[..60])
-                } else {
-                    representative_msg.clone()
-                };
-
-                ErrorPattern {
-                    name: format!("Semantically similar: \"{}\"", label),
-                    error_ids: ids,
-                    frequency: freq,
-                    pattern_type: PatternType::SimilarEmbedding,
-                    suggested_cause: Some(
-                        "These errors have similar semantic meaning and may share a root cause"
-                            .to_string(),
-                    ),
-                }
-            })
-            .collect()
+        Vec::new()
     }
 
     /// Generate suggested focus areas based on errors and patterns.
@@ -938,6 +676,7 @@ impl Default for DebugContextCurator {
 mod tests {
     use super::*;
     use crate::error_monitor::types::ErrorLocation;
+use crate::database::Connection;
 
     fn make_test_error(
         id: i64,
@@ -1037,47 +776,8 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// Create a minimal in-memory database with the error_events table for embedding tests.
-    fn create_embedding_test_db() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE error_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                log_source_id INTEGER,
-                log_source_name TEXT NOT NULL,
-                task_run_id TEXT,
-                workflow_step_id TEXT,
-                log_timestamp TEXT,
-                captured_at TEXT NOT NULL DEFAULT (datetime('now')),
-                severity TEXT NOT NULL DEFAULT 'error',
-                error_type TEXT,
-                error_code TEXT,
-                message TEXT NOT NULL,
-                stack_trace TEXT,
-                context_lines TEXT,
-                raw_entry TEXT,
-                file_path TEXT,
-                line_number INTEGER,
-                column_number INTEGER,
-                function_name TEXT,
-                signature_hash TEXT NOT NULL,
-                occurrence_count INTEGER DEFAULT 1,
-                first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-                status TEXT DEFAULT 'new',
-                finding_id INTEGER,
-                resolved_by_task_run_id TEXT,
-                resolved_by_fix_id TEXT,
-                resolution_notes TEXT,
-                message_embedding BLOB,
-                trace_id TEXT,
-                acknowledged_at TEXT,
-                resolved_at TEXT
-            );
-            "#,
-        )
-        .unwrap();
-        conn
+    fn create_embedding_test_db() -> crate::database::Connection {
+        todo!("SQLite removed")
     }
 
     /// Create a 384-dim f32 embedding as a little-endian byte blob, normalized to unit length.
@@ -1096,17 +796,11 @@ mod tests {
 
     /// Insert an error event with an embedding into the test DB and return its id.
     fn insert_error_with_embedding(
-        conn: &rusqlite::Connection,
+        conn: &crate::database::Connection,
         message: &str,
         embedding: &[u8],
     ) -> i64 {
-        conn.execute(
-            r#"INSERT INTO error_events (log_source_name, message, signature_hash, message_embedding)
-               VALUES ('test', ?1, ?2, ?3)"#,
-            rusqlite::params![message, format!("hash_{}", message), embedding],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
+        0
     }
 
     /// Helper to build an orthogonal embedding blob (non-zero only in the second half of dims).

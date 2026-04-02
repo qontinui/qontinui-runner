@@ -233,6 +233,7 @@ pub async fn import_known_issues(
         }
 
         use crate::known_issues::types::*;
+use crate::database::Connection;
 
         let req = CreateKnownIssueRequest {
             title: item.title.clone(),
@@ -289,7 +290,7 @@ pub async fn create_pattern_template(
 }
 
 /// Seed built-in pattern templates (called on startup).
-pub fn seed_built_in_templates(conn: &rusqlite::Connection) {
+pub fn seed_built_in_templates(conn: &crate::database::Connection) {
     if let Err(e) = templates::seed_templates(conn) {
         tracing::warn!("Failed to seed pattern templates: {}", e);
     }

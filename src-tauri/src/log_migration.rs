@@ -95,110 +95,7 @@ pub fn migrate_logs_to_sqlite(
     dev_logs_dir: &Path,
     workflow_name: Option<&str>,
 ) -> Result<LogMigrationResult, String> {
-    let mut result = LogMigrationResult::default();
-
-    // Migrate general events
-    let general_path = dev_logs_dir.join("runner-general.jsonl");
-    if general_path.exists() {
-        match migrate_general_events(db, task_run_id, &general_path, workflow_name) {
-            Ok(count) => result.general_events = count,
-            Err(e) => result.errors.push(format!("General events: {}", e)),
-        }
-    }
-
-    // Migrate action events
-    let actions_path = dev_logs_dir.join("runner-actions.jsonl");
-    if actions_path.exists() {
-        match migrate_action_events(db, task_run_id, &actions_path, workflow_name) {
-            Ok(count) => result.action_events = count,
-            Err(e) => result.errors.push(format!("Action events: {}", e)),
-        }
-    }
-
-    // Migrate image recognition events and screenshots
-    let image_path = dev_logs_dir.join("runner-image-recognition.jsonl");
-    if image_path.exists() {
-        match migrate_image_recognition_events(db, task_run_id, &image_path, workflow_name) {
-            Ok((events, screenshots)) => {
-                result.image_recognition_events = events;
-                result.screenshots = screenshots;
-            }
-            Err(e) => result.errors.push(format!("Image recognition: {}", e)),
-        }
-    }
-
-    // Migrate Playwright results
-    let playwright_path = dev_logs_dir.join("runner-playwright.jsonl");
-    if playwright_path.exists() {
-        match migrate_playwright_results(db, task_run_id, &playwright_path) {
-            Ok(count) => result.playwright_results = count,
-            Err(e) => result.errors.push(format!("Playwright results: {}", e)),
-        }
-    }
-
-    // Migrate AI output events
-    let ai_output_path = dev_logs_dir.join("ai-output.jsonl");
-    if ai_output_path.exists() {
-        match migrate_ai_output_events(db, task_run_id, &ai_output_path, workflow_name) {
-            Ok(count) => {
-                // Add to general events count since they go into the same table
-                result.general_events += count;
-            }
-            Err(e) => result.errors.push(format!("AI output events: {}", e)),
-        }
-    }
-
-    // Migrate API request events
-    let api_requests_path = dev_logs_dir.join("runner-api-requests.jsonl");
-    if api_requests_path.exists() {
-        match migrate_api_request_events(db, task_run_id, &api_requests_path) {
-            Ok(count) => result.api_requests = count,
-            Err(e) => result.errors.push(format!("API requests: {}", e)),
-        }
-    }
-
-    info!(
-        "Log migration complete for task {}: {} general, {} actions, {} image recognition, {} screenshots, {} playwright, {} api_requests",
-        task_run_id,
-        result.general_events,
-        result.action_events,
-        result.image_recognition_events,
-        result.screenshots,
-        result.playwright_results,
-        result.api_requests
-    );
-
-    // Clear migrated JSONL files to prevent unbounded growth.
-    // These files are write-ahead buffers — once migrated to DB they are redundant.
-    // Only delete if migration had no errors to avoid data loss.
-    if result.errors.is_empty() {
-        let migrated_files = [
-            "runner-general.jsonl",
-            "runner-actions.jsonl",
-            "runner-image-recognition.jsonl",
-            "runner-playwright.jsonl",
-            "runner-api-requests.jsonl",
-            "ai-output.jsonl",
-        ];
-        for filename in migrated_files {
-            let path = dev_logs_dir.join(filename);
-            if path.exists() {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    debug!("Failed to clear migrated log file {}: {}", filename, e);
-                } else {
-                    debug!("Cleared migrated log file: {}", filename);
-                }
-            }
-        }
-    } else {
-        warn!(
-            "Skipping log file deletion due to {} migration error(s): {:?}",
-            result.errors.len(),
-            result.errors
-        );
-    }
-
-    Ok(result)
+    Err("SQLite removed".to_string())
 }
 
 /// Migrate general events from runner-general.jsonl
@@ -208,47 +105,7 @@ fn migrate_general_events(
     path: &Path,
     workflow_name: Option<&str>,
 ) -> Result<usize, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<GeneralEvent>(&line) {
-            Ok(event) => {
-                let subtype = event.level.as_deref();
-                let data = if event.extra.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&event.extra).unwrap_or_default())
-                };
-
-                events.push(CreateTaskRunEventInput {
-                    task_run_id: task_run_id.to_string(),
-                    event_type: "general".to_string(),
-                    event_subtype: subtype.map(|s| s.to_string()),
-                    message: event.message,
-                    data,
-                    workflow_name: workflow_name.map(|s| s.to_string()),
-                    state_name: None,
-                    action_id: None,
-                    timestamp: event.timestamp,
-                    duration_ms: None,
-                });
-            }
-            Err(e) => {
-                debug!("Failed to parse general event: {} - {}", e, line);
-            }
-        }
-    }
-
-    let count = events.len();
-    db.batch_create_task_run_events(&events)?;
-    Ok(count)
+    Err("SQLite removed".to_string())
 }
 
 /// Migrate action events from runner-actions.jsonl
@@ -258,51 +115,7 @@ fn migrate_action_events(
     path: &Path,
     workflow_name: Option<&str>,
 ) -> Result<usize, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<ActionEvent>(&line) {
-            Ok(event) => {
-                let data = if event.extra.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&event.extra).unwrap_or_default())
-                };
-
-                let message = event
-                    .step_name
-                    .clone()
-                    .unwrap_or_else(|| event.event_type.clone());
-
-                events.push(CreateTaskRunEventInput {
-                    task_run_id: task_run_id.to_string(),
-                    event_type: "action".to_string(),
-                    event_subtype: Some(event.event_type),
-                    message,
-                    data,
-                    workflow_name: workflow_name.map(|s| s.to_string()),
-                    state_name: None,
-                    action_id: event.step_name,
-                    timestamp: event.timestamp,
-                    duration_ms: event.duration_ms.map(|d| d as i64),
-                });
-            }
-            Err(e) => {
-                debug!("Failed to parse action event: {} - {}", e, line);
-            }
-        }
-    }
-
-    let count = events.len();
-    db.batch_create_task_run_events(&events)?;
-    Ok(count)
+    Err("SQLite removed".to_string())
 }
 
 /// Migrate image recognition events from runner-image-recognition.jsonl
@@ -312,84 +125,7 @@ fn migrate_image_recognition_events(
     path: &Path,
     workflow_name: Option<&str>,
 ) -> Result<(usize, usize), String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
-    let mut event_count = 0;
-    let mut screenshot_count = 0;
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<ImageRecognitionEvent>(&line) {
-            Ok(event) => {
-                // Create the event
-                let subtype = if event.matched { "match" } else { "no_match" };
-                let location_json = event
-                    .location
-                    .as_ref()
-                    .map(|loc| serde_json::to_string(loc).unwrap_or_default());
-
-                let message = format!(
-                    "Template '{}': {} (confidence: {:.2}%, threshold: {:.2}%)",
-                    event.template_name,
-                    if event.matched { "matched" } else { "no match" },
-                    event.confidence * 100.0,
-                    event.threshold * 100.0
-                );
-
-                let data = serde_json::json!({
-                    "template_name": event.template_name,
-                    "matched": event.matched,
-                    "confidence": event.confidence,
-                    "threshold": event.threshold,
-                    "location": event.location,
-                });
-
-                let event_input = CreateTaskRunEventInput {
-                    task_run_id: task_run_id.to_string(),
-                    event_type: "image_recognition".to_string(),
-                    event_subtype: Some(subtype.to_string()),
-                    message,
-                    data: Some(serde_json::to_string(&data).unwrap_or_default()),
-                    workflow_name: workflow_name.map(|s| s.to_string()),
-                    state_name: None,
-                    action_id: None,
-                    timestamp: event.timestamp.clone(),
-                    duration_ms: None,
-                };
-
-                let event_id = db.create_task_run_event(&event_input)?;
-                event_count += 1;
-
-                // Create screenshot record if path exists
-                if let Some(screenshot_path) = &event.screenshot_path {
-                    let screenshot_input = CreateTaskRunScreenshotInput {
-                        task_run_id: task_run_id.to_string(),
-                        event_id: Some(event_id),
-                        file_path: screenshot_path.clone(),
-                        screenshot_type: "annotated".to_string(),
-                        template_name: Some(event.template_name.clone()),
-                        confidence: Some(event.confidence),
-                        match_location: location_json,
-                        width: None,
-                        height: None,
-                        file_size_bytes: None,
-                    };
-
-                    db.create_task_run_screenshot(&screenshot_input)?;
-                    screenshot_count += 1;
-                }
-            }
-            Err(e) => {
-                debug!("Failed to parse image recognition event: {} - {}", e, line);
-            }
-        }
-    }
-
-    Ok((event_count, screenshot_count))
+    Err("SQLite removed".to_string())
 }
 
 /// Migrate Playwright results from runner-playwright.jsonl
@@ -398,51 +134,7 @@ fn migrate_playwright_results(
     task_run_id: &str,
     path: &Path,
 ) -> Result<usize, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
-    let mut count = 0;
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<PlaywrightLogs>(&line) {
-            Ok(logs) => {
-                // Create a result for each spec
-                for spec in &logs.specs {
-                    let input = CreateTaskRunPlaywrightResultInput {
-                        task_run_id: task_run_id.to_string(),
-                        test_name: spec.name.clone(),
-                        spec_file: None,
-                        status: if spec.passed {
-                            "passed".to_string()
-                        } else {
-                            "failed".to_string()
-                        },
-                        duration_ms: Some(spec.duration_ms as i64),
-                        stdout: None,
-                        stderr: None,
-                        console_output: logs.console_output.clone(),
-                        page_snapshot: None,
-                        error_message: spec.error.clone(),
-                        failure_screenshot_path: logs.failure_screenshots.first().cloned(),
-                        assertions_passed: if spec.passed { 1 } else { 0 },
-                        assertions_failed: if spec.passed { 0 } else { 1 },
-                    };
-
-                    db.create_task_run_playwright_result(&input)?;
-                    count += 1;
-                }
-            }
-            Err(e) => {
-                debug!("Failed to parse Playwright logs: {} - {}", e, line);
-            }
-        }
-    }
-
-    Ok(count)
+    Err("SQLite removed".to_string())
 }
 
 /// Migrate AI output events from ai-output.jsonl
@@ -452,51 +144,7 @@ fn migrate_ai_output_events(
     path: &Path,
     workflow_name: Option<&str>,
 ) -> Result<usize, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<AiOutputEvent>(&line) {
-            Ok(event) => {
-                let data = if event.extra.is_empty() {
-                    event.content.clone()
-                } else {
-                    Some(serde_json::to_string(&event.extra).unwrap_or_default())
-                };
-
-                let message = event
-                    .content
-                    .clone()
-                    .unwrap_or_else(|| event.event_type.clone());
-
-                events.push(CreateTaskRunEventInput {
-                    task_run_id: task_run_id.to_string(),
-                    event_type: "ai_output".to_string(),
-                    event_subtype: Some(event.event_type),
-                    message,
-                    data,
-                    workflow_name: workflow_name.map(|s| s.to_string()),
-                    state_name: None,
-                    action_id: None,
-                    timestamp: event.timestamp,
-                    duration_ms: None,
-                });
-            }
-            Err(e) => {
-                debug!("Failed to parse AI output event: {} - {}", e, line);
-            }
-        }
-    }
-
-    let count = events.len();
-    db.batch_create_task_run_events(&events)?;
-    Ok(count)
+    Err("SQLite removed".to_string())
 }
 
 /// Migrate API request events from runner-api-requests.jsonl
@@ -505,81 +153,13 @@ fn migrate_api_request_events(
     task_run_id: &str,
     path: &Path,
 ) -> Result<usize, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
-    let reader = BufReader::new(file);
-    let mut requests = Vec::new();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<ApiRequestEvent>(&line) {
-            Ok(event) => {
-                // Serialize headers to JSON string
-                let request_headers = if event.headers.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&event.headers).unwrap_or_default())
-                };
-
-                let response_headers = if event.response_headers.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&event.response_headers).unwrap_or_default())
-                };
-
-                // Serialize extractions and assertions to JSON strings
-                let extractions = if event.extractions.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&event.extractions).unwrap_or_default())
-                };
-
-                let assertions = if event.assertions.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::to_string(&event.assertions).unwrap_or_default())
-                };
-
-                requests.push(CreateTaskRunApiRequestInput {
-                    task_run_id: task_run_id.to_string(),
-                    step_id: event.step_id,
-                    step_name: Some(event.step_name),
-                    method: event.method,
-                    url: event.url,
-                    resolved_url: event.resolved_url,
-                    request_headers,
-                    request_body: event.body,
-                    status_code: event.status_code as i32,
-                    status_text: Some(event.status_text),
-                    response_headers,
-                    response_time_ms: event.response_time_ms as i64,
-                    response_body_type: event.response_body_type,
-                    response_body: event.response_body,
-                    response_size_bytes: Some(event.response_size_bytes as i64),
-                    extractions,
-                    assertions,
-                    success: event.success,
-                    error_message: event.error,
-                    timestamp: event.timestamp,
-                });
-            }
-            Err(e) => {
-                debug!("Failed to parse API request event: {} - {}", e, line);
-            }
-        }
-    }
-
-    let count = requests.len();
-    db.batch_create_task_run_api_requests(&requests)?;
-    Ok(count)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_parse_general_event() {

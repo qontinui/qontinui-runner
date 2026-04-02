@@ -23,34 +23,38 @@ impl IsolatedExecutor {
         command: &str,
         working_directory: Option<&str>,
     ) -> Result<ContainerResult, String> {
-        self.execute_with_policy(command, working_directory, None).await
+        self.execute_with_policy(command, working_directory, None, &[]).await
     }
 
-    /// Execute a command in a container with an optional security policy overlay.
-    ///
-    /// When a `SecurityPolicy` is provided, the base container config is transformed
-    /// via `policy_to_container_config` to apply security hardening (cap_drop, seccomp,
-    /// non-root user, PID limits, etc.) before execution.
+    /// Execute a command in a container with an optional security policy overlay
+    /// and additional environment variables (proxy URLs, credential placeholders).
     pub async fn execute_with_policy(
         &self,
         command: &str,
         working_directory: Option<&str>,
         security_policy: Option<&crate::security::SecurityPolicy>,
+        extra_env: &[String],
     ) -> Result<ContainerResult, String> {
         if !self.docker.is_available() {
             return Err("Docker is not available".to_string());
         }
 
-        let effective_config = if let Some(policy) = security_policy {
+        let mut effective_config = if let Some(policy) = security_policy {
             crate::security::policy_to_container_config(policy, &self.config)
         } else {
             self.config.clone()
         };
 
+        // Inject extra environment variables (proxy URLs, credential placeholders)
+        if !extra_env.is_empty() {
+            effective_config.extra_env.extend(extra_env.iter().cloned());
+        }
+
         info!(
-            "Executing in container: {} (profile={})",
+            "Executing in container: {} (profile={}, extra_env={})",
             &command[..command.len().min(100)],
             security_policy.map(|p| p.profile_name.as_str()).unwrap_or("none"),
+            extra_env.len(),
         );
         self.docker
             .execute_in_container(command, &effective_config, working_directory)
@@ -66,7 +70,7 @@ impl IsolatedExecutor {
         command: &str,
         working_directory: Option<&str>,
     ) -> Result<Option<ContainerResult>, String> {
-        self.try_execute_with_policy(command, working_directory, None).await
+        self.try_execute_with_policy(command, working_directory, None, &[]).await
     }
 
     /// Execute with fallback to host execution and optional security policy overlay.
@@ -75,12 +79,13 @@ impl IsolatedExecutor {
         command: &str,
         working_directory: Option<&str>,
         security_policy: Option<&crate::security::SecurityPolicy>,
+        extra_env: &[String],
     ) -> Result<Option<ContainerResult>, String> {
         if !self.is_available() {
             return Ok(None); // Signal to use host execution
         }
 
-        match self.execute_with_policy(command, working_directory, security_policy).await {
+        match self.execute_with_policy(command, working_directory, security_policy, extra_env).await {
             Ok(result) => Ok(Some(result)),
             Err(e) => {
                 warn!(

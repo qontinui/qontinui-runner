@@ -88,6 +88,106 @@ pub struct CoordinatorResult {
 }
 
 // =============================================================================
+// Async enrichment (called before sync computation)
+// =============================================================================
+
+/// Enrich an OnlineLearningOutcome with pipeline trace data from PG.
+///
+/// Converts `PipelineAgentTrace` records into `StepAttribution` structs
+/// and `StepReflection` structs with real duration/cost data.
+pub async fn enrich_from_pipeline_traces(
+    pg: &std::sync::Arc<crate::database::pg::PgDb>,
+    outcome: &mut OnlineLearningOutcome,
+) {
+    let traces = match pg
+        .get_pipeline_traces_for_task(&outcome.task_run_id)
+        .await
+    {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return, // No traces for this run (non-pipeline architecture)
+        Err(e) => {
+            debug!("Failed to load pipeline traces for enrichment: {}", e);
+            return;
+        }
+    };
+
+    // Convert traces to StepAttribution structs
+    let attributions: Vec<StepAttribution> = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.span_type == "agent") // Only agent spans, not guardrails/handoffs
+        .map(|(i, trace)| {
+            // Estimate output utilization from handoff presence
+            let output_utilization = if trace.handoff_received.is_some() {
+                0.8 // Had handoff context → likely consumed
+            } else if trace.downstream_success == Some(true) {
+                0.7 // Downstream succeeded → output probably used
+            } else {
+                0.4 // Default moderate utilization
+            };
+
+            // Estimate state change magnitude from output snapshot size
+            let state_change = trace
+                .output_snapshot
+                .as_object()
+                .map(|o| o.len() as f64 * 0.5)
+                .unwrap_or(0.5);
+
+            StepAttribution {
+                step_index: i,
+                step_type: trace.agent_type.clone(),
+                agent_type: trace.agent_type.clone(),
+                duration_ms: trace.duration_ms,
+                tokens_used: (trace.tokens_in as u64) + (trace.tokens_out as u64),
+                cost_usd: trace.cost_usd,
+                downstream_success: trace.downstream_success,
+                confidence_delta: trace.output_quality_score.map(|q| q - 0.5), // Center around 0
+                output_utilization,
+                state_change_magnitude: state_change,
+            }
+        })
+        .collect();
+
+    // Also enrich step_reflections with real duration data from traces
+    let reflections: Vec<StepReflection> = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.span_type == "agent")
+        .map(|(i, trace)| {
+            let success = trace.downstream_success.unwrap_or(true);
+            StepReflection {
+                step_type: trace.agent_type.clone(),
+                step_index: i,
+                task_run_id: outcome.task_run_id.clone(),
+                duration_ms: trace.duration_ms,
+                success,
+                tool_calls: Vec::new(), // Not available from traces
+                error_type: if !success {
+                    Some("agent_failure".to_string())
+                } else {
+                    None
+                },
+                retry_count: trace.validation_retries.unwrap_or(0) as u32,
+            }
+        })
+        .collect();
+
+    if !attributions.is_empty() {
+        info!(
+            "Enriched run {} with {} step attributions from pipeline traces",
+            outcome.task_run_id,
+            attributions.len()
+        );
+        outcome.step_attributions = attributions;
+    }
+
+    // Only replace step_reflections if we got better data from traces
+    if !reflections.is_empty() && reflections.iter().any(|r| r.duration_ms > 0) {
+        outcome.step_reflections = reflections;
+    }
+}
+
+// =============================================================================
 // Coordinator (sync — called from spawn_blocking)
 // =============================================================================
 

@@ -5,7 +5,7 @@
 //! workflow runs and manages a per-domain example bank that can be injected
 //! into generation prompts as few-shot demonstrations.
 
-use rusqlite::{params, Connection};
+use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -39,43 +39,12 @@ pub struct CuratedExample {
 
 /// Ensure the curated_examples table and indices exist.
 fn ensure_table(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS curated_examples (
-            id TEXT PRIMARY KEY,
-            domain TEXT NOT NULL,
-            criterion_description TEXT NOT NULL,
-            steps_json TEXT NOT NULL,
-            quality_score REAL NOT NULL DEFAULT 0.0,
-            execution_verified INTEGER NOT NULL DEFAULT 0,
-            times_used INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE INDEX IF NOT EXISTS idx_curated_examples_domain
-            ON curated_examples(domain);
-        CREATE INDEX IF NOT EXISTS idx_curated_examples_quality
-            ON curated_examples(quality_score);",
-    )
-    .map_err(|e| format!("Failed to create curated_examples table: {}", e))
+    Err("SQLite removed".to_string())
 }
 
 /// Insert a new curated example.
 fn insert_example(conn: &Connection, example: &CuratedExample) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO curated_examples (id, domain, criterion_description, steps_json, quality_score, execution_verified, times_used, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            example.id,
-            example.domain,
-            example.criterion_description,
-            example.steps_json,
-            example.quality_score,
-            example.execution_verified as i32,
-            example.times_used,
-            example.created_at,
-        ],
-    )
-    .map_err(|e| format!("Failed to insert curated example: {}", e))?;
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Query examples for a given domain, ordered by quality descending.
@@ -84,51 +53,12 @@ fn query_by_domain(
     domain: &str,
     limit: usize,
 ) -> Result<Vec<CuratedExample>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, domain, criterion_description, steps_json, quality_score,
-                    execution_verified, times_used, created_at
-             FROM curated_examples
-             WHERE domain = ?1
-             ORDER BY quality_score DESC
-             LIMIT ?2",
-        )
-        .map_err(|e| format!("Failed to prepare query_by_domain: {}", e))?;
-
-    let rows = stmt
-        .query_map(params![domain, limit as i64], |row| {
-            Ok(CuratedExample {
-                id: row.get(0)?,
-                domain: row.get(1)?,
-                criterion_description: row.get(2)?,
-                steps_json: row.get(3)?,
-                quality_score: row.get(4)?,
-                execution_verified: row.get::<_, i32>(5)? != 0,
-                times_used: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query curated examples: {}", e))?;
-
-    let mut examples = Vec::new();
-    for row in rows {
-        match row {
-            Ok(ex) => examples.push(ex),
-            Err(e) => warn!("Skipping malformed curated example row: {}", e),
-        }
-    }
-    Ok(examples)
+    Err("SQLite removed".to_string())
 }
 
 /// Count how many curated examples exist for a domain.
 fn count_by_domain(conn: &Connection, domain: &str) -> Result<usize, String> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM curated_examples WHERE domain = ?1",
-        params![domain],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|c| c as usize)
-    .map_err(|e| format!("Failed to count curated examples: {}", e))
+    Err("SQLite removed".to_string())
 }
 
 /// Get the weakest (lowest quality_score) example for a domain.
@@ -136,37 +66,7 @@ fn get_weakest_by_domain(
     conn: &Connection,
     domain: &str,
 ) -> Result<Option<CuratedExample>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, domain, criterion_description, steps_json, quality_score,
-                    execution_verified, times_used, created_at
-             FROM curated_examples
-             WHERE domain = ?1
-             ORDER BY quality_score ASC
-             LIMIT 1",
-        )
-        .map_err(|e| format!("Failed to prepare get_weakest_by_domain: {}", e))?;
-
-    let mut rows = stmt
-        .query_map(params![domain], |row| {
-            Ok(CuratedExample {
-                id: row.get(0)?,
-                domain: row.get(1)?,
-                criterion_description: row.get(2)?,
-                steps_json: row.get(3)?,
-                quality_score: row.get(4)?,
-                execution_verified: row.get::<_, i32>(5)? != 0,
-                times_used: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })
-        .map_err(|e| format!("Failed to query weakest curated example: {}", e))?;
-
-    match rows.next() {
-        Some(Ok(ex)) => Ok(Some(ex)),
-        Some(Err(e)) => Err(format!("Failed to read weakest example: {}", e)),
-        None => Ok(None),
-    }
+    Err("SQLite removed".to_string())
 }
 
 /// Replace an existing example (by id) with a new one.
@@ -175,22 +75,12 @@ fn replace_example(
     old_id: &str,
     new_example: &CuratedExample,
 ) -> Result<(), String> {
-    conn.execute(
-        "DELETE FROM curated_examples WHERE id = ?1",
-        params![old_id],
-    )
-    .map_err(|e| format!("Failed to delete old curated example: {}", e))?;
-    insert_example(conn, new_example)
+    Err("SQLite removed".to_string())
 }
 
 /// Increment the times_used counter for an example.
 fn increment_times_used(conn: &Connection, id: &str) -> Result<(), String> {
-    conn.execute(
-        "UPDATE curated_examples SET times_used = times_used + 1 WHERE id = ?1",
-        params![id],
-    )
-    .map_err(|e| format!("Failed to increment times_used: {}", e))?;
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -262,113 +152,7 @@ impl FewShotCurator {
         domain: &str,
         conn: &Connection,
     ) -> Result<usize, String> {
-        // Gate 1: only first-attempt successes are gold-standard quality
-        if iterations > 0 {
-            debug!(
-                run_id,
-                iterations, "Skipping example extraction — not first-attempt"
-            );
-            return Ok(0);
-        }
-
-        ensure_table(conn)?;
-
-        let mut extracted = 0usize;
-
-        for (step_id, criterion_desc, score, steps_json) in step_evaluations {
-            // Gate 2: quality score must meet threshold
-            if *score < self.min_quality_score {
-                debug!(
-                    step_id,
-                    score,
-                    min = self.min_quality_score,
-                    "Step score below minimum — skipping"
-                );
-                continue;
-            }
-
-            let existing_count = count_by_domain(conn, domain)?;
-
-            if existing_count >= self.max_examples_per_domain {
-                // At capacity — only replace if meaningfully better than weakest
-                let weakest = get_weakest_by_domain(conn, domain)?;
-                if let Some(ref weak) = weakest {
-                    if *score < weak.quality_score + 0.1 {
-                        debug!(
-                            step_id,
-                            score,
-                            weakest_score = weak.quality_score,
-                            "Not enough improvement over weakest — skipping"
-                        );
-                        continue;
-                    }
-                    // Build replacement
-                    let new_example = CuratedExample {
-                        id: Uuid::new_v4().to_string(),
-                        domain: domain.to_string(),
-                        criterion_description: criterion_desc.clone(),
-                        steps_json: steps_json.clone(),
-                        quality_score: *score,
-                        execution_verified: true,
-                        times_used: 0,
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    info!(
-                        domain,
-                        new_score = score,
-                        replaced_id = %weak.id,
-                        "Replacing weakest curated example"
-                    );
-                    replace_example(conn, &weak.id, &new_example)?;
-                    extracted += 1;
-                }
-            } else {
-                // Under capacity — check diversity against existing examples
-                let existing = query_by_domain(conn, domain, self.max_examples_per_domain)?;
-                let dominated = existing.iter().any(|ex| {
-                    let dist =
-                        normalized_char_distance(&ex.criterion_description, criterion_desc);
-                    dist < self.diversity_threshold
-                });
-
-                if dominated {
-                    debug!(
-                        step_id,
-                        criterion_desc,
-                        "Too similar to existing example — skipping"
-                    );
-                    continue;
-                }
-
-                let new_example = CuratedExample {
-                    id: Uuid::new_v4().to_string(),
-                    domain: domain.to_string(),
-                    criterion_description: criterion_desc.clone(),
-                    steps_json: steps_json.clone(),
-                    quality_score: *score,
-                    execution_verified: true,
-                    times_used: 0,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                };
-                info!(
-                    domain,
-                    score,
-                    criterion_desc,
-                    "Inserting new curated example"
-                );
-                insert_example(conn, &new_example)?;
-                extracted += 1;
-            }
-        }
-
-        if extracted > 0 {
-            info!(
-                run_id,
-                domain, extracted, "Curated examples extracted from run"
-            );
-        }
-
-        Ok(extracted)
+        Err("SQLite removed".to_string())
     }
 
     /// Select relevant examples for a generation prompt.
@@ -381,23 +165,7 @@ impl FewShotCurator {
         max_examples: usize,
         conn: &Connection,
     ) -> Result<Vec<CuratedExample>, String> {
-        ensure_table(conn)?;
-
-        let examples = query_by_domain(conn, domain, max_examples)?;
-
-        // Track usage
-        for ex in &examples {
-            if let Err(e) = increment_times_used(conn, &ex.id) {
-                warn!(id = %ex.id, error = %e, "Failed to increment times_used");
-            }
-        }
-
-        debug!(
-            domain,
-            count = examples.len(),
-            "Selected curated examples for few-shot injection"
-        );
-        Ok(examples)
+        Err("SQLite removed".to_string())
     }
 
     /// Format curated examples as a few-shot section for prompt injection.

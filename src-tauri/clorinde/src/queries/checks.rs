@@ -722,7 +722,7 @@ where
 pub struct ListChecksStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_checks() -> ListChecksStmt {
     ListChecksStmt(
-        "SELECT id, name, description, check_type, tool, command, working_directory, config_path, auto_fix, fail_on_warning, timeout_seconds, is_critical, enabled, ai_generated, ai_generation_prompt, tags, created_at, updated_at FROM checks ORDER BY updated_at DESC",
+        "SELECT id, name, COALESCE(description, '') as description, check_type, tool, COALESCE(command, '') as command, COALESCE(working_directory, '') as working_directory, COALESCE(config_path, '') as config_path, auto_fix, fail_on_warning, COALESCE(timeout_seconds, 30) as timeout_seconds, is_critical, enabled, ai_generated, COALESCE(ai_generation_prompt, '') as ai_generation_prompt, tags, created_at, updated_at FROM checks ORDER BY updated_at DESC",
         None,
     )
 }
@@ -773,7 +773,7 @@ impl ListChecksStmt {
 pub struct GetCheckStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_check() -> GetCheckStmt {
     GetCheckStmt(
-        "SELECT id, name, description, check_type, tool, command, working_directory, config_path, auto_fix, fail_on_warning, timeout_seconds, is_critical, enabled, ai_generated, ai_generation_prompt, tags, created_at, updated_at FROM checks WHERE id = $1",
+        "SELECT id, name, COALESCE(description, '') as description, check_type, tool, COALESCE(command, '') as command, COALESCE(working_directory, '') as working_directory, COALESCE(config_path, '') as config_path, auto_fix, fail_on_warning, COALESCE(timeout_seconds, 30) as timeout_seconds, is_critical, enabled, ai_generated, COALESCE(ai_generation_prompt, '') as ai_generation_prompt, tags, created_at, updated_at FROM checks WHERE id = $1",
         None,
     )
 }
@@ -1105,7 +1105,7 @@ impl DeleteCheckStmt {
 pub struct GetCheckGroupStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_check_group() -> GetCheckGroupStmt {
     GetCheckGroupStmt(
-        "SELECT id, name, description, color, enabled, run_in_parallel, stop_on_failure, tags, created_at, updated_at FROM check_groups WHERE id = $1",
+        "SELECT id, name, COALESCE(description, '') as description, COALESCE(color, '') as color, enabled, run_in_parallel, stop_on_failure, tags, created_at, updated_at FROM check_groups WHERE id = $1",
         None,
     )
 }
@@ -1270,7 +1270,7 @@ impl DeleteCheckGroupStmt {
 pub struct GetChecksInGroupStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_checks_in_group() -> GetChecksInGroupStmt {
     GetChecksInGroupStmt(
-        "SELECT c.id, c.name, c.description, c.check_type, c.tool, c.command, c.working_directory, c.config_path, c.auto_fix, c.fail_on_warning, c.timeout_seconds, c.is_critical, c.enabled, c.ai_generated, c.ai_generation_prompt, c.tags, c.created_at, c.updated_at FROM checks c JOIN check_group_members cgm ON c.id = cgm.check_id WHERE cgm.group_id = $1 ORDER BY cgm.sort_order ASC",
+        "SELECT c.id, c.name, COALESCE(c.description, '') as description, c.check_type, c.tool, COALESCE(c.command, '') as command, COALESCE(c.working_directory, '') as working_directory, COALESCE(c.config_path, '') as config_path, c.auto_fix, c.fail_on_warning, COALESCE(c.timeout_seconds, 30) as timeout_seconds, c.is_critical, c.enabled, c.ai_generated, COALESCE(c.ai_generation_prompt, '') as ai_generation_prompt, c.tags, c.created_at, c.updated_at FROM checks c JOIN check_group_members cgm ON c.id = cgm.check_id WHERE cgm.group_id = $1 ORDER BY cgm.sort_order ASC",
         None,
     )
 }

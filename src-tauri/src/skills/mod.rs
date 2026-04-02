@@ -13,8 +13,8 @@
 
 pub mod playbook_parser;
 
+use crate::database::Connection;
 use crate::database::pg::PgDb;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -233,74 +233,7 @@ fn load_builtin_skills() -> Vec<SkillDefinition> {
 /// `Connection` passed through the generator pipeline (same pattern as
 /// `rules::load_rules`).
 pub fn load_user_skills_from_conn(conn: &Connection) -> Vec<SkillDefinition> {
-    let mut stmt = match conn.prepare(
-        r#"SELECT id, name, slug, description, category, tags, icon, color,
-                  allowed_phases, parameters, template, source,
-                  version, author, checksum, depends_on, usage_count,
-                  approval_status, forked_from
-           FROM user_skills
-           ORDER BY updated_at DESC"#,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to prepare user_skills query: {}", e);
-            return vec![];
-        }
-    };
-
-    let rows = stmt.query_map([], |row| {
-        let tags_json: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string());
-        let phases_json: String = row
-            .get::<_, String>(8)
-            .unwrap_or_else(|_| "[\"setup\"]".to_string());
-        let params_json: String = row.get::<_, String>(9).unwrap_or_else(|_| "[]".to_string());
-        let template_json: String = row.get(10)?;
-
-        Ok(SkillDefinition {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            slug: row.get(2)?,
-            description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            category: row
-                .get::<_, Option<String>>(4)?
-                .unwrap_or_else(|| "custom".to_string()),
-            tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-            icon: row
-                .get::<_, Option<String>>(6)?
-                .unwrap_or_else(|| "puzzle".to_string()),
-            color: row
-                .get::<_, Option<String>>(7)?
-                .unwrap_or_else(|| "gray".to_string()),
-            allowed_phases: serde_json::from_str(&phases_json)
-                .unwrap_or_else(|_| vec!["setup".to_string()]),
-            parameters: serde_json::from_str(&params_json).unwrap_or_default(),
-            template: serde_json::from_str(&template_json).unwrap_or(SkillTemplate::SingleStep {
-                step: HashMap::new(),
-            }),
-            source: row
-                .get::<_, Option<String>>(11)?
-                .unwrap_or_else(|| "user".to_string()),
-            version: row.get::<_, Option<String>>(12)?,
-            author: row
-                .get::<_, Option<String>>(13)?
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            checksum: row.get::<_, Option<String>>(14)?,
-            depends_on: row
-                .get::<_, Option<String>>(15)?
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            usage_count: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
-            approval_status: row.get::<_, Option<String>>(17)?,
-            forked_from: row.get::<_, Option<String>>(18)?,
-        })
-    });
-
-    match rows {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) => {
-            warn!("Failed to query user skills: {}", e);
-            vec![]
-        }
-    }
+    Vec::new()
 }
 
 // =============================================================================
@@ -332,15 +265,7 @@ impl SkillRegistry {
     ///
     /// If `conn` is None or the query fails, only built-in skills are loaded.
     pub fn with_db(conn: Option<&Connection>) -> Self {
-        let mut registry = Self::new();
-        if let Some(conn) = conn {
-            let user_skills = load_user_skills_from_conn(conn);
-            if !user_skills.is_empty() {
-                tracing::debug!("Loaded {} user skills from database", user_skills.len());
-                registry.user = user_skills;
-            }
-        }
-        registry
+        todo!("SQLite removed")
     }
 
     /// Create a registry with built-in skills + user skills loaded from PG.
@@ -950,6 +875,7 @@ pub fn annotate_skill_origins(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_load_builtin_skills() {

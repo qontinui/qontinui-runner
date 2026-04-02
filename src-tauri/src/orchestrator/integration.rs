@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+use crate::database::CheckpointDb;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -16,7 +17,6 @@ use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 
 use crate::ai_provider::cache_aware_builder::StructuredPrompt;
-use crate::database::CheckpointDb;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 use crate::workflow_generation::learning_orchestrator::{
@@ -684,24 +684,7 @@ impl Orchestrator {
         db: Arc<CheckpointDb>,
         doctor_handle: Option<DoctorHandle>,
     ) -> Self {
-        let knowledge_base = KnowledgeBase::new(Arc::clone(&db));
-        let verifier =
-            VerificationOrchestrator::new(config.working_directory.clone(), doctor_handle.clone());
-
-        Self {
-            config,
-            db,
-            knowledge_base,
-            verifier,
-            app_handle: None,
-            session_ctx: None,
-            hook_executor: HookExecutor::empty(),
-            doctor_handle,
-            pg_db: None,
-            learning_orchestrator: std::sync::Mutex::new(LearningOrchestrator::new(
-                LearningConfig::default(),
-            )),
-        }
+        todo!("SQLite removed")
     }
 
     /// Create a new orchestrator with output capabilities.
@@ -712,24 +695,7 @@ impl Orchestrator {
         session_ctx: Option<AiSessionContext>,
         doctor_handle: Option<DoctorHandle>,
     ) -> Self {
-        let knowledge_base = KnowledgeBase::new(Arc::clone(&db));
-        let verifier =
-            VerificationOrchestrator::new(config.working_directory.clone(), doctor_handle.clone());
-
-        Self {
-            config,
-            db,
-            knowledge_base,
-            verifier,
-            app_handle: Some(app_handle),
-            session_ctx,
-            hook_executor: HookExecutor::empty(),
-            doctor_handle,
-            pg_db: None,
-            learning_orchestrator: std::sync::Mutex::new(LearningOrchestrator::new(
-                LearningConfig::default(),
-            )),
-        }
+        todo!("SQLite removed")
     }
 
     /// Set the PostgreSQL database for unified memory queries.
@@ -1786,96 +1752,7 @@ impl Orchestrator {
     /// Only skills with approval_status='approved' and source='auto' are included.
     /// Limited to 10 skills to avoid bloating the prompt.
     fn build_skill_context(&self, state: &OrchestratorState) -> String {
-        // Prefer PG path for approved auto-extracted skills (hot path, every workflow execution).
-        let skills: Vec<(String, String, String, String)> = if let Some(ref pg) = self.pg_db {
-            let pg = Arc::clone(pg);
-            tokio::runtime::Handle::current()
-                .block_on(async move { pg.get_approved_auto_skills().await })
-                .unwrap_or_default()
-        } else {
-            // Fallback to SQLite when PG is unavailable
-            let conn = match self.db.get_conn() {
-                Ok(c) => c,
-                Err(_) => return String::new(),
-            };
-            let mut stmt = match conn.prepare(
-                r#"SELECT name, slug, description, category
-                   FROM user_skills
-                   WHERE approval_status = 'approved'
-                   AND source = 'auto'
-                   ORDER BY usage_count DESC
-                   LIMIT 10"#,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("Skills query unavailable: {}", e);
-                    return String::new();
-                }
-            };
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        };
-
-        if skills.is_empty() {
-            return String::new();
-        }
-
-        let mut context = String::from(
-            "## Procedural Skills (Auto-Learned)\n\n\
-             The following fix patterns were learned from previous successful runs. \
-             Apply them if they match the current issue:\n\n",
-        );
-
-        // Token budget: ~500 tokens (~2000 chars) to avoid bloating the prompt
-        let max_skill_chars: usize = 2000;
-        let mut chars_used: usize = context.len();
-        let mut injected_count = 0;
-
-        for (name, slug, description, category) in &skills {
-            let short_desc = description
-                .split('.')
-                .next()
-                .unwrap_or(description)
-                .trim();
-            let line = format!(
-                "- **{}** (`{}`) [{}]: {}\n",
-                name, slug, category, short_desc
-            );
-            if chars_used + line.len() > max_skill_chars {
-                break;
-            }
-            context.push_str(&line);
-            chars_used += line.len();
-            injected_count += 1;
-        }
-
-        if injected_count == 0 {
-            return String::new();
-        }
-
-        let remaining = skills.len() - injected_count;
-        if remaining > 0 {
-            context.push_str(&format!(
-                "\n_{} skill(s) shown, {} more available (token budget reached)._\n",
-                injected_count, remaining
-            ));
-        } else {
-            context.push_str(&format!(
-                "\n_{} skill(s) available. These were extracted from effective fixes in prior runs._\n",
-                injected_count
-            ));
-        }
-
-        context
+        String::new()
     }
 
     /// Check if any approved auto-skills were active and emit SKILL_FAILED events.
@@ -1888,99 +1765,7 @@ impl Orchestrator {
     /// The counter is reset when `build_skill_context` runs on a successful verification
     /// (which doesn't call this method at all — it's only called on failure).
     fn check_and_emit_skill_failures(&self, state: &OrchestratorState) {
-        let conn = match self.db.get_conn() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-
-        // Find approved auto-skills that were active (would have been injected)
-        let active_skills: Vec<(String, String)> = conn
-            .prepare(
-                r#"SELECT id, slug FROM user_skills
-                   WHERE approval_status = 'approved' AND source = 'auto'
-                   LIMIT 10"#,
-            )
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                    ))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default();
-
-        if active_skills.is_empty() {
-            return;
-        }
-
-        let bus = crate::workflow_event_bus::get_workflow_event_bus().clone();
-        let task_run_id = state.task_run_id.clone();
-        let iteration = state.iteration;
-        let consecutive_threshold = 3i64;
-
-        for (skill_id, slug) in &active_skills {
-            // Track consecutive failures per-skill using task_run_events.
-            // Each call inserts a failure marker event; count them to determine threshold.
-            let failure_event_type = format!("skill_failure:{}", skill_id);
-            let _ = conn.execute(
-                r#"INSERT INTO task_run_events (id, task_run_id, event_type, event_subtype, data, timestamp)
-                   VALUES (?1, ?2, 'skill_failure', ?3, '{}', datetime('now'))"#,
-                rusqlite::params![
-                    format!("sfe-{}-{}", skill_id, iteration),
-                    task_run_id,
-                    skill_id,
-                ],
-            );
-
-            // Count consecutive failures for this skill in this task run
-            let total_failures: i64 = conn
-                .query_row(
-                    r#"SELECT COUNT(*) FROM task_run_events
-                       WHERE task_run_id = ?1 AND event_type = 'skill_failure' AND event_subtype = ?2"#,
-                    rusqlite::params![task_run_id, skill_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            let auto_disabled = total_failures >= consecutive_threshold;
-
-            if auto_disabled {
-                let _ = conn.execute(
-                    r#"UPDATE user_skills SET approval_status = 'pending',
-                       updated_at = datetime('now')
-                       WHERE id = ?1 AND approval_status = 'approved'"#,
-                    rusqlite::params![skill_id],
-                );
-                warn!(
-                    "Auto-disabled skill '{}' after {} consecutive failures in task {}",
-                    slug, total_failures, task_run_id
-                );
-            }
-
-            let bus_clone = bus.clone();
-            let tr_id = task_run_id.clone();
-            let s_id = skill_id.clone();
-            let s_slug = slug.clone();
-            tokio::spawn(async move {
-                bus_clone
-                    .emit_workflow_event(
-                        crate::workflow_event_bus::events::SKILL_FAILED,
-                        &tr_id,
-                        None,
-                        None,
-                        serde_json::json!({
-                            "skill_id": s_id,
-                            "skill_slug": s_slug,
-                            "iteration": iteration,
-                            "consecutive_failures": total_failures,
-                            "auto_disabled": auto_disabled,
-                        }),
-                    )
-                    .await;
-            });
-        }
+        // SQLite removed - no-op
     }
 
     /// Process worker output and determine next action.
@@ -2569,72 +2354,7 @@ impl Orchestrator {
         state: &OrchestratorState,
         result: &TaskCompletionResult,
     ) {
-        let conn = match self.db.get_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Cannot run adaptive learning — no DB connection: {}", e);
-                return;
-            }
-        };
-
-        let (iterations, overall_score) = match result {
-            TaskCompletionResult::Success { iterations, .. } => (*iterations, 0.85),
-            TaskCompletionResult::Failed { iterations, .. } => (*iterations, 0.3),
-            TaskCompletionResult::Stopped { at_iteration, .. } => (*at_iteration, 0.2),
-            TaskCompletionResult::Paused { at_iteration, .. } => (*at_iteration, 0.5),
-        };
-
-        // Use first domain assignment if available, otherwise "general"
-        let domain = state
-            .domain_assignments
-            .first()
-            .map(|d| d.domain_id.clone())
-            .unwrap_or_else(|| "general".to_string());
-
-        let run_context = RunContext {
-            run_id: state.task_run_id.clone(),
-            overall_score,
-            iterations,
-            domain,
-            step_evaluation_summaries: None,
-            used_templates: None,
-            description: Some(state.task_run_id.clone()),
-        };
-
-        match self.learning_orchestrator.lock() {
-            Ok(mut orchestrator) => {
-                let actions = orchestrator.on_run_complete(&run_context, &conn);
-                if actions.has_activity() {
-                    debug!(
-                        "Adaptive learning for run {}: {} lessons, {} examples",
-                        state.task_run_id,
-                        actions.lessons_added,
-                        actions.examples_extracted,
-                    );
-                    // Emit event so frontend auto-refreshes adaptive learning panels
-                    if let Some(ref app_handle) = self.app_handle {
-                        let (status_str, _) = match result {
-                            TaskCompletionResult::Success { .. } => ("success", true),
-                            TaskCompletionResult::Failed { .. } => ("failure", false),
-                            TaskCompletionResult::Stopped { .. } => ("abandoned", false),
-                            TaskCompletionResult::Paused { .. } => ("partial", false),
-                        };
-                        emit_learning_update(
-                            app_handle,
-                            &state.task_run_id,
-                            status_str,
-                            state.total_duration_secs(),
-                            Some(iterations),
-                            None, // strategy
-                            vec![],
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Failed to lock learning orchestrator: {}", e);
-            }
-        }
+        // SQLite removed - no-op
     }
 
     /// Get accumulated findings for a task.
@@ -3400,118 +3120,7 @@ pub async fn run_orchestrated_task(
     // Doctor health monitor handle
     doctor_handle: Option<DoctorHandle>,
 ) -> Result<TaskCompletionResult, String> {
-    let arch = config.workflow_architecture.clone();
-    let orchestrator = Orchestrator::new(config.clone(), db, doctor_handle);
-    let mut state = orchestrator.initialize_task(task_run_id, goal)?;
-    state.set_workflow_architecture(arch);
-
-    loop {
-        // Build worker prompt with context
-        let prompt = orchestrator.build_worker_prompt(&state, base_prompt)?;
-
-        // Run worker (external callback)
-        let output = worker_fn(&prompt)?;
-
-        // Process output
-        let action = orchestrator.process_worker_output(&mut state, &output)?;
-
-        match action {
-            WorkerOutputAction::Continue => {
-                // Continue to next iteration
-                continue;
-            }
-            WorkerOutputAction::RunVerification => {
-                // Capture screenshot if needed
-                let screenshot = if orchestrator.config.enable_ai_verification {
-                    screenshot_fn()?
-                } else {
-                    None
-                };
-
-                // Run verification
-                let results = orchestrator
-                    .run_verification(&mut state, screenshot.as_deref())
-                    .await?;
-
-                if results.all_passed {
-                    // Success!
-                    let findings = orchestrator.get_findings(task_run_id)?;
-                    let result = TaskCompletionResult::Success {
-                        iterations: state.iteration,
-                        findings: findings
-                            .iter()
-                            .filter(|f| f.category == "finding")
-                            .map(|f| crate::orchestrator::types::Finding {
-                                id: f.id.clone(),
-                                finding_type: f.category.clone(),
-                                description: f.content.clone(),
-                                evidence: f.evidence.clone(),
-                                confidence: crate::orchestrator::types::Confidence::Medium,
-                                related_files: f.related_files.clone(),
-                            })
-                            .collect(),
-                        verification_results: results,
-                    };
-                    orchestrator.complete_task(&mut state, result.clone());
-                    return Ok(result);
-                } else {
-                    // Verification failed, continue iteration
-                    if state.iteration >= config.max_iterations {
-                        let result = TaskCompletionResult::Failed {
-                            reason: "Max iterations reached without passing verification"
-                                .to_string(),
-                            iterations: state.iteration,
-                            last_results: Some(results),
-                            findings: vec![],
-                        };
-                        orchestrator.complete_task(&mut state, result.clone());
-                        return Ok(result);
-                    }
-                    // Transition to agentic phase for next iteration
-                    state.record_stage_transition("agentic");
-                    orchestrator.persist_transition_history(&state);
-                    // Continue to next iteration with verification feedback
-                    continue;
-                }
-            }
-            WorkerOutputAction::Replan { reason } => {
-                orchestrator.handle_replan(&mut state, &reason)?;
-                // Transition to agentic phase for re-planning
-                state.record_stage_transition("agentic");
-                orchestrator.persist_transition_history(&state);
-                // Continue with new plan
-                continue;
-            }
-            WorkerOutputAction::MaxIterationsReached => {
-                let result = TaskCompletionResult::Paused {
-                    at_iteration: state.iteration,
-                    max_iterations: config.max_iterations,
-                    last_results: state.last_verification.clone(),
-                    findings: vec![],
-                };
-                orchestrator.complete_task(&mut state, result.clone());
-                return Ok(result);
-            }
-            WorkerOutputAction::SetupPhaseComplete => {
-                // Setup steps completed, transition to verification phase
-                // This is handled automatically - the orchestrator knows to continue
-                // without requiring explicit AI signals
-                orchestrator.complete_setup_phase(&mut state);
-                // Continue to verification loop
-                continue;
-            }
-            WorkerOutputAction::CompletionPhaseComplete => {
-                // Completion steps finished, task is done
-                let success = state
-                    .last_verification
-                    .as_ref()
-                    .map(|v| v.all_passed)
-                    .unwrap_or(false);
-                let result = orchestrator.complete_completion_phase(&mut state, success);
-                return Ok(result);
-            }
-        }
-    }
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -3521,6 +3130,7 @@ pub async fn run_orchestrated_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_orchestrator_config_default() {

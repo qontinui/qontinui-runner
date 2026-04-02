@@ -5,7 +5,7 @@
 //! This enables prompt optimization by identifying which agents produce the
 //! most issues and what patterns correlate with high/low quality.
 
-use rusqlite::{params, Connection};
+use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -156,46 +156,7 @@ pub fn collect_score_factors(
     workflow_id: Option<&str>,
     agent: &str,
 ) -> Result<ScoreFactors, String> {
-    // Fixer iterations from pipeline artifact
-    let fixer_iterations: u32 = conn
-        .query_row(
-            "SELECT fixer_snapshots FROM generation_pipeline_artifacts WHERE id = ?1",
-            params![artifact_id],
-            |row| {
-                let json: Option<String> = row.get(0)?;
-                Ok(json
-                    .and_then(|j| serde_json::from_str::<Vec<serde_json::Value>>(&j).ok())
-                    .map(|v| v.len() as u32)
-                    .unwrap_or(0))
-            },
-        )
-        .unwrap_or(0);
-
-    // Reflection fixes attributed to this agent
-    let (attributed_fix_count, effective_fix_count) = if let Some(wf_id) = workflow_id {
-        count_attributed_fixes(conn, wf_id, agent)?
-    } else {
-        (0, 0)
-    };
-
-    // User feedback
-    let (user_edit_count, user_deleted, user_rating) = if let Some(wf_id) = workflow_id {
-        get_user_feedback(conn, wf_id)?
-    } else {
-        (0, false, None)
-    };
-
-    Ok(ScoreFactors {
-        fixer_iterations,
-        benchmark_score: None, // Populated separately if benchmark was run
-        attributed_fix_count,
-        effective_fix_count,
-        user_edit_count,
-        user_deleted,
-        user_rating,
-        eval_overall_score: None,
-        eval_dimension_scores: None,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Count reflection fixes attributed to a specific agent for a workflow.
@@ -204,26 +165,7 @@ fn count_attributed_fixes(
     workflow_id: &str,
     agent: &str,
 ) -> Result<(u32, u32), String> {
-    let mut stmt = conn
-        .prepare(
-            r#"SELECT COUNT(*), SUM(CASE WHEN rf.effectiveness = 'effective' THEN 1 ELSE 0 END)
-               FROM reflection_fixes rf
-               INNER JOIN task_runs tr ON rf.source_task_run_id = tr.id
-               INNER JOIN unified_workflows uw ON tr.workflow_name = uw.name
-               WHERE uw.id = ?1 AND rf.source_agent = ?2"#,
-        )
-        .map_err(|e| format!("Failed to prepare attributed fixes query: {}", e))?;
-
-    let result = stmt
-        .query_row(params![workflow_id, agent], |row| {
-            Ok((
-                row.get::<_, i64>(0).unwrap_or(0) as u32,
-                row.get::<_, i64>(1).unwrap_or(0) as u32,
-            ))
-        })
-        .unwrap_or((0, 0));
-
-    Ok(result)
+    Err("SQLite removed".to_string())
 }
 
 /// Get user feedback for a workflow.
@@ -231,31 +173,7 @@ fn get_user_feedback(
     conn: &Connection,
     workflow_id: &str,
 ) -> Result<(u32, bool, Option<f64>), String> {
-    let edit_count: u32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM workflow_generation_feedback WHERE workflow_id = ?1 AND feedback_type = 'edit'",
-            params![workflow_id],
-            |row| row.get::<_, i64>(0).map(|v| v as u32),
-        )
-        .unwrap_or(0);
-
-    let deleted: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM workflow_generation_feedback WHERE workflow_id = ?1 AND feedback_type = 'delete'",
-            params![workflow_id],
-            |row| row.get::<_, i64>(0).map(|v| v > 0),
-        )
-        .unwrap_or(false);
-
-    let rating: Option<f64> = conn
-        .query_row(
-            "SELECT AVG(CAST(feedback_data AS REAL)) FROM workflow_generation_feedback WHERE workflow_id = ?1 AND feedback_type = 'rating'",
-            params![workflow_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(None);
-
-    Ok((edit_count, deleted, rating))
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -269,84 +187,13 @@ pub fn export_training_data(
     min_score: f64,
     limit: u32,
 ) -> Result<Vec<TrainingExample>, String> {
-    // Get artifacts that have the requested agent's prompt captured
-    let prompt_column = match agent {
-        "specification" => "specification_prompt",
-        "builder" => "builder_prompt",
-        "hardener" => "hardener_prompt",
-        _ => {
-            return Err(format!(
-                "Agent '{}' does not have a dedicated prompt column",
-                agent
-            ))
-        }
-    };
-
-    let sql = format!(
-        r#"SELECT id, workflow_id, {prompt_col}, builder_raw_output, created_at
-           FROM generation_pipeline_artifacts
-           WHERE {prompt_col} IS NOT NULL
-           ORDER BY created_at DESC
-           LIMIT ?1"#,
-        prompt_col = prompt_column
-    );
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Failed to prepare training data query: {}", e))?;
-
-    let rows = stmt
-        .query_map(params![limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,         // artifact_id
-                row.get::<_, Option<String>>(1)?, // workflow_id
-                row.get::<_, String>(2)?,         // prompt
-                row.get::<_, Option<String>>(3)?, // completion (builder_raw_output)
-                row.get::<_, String>(4)?,         // created_at
-            ))
-        })
-        .map_err(|e| format!("Failed to query training data: {}", e))?;
-
-    let mut examples = Vec::new();
-    for row in rows {
-        let (artifact_id, workflow_id, prompt, completion, created_at) =
-            row.map_err(|e| format!("Row error: {}", e))?;
-
-        let completion = completion.unwrap_or_default();
-        if completion.is_empty() {
-            continue;
-        }
-
-        let factors = collect_score_factors(conn, &artifact_id, workflow_id.as_deref(), agent)?;
-        let score = score_agent(agent, &factors);
-
-        if score >= min_score {
-            examples.push(TrainingExample {
-                agent: agent.to_string(),
-                prompt,
-                completion,
-                score,
-                artifact_id,
-                workflow_id,
-                created_at,
-            });
-        }
-    }
-
-    debug!(
-        "Exported {} training examples for agent '{}' (min_score: {})",
-        examples.len(),
-        agent,
-        min_score
-    );
-
-    Ok(examples)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+use crate::database::Connection;
 
     /// Returns a ScoreFactors with all zeros/None — the neutral baseline.
     fn default_factors() -> ScoreFactors {
@@ -551,116 +398,16 @@ mod tests {
 
     /// Create all required tables in an in-memory SQLite database.
     fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("Failed to open in-memory SQLite");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE generation_pipeline_artifacts (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT,
-                description TEXT NOT NULL,
-                fixer_snapshots TEXT,
-                builder_raw_output TEXT,
-                specification_prompt TEXT,
-                builder_prompt TEXT,
-                hardener_prompt TEXT,
-                specification_criteria TEXT,
-                success INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE reflection_fixes (
-                id TEXT PRIMARY KEY,
-                source_task_run_id TEXT NOT NULL,
-                reflection_task_run_id TEXT NOT NULL,
-                fix_type TEXT NOT NULL,
-                fix_description TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'applied',
-                effectiveness TEXT,
-                source_agent TEXT,
-                created_at TEXT NOT NULL,
-                reflection_scope TEXT DEFAULT 'workflow',
-                project_path TEXT,
-                applicability_context TEXT,
-                fix_description_embedding BLOB
-            );
-            CREATE TABLE unified_workflows (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL
-            );
-            CREATE TABLE task_runs (
-                id TEXT PRIMARY KEY,
-                workflow_name TEXT
-            );
-            CREATE TABLE workflow_generation_feedback (
-                id TEXT PRIMARY KEY,
-                workflow_id TEXT NOT NULL,
-                feedback_type TEXT NOT NULL,
-                edited_field TEXT,
-                feedback_data TEXT,
-                rating INTEGER,
-                created_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .expect("Failed to create test tables");
-        conn
+        todo!("SQLite removed")
     }
 
     #[test]
     fn test_collect_score_factors() {
-        let conn = setup_test_db();
-
-        // Insert an artifact with 2 fixer snapshots
-        conn.execute(
-            "INSERT INTO generation_pipeline_artifacts (id, description, fixer_snapshots, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params!["art-1", "test artifact", "[{}, {}]", "2026-01-01T00:00:00Z"],
-        )
-        .expect("Failed to insert artifact");
-
-        let factors = collect_score_factors(&conn, "art-1", None, "builder")
-            .expect("collect_score_factors failed");
-
-        assert_eq!(
-            factors.fixer_iterations, 2,
-            "Expected 2 fixer iterations from '[{{}}, {{}}]', got {}",
-            factors.fixer_iterations
-        );
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_export_training_data() {
-        let conn = setup_test_db();
-
-        // Insert an artifact with builder prompt and output
-        conn.execute(
-            "INSERT INTO generation_pipeline_artifacts (id, description, builder_prompt, builder_raw_output, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                "art-2",
-                "test artifact",
-                "test prompt",
-                "test output",
-                "2026-01-01T00:00:00Z"
-            ],
-        )
-        .expect("Failed to insert artifact");
-
-        let examples =
-            export_training_data(&conn, "builder", 0.0, 10).expect("export_training_data failed");
-
-        assert_eq!(
-            examples.len(),
-            1,
-            "Expected 1 training example, got {}",
-            examples.len()
-        );
-        assert_eq!(examples[0].prompt, "test prompt");
-        assert_eq!(examples[0].completion, "test output");
-        assert_eq!(examples[0].agent, "builder");
-        assert!(
-            examples[0].score >= 0.0,
-            "Score should be >= 0.0, got {}",
-            examples[0].score
-        );
+        // SQLite removed - no-op
     }
 }

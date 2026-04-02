@@ -3,9 +3,8 @@
 //! Combines SQL text search + vector similarity for findings, fixes,
 //! knowledge, errors, rules, and components into a single ranked result list.
 
-use rusqlite::{params, Connection};
+use crate::database::Connection;
 use serde::Serialize;
-use tracing::warn;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UnifiedSearchResult {
@@ -24,308 +23,31 @@ pub fn unified_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<UnifiedSearchResult>, String> {
-    let mut results = Vec::new();
-    let query_pattern = format!("%{}%", query);
-
-    // 1. Search task_run_findings
-    search_findings(conn, &query_pattern, &mut results);
-
-    // 2. Search reflection_fixes
-    search_fixes(conn, &query_pattern, &mut results);
-
-    // 3. Search task_knowledge
-    search_knowledge(conn, &query_pattern, &mut results);
-
-    // 4. Search error_events
-    search_errors(conn, &query_pattern, &mut results);
-
-    // 5. Search generation_rules
-    search_rules(conn, &query_pattern, &mut results);
-
-    // 6. Search unified_workflows
-    search_workflows(conn, &query_pattern, &mut results);
-
-    // 7. Search ui_bridge_elements (element interactions)
-    search_ui_elements(conn, &query_pattern, &mut results);
-
-    // Sort by relevance DESC, truncate
-    results.sort_by(|a, b| {
-        b.relevance_score
-            .partial_cmp(&a.relevance_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    results.truncate(limit);
-
-    Ok(results)
+    Err("SQLite removed".to_string())
 }
 
 fn search_findings(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
-    let query = r#"SELECT id, title, description, category, severity
-                   FROM task_run_findings
-                   WHERE title LIKE ?1 OR description LIKE ?1
-                   ORDER BY detected_at DESC
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let id: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let description: String = row.get(2)?;
-            let category: String = row.get(3)?;
-            let severity: String = row.get(4)?;
-            Ok((id, title, description, category, severity))
-        })?;
-
-        let mut collected = Vec::new();
-        for (id, title, description, category, severity) in rows.flatten() {
-            let title_matches = title.to_lowercase().contains(
-                &pattern
-                    .trim_matches('%')
-                    .to_lowercase(),
-            );
-            let score = if title_matches { 1.0 } else { 0.7 };
-            let snippet = format!("[{}][{}] {}", category, severity, truncate_str(&description, 120));
-            collected.push(UnifiedSearchResult {
-                entity_type: "finding".to_string(),
-                entity_id: id,
-                title,
-                snippet,
-                relevance_score: score,
-                source_table: "task_run_findings".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: findings query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 fn search_fixes(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
-    let query = r#"SELECT id, fix_type, fix_description, reflection_scope, status
-                   FROM reflection_fixes
-                   WHERE fix_description LIKE ?1 OR fix_type LIKE ?1
-                   ORDER BY created_at DESC
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let id: String = row.get(0)?;
-            let fix_type: String = row.get(1)?;
-            let fix_description: String = row.get(2)?;
-            let scope: String = row.get(3)?;
-            let status: String = row.get(4)?;
-            Ok((id, fix_type, fix_description, scope, status))
-        })?;
-
-        let mut collected = Vec::new();
-        for (id, fix_type, fix_description, scope, status) in rows.flatten() {
-            let type_matches = fix_type.to_lowercase().contains(
-                &pattern
-                    .trim_matches('%')
-                    .to_lowercase(),
-            );
-            let score = if type_matches { 1.0 } else { 0.7 };
-            let snippet = format!("[{}][{}] {}", scope, status, truncate_str(&fix_description, 120));
-            collected.push(UnifiedSearchResult {
-                entity_type: "fix".to_string(),
-                entity_id: id,
-                title: fix_type,
-                snippet,
-                relevance_score: score,
-                source_table: "reflection_fixes".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: fixes query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 fn search_knowledge(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
-    let query = r#"SELECT id, category, content, confidence
-                   FROM task_knowledge
-                   WHERE content LIKE ?1 OR category LIKE ?1
-                   ORDER BY created_at DESC
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let id: String = row.get(0)?;
-            let category: String = row.get(1)?;
-            let content: String = row.get(2)?;
-            let confidence: String = row.get(3)?;
-            Ok((id, category, content, confidence))
-        })?;
-
-        let mut collected = Vec::new();
-        for (id, category, content, confidence) in rows.flatten() {
-            let cat_matches = category.to_lowercase().contains(
-                &pattern
-                    .trim_matches('%')
-                    .to_lowercase(),
-            );
-            let score = if cat_matches { 1.0 } else { 0.7 };
-            let snippet = format!("[{}][conf:{}] {}", category, confidence, truncate_str(&content, 120));
-            collected.push(UnifiedSearchResult {
-                entity_type: "knowledge".to_string(),
-                entity_id: id,
-                title: format!("{} knowledge", category),
-                snippet,
-                relevance_score: score,
-                source_table: "task_knowledge".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: knowledge query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 fn search_errors(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
-    let query = r#"SELECT id, log_source_name, severity, message, error_type
-                   FROM error_events
-                   WHERE message LIKE ?1 OR error_type LIKE ?1
-                   ORDER BY last_seen_at DESC
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let id: i64 = row.get(0)?;
-            let source: String = row.get(1)?;
-            let severity: String = row.get(2)?;
-            let message: String = row.get(3)?;
-            let error_type: Option<String> = row.get(4)?;
-            Ok((id, source, severity, message, error_type))
-        })?;
-
-        let mut collected = Vec::new();
-        for (id, source, severity, message, error_type) in rows.flatten() {
-            let type_matches = error_type
-                .as_deref()
-                .map(|t| {
-                    t.to_lowercase().contains(
-                        &pattern
-                            .trim_matches('%')
-                            .to_lowercase(),
-                    )
-                })
-                .unwrap_or(false);
-            let score = if type_matches { 1.0 } else { 0.7 };
-            let title = error_type.unwrap_or_else(|| format!("{} error", source));
-            let snippet = format!("[{}][{}] {}", source, severity, truncate_str(&message, 120));
-            collected.push(UnifiedSearchResult {
-                entity_type: "error".to_string(),
-                entity_id: id.to_string(),
-                title,
-                snippet,
-                relevance_score: score,
-                source_table: "error_events".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: errors query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 fn search_rules(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
-    let query = r#"SELECT id, agent, title, content, severity, status
-                   FROM generation_rules
-                   WHERE title LIKE ?1 OR content LIKE ?1
-                   ORDER BY created_at DESC
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let id: String = row.get(0)?;
-            let agent: String = row.get(1)?;
-            let title: String = row.get(2)?;
-            let content: String = row.get(3)?;
-            let severity: String = row.get(4)?;
-            let status: String = row.get(5)?;
-            Ok((id, agent, title, content, severity, status))
-        })?;
-
-        let mut collected = Vec::new();
-        for (id, agent, title, content, severity, status) in rows.flatten() {
-            let title_matches = title.to_lowercase().contains(
-                &pattern
-                    .trim_matches('%')
-                    .to_lowercase(),
-            );
-            let score = if title_matches { 1.0 } else { 0.7 };
-            let snippet = format!("[{}][{}][{}] {}", agent, severity, status, truncate_str(&content, 120));
-            collected.push(UnifiedSearchResult {
-                entity_type: "rule".to_string(),
-                entity_id: id,
-                title: format!("{} ({})", title, agent),
-                snippet,
-                relevance_score: score,
-                source_table: "generation_rules".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: rules query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 fn search_workflows(conn: &Connection, pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
-    let query = r#"SELECT id, name, description, category
-                   FROM unified_workflows
-                   WHERE name LIKE ?1 OR description LIKE ?1
-                   ORDER BY updated_at DESC
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let description: String = row.get(2)?;
-            let category: String = row.get(3)?;
-            Ok((id, name, description, category))
-        })?;
-
-        let mut collected = Vec::new();
-        for (id, name, description, category) in rows.flatten() {
-            let name_matches = name.to_lowercase().contains(
-                &pattern
-                    .trim_matches('%')
-                    .to_lowercase(),
-            );
-            let score = if name_matches { 1.0 } else { 0.7 };
-            let snippet = format!("[{}] {}", category, truncate_str(&description, 120));
-            collected.push(UnifiedSearchResult {
-                entity_type: "workflow".to_string(),
-                entity_id: id,
-                title: name,
-                snippet,
-                relevance_score: score,
-                source_table: "unified_workflows".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: workflows query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 fn search_ui_elements(
@@ -333,58 +55,7 @@ fn search_ui_elements(
     pattern: &str,
     results: &mut Vec<UnifiedSearchResult>,
 ) {
-    let query = r#"SELECT DISTINCT element_id, element_type, label, text_content
-                   FROM ui_bridge_elements
-                   WHERE element_id LIKE ?1 OR label LIKE ?1 OR text_content LIKE ?1
-                   LIMIT 20"#;
-
-    let outcome = conn.prepare(query).and_then(|mut stmt| {
-        let rows = stmt.query_map(params![pattern], |row| {
-            let element_id: String = row.get(0)?;
-            let element_type: Option<String> = row.get(1)?;
-            let label: Option<String> = row.get(2)?;
-            let text_content: Option<String> = row.get(3)?;
-            Ok((element_id, element_type, label, text_content))
-        })?;
-
-        let mut collected = Vec::new();
-        for (element_id, element_type, label, text_content) in rows.flatten() {
-            let clean_pattern = pattern
-                .trim_start_matches('%')
-                .trim_end_matches('%')
-                .to_lowercase();
-            let id_matches = element_id.to_lowercase().contains(&clean_pattern);
-            let label_matches = label
-                .as_deref()
-                .is_some_and(|l| l.to_lowercase().contains(&clean_pattern));
-            let score = if id_matches { 1.0 } else if label_matches { 0.8 } else { 0.6 };
-
-            let title = label.unwrap_or_else(|| element_id.clone());
-            let snippet = format!(
-                "[{}] {}",
-                element_type.as_deref().unwrap_or("unknown"),
-                text_content
-                    .as_deref()
-                    .map(|t| truncate_str(t, 120))
-                    .unwrap_or_default()
-            );
-
-            collected.push(UnifiedSearchResult {
-                entity_type: "ui_element".to_string(),
-                entity_id: element_id,
-                title,
-                snippet,
-                relevance_score: score,
-                source_table: "ui_bridge_elements".to_string(),
-            });
-        }
-        Ok(collected)
-    });
-
-    match outcome {
-        Ok(items) => results.extend(items),
-        Err(e) => warn!("Unified search: ui_bridge_elements query failed: {}", e),
-    }
+    // SQLite removed - no-op
 }
 
 /// Truncate a string to a maximum character length, appending "..." if truncated.

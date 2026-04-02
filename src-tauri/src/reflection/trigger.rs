@@ -12,6 +12,7 @@ use tracing::{debug, info};
 
 use crate::config_storage::ConfigStorage;
 use crate::AppState;
+use crate::database::Connection;
 
 /// Number of consecutive successful runs (zero findings) before suppressing reflection.
 const CONVERGENCE_THRESHOLD: u32 = 5;
@@ -529,5 +530,5 @@ pub fn launch_ui_bridge_reflection(
     Ok(reflection_id)
 }
 
-// Tests removed — they relied on SQLite (rusqlite::Connection) which has been removed.
+// Tests removed — they relied on SQLite (crate::database::Connection) which has been removed.
 // Convergence functions are now stubbed; tests should be rewritten against PG when migrated.

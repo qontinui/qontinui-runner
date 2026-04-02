@@ -519,7 +519,7 @@ impl GetConfigStmt {
 pub struct ListConfigsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_configs() -> ListConfigsStmt {
     ListConfigsStmt(
-        "SELECT id, name, source_type, source_path, created_at, updated_at FROM configs ORDER BY updated_at DESC",
+        "SELECT id, name, source_type, COALESCE(source_path, '') as source_path, created_at, updated_at FROM configs ORDER BY updated_at DESC",
         None,
     )
 }

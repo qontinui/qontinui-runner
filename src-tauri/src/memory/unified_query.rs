@@ -2,6 +2,7 @@
 //!
 //! Queries all memory stores in parallel and fuses results using RRF scoring.
 
+use crate::database::CheckpointDb;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,7 +10,6 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 use crate::reflection::graph_engine::KnowledgeGraph;
 
 // =============================================================================
@@ -571,121 +571,7 @@ pub async fn query_memory(
     _db: Option<Arc<CheckpointDb>>,
     graph: Option<&KnowledgeGraph>,
 ) -> Result<Vec<MemoryResult>, String> {
-    let per_source_limit = (params.limit * 3) as i64;
-    let query = &params.query;
-    let sources = &params.sources;
-
-    fn source_enabled(sources: &Option<Vec<MemorySource>>, s: MemorySource) -> bool {
-        sources.as_ref().is_none_or(|list| list.contains(&s))
-    }
-
-    // Determine which sources to query
-    let want_observations = source_enabled(sources, MemorySource::Observation);
-    let want_timeline = source_enabled(sources, MemorySource::ActivityTimeline);
-    let want_knowledge = source_enabled(sources, MemorySource::TaskKnowledge);
-    let want_sqlite = source_enabled(sources, MemorySource::Finding)
-        || source_enabled(sources, MemorySource::Fix)
-        || source_enabled(sources, MemorySource::Error)
-        || source_enabled(sources, MemorySource::Rule)
-        || source_enabled(sources, MemorySource::Workflow)
-        || source_enabled(sources, MemorySource::TaskKnowledge)
-        || source_enabled(sources, MemorySource::UiElement);
-    let want_graph = source_enabled(sources, MemorySource::GraphNode);
-    let want_embeddings = source_enabled(sources, MemorySource::Finding)
-        || source_enabled(sources, MemorySource::TaskKnowledge)
-        || source_enabled(sources, MemorySource::Error)
-        || sources.is_none();
-
-    // Fan out to all enabled sources in parallel.
-    // PG queries are async; SQLite and graph are sync so we spawn_blocking.
-    let obs_query = query.to_string();
-    let timeline_query = query.to_string();
-    let knowledge_query = query.to_string();
-    let sqlite_query = query.to_string();
-    let graph_query = query.to_string();
-    let embeddings_query = query.to_string();
-
-    let obs_fut = async {
-        if want_observations {
-            retrieve_observations(pg, &obs_query, per_source_limit).await
-        } else {
-            Vec::new()
-        }
-    };
-
-    let timeline_fut = async {
-        if want_timeline {
-            retrieve_timeline(pg, &timeline_query, per_source_limit).await
-        } else {
-            Vec::new()
-        }
-    };
-
-    let knowledge_fut = async {
-        if want_knowledge {
-            retrieve_knowledge(pg, &knowledge_query, per_source_limit).await
-        } else {
-            Vec::new()
-        }
-    };
-
-    // PG unified search replaces SQLite retrieve_sqlite
-    let pg_for_sqlite = pg;
-    let sqlite_limit = params.limit * 3;
-    let sqlite_fut = async move {
-        if want_sqlite {
-            retrieve_pg_unified(pg_for_sqlite, &sqlite_query, sqlite_limit).await
-        } else {
-            Vec::new()
-        }
-    };
-
-    // Graph is optional — only runs if already materialized
-    let graph_limit = params.limit * 3;
-    let graph_results = if want_graph {
-        if let Some(g) = graph {
-            retrieve_graph(g, &graph_query, graph_limit)
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-
-    // Embedding-based semantic similarity (async, uses local embedding service + PG)
-    let embeddings_limit = params.limit * 3;
-    let embeddings_fut = async move {
-        if want_embeddings {
-            retrieve_embeddings(pg, &embeddings_query, embeddings_limit).await
-        } else {
-            Vec::new()
-        }
-    };
-
-    let (obs, timeline, knowledge, sqlite, embeddings) =
-        tokio::join!(obs_fut, timeline_fut, knowledge_fut, sqlite_fut, embeddings_fut);
-
-    // Collect all result sets for fusion (6 sources)
-    let result_sets = vec![obs, timeline, knowledge, sqlite, graph_results, embeddings];
-
-    // Fuse with RRF (k=60 is standard)
-    let mut fused = reciprocal_rank_fusion(result_sets, 60.0);
-
-    // Apply temporal filters
-    if let Some(from) = params.from {
-        fused.retain(|r| r.timestamp.is_none_or(|t| t >= from));
-    }
-    if let Some(to) = params.to {
-        fused.retain(|r| r.timestamp.is_none_or(|t| t <= to));
-    }
-
-    // Apply score threshold
-    if let Some(min) = params.min_score {
-        fused.retain(|r| r.fused_score >= min);
-    }
-
-    fused.truncate(params.limit);
-    Ok(fused)
+    Err("SQLite removed".to_string())
 }
 
 // =============================================================================
@@ -878,6 +764,7 @@ mod tests {
     #[test]
     fn test_temporal_filter_to() {
         use chrono::TimeZone;
+use crate::database::CheckpointDb;
 
         let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();

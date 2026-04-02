@@ -3,7 +3,7 @@
 //! Analyzes all successful workflows in the database to extract recurring
 //! patterns and automatically generate rules for the rules engine.
 
-use rusqlite::Connection;
+use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -122,127 +122,7 @@ fn parse_steps(data: &serde_json::Value, phase: &str) -> Vec<serde_json::Value> 
 
 /// Analyze all workflows in the database to extract patterns.
 pub fn mine_patterns(conn: &Connection) -> Result<MiningReport, String> {
-    let start = Instant::now();
-
-    // Collect workflow data
-    let mut stmt = conn
-        .prepare("SELECT id, data FROM unified_workflows")
-        .map_err(|e| format!("Failed to prepare unified_workflows query: {}", e))?;
-
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| format!("Failed to query unified_workflows: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let workflows_analyzed = rows.len() as u32;
-    debug!(
-        "Pattern mining: loaded {} workflows for analysis",
-        workflows_analyzed
-    );
-
-    // Parse all workflows into structured data
-    let mut parsed: Vec<(String, serde_json::Value)> = Vec::new();
-    for (id, data_str) in &rows {
-        match serde_json::from_str::<serde_json::Value>(data_str) {
-            Ok(val) => parsed.push((id.clone(), val)),
-            Err(e) => {
-                debug!("Skipping workflow {} with unparseable data: {}", id, e);
-            }
-        }
-    }
-
-    // Determine which workflows were successful by joining with task_runs
-    let successful_ids: std::collections::HashSet<String> = conn
-        .prepare(
-            "SELECT DISTINCT w.id FROM unified_workflows w \
-             JOIN task_runs tr ON tr.workflow_id = w.id \
-             WHERE tr.status = 'success'",
-        )
-        .map(|mut s| {
-            let ids: Vec<String> = s
-                .query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            ids
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    let failed_ids: std::collections::HashSet<String> = conn
-        .prepare(
-            "SELECT DISTINCT w.id FROM unified_workflows w \
-             JOIN task_runs tr ON tr.workflow_id = w.id \
-             WHERE tr.status = 'failure'",
-        )
-        .map(|mut s| {
-            let ids: Vec<String> = s
-                .query_map([], |row| row.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            ids
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    let mut patterns: Vec<MinedPattern> = Vec::new();
-
-    // ---- Setup Sequences ----
-    patterns.extend(mine_setup_sequences(&parsed, &successful_ids));
-
-    // ---- Effective Verifications ----
-    patterns.extend(mine_effective_verifications(&parsed, &successful_ids));
-
-    // ---- Optimal Ordering ----
-    patterns.extend(mine_optimal_orderings(&parsed, &successful_ids));
-
-    // ---- Anti-Patterns ----
-    patterns.extend(mine_anti_patterns(&parsed, &failed_ids, &successful_ids));
-
-    // Deduplicate by name
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut deduped: Vec<MinedPattern> = Vec::new();
-    for p in patterns {
-        if let Some(&idx) = seen.get(&p.name) {
-            // Merge: keep the one with higher score
-            let existing = &deduped[idx];
-            let existing_score = existing.occurrence_count as f32 * existing.success_rate;
-            let new_score = p.occurrence_count as f32 * p.success_rate;
-            if new_score > existing_score {
-                deduped[idx] = p;
-            }
-        } else {
-            seen.insert(p.name.clone(), deduped.len());
-            deduped.push(p);
-        }
-    }
-
-    // Sort by occurrence_count * success_rate descending
-    deduped.sort_by(|a, b| {
-        let score_a = a.occurrence_count as f32 * a.success_rate;
-        let score_b = b.occurrence_count as f32 * b.success_rate;
-        score_b
-            .partial_cmp(&score_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    info!(
-        "Pattern mining complete: {} patterns found from {} workflows in {}ms",
-        deduped.len(),
-        workflows_analyzed,
-        duration_ms
-    );
-
-    Ok(MiningReport {
-        patterns: deduped,
-        workflows_analyzed,
-        duration_ms,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Convert mined patterns into generation rules for the rules engine.
@@ -254,94 +134,7 @@ pub fn patterns_to_rules(
     patterns: &[MinedPattern],
     min_occurrences: u32,
 ) -> Result<u32, String> {
-    let qualifying: Vec<&MinedPattern> = patterns
-        .iter()
-        .filter(|p| p.occurrence_count >= min_occurrences)
-        .collect();
-
-    if qualifying.is_empty() {
-        debug!(
-            "No patterns meet the minimum occurrence threshold of {}",
-            min_occurrences
-        );
-        return Ok(0);
-    }
-
-    // Load existing pattern_mining rules to check for duplicates
-    let existing_rules = rules::list_rules(
-        conn,
-        &ListRulesQuery {
-            provenance: Some("pattern_mining".to_string()),
-            ..Default::default()
-        },
-    )
-    .unwrap_or_default();
-
-    let existing_titles: std::collections::HashSet<String> =
-        existing_rules.iter().map(|r| r.title.clone()).collect();
-
-    let mut created = 0u32;
-    for (i, pattern) in qualifying.iter().enumerate() {
-        if existing_titles.contains(&pattern.name) {
-            debug!("Skipping duplicate pattern rule: {}", pattern.name);
-            continue;
-        }
-
-        let section = match pattern.category {
-            PatternCategory::SetupSequence => "setup",
-            PatternCategory::EffectiveVerification => "verification",
-            PatternCategory::OptimalOrdering => "ordering",
-            PatternCategory::AntiPattern => "anti_patterns",
-        };
-
-        let mut content = pattern.description.clone();
-        if let Some(ref example) = pattern.example_step {
-            content.push_str(&format!(
-                "\n\nExample:\n```json\n{}\n```",
-                serde_json::to_string_pretty(example).unwrap_or_default()
-            ));
-        }
-
-        let condition = if pattern.conditions.is_empty() {
-            None
-        } else {
-            Some(pattern.conditions.join(", "))
-        };
-
-        let input = InsertRuleInput {
-            agent: "builder".to_string(),
-            section: section.to_string(),
-            rule_number: (i as i32) + 1,
-            title: pattern.name.clone(),
-            content,
-            condition,
-            provenance: "pattern_mining".to_string(),
-            source_fix_id: None,
-            severity: None,
-            examples_json: None,
-        };
-
-        match rules::insert_rule(conn, &input) {
-            Ok(rule) => {
-                info!("Created pattern-mined rule: {} ({})", rule.title, rule.id);
-                created += 1;
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to create rule for pattern '{}': {}",
-                    pattern.name, e
-                );
-            }
-        }
-    }
-
-    info!(
-        "Pattern-to-rules conversion: created {} new rules from {} qualifying patterns",
-        created,
-        qualifying.len()
-    );
-
-    Ok(created)
+    Err("SQLite removed".to_string())
 }
 
 /// Format mined patterns as context for the builder prompt.
@@ -621,6 +414,7 @@ fn mine_anti_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_extract_step_signature_basic() {

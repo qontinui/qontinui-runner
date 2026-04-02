@@ -1,16 +1,18 @@
 --- Check and check group CRUD operations.
 
 --! list_checks
-SELECT id, name, description, check_type, tool, command, working_directory, config_path,
-       auto_fix, fail_on_warning, timeout_seconds, is_critical, enabled, ai_generated,
-       ai_generation_prompt, tags, created_at, updated_at
+SELECT id, name, COALESCE(description, '') as description, check_type, tool, COALESCE(command, '') as command,
+       COALESCE(working_directory, '') as working_directory, COALESCE(config_path, '') as config_path,
+       auto_fix, fail_on_warning, COALESCE(timeout_seconds, 30) as timeout_seconds, is_critical, enabled, ai_generated,
+       COALESCE(ai_generation_prompt, '') as ai_generation_prompt, tags, created_at, updated_at
 FROM checks
 ORDER BY updated_at DESC;
 
 --! get_check
-SELECT id, name, description, check_type, tool, command, working_directory, config_path,
-       auto_fix, fail_on_warning, timeout_seconds, is_critical, enabled, ai_generated,
-       ai_generation_prompt, tags, created_at, updated_at
+SELECT id, name, COALESCE(description, '') as description, check_type, tool, COALESCE(command, '') as command,
+       COALESCE(working_directory, '') as working_directory, COALESCE(config_path, '') as config_path,
+       auto_fix, fail_on_warning, COALESCE(timeout_seconds, 30) as timeout_seconds, is_critical, enabled, ai_generated,
+       COALESCE(ai_generation_prompt, '') as ai_generation_prompt, tags, created_at, updated_at
 FROM checks
 WHERE id = :id;
 
@@ -47,7 +49,8 @@ RETURNING id;
 DELETE FROM checks WHERE id = :id RETURNING id;
 
 --! get_check_group
-SELECT id, name, description, color, enabled, run_in_parallel, stop_on_failure, tags,
+SELECT id, name, COALESCE(description, '') as description, COALESCE(color, '') as color,
+       enabled, run_in_parallel, stop_on_failure, tags,
        created_at, updated_at
 FROM check_groups
 WHERE id = :id;
@@ -61,9 +64,10 @@ RETURNING id;
 DELETE FROM check_groups WHERE id = :id RETURNING id;
 
 --! get_checks_in_group
-SELECT c.id, c.name, c.description, c.check_type, c.tool, c.command, c.working_directory,
-       c.config_path, c.auto_fix, c.fail_on_warning, c.timeout_seconds, c.is_critical,
-       c.enabled, c.ai_generated, c.ai_generation_prompt, c.tags, c.created_at, c.updated_at
+SELECT c.id, c.name, COALESCE(c.description, '') as description, c.check_type, c.tool, COALESCE(c.command, '') as command,
+       COALESCE(c.working_directory, '') as working_directory, COALESCE(c.config_path, '') as config_path,
+       c.auto_fix, c.fail_on_warning, COALESCE(c.timeout_seconds, 30) as timeout_seconds, c.is_critical,
+       c.enabled, c.ai_generated, COALESCE(c.ai_generation_prompt, '') as ai_generation_prompt, c.tags, c.created_at, c.updated_at
 FROM checks c
 JOIN check_group_members cgm ON c.id = cgm.check_id
 WHERE cgm.group_id = :group_id

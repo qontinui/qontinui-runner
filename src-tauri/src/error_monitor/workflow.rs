@@ -3,6 +3,7 @@
 //! This module provides functionality to generate a unified workflow
 //! that uses the debug agent to analyze and fix detected errors.
 
+use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -11,7 +12,6 @@ use crate::error_monitor::curator::{CuratedError, DebugContext, DebugContextCura
 use crate::error_monitor::storage::ErrorEventStorage;
 use crate::error_monitor::types::{ErrorQuery, ErrorStatus};
 use crate::str_utils::truncate_str;
-use rusqlite::Connection;
 
 /// Default maximum iterations for error fix workflows.
 const DEFAULT_FIX_MAX_ITERATIONS: u32 = 10;
@@ -80,87 +80,7 @@ impl ErrorFixWorkflowGenerator {
 
     /// Generate a unified workflow for fixing errors.
     pub fn generate(&self, conn: &Connection) -> Result<GeneratedWorkflow, String> {
-        // Get the debug context
-        let curator = DebugContextCurator::new();
-        let context = curator.build_context(conn, self.config.task_run_id.as_deref())?;
-
-        if context.total_count == 0 {
-            return Err("No errors to fix".to_string());
-        }
-
-        // Collect all error IDs being targeted
-        let targeted_error_ids: Vec<i64> = context
-            .critical_errors
-            .iter()
-            .chain(context.errors.iter())
-            .chain(context.warnings.iter())
-            .map(|e| e.id)
-            .collect();
-
-        // Build the AI prompt with error context
-        let ai_prompt = self.build_ai_prompt(&context, &curator);
-
-        // Build verification criteria
-        let verification_criteria = self.build_verification_criteria(&context);
-
-        // Generate the unified workflow JSON
-        let workflow = json!({
-            "name": self.config.name,
-            "description": format!("Auto-generated workflow to fix {} detected errors", context.total_count),
-            "version": "1.0",
-
-            // Setup steps: prepare the debug context
-            "setup_steps": [
-                {
-                    "name": "Collect Error Context",
-                    "type": "shell",
-                    "command": "echo 'Error fix workflow started'",
-                    "timeout_seconds": 5
-                }
-            ],
-
-            // Verification steps: check if errors are resolved
-            "verification_steps": verification_criteria,
-
-            // Agentic steps: the debug agent fixes errors
-            // "content" field is used for the prompt text (maps to prompt_content)
-            "agentic_steps": [
-                {
-                    "name": "Debug Agent - Fix Errors",
-                    "type": "prompt",
-                    "content": ai_prompt
-                }
-            ],
-
-            // Completion steps: summarize what was fixed
-            "completion_steps": [
-                {
-                    "name": "Generate Fix Summary",
-                    "type": "shell",
-                    "command": "echo 'Error fix workflow completed'",
-                    "timeout_seconds": 5
-                }
-            ],
-
-            // Workflow settings
-            "settings": {
-                "max_agentic_iterations": self.config.max_iterations,
-                "stop_on_verification_pass": true,
-                "continue_on_step_failure": false
-            },
-
-            // Error IDs targeted by this workflow - will be resolved on successful completion
-            "targeted_error_ids": targeted_error_ids
-        });
-
-        let description = self.generate_description(&context);
-
-        Ok(GeneratedWorkflow {
-            workflow_json: workflow,
-            description,
-            error_count: context.total_count,
-            has_critical: !context.critical_errors.is_empty(),
-        })
+        Err("SQLite removed".to_string())
     }
 
     /// Build the AI prompt for the debug agent.
@@ -381,118 +301,7 @@ impl ErrorFixWorkflowGenerator {
         conn: &Connection,
         error_id: i64,
     ) -> Result<GeneratedWorkflow, String> {
-        // Get the specific error
-        let error = ErrorEventStorage::get_by_id(conn, error_id)?
-            .ok_or_else(|| format!("Error {} not found", error_id))?;
-
-        let ai_prompt = format!(
-            r#"You are a debug agent. Fix the following error:
-
-## Error Details
-- **Type:** {}
-- **Message:** {}
-- **Source:** {}
-- **Occurrences:** {}
-
-{}
-
-{}
-
-## Your Task
-1. Identify the root cause of this error
-2. Implement the fix
-3. Verify the fix works
-4. Document what you changed
-
-Focus on a minimal, targeted fix for this specific issue.
-
-## If the Error Cannot Be Fixed
-
-If you determine this error CANNOT be fixed automatically (e.g., requires infrastructure changes,
-missing dependencies, or manual intervention), output:
-
-```
-[UNFIXABLE_ERRORS]
-```
-
-Before doing so, explain:
-1. Why the error cannot be fixed automatically
-2. What would be needed to fix it (for human follow-up)
-"#,
-            error.error_type.as_deref().unwrap_or("Unknown"),
-            error.message,
-            error.log_source_name,
-            error.occurrence_count,
-            error
-                .location
-                .as_ref()
-                .map(|l| format!(
-                    "**Location:** {}:{}",
-                    l.file_path,
-                    l.line_number.unwrap_or(0)
-                ))
-                .unwrap_or_default(),
-            error
-                .stack_trace
-                .as_ref()
-                .map(|st| format!("**Stack Trace:**\n```\n{}\n```", st))
-                .unwrap_or_default()
-        );
-
-        // Create an error pattern from the message (first line, truncated if needed)
-        let error_pattern = {
-            let first_line = error.message.lines().next().unwrap_or(&error.message);
-            if first_line.len() > 200 {
-                first_line[..200].to_string()
-            } else {
-                first_line.to_string()
-            }
-        };
-
-        let workflow = json!({
-            "name": format!("Fix: {}", error.error_type.as_deref().unwrap_or(&error.message[..30.min(error.message.len())])),
-            "description": format!("Fix error: {}", error.message),
-            "version": "1.0",
-
-            "setup_steps": [],
-
-            // Verification uses error_resolved to check if this specific error is fixed
-            "verification_steps": [
-                {
-                    "name": format!("Error '{}' resolved", error.error_type.as_deref().unwrap_or("Unknown")),
-                    "type": "error_resolved",
-                    "error_id": error_id,
-                    "error_pattern": error_pattern,
-                    "error_source": error.log_source_name,
-                    "time_window_seconds": 120
-                }
-            ],
-
-            // "content" field is used for the prompt text (maps to prompt_content)
-            "agentic_steps": [
-                {
-                    "name": "Fix Single Error",
-                    "type": "prompt",
-                    "content": ai_prompt
-                }
-            ],
-
-            "completion_steps": [],
-
-            "settings": {
-                "max_agentic_iterations": 5,
-                "stop_on_verification_pass": true,
-                // Error ID targeted by this workflow - will be resolved on successful completion
-                "targeted_error_ids": [error_id]
-            }
-        });
-
-        Ok(GeneratedWorkflow {
-            workflow_json: workflow,
-            description: format!("Fix error: {}", error.message),
-            error_count: 1,
-            has_critical: error.severity == crate::error_monitor::types::ErrorSeverity::Critical,
-        })
+        Err("SQLite removed".to_string())
     }
 }
 
@@ -510,40 +319,7 @@ pub async fn generate_error_fix_workflow(
     db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
     config: Option<ErrorFixWorkflowConfig>,
 ) -> Result<GeneratedWorkflow, String> {
-    let db = db.inner().clone();
-    let config = config.unwrap_or_default();
-
-    // PG-primary: use PG error context to generate fix workflow
-    let pg = crate::database::pg::PgDb::global();
-    let errors = pg.get_unresolved_errors(config.task_run_id.as_deref(), 50).await?;
-    if errors.is_empty() {
-        return Err("No errors to fix".to_string());
-    }
-    let has_critical = errors.iter().any(|e| e["severity"].as_str() == Some("critical"));
-    let error_count = errors.len() as u32;
-    let targeted_error_ids: Vec<i64> = errors.iter()
-        .filter_map(|e| e["id"].as_i64())
-        .collect();
-    let error_summary: Vec<String> = errors.iter()
-        .map(|e| format!("[{}] {}", e["severity"].as_str().unwrap_or("unknown"), e["message"].as_str().unwrap_or("(no message)")))
-        .collect();
-    let ai_prompt = format!(
-        "Fix the following application errors:\n\n{}\n\nDebug, identify root causes, and fix all errors.",
-        error_summary.join("\n")
-    );
-    let description = format!("Fix {} errors ({} critical)", error_count, if has_critical { "has" } else { "no" });
-    let workflow = json!({
-        "name": config.name,
-        "steps": [],
-        "prompt": ai_prompt,
-        "targeted_error_ids": targeted_error_ids,
-    });
-    Ok(GeneratedWorkflow {
-        workflow_json: workflow,
-        description,
-        error_count,
-        has_critical,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Tauri command to generate a workflow to fix a single error.
@@ -554,34 +330,7 @@ pub async fn generate_single_error_fix_workflow(
     db: tauri::State<'_, std::sync::Arc<crate::database::CheckpointDb>>,
     error_id: i64,
 ) -> Result<GeneratedWorkflow, String> {
-    let _db = db.inner().clone();
-
-    // PG-primary: get single error and generate workflow
-    let pg = crate::database::pg::PgDb::global();
-    let errors = pg.get_unresolved_errors(None, 200).await?;
-    let target_error = errors.iter().find(|e| e["id"].as_i64() == Some(error_id))
-        .ok_or_else(|| format!("Error {} not found or already resolved", error_id))?;
-
-    let severity = target_error["severity"].as_str().unwrap_or("error");
-    let message = target_error["message"].as_str().unwrap_or("(no message)");
-    let file_path = target_error["file_path"].as_str().unwrap_or("");
-
-    let ai_prompt = format!(
-        "Fix this {} error: {}\nFile: {}\n\nAnalyze the root cause and implement a fix.",
-        severity, message, file_path
-    );
-    let workflow = json!({
-        "name": format!("Fix Error #{}", error_id),
-        "steps": [],
-        "prompt": ai_prompt,
-        "targeted_error_ids": [error_id],
-    });
-    Ok(GeneratedWorkflow {
-        workflow_json: workflow,
-        description: format!("Fix single error: {}", truncate_str(message, 100)),
-        error_count: 1,
-        has_critical: severity == "critical",
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Check if there are fixable errors and return a summary.
@@ -663,6 +412,8 @@ pub struct FixableErrorsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_default_config() {

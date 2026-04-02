@@ -10,10 +10,10 @@
 //! - config_statistics table (aggregated transition/template statistics)
 //! - task_run_automation table (run-level metrics)
 
+use crate::database::Connection;
 use crate::commands::AppState;
 use crate::tiered_info;
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -323,47 +323,7 @@ fn aggregate_summary(
     config_id: &str,
     range: &TimeRange,
 ) -> Result<PerformanceSummary, String> {
-    // Get config statistics for overall metrics
-    let stats = tiered_info::get_config_statistics(conn, config_id)?;
-
-    let (
-        total_runs,
-        overall_success_rate,
-        avg_run_duration_ms,
-        flaky_transition_count,
-        flaky_template_count,
-        last_run_at,
-    ) = match stats {
-        Some(s) => {
-            let success_rate = if s.total_runs > 0 {
-                s.successful_runs as f64 / s.total_runs as f64
-            } else {
-                0.0
-            };
-            (
-                s.total_runs,
-                success_rate,
-                s.avg_duration_ms.unwrap_or(0) as f64,
-                s.flaky_transitions.len() as u32,
-                s.flaky_templates.len() as u32,
-                s.last_run_at,
-            )
-        }
-        None => (0, 0.0, 0.0, 0, 0, None),
-    };
-
-    // Count total actions from task_run_events within time range
-    let total_actions = count_actions_in_range(conn, config_id, range)?;
-
-    Ok(PerformanceSummary {
-        total_runs,
-        overall_success_rate,
-        avg_run_duration_ms,
-        total_actions,
-        flaky_transition_count,
-        flaky_template_count,
-        last_run_at,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Count actions within the time range.
@@ -372,38 +332,7 @@ fn count_actions_in_range(
     config_id: &str,
     range: &TimeRange,
 ) -> Result<u32, String> {
-    let cutoff = range.cutoff();
-
-    let sql = if cutoff.is_some() {
-        r#"
-        SELECT COUNT(*)
-        FROM task_run_events e
-        INNER JOIN task_runs tr ON e.task_run_id = tr.id
-        WHERE tr.config_id = ?1
-          AND e.event_type = 'action'
-          AND e.timestamp >= ?2
-        "#
-    } else {
-        r#"
-        SELECT COUNT(*)
-        FROM task_run_events e
-        INNER JOIN task_runs tr ON e.task_run_id = tr.id
-        WHERE tr.config_id = ?1
-          AND e.event_type = 'action'
-        "#
-    };
-
-    let count: u32 = if let Some(cutoff_dt) = cutoff {
-        conn.query_row(sql, params![config_id, cutoff_dt.to_rfc3339()], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0)
-    } else {
-        conn.query_row(sql, params![config_id], |row| row.get(0))
-            .unwrap_or(0)
-    };
-
-    Ok(count)
+    Err("SQLite removed".to_string())
 }
 
 /// Aggregate action performance metrics from task_run_events.
@@ -412,121 +341,7 @@ fn aggregate_action_performance(
     config_id: &str,
     range: &TimeRange,
 ) -> Result<Vec<ActionPerformanceMetrics>, String> {
-    let cutoff = range.cutoff();
-
-    // Query action events with duration data
-    let sql = if cutoff.is_some() {
-        r#"
-        SELECT
-            e.event_subtype as action_type,
-            e.duration_ms,
-            CASE
-                WHEN e.data LIKE '%"success":true%' OR e.data LIKE '%"success": true%' THEN 1
-                WHEN e.data LIKE '%"success":false%' OR e.data LIKE '%"success": false%' THEN 0
-                ELSE 1
-            END as success
-        FROM task_run_events e
-        INNER JOIN task_runs tr ON e.task_run_id = tr.id
-        WHERE tr.config_id = ?1
-          AND e.event_type = 'action'
-          AND e.event_subtype IS NOT NULL
-          AND e.duration_ms IS NOT NULL
-          AND e.timestamp >= ?2
-        ORDER BY e.event_subtype
-        "#
-    } else {
-        r#"
-        SELECT
-            e.event_subtype as action_type,
-            e.duration_ms,
-            CASE
-                WHEN e.data LIKE '%"success":true%' OR e.data LIKE '%"success": true%' THEN 1
-                WHEN e.data LIKE '%"success":false%' OR e.data LIKE '%"success": false%' THEN 0
-                ELSE 1
-            END as success
-        FROM task_run_events e
-        INNER JOIN task_runs tr ON e.task_run_id = tr.id
-        WHERE tr.config_id = ?1
-          AND e.event_type = 'action'
-          AND e.event_subtype IS NOT NULL
-          AND e.duration_ms IS NOT NULL
-        ORDER BY e.event_subtype
-        "#
-    };
-
-    // Collect all durations per action type
-    let mut action_data: HashMap<String, Vec<(u64, bool)>> = HashMap::new();
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-    let mut rows = if let Some(cutoff_dt) = cutoff {
-        stmt.query(params![config_id, cutoff_dt.to_rfc3339()])
-    } else {
-        stmt.query(params![config_id])
-    }
-    .map_err(|e| format!("Failed to query action events: {}", e))?;
-
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| format!("Failed to read row: {}", e))?
-    {
-        let action_type: String = row
-            .get(0)
-            .map_err(|e| format!("Failed to get action_type: {}", e))?;
-        let duration_ms: i64 = row
-            .get(1)
-            .map_err(|e| format!("Failed to get duration_ms: {}", e))?;
-        let success: i32 = row
-            .get(2)
-            .map_err(|e| format!("Failed to get success: {}", e))?;
-
-        action_data
-            .entry(action_type)
-            .or_default()
-            .push((duration_ms as u64, success == 1));
-    }
-
-    // Calculate metrics for each action type
-    let mut metrics: Vec<ActionPerformanceMetrics> = action_data
-        .into_iter()
-        .map(|(action_type, data)| {
-            let durations: Vec<u64> = data.iter().map(|(d, _)| *d).collect();
-            let (p50, p95, p99) = calculate_percentiles(&durations);
-
-            let total = data.len() as u32;
-            let success_count = data.iter().filter(|(_, s)| *s).count() as u32;
-            let failure_count = total - success_count;
-            let avg_duration: f64 = if total > 0 {
-                durations.iter().sum::<u64>() as f64 / total as f64
-            } else {
-                0.0
-            };
-            let success_rate = if total > 0 {
-                success_count as f64 / total as f64
-            } else {
-                0.0
-            };
-
-            ActionPerformanceMetrics {
-                action_type,
-                total_executions: total,
-                avg_duration_ms: avg_duration,
-                p50_duration_ms: p50,
-                p95_duration_ms: p95,
-                p99_duration_ms: p99,
-                success_count,
-                failure_count,
-                success_rate,
-            }
-        })
-        .collect();
-
-    // Sort by total executions (most common first)
-    metrics.sort_by(|a, b| b.total_executions.cmp(&a.total_executions));
-
-    Ok(metrics)
+    Err("SQLite removed".to_string())
 }
 
 /// Calculate percentiles (p50, p95, p99) from a list of durations.
@@ -557,38 +372,7 @@ fn get_transition_metrics(
     conn: &Connection,
     config_id: &str,
 ) -> Result<Vec<StateTransitionMetrics>, String> {
-    let stats = tiered_info::get_config_statistics(conn, config_id)?;
-
-    let metrics: Vec<StateTransitionMetrics> = match stats {
-        Some(s) => s
-            .transition_stats
-            .iter()
-            .map(|(key, ts)| {
-                let parts: Vec<&str> = key.split('|').collect();
-                let (from_state, to_state) = if parts.len() >= 2 {
-                    (parts[0].to_string(), parts[1].to_string())
-                } else {
-                    (key.clone(), "unknown".to_string())
-                };
-
-                let success_rate = ts.success_rate();
-                let is_flaky = ts.is_flaky(0.2);
-
-                StateTransitionMetrics {
-                    from_state,
-                    to_state,
-                    total_attempts: ts.total,
-                    success_rate,
-                    avg_duration_ms: ts.avg_duration_ms as f64,
-                    is_flaky,
-                    last_failure: ts.last_failure.clone(),
-                }
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    Ok(metrics)
+    Err("SQLite removed".to_string())
 }
 
 /// Get element resolution metrics from config_statistics.
@@ -596,33 +380,7 @@ fn get_element_metrics(
     conn: &Connection,
     config_id: &str,
 ) -> Result<Vec<ElementResolutionMetrics>, String> {
-    let stats = tiered_info::get_config_statistics(conn, config_id)?;
-
-    let metrics: Vec<ElementResolutionMetrics> = match stats {
-        Some(s) => s
-            .template_stats
-            .iter()
-            .map(|(key, ts)| {
-                let success_rate = ts.match_rate();
-                let is_flaky = ts.is_flaky(0.2);
-
-                ElementResolutionMetrics {
-                    element_name: key.clone(),
-                    total_attempts: ts.total,
-                    successful_matches: ts.matches,
-                    failed_matches: ts.failures,
-                    success_rate,
-                    avg_confidence: ts.avg_confidence as f64,
-                    min_confidence: ts.min_confidence.map(|c| c as f64),
-                    max_confidence: ts.max_confidence.map(|c| c as f64),
-                    is_flaky,
-                }
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    Ok(metrics)
+    Err("SQLite removed".to_string())
 }
 
 /// Aggregate success rate trend over time.
@@ -631,116 +389,7 @@ fn aggregate_success_rate_trend(
     config_id: &str,
     range: &TimeRange,
 ) -> Result<Vec<TimeSeriesDataPoint>, String> {
-    let cutoff = range.cutoff();
-
-    // Determine bucket format based on time range
-    let (bucket_format, sql) = match range {
-        TimeRange::OneHour | TimeRange::TwentyFourHours => {
-            // Bucket by hour
-            let sql = if cutoff.is_some() {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT%H:00:00Z', tra.started_at) as bucket,
-                    COUNT(*) as total,
-                    SUM(CASE WHEN tra.success = 1 THEN 1 ELSE 0 END) as successes
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                  AND tra.started_at >= ?2
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            } else {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT%H:00:00Z', tra.started_at) as bucket,
-                    COUNT(*) as total,
-                    SUM(CASE WHEN tra.success = 1 THEN 1 ELSE 0 END) as successes
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            };
-            ("hourly", sql)
-        }
-        _ => {
-            // Bucket by day
-            let sql = if cutoff.is_some() {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT00:00:00Z', tra.started_at) as bucket,
-                    COUNT(*) as total,
-                    SUM(CASE WHEN tra.success = 1 THEN 1 ELSE 0 END) as successes
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                  AND tra.started_at >= ?2
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            } else {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT00:00:00Z', tra.started_at) as bucket,
-                    COUNT(*) as total,
-                    SUM(CASE WHEN tra.success = 1 THEN 1 ELSE 0 END) as successes
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            };
-            ("daily", sql)
-        }
-    };
-
-    debug!(
-        "Aggregating success rate trend ({}) for config {}",
-        bucket_format, config_id
-    );
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to prepare trend query: {}", e))?;
-
-    let mut rows = if let Some(cutoff_dt) = cutoff {
-        stmt.query(params![config_id, cutoff_dt.to_rfc3339()])
-    } else {
-        stmt.query(params![config_id])
-    }
-    .map_err(|e| format!("Failed to query trend data: {}", e))?;
-
-    let mut trend: Vec<TimeSeriesDataPoint> = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| format!("Failed to read trend row: {}", e))?
-    {
-        let timestamp: String = row
-            .get(0)
-            .map_err(|e| format!("Failed to get timestamp: {}", e))?;
-        let total: u32 = row
-            .get(1)
-            .map_err(|e| format!("Failed to get total: {}", e))?;
-        let successes: u32 = row
-            .get(2)
-            .map_err(|e| format!("Failed to get successes: {}", e))?;
-
-        let value = if total > 0 {
-            successes as f64 / total as f64
-        } else {
-            0.0
-        };
-        trend.push(TimeSeriesDataPoint {
-            timestamp,
-            value,
-            count: Some(total),
-        });
-    }
-
-    Ok(trend)
+    Err("SQLite removed".to_string())
 }
 
 /// Aggregate duration trend over time.
@@ -749,111 +398,13 @@ fn aggregate_duration_trend(
     config_id: &str,
     range: &TimeRange,
 ) -> Result<Vec<TimeSeriesDataPoint>, String> {
-    let cutoff = range.cutoff();
-
-    // Determine bucket format based on time range
-    let sql = match range {
-        TimeRange::OneHour | TimeRange::TwentyFourHours => {
-            if cutoff.is_some() {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT%H:00:00Z', tra.started_at) as bucket,
-                    AVG(tra.duration_ms) as avg_duration,
-                    COUNT(*) as total
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                  AND tra.started_at >= ?2
-                  AND tra.duration_ms IS NOT NULL
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            } else {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT%H:00:00Z', tra.started_at) as bucket,
-                    AVG(tra.duration_ms) as avg_duration,
-                    COUNT(*) as total
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                  AND tra.duration_ms IS NOT NULL
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            }
-        }
-        _ => {
-            if cutoff.is_some() {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT00:00:00Z', tra.started_at) as bucket,
-                    AVG(tra.duration_ms) as avg_duration,
-                    COUNT(*) as total
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                  AND tra.started_at >= ?2
-                  AND tra.duration_ms IS NOT NULL
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            } else {
-                r#"
-                SELECT
-                    strftime('%Y-%m-%dT00:00:00Z', tra.started_at) as bucket,
-                    AVG(tra.duration_ms) as avg_duration,
-                    COUNT(*) as total
-                FROM task_run_automation tra
-                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-                WHERE tr.config_id = ?1
-                  AND tra.duration_ms IS NOT NULL
-                GROUP BY bucket
-                ORDER BY bucket ASC
-                "#
-            }
-        }
-    };
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| format!("Failed to prepare duration trend query: {}", e))?;
-
-    let mut rows = if let Some(cutoff_dt) = cutoff {
-        stmt.query(params![config_id, cutoff_dt.to_rfc3339()])
-    } else {
-        stmt.query(params![config_id])
-    }
-    .map_err(|e| format!("Failed to query duration trend data: {}", e))?;
-
-    let mut trend: Vec<TimeSeriesDataPoint> = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| format!("Failed to read duration row: {}", e))?
-    {
-        let timestamp: String = row
-            .get(0)
-            .map_err(|e| format!("Failed to get timestamp: {}", e))?;
-        let avg_duration: f64 = row
-            .get(1)
-            .map_err(|e| format!("Failed to get avg_duration: {}", e))?;
-        let total: u32 = row
-            .get(2)
-            .map_err(|e| format!("Failed to get total: {}", e))?;
-
-        trend.push(TimeSeriesDataPoint {
-            timestamp,
-            value: avg_duration,
-            count: Some(total),
-        });
-    }
-
-    Ok(trend)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_calculate_percentiles_empty() {

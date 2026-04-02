@@ -11,7 +11,7 @@ use tauri::Manager;
 use tracing::{error, info, warn};
 
 use crate::context;
-use crate::database::{CheckpointDb, CreateTaskRunInput};
+use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::{
     emit_ai_output, get_workspace_paths_internal, spawn_python_with_console, FINDING_INSTRUCTIONS,
 };
@@ -23,6 +23,7 @@ use crate::settings;
 // Re-export AiSessionContext from the canonical location
 pub use crate::execution_context::AiSessionContext;
 use crate::runtime_env::{AiSessionContextExt, ExecutionContextExt};
+use crate::database::CheckpointDb;
 
 // ============================================================================
 // Inline Python Execution Types
@@ -318,29 +319,13 @@ pub async fn restart_runner(
 /// use has_running_ai_tasks_async() or wrap this in spawn_blocking.
 #[allow(dead_code)]
 pub fn has_running_ai_tasks(db: &Arc<CheckpointDb>) -> bool {
-    match db.get_running_task_runs(None) {
-        Ok(tasks) => !tasks.is_empty(),
-        Err(e) => {
-            warn!("Failed to check running tasks: {}", e);
-            false
-        }
-    }
+    false
 }
 
 /// Check if any AI analysis tasks are currently running (async version).
 /// Uses spawn_blocking to avoid blocking the async runtime.
 pub async fn has_running_ai_tasks_async(db: Arc<CheckpointDb>) -> bool {
-    match tokio::task::spawn_blocking(move || db.get_running_task_runs(None)).await {
-        Ok(Ok(tasks)) => !tasks.is_empty(),
-        Ok(Err(e)) => {
-            warn!("Failed to check running tasks: {}", e);
-            false
-        }
-        Err(e) => {
-            warn!("spawn_blocking error checking running tasks: {}", e);
-            false
-        }
-    }
+    false
 }
 
 /// Migrate JSONL logs to SQLite for a completed task run.
@@ -350,84 +335,7 @@ pub async fn migrate_logs_for_task(
     task_id: &str,
     workflow_name: Option<String>,
 ) {
-    let task_id_owned = task_id.to_string();
-
-    // Get the dev-logs directory path
-    let dev_logs_dir = match std::env::current_exe() {
-        Ok(exe_path) => {
-            // Navigate up to find the parent directory containing .dev-logs
-            let mut current = exe_path.as_path();
-            loop {
-                if let Some(parent) = current.parent() {
-                    let dev_logs = parent.join(".dev-logs");
-                    if dev_logs.exists() {
-                        break dev_logs;
-                    }
-                    // Also check parent's parent (for qontinui_parent_directory)
-                    if let Some(grandparent) = parent.parent() {
-                        let dev_logs = grandparent.join(".dev-logs");
-                        if dev_logs.exists() {
-                            break dev_logs;
-                        }
-                    }
-                    current = parent;
-                } else {
-                    // Fallback to a reasonable default
-                    warn!("Could not find .dev-logs directory, skipping log migration");
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to get executable path for log migration: {}", e);
-            return;
-        }
-    };
-
-    info!(
-        "Migrating JSONL logs to SQLite for task run: {}",
-        task_id_owned
-    );
-
-    let result = tokio::task::spawn_blocking(move || {
-        crate::log_migration::migrate_logs_to_sqlite(
-            &db,
-            &task_id_owned,
-            &dev_logs_dir,
-            workflow_name.as_deref(),
-        )
-    })
-    .await;
-
-    match result {
-        Ok(Ok(migration_result)) => {
-            info!(
-                "Log migration complete for task {}: {} general, {} actions, {} image recognition, {} screenshots, {} playwright",
-                task_id,
-                migration_result.general_events,
-                migration_result.action_events,
-                migration_result.image_recognition_events,
-                migration_result.screenshots,
-                migration_result.playwright_results
-            );
-            if !migration_result.errors.is_empty() {
-                warn!(
-                    "Log migration had {} errors: {:?}",
-                    migration_result.errors.len(),
-                    migration_result.errors
-                );
-            }
-        }
-        Ok(Err(e)) => {
-            warn!("Failed to migrate logs for task {}: {}", task_id, e);
-        }
-        Err(e) => {
-            warn!(
-                "spawn_blocking error during log migration for task {}: {}",
-                task_id, e
-            );
-        }
-    }
+    // SQLite removed - no-op
 }
 
 /// Helper function to mark a task run as complete with retry logic.
@@ -437,73 +345,6 @@ pub async fn migrate_logs_for_task(
 ///
 /// Uses gated function - unified workflows have status managed by LoopController only.
 pub async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> bool {
-    let task_id_owned = task_id.to_string();
-    let max_retries = 3;
-
-    // Get workflow name before completion for log migration context
-    let workflow_name = db
-        .get_task_run(&task_id_owned)
-        .ok()
-        .flatten()
-        .and_then(|t| t.workflow_name);
-
-    for retry in 0..max_retries {
-        let db_clone = db.clone();
-        let id = task_id_owned.clone();
-
-        // Use gated function - unified workflows have status managed by LoopController
-        match tokio::task::spawn_blocking(move || {
-            db_clone.complete_task_run_if_allowed(&id, "complete_task_run_with_retry")
-        })
-        .await
-        {
-            Ok(Ok(true)) => {
-                // Successfully marked complete
-                if retry > 0 {
-                    info!(
-                        "Task run {} marked complete after {} retries",
-                        task_id_owned, retry
-                    );
-                }
-
-                // Migrate logs to SQLite after successful completion
-                migrate_logs_for_task(db.clone(), &task_id_owned, workflow_name).await;
-
-                return true;
-            }
-            Ok(Ok(false)) => {
-                // Unified workflow - status managed by LoopController, not an error
-                return true;
-            }
-            Ok(Err(e)) => {
-                if retry < max_retries - 1 {
-                    let delay_ms = 100 * (1 << retry); // 100, 200, 400ms
-                    warn!(
-                        "Retry {}/{} marking task_run {} complete (waiting {}ms): {}",
-                        retry + 1,
-                        max_retries,
-                        task_id_owned,
-                        delay_ms,
-                        e
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                } else {
-                    error!(
-                        "Failed to mark task_run {} as complete after {} retries: {}",
-                        task_id_owned, max_retries, e
-                    );
-                }
-            }
-            Err(e) => {
-                error!(
-                    "spawn_blocking error marking task_run {} complete: {}",
-                    task_id_owned, e
-                );
-                return false;
-            }
-        }
-    }
-
     false
 }
 

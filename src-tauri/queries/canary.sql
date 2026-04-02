@@ -11,29 +11,29 @@ INSERT INTO canary_rollouts (
 RETURNING id, recommendation_id, percentage, status, start_date, created_at;
 
 --! get_active_canaries
-SELECT id, recommendation_id, percentage, status, start_date, end_date,
-       baseline_run_count, canary_run_count,
-       baseline_metrics_json, canary_metrics_json, created_at
+SELECT id, recommendation_id, percentage, status, start_date, COALESCE(end_date, NOW()) as end_date,
+       COALESCE(baseline_run_count, 0) as baseline_run_count, COALESCE(canary_run_count, 0) as canary_run_count,
+       COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(canary_metrics_json, '{}') as canary_metrics_json, created_at
 FROM canary_rollouts
 WHERE status = 'active'
 ORDER BY created_at DESC;
 
 --! get_canary_history
 SELECT cr.id, cr.recommendation_id, cr.percentage, cr.status,
-       cr.start_date, cr.end_date,
-       cr.baseline_run_count, cr.canary_run_count,
-       cr.baseline_metrics_json, cr.canary_metrics_json,
+       cr.start_date, COALESCE(cr.end_date, NOW()) as end_date,
+       COALESCE(cr.baseline_run_count, 0) as baseline_run_count, COALESCE(cr.canary_run_count, 0) as canary_run_count,
+       COALESCE(cr.baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(cr.canary_metrics_json, '{}') as canary_metrics_json,
        cr.created_at,
-       mor.title as recommendation_title,
-       mor.optimizer_type, mor.target_agent
+       COALESCE(mor.title, '') as recommendation_title,
+       COALESCE(mor.optimizer_type, '') as optimizer_type, COALESCE(mor.target_agent, '') as target_agent
 FROM canary_rollouts cr
 LEFT JOIN meta_optimizer_recommendations mor ON mor.id = cr.recommendation_id
 ORDER BY cr.created_at DESC
 LIMIT :max_results;
 
 --! get_canary_metrics
-SELECT id, baseline_run_count, canary_run_count,
-       baseline_metrics_json, canary_metrics_json
+SELECT id, COALESCE(baseline_run_count, 0) as baseline_run_count, COALESCE(canary_run_count, 0) as canary_run_count,
+       COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(canary_metrics_json, '{}') as canary_metrics_json
 FROM canary_rollouts
 WHERE id = :id;
 
@@ -79,8 +79,8 @@ RETURNING id, template_id, baseline_version, candidate_version, status, created_
 --! get_template_canary
 SELECT id, template_id, baseline_version, candidate_version,
        traffic_percentage, status,
-       baseline_metrics_json, candidate_metrics_json,
-       created_at, ended_at
+       COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(candidate_metrics_json, '{}') as candidate_metrics_json,
+       created_at, COALESCE(ended_at, NOW()) as ended_at
 FROM prompt_template_canaries
 WHERE id = :id;
 
@@ -94,8 +94,8 @@ RETURNING id, template_id, status;
 --! get_active_template_canary
 SELECT id, template_id, baseline_version, candidate_version,
        traffic_percentage, status,
-       baseline_metrics_json, candidate_metrics_json,
-       created_at, ended_at
+       COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(candidate_metrics_json, '{}') as candidate_metrics_json,
+       created_at, COALESCE(ended_at, NOW()) as ended_at
 FROM prompt_template_canaries
 WHERE template_id = :template_id AND status = 'active'
 LIMIT 1;

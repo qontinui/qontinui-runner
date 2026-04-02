@@ -1455,7 +1455,7 @@ impl<
 pub struct GetActiveCanariesStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_active_canaries() -> GetActiveCanariesStmt {
     GetActiveCanariesStmt(
-        "SELECT id, recommendation_id, percentage, status, start_date, end_date, baseline_run_count, canary_run_count, baseline_metrics_json, canary_metrics_json, created_at FROM canary_rollouts WHERE status = 'active' ORDER BY created_at DESC",
+        "SELECT id, recommendation_id, percentage, status, start_date, COALESCE(end_date, NOW()) as end_date, COALESCE(baseline_run_count, 0) as baseline_run_count, COALESCE(canary_run_count, 0) as canary_run_count, COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(canary_metrics_json, '{}') as canary_metrics_json, created_at FROM canary_rollouts WHERE status = 'active' ORDER BY created_at DESC",
         None,
     )
 }
@@ -1500,7 +1500,7 @@ impl GetActiveCanariesStmt {
 pub struct GetCanaryHistoryStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_canary_history() -> GetCanaryHistoryStmt {
     GetCanaryHistoryStmt(
-        "SELECT cr.id, cr.recommendation_id, cr.percentage, cr.status, cr.start_date, cr.end_date, cr.baseline_run_count, cr.canary_run_count, cr.baseline_metrics_json, cr.canary_metrics_json, cr.created_at, mor.title as recommendation_title, mor.optimizer_type, mor.target_agent FROM canary_rollouts cr LEFT JOIN meta_optimizer_recommendations mor ON mor.id = cr.recommendation_id ORDER BY cr.created_at DESC LIMIT $1",
+        "SELECT cr.id, cr.recommendation_id, cr.percentage, cr.status, cr.start_date, COALESCE(cr.end_date, NOW()) as end_date, COALESCE(cr.baseline_run_count, 0) as baseline_run_count, COALESCE(cr.canary_run_count, 0) as canary_run_count, COALESCE(cr.baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(cr.canary_metrics_json, '{}') as canary_metrics_json, cr.created_at, COALESCE(mor.title, '') as recommendation_title, COALESCE(mor.optimizer_type, '') as optimizer_type, COALESCE(mor.target_agent, '') as target_agent FROM canary_rollouts cr LEFT JOIN meta_optimizer_recommendations mor ON mor.id = cr.recommendation_id ORDER BY cr.created_at DESC LIMIT $1",
         None,
     )
 }
@@ -1549,7 +1549,7 @@ impl GetCanaryHistoryStmt {
 pub struct GetCanaryMetricsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_canary_metrics() -> GetCanaryMetricsStmt {
     GetCanaryMetricsStmt(
-        "SELECT id, baseline_run_count, canary_run_count, baseline_metrics_json, canary_metrics_json FROM canary_rollouts WHERE id = $1",
+        "SELECT id, COALESCE(baseline_run_count, 0) as baseline_run_count, COALESCE(canary_run_count, 0) as canary_run_count, COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(canary_metrics_json, '{}') as canary_metrics_json FROM canary_rollouts WHERE id = $1",
         None,
     )
 }
@@ -1935,7 +1935,7 @@ impl<
 pub struct GetTemplateCanaryStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_template_canary() -> GetTemplateCanaryStmt {
     GetTemplateCanaryStmt(
-        "SELECT id, template_id, baseline_version, candidate_version, traffic_percentage, status, baseline_metrics_json, candidate_metrics_json, created_at, ended_at FROM prompt_template_canaries WHERE id = $1",
+        "SELECT id, template_id, baseline_version, candidate_version, traffic_percentage, status, COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(candidate_metrics_json, '{}') as candidate_metrics_json, created_at, COALESCE(ended_at, NOW()) as ended_at FROM prompt_template_canaries WHERE id = $1",
         None,
     )
 }
@@ -2051,7 +2051,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql, T
 pub struct GetActiveTemplateCanaryStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_active_template_canary() -> GetActiveTemplateCanaryStmt {
     GetActiveTemplateCanaryStmt(
-        "SELECT id, template_id, baseline_version, candidate_version, traffic_percentage, status, baseline_metrics_json, candidate_metrics_json, created_at, ended_at FROM prompt_template_canaries WHERE template_id = $1 AND status = 'active' LIMIT 1",
+        "SELECT id, template_id, baseline_version, candidate_version, traffic_percentage, status, COALESCE(baseline_metrics_json, '{}') as baseline_metrics_json, COALESCE(candidate_metrics_json, '{}') as candidate_metrics_json, created_at, COALESCE(ended_at, NOW()) as ended_at FROM prompt_template_canaries WHERE template_id = $1 AND status = 'active' LIMIT 1",
         None,
     )
 }

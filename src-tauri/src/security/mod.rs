@@ -120,3 +120,35 @@ pub fn policy_to_container_config(
 
     config
 }
+
+/// Build extra environment variables for container security features.
+///
+/// Returns env vars for:
+/// - HTTP_PROXY/HTTPS_PROXY when network proxy is enabled (filled by caller with proxy URL)
+/// - Credential placeholders when credential proxy is enabled
+pub fn build_container_security_env(
+    policy: &SecurityPolicy,
+    settings: &engine::SecuritySettings,
+) -> Vec<String> {
+    let mut env = Vec::new();
+
+    // Credential placeholders
+    if settings.credential_proxy_enabled
+        && policy.credentials.mode == policy::CredentialMode::Proxy
+    {
+        let cred_names: Vec<&str> = if policy.credentials.allowed_credentials.is_empty() {
+            vec!["claude_api", "openai", "gemini"]
+        } else {
+            policy
+                .credentials
+                .allowed_credentials
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        };
+        let cred_proxy = credential_proxy::CredentialProxy::new(&cred_names);
+        env.extend(cred_proxy.placeholder_env_vars());
+    }
+
+    env
+}

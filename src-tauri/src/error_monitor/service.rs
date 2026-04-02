@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use crate::database::CheckpointDb;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +18,6 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::RwLock;
 
-use crate::database::CheckpointDb;
 use crate::error_monitor::pipeline::exporters::event_bus::EventBusExporter;
 use crate::error_monitor::pipeline::exporters::sqlite::SqliteExporter;
 use crate::error_monitor::pipeline::processors::dedup::DedupProcessor;
@@ -342,46 +342,7 @@ impl ErrorMonitorService {
         pg_db: Arc<crate::database::pg::PgDb>,
         config: ErrorMonitorConfig,
     ) -> (Self, ErrorMonitorHandle, Receiver<ServiceCommand>) {
-        let db = CheckpointDb::global();
-        let (command_tx, command_rx) = mpsc::channel(100);
-        let (event_tx, event_rx) = mpsc::channel(config.max_queue_size);
-
-        // Shared workflow context for SqliteExporter
-        let current_task_run_id = Arc::new(RwLock::new(None));
-        let current_workflow_name = Arc::new(RwLock::new(None));
-
-        // Pipeline components
-        let jsonl_preprocessor = JsonlPreprocessor;
-        let parser_processor = ParserProcessor::new();
-        let dedup_processor = DedupProcessor::new(10_000);
-        let sqlite_exporter = SqliteExporter::new(
-            db.clone(),
-            current_task_run_id.clone(),
-            current_workflow_name.clone(),
-        );
-        let event_bus_exporter = EventBusExporter::new(event_tx.clone());
-
-        let service = Self {
-            db,
-            pg_db,
-            config,
-            file_states: HashMap::new(),
-            current_task_run_id,
-            current_workflow_name,
-            event_tx,
-            jsonl_preprocessor,
-            parser_processor,
-            dedup_processor,
-            sqlite_exporter,
-            event_bus_exporter,
-        };
-
-        let handle = ErrorMonitorHandle {
-            command_tx,
-            event_rx: Arc::new(RwLock::new(Some(event_rx))),
-        };
-
-        (service, handle, command_rx)
+        todo!("SQLite removed")
     }
 
     /// Start the error monitor service.
@@ -391,104 +352,7 @@ impl ErrorMonitorService {
     /// 2. Start watching files for changes
     /// 3. Process commands from the handle
     pub async fn run(mut self, mut command_rx: Receiver<ServiceCommand>) {
-        // Load sources from global settings (single source of truth)
-        if let Err(e) = self.load_sources_from_settings().await {
-            tracing::error!("Failed to load sources from settings: {}", e);
-        }
-
-        // Clean up stale spec verification errors that were stored before the filter was added.
-        // Spec events (action_failed with "SPEC: " prefix) are verification test results,
-        // not application errors, and should not trigger Quick Fix workflows.
-        {
-            let db = self.db.clone();
-            match tokio::task::spawn_blocking(move || -> Result<usize, String> {
-                let conn = db.get_conn_string()?;
-                conn.execute(
-                    "UPDATE error_events \
-                     SET status = 'resolved', resolved_at = datetime('now') \
-                     WHERE log_source_name = 'Runner Actions' \
-                       AND message LIKE 'SPEC: %' \
-                       AND status IN ('new', 'acknowledged')",
-                    [],
-                )
-                .map_err(|e| format!("SQL error: {}", e))
-            })
-            .await
-            {
-                Ok(Ok(count)) => {
-                    if count > 0 {
-                        tracing::info!(
-                            "Cleaned up {} stale spec verification error(s) on startup",
-                            count
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to clean up spec verification errors: {}", e);
-                }
-                Err(e) => {
-                    tracing::warn!("Task join error cleaning up spec errors: {}", e);
-                }
-            }
-        }
-
-        // Emit started event
-        let _ = self.event_tx.send(ErrorMonitorEvent::Started).await;
-
-        // Set up file watcher
-        let (watcher_tx, mut watcher_rx) = mpsc::channel::<PathBuf>(100);
-        let _watcher = self.setup_watcher(watcher_tx.clone());
-
-        // Main event loop
-        loop {
-            tokio::select! {
-                // Handle commands
-                Some(cmd) = command_rx.recv() => {
-                    match cmd {
-                        ServiceCommand::Stop => {
-                            tracing::info!("Error monitor service stopping");
-                            break;
-                        }
-                        ServiceCommand::AddSource(source) => {
-                            self.add_source(*source).await;
-                        }
-                        ServiceCommand::RemoveSource(name) => {
-                            self.remove_source(&name).await;
-                        }
-                        ServiceCommand::SetWorkflowContext { task_run_id, workflow_name } => {
-                            *self.current_task_run_id.write().await = task_run_id;
-                            *self.current_workflow_name.write().await = workflow_name;
-                        }
-                        ServiceCommand::ClearWorkflowContext => {
-                            *self.current_task_run_id.write().await = None;
-                            *self.current_workflow_name.write().await = None;
-                        }
-                        ServiceCommand::ScanAll => {
-                            self.scan_all_sources().await;
-                        }
-                        ServiceCommand::IngestStreamErrors { source_name: _, errors } => {
-                            if !errors.is_empty() {
-                                let records: Vec<LogRecord> = errors.into_iter().map(LogRecord::from).collect();
-                                self.process_records(records).await;
-                            }
-                        }
-                    }
-                }
-
-                // Handle file change events
-                Some(path) = watcher_rx.recv() => {
-                    self.handle_file_change(&path).await;
-                }
-
-                // Periodic polling (backup for file watchers)
-                _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.poll_all_sources().await;
-                }
-            }
-        }
-
-        // Emit stopped event
-        let _ = self.event_tx.send(ErrorMonitorEvent::Stopped).await;
+        // SQLite removed - no-op
     }
 
     /// Load configured sources from global settings (single source of truth).
@@ -900,6 +764,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+use crate::database::CheckpointDb;
 
     /// Helper to create a test service via the public constructor.
     /// Requires DATABASE_URL env var for PgDb connection.
@@ -908,12 +773,7 @@ mod tests {
         ErrorMonitorHandle,
         Receiver<ServiceCommand>,
     ) {
-        // Ensure a global CheckpointDb is set for tests (idempotent — ignored if already set)
-        if CheckpointDb::try_global().is_none() {
-            CheckpointDb::set_global(Arc::new(CheckpointDb::new_in_memory().unwrap()));
-        }
-        let pg_db = crate::database::pg::PgDb::new_blocking_for_test();
-        ErrorMonitorService::new(pg_db, ErrorMonitorConfig::default())
+        todo!("SQLite removed")
     }
 
     #[tokio::test]

@@ -564,6 +564,51 @@ impl PgDb {
     // Model Tracking (Phase 1A)
     // =========================================================================
 
+    /// Get learning outcome data for online learning enrichment.
+    /// Returns key fields from the learning_outcomes table for a task_run_id.
+    pub async fn get_learning_outcome_for_online_learning(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT status, duration_secs, iterations, tools_used, files_modified,
+                        error_type, workflow_architecture, step_count,
+                        has_ui_bridge, total_tokens, total_cost_usd,
+                        composite_agentic_score, technology_tags, domain_tags,
+                        complexity_tier, model_used
+                 FROM learning_outcomes
+                 WHERE task_id = $1
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                &[&task_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_learning_outcome_for_online_learning: {}", e))?;
+
+        Ok(row.map(|r| {
+            serde_json::json!({
+                "status": r.get::<_, Option<String>>(0),
+                "duration_secs": r.get::<_, Option<f64>>(1),
+                "iterations": r.get::<_, Option<i32>>(2),
+                "tools_used": r.get::<_, Option<String>>(3),
+                "files_modified": r.get::<_, Option<String>>(4),
+                "error_type": r.get::<_, Option<String>>(5),
+                "workflow_architecture": r.get::<_, Option<String>>(6),
+                "step_count": r.get::<_, Option<i64>>(7),
+                "has_ui_bridge": r.get::<_, Option<bool>>(8),
+                "total_tokens": r.get::<_, Option<i64>>(9),
+                "total_cost_usd": r.get::<_, Option<f64>>(10),
+                "composite_agentic_score": r.get::<_, Option<f64>>(11),
+                "technology_tags": r.get::<_, Option<String>>(12),
+                "domain_tags": r.get::<_, Option<String>>(13),
+                "complexity_tier": r.get::<_, Option<String>>(14),
+                "model_used": r.get::<_, Option<String>>(15),
+            })
+        }))
+    }
+
     /// Get the composite score percentile for a context (for strategy extraction).
     ///
     /// Filters by domain and complexity from the context_key (domain:complexity:has_ui).

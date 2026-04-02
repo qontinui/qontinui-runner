@@ -464,7 +464,7 @@ impl<
 pub struct GetTaskKnowledgeStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_knowledge() -> GetTaskKnowledgeStmt {
     GetTaskKnowledgeStmt(
-        "SELECT id, task_run_id, category, agent_type, iteration, content, evidence, confidence, related_files, is_resolved, created_at FROM task_knowledge WHERE id = $1",
+        "SELECT id, task_run_id, category, agent_type, iteration, content, COALESCE(evidence, '') as evidence, confidence, COALESCE(related_files, '[]') as related_files, is_resolved, created_at FROM task_knowledge WHERE id = $1",
         None,
     )
 }
@@ -510,7 +510,7 @@ impl GetTaskKnowledgeStmt {
 pub struct ListTaskKnowledgeByCategoryStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_task_knowledge_by_category() -> ListTaskKnowledgeByCategoryStmt {
     ListTaskKnowledgeByCategoryStmt(
-        "SELECT id, task_run_id, category, agent_type, iteration, content, evidence, confidence, related_files, is_resolved, content_embedding, created_at FROM task_knowledge WHERE ($1::TEXT IS NULL OR category = $1) AND content_embedding IS NOT NULL ORDER BY created_at DESC LIMIT $2",
+        "SELECT id, task_run_id, category, agent_type, iteration, content, COALESCE(evidence, '') as evidence, confidence, COALESCE(related_files, '[]') as related_files, is_resolved, content_embedding, created_at FROM task_knowledge WHERE ($1::TEXT IS NULL OR category = $1) AND content_embedding IS NOT NULL ORDER BY created_at DESC LIMIT $2",
         None,
     )
 }

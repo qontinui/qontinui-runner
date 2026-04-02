@@ -11,7 +11,7 @@
 //!
 //! All learning is async and non-blocking — it never delays workflow execution.
 
-use rusqlite::Connection;
+use crate::database::Connection;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -118,139 +118,7 @@ impl LearningOrchestrator {
         run_context: &RunContext,
         conn: &Connection,
     ) -> LearningActions {
-        let mut actions = LearningActions::default();
-
-        // 1. ALWAYS: Reflect on the run and curate lessons
-        match self.reflect_and_curate(run_context, conn) {
-            Ok(curation) => {
-                actions.lessons_added = curation.added;
-                actions.lessons_merged = curation.merged;
-                actions.lessons_retired = curation.retired;
-                if curation.added > 0 || curation.merged > 0 {
-                    debug!(
-                        "Playbook updated: {} added, {} merged, {} retired",
-                        curation.added, curation.merged, curation.retired
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("Reflector-curator failed (non-fatal): {}", e);
-            }
-        }
-
-        // 2. ALWAYS: Track template usage
-        if let Some(ref templates) = run_context.used_templates {
-            for (template_id, template_name, passed, quality_score) in templates {
-                if let Err(e) = self.template_manager.track_usage(
-                    template_id,
-                    template_name,
-                    *passed,
-                    *quality_score,
-                    conn,
-                ) {
-                    warn!("Template tracking failed for {}: {}", template_id, e);
-                }
-            }
-            actions.templates_tracked = templates.len();
-        }
-
-        // 3. ALWAYS: Consider few-shot extraction
-        if let Some(ref step_evals) = run_context.step_evaluation_summaries {
-            match self.few_shot_curator.consider_extraction(
-                &run_context.run_id,
-                run_context.iterations,
-                step_evals,
-                &run_context.domain,
-                conn,
-            ) {
-                Ok(count) => {
-                    actions.examples_extracted = count;
-                    if count > 0 {
-                        debug!("Extracted {} few-shot examples", count);
-                    }
-                }
-                Err(e) => {
-                    warn!("Few-shot extraction failed (non-fatal): {}", e);
-                }
-            }
-        }
-
-        // 4. PERIODIC: Check template lifecycle transitions
-        self.runs_since_extraction += 1;
-        if self.runs_since_extraction >= self.config.template_extraction_interval {
-            self.runs_since_extraction = 0;
-            match self.template_manager.check_lifecycle_transitions(conn) {
-                Ok(result) => {
-                    actions.lifecycle_actions = result.actions.len();
-                    if !result.actions.is_empty() {
-                        info!(
-                            "Template lifecycle: {} transitions applied",
-                            result.actions.len()
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("Template lifecycle check failed (non-fatal): {}", e);
-                }
-            }
-        }
-
-        // 5. PERIODIC: Retire underperforming playbook entries
-        if self.runs_since_extraction == 0 {
-            match self.curator.retire_underperforming(conn) {
-                Ok(retired) => {
-                    actions.lessons_retired += retired;
-                }
-                Err(e) => {
-                    warn!("Playbook retirement failed (non-fatal): {}", e);
-                }
-            }
-        }
-
-        // 6. PERIODIC: GEPA optimization (async trigger — logs intent only)
-        self.runs_since_gepa += 1;
-        if self.config.gepa_enabled
-            && self.runs_since_gepa >= self.config.gepa_trigger_interval
-            && self.gepa_cooldown_elapsed()
-        {
-            self.runs_since_gepa = 0;
-            self.last_gepa_time = Some(Instant::now());
-            actions.gepa_triggered = true;
-            info!(
-                "GEPA optimization triggered for domain '{}'",
-                run_context.domain
-            );
-        }
-
-        // 7. PERIODIC: PRM retrain trigger (when enough new examples accumulate)
-        self.total_runs += 1;
-        let runs_since_retrain = self.total_runs - self.runs_at_last_prm_retrain;
-        if runs_since_retrain >= self.config.prm_retrain_threshold {
-            self.runs_at_last_prm_retrain = self.total_runs;
-            actions.prm_retrain_triggered = true;
-            info!(
-                "PRM retrain triggered after {} new runs (threshold: {}). \
-                 Export URL: {}",
-                runs_since_retrain,
-                self.config.prm_retrain_threshold,
-                self.config.prm_export_url,
-            );
-        }
-
-        if actions.has_activity() {
-            info!(
-                "Learning actions: lessons={}/merged={}, examples={}, templates_tracked={}, lifecycle={}, gepa={}, prm_retrain={}",
-                actions.lessons_added,
-                actions.lessons_merged,
-                actions.examples_extracted,
-                actions.templates_tracked,
-                actions.lifecycle_actions,
-                actions.gepa_triggered,
-                actions.prm_retrain_triggered,
-            );
-        }
-
-        actions
+        todo!("SQLite removed")
     }
 
     /// Reflect on a run and curate any lessons learned.
@@ -259,40 +127,7 @@ impl LearningOrchestrator {
         ctx: &RunContext,
         conn: &Connection,
     ) -> Result<CurationResult, String> {
-        let step_evals = ctx
-            .step_evaluation_summaries
-            .as_ref()
-            .map(|evals| {
-                evals
-                    .iter()
-                    .map(|(step_id, criterion_desc, score, steps_json)| {
-                        StepEvaluationSummary {
-                            step_id: step_id.clone(),
-                            step_name: step_id.clone(), // Use step_id as name if not available
-                            composite_score: *score,
-                            min_score: *score,
-                            weakest_dimension: "unknown".to_string(),
-                            explanation: None,
-                            criterion_description: Some(criterion_desc.clone()),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let lessons = super::reflector::reflect_on_run(
-            &ctx.run_id,
-            ctx.overall_score,
-            ctx.iterations,
-            &step_evals,
-            conn,
-        )?;
-
-        if lessons.is_empty() {
-            return Ok(CurationResult::default());
-        }
-
-        self.curator.curate(lessons, conn)
+        Err("SQLite removed".to_string())
     }
 
     /// Check if enough time has passed since last GEPA optimization.
@@ -383,36 +218,7 @@ pub fn build_learning_context(
     max_examples: usize,
     conn: &Connection,
 ) -> String {
-    let mut context = String::new();
-
-    // 1. Playbook lessons
-    let curator = PlaybookCurator::new();
-    match curator.select_lessons(domain, max_lessons, conn) {
-        Ok(lessons) if !lessons.is_empty() => {
-            context.push_str(&super::reflector::build_playbook_section(&lessons));
-            context.push('\n');
-        }
-        Ok(_) => {}
-        Err(e) => {
-            debug!("Could not load playbook lessons: {}", e);
-        }
-    }
-
-    // 2. Few-shot examples
-    let few_shot = FewShotCurator::new();
-    let domain_str = domain.unwrap_or("general");
-    match few_shot.select_examples(domain_str, max_examples, conn) {
-        Ok(examples) if !examples.is_empty() => {
-            context.push_str(&FewShotCurator::format_few_shot_section(&examples));
-            context.push('\n');
-        }
-        Ok(_) => {}
-        Err(e) => {
-            debug!("Could not load few-shot examples: {}", e);
-        }
-    }
-
-    context
+    String::new()
 }
 
 // ============================================================================
@@ -422,6 +228,7 @@ pub fn build_learning_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_default_config() {

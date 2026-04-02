@@ -4,8 +4,8 @@
 //! waits for all to complete, then triggers AI comparison analysis.
 
 use serde::{Deserialize, Serialize};
-
 use crate::database::CheckpointDb;
+
 
 // =============================================================================
 // Types
@@ -331,34 +331,5 @@ pub fn build_entry_summaries(
     entries: &[ComparisonEntry],
     db: &CheckpointDb,
 ) -> Vec<(String, String, String)> {
-    entries
-        .iter()
-        .map(|entry| {
-            let result_summary = entry
-                .result
-                .as_ref()
-                .map(|r| {
-                    format!(
-                "Success: {}, Verification: {}, Iterations: {}, Duration: {}ms, Files changed: {}",
-                r.success, r.verification_passed, r.iterations, r.duration_ms, r.files_changed
-            )
-                })
-                .unwrap_or_else(|| {
-                    // Try to get from database
-                    db.get_task_run(&entry.task_run_id)
-                        .ok()
-                        .flatten()
-                        .map(|run| {
-                            format!(
-                                "Status: {}, Summary: {}",
-                                run.status,
-                                run.summary.as_deref().unwrap_or("none")
-                            )
-                        })
-                        .unwrap_or_else(|| format!("Status: {:?}", entry.status))
-                });
-
-            (entry.branch_name.clone(), String::new(), result_summary)
-        })
-        .collect()
+    Vec::new()
 }

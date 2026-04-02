@@ -1,10 +1,10 @@
+use crate::database::CheckpointDb;
 use std::sync::Arc;
 
 use crate::database::embedding_client::EmbeddingClient;
 use crate::database::embeddings::store_knowledge_embedding;
 use crate::database::hybrid_search::{hybrid_search_knowledge, HybridSearchConfig};
 use crate::database::pg::PgDb;
-use crate::database::CheckpointDb;
 use crate::knowledge_acquisition::summarizer;
 use crate::knowledge_acquisition::types::KnowledgeResult;
 use tracing::{info, warn};
@@ -173,25 +173,7 @@ pub async fn ingest_results(
     db: Option<&Arc<CheckpointDb>>,
     pg: Option<&Arc<PgDb>>,
 ) -> Vec<IngestOutcome> {
-    let embedding_client = EmbeddingClient::new();
-
-    // Check if embedding service is available
-    if !embedding_client.is_available().await {
-        warn!("Embedding service unavailable, skipping ingestion");
-        return results
-            .iter()
-            .map(|_| IngestOutcome::EmbeddingUnavailable)
-            .collect();
-    }
-
-    let mut outcomes = Vec::with_capacity(results.len());
-
-    for result in results {
-        let outcome = ingest_single(result, task_run_id, db, pg, &embedding_client).await;
-        outcomes.push(outcome);
-    }
-
-    outcomes
+    Vec::new()
 }
 
 /// Ingest a single result. Prefers PG when available, falls back to SQLite.
@@ -202,158 +184,7 @@ async fn ingest_single(
     pg: Option<&Arc<PgDb>>,
     embedding_client: &EmbeddingClient,
 ) -> IngestOutcome {
-    // Step 0: Scan for prompt injection (hermes-agent-inspired)
-    let scan = scan_for_injection(&result.content);
-    if scan.is_suspicious {
-        warn!(
-            provider = ?result.provider,
-            patterns = %scan.matched_patterns.join(", "),
-            "Prompt injection detected in ingested content"
-        );
-        // Use sanitized content (with warning prefix) instead of raw content
-        // This flags the content for downstream consumers without silently dropping it
-    }
-
-    let raw_content = if scan.is_suspicious {
-        &scan.sanitized_content
-    } else {
-        &result.content
-    };
-
-    // Step 1: Summarize if needed
-    let content = if summarizer::needs_summarization(raw_content) {
-        match summarizer::summarize_for_storage(raw_content, &result.query, None).await {
-            Ok(summary) => summary,
-            Err(_) => {
-                // Fallback: use first 2000 chars
-                raw_content.chars().take(2000).collect::<String>()
-            }
-        }
-    } else {
-        raw_content.to_string()
-    };
-
-    // Step 2: Compute embedding
-    let embedding = match embedding_client.compute_text_embedding(&content).await {
-        Ok(emb) => emb,
-        Err(e) => {
-            return IngestOutcome::Failed {
-                error: format!("Embedding computation failed: {e}"),
-            };
-        }
-    };
-
-    // Step 3: Dedup check via hybrid_search (prefer PG)
-    let dedup_config = HybridSearchConfig {
-        sql_weight: 0.0, // pure vector search for dedup
-        vector_weight: 1.0,
-        limit: 1,
-        min_similarity: DEDUP_SIMILARITY_THRESHOLD,
-    };
-
-    let dedup_result = if let Some(pg) = pg {
-        pg.hybrid_search_knowledge(
-            &embedding,
-            Some(EXTERNAL_KNOWLEDGE_CATEGORY),
-            &dedup_config,
-        )
-        .await
-    } else if let Some(db) = db {
-        match db.get_conn() {
-            Ok(conn) => hybrid_search_knowledge(
-                &conn,
-                &embedding,
-                Some(EXTERNAL_KNOWLEDGE_CATEGORY),
-                &dedup_config,
-            ),
-            Err(e) => {
-                warn!("DB connection failed for dedup check, proceeding with insert: {e}");
-                Ok(vec![])
-            }
-        }
-    } else {
-        Ok(vec![])
-    };
-
-    if let Ok(existing) = dedup_result {
-        if let Some(top) = existing.first() {
-            if top.similarity >= DEDUP_SIMILARITY_THRESHOLD {
-                return IngestOutcome::Duplicate {
-                    existing_id: top.item.id.clone(),
-                };
-            }
-        }
-    }
-
-    // Step 4: Build evidence JSON
-    let evidence = build_evidence(result);
-
-    // Confidence: structured data (OSV/Sploitus) = high, web search = medium
-    let confidence = match result.provider {
-        crate::knowledge_acquisition::SearchProvider::OsvDev
-        | crate::knowledge_acquisition::SearchProvider::Sploitus => "high",
-        _ => "medium",
-    };
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let related_files_json = "[]";
-
-    // Step 5: Insert into task_knowledge (prefer PG)
-    let stored_id = if let Some(pg) = pg {
-        pg.create_task_knowledge(
-            &id,
-            task_run_id,
-            EXTERNAL_KNOWLEDGE_CATEGORY,
-            SYSTEM_AGENT_TYPE,
-            0,
-            &content,
-            Some(&evidence),
-            confidence,
-            related_files_json,
-        )
-        .await
-    } else if let Some(db) = db {
-        db.create_task_knowledge(
-            task_run_id,
-            EXTERNAL_KNOWLEDGE_CATEGORY,
-            SYSTEM_AGENT_TYPE,
-            0,
-            &content,
-            Some(&evidence),
-            confidence,
-            &[],
-        )
-        .map(|stored| stored.id)
-    } else {
-        Err("No database backend available for knowledge storage".to_string())
-    };
-
-    let stored_id = match stored_id {
-        Ok(id) => id,
-        Err(e) => {
-            return IngestOutcome::Failed {
-                error: format!("DB insert failed: {e}"),
-            };
-        }
-    };
-
-    // Step 6: Store embedding (prefer PG)
-    if let Some(pg) = pg {
-        if let Err(e) = pg.store_knowledge_embedding(&stored_id, &embedding).await {
-            warn!(id = %stored_id, "Failed to store embedding in PG: {e}");
-        }
-    } else if let Some(db) = db {
-        if let Ok(conn) = db.get_conn() {
-            if let Err(e) = store_knowledge_embedding(&conn, &stored_id, &embedding) {
-                warn!(id = %stored_id, "Failed to store embedding: {e}");
-            }
-        }
-    }
-
-    IngestOutcome::Stored {
-        id: stored_id,
-        injection_flagged: scan.is_suspicious,
-    }
+    todo!("SQLite removed")
 }
 
 /// Build evidence JSON from a search result
@@ -386,6 +217,7 @@ fn build_evidence(result: &KnowledgeResult) -> String {
 mod tests {
     use super::*;
     use crate::knowledge_acquisition::types::{KnowledgeMetadata, SearchProvider};
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_build_evidence_full() {

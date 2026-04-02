@@ -7,11 +7,11 @@
 // but are part of the complete scheduler interface
 #![allow(dead_code)]
 
+use crate::database::{CheckpointDb, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::database::CheckpointDb;
 
 // ============================================================================
 // Schedule Expression Types
@@ -481,24 +481,12 @@ pub struct NextTaskInfo {
 
 /// Get all scheduled tasks
 pub fn get_all_tasks(db: &CheckpointDb) -> Vec<ScheduledTask> {
-    match db.get_all_scheduled_tasks() {
-        Ok(tasks) => tasks,
-        Err(e) => {
-            error!("Failed to get all scheduled tasks: {}", e);
-            Vec::new()
-        }
-    }
+    Vec::new()
 }
 
 /// Get a task by ID
 pub fn get_task(db: &CheckpointDb, id: &str) -> Option<ScheduledTask> {
-    match db.get_scheduled_task(id) {
-        Ok(task) => task,
-        Err(e) => {
-            error!("Failed to get scheduled task {}: {}", id, e);
-            None
-        }
-    }
+    None
 }
 
 /// Create a new scheduled task
@@ -514,24 +502,7 @@ pub fn create_task(
     success_criteria: Option<String>,
     conditions: Option<ScheduleConditions>,
 ) -> Result<ScheduledTask, String> {
-    let mut scheduled_task = ScheduledTask::new(name, description, schedule, task);
-    scheduled_task.skip_if_completed = skip_if_completed;
-    scheduled_task.auto_fix_on_failure = auto_fix_on_failure;
-    scheduled_task.success_criteria = success_criteria;
-    scheduled_task.conditions = conditions;
-
-    // Compute initial next_run
-    let now = chrono::Utc::now();
-    scheduled_task.next_run =
-        compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339());
-
-    db.insert_scheduled_task(&scheduled_task)?;
-
-    info!(
-        "Created scheduled task: {} ({})",
-        scheduled_task.name, scheduled_task.id
-    );
-    Ok(scheduled_task)
+    Err("SQLite removed".to_string())
 }
 
 /// Update an existing task
@@ -549,67 +520,12 @@ pub fn update_task(
     success_criteria: Option<Option<String>>,
     conditions: Option<Option<ScheduleConditions>>,
 ) -> Result<ScheduledTask, String> {
-    let mut scheduled_task = db
-        .get_scheduled_task(id)?
-        .ok_or_else(|| format!("Task not found: {}", id))?;
-
-    if let Some(name) = name {
-        scheduled_task.name = name;
-    }
-    if let Some(description) = description {
-        scheduled_task.description = description;
-    }
-    if let Some(enabled) = enabled {
-        scheduled_task.enabled = enabled;
-    }
-    if let Some(schedule) = schedule {
-        scheduled_task.schedule = schedule;
-    }
-    if let Some(task) = task {
-        scheduled_task.task = task;
-    }
-    if let Some(skip_if_completed) = skip_if_completed {
-        scheduled_task.skip_if_completed = skip_if_completed;
-    }
-    if let Some(auto_fix_on_failure) = auto_fix_on_failure {
-        scheduled_task.auto_fix_on_failure = auto_fix_on_failure;
-    }
-    if let Some(success_criteria) = success_criteria {
-        scheduled_task.success_criteria = success_criteria;
-    }
-    if let Some(conditions) = conditions {
-        scheduled_task.conditions = conditions;
-        // Clear condition_status when conditions change
-        scheduled_task.condition_status = None;
-    }
-
-    // Recompute next_run when schedule or enabled status changes
-    let now = chrono::Utc::now();
-    scheduled_task.next_run = if scheduled_task.enabled {
-        compute_next_run(&scheduled_task.schedule, now).map(|dt| dt.to_rfc3339())
-    } else {
-        None
-    };
-
-    scheduled_task.touch();
-    db.update_scheduled_task(&scheduled_task)?;
-
-    info!(
-        "Updated scheduled task: {} ({})",
-        scheduled_task.name, scheduled_task.id
-    );
-    Ok(scheduled_task)
+    Err("SQLite removed".to_string())
 }
 
 /// Delete a task
 pub fn delete_task(db: &CheckpointDb, id: &str) -> Result<(), String> {
-    // Verify task exists first
-    db.get_scheduled_task(id)?
-        .ok_or_else(|| format!("Task not found: {}", id))?;
-
-    db.delete_scheduled_task(id)?;
-    info!("Deleted scheduled task: {}", id);
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Record an execution
@@ -618,27 +534,12 @@ pub fn record_execution(
     task_id: &str,
     record: TaskExecutionRecord,
 ) -> Result<(), String> {
-    // Update last_run on the task
-    db.update_task_last_run(task_id, Some(&record.execution_id))?;
-
-    // Add to history
-    db.insert_execution_record(task_id, &record)?;
-
-    // Trim history if needed (keep max 50 entries)
-    db.trim_execution_history(task_id, 50)?;
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Get execution history for a task
 pub fn get_task_history(db: &CheckpointDb, task_id: &str) -> Vec<TaskExecutionRecord> {
-    match db.get_execution_history(task_id, 50) {
-        Ok(records) => records,
-        Err(e) => {
-            error!("Failed to get task history for {}: {}", task_id, e);
-            Vec::new()
-        }
-    }
+    Vec::new()
 }
 
 /// Update the condition status for a task
@@ -647,25 +548,17 @@ pub fn update_task_condition_status(
     task_id: &str,
     status: ConditionStatus,
 ) -> Result<(), String> {
-    let status_json = serde_json::to_string(&status)
-        .map_err(|e| format!("Failed to serialize condition status: {}", e))?;
-    db.update_task_condition_status(task_id, Some(&status_json))
+    Err("SQLite removed".to_string())
 }
 
 /// Clear the condition status for a task (after execution or timeout)
 pub fn clear_task_condition_status(db: &CheckpointDb, task_id: &str) -> Result<(), String> {
-    db.update_task_condition_status(task_id, None)
+    Err("SQLite removed".to_string())
 }
 
 /// Get scheduler settings
 pub fn get_scheduler_settings(db: &CheckpointDb) -> SchedulerSettings {
-    match db.get_scheduler_settings() {
-        Ok(settings) => settings,
-        Err(e) => {
-            error!("Failed to get scheduler settings: {}", e);
-            SchedulerSettings::default()
-        }
-    }
+    todo!("SQLite removed")
 }
 
 /// Update scheduler settings
@@ -673,45 +566,12 @@ pub fn update_scheduler_settings(
     db: &CheckpointDb,
     settings: SchedulerSettings,
 ) -> Result<(), String> {
-    db.update_scheduler_settings(&settings)?;
-    info!("Updated scheduler settings");
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Get current scheduler status
 pub fn get_scheduler_status(db: &CheckpointDb) -> SchedulerStatus {
-    let tasks = get_all_tasks(db);
-    let settings = get_scheduler_settings(db);
-
-    let running_tasks = tasks
-        .iter()
-        .filter(|t| {
-            t.last_run
-                .as_ref()
-                .map(|r| r.status == ScheduledTaskStatus::Running)
-                .unwrap_or(false)
-        })
-        .count() as u32;
-
-    let pending_tasks = tasks.iter().filter(|t| t.enabled).count() as u32;
-
-    // Find next task to run
-    let next_task = tasks
-        .iter()
-        .filter(|t| t.enabled && t.next_run.is_some())
-        .min_by_key(|t| t.next_run.as_ref().unwrap())
-        .map(|t| NextTaskInfo {
-            id: t.id.clone(),
-            name: t.name.clone(),
-            next_run: t.next_run.clone().unwrap(),
-        });
-
-    SchedulerStatus {
-        enabled: settings.enabled,
-        running_tasks,
-        pending_tasks,
-        next_task,
-    }
+    todo!("SQLite removed")
 }
 
 // ============================================================================
@@ -759,19 +619,7 @@ pub fn compute_next_run(
 
 /// Update next_run for all tasks
 pub fn update_all_next_runs(db: &CheckpointDb) -> Result<(), String> {
-    let tasks = get_all_tasks(db);
-    let now = chrono::Utc::now();
-
-    for task in &tasks {
-        let next_run = if task.enabled {
-            compute_next_run(&task.schedule, now).map(|dt| dt.to_rfc3339())
-        } else {
-            None
-        };
-        db.update_task_next_run(&task.id, next_run.as_deref())?;
-    }
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -781,6 +629,7 @@ pub fn update_all_next_runs(db: &CheckpointDb) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_cron_parsing() {

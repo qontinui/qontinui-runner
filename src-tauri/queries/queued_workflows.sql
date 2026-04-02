@@ -10,14 +10,16 @@ RETURNING id;
 
 --! queue_get
 SELECT id, workflow_id, workflow_name, queued_at, priority, status,
-       started_at, completed_at, updated_at, error_message, task_run_id,
+       COALESCE(started_at, NOW()) as started_at, COALESCE(completed_at, NOW()) as completed_at,
+       updated_at, COALESCE(error_message, '') as error_message, COALESCE(task_run_id, '') as task_run_id,
        retry_count, max_retries
 FROM queued_workflows
 WHERE id = :id;
 
 --! queue_load_pending
 SELECT id, workflow_id, workflow_name, queued_at, priority, status,
-       started_at, completed_at, updated_at, error_message, task_run_id,
+       COALESCE(started_at, NOW()) as started_at, COALESCE(completed_at, NOW()) as completed_at,
+       updated_at, COALESCE(error_message, '') as error_message, COALESCE(task_run_id, '') as task_run_id,
        retry_count, max_retries
 FROM queued_workflows
 WHERE status IN ('pending', 'running')

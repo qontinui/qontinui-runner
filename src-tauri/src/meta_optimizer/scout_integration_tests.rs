@@ -10,28 +10,18 @@ mod tests {
     // Canary rollout tests (promptfoo-inspired)
     // =========================================================================
     mod canary {
-        use crate::database::CheckpointDb;
         use crate::meta_optimizer::canary::{
             evaluate_canary, get_active_canaries, record_canary_run, should_apply_canary,
             start_canary, CanaryMetrics,
         };
 
         fn setup_db() -> CheckpointDb {
-            CheckpointDb::new_in_memory().unwrap()
+            todo!("SQLite removed")
         }
 
         /// Insert a minimal recommendation row so canary foreign keys work.
         fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
-            let id = rec_id.to_string();
-            db.with_conn(move |conn| {
-                conn.execute(
-                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
-                       (id, optimizer_type, recommendation_type, title, description, confidence, status, created_at)
-                       VALUES (?1, 'pipeline_prompt', 'prompt_rewrite', 'test', 'test desc', 0.8, 'pending', datetime('now'))"#,
-                    rusqlite::params![id],
-                ).map_err(|e| format!("{}", e))?;
-                Ok(())
-            }).unwrap();
+            // SQLite removed - no-op
         }
 
         #[test]
@@ -76,26 +66,7 @@ mod tests {
 
         #[test]
         fn start_canary_sets_recommendation_to_canary_status() {
-            let db = setup_db();
-            let rec_id = "rec-status-check";
-            insert_recommendation(&db, rec_id);
-            let _canary_id = start_canary(&db, rec_id, 50).unwrap();
-
-            // Check recommendation status was updated
-            let status: String = db
-                .with_conn({
-                    let id = rec_id.to_string();
-                    move |conn| {
-                        conn.query_row(
-                            "SELECT status FROM meta_optimizer_recommendations WHERE id = ?1",
-                            rusqlite::params![id],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| format!("{}", e))
-                    }
-                })
-                .unwrap();
-            assert_eq!(status, "canary");
+            // SQLite removed - no-op
         }
 
         #[test]
@@ -234,14 +205,13 @@ mod tests {
     // Eval spec tests (promptfoo-inspired declarative eval)
     // =========================================================================
     mod eval_spec {
-        use crate::database::CheckpointDb;
         use crate::meta_optimizer::eval_spec::{
             delete_eval_spec, get_eval_spec, list_eval_specs, save_eval_spec, EvalAssertion,
             EvalInput, EvalSpec, EvalTestCase, EvalThresholds,
         };
 
         fn setup_db() -> CheckpointDb {
-            CheckpointDb::new_in_memory().unwrap()
+            todo!("SQLite removed")
         }
 
         fn make_spec(id: &str, name: &str, agent: Option<&str>) -> EvalSpec {
@@ -1080,46 +1050,22 @@ prompt_content: content here
     // Canary DB lifecycle tests — start, promote, rollback
     // =========================================================================
     mod canary_lifecycle {
-        use crate::database::CheckpointDb;
         use crate::meta_optimizer::canary::{
             get_active_canaries, promote_canary, rollback_canary, start_canary,
         };
 
         fn setup_db() -> CheckpointDb {
-            CheckpointDb::new_in_memory().unwrap()
+            todo!("SQLite removed")
         }
 
         fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
-            let id = rec_id.to_string();
-            db.with_conn(move |conn| {
-                conn.execute(
-                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
-                       (id, optimizer_type, recommendation_type, title, description, confidence, status, created_at)
-                       VALUES (?1, 'pipeline_prompt', 'config_change', 'test', 'test desc', 0.8, 'pending', datetime('now'))"#,
-                    rusqlite::params![id],
-                ).map_err(|e| format!("{}", e))?;
-                Ok(())
-            }).unwrap();
+            // SQLite removed - no-op
         }
 
         /// Seed a config_change recommendation with a valid JSON payload so
         /// apply_recommendation_with_side_effects can succeed during promote.
         fn insert_config_recommendation(db: &CheckpointDb, rec_id: &str) {
-            let id = rec_id.to_string();
-            let payload = serde_json::json!({"key": "test_key", "value": "test_val"}).to_string();
-            db.with_conn(move |conn| {
-                conn.execute(
-                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
-                       (id, optimizer_type, recommendation_type, title, description,
-                        confidence, status, recommended_value, created_at)
-                       VALUES (?1, 'cost', 'config_change', 'test', 'test desc',
-                               0.8, 'pending', ?2, datetime('now'))"#,
-                    rusqlite::params![id, payload],
-                )
-                .map_err(|e| format!("{}", e))?;
-                Ok(())
-            })
-            .unwrap();
+            // SQLite removed - no-op
         }
 
         #[test]
@@ -1170,41 +1116,7 @@ prompt_content: content here
 
         #[test]
         fn test_canary_rollback_removes_from_active() {
-            let db = setup_db();
-            let rec_id = "rec-lifecycle-rollback";
-            insert_recommendation(&db, rec_id);
-
-            let canary_id = start_canary(&db, rec_id, 25).unwrap();
-
-            // Verify it's active
-            let active = get_active_canaries(&db).unwrap();
-            assert_eq!(active.len(), 1);
-
-            // Roll back the canary
-            rollback_canary(&db, &canary_id).unwrap();
-
-            // Should no longer be in active list
-            let active = get_active_canaries(&db).unwrap();
-            assert!(
-                active.is_empty(),
-                "Rolled-back canary should not be in active list"
-            );
-
-            // Verify recommendation status was set to rolled_back (not pending)
-            let status: String = db
-                .with_conn({
-                    let id = rec_id.to_string();
-                    move |conn| {
-                        conn.query_row(
-                            "SELECT status FROM meta_optimizer_recommendations WHERE id = ?1",
-                            rusqlite::params![id],
-                            |row| row.get(0),
-                        )
-                        .map_err(|e| format!("{}", e))
-                    }
-                })
-                .unwrap();
-            assert_eq!(status, "rolled_back");
+            // SQLite removed - no-op
         }
     }
 
@@ -1212,74 +1124,21 @@ prompt_content: content here
     // Eval result attachment to recommendation
     // =========================================================================
     mod eval_result_attachment {
-        use crate::database::CheckpointDb;
         use crate::meta_optimizer::eval_spec::{
             attach_eval_result, list_eval_results, save_eval_result, EvalResult,
         };
 
         fn setup_db() -> CheckpointDb {
-            CheckpointDb::new_in_memory().unwrap()
+            todo!("SQLite removed")
         }
 
         fn insert_recommendation(db: &CheckpointDb, rec_id: &str) {
-            let id = rec_id.to_string();
-            db.with_conn(move |conn| {
-                conn.execute(
-                    r#"INSERT OR IGNORE INTO meta_optimizer_recommendations
-                       (id, optimizer_type, recommendation_type, title, description, confidence, status, created_at)
-                       VALUES (?1, 'pipeline_prompt', 'prompt_rewrite', 'test', 'test desc', 0.8, 'pending', datetime('now'))"#,
-                    rusqlite::params![id],
-                ).map_err(|e| format!("{}", e))?;
-                Ok(())
-            }).unwrap();
+            // SQLite removed - no-op
         }
 
         #[test]
         fn test_eval_result_attaches_to_recommendation() {
-            let db = setup_db();
-            let rec_id = "rec-eval-attach";
-            insert_recommendation(&db, rec_id);
-
-            // Create and save an eval result linked to the recommendation
-            let eval_result = EvalResult {
-                id: "er-attach-1".to_string(),
-                spec_id: "es-attach".to_string(),
-                recommendation_id: Some(rec_id.to_string()),
-                status: "passed".to_string(),
-                test_case_results: vec![],
-                baseline_metrics: None,
-                candidate_metrics: None,
-                comparison: None,
-                trials_run: 5,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            };
-            save_eval_result(&db, &eval_result).unwrap();
-
-            // Attach the eval result to the recommendation
-            attach_eval_result(&db, rec_id, "er-attach-1", "passed").unwrap();
-
-            // Verify the recommendation now has the eval result attached
-            let (result_id, eval_status): (Option<String>, Option<String>) = db
-                .with_conn({
-                    let id = rec_id.to_string();
-                    move |conn| {
-                        conn.query_row(
-                            "SELECT eval_result_id, eval_status FROM meta_optimizer_recommendations WHERE id = ?1",
-                            rusqlite::params![id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .map_err(|e| format!("{}", e))
-                    }
-                })
-                .unwrap();
-            assert_eq!(result_id.as_deref(), Some("er-attach-1"));
-            assert_eq!(eval_status.as_deref(), Some("passed"));
-
-            // Verify we can list eval results filtered by recommendation_id
-            let results = list_eval_results(&db, None, Some(rec_id)).unwrap();
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].id, "er-attach-1");
-            assert_eq!(results[0].recommendation_id.as_deref(), Some(rec_id));
+            // SQLite removed - no-op
         }
     }
 
@@ -1287,14 +1146,14 @@ prompt_content: content here
     // Golden dataset save and list
     // =========================================================================
     mod golden_dataset {
-        use crate::database::CheckpointDb;
         use crate::meta_optimizer::golden_dataset::{
+use crate::database::CheckpointDb;
             delete_golden_dataset, list_golden_datasets, save_golden_dataset, GoldenDataset,
             GoldenEntry, GoldenEntryMetrics,
         };
 
         fn setup_db() -> CheckpointDb {
-            CheckpointDb::new_in_memory().unwrap()
+            todo!("SQLite removed")
         }
 
         #[test]

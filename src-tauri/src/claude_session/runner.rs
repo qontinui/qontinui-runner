@@ -6,11 +6,11 @@
 //! - `run_claude_session_interactive` — bidirectional session via `ClaudeSession`
 //! - `run_claude_session_interactive_with_retry` — interactive with retry
 
+use crate::database::CheckpointDb;
 use std::sync::Arc;
 use tauri::Emitter;
 use tracing::{debug, info, warn};
 
-use crate::database::CheckpointDb;
 use crate::doctor::DoctorHandle;
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
@@ -2226,6 +2226,7 @@ pub fn run_claude_session_interactive_with_retry(
 ) -> Result<CliSessionRetryOutput, String> {
     use std::thread;
     use std::time::Duration;
+use crate::database::CheckpointDb;
 
     // If no retry config or retry disabled, just run once
     let config = match retry_config {

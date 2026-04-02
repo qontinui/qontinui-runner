@@ -3020,7 +3020,7 @@ impl SetSyncPendingStmt {
 pub struct ListSlashCommandSourcesStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn list_slash_command_sources() -> ListSlashCommandSourcesStmt {
     ListSlashCommandSourcesStmt(
-        "SELECT id, name, source_file_path FROM unified_workflows WHERE source_file_path IS NOT NULL",
+        "SELECT id, name, COALESCE(source_file_path, '') as source_file_path FROM unified_workflows WHERE source_file_path IS NOT NULL",
         None,
     )
 }
@@ -3147,7 +3147,7 @@ impl<
 pub struct GetWorkflowStatsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_workflow_stats() -> GetWorkflowStatsStmt {
     GetWorkflowStatsStmt(
-        "SELECT COUNT(*)::bigint as total_runs, COUNT(*) FILTER (WHERE status = 'complete')::bigint as success_count, COUNT(*) FILTER (WHERE status = 'failed')::bigint as failure_count, MAX(created_at) as last_run_at, (SELECT status FROM task_runs WHERE workflow_name = $1 ORDER BY created_at DESC LIMIT 1) as last_run_status, AVG(CASE WHEN completed_at IS NOT NULL THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000 END)::double precision as avg_duration_ms FROM task_runs WHERE workflow_name = $1",
+        "SELECT COUNT(*)::bigint as total_runs, COUNT(*) FILTER (WHERE status = 'complete')::bigint as success_count, COUNT(*) FILTER (WHERE status = 'failed')::bigint as failure_count, COALESCE(MAX(created_at), NOW()) as last_run_at, COALESCE((SELECT status FROM task_runs WHERE workflow_name = $1 ORDER BY created_at DESC LIMIT 1), '') as last_run_status, COALESCE(AVG(CASE WHEN completed_at IS NOT NULL THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000 END)::double precision, 0) as avg_duration_ms FROM task_runs WHERE workflow_name = $1",
         None,
     )
 }

@@ -1191,6 +1191,7 @@ pub async fn migrate_task_run_logs(
 /// are merged so that start and complete events produce a single `StepExecutionData`.
 pub fn aggregate_step_events(events: &[crate::database::TaskRunEvent]) -> AggregatedStepData {
     use std::collections::HashMap;
+use crate::database::CheckpointDb;
 
     let mut step_map: HashMap<String, StepExecutionData> = HashMap::new();
 

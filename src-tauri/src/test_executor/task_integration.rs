@@ -6,7 +6,9 @@
 //! - Format test results for AI context
 //! - Create findings for failed critical tests
 
-use crate::database::{CheckpointDb, CreateTestResultInput, TestResultStatus, TriggerPoint};
+use crate::database::Connection;
+use crate::database::CheckpointDb;
+use crate::database::{CreateTestResultInput, TestResultStatus, TriggerPoint};
 use crate::test_executor::{
     execute_test, RepoTestConfig, TestCategory, TestDefinition, TestExecutionResult, TestStatus,
     TestType, VisionConfig,
@@ -47,160 +49,7 @@ pub fn execute_tests_for_trigger(
     trigger: &TriggerPoint,
     task_run_id: Option<&str>,
 ) -> TriggerTestsResult {
-    info!(
-        "Executing tests for trigger {:?} on config {}",
-        trigger, config_id
-    );
-
-    // Get test associations for this config and trigger
-    let associations = match db.get_associations_for_config(config_id, Some(trigger)) {
-        Ok(assocs) => assocs,
-        Err(e) => {
-            warn!("Failed to get test associations: {}", e);
-            return TriggerTestsResult::default();
-        }
-    };
-
-    if associations.is_empty() {
-        info!("No tests associated with trigger {:?}", trigger);
-        return TriggerTestsResult::default();
-    }
-
-    info!(
-        "Found {} test associations for trigger {:?}",
-        associations.len(),
-        trigger
-    );
-
-    let mut result = TriggerTestsResult::default();
-    let mut context_lines: Vec<String> = Vec::new();
-
-    context_lines.push(format!("=== Verification Tests ({:?}) ===", trigger));
-
-    // Sort by execution_order
-    let mut sorted_assocs = associations;
-    sorted_assocs.sort_by_key(|a| a.execution_order);
-
-    for assoc in sorted_assocs {
-        if !assoc.enabled {
-            continue;
-        }
-
-        // Get the test definition
-        let test = match db.get_verification_test(&assoc.test_id) {
-            Ok(Some(t)) => t,
-            Ok(None) => {
-                warn!("Test {} not found", assoc.test_id);
-                continue;
-            }
-            Err(e) => {
-                warn!("Failed to get test {}: {}", assoc.test_id, e);
-                continue;
-            }
-        };
-
-        if !test.enabled {
-            continue;
-        }
-
-        // Convert to TestDefinition
-        let test_def = db_test_to_definition(&test);
-
-        // Create test result record
-        let result_input = CreateTestResultInput {
-            test_id: test.id.clone(),
-            task_run_id: task_run_id.map(|s| s.to_string()),
-        };
-
-        let test_result_record = match db.create_test_result(&result_input) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Failed to create test result: {}", e);
-                continue;
-            }
-        };
-
-        // Mark as started
-        let _ = db.start_test_result(&test_result_record.id);
-
-        // Execute the test
-        info!("Executing test: {} (type: {:?})", test.name, test.test_type);
-        let exec_result = execute_test(&test_def);
-
-        // Update result in database
-        let db_status = executor_status_to_db(&exec_result.status);
-        let _ = db.update_test_result(
-            &test_result_record.id,
-            &db_status,
-            Some(&exec_result.output),
-            exec_result.error.as_deref(),
-            exec_result.structured_output.as_ref(),
-            exec_result.assertions_passed,
-            exec_result.assertions_failed,
-            &exec_result.screenshots,
-        );
-
-        // Track results
-        result.total += 1;
-        let status = &exec_result.status;
-
-        if matches!(status, TestStatus::Passed) {
-            result.passed += 1;
-            context_lines.push(format!(
-                "PASSED: {} ({}ms)",
-                test.name, exec_result.duration_ms
-            ));
-        } else if matches!(status, TestStatus::Skipped) {
-            // Skipped tests are not failures — don't count them
-            context_lines.push(format!("SKIPPED: {}", test.name));
-        } else {
-            result.failed += 1;
-            if test.is_critical {
-                result.critical_failure = true;
-            }
-            context_lines.push(format!(
-                "FAILED: {} ({}ms) - {}",
-                test.name,
-                exec_result.duration_ms,
-                exec_result.error.as_deref().unwrap_or("Unknown error")
-            ));
-        }
-
-        // Add assertion details
-        if exec_result.assertions_passed > 0 || exec_result.assertions_failed > 0 {
-            context_lines.push(format!(
-                "  Assertions: {}/{} passed",
-                exec_result.assertions_passed,
-                exec_result.assertions_passed + exec_result.assertions_failed
-            ));
-        }
-
-        result.results.push(exec_result);
-    }
-
-    // Summary line
-    if result.total > 0 {
-        context_lines.push(format!(
-            "\nExecuted {} tests: {} passed, {} failed{}",
-            result.total,
-            result.passed,
-            result.failed,
-            if result.critical_failure {
-                " (CRITICAL FAILURE)"
-            } else {
-                ""
-            }
-        ));
-    }
-
-    result.ai_context = context_lines.join("\n");
-
-    info!(
-        "Test execution complete: {}/{} passed",
-        result.passed, result.total
-    );
-
-    result
+    todo!("SQLite removed")
 }
 
 /// Create findings for failed critical tests
@@ -217,53 +66,7 @@ pub fn create_findings_for_failures(
     tests_result: &TriggerTestsResult,
     _config_id: &str,
 ) {
-    for exec_result in &tests_result.results {
-        if matches!(exec_result.status, TestStatus::Passed | TestStatus::Skipped) {
-            continue;
-        }
-
-        // Get the test to check if it's critical
-        let test = match db.get_verification_test(&exec_result.test_id) {
-            Ok(Some(t)) => t,
-            _ => continue,
-        };
-
-        if !test.is_critical {
-            continue;
-        }
-
-        // Create a finding for the critical failure
-        let finding_title = format!("Test failed: {}", test.name);
-        let finding_description = format!(
-            "Critical verification test '{}' failed.\n\nError: {}\n\nTest Type: {:?}\nDuration: {}ms\nAssertions: {} passed, {} failed",
-            test.name,
-            exec_result.error.as_deref().unwrap_or("Unknown error"),
-            test.test_type,
-            exec_result.duration_ms,
-            exec_result.assertions_passed,
-            exec_result.assertions_failed
-        );
-
-        // Insert finding using the findings storage
-        match insert_test_failure_finding(
-            db,
-            task_run_id,
-            session_num,
-            &finding_title,
-            &finding_description,
-            &test.name,
-        ) {
-            Ok(finding_id) => {
-                info!(
-                    "Created finding {} for failed test {}",
-                    finding_id, test.name
-                );
-            }
-            Err(e) => {
-                warn!("Failed to create finding for test {}: {}", test.name, e);
-            }
-        }
-    }
+    // SQLite removed - no-op
 }
 
 /// Insert a test failure finding into the database via PG.
@@ -276,20 +79,7 @@ fn insert_test_failure_finding(
     description: &str,
     test_name: &str,
 ) -> Result<String, String> {
-    // PG-primary: use block_in_place since this is called from sync context within async runtime.
-    use crate::database::pg::PgDb;
-    let pg_db = PgDb::global();
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.insert_test_failure_finding(
-                task_run_id,
-                session_num,
-                title,
-                description,
-                test_name,
-            ).await
-        })
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Format test results as AI context string
@@ -373,6 +163,7 @@ fn executor_status_to_db(status: &TestStatus) -> TestResultStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_default_result() {

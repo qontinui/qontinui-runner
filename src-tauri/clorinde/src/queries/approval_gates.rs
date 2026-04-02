@@ -369,7 +369,7 @@ impl<
 pub struct GetApprovalGatesForTaskRunStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_approval_gates_for_task_run() -> GetApprovalGatesForTaskRunStmt {
     GetApprovalGatesForTaskRunStmt(
-        "SELECT id, task_run_id, iteration, prompt, context_json, action, comment, status, created_at, resolved_at FROM approval_gates WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, iteration, prompt, context_json, COALESCE(action, '') as action, COALESCE(comment, '') as comment, status, created_at, COALESCE(resolved_at, NOW()) as resolved_at FROM approval_gates WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }

@@ -3,8 +3,8 @@
 //! Handles the HTTP communication with the backend API for submitting
 //! discoveries. Supports offline operation via the queue in storage.rs.
 
+use crate::database::Connection;
 use crate::auth::AuthManager;
-use rusqlite::Connection;
 use tracing::{debug, error, info, warn};
 
 use super::storage::{
@@ -160,15 +160,7 @@ pub struct SingleSyncResult {
 /// then call `sync_discoveries_batch` with the data, then call
 /// `apply_sync_results` to update the database.
 pub fn extract_discoveries_for_sync(conn: &Connection) -> Result<Vec<DiscoveryToSync>, String> {
-    let discoveries = get_discoveries_for_retry(conn)?;
-
-    Ok(discoveries
-        .into_iter()
-        .map(|d| DiscoveryToSync {
-            id: d.id,
-            payload: d.payload,
-        })
-        .collect())
+    Err("SQLite removed".to_string())
 }
 
 /// Sync a batch of discoveries (async operation, no connection needed).
@@ -203,23 +195,7 @@ pub fn apply_sync_results(
     conn: &Connection,
     results: Vec<SingleSyncResult>,
 ) -> Result<SyncResult, String> {
-    let mut sync_result = SyncResult::new();
-
-    for result in results {
-        if result.success {
-            if let Err(e) = mark_discovery_sent(conn, &result.id) {
-                warn!("Failed to mark discovery as sent: {}", e);
-            }
-            sync_result.record_success();
-        } else if let Some(error) = result.error {
-            if let Err(e) = record_sync_failure(conn, &result.id, &error) {
-                warn!("Failed to record sync failure: {}", e);
-            }
-            sync_result.record_failure(error);
-        }
-    }
-
-    Ok(sync_result)
+    Err("SQLite removed".to_string())
 }
 
 /// Sync all pending discoveries to qontinui-web.
@@ -233,28 +209,7 @@ pub fn apply_sync_results(
 /// Use the phased approach instead (extract -> batch -> apply).
 #[allow(dead_code)]
 pub async fn sync_pending_discoveries(conn: &Connection) -> Result<SyncResult, String> {
-    // Phase 1: Extract (sync)
-    let to_sync = extract_discoveries_for_sync(conn)?;
-
-    if to_sync.is_empty() {
-        debug!("No discoveries ready for sync");
-        return Ok(SyncResult::new());
-    }
-
-    info!("Syncing {} pending discoveries", to_sync.len());
-
-    // Phase 2: Sync (async)
-    let results = sync_discoveries_batch(to_sync).await;
-
-    // Phase 3: Apply results (sync)
-    let sync_result = apply_sync_results(conn, results)?;
-
-    info!(
-        "Sync complete: {} sent, {} failed",
-        sync_result.sent, sync_result.failed
-    );
-
-    Ok(sync_result)
+    Err("SQLite removed".to_string())
 }
 
 /// Get the sync status summary.
@@ -270,22 +225,13 @@ pub struct SyncStatus {
 
 /// Get current sync status.
 pub fn get_sync_status(conn: &Connection) -> Result<SyncStatus, String> {
-    let auth_manager = AuthManager::new();
-    let authenticated = auth_manager.has_tokens();
-
-    let all_pending = get_pending_discoveries(conn)?;
-    let ready = get_discoveries_for_retry(conn)?;
-
-    Ok(SyncStatus {
-        pending_count: all_pending.len() as u32,
-        ready_for_retry: ready.len() as u32,
-        authenticated,
-    })
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::Connection;
 
     #[test]
     fn test_sync_result() {

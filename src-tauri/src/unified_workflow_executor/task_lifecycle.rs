@@ -157,6 +157,23 @@ impl LoopController {
                 )
                 .await;
             });
+
+            // ── Online Learning: non-blocking post-run update ──
+            // Spawns async pipeline: enrich from traces → drift detection →
+            // bandit update → credit assignment → experience reflection → persist to PG.
+            {
+                let ol_pg = self.app_state.pg_db.clone();
+                let ol_app_handle = self.app_handle.clone();
+                let ol_task_run_id = execution_id.to_string();
+                tokio::spawn(async move {
+                    crate::online_learning::run_post_completion(
+                        &ol_pg,
+                        &ol_app_handle,
+                        &ol_task_run_id,
+                    )
+                    .await;
+                });
+            }
         }
     }
 
@@ -215,6 +232,21 @@ impl LoopController {
                 )
                 .await;
             });
+
+            // ── Online Learning: also learn from failures ──
+            {
+                let ol_pg = self.app_state.pg_db.clone();
+                let ol_app_handle = self.app_handle.clone();
+                let ol_task_run_id = execution_id.to_string();
+                tokio::spawn(async move {
+                    crate::online_learning::run_post_completion(
+                        &ol_pg,
+                        &ol_app_handle,
+                        &ol_task_run_id,
+                    )
+                    .await;
+                });
+            }
         }
     }
 

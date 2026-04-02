@@ -584,89 +584,7 @@ pub fn create_verification_plan(
     context: &PlanningContext,
     doctor_handle: Option<&DoctorHandle>,
 ) -> Result<PlanCreationResult, String> {
-    use tracing::{debug, error};
-
-    info!("Creating verification plan for task: {}", task_run_id);
-
-    // Build the full prompt
-    let system_prompt = build_planning_system_prompt();
-    let user_prompt = build_planning_user_prompt(context);
-
-    // Combine into a single prompt for the AI
-    // (Most AI providers expect a single prompt, system instructions can be prepended)
-    let full_prompt = format!("{}\n\n---\n\n{}", system_prompt, user_prompt);
-
-    debug!(
-        "Planning prompt built (length: {} chars)",
-        full_prompt.len()
-    );
-
-    // Build task context for routing (planning is typically medium/complex)
-    let task_context = TaskContext::from_prompt(&full_prompt)
-        .with_file_count(context.project_hints.test_frameworks.len());
-
-    // Call the AI provider with routing
-    let ai_response =
-        crate::ai_provider::run_prompt_with_routing(&full_prompt, &task_context, doctor_handle);
-
-    if !ai_response.success {
-        let error_msg = ai_response
-            .error
-            .unwrap_or_else(|| "Unknown AI error".to_string());
-        error!("Planning AI call failed: {}", error_msg);
-        return Err(format!("Planning AI call failed: {}", error_msg));
-    }
-
-    let raw_response = ai_response.output;
-    debug!(
-        "Planning AI response (length: {} chars)",
-        raw_response.len()
-    );
-
-    // Parse the response into a VerificationPlan
-    let mut plan = parse_planning_response(&raw_response)?;
-
-    // Set the version based on whether this is a replan
-    if context.previous_plan.is_some() {
-        plan.version = context
-            .previous_plan
-            .as_ref()
-            .map(|p| p.version + 1)
-            .unwrap_or(1);
-    }
-
-    info!(
-        "Parsed verification plan: {} criteria, {} AI-evaluated",
-        plan.success_criteria.len(),
-        plan.ai_criteria().len()
-    );
-
-    // Get previous version ID if this is a replan
-    let previous_version_id = if context.previous_plan.is_some() {
-        // Try to get the previous plan from the database
-        db.get_latest_verification_plan(task_run_id)?.map(|p| p.id)
-    } else {
-        None
-    };
-
-    // Store in database
-    let stored_plan = db.create_verification_plan(
-        task_run_id,
-        &plan,
-        context.replan_reason.as_deref(),
-        previous_version_id.as_deref(),
-    )?;
-
-    info!(
-        "Stored verification plan {} (version {})",
-        stored_plan.id, stored_plan.version
-    );
-
-    Ok(PlanCreationResult {
-        plan,
-        stored_plan_id: stored_plan.id,
-        raw_ai_response: raw_response,
-    })
+    Err("SQLite removed".to_string())
 }
 
 /// Create a verification plan for replanning.
@@ -686,29 +604,7 @@ pub fn create_replan(
     replan_reason: &str,
     doctor_handle: Option<&DoctorHandle>,
 ) -> Result<PlanCreationResult, String> {
-    info!(
-        "Creating replan for task: {} (reason: {})",
-        task_run_id, replan_reason
-    );
-
-    // Get the previous plan
-    let previous_stored = db
-        .get_latest_verification_plan(task_run_id)?
-        .ok_or_else(|| "Cannot replan: no existing plan found".to_string())?;
-
-    let previous_plan = previous_stored.parse_plan()?;
-    let goal = previous_plan.goal_summary.clone(); // Clone before moving
-
-    // Create context with replan info
-    let context = create_planning_context(
-        &goal, // Use original goal
-        workspace_root,
-        None, // No new execution steps
-        Some(previous_plan),
-        Some(replan_reason.to_string()),
-    );
-
-    create_verification_plan(db, task_run_id, &context, doctor_handle)
+    Err("SQLite removed".to_string())
 }
 
 /// Quick plan creation for simple tasks without full context.
@@ -721,8 +617,7 @@ pub fn create_simple_plan(
     workspace_root: &str,
     doctor_handle: Option<&DoctorHandle>,
 ) -> Result<PlanCreationResult, String> {
-    let context = create_planning_context(goal, workspace_root, None, None, None);
-    create_verification_plan(db, task_run_id, &context, doctor_handle)
+    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -825,24 +720,13 @@ pub fn ensure_verification_plan(
     workspace_root: &str,
     doctor_handle: Option<&DoctorHandle>,
 ) -> Result<VerificationPlan, String> {
-    // Check if a plan already exists
-    if let Some(stored_plan) = db.get_latest_verification_plan(task_run_id)? {
-        info!(
-            "Using existing verification plan {} (version {}) for task {}",
-            stored_plan.id, stored_plan.version, task_run_id
-        );
-        return stored_plan.parse_plan();
-    }
-
-    // Create a new plan
-    info!("Creating new verification plan for task {}", task_run_id);
-    let result = create_simple_plan(db, task_run_id, goal, workspace_root, doctor_handle)?;
-    Ok(result.plan)
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_parse_planning_response() {

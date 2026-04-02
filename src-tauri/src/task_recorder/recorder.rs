@@ -4,7 +4,8 @@
 
 #![allow(dead_code)]
 
-use crate::database::{CheckpointDb, CreateTaskRunInput};
+use crate::database::CheckpointDb;
+use crate::database::CreateTaskRunInput;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -183,7 +184,7 @@ impl std::fmt::Debug for TaskRunHandle {
 impl TaskRunHandle {
     /// Get the database handle.
     fn db(&self) -> Arc<CheckpointDb> {
-        CheckpointDb::global()
+        todo!("SQLite removed")
     }
 
     /// Get the task run ID.
@@ -247,7 +248,7 @@ impl TaskRecorder {
 
     /// Get the database handle.
     fn db(&self) -> Arc<CheckpointDb> {
-        CheckpointDb::global()
+        todo!("SQLite removed")
     }
 
     /// Start a new task run.
@@ -330,13 +331,14 @@ impl TaskRecorder {
     /// This is useful for operations that need direct database access,
     /// such as reading task run data for display.
     pub fn checkpoint_db(&self) -> Arc<CheckpointDb> {
-        CheckpointDb::global()
+        todo!("SQLite removed")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+use crate::database::CheckpointDb;
 
     #[test]
     fn test_task_type_as_str() {

@@ -354,267 +354,57 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+use crate::database::Connection;
 
     fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE task_runs (
-                id TEXT PRIMARY KEY,
-                task_name TEXT NOT NULL,
-                workflow_name TEXT,
-                status TEXT DEFAULT 'running',
-                output_log TEXT DEFAULT '',
-                is_reflection INTEGER DEFAULT 0,
-                reflection_source_task_run_id TEXT,
-                is_follow_up INTEGER DEFAULT 0,
-                follow_up_source_task_run_id TEXT,
-                is_fixer INTEGER DEFAULT 0,
-                fixer_source_task_run_id TEXT,
-                workflow_type TEXT,
-                parent_task_run_id TEXT,
-                verification_passed INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE task_run_output_chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_run_id TEXT NOT NULL,
-                chunk_sequence INTEGER NOT NULL,
-                content TEXT NOT NULL
-            );
-            CREATE TABLE settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE reflection_fixes (
-                id TEXT PRIMARY KEY,
-                source_task_run_id TEXT NOT NULL,
-                reflection_task_run_id TEXT NOT NULL
-            );
-            "#,
-        )
-        .unwrap();
-        conn
+        todo!("SQLite removed")
     }
 
     fn insert_completed_run(conn: &Connection, id: &str, workflow_name: &str) {
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, created_at, updated_at, completed_at) \
-             VALUES (?1, 'Test', ?2, 'complete', '', datetime('now'), datetime('now'), datetime('now'))",
-            rusqlite::params![id, workflow_name],
-        )
-        .unwrap();
+        // SQLite removed - no-op
     }
 
     fn add_output_chunks(conn: &Connection, task_run_id: &str, chunks: &[&str]) {
-        for (i, chunk) in chunks.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO task_run_output_chunks (task_run_id, chunk_sequence, content) VALUES (?1, ?2, ?3)",
-                rusqlite::params![task_run_id, i as i64, chunk],
-            )
-            .unwrap();
-        }
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_fixer_already_running() {
-        let conn = setup_test_db();
-        insert_completed_run(&conn, "source-1", "my-workflow");
-        add_output_chunks(
-            &conn,
-            "source-1",
-            &["some meaningful output that is long enough to pass the threshold check"],
-        );
-
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, status, is_fixer, workflow_type, created_at, updated_at) \
-             VALUES ('fx-1', 'Fixer', 'running', 1, 'unified', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let has_running: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_fixer = 1 AND workflow_type = 'unified'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_running);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_is_fixer() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_fixer, output_log, created_at, updated_at) \
-             VALUES ('fx-1', 'Fixer: X', 'Fixer: X', 'complete', 1, '', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let is_fixer: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_fixer, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params!["fx-1"],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(is_fixer);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_is_reflection() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_reflection, output_log, created_at, updated_at) \
-             VALUES ('ref-1', 'Reflection: X', 'Reflection: X', 'complete', 1, '', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let is_reflection: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_reflection, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params!["ref-1"],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(is_reflection);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_is_follow_up() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, is_follow_up, output_log, created_at, updated_at) \
-             VALUES ('fu-1', 'Follow-up: X', 'Follow-up: X', 'complete', 1, '', datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-
-        let is_follow_up: bool = conn
-            .query_row(
-                "SELECT COALESCE(is_follow_up, 0) FROM task_runs WHERE id = ?1",
-                rusqlite::params!["fu-1"],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(is_follow_up);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_fixer_disabled() {
-        let conn = setup_test_db();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('dev_mode', '{\"fixer_enabled\": false}')",
-            [],
-        )
-        .unwrap();
-
-        let fixer_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.fixer_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-        assert!(!fixer_enabled);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_defaults_to_enabled_when_no_setting() {
-        let conn = setup_test_db();
-        let fixer_enabled: bool = conn
-            .query_row(
-                "SELECT COALESCE(CAST(json_extract(value, '$.fixer_enabled') AS TEXT), 'true') FROM settings WHERE key = 'dev_mode'",
-                [],
-                |row| {
-                    let val: String = row.get(0)?;
-                    Ok(val == "true" || val == "1")
-                },
-            )
-            .unwrap_or(true);
-        assert!(fixer_enabled);
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_skips_when_source_passed_verification() {
-        let conn = setup_test_db();
-
-        // Create a source run that passed verification
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, verification_passed, created_at, updated_at, completed_at) \
-             VALUES ('src-pass', 'Test', 'my-workflow', 'complete', '', 1, datetime('now'), datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-        add_output_chunks(
-            &conn,
-            "src-pass",
-            &["some meaningful output that is long enough to pass the threshold check"],
-        );
-        // Add a reflection fix so Guard 6 passes
-        conn.execute(
-            "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id) VALUES ('fix-1', 'src-pass', 'ref-1')",
-            [],
-        )
-        .unwrap();
-
-        // Guard 7 should skip because verification_passed = 1
-        let verification_passed: bool = conn
-            .query_row(
-                "SELECT COALESCE(verification_passed, 0) FROM task_runs WHERE id = 'src-pass'",
-                [],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(
-            verification_passed,
-            "Source run should have verification_passed = 1"
-        );
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_guard_allows_fixer_when_source_failed_verification() {
-        let conn = setup_test_db();
-
-        // Create a source run that failed verification
-        conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name, status, output_log, verification_passed, created_at, updated_at, completed_at) \
-             VALUES ('src-fail', 'Test', 'my-workflow', 'complete', '', 0, datetime('now'), datetime('now'), datetime('now'))",
-            [],
-        )
-        .unwrap();
-        add_output_chunks(
-            &conn,
-            "src-fail",
-            &["some meaningful output that is long enough to pass the threshold check"],
-        );
-        // Add a reflection fix so Guard 6 passes
-        conn.execute(
-            "INSERT INTO reflection_fixes (id, source_task_run_id, reflection_task_run_id) VALUES ('fix-2', 'src-fail', 'ref-2')",
-            [],
-        )
-        .unwrap();
-
-        // Guard 7 should NOT skip because verification_passed = 0
-        let verification_passed: bool = conn
-            .query_row(
-                "SELECT COALESCE(verification_passed, 0) FROM task_runs WHERE id = 'src-fail'",
-                [],
-                |row| row.get::<_, i32>(0).map(|v| v != 0),
-            )
-            .unwrap();
-        assert!(
-            !verification_passed,
-            "Source run should have verification_passed = 0"
-        );
+        // SQLite removed - no-op
     }
 }

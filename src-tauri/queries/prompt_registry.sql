@@ -2,14 +2,16 @@
 
 --! get_active_prompt
 SELECT id, agent_type, variant_name, prompt_content, version, is_active,
-       source_recommendation_id, performance_metrics, created_at, updated_at
+       COALESCE(source_recommendation_id, '') as source_recommendation_id,
+       COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at
 FROM prompt_registry
 WHERE agent_type = :agent_type AND is_active = true
 LIMIT 1;
 
 --! get_prompt_by_version
 SELECT id, agent_type, variant_name, prompt_content, version, is_active,
-       source_recommendation_id, performance_metrics, created_at, updated_at
+       COALESCE(source_recommendation_id, '') as source_recommendation_id,
+       COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at
 FROM prompt_registry
 WHERE agent_type = :agent_type AND version = :version
 LIMIT 1;
@@ -38,13 +40,15 @@ RETURNING id;
 
 --! list_variants
 SELECT id, agent_type, variant_name, prompt_content, version, is_active,
-       source_recommendation_id, performance_metrics, created_at, updated_at
+       COALESCE(source_recommendation_id, '') as source_recommendation_id,
+       COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at
 FROM prompt_registry
 ORDER BY agent_type, version DESC;
 
 --! list_variants_by_agent
 SELECT id, agent_type, variant_name, prompt_content, version, is_active,
-       source_recommendation_id, performance_metrics, created_at, updated_at
+       COALESCE(source_recommendation_id, '') as source_recommendation_id,
+       COALESCE(performance_metrics, '{}') as performance_metrics, created_at, updated_at
 FROM prompt_registry
 WHERE agent_type = :agent_type
 ORDER BY version DESC;

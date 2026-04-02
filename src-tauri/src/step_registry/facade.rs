@@ -295,6 +295,7 @@ mod tests {
     use super::*;
     use crate::step_types::StepType;
     use crate::unified_workflow_executor::WorkflowPhase;
+use crate::database::CheckpointDb;
 
     // Note: These tests would require mocking the CheckpointDb.
     // For now, we test the policy enforcement logic.

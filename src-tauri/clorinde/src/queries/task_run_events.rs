@@ -1744,7 +1744,7 @@ impl<
 pub struct GetTaskRunScreenshotsAllStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_screenshots_all() -> GetTaskRunScreenshotsAllStmt {
     GetTaskRunScreenshotsAllStmt(
-        "SELECT id, task_run_id, event_id, file_path, screenshot_type, template_name, confidence, match_location, width, height, file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type, COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence, COALESCE(match_location, '') as match_location, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(file_size_bytes, 0) as file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }
@@ -1791,7 +1791,7 @@ impl GetTaskRunScreenshotsAllStmt {
 pub struct GetTaskRunScreenshotsByTypeStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_screenshots_by_type() -> GetTaskRunScreenshotsByTypeStmt {
     GetTaskRunScreenshotsByTypeStmt(
-        "SELECT id, task_run_id, event_id, file_path, screenshot_type, template_name, confidence, match_location, width, height, file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 AND screenshot_type = $2 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type, COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence, COALESCE(match_location, '') as match_location, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(file_size_bytes, 0) as file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 AND screenshot_type = $2 ORDER BY created_at ASC",
         None,
     )
 }
@@ -1993,7 +1993,7 @@ impl<
 pub struct GetTaskRunPlaywrightResultsAllStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_playwright_results_all() -> GetTaskRunPlaywrightResultsAllStmt {
     GetTaskRunPlaywrightResultsAllStmt(
-        "SELECT id, task_run_id, test_name, spec_file, status, duration_ms, stdout, stderr, console_output, page_snapshot, error_message, failure_screenshot_path, assertions_passed, assertions_failed, created_at FROM task_run_playwright_results WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status, COALESCE(duration_ms, 0) as duration_ms, COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr, COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot, COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path, assertions_passed, assertions_failed, created_at FROM task_run_playwright_results WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }
@@ -2230,7 +2230,7 @@ impl<
 pub struct GetTaskRunApiRequestsAllStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_api_requests_all() -> GetTaskRunApiRequestsAllStmt {
     GetTaskRunApiRequestsAllStmt(
-        "SELECT id, task_run_id, step_id, step_name, method, url, resolved_url, request_headers, request_body, status_code, status_text, response_headers, response_time_ms, response_body_type, response_body, response_size_bytes, extractions, assertions, success, error_message, created_at FROM task_run_api_requests WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name, method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers, COALESCE(request_body, '') as request_body, status_code, COALESCE(status_text, '') as status_text, COALESCE(response_headers, '{}') as response_headers, response_time_ms, response_body_type, COALESCE(response_body, '') as response_body, COALESCE(response_size_bytes, 0) as response_size_bytes, COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions, success, COALESCE(error_message, '') as error_message, created_at FROM task_run_api_requests WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }
@@ -2402,7 +2402,7 @@ impl<
 pub struct GetTaskRunAwasStepsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_awas_steps() -> GetTaskRunAwasStepsStmt {
     GetTaskRunAwasStepsStmt(
-        "SELECT id, task_run_id, step_id, step_name, step_type, url, action_id, parameters, response_data, success, error_message, duration_ms, created_at FROM task_run_awas_steps WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at FROM task_run_awas_steps WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }

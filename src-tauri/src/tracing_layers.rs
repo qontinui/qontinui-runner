@@ -328,283 +328,34 @@ where
 }
 
 // ============================================================================
-// SQLite Span Layer
+// SQLite Span Layer (stub -- SQLite removed, PG span persistence TBD)
 // ============================================================================
 
-/// Layer that persists summary spans to the SQLite database for AI analysis.
-///
-/// Only spans whose names are in the `summary_span_names` list are persisted.
-/// This keeps the database lean while capturing key performance data.
+/// No-op span layer stub. Previously persisted spans to SQLite; the SQLite
+/// backend has been removed. Retains the public API so callers compile.
 pub struct SqliteSpanLayer {
     config: SpanLayerConfig,
-    /// Track active spans by their ID
+    /// Track active spans by their ID (unused, kept for API compat)
     active_spans: Arc<RwLock<HashMap<u64, ActiveSpanData>>>,
-    /// Database connection pool (set after initialization)
-    db_pool: Arc<RwLock<Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>>>,
 }
 
 impl SqliteSpanLayer {
-    /// Create a new SQLite span layer
+    /// Create a new (no-op) span layer
     pub fn new(config: SpanLayerConfig) -> Self {
         Self {
             config,
             active_spans: Arc::new(RwLock::new(HashMap::new())),
-            db_pool: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Set the database connection pool (called after DB is initialized)
-    pub fn set_db_pool(&self, pool: r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>) {
-        if let Ok(mut guard) = self.db_pool.write() {
-            *guard = Some(pool);
-        }
-    }
-
-    /// Check if a span name should be persisted.
-    fn should_persist(&self, name: &str) -> bool {
-        self.config.summary_span_names.iter().any(|n| n == name)
-    }
-
-    /// Write a span to the database
-    fn write_to_db(&self, entry: &SpanEntry, execution_id: Option<&str>) {
-        let pool = {
-            if let Ok(guard) = self.db_pool.read() {
-                guard.clone()
-            } else {
-                return;
-            }
-        };
-
-        let Some(pool) = pool else { return };
-
-        let conn = match pool.get() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to get DB connection for span: {}", e);
-                return;
-            }
-        };
-
-        let attributes_json = serde_json::to_string(&entry.attributes).unwrap_or_default();
-        // Use None (NULL in SQL) when no execution_id, not empty string
-        // Empty string violates FK constraint, NULL is allowed
-        let exec_id: Option<&str> = execution_id.filter(|s| !s.is_empty());
-
-        // Extract denormalized columns from attributes for efficient querying
-        let queue_wait_ms: Option<i64> = entry
-            .attributes
-            .get("queue_wait_ms")
-            .and_then(|v| v.as_i64());
-        let retry_attempt: Option<i64> = entry
-            .attributes
-            .get("retry_attempt")
-            .and_then(|v| v.as_i64());
-        let phase: Option<String> = entry
-            .attributes
-            .get("phase")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let iteration: Option<i64> = entry
-            .attributes
-            .get("iteration")
-            .and_then(|v| v.as_i64());
-        let workflow_id: Option<String> = entry
-            .attributes
-            .get("workflow_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let input_tokens: Option<i64> = entry.attributes.get("ai.input_tokens").and_then(|v| v.as_i64());
-        let output_tokens: Option<i64> = entry.attributes.get("ai.output_tokens").and_then(|v| v.as_i64());
-        let cost_cents: Option<i64> = entry.attributes.get("ai.cost_cents").and_then(|v| v.as_i64());
-
-        let result = conn.execute(
-            "INSERT INTO execution_spans (
-                execution_id, trace_id, span_id, parent_span_id, name,
-                start_ts, end_ts, duration_ms, attributes, success, error,
-                queue_wait_ms, retry_attempt, phase, iteration, workflow_id,
-                input_tokens, output_tokens, cost_cents,
-                created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, datetime('now'))",
-            rusqlite::params![
-                exec_id,
-                entry.trace_id,
-                entry.span_id,
-                entry.parent_span_id,
-                entry.name,
-                entry.start_ts,
-                entry.end_ts,
-                entry.duration_ms.map(|v| v as i64),
-                attributes_json,
-                entry.success,
-                entry.error,
-                queue_wait_ms,
-                retry_attempt,
-                phase,
-                iteration,
-                workflow_id,
-                input_tokens,
-                output_tokens,
-                cost_cents,
-            ],
-        );
-
-        if let Err(e) = result {
-            eprintln!("Failed to insert span to database: {}", e);
-        }
-    }
-
-    /// Generate IDs (same as JSONL layer)
-    fn generate_trace_id() -> String {
-        uuid::Uuid::new_v4().to_string()[..8].to_string()
-    }
-
-    fn generate_span_id() -> String {
-        uuid::Uuid::new_v4().to_string()[..12].to_string()
-    }
 }
 
+// No-op Layer implementation for SqliteSpanLayer (SQLite removed)
 impl<S> Layer<S> for SqliteSpanLayer
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        if !self.config.enable_sqlite {
-            return;
-        }
-
-        let span = ctx.span(id).expect("span should exist");
-        let metadata = span.metadata();
-        let name = metadata.name();
-
-        // Only track spans we'll persist
-        if !self.should_persist(name) {
-            return;
-        }
-
-        // Determine parent span ID and trace ID
-        let (parent_span_id, trace_id) = if let Some(parent) = span.parent() {
-            let parent_id = parent.id();
-            if let Ok(spans) = self.active_spans.read() {
-                if let Some(parent_data) = spans.get(&parent_id.into_u64()) {
-                    (
-                        Some(parent_data.span_id.clone()),
-                        parent_data.trace_id.clone(),
-                    )
-                } else {
-                    (None, Self::generate_trace_id())
-                }
-            } else {
-                (None, Self::generate_trace_id())
-            }
-        } else {
-            (None, Self::generate_trace_id())
-        };
-
-        // Collect attributes
-        let mut attributes = HashMap::new();
-        let mut visitor = AttributeVisitor(&mut attributes);
-        attrs.record(&mut visitor);
-
-        let span_data = ActiveSpanData {
-            trace_id,
-            span_id: Self::generate_span_id(),
-            parent_span_id,
-            name: name.to_string(),
-            target: metadata.target().to_string(),
-            level: format!("{:?}", metadata.level()),
-            start_time: Utc::now(),
-            attributes,
-            had_error: false,
-            error_message: None,
-        };
-
-        if let Ok(mut spans) = self.active_spans.write() {
-            spans.insert(id.into_u64(), span_data);
-        }
-    }
-
-    fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
-        if !self.config.enable_sqlite {
-            return;
-        }
-
-        if let Ok(mut spans) = self.active_spans.write() {
-            if let Some(span_data) = spans.get_mut(&id.into_u64()) {
-                let mut visitor = AttributeVisitor(&mut span_data.attributes);
-                values.record(&mut visitor);
-            }
-        }
-    }
-
-    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        if !self.config.enable_sqlite {
-            return;
-        }
-
-        // Check if this is an error event
-        let level = event.metadata().level();
-        if *level == tracing::Level::ERROR {
-            if let Some(span) = ctx.lookup_current() {
-                if let Ok(mut spans) = self.active_spans.write() {
-                    if let Some(span_data) = spans.get_mut(&span.id().into_u64()) {
-                        span_data.had_error = true;
-                        let mut message = String::new();
-                        let mut visitor = MessageVisitor(&mut message);
-                        event.record(&mut visitor);
-                        if !message.is_empty() {
-                            span_data.error_message = Some(message);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
-        if !self.config.enable_sqlite {
-            return;
-        }
-
-        let span_data = {
-            if let Ok(mut spans) = self.active_spans.write() {
-                spans.remove(&id.into_u64())
-            } else {
-                None
-            }
-        };
-
-        if let Some(data) = span_data {
-            let end_time = Utc::now();
-            let duration = end_time
-                .signed_duration_since(data.start_time)
-                .num_milliseconds().max(0) as u64;
-
-            // Try to get execution_id from attributes
-            let execution_id = data
-                .attributes
-                .get("execution_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let entry = SpanEntry {
-                trace_id: data.trace_id,
-                span_id: data.span_id,
-                parent_span_id: data.parent_span_id,
-                name: data.name,
-                target: data.target,
-                level: data.level,
-                start_ts: data.start_time.to_rfc3339(),
-                end_ts: Some(end_time.to_rfc3339()),
-                duration_ms: Some(duration),
-                attributes: data.attributes,
-                success: !data.had_error,
-                error: data.error_message,
-            };
-
-            self.write_to_db(&entry, execution_id.as_deref());
-        }
-    }
+    // All methods use default no-op implementations
 }
 
 // ============================================================================

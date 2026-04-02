@@ -396,12 +396,12 @@ export function useContexts() {
  * @param taskRunId - Task run ID to get events for
  * @param eventType - Optional event type filter ('general', 'action', 'image_recognition', etc.)
  */
-export function useTaskRunEvents(taskRunId: string | null, eventType?: string) {
+export function useTaskRunEvents(taskRunId: string | null, eventType?: string, limit?: number) {
   return useQuery({
-    queryKey: aiDataKeys.taskRunEvents(taskRunId ?? "", eventType),
+    queryKey: [...aiDataKeys.taskRunEvents(taskRunId ?? "", eventType), limit],
     queryFn: async (): Promise<TaskRunEventsResult | null> => {
       if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunEvents(taskRunId, eventType);
+      const response = await aiDataService.getTaskRunEvents(taskRunId, eventType, limit);
       if (!response.success || !response.data) {
         throw new Error(response.error || "Failed to load task run events");
       }

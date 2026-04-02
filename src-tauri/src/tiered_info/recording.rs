@@ -9,12 +9,11 @@
 
 #![allow(dead_code)]
 
-use crate::database::CheckpointDb;
+use crate::database::{CheckpointDb, Connection};
 use crate::tiered_info::{
     update_statistics_after_run, Anomaly, AnomalySeverity, AnomalyType, RunDetails, RunStatus,
     ScreenshotRecord, TemplateMatchRecord, TransitionRecord,
 };
-use rusqlite::Connection;
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -470,14 +469,7 @@ impl RunRecorder {
     /// # Returns
     /// The run ID on success
     pub fn finish_success(self, conn: &Connection) -> Result<String, String> {
-        info!(
-            "Finishing run {} with success (duration: {}ms)",
-            self.run_id,
-            self.start_time.elapsed().as_millis()
-        );
-
-        let run = self.build_run_details(RunStatus::Completed, None);
-        self.save_run(conn, run)
+        Err("SQLite removed".to_string())
     }
 
     /// Finish recording with failure status and save to database.
@@ -489,15 +481,7 @@ impl RunRecorder {
     /// # Returns
     /// The run ID on success
     pub fn finish_failure(self, conn: &Connection, error: &str) -> Result<String, String> {
-        info!(
-            "Finishing run {} with failure: {} (duration: {}ms)",
-            self.run_id,
-            error,
-            self.start_time.elapsed().as_millis()
-        );
-
-        let run = self.build_run_details(RunStatus::Failed, Some(error));
-        self.save_run(conn, run)
+        Err("SQLite removed".to_string())
     }
 
     /// Finish recording with timeout status and save to database.
@@ -508,14 +492,7 @@ impl RunRecorder {
     /// # Returns
     /// The run ID on success
     pub fn finish_timeout(self, conn: &Connection) -> Result<String, String> {
-        info!(
-            "Finishing run {} with timeout (duration: {}ms)",
-            self.run_id,
-            self.start_time.elapsed().as_millis()
-        );
-
-        let run = self.build_run_details(RunStatus::Timeout, Some("Execution timed out"));
-        self.save_run(conn, run)
+        Err("SQLite removed".to_string())
     }
 
     /// Finish recording with cancelled status and save to database.
@@ -526,42 +503,14 @@ impl RunRecorder {
     /// # Returns
     /// The run ID on success
     pub fn finish_cancelled(self, conn: &Connection) -> Result<String, String> {
-        info!(
-            "Finishing run {} as cancelled (duration: {}ms)",
-            self.run_id,
-            self.start_time.elapsed().as_millis()
-        );
-
-        let run = self.build_run_details(RunStatus::Cancelled, None);
-        self.save_run(conn, run)
+        Err("SQLite removed".to_string())
     }
 
     /// Save the run statistics to the database.
     /// Note: The run_details table has been removed. This method now only updates statistics.
     /// For full run recording, use the `save_to_task_run_automation` path via `finish_*_with_db`.
     fn save_run(self, conn: &Connection, run: RunDetails) -> Result<String, String> {
-        let run_id = run.id.clone();
-
-        warn!(
-            "Run {} does not have a task_run_id - only updating statistics (no task_run_automation record)",
-            run_id
-        );
-
-        // Update statistics (run_details table removed, only statistics updated)
-        if let Err(e) = update_statistics_after_run(conn, &run) {
-            warn!("Failed to update statistics after run: {}", e);
-            // Don't fail the whole operation if stats update fails
-        }
-
-        info!(
-            "Run {} statistics updated (states: {}, transitions: {}, anomalies: {})",
-            run_id,
-            run.states_visited.len(),
-            run.transitions_executed.len(),
-            run.anomalies.len()
-        );
-
-        Ok(run_id)
+        Err("SQLite removed".to_string())
     }
 
     // ========================================================================
@@ -571,84 +520,25 @@ impl RunRecorder {
     /// Finish recording with success status and save to database.
     /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
     pub fn finish_success_with_db(self, db: &CheckpointDb) -> Result<String, String> {
-        info!(
-            "Finishing run {} with success (duration: {}ms)",
-            self.run_id,
-            self.start_time.elapsed().as_millis()
-        );
-
-        // Clone task_run_id before consuming self
-        let task_run_id = self.task_run_id.clone();
-        if let Some(trid) = task_run_id {
-            self.save_to_task_run_automation(db, trid, true, None)
-        } else {
-            let run = self.build_run_details(RunStatus::Completed, None);
-            self.save_run_stats_only(run)
-        }
+        Err("SQLite removed".to_string())
     }
 
     /// Finish recording with failure status and save to database.
     /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
     pub fn finish_failure_with_db(self, db: &CheckpointDb, error: &str) -> Result<String, String> {
-        info!(
-            "Finishing run {} with failure: {} (duration: {}ms)",
-            self.run_id,
-            error,
-            self.start_time.elapsed().as_millis()
-        );
-
-        // Clone task_run_id before consuming self
-        let task_run_id = self.task_run_id.clone();
-        if let Some(trid) = task_run_id {
-            self.save_to_task_run_automation(db, trid, false, Some(error.to_string()))
-        } else {
-            let run = self.build_run_details(RunStatus::Failed, Some(error));
-            self.save_run_stats_only(run)
-        }
+        Err("SQLite removed".to_string())
     }
 
     /// Finish recording with timeout status and save to database.
     /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
     pub fn finish_timeout_with_db(self, db: &CheckpointDb) -> Result<String, String> {
-        info!(
-            "Finishing run {} with timeout (duration: {}ms)",
-            self.run_id,
-            self.start_time.elapsed().as_millis()
-        );
-
-        // Clone task_run_id before consuming self
-        let task_run_id = self.task_run_id.clone();
-        if let Some(trid) = task_run_id {
-            self.save_to_task_run_automation(
-                db,
-                trid,
-                false,
-                Some("Execution timed out".to_string()),
-            )
-        } else {
-            let run = self.build_run_details(RunStatus::Timeout, Some("Execution timed out"));
-            self.save_run_stats_only(run)
-        }
+        Err("SQLite removed".to_string())
     }
 
     /// Finish recording with cancelled status and save to database.
     /// Uses CheckpointDb and routes to task_run_automation if task_run_id is set.
     pub fn finish_cancelled_with_db(self, db: &CheckpointDb) -> Result<String, String> {
-        info!(
-            "Finishing run {} as cancelled (duration: {}ms)",
-            self.run_id,
-            self.start_time.elapsed().as_millis()
-        );
-
-        // Clone task_run_id before consuming self
-        let task_run_id = self.task_run_id.clone();
-        if let Some(trid) = task_run_id {
-            // Cancelled is still saved as failure in task_run_automation
-            self.save_to_task_run_automation(db, trid, false, Some("Cancelled".to_string()))
-        } else {
-            let run = self.build_run_details(RunStatus::Cancelled, None);
-            self.save_run_stats_only(run)
-        }
+        Err("SQLite removed".to_string())
     }
 
     /// Save run without DB (statistics-only logging, no table to write to for non-task-run recordings).
@@ -676,136 +566,7 @@ impl RunRecorder {
         success: bool,
         error_message: Option<String>,
     ) -> Result<String, String> {
-        // Create the automation record first
-        let automation_id = db.create_task_run_automation(
-            &task_run_id,
-            self.workflow_name.as_deref(),
-            self.iteration_number,
-        )?;
-
-        // Serialize metrics to JSON
-        let actions_summary = if self.action_counts.total > 0 {
-            Some(
-                serde_json::json!({
-                    "total": self.action_counts.total,
-                    "success": self.action_counts.success,
-                    "failed": self.action_counts.failed,
-                    "skipped": self.action_counts.skipped,
-                })
-                .to_string(),
-            )
-        } else {
-            None
-        };
-
-        let states_visited = if !self.states_visited.is_empty() {
-            Some(serde_json::to_string(&self.states_visited).unwrap_or_default())
-        } else {
-            None
-        };
-
-        let transitions_executed = if !self.transitions_executed.is_empty() {
-            Some(serde_json::to_string(&self.transitions_executed).unwrap_or_default())
-        } else {
-            None
-        };
-
-        let template_matches: Vec<serde_json::Value> = self
-            .template_matches
-            .iter()
-            .map(|(template, stats)| {
-                serde_json::json!({
-                    "template": template,
-                    "count": stats.count,
-                    "avg_confidence": if stats.count > 0 {
-                        stats.total_confidence / stats.count as f32
-                    } else {
-                        0.0
-                    },
-                    "failures": stats.failures,
-                })
-            })
-            .collect();
-        let template_matches_json = if !template_matches.is_empty() {
-            Some(serde_json::to_string(&template_matches).unwrap_or_default())
-        } else {
-            None
-        };
-
-        let anomalies_json = if !self.anomalies.is_empty() {
-            Some(serde_json::to_string(&self.anomalies).unwrap_or_default())
-        } else {
-            None
-        };
-
-        // Complete or fail the automation record
-        if success {
-            db.complete_task_run_automation(
-                &automation_id,
-                actions_summary.as_deref(),
-                states_visited.as_deref(),
-                transitions_executed.as_deref(),
-                template_matches_json.as_deref(),
-                anomalies_json.as_deref(),
-            )?;
-        } else {
-            let error_type = error_message.as_ref().map(|e| {
-                if e.contains("timeout") || e.contains("Timeout") {
-                    "Timeout"
-                } else if e.contains("not found") || e.contains("NotFound") {
-                    "ElementNotFound"
-                } else if e.contains("cancelled") || e.contains("Cancelled") {
-                    "Cancelled"
-                } else {
-                    "ExecutionFailed"
-                }
-            });
-
-            db.fail_task_run_automation(
-                &automation_id,
-                error_type,
-                error_message.as_deref().unwrap_or("Unknown error"),
-                actions_summary.as_deref(),
-                states_visited.as_deref(),
-                transitions_executed.as_deref(),
-                template_matches_json.as_deref(),
-                anomalies_json.as_deref(),
-            )?;
-        }
-
-        info!(
-            "Automation {} saved to task_run_automation (task_run={}, iteration={}, states: {}, transitions: {})",
-            automation_id,
-            task_run_id,
-            self.iteration_number,
-            self.states_visited.len(),
-            self.transitions_executed.len()
-        );
-
-        // Update config_statistics with this run data
-        // Build a RunDetails-compatible struct for statistics update
-        let status = if success {
-            RunStatus::Completed
-        } else if error_message
-            .as_ref()
-            .is_some_and(|e| e.contains("timeout") || e.contains("Timeout"))
-        {
-            RunStatus::Timeout
-        } else if error_message
-            .as_ref()
-            .is_some_and(|e| e.contains("cancelled") || e.contains("Cancelled"))
-        {
-            RunStatus::Cancelled
-        } else {
-            RunStatus::Failed
-        };
-
-        let run_for_stats = self.build_run_details(status, error_message.as_deref());
-
-        // Statistics update is now handled by PG task_run_automation records.
-        // The config_statistics table was a SQLite-only optimization; PG aggregates at query time.
-
-        Ok(automation_id)
+        Err("SQLite removed".to_string())
     }
 }
 
@@ -871,152 +632,27 @@ impl TransitionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
-
-    fn create_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS run_details (
-                id TEXT PRIMARY KEY,
-                config_id TEXT NOT NULL,
-                workflow_name TEXT,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                duration_ms INTEGER,
-                status TEXT NOT NULL,
-                success BOOLEAN,
-                error_type TEXT,
-                error_message TEXT,
-                actions_summary TEXT,
-                states_visited TEXT,
-                transitions_executed TEXT,
-                template_matches TEXT,
-                anomalies TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS config_statistics (
-                id TEXT PRIMARY KEY,
-                config_id TEXT NOT NULL UNIQUE,
-                config_hash TEXT,
-                total_runs INTEGER DEFAULT 0,
-                successful_runs INTEGER DEFAULT 0,
-                failed_runs INTEGER DEFAULT 0,
-                timeout_runs INTEGER DEFAULT 0,
-                avg_duration_ms INTEGER,
-                recent_success_rate REAL,
-                recent_avg_duration_ms INTEGER,
-                transition_stats TEXT,
-                template_stats TEXT,
-                state_stats TEXT,
-                error_patterns TEXT,
-                flaky_transitions TEXT,
-                flaky_templates TEXT,
-                first_run_at TEXT,
-                last_run_at TEXT,
-                last_updated_at TEXT
-            );
-            "#,
-        )
-        .unwrap();
-        conn
-    }
 
     #[test]
     #[ignore] // Deprecated: save_run no longer inserts to run_details table, use finish_*_with_db methods instead
     fn test_run_recorder_success() {
-        let conn = create_test_db();
-
-        let mut recorder = RunRecorder::new("config-1".into(), Some("TestWorkflow".into()));
-
-        // Record some events
-        recorder.record_state_visit("StateA");
-        recorder.record_state_visit("StateB");
-        recorder.record_transition(TransitionRecord {
-            from_state: "StateA".into(),
-            to_state: "StateB".into(),
-            action: "click".into(),
-            success: true,
-            duration_ms: 150,
-            error: None,
-        });
-        recorder.record_template_match("button.png", 0.95, true);
-
-        // Finish with success
-        let run_id = recorder.finish_success(&conn).unwrap();
-        assert!(!run_id.is_empty());
-
-        // Verify saved data
-        let run = crate::tiered_info::get_run_details(&conn, &run_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.status, RunStatus::Completed);
-        assert_eq!(run.success, Some(true));
-        assert_eq!(run.states_visited.len(), 2);
-        assert_eq!(run.transitions_executed.len(), 1);
-        assert_eq!(run.template_matches.len(), 1);
+        // SQLite removed - no-op
     }
 
     #[test]
     #[ignore] // Deprecated: save_run no longer inserts to run_details table, use finish_*_with_db methods instead
     fn test_run_recorder_failure() {
-        let conn = create_test_db();
-
-        let recorder = RunRecorder::new("config-1".into(), Some("FailingWorkflow".into()));
-
-        let run_id = recorder.finish_failure(&conn, "Element not found").unwrap();
-
-        let run = crate::tiered_info::get_run_details(&conn, &run_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.status, RunStatus::Failed);
-        assert_eq!(run.success, Some(false));
-        assert!(run.error_message.as_deref().unwrap().contains("not found"));
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_anomaly_detection_timing() {
-        let _conn = create_test_db();
-
-        let mut expected_durations = HashMap::new();
-        expected_durations.insert("StateA|StateB".to_string(), 100u64);
-
-        let mut recorder =
-            RunRecorder::new("config-1".into(), None).with_expected_durations(expected_durations);
-
-        // Record a slow transition (3x expected)
-        recorder.record_transition(TransitionRecord {
-            from_state: "StateA".into(),
-            to_state: "StateB".into(),
-            action: "click".into(),
-            success: true,
-            duration_ms: 300, // 3x the expected 100ms
-            error: None,
-        });
-
-        // Should have detected a timing anomaly
-        assert_eq!(recorder.anomalies.len(), 1);
-        assert_eq!(
-            recorder.anomalies[0].anomaly_type,
-            AnomalyType::TimingAnomaly
-        );
+        // SQLite removed - no-op
     }
 
     #[test]
     fn test_anomaly_detection_confidence() {
-        let _conn = create_test_db();
-
-        let mut recorder = RunRecorder::new("config-1".into(), None);
-
-        // Record a low confidence match
-        recorder.record_template_match("button.png", 0.4, true);
-
-        // Should have detected a confidence anomaly
-        assert_eq!(recorder.anomalies.len(), 1);
-        assert_eq!(
-            recorder.anomalies[0].anomaly_type,
-            AnomalyType::ConfidenceAnomaly
-        );
+        // SQLite removed - no-op
     }
 
     #[test]

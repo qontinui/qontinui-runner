@@ -523,7 +523,7 @@ impl<
 pub struct QueueGetStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn queue_get() -> QueueGetStmt {
     QueueGetStmt(
-        "SELECT id, workflow_id, workflow_name, queued_at, priority, status, started_at, completed_at, updated_at, error_message, task_run_id, retry_count, max_retries FROM queued_workflows WHERE id = $1",
+        "SELECT id, workflow_id, workflow_name, queued_at, priority, status, COALESCE(started_at, NOW()) as started_at, COALESCE(completed_at, NOW()) as completed_at, updated_at, COALESCE(error_message, '') as error_message, COALESCE(task_run_id, '') as task_run_id, retry_count, max_retries FROM queued_workflows WHERE id = $1",
         None,
     )
 }
@@ -570,7 +570,7 @@ impl QueueGetStmt {
 pub struct QueueLoadPendingStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn queue_load_pending() -> QueueLoadPendingStmt {
     QueueLoadPendingStmt(
-        "SELECT id, workflow_id, workflow_name, queued_at, priority, status, started_at, completed_at, updated_at, error_message, task_run_id, retry_count, max_retries FROM queued_workflows WHERE status IN ('pending', 'running') ORDER BY priority DESC, queued_at ASC",
+        "SELECT id, workflow_id, workflow_name, queued_at, priority, status, COALESCE(started_at, NOW()) as started_at, COALESCE(completed_at, NOW()) as completed_at, updated_at, COALESCE(error_message, '') as error_message, COALESCE(task_run_id, '') as task_run_id, retry_count, max_retries FROM queued_workflows WHERE status IN ('pending', 'running') ORDER BY priority DESC, queued_at ASC",
         None,
     )
 }

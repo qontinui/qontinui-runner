@@ -719,7 +719,7 @@ impl<
 pub struct GetWorkflowExecutionStateStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_workflow_execution_state() -> GetWorkflowExecutionStateStmt {
     GetWorkflowExecutionStateStmt(
-        "SELECT execution_id, workflow_type, state_name, state_data, phase, iteration, updated_at FROM workflow_execution_state WHERE execution_id = $1",
+        "SELECT execution_id, workflow_type, state_name, COALESCE(state_data, '') as state_data, COALESCE(phase, '') as phase, COALESCE(iteration, 0) as iteration, updated_at FROM workflow_execution_state WHERE execution_id = $1",
         None,
     )
 }
@@ -787,7 +787,7 @@ pub struct GetStepCheckpointsPaginatedWithCursorStmt(
 );
 pub fn get_step_checkpoints_paginated_with_cursor() -> GetStepCheckpointsPaginatedWithCursorStmt {
     GetStepCheckpointsPaginatedWithCursorStmt(
-        "SELECT id, execution_id, workflow_type, phase, iteration, step_index, stage_index, step_type, step_name, status, result_json, step_config_json, started_at, completed_at, duration_ms, error FROM workflow_step_checkpoints WHERE execution_id = $1 AND step_index > $2 ORDER BY step_index ASC LIMIT $3",
+        "SELECT id, execution_id, workflow_type, phase, COALESCE(iteration, 0) as iteration, step_index, COALESCE(stage_index, 0) as stage_index, step_type, COALESCE(step_name, '') as step_name, status, COALESCE(result_json, '') as result_json, COALESCE(step_config_json, '') as step_config_json, COALESCE(started_at::TEXT, '') as started_at, COALESCE(completed_at::TEXT, '') as completed_at, COALESCE(duration_ms, 0) as duration_ms, COALESCE(error, '') as error FROM workflow_step_checkpoints WHERE execution_id = $1 AND step_index > $2 ORDER BY step_index ASC LIMIT $3",
         None,
     )
 }
@@ -885,7 +885,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
 pub struct GetStepCheckpointsPaginatedNoCursorStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_step_checkpoints_paginated_no_cursor() -> GetStepCheckpointsPaginatedNoCursorStmt {
     GetStepCheckpointsPaginatedNoCursorStmt(
-        "SELECT id, execution_id, workflow_type, phase, iteration, step_index, stage_index, step_type, step_name, status, result_json, step_config_json, started_at, completed_at, duration_ms, error FROM workflow_step_checkpoints WHERE execution_id = $1 ORDER BY step_index ASC LIMIT $2",
+        "SELECT id, execution_id, workflow_type, phase, COALESCE(iteration, 0) as iteration, step_index, COALESCE(stage_index, 0) as stage_index, step_type, COALESCE(step_name, '') as step_name, status, COALESCE(result_json, '') as result_json, COALESCE(step_config_json, '') as step_config_json, COALESCE(started_at::TEXT, '') as started_at, COALESCE(completed_at::TEXT, '') as completed_at, COALESCE(duration_ms, 0) as duration_ms, COALESCE(error, '') as error FROM workflow_step_checkpoints WHERE execution_id = $1 ORDER BY step_index ASC LIMIT $2",
         None,
     )
 }
@@ -1007,7 +1007,7 @@ impl GetRunningCheckpointIdStmt {
 pub struct GetLatestStepProgressMarkerStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_latest_step_progress_marker() -> GetLatestStepProgressMarkerStmt {
     GetLatestStepProgressMarkerStmt(
-        "SELECT id, checkpoint_id, marker_type, current_value, total_value, description, data_json, created_at FROM step_progress_markers WHERE checkpoint_id = $1 ORDER BY id DESC LIMIT 1",
+        "SELECT id, COALESCE(checkpoint_id, '') as checkpoint_id, marker_type, COALESCE(current_value, 0) as current_value, COALESCE(total_value, 0) as total_value, COALESCE(description, '') as description, COALESCE(data_json, '') as data_json, created_at FROM step_progress_markers WHERE checkpoint_id = $1 ORDER BY id DESC LIMIT 1",
         None,
     )
 }

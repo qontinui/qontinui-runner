@@ -30,7 +30,7 @@ RETURNING id;
 SELECT config_json FROM configs WHERE id = :id;
 
 --! list_configs
-SELECT id, name, source_type, source_path, created_at, updated_at
+SELECT id, name, source_type, COALESCE(source_path, '') as source_path, created_at, updated_at
 FROM configs
 ORDER BY updated_at DESC;
 

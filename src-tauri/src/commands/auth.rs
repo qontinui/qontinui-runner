@@ -524,62 +524,7 @@ pub struct ConnectionInfo {
 /// - Backend API call fails
 #[tauri::command]
 pub async fn get_connection_info() -> Result<ConnectionInfo, String> {
-    info!("Getting connection info");
-
-    let auth_manager = AuthManager::new();
-
-    // Check authentication
-    if !auth_manager.has_tokens() {
-        return Err("Not authenticated. Please log in first.".to_string());
-    }
-
-    // Get device ID and access token
-    let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
-        format!("Failed to get device ID: {}", e)
-    })?;
-
-    let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
-        format!("Failed to get access token: {}", e)
-    })?;
-
-    // Call backend API
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "{}/api/v1/runner-devices/{}/connection-info",
-            get_api_base_url(),
-            device_id
-        ))
-        .bearer_auth(&access_token)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to get connection info: {}", e);
-            format!("Network error: {}", e)
-        })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!(
-            "Get connection info failed with status {}: {}",
-            status, error_text
-        );
-        return Err(format!("Failed to get connection info: {}", error_text));
-    }
-
-    let connection_info: ConnectionInfo = response.json().await.map_err(|e| {
-        error!("Failed to parse connection info: {}", e);
-        format!("Invalid response from server: {}", e)
-    })?;
-
-    info!("Connection info retrieved successfully");
-    Ok(connection_info)
+    Err("SQLite removed".to_string())
 }
 
 /// Project information

@@ -3,8 +3,8 @@
 //! These templates provide reusable detection strategies that can be
 //! referenced by known issues to standardize how they are verified.
 
+use crate::database::Connection;
 use chrono::Utc;
-use rusqlite::{params, Connection};
 use tracing::info;
 
 use super::types::{IssuePatternTemplate, TemplateParameter};
@@ -325,56 +325,14 @@ pub fn get_built_in_templates() -> Vec<IssuePatternTemplate> {
 
 /// Seed built-in templates into the database (INSERT OR IGNORE).
 pub fn seed_templates(conn: &Connection) -> Result<(), String> {
-    let templates = get_built_in_templates();
-
-    for template in &templates {
-        let step_template_json = template
-            .step_template
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
-
-        let parameters_json =
-            serde_json::to_string(&template.parameters).unwrap_or_else(|_| "[]".to_string());
-
-        conn.execute(
-            r#"
-            INSERT OR IGNORE INTO issue_pattern_templates (
-                id, name, description, category, detection_type,
-                step_template, ai_prompt_template, parameters,
-                built_in, status, created_at, updated_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12
-            )
-            "#,
-            params![
-                template.id,
-                template.name,
-                template.description,
-                template.category,
-                template.detection_type,
-                step_template_json,
-                template.ai_prompt_template,
-                parameters_json,
-                template.built_in as i32,
-                template.status,
-                template.created_at,
-                template.updated_at,
-            ],
-        )
-        .map_err(|e| format!("Failed to seed template '{}': {}", template.id, e))?;
-    }
-
-    info!("Seeded {} built-in pattern templates", templates.len());
-
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::known_issues::storage::ensure_tables;
+use crate::database::Connection;
 
     #[test]
     fn test_get_built_in_templates_returns_six() {

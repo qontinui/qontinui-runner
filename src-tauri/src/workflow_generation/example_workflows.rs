@@ -4,9 +4,8 @@
 //! workflows for use as few-shot examples in the generation prompt.
 //! The example library starts empty and grows organically as workflows succeed.
 
-use rusqlite::Connection;
+use crate::database::Connection;
 use serde::Serialize;
-use tracing::{debug, error, info, warn};
 
 /// Reference to a workflow used as an example in the generation prompt.
 #[derive(Debug, Clone, Serialize)]
@@ -29,22 +28,7 @@ pub fn find_relevant_examples(
     category: Option<&str>,
     limit: usize,
 ) -> Vec<ExampleWorkflowRef> {
-    if let Some(embedding) = query_embedding {
-        match find_by_embedding(conn, embedding, category, limit) {
-            Ok(results) if !results.is_empty() => return results,
-            Ok(_) => debug!("No embedding-matched examples found, falling back to recency"),
-            Err(e) => debug!("Embedding search failed, falling back to recency: {}", e),
-        }
-    }
-
-    // Fallback: most recent active examples, optionally filtered by category
-    match find_by_recency(conn, category, limit) {
-        Ok(results) => results,
-        Err(e) => {
-            warn!("Failed to retrieve example workflows: {}", e);
-            Vec::new()
-        }
-    }
+    Vec::new()
 }
 
 type EmbeddingRow = (
@@ -58,18 +42,7 @@ type EmbeddingRow = (
     Vec<u8>,
 );
 
-fn map_embedding_row(row: &rusqlite::Row) -> rusqlite::Result<EmbeddingRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
-}
+// map_embedding_row removed (SQLite dead code)
 
 fn find_by_embedding(
     conn: &Connection,
@@ -77,120 +50,19 @@ fn find_by_embedding(
     category: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ExampleWorkflowRef>, String> {
-    let query = if category.is_some() {
-        "SELECT id, name, description, category, setup_steps, verification_steps, agentic_steps, \
-         description_embedding FROM unified_workflows \
-         WHERE example_status = 'active' AND description_embedding IS NOT NULL AND category = ?1 \
-         ORDER BY updated_at DESC LIMIT 50"
-    } else {
-        "SELECT id, name, description, category, setup_steps, verification_steps, agentic_steps, \
-         description_embedding FROM unified_workflows \
-         WHERE example_status = 'active' AND description_embedding IS NOT NULL \
-         ORDER BY updated_at DESC LIMIT 50"
-    };
-
-    let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
-
-    let rows: Vec<EmbeddingRow> = if let Some(cat) = category {
-        stmt.query_map([cat], map_embedding_row)
-    } else {
-        stmt.query_map([], map_embedding_row)
-    }
-    .map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
-
-    let mut scored: Vec<ExampleWorkflowRef> = rows
-        .into_iter()
-        .filter_map(
-            |(id, name, description, category, setup, verification, agentic, embedding_blob)| {
-                let embedding = blob_to_f32_vec(&embedding_blob)?;
-                let similarity = cosine_similarity(query_embedding, &embedding);
-                let workflow_json =
-                    reconstruct_workflow_json(&name, &description, &setup, &verification, &agentic);
-                Some(ExampleWorkflowRef {
-                    id,
-                    name,
-                    description,
-                    category,
-                    workflow_json,
-                    similarity,
-                })
-            },
-        )
-        .collect();
-
-    // Sort by similarity descending
-    scored.sort_by(|a, b| {
-        b.similarity
-            .partial_cmp(&a.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    scored.truncate(limit);
-    Ok(scored)
+    Err("SQLite removed".to_string())
 }
 
 type RecencyRow = (String, String, String, String, String, String, String);
 
-fn map_recency_row(row: &rusqlite::Row) -> rusqlite::Result<RecencyRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-    ))
-}
+// map_recency_row removed (SQLite dead code)
 
 fn find_by_recency(
     conn: &Connection,
     category: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ExampleWorkflowRef>, String> {
-    let query = if category.is_some() {
-        "SELECT id, name, description, category, setup_steps, verification_steps, agentic_steps \
-         FROM unified_workflows \
-         WHERE example_status = 'active' AND category = ?1 \
-         ORDER BY updated_at DESC LIMIT ?2"
-    } else {
-        "SELECT id, name, description, category, setup_steps, verification_steps, agentic_steps \
-         FROM unified_workflows \
-         WHERE example_status = 'active' \
-         ORDER BY updated_at DESC LIMIT ?1"
-    };
-
-    let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
-
-    let rows: Vec<RecencyRow> = if let Some(cat) = category {
-        stmt.query_map(rusqlite::params![cat, limit as i64], map_recency_row)
-    } else {
-        stmt.query_map(rusqlite::params![limit as i64], map_recency_row)
-    }
-    .map_err(|e| e.to_string())?
-    .filter_map(|r| r.ok())
-    .collect();
-
-    let results = rows
-        .into_iter()
-        .map(
-            |(id, name, description, category, setup, verification, agentic)| {
-                let workflow_json =
-                    reconstruct_workflow_json(&name, &description, &setup, &verification, &agentic);
-                ExampleWorkflowRef {
-                    id,
-                    name,
-                    description,
-                    category,
-                    workflow_json,
-                    similarity: 0.0,
-                }
-            },
-        )
-        .collect();
-
-    Ok(results)
+    Err("SQLite removed".to_string())
 }
 
 /// Format example workflows for inclusion in the AI prompt.
@@ -214,38 +86,17 @@ pub fn format_examples_for_prompt(examples: &[ExampleWorkflowRef], max_count: us
 
 /// Promote a workflow to the example library (set example_status = 'active').
 pub fn promote_workflow_to_example(conn: &Connection, workflow_id: &str) -> Result<(), String> {
-    conn.execute(
-        "UPDATE unified_workflows SET example_status = 'active' WHERE id = ?1",
-        [workflow_id],
-    )
-    .map_err(|e| format!("Failed to promote workflow to example: {}", e))?;
-    info!("Promoted workflow '{}' to example library", workflow_id);
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Exclude a workflow from ever being added to the example library.
 pub fn exclude_workflow_from_examples(conn: &Connection, workflow_id: &str) -> Result<(), String> {
-    conn.execute(
-        "UPDATE unified_workflows SET example_status = 'excluded' WHERE id = ?1",
-        [workflow_id],
-    )
-    .map_err(|e| format!("Failed to exclude workflow from examples: {}", e))?;
-    info!("Excluded workflow '{}' from example library", workflow_id);
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Remove a workflow from the example library (back to pending, allows re-add on next success).
 pub fn remove_workflow_from_examples(conn: &Connection, workflow_id: &str) -> Result<(), String> {
-    conn.execute(
-        "UPDATE unified_workflows SET example_status = 'pending' WHERE id = ?1",
-        [workflow_id],
-    )
-    .map_err(|e| format!("Failed to remove workflow from examples: {}", e))?;
-    info!(
-        "Removed workflow '{}' from example library (back to pending)",
-        workflow_id
-    );
-    Ok(())
+    Err("SQLite removed".to_string())
 }
 
 /// Attempt to promote a workflow after a successful task run.
@@ -257,51 +108,7 @@ pub fn remove_workflow_from_examples(conn: &Connection, workflow_id: &str) -> Re
 ///
 /// This is fire-and-forget — errors are logged but never propagated.
 pub fn try_promote_on_success(conn: &Connection, workflow_id: &str) {
-    let result: Result<(), String> = (|| {
-        let row: Option<(Option<String>, String, String)> = conn
-            .query_row(
-                "SELECT generated_by_task_run_id, COALESCE(example_status, 'pending'), category \
-                 FROM unified_workflows WHERE id = ?1",
-                [workflow_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map(Some)
-            .unwrap_or(None);
-
-        let Some((generated_by, example_status, category)) = row else {
-            debug!("Workflow '{}' not found for example promotion", workflow_id);
-            return Ok(());
-        };
-
-        // Gate: must be AI-generated
-        if generated_by.is_none() {
-            return Ok(());
-        }
-
-        // Gate: must be pending
-        if example_status != "pending" {
-            return Ok(());
-        }
-
-        // Gate: must not be meta-workflow
-        if category == "meta" {
-            return Ok(());
-        }
-
-        promote_workflow_to_example(conn, workflow_id)?;
-        info!(
-            "Promoted workflow '{}' to example library after first successful run",
-            workflow_id
-        );
-        Ok(())
-    })();
-
-    if let Err(e) = result {
-        error!(
-            "Failed to promote workflow '{}' to example library: {}",
-            workflow_id, e
-        );
-    }
+    // SQLite removed - no-op
 }
 
 // ============================================================================
