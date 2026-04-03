@@ -27,18 +27,12 @@ export function CircuitBreakerStatus({ budget }: CircuitBreakerStatusProps) {
       </div>
 
       <div className="flex items-center gap-3">
-        <Badge variant={tripped ? "danger" : "success"}>
-          {tripped ? "Tripped" : "Closed"}
-        </Badge>
+        <Badge variant={tripped ? "danger" : "success"}>{tripped ? "Tripped" : "Closed"}</Badge>
         {tripped && (
-          <span className="text-xs text-red-400">
-            Budget exceeded or anomaly detected
-          </span>
+          <span className="text-xs text-red-400">Budget exceeded or anomaly detected</span>
         )}
         {!tripped && !budget && (
-          <span className="text-xs text-muted-foreground">
-            No active budget
-          </span>
+          <span className="text-xs text-muted-foreground">No active budget</span>
         )}
       </div>
 

@@ -1,14 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  Shield,
-  Check,
-  Info,
-  FileSearch,
-  RefreshCw,
-  Download,
-  Sliders,
-} from "lucide-react";
+import { Shield, Check, Info, FileSearch, RefreshCw, Download, Sliders } from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 
 interface SecuritySettingsData {
@@ -155,7 +147,15 @@ const LAYER_SCORES: Record<string, Record<string, number>> = {
   custom: { L1: 2, L2: 2, L3: 2, L4: 2, L5: 2, L6: 2, L7: 2 },
 };
 
-const LAYER_NAMES = ["L1:Compute", "L2:Resources", "L3:Filesystem", "L4:Network", "L5:Credentials", "L6:Actions", "L7:Audit"];
+const LAYER_NAMES = [
+  "L1:Compute",
+  "L2:Resources",
+  "L3:Filesystem",
+  "L4:Network",
+  "L5:Credentials",
+  "L6:Actions",
+  "L7:Audit",
+];
 const SCORE_COLORS = ["bg-red-500", "bg-orange-500", "bg-yellow-500", "bg-green-500"];
 const SCORE_LABELS = ["None", "Cooperative", "Software", "Kernel"];
 
@@ -208,9 +208,26 @@ function CustomProfileEditor({
 }) {
   const p: SecurityPolicy = policy || {
     profile_name: "custom",
-    filesystem: { read_write_paths: [], read_only_paths: [], denied_paths: [], read_only_root: false },
-    network: { mode: "unrestricted", allowed_domains: [], denied_domains: [], block_metadata_endpoints: true, allowed_protocols: [], log_requests: true },
-    actions: { allowed_commands: null, blocked_commands: [], block_destructive: false, max_recursion_depth: 10 },
+    filesystem: {
+      read_write_paths: [],
+      read_only_paths: [],
+      denied_paths: [],
+      read_only_root: false,
+    },
+    network: {
+      mode: "unrestricted",
+      allowed_domains: [],
+      denied_domains: [],
+      block_metadata_endpoints: true,
+      allowed_protocols: [],
+      log_requests: true,
+    },
+    actions: {
+      allowed_commands: null,
+      blocked_commands: [],
+      block_destructive: false,
+      max_recursion_depth: 10,
+    },
     resources: { cpu_limit: null, memory_limit_mb: null, pids_limit: null, timeout_secs: 300 },
     credentials: { mode: "direct", allowed_credentials: [] },
   };
@@ -235,7 +252,9 @@ function CustomProfileEditor({
         <div className="space-y-2">
           <h5 className="text-xs font-medium text-neutral-300">Network</h5>
           <div className="flex gap-2 items-center">
-            <label htmlFor="security-network-mode" className="text-[10px] text-neutral-500 w-14">Mode</label>
+            <label htmlFor="security-network-mode" className="text-[10px] text-neutral-500 w-14">
+              Mode
+            </label>
             <select
               id="security-network-mode"
               value={p.network.mode}
@@ -254,7 +273,10 @@ function CustomProfileEditor({
                 {p.network.mode === "allow_list" ? "Allowed" : "Denied"} domains (one per line)
               </label>
               <textarea
-                value={(p.network.mode === "allow_list" ? p.network.allowed_domains : p.network.denied_domains).join("\n")}
+                value={(p.network.mode === "allow_list"
+                  ? p.network.allowed_domains
+                  : p.network.denied_domains
+                ).join("\n")}
                 onChange={(e) => {
                   const domains = e.target.value.split("\n").filter(Boolean);
                   if (p.network.mode === "allow_list") updateNetwork({ allowed_domains: domains });
@@ -286,11 +308,15 @@ function CustomProfileEditor({
             <span className="text-[10px] text-neutral-400">Block destructive commands</span>
           </div>
           <div className="space-y-1">
-            <label htmlFor="security-blocked-commands" className="text-[10px] text-neutral-500">Blocked command patterns (regex, one per line)</label>
+            <label htmlFor="security-blocked-commands" className="text-[10px] text-neutral-500">
+              Blocked command patterns (regex, one per line)
+            </label>
             <textarea
               id="security-blocked-commands"
               value={p.actions.blocked_commands.join("\n")}
-              onChange={(e) => updateActions({ blocked_commands: e.target.value.split("\n").filter(Boolean) })}
+              onChange={(e) =>
+                updateActions({ blocked_commands: e.target.value.split("\n").filter(Boolean) })
+              }
               rows={2}
               className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none font-mono"
               placeholder="^\s*sudo\b&#10;^\s*su\b"
@@ -309,11 +335,15 @@ function CustomProfileEditor({
             <span className="text-[10px] text-neutral-400">Read-only root filesystem</span>
           </div>
           <div className="space-y-1">
-            <label htmlFor="security-denied-paths" className="text-[10px] text-neutral-500">Denied paths (glob, one per line)</label>
+            <label htmlFor="security-denied-paths" className="text-[10px] text-neutral-500">
+              Denied paths (glob, one per line)
+            </label>
             <textarea
               id="security-denied-paths"
               value={p.filesystem.denied_paths.join("\n")}
-              onChange={(e) => updateFilesystem({ denied_paths: e.target.value.split("\n").filter(Boolean) })}
+              onChange={(e) =>
+                updateFilesystem({ denied_paths: e.target.value.split("\n").filter(Boolean) })
+              }
               rows={2}
               className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none font-mono"
               placeholder="/etc/shadow&#10;/home/*/.ssh/**"
@@ -326,34 +356,55 @@ function CustomProfileEditor({
           <h5 className="text-xs font-medium text-neutral-300">Resources</h5>
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-0.5">
-              <label htmlFor="security-cpu-limit" className="text-[10px] text-neutral-500">CPU limit (cores)</label>
+              <label htmlFor="security-cpu-limit" className="text-[10px] text-neutral-500">
+                CPU limit (cores)
+              </label>
               <input
                 id="security-cpu-limit"
-                type="number" step="0.5" min="0.5" max="16"
+                type="number"
+                step="0.5"
+                min="0.5"
+                max="16"
                 value={p.resources.cpu_limit ?? ""}
-                onChange={(e) => updateResources({ cpu_limit: e.target.value ? parseFloat(e.target.value) : null })}
+                onChange={(e) =>
+                  updateResources({ cpu_limit: e.target.value ? parseFloat(e.target.value) : null })
+                }
                 className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
                 placeholder="No limit"
               />
             </div>
             <div className="space-y-0.5">
-              <label htmlFor="security-memory-limit" className="text-[10px] text-neutral-500">Memory (MB)</label>
+              <label htmlFor="security-memory-limit" className="text-[10px] text-neutral-500">
+                Memory (MB)
+              </label>
               <input
                 id="security-memory-limit"
-                type="number" min="64" max="32768"
+                type="number"
+                min="64"
+                max="32768"
                 value={p.resources.memory_limit_mb ?? ""}
-                onChange={(e) => updateResources({ memory_limit_mb: e.target.value ? parseInt(e.target.value) : null })}
+                onChange={(e) =>
+                  updateResources({
+                    memory_limit_mb: e.target.value ? parseInt(e.target.value) : null,
+                  })
+                }
                 className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
                 placeholder="No limit"
               />
             </div>
             <div className="space-y-0.5">
-              <label htmlFor="security-pids-limit" className="text-[10px] text-neutral-500">PID limit</label>
+              <label htmlFor="security-pids-limit" className="text-[10px] text-neutral-500">
+                PID limit
+              </label>
               <input
                 id="security-pids-limit"
-                type="number" min="16" max="4096"
+                type="number"
+                min="16"
+                max="4096"
                 value={p.resources.pids_limit ?? ""}
-                onChange={(e) => updateResources({ pids_limit: e.target.value ? parseInt(e.target.value) : null })}
+                onChange={(e) =>
+                  updateResources({ pids_limit: e.target.value ? parseInt(e.target.value) : null })
+                }
                 className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
                 placeholder="No limit"
               />
@@ -361,7 +412,9 @@ function CustomProfileEditor({
             <div className="space-y-0.5">
               <label className="text-[10px] text-neutral-500">Timeout (sec)</label>
               <input
-                type="number" min="10" max="3600"
+                type="number"
+                min="10"
+                max="3600"
                 value={p.resources.timeout_secs}
                 onChange={(e) => updateResources({ timeout_secs: parseInt(e.target.value) || 300 })}
                 className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
@@ -377,7 +430,9 @@ function CustomProfileEditor({
             <label className="text-[10px] text-neutral-500 w-14">Mode</label>
             <select
               value={p.credentials.mode}
-              onChange={(e) => onChange({ ...p, credentials: { ...p.credentials, mode: e.target.value } })}
+              onChange={(e) =>
+                onChange({ ...p, credentials: { ...p.credentials, mode: e.target.value } })
+              }
               className="flex-1 px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
             >
               <option value="direct">Direct (current behavior)</option>
@@ -485,7 +540,7 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
         const rows = events
           .map(
             (e: AuditEvent) =>
-              `"${e.timestamp}","${e.event_type}","${e.decision}","${e.action.replace(/"/g, '""')}","${(e.reason || "").replace(/"/g, '""')}","${e.step_name || ""}"`
+              `"${e.timestamp}","${e.event_type}","${e.decision}","${e.action.replace(/"/g, '""')}","${(e.reason || "").replace(/"/g, '""')}","${e.step_name || ""}"`,
           )
           .join("\n");
         content = headers + rows;
@@ -610,9 +665,7 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
       {config.default_profile === "custom" && (
         <CustomProfileEditor
           policy={config.custom_policy}
-          onChange={(custom_policy) =>
-            setConfig((prev) => ({ ...prev, custom_policy }))
-          }
+          onChange={(custom_policy) => setConfig((prev) => ({ ...prev, custom_policy }))}
         />
       )}
 

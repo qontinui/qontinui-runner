@@ -84,9 +84,7 @@ interface ApiResponse<T> {
 
 async function fetchOL<T>(endpoint: string): Promise<T | null> {
   try {
-    const resp = await tracedFetch(
-      `${getApiBase()}/online-learning/${endpoint}`
-    );
+    const resp = await tracedFetch(`${getApiBase()}/online-learning/${endpoint}`);
     if (!resp.ok) return null;
     const json: ApiResponse<T> = await resp.json();
     return json.success ? (json.data ?? null) : null;
@@ -99,13 +97,7 @@ async function fetchOL<T>(endpoint: string): Promise<T | null> {
 // Sub-tab type
 // =============================================================================
 
-type SubTab =
-  | "overview"
-  | "model-routing"
-  | "drift"
-  | "credits"
-  | "strategies"
-  | "experiences";
+type SubTab = "overview" | "model-routing" | "drift" | "credits" | "strategies" | "experiences";
 
 // =============================================================================
 // Main component
@@ -116,14 +108,10 @@ export function OnlineLearningDashboard() {
   const [loading, setLoading] = useState(true);
 
   // Data
-  const [routingState, setRoutingState] = useState<ModelRoutingState | null>(
-    null
-  );
+  const [routingState, setRoutingState] = useState<ModelRoutingState | null>(null);
   const [routingTable, setRoutingTable] = useState<RoutingTableEntry[]>([]);
   const [driftSignals, setDriftSignals] = useState<DriftSignal[]>([]);
-  const [driftMonitor, setDriftMonitor] = useState<DriftMonitorState | null>(
-    null
-  );
+  const [driftMonitor, setDriftMonitor] = useState<DriftMonitorState | null>(null);
   const [scorecard, setScorecard] = useState<StepScorecard[]>([]);
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [experiences, setExperiences] = useState<ExperienceSummary[]>([]);
@@ -179,14 +167,8 @@ export function OnlineLearningDashboard() {
       {/* Header */}
       <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
         <div className="flex items-center gap-3">
-          <span className="text-lg font-semibold text-white/90">
-            Online Learning
-          </span>
-          {loading && (
-            <span className="text-xs text-white/40 animate-pulse">
-              Loading...
-            </span>
-          )}
+          <span className="text-lg font-semibold text-white/90">Online Learning</span>
+          {loading && <span className="text-xs text-white/40 animate-pulse">Loading...</span>}
         </div>
         <button
           onClick={loadData}
@@ -230,24 +212,14 @@ export function OnlineLearningDashboard() {
           />
         )}
         {activeTab === "model-routing" && (
-          <ModelRoutingTab
-            routingState={routingState}
-            routingTable={routingTable}
-          />
+          <ModelRoutingTab routingState={routingState} routingTable={routingTable} />
         )}
         {activeTab === "drift" && (
-          <DriftTab
-            driftSignals={driftSignals}
-            driftMonitor={driftMonitor}
-          />
+          <DriftTab driftSignals={driftSignals} driftMonitor={driftMonitor} />
         )}
         {activeTab === "credits" && <CreditsTab scorecard={scorecard} />}
-        {activeTab === "strategies" && (
-          <StrategiesTab strategies={strategies} />
-        )}
-        {activeTab === "experiences" && (
-          <ExperiencesTab experiences={experiences} />
-        )}
+        {activeTab === "strategies" && <StrategiesTab strategies={strategies} />}
+        {activeTab === "experiences" && <ExperiencesTab experiences={experiences} />}
       </div>
     </div>
   );
@@ -285,11 +257,7 @@ function OverviewTab({
           sub={`${driftMonitor?.detector_count ?? 0} detectors`}
           alert={driftSignals.length > 0}
         />
-        <StatCard
-          label="Step Types Scored"
-          value={scorecard.length}
-          sub="credit attribution"
-        />
+        <StatCard label="Step Types Scored" value={scorecard.length} sub="credit attribution" />
         <StatCard
           label="Strategies"
           value={strategies.length}
@@ -300,27 +268,19 @@ function OverviewTab({
       {/* Drift alerts */}
       {driftSignals.length > 0 && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
-          <h3 className="text-sm font-medium text-amber-400 mb-2">
-            Active Drift Signals
-          </h3>
+          <h3 className="text-sm font-medium text-amber-400 mb-2">Active Drift Signals</h3>
           <div className="space-y-1">
             {driftSignals.slice(0, 5).map((s) => (
-              <div
-                key={s.id}
-                className="text-xs text-white/60 flex items-center gap-2"
-              >
+              <div key={s.id} className="text-xs text-white/60 flex items-center gap-2">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    s.drift_level === "drift"
-                      ? "bg-red-400"
-                      : "bg-amber-400"
+                    s.drift_level === "drift" ? "bg-red-400" : "bg-amber-400"
                   }`}
                 />
                 <span className="text-white/80">{s.metric_name}</span>
                 <span className="text-white/40">{s.context_key}</span>
                 <span className="text-white/50">
-                  {s.pre_drift_mean.toFixed(3)} &rarr;{" "}
-                  {s.post_drift_mean.toFixed(3)}
+                  {s.pre_drift_mean.toFixed(3)} &rarr; {s.post_drift_mean.toFixed(3)}
                 </span>
               </div>
             ))}
@@ -340,16 +300,12 @@ function OverviewTab({
                 key={p.context_key}
                 className="flex items-center justify-between bg-white/[0.03] rounded px-3 py-2"
               >
-                <span className="text-xs text-white/60 truncate max-w-[60%]">
-                  {p.context_key}
-                </span>
+                <span className="text-xs text-white/60 truncate max-w-[60%]">{p.context_key}</span>
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-mono text-blue-400">
                     {p.recommended_arm.split("-").slice(1, 2).join("")}
                   </span>
-                  <span className="text-[10px] text-white/30">
-                    q={p.q_value.toFixed(3)}
-                  </span>
+                  <span className="text-[10px] text-white/30">q={p.q_value.toFixed(3)}</span>
                 </div>
               </div>
             ))}
@@ -360,15 +316,11 @@ function OverviewTab({
       {/* Step credit scorecard preview */}
       {scorecard.length > 0 && (
         <div className="rounded-lg border border-white/10 bg-white/[0.02] p-4">
-          <h3 className="text-sm font-medium text-white/80 mb-3">
-            Step Type Credit Scorecard
-          </h3>
+          <h3 className="text-sm font-medium text-white/80 mb-3">Step Type Credit Scorecard</h3>
           <div className="space-y-1.5">
             {scorecard.slice(0, 6).map((s) => (
               <div key={s.step_type} className="flex items-center gap-3">
-                <span className="text-xs text-white/60 w-32 truncate">
-                  {s.step_type}
-                </span>
+                <span className="text-xs text-white/60 w-32 truncate">{s.step_type}</span>
                 <div className="flex-1 h-2 bg-white/5 rounded-full overflow-hidden">
                   <div
                     className="h-full bg-blue-500/60 rounded-full"
@@ -406,10 +358,7 @@ function ModelRoutingTab({
       {routingState && (
         <div className="flex gap-2 mb-3">
           {routingState.available_models.map((m) => (
-            <span
-              key={m}
-              className="px-2 py-1 text-xs rounded bg-white/5 text-white/60"
-            >
+            <span key={m} className="px-2 py-1 text-xs rounded bg-white/5 text-white/60">
               {m}
             </span>
           ))}
@@ -436,18 +385,14 @@ function ModelRoutingTab({
                     key={`${row.context_key}-${row.model_id}`}
                     className="border-t border-white/5 hover:bg-white/[0.02]"
                   >
-                    <td className="px-3 py-1.5 text-white/60 font-mono">
-                      {row.context_key}
-                    </td>
+                    <td className="px-3 py-1.5 text-white/60 font-mono">{row.context_key}</td>
                     <td className="px-3 py-1.5 text-blue-400">
                       {row.model_id.replace("claude-", "").split("-20")[0]}
                     </td>
                     <td className="px-3 py-1.5 text-right text-white/70">
                       {row.q_value.toFixed(4)}
                     </td>
-                    <td className="px-3 py-1.5 text-right text-white/40">
-                      {row.visit_count}
-                    </td>
+                    <td className="px-3 py-1.5 text-right text-white/40">{row.visit_count}</td>
                   </tr>
                 ))}
             </tbody>
@@ -501,10 +446,7 @@ function DriftTab({
             </thead>
             <tbody>
               {driftSignals.map((s) => (
-                <tr
-                  key={s.id}
-                  className="border-t border-white/5 hover:bg-white/[0.02]"
-                >
+                <tr key={s.id} className="border-t border-white/5 hover:bg-white/[0.02]">
                   <td className="px-3 py-1.5">
                     <span
                       className={`px-1.5 py-0.5 rounded text-[10px] ${
@@ -516,15 +458,9 @@ function DriftTab({
                       {s.drift_level}
                     </span>
                   </td>
-                  <td className="px-3 py-1.5 text-white/70">
-                    {s.metric_name}
-                  </td>
-                  <td className="px-3 py-1.5 text-white/50 font-mono">
-                    {s.context_key}
-                  </td>
-                  <td className="px-3 py-1.5 text-white/40">
-                    {s.detector_type}
-                  </td>
+                  <td className="px-3 py-1.5 text-white/70">{s.metric_name}</td>
+                  <td className="px-3 py-1.5 text-white/50 font-mono">{s.context_key}</td>
+                  <td className="px-3 py-1.5 text-white/40">{s.detector_type}</td>
                   <td className="px-3 py-1.5 text-right text-white/60">
                     {s.pre_drift_mean.toFixed(4)}
                   </td>
@@ -564,10 +500,7 @@ function CreditsTab({ scorecard }: { scorecard: StepScorecard[] }) {
             </thead>
             <tbody>
               {scorecard.map((s) => (
-                <tr
-                  key={s.step_type}
-                  className="border-t border-white/5 hover:bg-white/[0.02]"
-                >
+                <tr key={s.step_type} className="border-t border-white/5 hover:bg-white/[0.02]">
                   <td className="px-3 py-1.5 text-white/70">{s.step_type}</td>
                   <td className="px-3 py-1.5 text-right text-blue-400 font-mono">
                     {s.avg_normalized_credit.toFixed(4)}
@@ -575,9 +508,7 @@ function CreditsTab({ scorecard }: { scorecard: StepScorecard[] }) {
                   <td className="px-3 py-1.5 text-right text-white/50 font-mono">
                     {s.avg_raw_credit.toFixed(4)}
                   </td>
-                  <td className="px-3 py-1.5 text-right text-white/40">
-                    {s.total_count}
-                  </td>
+                  <td className="px-3 py-1.5 text-right text-white/40">{s.total_count}</td>
                   <td className="px-3 py-1.5 w-32">
                     <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                       <div
@@ -611,14 +542,9 @@ function StrategiesTab({ strategies }: { strategies: Strategy[] }) {
         strategies.map((s) => {
           const stats = tryParseStats(s.stats);
           return (
-            <div
-              key={s.id}
-              className="rounded-lg border border-white/10 bg-white/[0.02] p-4"
-            >
+            <div key={s.id} className="rounded-lg border border-white/10 bg-white/[0.02] p-4">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-sm font-medium text-white/80">
-                  {s.name}
-                </span>
+                <span className="text-sm font-medium text-white/80">{s.name}</span>
                 <span
                   className={`px-2 py-0.5 rounded text-[10px] ${
                     s.status === "active"
@@ -634,26 +560,16 @@ function StrategiesTab({ strategies }: { strategies: Strategy[] }) {
               <p className="text-xs text-white/50 mb-2">{s.description}</p>
               {stats && (
                 <div className="flex gap-4 text-[10px] text-white/40">
-                  <span>
-                    Selected: {stats.times_selected ?? 0}x
-                  </span>
+                  <span>Selected: {stats.times_selected ?? 0}x</span>
                   <span>
                     Success:{" "}
                     {stats.times_selected
-                      ? (
-                          ((stats.times_succeeded ?? 0) /
-                            stats.times_selected) *
-                          100
-                        ).toFixed(0)
+                      ? (((stats.times_succeeded ?? 0) / stats.times_selected) * 100).toFixed(0)
                       : 0}
                     %
                   </span>
-                  <span>
-                    Avg Score: {(stats.avg_composite_score ?? 0).toFixed(3)}
-                  </span>
-                  <span>
-                    Avg Cost: ${(stats.avg_cost_usd ?? 0).toFixed(2)}
-                  </span>
+                  <span>Avg Score: {(stats.avg_composite_score ?? 0).toFixed(3)}</span>
+                  <span>Avg Cost: ${(stats.avg_cost_usd ?? 0).toFixed(2)}</span>
                 </div>
               )}
             </div>
@@ -670,11 +586,7 @@ function StrategiesTab({ strategies }: { strategies: Strategy[] }) {
 // Experiences Tab
 // =============================================================================
 
-function ExperiencesTab({
-  experiences,
-}: {
-  experiences: ExperienceSummary[];
-}) {
+function ExperiencesTab({ experiences }: { experiences: ExperienceSummary[] }) {
   return (
     <div className="space-y-3">
       {experiences.length > 0 ? (
@@ -683,10 +595,7 @@ function ExperiencesTab({
           const failures = tryParseArray(e.failure_points);
           const patterns = tryParseArray(e.effective_patterns);
           return (
-            <div
-              key={e.id}
-              className="rounded-lg border border-white/10 bg-white/[0.02] p-4"
-            >
+            <div key={e.id} className="rounded-lg border border-white/10 bg-white/[0.02] p-4">
               <div className="flex items-center gap-3 mb-2">
                 <span
                   className={`px-1.5 py-0.5 rounded text-[10px] ${
@@ -698,9 +607,7 @@ function ExperiencesTab({
                   {e.outcome}
                 </span>
                 <span className="text-xs text-white/60">{e.domain}</span>
-                <span className="text-xs text-white/40">
-                  {e.complexity_tier}
-                </span>
+                <span className="text-xs text-white/40">{e.complexity_tier}</span>
                 <span className="text-[10px] text-white/30 font-mono ml-auto">
                   {e.task_run_id.slice(0, 12)}...
                 </span>
@@ -738,9 +645,7 @@ function StatCard({
   return (
     <div
       className={`rounded-lg border p-4 ${
-        alert
-          ? "border-amber-500/30 bg-amber-500/5"
-          : "border-white/10 bg-white/[0.02]"
+        alert ? "border-amber-500/30 bg-amber-500/5" : "border-white/10 bg-white/[0.02]"
       }`}
     >
       <div className="text-2xl font-semibold text-white/90">{value}</div>
@@ -752,9 +657,7 @@ function StatCard({
 
 function EmptyState({ message }: { message: string }) {
   return (
-    <div className="flex items-center justify-center h-48 text-sm text-white/30">
-      {message}
-    </div>
+    <div className="flex items-center justify-center h-48 text-sm text-white/30">{message}</div>
   );
 }
 

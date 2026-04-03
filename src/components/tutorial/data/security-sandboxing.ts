@@ -19,14 +19,7 @@ export const securitySandboxingTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "settings",
   category: "Architecture",
-  tags: [
-    "security",
-    "sandboxing",
-    "containers",
-    "featured",
-    "architecture",
-    "ast",
-  ],
+  tags: ["security", "sandboxing", "containers", "featured", "architecture", "ast"],
   prerequisites: ["getting-started"],
   learningObjectives: [
     "Understand why agent sandboxing matters for autonomous workflows",

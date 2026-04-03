@@ -1,7 +1,19 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "../../lib/utils";
-import { Play, Square, Loader2, Zap, Save, Star, Trash2, FolderOpen, Layers, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  Play,
+  Square,
+  Loader2,
+  Zap,
+  Save,
+  Star,
+  Trash2,
+  FolderOpen,
+  Layers,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import { MultiLoopPanel } from "./MultiLoopPanel";
 
 // --- Types matching the Rust backend ---
@@ -512,7 +524,10 @@ export function OrchestrationLoopPanel() {
   return (
     <div className="flex flex-col h-full overflow-hidden" data-tutorial-id="ol-panel">
       {/* Header bar */}
-      <div className="px-4 py-2.5 border-b border-border flex items-center justify-between" data-tutorial-id="ol-header">
+      <div
+        className="px-4 py-2.5 border-b border-border flex items-center justify-between"
+        data-tutorial-id="ol-header"
+      >
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold">Orchestration Loop</h2>
           <button
@@ -746,7 +761,10 @@ export function OrchestrationLoopPanel() {
 
             {/* Config form */}
             {!running && (
-              <div className="border border-border rounded p-3 space-y-3" data-tutorial-id="ol-config-form">
+              <div
+                className="border border-border rounded p-3 space-y-3"
+                data-tutorial-id="ol-config-form"
+              >
                 <div className="flex items-center gap-4 flex-wrap">
                   <div className="flex items-center gap-2">
                     <label className="flex items-center gap-1 text-xs cursor-pointer">
@@ -886,7 +904,10 @@ export function OrchestrationLoopPanel() {
                   </div>
                 ) : (
                   <>
-                    <div className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")} data-tutorial-id="ol-pipeline-textareas">
+                    <div
+                      className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")}
+                      data-tutorial-id="ol-pipeline-textareas"
+                    >
                       <div>
                         <div className={cn(labelCls, "mb-1")}>Build Description</div>
                         <textarea
@@ -946,12 +967,18 @@ export function OrchestrationLoopPanel() {
                         </span>
                       </label>
                       {enableDiagnose && (
-                        <div className="flex items-center gap-1.5" data-tutorial-id="ol-diag-exit-strategy">
+                        <div
+                          className="flex items-center gap-1.5"
+                          data-tutorial-id="ol-diag-exit-strategy"
+                        >
                           <span className={labelCls}>Exit</span>
                           <select
                             value={exitStrategy}
                             onChange={(e) => setExitStrategy(e.target.value)}
-                            className={cn(inputCls, "w-auto [&>option]:text-black [&>option]:bg-white")}
+                            className={cn(
+                              inputCls,
+                              "w-auto [&>option]:text-black [&>option]:bg-white",
+                            )}
                             style={{ colorScheme: "dark" }}
                           >
                             <option value="reflection">Reflection (0 fixes)</option>
@@ -960,7 +987,10 @@ export function OrchestrationLoopPanel() {
                           </select>
                         </div>
                       )}
-                      <label data-tutorial-id="ol-enable-diagnose" className="flex items-center gap-1.5 text-xs cursor-pointer">
+                      <label
+                        data-tutorial-id="ol-enable-diagnose"
+                        className="flex items-center gap-1.5 text-xs cursor-pointer"
+                      >
                         <input
                           type="checkbox"
                           checked={enableDiagnose}
@@ -974,18 +1004,21 @@ export function OrchestrationLoopPanel() {
                       </label>
                     </div>
                     {enableDiagnose && (
-                      <div data-tutorial-id="ol-diag-config-panel" className="border border-teal-500/20 rounded p-3 space-y-2 bg-teal-500/5">
+                      <div
+                        data-tutorial-id="ol-diag-config-panel"
+                        className="border border-teal-500/20 rounded p-3 space-y-2 bg-teal-500/5"
+                      >
                         <div className="text-[0.7rem] font-semibold text-teal-400 mb-1">
                           Diagnostic Configuration
                         </div>
                         <div>
-                          <div className={cn(labelCls, "mb-1")}>
-                            Assertions (JSON array)
-                          </div>
+                          <div className={cn(labelCls, "mb-1")}>Assertions (JSON array)</div>
                           <textarea
                             value={diagnoseAssertions}
                             onChange={(e) => setDiagnoseAssertions(e.target.value)}
-                            placeholder={'[\n  { "type": "visible", "role": "tab", "name": "Transitions" },\n  { "type": "count", "role": "row", "min": 1 }\n]'}
+                            placeholder={
+                              '[\n  { "type": "visible", "role": "tab", "name": "Transitions" },\n  { "type": "count", "role": "row", "min": 1 }\n]'
+                            }
                             rows={6}
                             className={cn(textareaCls, "font-mono text-[0.7rem]")}
                           />
@@ -995,9 +1028,7 @@ export function OrchestrationLoopPanel() {
                             <input
                               type="checkbox"
                               checked={diagnoseCaptureSnapshot}
-                              onChange={(e) =>
-                                setDiagnoseCaptureSnapshot(e.target.checked)
-                              }
+                              onChange={(e) => setDiagnoseCaptureSnapshot(e.target.checked)}
                               className="accent-primary"
                             />
                             <span className="text-muted-foreground">Capture DOM snapshot</span>
@@ -1007,16 +1038,17 @@ export function OrchestrationLoopPanel() {
                             <input
                               type="number"
                               value={diagnoseSnapshotMaxChars}
-                              onChange={(e) =>
-                                setDiagnoseSnapshotMaxChars(Number(e.target.value))
-                              }
+                              onChange={(e) => setDiagnoseSnapshotMaxChars(Number(e.target.value))}
                               min={1000}
                               max={50000}
                               step={1000}
                               className={cn(inputCls, "w-20 text-center")}
                             />
                           </div>
-                          <div data-tutorial-id="ol-diag-model-override" className="flex items-center gap-1.5">
+                          <div
+                            data-tutorial-id="ol-diag-model-override"
+                            className="flex items-center gap-1.5"
+                          >
                             <span className={labelCls}>Model override</span>
                             <input
                               type="text"
@@ -1074,110 +1106,121 @@ export function OrchestrationLoopPanel() {
                       const isExpanded = expandedIters.has(iter.iteration);
                       return (
                         <Fragment key={iter.iteration}>
-                        <tr
-                          className={cn(
-                            "border-b border-border/50 hover:bg-muted/30",
-                            diag && "cursor-pointer",
-                          )}
-                          onClick={() => diag && toggleIterExpand(iter.iteration)}
-                        >
-                          <td className="px-3 py-1.5 text-primary font-semibold">
-                            <span className="flex items-center gap-1">
-                              {diag && (isExpanded
-                                ? <ChevronDown className="w-3 h-3 text-muted-foreground" />
-                                : <ChevronRight className="w-3 h-3 text-muted-foreground" />
-                              )}
-                              #{iter.iteration}
-                            </span>
-                          </td>
-                          <td className="px-3 py-1.5 font-mono">{duration}</td>
-                          <td className="px-3 py-1.5">
-                            <span
-                              className={
-                                iter.exit_check?.should_exit ? "text-green-400" : "text-yellow-400"
-                              }
-                            >
-                              {iter.exit_check?.should_exit ? "EXIT" : "CONTINUE"}
-                            </span>
-                          </td>
-                          <td
-                            className="px-3 py-1.5 max-w-[300px] truncate"
-                            title={iter.exit_check?.reason}
-                          >
-                            {iter.exit_check?.reason || "--"}
-                          </td>
-                          <td className="px-3 py-1.5">
-                            {diag ? (
-                              <span
-                                className={cn(
-                                  "inline-flex px-1.5 py-0.5 rounded text-[0.65rem] font-semibold",
-                                  diag.passed
-                                    ? "bg-green-500/10 text-green-400"
-                                    : "bg-red-500/10 text-red-400",
-                                )}
-                              >
-                                {diag.passed ? "PASS" : "FAIL"}
-                                {diag.root_cause && ` · ${diag.root_cause.replace(/_/g, " ")}`}
-                              </span>
-                            ) : (
-                              <span className="text-muted-foreground/40">--</span>
+                          <tr
+                            className={cn(
+                              "border-b border-border/50 hover:bg-muted/30",
+                              diag && "cursor-pointer",
                             )}
-                          </td>
-                          <td className="px-3 py-1.5 text-muted-foreground text-[0.7rem]">
-                            {meta.length > 0 ? meta.join(", ") : "--"}
-                          </td>
-                        </tr>
-                        {diag && isExpanded && (
-                          <tr key={`${iter.iteration}-diag`} className="border-b border-border/50">
-                            <td colSpan={6} className="px-3 py-2">
-                              <div className="ml-6 space-y-1.5 text-xs">
-                                {diag.diagnosis && (
-                                  <div>
-                                    <span className="text-teal-400 font-semibold">Diagnosis: </span>
-                                    <span className="text-foreground/80">{diag.diagnosis}</span>
-                                  </div>
-                                )}
-                                {diag.prompt_rewrite_suggestion && (
-                                  <div className="border-l-2 border-teal-500/30 pl-2 bg-teal-500/5 rounded-r py-1">
-                                    <span className="text-teal-400/70 font-semibold text-[0.7rem]">
-                                      Suggested prompt rewrite:{" "}
-                                    </span>
-                                    <span className="text-foreground/70 text-[0.7rem]">
-                                      {diag.prompt_rewrite_suggestion}
-                                    </span>
-                                  </div>
-                                )}
-                                {diag.assertion_results.length > 0 && (
-                                  <div>
-                                    <span className="text-muted-foreground font-semibold text-[0.7rem]">
-                                      Assertions ({diag.assertion_results.length}):
-                                    </span>
-                                    <div className="mt-0.5 flex flex-wrap gap-1">
-                                      {diag.assertion_results.map((a, i) => {
-                                        const passed = (a as Record<string, unknown>).passed;
-                                        return (
-                                          <span
-                                            key={i}
-                                            className={cn(
-                                              "px-1.5 py-0.5 rounded text-[0.65rem] font-mono",
-                                              passed
-                                                ? "bg-green-500/10 text-green-400"
-                                                : "bg-red-500/10 text-red-400",
-                                            )}
-                                            title={JSON.stringify(a, null, 2)}
-                                          >
-                                            {((a as Record<string, unknown>).type as string | undefined) ?? `#${i + 1}`}
-                                            {passed ? " ✓" : " ✗"}
-                                          </span>
-                                        );
-                                      })}
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
+                            onClick={() => diag && toggleIterExpand(iter.iteration)}
+                          >
+                            <td className="px-3 py-1.5 text-primary font-semibold">
+                              <span className="flex items-center gap-1">
+                                {diag &&
+                                  (isExpanded ? (
+                                    <ChevronDown className="w-3 h-3 text-muted-foreground" />
+                                  ) : (
+                                    <ChevronRight className="w-3 h-3 text-muted-foreground" />
+                                  ))}
+                                #{iter.iteration}
+                              </span>
+                            </td>
+                            <td className="px-3 py-1.5 font-mono">{duration}</td>
+                            <td className="px-3 py-1.5">
+                              <span
+                                className={
+                                  iter.exit_check?.should_exit
+                                    ? "text-green-400"
+                                    : "text-yellow-400"
+                                }
+                              >
+                                {iter.exit_check?.should_exit ? "EXIT" : "CONTINUE"}
+                              </span>
+                            </td>
+                            <td
+                              className="px-3 py-1.5 max-w-[300px] truncate"
+                              title={iter.exit_check?.reason}
+                            >
+                              {iter.exit_check?.reason || "--"}
+                            </td>
+                            <td className="px-3 py-1.5">
+                              {diag ? (
+                                <span
+                                  className={cn(
+                                    "inline-flex px-1.5 py-0.5 rounded text-[0.65rem] font-semibold",
+                                    diag.passed
+                                      ? "bg-green-500/10 text-green-400"
+                                      : "bg-red-500/10 text-red-400",
+                                  )}
+                                >
+                                  {diag.passed ? "PASS" : "FAIL"}
+                                  {diag.root_cause && ` · ${diag.root_cause.replace(/_/g, " ")}`}
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground/40">--</span>
+                              )}
+                            </td>
+                            <td className="px-3 py-1.5 text-muted-foreground text-[0.7rem]">
+                              {meta.length > 0 ? meta.join(", ") : "--"}
                             </td>
                           </tr>
-                        )}
+                          {diag && isExpanded && (
+                            <tr
+                              key={`${iter.iteration}-diag`}
+                              className="border-b border-border/50"
+                            >
+                              <td colSpan={6} className="px-3 py-2">
+                                <div className="ml-6 space-y-1.5 text-xs">
+                                  {diag.diagnosis && (
+                                    <div>
+                                      <span className="text-teal-400 font-semibold">
+                                        Diagnosis:{" "}
+                                      </span>
+                                      <span className="text-foreground/80">{diag.diagnosis}</span>
+                                    </div>
+                                  )}
+                                  {diag.prompt_rewrite_suggestion && (
+                                    <div className="border-l-2 border-teal-500/30 pl-2 bg-teal-500/5 rounded-r py-1">
+                                      <span className="text-teal-400/70 font-semibold text-[0.7rem]">
+                                        Suggested prompt rewrite:{" "}
+                                      </span>
+                                      <span className="text-foreground/70 text-[0.7rem]">
+                                        {diag.prompt_rewrite_suggestion}
+                                      </span>
+                                    </div>
+                                  )}
+                                  {diag.assertion_results.length > 0 && (
+                                    <div>
+                                      <span className="text-muted-foreground font-semibold text-[0.7rem]">
+                                        Assertions ({diag.assertion_results.length}):
+                                      </span>
+                                      <div className="mt-0.5 flex flex-wrap gap-1">
+                                        {diag.assertion_results.map((a, i) => {
+                                          const passed = (a as Record<string, unknown>).passed;
+                                          return (
+                                            <span
+                                              key={i}
+                                              className={cn(
+                                                "px-1.5 py-0.5 rounded text-[0.65rem] font-mono",
+                                                passed
+                                                  ? "bg-green-500/10 text-green-400"
+                                                  : "bg-red-500/10 text-red-400",
+                                              )}
+                                              title={JSON.stringify(a, null, 2)}
+                                            >
+                                              {((a as Record<string, unknown>).type as
+                                                | string
+                                                | undefined) ?? `#${i + 1}`}
+                                              {passed ? " ✓" : " ✗"}
+                                            </span>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
                         </Fragment>
                       );
                     })}

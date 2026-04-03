@@ -60,7 +60,9 @@ export function ProcessOutputViewer({
   const [searchText, setSearchText] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const listRef = useListRef(null);
-  const scrollableRef = listRef as React.RefObject<{ scrollToRow: (config: { index: number; align?: string }) => void } | null>;
+  const scrollableRef = listRef as React.RefObject<{
+    scrollToRow: (config: { index: number; align?: string }) => void;
+  } | null>;
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const LINE_HEIGHT = 20;
 

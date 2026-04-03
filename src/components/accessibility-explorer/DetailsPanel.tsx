@@ -83,9 +83,7 @@ export function DetailsPanel({
         <div className="flex items-center justify-between">
           <span className="text-muted-foreground text-xs">Ref ID</span>
           <div className="flex items-center gap-1">
-            <code className="font-mono text-xs bg-muted/30 px-1.5 py-0.5 rounded">
-              {node.ref}
-            </code>
+            <code className="font-mono text-xs bg-muted/30 px-1.5 py-0.5 rounded">{node.ref}</code>
             <button
               type="button"
               onClick={() => copyToClipboard(node.ref)}

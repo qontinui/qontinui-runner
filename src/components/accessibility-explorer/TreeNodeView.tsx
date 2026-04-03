@@ -14,17 +14,12 @@ import type { UnifiedNode } from "./types";
 /** Color mapping for common accessibility roles. */
 function getRoleBadgeVariant(role: string): "info" | "success" | "muted" | "default" | "purple" {
   const lower = role.toLowerCase();
-  if (
-    lower.includes("button") ||
-    lower === "link" ||
-    lower === "menuitem" ||
-    lower === "tab"
-  ) {
+  if (lower.includes("button") || lower === "link" || lower === "menuitem" || lower === "tab") {
     return "info";
   }
   if (
     lower.includes("edit") ||
-    lower.includes("text") && lower.includes("input") ||
+    (lower.includes("text") && lower.includes("input")) ||
     lower === "combobox" ||
     lower === "spinbutton" ||
     lower === "slider" ||
@@ -34,12 +29,7 @@ function getRoleBadgeVariant(role: string): "info" | "success" | "muted" | "defa
   ) {
     return "success";
   }
-  if (
-    lower === "statictext" ||
-    lower === "text" ||
-    lower === "label" ||
-    lower === "heading"
-  ) {
+  if (lower === "statictext" || lower === "text" || lower === "label" || lower === "heading") {
     return "muted";
   }
   if (
@@ -79,13 +69,10 @@ const TreeNodeView = memo(function TreeNodeView({
   const hasChildren = node.children.length > 0;
   const isSelected = selectedRef === node.ref;
 
-  const handleToggle = useCallback(
-    (e: React.MouseEvent) => {
-      e.stopPropagation();
-      setExpanded((prev) => !prev);
-    },
-    [],
-  );
+  const handleToggle = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    setExpanded((prev) => !prev);
+  }, []);
 
   const handleSelect = useCallback(() => {
     onSelect(node);

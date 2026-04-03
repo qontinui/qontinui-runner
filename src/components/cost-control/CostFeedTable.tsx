@@ -75,9 +75,7 @@ export function CostFeedTable({ events }: CostFeedTableProps) {
                   key={`${evt.timestamp}-${i}`}
                   className="border-b border-border/30 hover:bg-muted/20 transition-colors"
                 >
-                  <td className="py-1.5 px-2 text-muted-foreground">
-                    {formatTime(evt.timestamp)}
-                  </td>
+                  <td className="py-1.5 px-2 text-muted-foreground">{formatTime(evt.timestamp)}</td>
                   <td className="py-1.5 px-2">{evt.phase}</td>
                   <td className="py-1.5 px-2 text-right text-muted-foreground">
                     {evt.iteration ?? "-"}
@@ -85,9 +83,7 @@ export function CostFeedTable({ events }: CostFeedTableProps) {
                   <td className="py-1.5 px-2 text-right text-muted-foreground">
                     {formatTokenCount(evt.input_tokens)}/{formatTokenCount(evt.output_tokens)}
                   </td>
-                  <td className="py-1.5 px-2 text-right font-mono">
-                    {formatCost(evt.cost_usd)}
-                  </td>
+                  <td className="py-1.5 px-2 text-right font-mono">{formatCost(evt.cost_usd)}</td>
                   <td className="py-1.5 px-2 text-right font-mono">
                     {formatCost(evt.cumulative_cost_usd)}
                   </td>

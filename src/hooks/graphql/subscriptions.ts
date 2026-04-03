@@ -219,10 +219,7 @@ export interface CostAnomalyEventData {
   timestamp: string;
 }
 
-export type CostEventData =
-  | CostUpdateEventData
-  | BudgetWarningEventData
-  | CostAnomalyEventData;
+export type CostEventData = CostUpdateEventData | BudgetWarningEventData | CostAnomalyEventData;
 
 /**
  * Subscribe to cost events (cost updates, budget warnings, anomalies).

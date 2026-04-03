@@ -22,16 +22,7 @@ export const traceObservabilityTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "gui-automation",
   category: "Observability",
-  tags: [
-    "featured",
-    "traces",
-    "observability",
-    "tokens",
-    "cost",
-    "replay",
-    "agent-graph",
-    "genai",
-  ],
+  tags: ["featured", "traces", "observability", "tokens", "cost", "replay", "agent-graph", "genai"],
   prerequisites: ["trace-analysis"],
   learningObjectives: [
     "Use token/cost heatmap overlays to find expensive spans at a glance",

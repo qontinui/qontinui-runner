@@ -39,9 +39,7 @@ export function AnomalyFeed({ anomalies }: AnomalyFeedProps) {
       <h3 className="text-sm font-semibold flex items-center gap-2 mb-3">
         <AlertTriangle className="w-4 h-4 text-yellow-500" />
         Anomaly Detection
-        <span className="text-xs text-muted-foreground font-normal">
-          ({anomalies.length})
-        </span>
+        <span className="text-xs text-muted-foreground font-normal">({anomalies.length})</span>
       </h3>
       <div className="max-h-48 overflow-y-auto space-y-2">
         {anomalies.map((anomaly, i) => (
@@ -53,9 +51,7 @@ export function AnomalyFeed({ anomalies }: AnomalyFeedProps) {
               <span className="text-yellow-500 font-medium">
                 z-score: {anomaly.z_score.toFixed(2)}
               </span>
-              <span className="text-muted-foreground">
-                {formatTime(anomaly.timestamp)}
-              </span>
+              <span className="text-muted-foreground">{formatTime(anomaly.timestamp)}</span>
             </div>
             <p className="text-muted-foreground">{anomaly.message}</p>
             <div className="flex gap-3 mt-1 text-muted-foreground">

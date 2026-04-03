@@ -55,7 +55,11 @@ function getTestStatusStyle(status: string) {
 
 export function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
   const [pageSize, setPageSize] = useState(PAGE_SIZE);
-  const { data: playwrightData, isLoading, error } = useTaskRunPlaywrightResults(taskRunId, pageSize);
+  const {
+    data: playwrightData,
+    isLoading,
+    error,
+  } = useTaskRunPlaywrightResults(taskRunId, pageSize);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const loadMore = useCallback(() => {

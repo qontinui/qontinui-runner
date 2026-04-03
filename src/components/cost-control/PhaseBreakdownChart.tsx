@@ -6,15 +6,7 @@
  */
 
 import { useMemo } from "react";
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  Legend,
-} from "recharts";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { Layers } from "lucide-react";
 import type { PhaseCostBreakdown } from "./types";
 
@@ -104,11 +96,7 @@ export function PhaseBreakdownChart({ data }: PhaseBreakdownChartProps) {
 
       <div className="h-64">
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart
-            data={chartData}
-            layout="vertical"
-            margin={{ left: leftMargin, right: 20 }}
-          >
+          <BarChart data={chartData} layout="vertical" margin={{ left: leftMargin, right: 20 }}>
             <XAxis
               type="number"
               tick={{ fontSize: 11, fill: "hsl(var(--muted-foreground))" }}
@@ -123,9 +111,7 @@ export function PhaseBreakdownChart({ data }: PhaseBreakdownChartProps) {
             <Tooltip content={<CustomTooltip />} />
             <Legend
               wrapperStyle={{ fontSize: 11 }}
-              formatter={(value: string) =>
-                value === "cost" ? "Cost (USD)" : value
-              }
+              formatter={(value: string) => (value === "cost" ? "Cost (USD)" : value)}
             />
             <Bar
               dataKey="cost"

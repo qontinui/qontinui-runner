@@ -18,14 +18,7 @@ export const schemaValidationTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "gui-automation",
   category: "AI Architecture",
-  tags: [
-    "featured",
-    "schema",
-    "validation",
-    "structured-output",
-    "agents",
-    "reliability",
-  ],
+  tags: ["featured", "schema", "validation", "structured-output", "agents", "reliability"],
   prerequisites: ["workflow-execution"],
   learningObjectives: [
     "Understand why LLM output needs schema validation and what goes wrong without it",
@@ -77,7 +70,7 @@ Required field "findings" (array of objects): Each with "type", "message", "seve
 This replaces the old hand-written \`worker_output_instructions()\` function that had to be manually kept in sync with the struct definition.`,
       tips: [
         "The schema registry uses a global cache — schemas are generated once and reused",
-        "schemars supports #[schemars(description = \"...\")] for field-level docs that appear in the schema",
+        'schemars supports #[schemars(description = "...")] for field-level docs that appear in the schema',
       ],
       estimatedDuration: 2,
     },

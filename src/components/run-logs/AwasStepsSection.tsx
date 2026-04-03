@@ -61,7 +61,11 @@ function getStepTypeStyle(stepType: string) {
 export function AwasStepsSection() {
   const { selectedRunId, selectedRun: _selectedRun } = useRunSelection();
   const [pageSize, setPageSize] = useState(PAGE_SIZE);
-  const { data: awasData, isLoading, error } = useTaskRunAwasSteps(selectedRunId, undefined, pageSize);
+  const {
+    data: awasData,
+    isLoading,
+    error,
+  } = useTaskRunAwasSteps(selectedRunId, undefined, pageSize);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const loadMore = useCallback(() => {

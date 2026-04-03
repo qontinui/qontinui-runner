@@ -7,14 +7,7 @@
 
 import { useState, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  Accessibility,
-  RefreshCw,
-  Plug,
-  Unplug,
-  Search,
-  Eye,
-} from "lucide-react";
+import { Accessibility, RefreshCw, Plug, Unplug, Search, Eye } from "lucide-react";
 import { cn } from "../../lib/utils";
 import {
   Button,

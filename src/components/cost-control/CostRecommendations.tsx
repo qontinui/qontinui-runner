@@ -97,9 +97,7 @@ function deriveInsights(dashboard: CostDashboard | null): CostInsight[] {
 
   // Identify the most expensive phase
   if (dashboard.per_phase_breakdown.length > 1) {
-    const sorted = [...dashboard.per_phase_breakdown].sort(
-      (a, b) => b.cost_usd - a.cost_usd
-    );
+    const sorted = [...dashboard.per_phase_breakdown].sort((a, b) => b.cost_usd - a.cost_usd);
     const top = sorted[0];
     const totalCost = dashboard.total_cost_usd;
     if (totalCost > 0) {
@@ -130,17 +128,14 @@ function deriveInsights(dashboard: CostDashboard | null): CostInsight[] {
 
 export function CostRecommendations() {
   // Fetch meta-optimizer recommendations filtered to cost optimization
-  const {
-    data: recommendations,
-    isLoading: recsLoading,
-  } = useQuery<Recommendation[]>({
+  const { data: recommendations, isLoading: recsLoading } = useQuery<Recommendation[]>({
     queryKey: ["cost-recommendations"],
     queryFn: async () => {
       try {
-        return await invoke<Recommendation[]>(
-          "get_meta_optimizer_recommendations",
-          { optimizerType: "pipeline_prompt", status: null }
-        );
+        return await invoke<Recommendation[]>("get_meta_optimizer_recommendations", {
+          optimizerType: "pipeline_prompt",
+          status: null,
+        });
       } catch {
         // Command may not be available if PG isn't connected
         return [];
@@ -164,7 +159,7 @@ export function CostRecommendations() {
       r.recommendation_type === "duplicate_prompt" ||
       r.title.toLowerCase().includes("cost") ||
       r.title.toLowerCase().includes("cache") ||
-      r.title.toLowerCase().includes("duplicate")
+      r.title.toLowerCase().includes("duplicate"),
   );
 
   const insights = deriveInsights(dashboard ?? null);
@@ -190,9 +185,7 @@ export function CostRecommendations() {
         <div className="text-center text-muted-foreground py-6">
           <TrendingDown className="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p className="text-sm">No cost optimization recommendations yet</p>
-          <p className="text-xs mt-1">
-            Run workflows to accumulate data for cost analysis
-          </p>
+          <p className="text-xs mt-1">Run workflows to accumulate data for cost analysis</p>
         </div>
       ) : (
         <div className="space-y-2 max-h-64 overflow-y-auto">
@@ -200,18 +193,11 @@ export function CostRecommendations() {
           {costRecs.map((rec) => {
             const tier = confidenceTier(rec.confidence);
             return (
-              <div
-                key={rec.id}
-                className="rounded-md border border-border/30 bg-muted/30 p-3"
-              >
+              <div key={rec.id} className="rounded-md border border-border/30 bg-muted/30 p-3">
                 <div className="flex items-center gap-2 mb-1">
                   <CheckCircle2 className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
-                  <span className="text-sm font-medium flex-1">
-                    {rec.title}
-                  </span>
-                  <span
-                    className={`text-[10px] px-1.5 py-0.5 rounded ${CONFIDENCE_COLORS[tier]}`}
-                  >
+                  <span className="text-sm font-medium flex-1">{rec.title}</span>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${CONFIDENCE_COLORS[tier]}`}>
                     {(rec.confidence * 100).toFixed(0)}%
                   </span>
                   <span
@@ -220,9 +206,7 @@ export function CostRecommendations() {
                     {rec.status}
                   </span>
                 </div>
-                <p className="text-xs text-muted-foreground ml-5.5 pl-px">
-                  {rec.description}
-                </p>
+                <p className="text-xs text-muted-foreground ml-5.5 pl-px">{rec.description}</p>
                 {rec.target_agent && (
                   <span className="text-[10px] text-muted-foreground ml-5.5 pl-px mt-1 inline-block">
                     Agent: {rec.target_agent}
@@ -244,9 +228,7 @@ export function CostRecommendations() {
                 />
                 <span className="text-sm font-medium">{insight.title}</span>
               </div>
-              <p className="text-xs text-muted-foreground ml-4">
-                {insight.description}
-              </p>
+              <p className="text-xs text-muted-foreground ml-4">{insight.description}</p>
             </div>
           ))}
         </div>

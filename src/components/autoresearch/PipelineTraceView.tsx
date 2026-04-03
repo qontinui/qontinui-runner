@@ -112,8 +112,20 @@ function TraceRow({ trace }: { trace: PipelineAgentTrace }) {
         </td>
         <td className="px-2 py-1 text-center">
           {trace.schema_valid_first_attempt != null ? (
-            <span className={trace.schema_valid_first_attempt ? "text-green-400" : trace.validation_retries ? "text-yellow-400" : "text-red-400"}>
-              {trace.schema_valid_first_attempt ? "✓" : trace.validation_retries ? `R${trace.validation_retries}` : "✗"}
+            <span
+              className={
+                trace.schema_valid_first_attempt
+                  ? "text-green-400"
+                  : trace.validation_retries
+                    ? "text-yellow-400"
+                    : "text-red-400"
+              }
+            >
+              {trace.schema_valid_first_attempt
+                ? "✓"
+                : trace.validation_retries
+                  ? `R${trace.validation_retries}`
+                  : "✗"}
             </span>
           ) : (
             <span className="text-zinc-600">—</span>
@@ -191,7 +203,10 @@ export function PipelineTraceView({ result }: Props) {
       </div>
 
       {/* Agent Traces */}
-      <div className="border border-zinc-700 rounded overflow-auto max-h-80" data-tutorial-id="pipeline-trace-table">
+      <div
+        className="border border-zinc-700 rounded overflow-auto max-h-80"
+        data-tutorial-id="pipeline-trace-table"
+      >
         <table className="w-full text-xs">
           <thead className="bg-zinc-800 sticky top-0">
             <tr>

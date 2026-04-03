@@ -32,15 +32,8 @@ function formatTokenCount(count: number): string {
 }
 
 export default function CostControlPanel() {
-  const {
-    costEvents,
-    budgetWarnings,
-    anomalies,
-    dashboard,
-    activeBudget,
-    isLoading,
-    refresh,
-  } = useCostControl();
+  const { costEvents, budgetWarnings, anomalies, dashboard, activeBudget, isLoading, refresh } =
+    useCostControl();
 
   if (isLoading) {
     return (
@@ -96,11 +89,7 @@ export default function CostControlPanel() {
         />
         <MetricCard
           title="Cache Hit Rate"
-          value={
-            dashboard
-              ? `${(dashboard.cache_hit_rate * 100).toFixed(0)}%`
-              : "0%"
-          }
+          value={dashboard ? `${(dashboard.cache_hit_rate * 100).toFixed(0)}%` : "0%"}
           subtitle="Token cache efficiency"
         />
         <MetricCard
@@ -114,7 +103,10 @@ export default function CostControlPanel() {
       {/* Budget Gauge + Phase Breakdown */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Budget Gauge */}
-        <div data-tutorial-id="cc-budget-gauge" className="bg-card rounded-lg border border-border/50 p-4">
+        <div
+          data-tutorial-id="cc-budget-gauge"
+          className="bg-card rounded-lg border border-border/50 p-4"
+        >
           <h3 className="text-sm font-semibold flex items-center gap-2 mb-4">
             <Wallet className="w-4 h-4" />
             Budget Utilization
@@ -127,17 +119,13 @@ export default function CostControlPanel() {
             <div className="text-center text-muted-foreground py-8">
               <AlertTriangle className="w-8 h-8 mx-auto mb-2 opacity-50" />
               <p className="text-sm">No active run</p>
-              <p className="text-xs mt-1">
-                Budget tracking will appear when a run starts
-              </p>
+              <p className="text-xs mt-1">Budget tracking will appear when a run starts</p>
             </div>
           )}
         </div>
 
         {/* Phase Breakdown */}
-        <PhaseBreakdownChart
-          data={dashboard?.per_phase_breakdown ?? []}
-        />
+        <PhaseBreakdownChart data={dashboard?.per_phase_breakdown ?? []} />
       </div>
 
       {/* ============================================================ */}

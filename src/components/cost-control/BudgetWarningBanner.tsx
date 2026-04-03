@@ -28,9 +28,7 @@ export function BudgetWarningBanner({ warnings }: BudgetWarningBannerProps) {
         <p className="text-sm font-medium text-yellow-500">
           Budget Warning - {remainingPct}% remaining
         </p>
-        <p className="text-xs text-muted-foreground mt-1">
-          {latest.message}
-        </p>
+        <p className="text-xs text-muted-foreground mt-1">{latest.message}</p>
         <p className="text-xs text-muted-foreground mt-0.5">
           ${latest.total_cost_usd.toFixed(2)} / ${latest.budget_limit_usd.toFixed(2)}
         </p>

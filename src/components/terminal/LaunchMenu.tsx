@@ -33,7 +33,8 @@ function CountButtons({
           }}
           className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#2a2d3d]/60 text-[#a9b1d6] hover:bg-[#7aa2f7]/20 hover:text-[#7aa2f7] transition-colors"
         >
-          {c}{suffix}
+          {c}
+          {suffix}
         </button>
       ))}
     </span>
@@ -42,8 +43,7 @@ function CountButtons({
 
 function UtilizationBar({ utilization }: { utilization: number }) {
   const pct = Math.round((utilization ?? 0) * 100);
-  const color =
-    pct >= 80 ? "#f7768e" : pct >= 50 ? "#e0af68" : "#9ece6a";
+  const color = pct >= 80 ? "#f7768e" : pct >= 50 ? "#e0af68" : "#9ece6a";
 
   return (
     <span className="flex items-center gap-1.5 shrink-0">
@@ -53,10 +53,7 @@ function UtilizationBar({ utilization }: { utilization: number }) {
           style={{ width: `${pct}%`, backgroundColor: color }}
         />
       </span>
-      <span
-        className="text-[10px] font-mono w-7 text-right"
-        style={{ color }}
-      >
+      <span className="text-[10px] font-mono w-7 text-right" style={{ color }}>
         {pct}%
       </span>
     </span>
@@ -119,8 +116,9 @@ export function LaunchMenu({
 
   const distributeRoundRobin = (count: number): string[] => {
     if (sortedAccounts.length === 0) return [];
-    return Array.from({ length: count }, (_, i) =>
-      sortedAccounts[i % sortedAccounts.length].config_dir,
+    return Array.from(
+      { length: count },
+      (_, i) => sortedAccounts[i % sortedAccounts.length].config_dir,
     );
   };
 
@@ -160,9 +158,7 @@ export function LaunchMenu({
           {bestAccount && (
             <>
               <button
-                onClick={() =>
-                  fire(() => onCreateAiSession(1, bestAccount.config_dir))
-                }
+                onClick={() => fire(() => onCreateAiSession(1, bestAccount.config_dir))}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#9ece6a]/10 transition-colors"
               >
                 <Star className="w-3.5 h-3.5 text-[#e0af68]" />
@@ -181,9 +177,7 @@ export function LaunchMenu({
                 <span className="text-left">Best Account x N</span>
                 <CountButtons
                   counts={[2, 4, 6]}
-                  onSelect={(c) =>
-                    fire(() => onCreateAiSession(c, bestAccount.config_dir))
-                  }
+                  onSelect={(c) => fire(() => onCreateAiSession(c, bestAccount.config_dir))}
                 />
               </div>
             </>
@@ -196,15 +190,11 @@ export function LaunchMenu({
           {sortedAccounts.map((account) => (
             <button
               key={account.config_dir}
-              onClick={() =>
-                fire(() => onCreateAiSession(1, account.config_dir))
-              }
+              onClick={() => fire(() => onCreateAiSession(1, account.config_dir))}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#7aa2f7]/10 transition-colors"
             >
               <span className="w-2 h-2 rounded-full bg-[#7aa2f7] shrink-0" />
-              <span className="flex-1 text-left truncate">
-                {extractLabel(account.config_dir)}
-              </span>
+              <span className="flex-1 text-left truncate">{extractLabel(account.config_dir)}</span>
               <UtilizationBar utilization={account.utilization} />
             </button>
           ))}
@@ -218,9 +208,7 @@ export function LaunchMenu({
                 <span className="text-left">Round-robin accounts</span>
                 <CountButtons
                   counts={[2, 4, 6]}
-                  onSelect={(c) =>
-                    fire(() => onCreateMultiAiSessions(distributeRoundRobin(c)))
-                  }
+                  onSelect={(c) => fire(() => onCreateMultiAiSessions(distributeRoundRobin(c)))}
                 />
               </div>
             </>

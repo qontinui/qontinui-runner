@@ -416,7 +416,11 @@ export function useTaskRunEvents(taskRunId: string | null, eventType?: string, l
  * Hook to get Playwright test results from SQLite database.
  * @param taskRunId - Task run ID to get results for
  */
-export function useTaskRunPlaywrightResults(taskRunId: string | null, limit?: number, offset?: number) {
+export function useTaskRunPlaywrightResults(
+  taskRunId: string | null,
+  limit?: number,
+  offset?: number,
+) {
   return useQuery({
     queryKey: [...aiDataKeys.taskRunPlaywrightResults(taskRunId ?? ""), limit, offset],
     queryFn: async (): Promise<TaskRunPlaywrightResultsDbResult | null> => {
@@ -457,12 +461,22 @@ export function useTaskRunMigratedLogsSummary(taskRunId: string | null) {
  * @param taskRunId - Task run ID to get API requests for
  * @param successFilter - Optional filter by success status
  */
-export function useTaskRunApiRequests(taskRunId: string | null, successFilter?: boolean, limit?: number, offset?: number) {
+export function useTaskRunApiRequests(
+  taskRunId: string | null,
+  successFilter?: boolean,
+  limit?: number,
+  offset?: number,
+) {
   return useQuery({
     queryKey: [...aiDataKeys.taskRunApiRequests(taskRunId ?? "", successFilter), limit, offset],
     queryFn: async (): Promise<TaskRunApiRequestsDbResult | null> => {
       if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunApiRequests(taskRunId, successFilter, limit, offset);
+      const response = await aiDataService.getTaskRunApiRequests(
+        taskRunId,
+        successFilter,
+        limit,
+        offset,
+      );
       if (!response.success || !response.data) {
         throw new Error(response.error || "Failed to load API requests");
       }
@@ -478,7 +492,12 @@ export function useTaskRunApiRequests(taskRunId: string | null, successFilter?: 
  * @param taskRunId - Task run ID to get AWAS steps for
  * @param stepType - Optional filter by step type ('awas_discover', 'awas_execute', etc.)
  */
-export function useTaskRunAwasSteps(taskRunId: string | null, stepType?: string, limit?: number, offset?: number) {
+export function useTaskRunAwasSteps(
+  taskRunId: string | null,
+  stepType?: string,
+  limit?: number,
+  offset?: number,
+) {
   return useQuery({
     queryKey: [...aiDataKeys.taskRunAwasSteps(taskRunId ?? "", stepType), limit, offset],
     queryFn: async (): Promise<TaskRunAwasStepsDbResult | null> => {
@@ -499,12 +518,22 @@ export function useTaskRunAwasSteps(taskRunId: string | null, stepType?: string,
  * @param taskRunId - Task run ID to get MCP calls for
  * @param successFilter - Optional filter by success status
  */
-export function useTaskRunMcpCalls(taskRunId: string | null, successFilter?: boolean, limit?: number, offset?: number) {
+export function useTaskRunMcpCalls(
+  taskRunId: string | null,
+  successFilter?: boolean,
+  limit?: number,
+  offset?: number,
+) {
   return useQuery({
     queryKey: [...aiDataKeys.taskRunMcpCalls(taskRunId ?? "", successFilter), limit, offset],
     queryFn: async (): Promise<TaskRunMcpCallsDbResult | null> => {
       if (!taskRunId) return null;
-      const response = await aiDataService.getTaskRunMcpCalls(taskRunId, successFilter, limit, offset);
+      const response = await aiDataService.getTaskRunMcpCalls(
+        taskRunId,
+        successFilter,
+        limit,
+        offset,
+      );
       if (!response.success || !response.data) {
         throw new Error(response.error || "Failed to load MCP calls");
       }

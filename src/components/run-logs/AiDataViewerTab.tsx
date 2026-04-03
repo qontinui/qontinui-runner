@@ -411,7 +411,8 @@ function ConsolidatedAiOutputDisplay({
   const estimatedTotalHeight =
     totalLines * LINE_HEIGHT_PX + displayedChunks.length * HEADER_HEIGHT_PX + BASE_UI_HEIGHT_PX;
 
-  const shouldDefaultExpand = displayedChunks.length <= 1 || estimatedTotalHeight < window.innerHeight;
+  const shouldDefaultExpand =
+    displayedChunks.length <= 1 || estimatedTotalHeight < window.innerHeight;
 
   return (
     <div className="space-y-4">
@@ -1366,7 +1367,10 @@ function EventsSection() {
           {eventTypes.map(({ type, label, count }) => (
             <button
               key={label}
-              onClick={() => { setEventFilter(type); setEventsLimit(EVENTS_SERVER_PAGE_SIZE); }}
+              onClick={() => {
+                setEventFilter(type);
+                setEventsLimit(EVENTS_SERVER_PAGE_SIZE);
+              }}
               className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
                 eventFilter === type
                   ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
@@ -1385,9 +1389,10 @@ function EventsSection() {
           <div className="space-y-2">
             <div className="text-xs text-muted-foreground">
               Showing {sqliteEvents.count} events
-              {migratedSummary?.events_count != null && sqliteEvents.count < migratedSummary.events_count && (
-                <span className="ml-1">of {migratedSummary.events_count} total</span>
-              )}
+              {migratedSummary?.events_count != null &&
+                sqliteEvents.count < migratedSummary.events_count && (
+                  <span className="ml-1">of {migratedSummary.events_count} total</span>
+                )}
             </div>
             <EventsDisplay events={sqliteEvents.events} />
             {sqliteEvents.events.length >= eventsLimit && (

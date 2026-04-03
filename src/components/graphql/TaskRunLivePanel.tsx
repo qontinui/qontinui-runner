@@ -34,7 +34,11 @@ interface OutputLineRowProps {
   lines: string[];
 }
 
-function OutputLineRow({ index, style, lines }: RowComponentProps<OutputLineRowProps>): ReactElement {
+function OutputLineRow({
+  index,
+  style,
+  lines,
+}: RowComponentProps<OutputLineRowProps>): ReactElement {
   return (
     <div style={style} className="whitespace-nowrap overflow-hidden text-ellipsis">
       {lines[index]}
@@ -306,7 +310,10 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
                   )}
                 </div>
               </div>
-              <div className="text-xs text-muted-foreground bg-muted/30 rounded font-mono" style={{ height: Math.min(outputLines.length * OUTPUT_LINE_HEIGHT, 128) }}>
+              <div
+                className="text-xs text-muted-foreground bg-muted/30 rounded font-mono"
+                style={{ height: Math.min(outputLines.length * OUTPUT_LINE_HEIGHT, 128) }}
+              >
                 <List
                   listRef={outputListRef}
                   rowCount={outputLines.length}
@@ -314,7 +321,10 @@ export function TaskRunLivePanel({ taskRunId, className, compact = false }: Task
                   rowComponent={OutputLineRow}
                   rowProps={{ lines: outputLines }}
                   overscanCount={5}
-                  style={{ width: "100%", height: Math.min(outputLines.length * OUTPUT_LINE_HEIGHT, 128) }}
+                  style={{
+                    width: "100%",
+                    height: Math.min(outputLines.length * OUTPUT_LINE_HEIGHT, 128),
+                  }}
                 />
               </div>
             </div>

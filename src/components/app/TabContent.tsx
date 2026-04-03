@@ -83,9 +83,7 @@ import { Loader2 } from "lucide-react";
 const LlmObservabilityDashboard = lazy(
   () => import("../llm-observability/LlmObservabilityDashboard"),
 );
-const CostControlPanel = lazy(
-  () => import("../cost-control/CostControlPanel"),
-);
+const CostControlPanel = lazy(() => import("../cost-control/CostControlPanel"));
 const EvaluationDashboard = lazy(() => import("../evaluation/EvaluationDashboard"));
 const SkillApprovalPanel = lazy(() =>
   import("../skills/SkillApprovalPanel").then((m) => ({ default: m.SkillApprovalPanel })),

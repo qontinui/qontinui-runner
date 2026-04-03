@@ -26,7 +26,11 @@ interface OutputLineRowProps {
   lines: ProcessSessionOutputLine[];
 }
 
-function OutputLineRow({ index, style, lines }: RowComponentProps<OutputLineRowProps>): ReactElement {
+function OutputLineRow({
+  index,
+  style,
+  lines,
+}: RowComponentProps<OutputLineRowProps>): ReactElement {
   const line = lines[index];
   return (
     <div
@@ -262,7 +266,9 @@ export function ProcessSessionOutputSection({
   const [searchText, setSearchText] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const listRef = useListRef(null);
-  const scrollableRef = listRef as React.RefObject<{ scrollToRow: (config: { index: number; align?: string }) => void } | null>;
+  const scrollableRef = listRef as React.RefObject<{
+    scrollToRow: (config: { index: number; align?: string }) => void;
+  } | null>;
 
   const filteredLines = useMemo(() => {
     if (!lines) return [];
@@ -350,10 +356,7 @@ export function ProcessSessionOutputSection({
             ? ` \u2014 Showing ${filteredLines.length} of ${lines.length} lines`
             : ` (${lines.length} lines)`}
           {hasMore && (
-            <button
-              onClick={loadMore}
-              className="ml-2 text-xs text-primary hover:underline"
-            >
+            <button onClick={loadMore} className="ml-2 text-xs text-primary hover:underline">
               Load more...
             </button>
           )}

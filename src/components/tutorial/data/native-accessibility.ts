@@ -18,15 +18,7 @@ export const nativeAccessibilityTutorial: Tutorial = {
   mode: "contextual",
   focusPage: "help",
   category: "Architecture",
-  tags: [
-    "accessibility",
-    "native",
-    "UIA",
-    "AT-SPI",
-    "automation",
-    "featured",
-    "architecture",
-  ],
+  tags: ["accessibility", "native", "UIA", "AT-SPI", "automation", "featured", "architecture"],
   prerequisites: ["getting-started"],
   learningObjectives: [
     "Understand what the native accessibility layer is and why it exists",

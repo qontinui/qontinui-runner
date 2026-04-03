@@ -544,4 +544,3 @@ export function TerminalTabBar({
     </div>
   );
 }
-

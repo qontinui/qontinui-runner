@@ -97,7 +97,8 @@ export const METRIC_INFO: Record<
   schema_compliance: {
     label: "Schema Compliance",
     category: "agentic",
-    description: "Output schema validation success rate (first-attempt, after coercion, after retry)",
+    description:
+      "Output schema validation success rate (first-attempt, after coercion, after retry)",
   },
 };
 

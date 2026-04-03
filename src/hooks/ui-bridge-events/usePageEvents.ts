@@ -702,9 +702,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               // External URL — full navigation required
               window.location.href = target;
             } else {
-              const path = target.startsWith("http")
-                ? new URL(target).pathname
-                : target;
+              const path = target.startsWith("http") ? new URL(target).pathname : target;
               const tabName = path.replace(/^\/+/, "") || "gui-automation";
               window.dispatchEvent(
                 new CustomEvent("ui-bridge-navigate", { detail: { page: tabName, url: path } }),

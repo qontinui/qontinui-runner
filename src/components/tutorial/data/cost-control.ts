@@ -75,7 +75,7 @@ export const costControlTutorial: Tutorial = {
         "- **Yellow** — 60-80% used, approaching limit\n" +
         "- **Red** — over 80%, danger zone\n\n" +
         'Below the gauge: exact dollar amounts ("$1.23 / $5.00") and remaining percentage.\n\n' +
-        "When no run is active, you'll see a \"No active run\" placeholder. The gauge appears automatically when a workflow starts.",
+        'When no run is active, you\'ll see a "No active run" placeholder. The gauge appears automatically when a workflow starts.',
       targetElement: {
         selector: '[data-tutorial-id="cc-budget-gauge"]',
         highlightType: "spotlight",
@@ -121,7 +121,7 @@ export const costControlTutorial: Tutorial = {
         "- **z-score** — how many standard deviations above normal\n" +
         "- **Cost** — what the anomalous call cost\n" +
         "- **Mean** — what the average call costs\n\n" +
-        "When no anomalies exist, you'll see \"No anomalies detected\" — which is the normal, healthy state.",
+        'When no anomalies exist, you\'ll see "No anomalies detected" — which is the normal, healthy state.',
       targetElement: {
         selector: '[data-tutorial-id="cc-safety-section"]',
         highlightType: "border",
