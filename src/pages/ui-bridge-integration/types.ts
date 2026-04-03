@@ -148,6 +148,7 @@ export interface PageComponent {
   component_path: string;
   component_name: string;
   has_registrations: boolean;
+  has_data_page_id: boolean;
   has_spec: boolean;
   has_tutorial: boolean;
 }
@@ -165,6 +166,7 @@ export interface ReadPageSourceResult {
 
 export interface PageGenerationOptions {
   generateRegistrations: boolean;
+  generateDataPageIds: boolean;
   generateSpecs: boolean;
   generateTutorials: boolean;
   generateDemoVideos: boolean;

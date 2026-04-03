@@ -265,6 +265,7 @@ export function HookGenerationPanel({
   const pageQueueRef = useRef<PageComponent[]>([]);
   const pageOptionsRef = useRef<PageGenerationOptions>({
     generateRegistrations: true,
+    generateDataPageIds: true,
     generateSpecs: true,
     generateTutorials: false,
     generateDemoVideos: false,

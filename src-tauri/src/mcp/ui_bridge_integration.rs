@@ -2325,6 +2325,7 @@ struct PageComponent {
     component_path: String,
     component_name: String,
     has_registrations: bool,
+    has_data_page_id: bool,
     has_spec: bool,
     has_tutorial: bool,
 }
@@ -2380,10 +2381,11 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
             .and_then(|s| s.to_str())
             .unwrap_or("page");
 
-        // Check for useUIElement/useUIComponent in the file
+        // Check for useUIElement/useUIComponent and data-page-id in the file
         if let Ok(content) = tokio::fs::read_to_string(project.join(&page.component_path)).await {
             page.has_registrations =
                 content.contains("useUIElement") || content.contains("useUIComponent");
+            page.has_data_page_id = content.contains("data-page-id");
         }
 
         // Check for .spec.uibridge.json nearby or in specs/
@@ -2518,6 +2520,7 @@ async fn walk_for_pages(
                     component_path: rel_path,
                     component_name,
                     has_registrations: false,
+                    has_data_page_id: false,
                     has_spec: false,
                     has_tutorial: false,
                 });

@@ -33,6 +33,7 @@ export function PageSelectionPanel({
   const [error, setError] = useState<string | null>(null);
   const [options, setOptions] = useState<PageGenerationOptions>({
     generateRegistrations: true,
+    generateDataPageIds: true,
     generateSpecs: true,
     generateTutorials: false,
     generateDemoVideos: false,
@@ -55,7 +56,7 @@ export function PageSelectionPanel({
         // Auto-select pages that need work
         const needsWork = new Set(
           data.data.pages
-            .filter((p) => !p.has_registrations || !p.has_spec || !p.has_tutorial)
+            .filter((p) => !p.has_registrations || !p.has_data_page_id || !p.has_spec || !p.has_tutorial)
             .map((p) => p.component_path),
         );
         setSelectedIds(needsWork);
@@ -91,8 +92,11 @@ export function PageSelectionPanel({
 
   const statusBadge = (page: PageComponent) => {
     const total =
-      (page.has_registrations ? 1 : 0) + (page.has_spec ? 1 : 0) + (page.has_tutorial ? 1 : 0);
-    if (total === 3)
+      (page.has_registrations ? 1 : 0) +
+      (page.has_data_page_id ? 1 : 0) +
+      (page.has_spec ? 1 : 0) +
+      (page.has_tutorial ? 1 : 0);
+    if (total === 4)
       return (
         <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">
           Complete
@@ -173,6 +177,7 @@ export function PageSelectionPanel({
                   <th className="p-2 text-left">Route</th>
                   <th className="p-2 text-left">Component</th>
                   <th className="p-2 text-center w-14">Regs</th>
+                  <th className="p-2 text-center w-14" title="data-page-id attribute">Page ID</th>
                   <th className="p-2 text-center w-14">Spec</th>
                   <th className="p-2 text-center w-14">Tutorial</th>
                   <th className="p-2 text-right w-20">Status</th>
@@ -196,6 +201,7 @@ export function PageSelectionPanel({
                     <td className="p-2 font-mono">{page.route}</td>
                     <td className="p-2 text-muted-foreground">{page.component_name}</td>
                     <td className="p-2 text-center">{checkIcon(page.has_registrations)}</td>
+                    <td className="p-2 text-center">{checkIcon(page.has_data_page_id)}</td>
                     <td className="p-2 text-center">{checkIcon(page.has_spec)}</td>
                     <td className="p-2 text-center">{checkIcon(page.has_tutorial)}</td>
                     <td className="p-2 text-right">{statusBadge(page)}</td>
@@ -220,6 +226,20 @@ export function PageSelectionPanel({
                 className="rounded"
               />
               Registrations
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer" title="Add data-page-id attributes to page root containers for state machine detection">
+              <input
+                type="checkbox"
+                checked={options.generateDataPageIds}
+                onChange={(e) =>
+                  setOptions({
+                    ...options,
+                    generateDataPageIds: e.target.checked,
+                  })
+                }
+                className="rounded"
+              />
+              Page IDs
             </label>
             <label className="flex items-center gap-1.5 cursor-pointer">
               <input

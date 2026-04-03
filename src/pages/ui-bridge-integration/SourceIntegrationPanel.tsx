@@ -202,6 +202,7 @@ export function SourceIntegrationPanel({ initialProjectPath }: SourceIntegration
       const allPages = discData.data.pages;
       const options: PageGenerationOptions = {
         generateRegistrations: true,
+        generateDataPageIds: true,
         generateSpecs: true,
         generateTutorials: false, // Off by default to keep it faster
         generateDemoVideos: false,
