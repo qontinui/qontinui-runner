@@ -10,6 +10,35 @@ import { cn } from "../../lib/utils";
 import { Button, Badge } from "../ui";
 import type { UnifiedNode } from "./types";
 
+/** Build badge descriptors from a node's state flags. */
+export function formatStateBadges(
+  state: UnifiedNode["state"],
+): Array<{ label: string; active: boolean }> {
+  return [
+    { label: "focused", active: state.is_focused },
+    { label: "disabled", active: state.is_disabled },
+    { label: "hidden", active: state.is_hidden },
+    { label: "readonly", active: state.is_readonly },
+    { label: "required", active: state.is_required },
+    { label: "editable", active: state.is_editable },
+    { label: "focusable", active: state.is_focusable },
+    { label: "modal", active: state.is_modal },
+    { label: "multiselectable", active: state.is_multiselectable },
+    ...(state.is_expanded !== "n/a"
+      ? [{ label: `expanded:${state.is_expanded}`, active: state.is_expanded === "true" }]
+      : []),
+    ...(state.is_selected !== "n/a"
+      ? [{ label: `selected:${state.is_selected}`, active: state.is_selected === "true" }]
+      : []),
+    ...(state.is_checked !== "n/a"
+      ? [{ label: `checked:${state.is_checked}`, active: state.is_checked === "true" }]
+      : []),
+    ...(state.is_pressed !== "n/a"
+      ? [{ label: `pressed:${state.is_pressed}`, active: state.is_pressed === "true" }]
+      : []),
+  ];
+}
+
 async function copyToClipboard(text: string) {
   try {
     await navigator.clipboard.writeText(text);

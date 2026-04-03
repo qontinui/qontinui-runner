@@ -1,0 +1,537 @@
+{
+  "version": "1.0.0",
+  "description": "Security & Sandboxing settings page. Configures agent sandboxing policies following the AST 7-layer defense model: compute isolation, resource limits, filesystem boundaries, network mediation, credential proxy, action governance, and audit logging. Supports three built-in profiles (permissive/standard/strict) plus a custom profile editor with full sub-policy configuration.",
+  "groups": [
+    {
+      "id": "sec-page-header",
+      "name": "Page Header & Title",
+      "description": "The page header shows the Shield icon, title 'Security & Sandboxing', and subtitle description.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "sec-header-title",
+          "description": "The page heading 'Security & Sandboxing' is displayed at the top",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "heading", "textContains": "Security" }, "label": "Page title" },
+          "assertionType": "containsText",
+          "expected": "Security & Sandboxing",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-header-subtitle",
+          "description": "Subtitle text explains the page purpose: sandbox constraints for workflow execution",
+          "category": "element-presence",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "sandbox constraints" }, "label": "Subtitle" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-profile-selector",
+      "name": "Security Profile Selector",
+      "description": "Dropdown to select the active security profile. Options: Permissive, Standard, Strict, Custom. Selecting a built-in profile shows its description and AST fingerprint.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "sec-profile-label",
+          "description": "A 'Security Profile' label is visible above the dropdown",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Security Profile" }, "label": "Profile label" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-profile-dropdown",
+          "description": "A select dropdown with profile options is present. It must include at least Permissive, Standard, Strict, and Custom options.",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "combobox" }, "label": "Profile dropdown" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-profile-description",
+          "description": "When a built-in profile is selected (permissive/standard/strict), a description panel appears below the dropdown explaining the profile's posture. The description should mention key features like 'No restrictions' for permissive, 'Balanced' for standard, or 'Maximum isolation' for strict.",
+          "category": "data-display",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "restrictions" }, "label": "Profile description" },
+          "assertionType": "semantic",
+          "precondition": "A built-in profile (not custom) is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-ast-fingerprint",
+          "description": "When a built-in profile is selected, the AST fingerprint notation is displayed in monospace font (e.g., 'L1:2/L2:1/L3:1/L4:0/L5:1/L6:1')",
+          "category": "data-display",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "AST Fingerprint" }, "label": "Fingerprint label" },
+          "assertionType": "exists",
+          "precondition": "A built-in profile is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-profile-switch",
+          "description": "Changing the profile dropdown to 'Standard' updates the description to mention balanced security, credential proxy, and destructive command blocking. The Security Posture visualization bars should also update to show higher scores.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "combobox" }, "label": "Profile dropdown" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-posture-visualization",
+      "name": "Security Posture Visualization",
+      "description": "A 7-layer bar chart showing the current profile's security scores. Each layer (L1:Compute through L7:Audit) has a colored bar indicating enforcement level: None (red), Cooperative (orange), Software (yellow), Kernel (green).",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "sec-posture-heading",
+          "description": "The 'Security Posture' section heading is visible",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Security Posture" }, "label": "Posture heading" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-posture-7-layers",
+          "description": "All 7 AST layers are listed: L1:Compute, L2:Resources, L3:Filesystem, L4:Network, L5:Credentials, L6:Actions, L7:Audit. Each has a label, colored bar segments, and a score label.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "L1:Compute" }, "label": "First layer" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-posture-permissive-low",
+          "description": "When 'Permissive' profile is selected, the L4:Network layer should show the lowest score (None/0) since permissive mode has no network restrictions. Most other layers should show low scores (1-2).",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "L4:Network" }, "label": "Network layer" },
+          "assertionType": "semantic",
+          "precondition": "Permissive profile is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-custom-profile-editor",
+      "name": "Custom Profile Editor",
+      "description": "When 'Custom' profile is selected, a full sub-policy editor appears with sections for Network, Actions, Filesystem, Resources, and Credentials. Each section has appropriate form controls.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "sec-custom-editor-visible",
+          "description": "When the profile dropdown is set to 'Custom', the 'Custom Policy Editor' panel appears with a Sliders icon and sub-sections for Network, Actions, Filesystem, Resources, and Credentials.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Custom Policy Editor" }, "label": "Custom editor" },
+          "assertionType": "behavior",
+          "precondition": "Profile is set to 'Custom'",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-custom-network-mode",
+          "description": "The Network section has a Mode dropdown with options: Unrestricted, Allow List, Deny List, Disabled. Selecting 'Allow List' or 'Deny List' reveals a textarea for entering domains (one per line).",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Network" }, "label": "Network section" },
+          "assertionType": "behavior",
+          "precondition": "Custom profile editor is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-custom-actions-destructive",
+          "description": "The Actions section has a 'Block destructive commands' toggle and a textarea for blocked command regex patterns.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Block destructive" }, "label": "Destructive toggle" },
+          "assertionType": "exists",
+          "precondition": "Custom profile editor is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-custom-resources-grid",
+          "description": "The Resources section shows a 2x2 grid with CPU limit (cores), Memory (MB), PID limit, and Timeout (sec) number inputs.",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "CPU limit" }, "label": "CPU input" },
+          "assertionType": "exists",
+          "precondition": "Custom profile editor is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-custom-credential-mode",
+          "description": "The Credentials section has a Mode dropdown with options: Direct, Proxy (placeholder injection), Denied (no credentials).",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Direct (current behavior)" }, "label": "Credential mode" },
+          "assertionType": "exists",
+          "precondition": "Custom profile editor is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-features-section",
+      "name": "Features Section",
+      "description": "Toggle switches for the three main security features: Credential Proxy, Network Mediation, and Security Audit Log.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "sec-features-heading",
+          "description": "The 'Features' section heading is visible",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Features" }, "label": "Features heading" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-credential-proxy-toggle",
+          "description": "A 'Credential Proxy' toggle is present with description mentioning placeholder injection",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Credential Proxy" }, "label": "Credential toggle" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-network-mediation-toggle",
+          "description": "A 'Network Mediation' toggle is present with description mentioning domain allowlisting",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Network Mediation" }, "label": "Network toggle" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-log-toggle",
+          "description": "A 'Security Audit Log' toggle is present with description mentioning policy decisions",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Security Audit Log" }, "label": "Audit toggle" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-retention-field",
+          "description": "When the audit log toggle is enabled, an 'Audit Retention (days)' number input appears with a left border indent. Default value should be 30.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Audit Retention" }, "label": "Retention field" },
+          "assertionType": "behavior",
+          "precondition": "Security Audit Log toggle is enabled",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-audit-log-viewer",
+      "name": "Audit Log Viewer",
+      "description": "When audit logging is enabled, a scrollable table shows recent security audit events with summary badges, filter dropdown, refresh button, and JSON export button.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "sec-audit-viewer-visible",
+          "description": "When audit logging is enabled, the 'Audit Log' panel appears with a FileSearch icon, heading, and summary badges showing allowed/denied/warning counts.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Audit Log" }, "label": "Audit panel" },
+          "assertionType": "behavior",
+          "precondition": "Security Audit Log toggle is enabled",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-filter-dropdown",
+          "description": "A filter dropdown with options All, Denied, Allowed, Warnings is present in the audit log header",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "combobox" }, "label": "Audit filter" },
+          "assertionType": "exists",
+          "precondition": "Audit log viewer is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-table-columns",
+          "description": "The audit event table has 5 columns: Time, Type, Decision, Action, Reason. Column headers are visible when events are loaded.",
+          "category": "data-display",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "table" }, "label": "Audit table" },
+          "assertionType": "semantic",
+          "precondition": "Audit events have been loaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-decision-badges",
+          "description": "Each audit event row shows a colored decision badge: green for 'allowed', red for 'denied', yellow for 'warning'. The type column shows a label badge (e.g., 'Network', 'Command', 'Policy').",
+          "category": "design",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "table" }, "label": "Audit table" },
+          "assertionType": "semantic",
+          "precondition": "Audit events are loaded and visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-empty-state",
+          "description": "When no audit events exist, the table area shows 'No audit events. Click refresh to load.' message",
+          "category": "state-consistency",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "No audit events" }, "label": "Empty state" },
+          "assertionType": "exists",
+          "precondition": "Audit logging is enabled but no events loaded yet",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-audit-export-button",
+          "description": "When audit events are loaded, a download button appears in the audit header. Clicking it exports the events as a JSON file with filename format 'security-audit-YYYY-MM-DD.json'.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Export button" },
+          "assertionType": "behavior",
+          "precondition": "Audit events are loaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-ast-info-banner",
+      "name": "AST 7-Layer Info Banner",
+      "description": "An informational banner explaining the Agent Sandbox Taxonomy (AST) 7-layer model at the bottom of the page.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "sec-ast-info-text",
+          "description": "A blue-tinted info banner mentions 'Agent Sandbox Taxonomy (AST)' and lists all 7 layers: L1:Compute, L2:Resources, L3:Filesystem, L4:Network, L5:Credentials, L6:Actions, L7:Audit",
+          "category": "element-presence",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Agent Sandbox Taxonomy" }, "label": "AST banner" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-action-buttons",
+      "name": "Action Buttons",
+      "description": "Reset to Defaults and Save Security Settings buttons at the bottom of the page.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "sec-reset-button",
+          "description": "A 'Reset to Defaults' button is present with neutral styling",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Reset to Defaults" }, "label": "Reset button" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-save-button",
+          "description": "A 'Save Security Settings' button is present with blue/primary styling and a Shield icon",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Save Security Settings" }, "label": "Save button" },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-save-flow",
+          "description": "Clicking 'Save Security Settings' shows a spinner while saving, then shows 'Saved' with a check icon on success. A green 'Settings saved' toast appears. On error, a red error banner appears at the top.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Save" }, "label": "Save button" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-reset-flow",
+          "description": "Clicking 'Reset to Defaults' resets the profile to 'permissive', disables all feature toggles (credential proxy, network mediation, audit log), and clears any custom policy.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Reset" }, "label": "Reset button" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-visual-design",
+      "name": "Visual Design & Typography",
+      "description": "Dark theme styling with neutral-800 card backgrounds, blue-400 accents, and consistent text hierarchy.",
+      "category": "design",
+      "assertions": [
+        {
+          "id": "sec-card-backgrounds",
+          "description": "All settings cards use a dark semi-transparent background (bg-neutral-800/50) with subtle border (border-neutral-700/50) and rounded corners (rounded-lg).",
+          "category": "design",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Security Profile" }, "label": "Profile card" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-heading-hierarchy",
+          "description": "Page title uses text-lg font-semibold text-white. Section headings use text-sm font-medium text-neutral-200. Sub-labels use text-xs text-neutral-300 or text-neutral-400. Description text uses text-[10px] text-neutral-500.",
+          "category": "design",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "role": "heading" }, "label": "Any heading" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-toggle-styling",
+          "description": "Toggle switches use blue-600 when enabled and neutral-600 when disabled. The toggle knob is white and transitions smoothly.",
+          "category": "design",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "role": "button" }, "label": "Toggle switch" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-save-button-styling",
+          "description": "The Save button uses bg-blue-600 with white text. The Reset button uses bg-neutral-700 with neutral-200 text. Both have hover states.",
+          "category": "design",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "role": "button", "textContains": "Save" }, "label": "Save button" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "sec-loading-error-states",
+      "name": "Loading & Error States",
+      "description": "The page handles loading, error, and success states appropriately.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "sec-loading-state",
+          "description": "While settings are loading, a centered 'Loading security settings...' message is displayed instead of the form.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Loading security settings" }, "label": "Loading text" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-error-banner",
+          "description": "When a settings operation fails, a red error banner appears at the top showing the error message with red-400 text on red-500/10 background.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Failed" }, "label": "Error banner" },
+          "assertionType": "semantic",
+          "precondition": "A save or load operation has failed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "sec-success-banner",
+          "description": "After successful save, a green 'Settings saved' banner appears with a Check icon. It auto-dismisses after 3 seconds.",
+          "category": "state-consistency",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Settings saved" }, "label": "Success banner" },
+          "assertionType": "semantic",
+          "precondition": "Settings were just saved successfully",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "SecuritySettings",
+    "pageUrl": "/settings/security",
+    "tags": ["settings", "security", "sandboxing", "ast", "audit", "profiles"]
+  }
+}

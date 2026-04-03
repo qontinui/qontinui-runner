@@ -19,6 +19,7 @@ import {
   TASK_RUN_PROGRESS_SUBSCRIPTION,
   FINDING_UPDATES_SUBSCRIPTION,
   ORCHESTRATION_LOOP_STATUS_SUBSCRIPTION,
+  COST_EVENTS_SUBSCRIPTION,
 } from "./documents";
 
 // ==========================================================================
@@ -174,6 +175,67 @@ export function useOrchestrationLoopStream(intervalMs = 2000, skip = false) {
     orchestrationLoopStatusStream: OrchestrationLoopStatusData;
   }>(ORCHESTRATION_LOOP_STATUS_SUBSCRIPTION, {
     variables: { intervalMs },
+    skip,
+  });
+}
+
+// ==========================================================================
+// Cost Event Types & Hook
+// ==========================================================================
+
+export interface CostUpdateEventData {
+  __typename: "GqlCostUpdateEvent";
+  taskRunId: string;
+  phase: string;
+  iteration: number | null;
+  inputTokens: string;
+  outputTokens: string;
+  cacheCreationTokens: string;
+  cacheReadTokens: string;
+  costUsd: number;
+  cumulativeCostUsd: number;
+  cacheHitRate: number;
+  timestamp: string;
+}
+
+export interface BudgetWarningEventData {
+  __typename: "GqlBudgetWarningEvent";
+  taskRunId: string;
+  remainingFraction: number;
+  totalCostUsd: number;
+  budgetLimitUsd: number;
+  message: string;
+  timestamp: string;
+}
+
+export interface CostAnomalyEventData {
+  __typename: "GqlCostAnomalyEvent";
+  taskRunId: string;
+  costUsd: number;
+  meanCostUsd: number;
+  stdDev: number;
+  zScore: number;
+  message: string;
+  timestamp: string;
+}
+
+export type CostEventData =
+  | CostUpdateEventData
+  | BudgetWarningEventData
+  | CostAnomalyEventData;
+
+/**
+ * Subscribe to cost events (cost updates, budget warnings, anomalies).
+ * Optional filter to receive only events for a specific task run.
+ *
+ * @param taskRunId - Optional task run ID to filter events
+ * @param skip - Skip subscription
+ */
+export function useCostEvents(taskRunId?: string, skip = false) {
+  return useSubscription<{
+    costEvents: CostEventData;
+  }>(COST_EVENTS_SUBSCRIPTION, {
+    variables: { taskRunId: taskRunId ?? null },
     skip,
   });
 }

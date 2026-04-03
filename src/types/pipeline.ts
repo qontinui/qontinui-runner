@@ -46,6 +46,9 @@ export interface PipelineAgentTrace {
   cost_usd: number;
   downstream_success?: boolean;
   output_quality_score?: number;
+  schema_valid_first_attempt?: boolean;
+  validation_retries?: number;
+  validation_error_summary?: string | null;
 }
 
 export interface PipelineCriterionResult {

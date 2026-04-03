@@ -242,6 +242,141 @@
       ],
       "source": "manual"
     }
+    ,
+    {
+      "id": "ai-data-pagination-memory-protection",
+      "name": "Pagination and Memory Protection",
+      "description": "All data-heavy panels (Events, API Requests, MCP Calls, Playwright Results, AWAS Steps, Process Session Output) use backend-driven pagination to prevent webview OOM crashes. Large datasets (240K+ rows, 48MB+) must never be loaded in full. Each panel initially loads a limited page of results and provides a 'Show more' mechanism to load additional pages on demand. The backend enforces LIMIT/OFFSET at the SQL level for unfiltered queries, capping IPC payload size at ~200 items by default.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "ai-data-events-paginated",
+          "description": "The Events section loads a limited number of events initially (200 for the events tab, 100 for AI output). When more events exist, a 'Show more' button appears at the bottom with the count of remaining items. Clicking it loads the next page from the backend without freezing the UI. The event count shown in the header reflects the total, not just the loaded count.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Show more"
+            },
+            "label": "Events Show More button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A completed task run with >200 events is selected and Events section is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-api-requests-paginated",
+          "description": "The API Requests section loads the first 50 requests from the backend (SQL LIMIT 50). When more requests exist, a 'Show more' button appears showing the remaining count (e.g., 'Show more (4603 remaining)'). Clicking loads the next 50 from the backend. The summary bar always shows total/success/failed counts from the full dataset, not just the loaded page.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Show more"
+            },
+            "label": "API Requests Show More button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A task run with >50 API requests is selected and API Requests section is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-mcp-calls-paginated",
+          "description": "The MCP Calls section loads the first 50 calls from the backend. When more exist, a 'Show more' button appears. The total/success/failed summary always reflects the full dataset. Each call is expandable to show arguments, resolved arguments, response, and error details.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Show more"
+            },
+            "label": "MCP Calls Show More button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A task run with >50 MCP calls is selected and MCP Calls section is active",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-playwright-paginated",
+          "description": "The Playwright Results section loads the first 50 test results from the backend. When more exist, a 'Show more' button appears. The passed/failed summary reflects total counts from the full dataset.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Show more"
+            },
+            "label": "Playwright Results Show More button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A task run with >50 Playwright results is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-awas-paginated",
+          "description": "The AWAS Steps section loads the first 50 steps from the backend. When more exist, a 'Show more' button appears. The success/failed summary reflects total counts.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Show more"
+            },
+            "label": "AWAS Steps Show More button"
+          },
+          "assertionType": "behavior",
+          "precondition": "A task run with >50 AWAS steps is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-process-output-virtualized",
+          "description": "The Process Session Output section uses virtualized rendering (react-window) to display log lines. Only visible lines plus a small buffer are rendered in the DOM. The viewer loads 500 lines initially and provides a 'Load more' mechanism when more lines exist. Search filtering and stdout/stderr stream filtering work on the loaded lines.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Session Output"
+            },
+            "label": "Process Session Output viewer"
+          },
+          "assertionType": "semantic",
+          "precondition": "A process session with >500 output lines is expanded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ai-data-no-oom-large-dataset",
+          "description": "When viewing a task run with thousands of events, API requests, or MCP calls, the webview does not crash with 'Error code: Out of Memory'. The page remains responsive and all sections load their initial page within 2 seconds. WebView2 process memory stays under 500MB even with 10K+ items in the database.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Out of Memory"
+            },
+            "label": "OOM error indicator"
+          },
+          "assertionType": "notExists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
   ],
   "metadata": {
     "component": "AiDataViewerTab",
@@ -250,6 +385,6 @@
     "updatedAt": "2026-03-05T00:00:00.000Z",
     "pageUrl": "/runs/ai-data",
     "elementSource": "sdk",
-    "tags": ["run-ai-data", "data-viewer", "mcp-tools", "debugging", "observe"]
+    "tags": ["run-ai-data", "data-viewer", "mcp-tools", "debugging", "observe", "pagination", "memory-protection"]
   }
 }

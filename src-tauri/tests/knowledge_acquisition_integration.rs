@@ -29,7 +29,10 @@ fn client() -> Client {
 async fn test_duckduckgo_returns_html() {
     let resp = client()
         .post("https://html.duckduckgo.com/html/")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
         .form(&[("q", "rust reqwest async example")])
         .send()
         .await
@@ -38,8 +41,14 @@ async fn test_duckduckgo_returns_html() {
     assert!(resp.status().is_success(), "Should return 200");
 
     let html = resp.text().await.unwrap();
-    assert!(html.contains("result__a"), "HTML should contain result links");
-    assert!(html.contains("result__snippet"), "HTML should contain snippets");
+    assert!(
+        html.contains("result__a"),
+        "HTML should contain result links"
+    );
+    assert!(
+        html.contains("result__snippet"),
+        "HTML should contain snippets"
+    );
 
     println!("DuckDuckGo returned {} bytes of HTML", html.len());
 }
@@ -49,7 +58,10 @@ async fn test_duckduckgo_returns_html() {
 async fn test_duckduckgo_error_message_search() {
     let resp = client()
         .post("https://html.duckduckgo.com/html/")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
         .form(&[(
             "q",
             "cannot borrow as mutable because it is also borrowed as immutable rust",
@@ -97,7 +109,10 @@ async fn test_osv_known_vulnerability() {
         "lodash 4.17.20 should have known vulnerabilities"
     );
 
-    println!("OSV found {} vulnerabilities for lodash@4.17.20", vulns.len());
+    println!(
+        "OSV found {} vulnerabilities for lodash@4.17.20",
+        vulns.len()
+    );
     for v in vulns.iter().take(3) {
         println!(
             "  - {} — {}",
@@ -125,7 +140,9 @@ async fn test_osv_batch_query() {
     assert!(resp.status().is_success());
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    let results = body["results"].as_array().expect("Should have results array");
+    let results = body["results"]
+        .as_array()
+        .expect("Should have results array");
 
     assert_eq!(results.len(), 2, "Should return results for both packages");
     println!("OSV batch results:");
@@ -172,7 +189,10 @@ async fn test_osv_safe_package() {
 async fn test_sploitus_cve_search() {
     let resp = client()
         .post("https://sploitus.com/search")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "type": "exploits",

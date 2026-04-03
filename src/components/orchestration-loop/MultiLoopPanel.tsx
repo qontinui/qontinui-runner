@@ -61,10 +61,17 @@ interface IterationResult {
   task_run_id: string;
   fix_count: number | null;
   exit_check: { should_exit: boolean; reason: string };
+  reflection_task_run_id: string | null;
+  generated_workflow_id?: string | null;
+  fixes_implemented?: boolean | null;
+  rebuild_triggered?: boolean | null;
   diagnostic_result?: {
     passed: boolean;
+    page_health: Record<string, unknown>;
+    assertion_results: Record<string, unknown>[];
     root_cause: string | null;
     diagnosis: string | null;
+    prompt_rewrite_suggestion: string | null;
   } | null;
 }
 
@@ -88,6 +95,7 @@ const PHASE_COLORS: Record<string, string> = {
   idle: "text-muted-foreground",
   running_workflow: "text-blue-400",
   building_workflow: "text-yellow-400",
+  diagnosing: "text-teal-400",
   evaluating_exit: "text-yellow-400",
   reflecting: "text-purple-400",
   implementing_fixes: "text-orange-400",
@@ -103,6 +111,7 @@ const PHASE_BG: Record<string, string> = {
   complete: "bg-green-500/10",
   error: "bg-red-500/10",
   running_workflow: "bg-blue-500/10",
+  diagnosing: "bg-teal-500/10",
   reflecting: "bg-purple-500/10",
 };
 

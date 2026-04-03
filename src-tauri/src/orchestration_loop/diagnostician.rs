@@ -7,7 +7,8 @@ use tracing::{info, warn};
 
 use super::remote_client::RunnerClient;
 use super::types::{DiagnosePhaseConfig, DiagnosticResult, RootCauseCategory};
-use crate::ai_provider::routing::run_prompt_sync;
+use crate::ai_provider::routing::run_prompt_with_model_override;
+use crate::ai_router::TaskContext;
 
 /// Run the full diagnostic evaluation: capture state, run assertions, triage if failed.
 pub async fn run_diagnostic(
@@ -94,8 +95,22 @@ pub async fn run_diagnostic(
         iteration,
     );
 
-    let triage_result = tokio::task::spawn_blocking(move || run_prompt_sync(&triage_prompt, None))
-        .await;
+    let model_override = config.model_override.clone();
+    let triage_result = tokio::task::spawn_blocking(move || {
+        let context = TaskContext::from_prompt(&triage_prompt);
+        run_prompt_with_model_override(
+            &triage_prompt,
+            &context,
+            None,
+            model_override.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    })
+    .await;
 
     let (root_cause, diagnosis, prompt_suggestion) = match triage_result {
         Ok(response) if response.success => parse_triage_response(&response.output),

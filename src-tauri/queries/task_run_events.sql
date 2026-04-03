@@ -68,7 +68,7 @@ VALUES (:id, :task_run_id, :event_id, :file_path, :screenshot_type,
         :width, :height, :file_size_bytes, NOW());
 
 --! get_task_run_screenshots_all
-SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type,
+SELECT id, task_run_id, COALESCE(event_id, 0) as event_id, file_path, screenshot_type,
        COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence,
        COALESCE(match_location, '') as match_location,
        COALESCE(width, 0) as width, COALESCE(height, 0) as height,
@@ -78,7 +78,7 @@ WHERE task_run_id = :task_run_id
 ORDER BY created_at ASC;
 
 --! get_task_run_screenshots_by_type
-SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type,
+SELECT id, task_run_id, COALESCE(event_id, 0) as event_id, file_path, screenshot_type,
        COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence,
        COALESCE(match_location, '') as match_location,
        COALESCE(width, 0) as width, COALESCE(height, 0) as height,

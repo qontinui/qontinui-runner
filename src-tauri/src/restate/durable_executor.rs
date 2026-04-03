@@ -201,14 +201,12 @@ pub async fn execute_steps_batch(
     }
 }
 
-/// Execute the full workflow orchestration loop.
+/// Legacy monolithic workflow executor (retained for fallback/testing).
 ///
-/// This is called from the Restate workflow `run()` handler.
-/// Each phase is executed as a batch, with the results being
-/// journaled by the calling code via `ctx.run()`.
-///
-/// The function returns a `WorkflowOutput` that summarizes the execution.
-pub async fn execute_workflow(
+/// Prefer the phase-level journaled execution in `service.rs::run()` which
+/// wraps each phase in a separate `ctx.run()` for crash recovery.
+#[allow(dead_code)]
+async fn execute_workflow_monolithic(
     app_state: &Arc<AppState>,
     config_storage: &Arc<tokio::sync::Mutex<ConfigStorage>>,
     input: &WorkflowInput,
@@ -269,6 +267,7 @@ pub async fn execute_workflow(
     // =========================================================================
     info!("Phase 1/4: Setup — execution_id={}", execution_id);
 
+    // Setup automation steps
     let setup_result = execute_steps_batch(
         app_state,
         config_storage,
@@ -294,6 +293,35 @@ pub async fn execute_workflow(
             duration_ms: start.elapsed().as_millis() as u64,
             files_modified: vec![],
             error: setup_result.failure_context,
+        };
+    }
+
+    // Setup prompt steps (AI prompts that run after automation setup)
+    let setup_prompt_result = execute_steps_batch(
+        app_state,
+        config_storage,
+        &input.setup_prompt_steps_json,
+        "setup_prompt",
+        None,
+        execution_id,
+        None,
+    )
+    .await;
+
+    if !setup_prompt_result.success {
+        error!(
+            "Setup prompt phase failed: {:?}",
+            setup_prompt_result.failure_context
+        );
+        return WorkflowOutput {
+            success: false,
+            verification_passed: false,
+            iterations_run: 0,
+            critical_failure: true,
+            was_stopped: false,
+            duration_ms: start.elapsed().as_millis() as u64,
+            files_modified: vec![],
+            error: setup_prompt_result.failure_context,
         };
     }
 
@@ -383,6 +411,7 @@ pub async fn execute_workflow(
             execution_id
         );
 
+        // Completion automation steps
         let c_result = execute_steps_batch(
             app_state,
             config_storage,
@@ -396,10 +425,28 @@ pub async fn execute_workflow(
 
         if !c_result.success {
             warn!(
-                "Completion phase had failures: {:?}",
+                "Completion automation phase had failures: {:?}",
                 c_result.failure_context
             );
-            // Completion failures don't change verification_passed
+        }
+
+        // Completion prompt steps (AI prompts after automation completion)
+        let cp_result = execute_steps_batch(
+            app_state,
+            config_storage,
+            &input.completion_prompt_steps_json,
+            "completion_prompt",
+            None,
+            execution_id,
+            None,
+        )
+        .await;
+
+        if !cp_result.success {
+            warn!(
+                "Completion prompt phase had failures: {:?}",
+                cp_result.failure_context
+            );
         }
     }
 
@@ -464,12 +511,14 @@ async fn is_stop_requested(app_state: &AppState, execution_id: &str) -> bool {
 }
 
 /// Get the current git HEAD commit hash for compensation tracking.
-async fn get_current_commit_hash() -> Option<String> {
-    match tokio::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .await
-    {
+/// Uses the current working directory unless `repo_path` is specified.
+async fn get_current_commit_hash_in(repo_path: Option<&str>) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["rev-parse", "HEAD"]);
+    if let Some(path) = repo_path {
+        cmd.current_dir(path);
+    }
+    match cmd.output().await {
         Ok(output) if output.status.success() => {
             let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if hash.is_empty() {
@@ -479,6 +528,31 @@ async fn get_current_commit_hash() -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+/// Get the current git HEAD commit hash using the process CWD.
+async fn get_current_commit_hash() -> Option<String> {
+    get_current_commit_hash_in(None).await
+}
+
+/// Get the list of files modified since the last commit (unstaged + staged).
+/// Used to populate `WorkflowOutput.files_modified`.
+pub async fn get_modified_files() -> Vec<String> {
+    let output = tokio::process::Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .output()
+        .await;
+
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect()
+        }
+        _ => vec![],
     }
 }
 

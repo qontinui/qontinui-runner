@@ -294,15 +294,72 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "summary-verification-pagination",
+      "name": "Verification Results Pagination",
+      "description": "The Verification tab paginates iteration results (20 per page) to handle runs with many verification iterations. The latest visible iteration is auto-expanded. A 'Show more' button loads additional iterations.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "summary-verification-show-more",
+          "description": "When more than 20 verification iterations exist, a 'Show more' button appears at the bottom of the iterations list showing the remaining count. Clicking loads the next 20 iterations.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "precondition": "A task run with >20 verification iterations is selected and Verification tab is active",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Show more" },
+            "label": "Verification iterations Show More"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "summary-verification-last-expanded",
+          "description": "The last visible verification iteration is automatically expanded to show its step results, so users immediately see the most recent verification outcome without clicking.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "At least one verification iteration exists",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Iteration" },
+            "label": "Auto-expanded latest iteration"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "summary-task-output-virtualized",
+          "description": "The TaskRunLivePanel output preview uses virtualized line rendering (react-window) to handle large output. Lines are split and rendered individually, capped at 128px height. A 'Load more' button fetches additional output from the backend.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "A task run with output is visible in the panel",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Output" },
+            "label": "Virtualized output preview"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "metadata": {
     "component": "RunRecapTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-02T00:00:00.000Z",
     "pageUrl": "/runs/summary",
     "elementSource": "sdk",
-    "tags": ["run-summary", "recap", "post-run-analysis", "observe"]
+    "tags": ["run-summary", "recap", "post-run-analysis", "observe", "pagination", "memory-protection"]
   }
 }

@@ -713,6 +713,8 @@ pub enum AgenticOutcome {
     },
     /// AI execution errored out
     Error { error: String },
+    /// Budget exceeded or circuit breaker tripped — run should stop gracefully
+    BudgetExceeded { reason: String },
     /// Skipped (no agentic steps defined)
     Skipped,
 }
@@ -726,7 +728,7 @@ impl AgenticOutcome {
         match self {
             AgenticOutcome::Success { output, .. } => Some(output),
             AgenticOutcome::Failed { output, .. } => Some(output),
-            AgenticOutcome::Error { error } => Some(error),
+            AgenticOutcome::Error { error } | AgenticOutcome::BudgetExceeded { reason: error } => Some(error),
             AgenticOutcome::Skipped => None,
         }
     }
@@ -744,7 +746,7 @@ impl AgenticOutcome {
                 output_tokens,
                 ..
             } => (*input_tokens, *output_tokens),
-            AgenticOutcome::Error { .. } | AgenticOutcome::Skipped => (None, None),
+            AgenticOutcome::Error { .. } | AgenticOutcome::BudgetExceeded { .. } | AgenticOutcome::Skipped => (None, None),
         }
     }
 
@@ -753,7 +755,7 @@ impl AgenticOutcome {
         match self {
             AgenticOutcome::Success { parsed, .. } => parsed.as_ref(),
             AgenticOutcome::Failed { parsed, .. } => parsed.as_ref(),
-            AgenticOutcome::Error { .. } | AgenticOutcome::Skipped => None,
+            AgenticOutcome::Error { .. } | AgenticOutcome::BudgetExceeded { .. } | AgenticOutcome::Skipped => None,
         }
     }
 }

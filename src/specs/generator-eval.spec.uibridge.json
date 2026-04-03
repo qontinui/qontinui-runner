@@ -198,13 +198,57 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "geneval-schema-compliance",
+      "name": "Pipeline Agent Schema Compliance",
+      "description": "The Pipeline Inspector's agent trace table includes schema compliance visibility for each agent in a pipeline execution. Each trace row shows whether the agent's output passed JSON schema validation on the first attempt, required coercion or retries, or failed entirely. When expanded, traces with validation failures display the specific validation error summary. This helps developers identify which agents or models consistently produce malformed output, informing model selection and prompt tuning decisions.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "geneval-schema-column-header",
+          "description": "The agent trace table includes a Schema column header so users can see at a glance which agents produced schema-valid output",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Schema"
+            },
+            "label": "Schema column header in agent trace table"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "geneval-schema-validation-errors",
+          "description": "When a trace row with validation errors is expanded, users can see the specific validation error summary to understand what schema violations occurred, enabling targeted prompt or output format fixes",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "conditional",
+          "condition": "An agent trace with validation errors is expanded",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Validation Errors"
+            },
+            "label": "Validation error summary in expanded trace row"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
     }
   ],
   "metadata": {
     "component": "GeneratorEvalPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-02T00:00:00.000Z",
     "pageUrl": "/generator-eval",
     "elementSource": "sdk",
     "tags": [
@@ -213,7 +257,8 @@
       "benchmarks",
       "training",
       "dev-only",
-      "runner-only"
+      "runner-only",
+      "schema-compliance"
     ]
   }
 }

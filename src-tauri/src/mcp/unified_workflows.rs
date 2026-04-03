@@ -1028,33 +1028,65 @@ pub async fn generate_unified_workflow_async_handler(
             .inner()
             .clone();
 
-        // Spawn the workflow executor in the background with panic protection
-        let url_lock = Some(state.app_state.url_lock_manager.clone());
-        let file_registry = Some(state.app_state.file_registry_manager.clone());
-        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-            execution_id_for_guard,
-            workflow_name,
-            url_lock,
-            file_registry,
-            state.app_state.pg_db.clone(),
-            async move {
-                let mut controller =
-                    LoopController::new(app_state, config_storage, app_handle, pid_tracker)
-                        .with_session_manager(session_manager);
+        // Check if Restate durable execution should be used
+        let mut use_legacy = true;
+        let restate_settings = crate::settings::load_settings().restate;
+        if crate::restate::launch::should_use_restate(&restate_settings).await {
+            match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
+                Ok(input) => {
+                    if let Err(e) = state.app_state.pg_db.save_restate_workflow_execution(
+                        &execution_id_for_guard,
+                        &execution_id_for_guard,
+                        None,
+                    ).await {
+                        tracing::error!("Failed to record Restate workflow: {}", e);
+                    }
 
-                controller
-                    .run(
-                        loop_config,
-                        Vec::new(), // No top-level steps — all in stages
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .await
-            },
-        );
+                    if let Err(e) = crate::restate::launch::launch_workflow_via_restate(
+                        &execution_id_for_guard,
+                        &input,
+                        &restate_settings.ingress_url(),
+                    ).await {
+                        tracing::error!("Restate launch failed, falling back to legacy: {}", e);
+                    } else {
+                        use_legacy = false;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to build WorkflowInput for Restate: {}", e);
+                }
+            }
+        }
+
+        // Spawn the workflow executor in the background with panic protection
+        if use_legacy {
+            let url_lock = Some(state.app_state.url_lock_manager.clone());
+            let file_registry = Some(state.app_state.file_registry_manager.clone());
+            crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+                execution_id_for_guard,
+                workflow_name,
+                url_lock,
+                file_registry,
+                state.app_state.pg_db.clone(),
+                async move {
+                    let mut controller =
+                        LoopController::new(app_state, config_storage, app_handle, pid_tracker)
+                            .with_session_manager(session_manager);
+
+                    controller
+                        .run(
+                            loop_config,
+                            Vec::new(), // No top-level steps — all in stages
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await
+                },
+            );
+        }
     }
 
     Ok(Json(ApiResponse::success(GenerateWorkflowAsyncResponse {
@@ -1423,38 +1455,70 @@ pub async fn run_unified_workflow(
         let url_lock = Some(state.app_state.url_lock_manager.clone());
         let file_registry = Some(state.app_state.file_registry_manager.clone());
 
-        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-            execution_id_for_guard,
-            workflow_name_for_guard,
-            url_lock,
-            file_registry,
-            app_state.pg_db.clone(),
-            async move {
-                let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
-                    .state::<Arc<crate::claude_session::SessionManager>>()
-                    .inner()
-                    .clone();
-                let mut controller = crate::unified_workflow_executor::LoopController::new(
-                    app_state,
-                    config_storage,
-                    app_handle,
-                    pid_tracker,
-                )
-                .with_session_manager(session_manager);
+        // Check if Restate durable execution should be used
+        let mut use_legacy = true;
+        let restate_settings = crate::settings::load_settings().restate;
+        if crate::restate::launch::should_use_restate(&restate_settings).await {
+            match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
+                Ok(input) => {
+                    if let Err(e) = state.app_state.pg_db.save_restate_workflow_execution(
+                        &execution_id_for_guard,
+                        &execution_id_for_guard,
+                        None,
+                    ).await {
+                        tracing::error!("Failed to record Restate workflow: {}", e);
+                    }
 
-                controller
-                    .run(
-                        loop_config,
-                        Vec::new(), // No top-level steps — all in stages
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
+                    if let Err(e) = crate::restate::launch::launch_workflow_via_restate(
+                        &execution_id_for_guard,
+                        &input,
+                        &restate_settings.ingress_url(),
+                    ).await {
+                        tracing::error!("Restate launch failed, falling back to legacy: {}", e);
+                    } else {
+                        use_legacy = false;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to build WorkflowInput for Restate: {}", e);
+                }
+            }
+        }
+
+        if use_legacy {
+            crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+                execution_id_for_guard,
+                workflow_name_for_guard,
+                url_lock,
+                file_registry,
+                app_state.pg_db.clone(),
+                async move {
+                    let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
+                        .state::<Arc<crate::claude_session::SessionManager>>()
+                        .inner()
+                        .clone();
+                    let mut controller = crate::unified_workflow_executor::LoopController::new(
+                        app_state,
+                        config_storage,
+                        app_handle,
+                        pid_tracker,
                     )
-                    .await
-            },
-        );
+                    .with_session_manager(session_manager);
+
+                    controller
+                        .run(
+                            loop_config,
+                            Vec::new(), // No top-level steps — all in stages
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await
+                },
+            );
+        }
 
         return Ok(Json(ApiResponse::success(RunUnifiedWorkflowResponse {
             task_run_id: execution_id,
@@ -1917,38 +1981,70 @@ pub async fn execute_inline_workflow(
         let app_handle = state.app_handle.clone();
         let pid_tracker = state.current_ai_pids.clone();
 
-        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-            execution_id_for_guard,
-            workflow_name_for_guard,
-            None,
-            None,
-            app_state.pg_db.clone(),
-            async move {
-                let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
-                    .state::<Arc<crate::claude_session::SessionManager>>()
-                    .inner()
-                    .clone();
-                let mut controller = crate::unified_workflow_executor::LoopController::new(
-                    app_state,
-                    config_storage,
-                    app_handle,
-                    pid_tracker,
-                )
-                .with_session_manager(session_manager);
+        // Check if Restate durable execution should be used
+        let mut use_legacy = true;
+        let restate_settings = crate::settings::load_settings().restate;
+        if crate::restate::launch::should_use_restate(&restate_settings).await {
+            match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
+                Ok(input) => {
+                    if let Err(e) = state.app_state.pg_db.save_restate_workflow_execution(
+                        &execution_id_for_guard,
+                        &execution_id_for_guard,
+                        None,
+                    ).await {
+                        tracing::error!("Failed to record Restate workflow: {}", e);
+                    }
 
-                controller
-                    .run(
-                        loop_config,
-                        Vec::new(), // No top-level steps — all in stages
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
+                    if let Err(e) = crate::restate::launch::launch_workflow_via_restate(
+                        &execution_id_for_guard,
+                        &input,
+                        &restate_settings.ingress_url(),
+                    ).await {
+                        tracing::error!("Restate launch failed, falling back to legacy: {}", e);
+                    } else {
+                        use_legacy = false;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to build WorkflowInput for Restate: {}", e);
+                }
+            }
+        }
+
+        if use_legacy {
+            crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+                execution_id_for_guard,
+                workflow_name_for_guard,
+                None,
+                None,
+                app_state.pg_db.clone(),
+                async move {
+                    let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
+                        .state::<Arc<crate::claude_session::SessionManager>>()
+                        .inner()
+                        .clone();
+                    let mut controller = crate::unified_workflow_executor::LoopController::new(
+                        app_state,
+                        config_storage,
+                        app_handle,
+                        pid_tracker,
                     )
-                    .await
-            },
-        );
+                    .with_session_manager(session_manager);
+
+                    controller
+                        .run(
+                            loop_config,
+                            Vec::new(), // No top-level steps — all in stages
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await
+                },
+            );
+        }
 
         return Ok(Json(ApiResponse::success(
             crate::step_executor::ExecutionResult {

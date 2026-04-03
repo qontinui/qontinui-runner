@@ -695,8 +695,9 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               return true;
             }
             const target = page.startsWith("/") || page.startsWith("http") ? page : "/" + page;
-            // Use history.pushState + popstate for SPA-friendly navigation
-            // (avoids full page reload that would destroy React state)
+            // Navigate using the app's tab system via CustomEvent (same pattern
+            // as page_navigate). Direct pushState alone does NOT trigger React
+            // re-renders — the SPA never switches tabs/pages.
             if (target.startsWith("http") && !target.startsWith(window.location.origin)) {
               // External URL — full navigation required
               window.location.href = target;
@@ -704,8 +705,11 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               const path = target.startsWith("http")
                 ? new URL(target).pathname
                 : target;
+              const tabName = path.replace(/^\/+/, "") || "gui-automation";
+              window.dispatchEvent(
+                new CustomEvent("ui-bridge-navigate", { detail: { page: tabName, url: path } }),
+              );
               window.history.pushState({}, "", path);
-              window.dispatchEvent(new PopStateEvent("popstate"));
             }
             await sendResponse({
               requestId,

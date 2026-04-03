@@ -1932,6 +1932,12 @@ impl LoopController {
                         ctx.iteration, error
                     )
                 }
+                AgenticOutcome::BudgetExceeded { reason } => {
+                    format!(
+                        "Iteration {}: Agentic phase budget exceeded: {}",
+                        ctx.iteration, reason
+                    )
+                }
                 AgenticOutcome::Skipped => String::new(),
             };
             if !observation.is_empty() {
@@ -2026,6 +2032,10 @@ impl LoopController {
                 AgenticOutcome::Error { error } => {
                     error!("AGENTIC-OUTCOME: Error details: {}", error);
                     "Error"
+                }
+                AgenticOutcome::BudgetExceeded { reason } => {
+                    warn!("AGENTIC-OUTCOME: Budget exceeded: {}", reason);
+                    "BudgetExceeded"
                 }
                 AgenticOutcome::Skipped => "Skipped",
             },

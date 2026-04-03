@@ -316,8 +316,10 @@ impl PgDb {
         summary_generated_at: &str,
     ) -> Result<(), String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let parsed_at: chrono::DateTime<chrono::FixedOffset> = chrono::DateTime::parse_from_rfc3339(summary_generated_at)
+            .map_err(|e| format!("PG update_task_summary: invalid timestamp '{}': {}", summary_generated_at, e))?;
         qontinui_db::queries::task_runs::update_task_summary()
-            .bind(&conn, &summary, &goal_achieved, &remaining_work, &summary_generated_at, &id)
+            .bind(&conn, &summary, &goal_achieved, &remaining_work, &parsed_at, &id)
             .opt()
             .await
             .map_err(|e| format!("PG update_task_summary: {}", e))?;

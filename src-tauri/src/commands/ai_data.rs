@@ -1254,7 +1254,7 @@ pub struct TaskRunPlaywrightResultsResult {
     pub has_more: bool,
 }
 
-/// Get Playwright test results from PG database.
+/// Get Playwright test results from PG database with SQL-level pagination.
 #[tauri::command]
 pub async fn get_task_run_playwright_results_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1262,27 +1262,28 @@ pub async fn get_task_run_playwright_results_from_db(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<AiDataResponse<TaskRunPlaywrightResultsResult>, String> {
-    match state
-        .pg_db
-        .get_task_run_playwright_results(&task_run_id)
+    let lim = limit.unwrap_or(200) as i64;
+    let off = offset.unwrap_or(0) as i64;
+
+    let total_count = state.pg_db
+        .count_task_run_table("task_run_playwright_results", &task_run_id)
+        .await.unwrap_or(0) as usize;
+
+    match state.pg_db
+        .get_task_run_playwright_results_paginated(&task_run_id, lim, off)
         .await
     {
-        Ok(all_results) => {
-            let total_count = all_results.len();
-            let total_passed = all_results.iter().filter(|r| r.status == "passed").count();
-            let total_failed = all_results.iter().filter(|r| r.status == "failed").count();
-
-            let off = offset.unwrap_or(0);
-            let lim = limit.unwrap_or(200);
-            let results: Vec<_> = all_results.into_iter().skip(off).take(lim).collect();
-            let has_more = off + results.len() < total_count;
+        Ok(results) => {
+            let passed = results.iter().filter(|r| r.status == "passed").count();
+            let failed = results.iter().filter(|r| r.status == "failed").count();
+            let has_more = (off as usize) + results.len() < total_count;
 
             Ok(AiDataResponse::ok(TaskRunPlaywrightResultsResult {
                 task_run_id,
                 results,
                 count: total_count,
-                passed: total_passed,
-                failed: total_failed,
+                passed,
+                failed,
                 has_more,
             }))
         }
@@ -1354,7 +1355,7 @@ pub struct TaskRunApiRequestsResult {
     pub has_more: bool,
 }
 
-/// Get API requests for a task run from PG database.
+/// Get API requests for a task run from PG database with SQL-level pagination.
 #[tauri::command]
 pub async fn get_task_run_api_requests_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1363,38 +1364,60 @@ pub async fn get_task_run_api_requests_from_db(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<AiDataResponse<TaskRunApiRequestsResult>, String> {
-    match state
-        .pg_db
-        .get_task_run_api_requests(&task_run_id)
-        .await
-    {
-        Ok(all_requests) => {
-            // Apply success_filter client-side (PG method returns all)
-            let filtered: Vec<_> = match success_filter {
-                Some(filter) => all_requests.into_iter().filter(|r| r.success == filter).collect(),
-                None => all_requests,
-            };
-            let total_count = filtered.len();
-            let success_count = filtered.iter().filter(|r| r.success).count();
-            let failed_count = filtered.iter().filter(|r| !r.success).count();
+    let lim = limit.unwrap_or(200);
+    let off = offset.unwrap_or(0);
 
-            // Apply offset/limit pagination
-            let off = offset.unwrap_or(0);
-            let lim = limit.unwrap_or(200);
-            let requests: Vec<_> = filtered.into_iter().skip(off).take(lim).collect();
-            let has_more = off + requests.len() < total_count;
+    // When no filter, use SQL-level LIMIT/OFFSET (avoids loading all rows into Rust memory)
+    if success_filter.is_none() {
+        let total_count = state.pg_db
+            .count_task_run_table("task_run_api_requests", &task_run_id)
+            .await.unwrap_or(0) as usize;
 
-            Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
-                task_run_id,
-                requests,
-                count: total_count, // backwards compat: count = total
-                total_count,
-                success_count,
-                failed_count,
-                has_more,
-            }))
+        match state.pg_db
+            .get_task_run_api_requests_paginated(&task_run_id, lim as i64, off as i64)
+            .await
+        {
+            Ok(requests) => {
+                let success_count = requests.iter().filter(|r| r.success).count();
+                let failed_count = requests.iter().filter(|r| !r.success).count();
+                let has_more = off + requests.len() < total_count;
+
+                Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
+                    task_run_id,
+                    requests,
+                    count: total_count,
+                    total_count,
+                    success_count,
+                    failed_count,
+                    has_more,
+                }))
+            }
+            Err(e) => Ok(AiDataResponse::err(e)),
         }
-        Err(e) => Ok(AiDataResponse::err(e)),
+    } else {
+        // With success_filter, must fetch all then filter in memory
+        match state.pg_db.get_task_run_api_requests(&task_run_id).await {
+            Ok(all_requests) => {
+                let filter = success_filter.unwrap();
+                let filtered: Vec<_> = all_requests.into_iter().filter(|r| r.success == filter).collect();
+                let total_count = filtered.len();
+                let success_count = filtered.iter().filter(|r| r.success).count();
+                let failed_count = filtered.iter().filter(|r| !r.success).count();
+                let requests: Vec<_> = filtered.into_iter().skip(off).take(lim).collect();
+                let has_more = off + requests.len() < total_count;
+
+                Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
+                    task_run_id,
+                    requests,
+                    count: total_count,
+                    total_count,
+                    success_count,
+                    failed_count,
+                    has_more,
+                }))
+            }
+            Err(e) => Ok(AiDataResponse::err(e)),
+        }
     }
 }
 
@@ -1410,7 +1433,7 @@ pub struct TaskRunAwasStepsResult {
     pub has_more: bool,
 }
 
-/// Get AWAS steps for a task run from database.
+/// Get AWAS steps for a task run from database with SQL-level pagination.
 #[tauri::command]
 pub async fn get_task_run_awas_steps_from_db(
     state: State<'_, Arc<AppState>>,
@@ -1419,38 +1442,60 @@ pub async fn get_task_run_awas_steps_from_db(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<AiDataResponse<TaskRunAwasStepsResult>, String> {
-    let steps_result = state.pg_db.get_task_run_awas_steps(&task_run_id).await;
-    match steps_result {
-        Ok(steps) => {
-            // Filter by step_type if provided
-            let filtered: Vec<TaskRunAwasStep> = if let Some(ref filter_type) = step_type {
-                steps
-                    .into_iter()
-                    .filter(|s| s.step_type == *filter_type)
-                    .collect()
-            } else {
-                steps
-            };
-            let total_count = filtered.len();
-            let success_count = filtered.iter().filter(|s| s.success).count();
-            let failed_count = filtered.iter().filter(|s| !s.success).count();
+    let lim = limit.unwrap_or(200);
+    let off = offset.unwrap_or(0);
 
-            let off = offset.unwrap_or(0);
-            let lim = limit.unwrap_or(200);
-            let steps: Vec<_> = filtered.into_iter().skip(off).take(lim).collect();
-            let has_more = off + steps.len() < total_count;
+    // When no filter, use SQL-level LIMIT/OFFSET
+    if step_type.is_none() {
+        let total_count = state.pg_db
+            .count_task_run_table("task_run_awas_steps", &task_run_id)
+            .await.unwrap_or(0) as usize;
 
-            Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
-                task_run_id,
-                steps,
-                count: total_count,
-                total_count,
-                success_count,
-                failed_count,
-                has_more,
-            }))
+        match state.pg_db
+            .get_task_run_awas_steps_paginated(&task_run_id, lim as i64, off as i64)
+            .await
+        {
+            Ok(steps) => {
+                let success_count = steps.iter().filter(|s| s.success).count();
+                let failed_count = steps.iter().filter(|s| !s.success).count();
+                let has_more = off + steps.len() < total_count;
+
+                Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
+                    task_run_id,
+                    steps,
+                    count: total_count,
+                    total_count,
+                    success_count,
+                    failed_count,
+                    has_more,
+                }))
+            }
+            Err(e) => Ok(AiDataResponse::err(e)),
         }
-        Err(e) => Ok(AiDataResponse::err(e)),
+    } else {
+        // With step_type filter, must fetch all then filter in memory
+        match state.pg_db.get_task_run_awas_steps(&task_run_id).await {
+            Ok(all_steps) => {
+                let filter_type = step_type.unwrap();
+                let filtered: Vec<_> = all_steps.into_iter().filter(|s| s.step_type == filter_type).collect();
+                let total_count = filtered.len();
+                let success_count = filtered.iter().filter(|s| s.success).count();
+                let failed_count = filtered.iter().filter(|s| !s.success).count();
+                let steps: Vec<_> = filtered.into_iter().skip(off).take(lim).collect();
+                let has_more = off + steps.len() < total_count;
+
+                Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
+                    task_run_id,
+                    steps,
+                    count: total_count,
+                    total_count,
+                    success_count,
+                    failed_count,
+                    has_more,
+                }))
+            }
+            Err(e) => Ok(AiDataResponse::err(e)),
+        }
     }
 }
 

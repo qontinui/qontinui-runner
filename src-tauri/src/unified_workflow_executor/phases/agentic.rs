@@ -337,7 +337,9 @@ impl AgenticExecutor {
                                             );
                                         }
                                         crate::cost_management::budget::BudgetResult::Exceeded { ref phase, overage_usd } => {
-                                            tracing::error!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                                            let reason = format!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                                            tracing::error!("{}", reason);
+                                            return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
                                         }
                                         crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                                     }
@@ -346,12 +348,17 @@ impl AgenticExecutor {
                                     let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
                                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
                                         tracing::error!("Cost circuit breaker tripped: {}", reason);
+                                        return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
                                     }
 
                                     // Check cache health
                                     let cache_create = resp.cache_creation_tokens.unwrap_or(0);
                                     let cache_read = resp.cache_read_tokens.unwrap_or(0);
-                                    trackers.circuit_breaker.record_cache_metrics(cache_create, cache_read);
+                                    let cache_cb = trackers.circuit_breaker.record_cache_metrics(cache_create, cache_read);
+                                    if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cache_cb {
+                                        tracing::error!("Cache circuit breaker tripped: {}", reason);
+                                        return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
+                                    }
 
                                     // Anomaly detection
                                     if let Ok(mut detector) = trackers.anomaly_detector.lock() {
@@ -1209,7 +1216,9 @@ impl AgenticExecutor {
                             );
                         }
                         crate::cost_management::budget::BudgetResult::Exceeded { ref phase, overage_usd } => {
-                            tracing::error!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                            let reason = format!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                            tracing::error!("{}", reason);
+                            return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
                         }
                         crate::cost_management::budget::BudgetResult::Ok { .. } => {}
                     }
@@ -1218,6 +1227,7 @@ impl AgenticExecutor {
                     let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
                         tracing::error!("Cost circuit breaker tripped: {}", reason);
+                        return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
                     }
 
                     // Anomaly detection
@@ -1251,6 +1261,7 @@ impl AgenticExecutor {
                 AgenticOutcome::Failed { .. } => "failed",
                 AgenticOutcome::Error { .. } => "failed",
                 AgenticOutcome::Skipped => "completed",
+                AgenticOutcome::BudgetExceeded { .. } => "failed",
             };
             let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
             if let Err(e) = self.app_state.pg_db.complete_workflow_ai_session(
@@ -1297,6 +1308,13 @@ impl AgenticExecutor {
                 ),
             ),
             AgenticOutcome::Skipped => ("complete", "Agentic phase skipped".to_string()),
+            AgenticOutcome::BudgetExceeded { reason } => (
+                "error",
+                format!(
+                    "Agentic AI session budget exceeded (iteration {}): {}",
+                    iteration, reason
+                ),
+            ),
         };
         let completion_event = CreateTaskRunEventInput {
             task_run_id: parent_id.clone(),

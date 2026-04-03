@@ -551,6 +551,22 @@ impl LoopController {
                             unreachable_reason: None,
                         }
                     }
+                    AgenticOutcome::BudgetExceeded { reason } => {
+                        warn!("AGENTIC-VERIFICATION: Budget exceeded: {}", reason);
+                        VerificationVerdict {
+                            status: VerificationStatus::Fail,
+                            confidence: 0.0,
+                            observations: format!("BUDGET EXCEEDED: {}", reason),
+                            next_priority: None,
+                            issues: vec![VerificationIssue {
+                                description: format!("Budget exceeded: {}", reason),
+                                severity: "critical".to_string(),
+                                suggestion: None,
+                            }],
+                            unreachable: false,
+                            unreachable_reason: None,
+                        }
+                    }
                     AgenticOutcome::Skipped => {
                         VerificationVerdict {
                             status: VerificationStatus::Fail,
@@ -888,6 +904,7 @@ impl LoopController {
                     Some(format!("Failed: {} (output: {}...)", error, output_preview))
                 }
                 AgenticOutcome::Error { error } => Some(format!("Error: {}", error)),
+                AgenticOutcome::BudgetExceeded { reason } => Some(format!("Budget exceeded: {}", reason)),
                 AgenticOutcome::Skipped => None,
             };
 

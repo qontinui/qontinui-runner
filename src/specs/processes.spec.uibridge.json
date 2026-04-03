@@ -199,6 +199,86 @@
       ],
       "source": "manual"
     }
+    ,
+    {
+      "id": "process-output-virtualization",
+      "name": "Process Output Virtualized Rendering",
+      "description": "The process output viewer uses react-window virtual scrolling to render only visible log lines. This prevents OOM crashes when processes produce extensive output (e.g., 240K+ lines, 48MB). The viewer maintains a 2000-line in-memory buffer, auto-scrolls to follow new output, and supports search filtering.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "proc-output-virtual-scroll",
+          "description": "The process output viewer uses virtualized rendering — only visible lines plus a 20-line overscan buffer are rendered in the DOM, not all 2000 buffered lines. Scrolling is smooth even with maximum buffer size. The line count indicator shows the total number of buffered lines.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "lines"
+            },
+            "label": "Line count indicator"
+          },
+          "assertionType": "semantic",
+          "precondition": "A process is selected and has produced output",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-output-auto-scroll",
+          "description": "New output lines automatically scroll the viewer to the bottom when the user is already at the bottom (auto-scroll mode). When the user scrolls up to inspect earlier output, auto-scroll pauses and a 'Scroll to bottom' button appears. Clicking it re-enables auto-scroll.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Scroll to bottom"
+            },
+            "label": "Scroll to bottom button"
+          },
+          "assertionType": "behavior",
+          "precondition": "Process is running and producing output, user has scrolled up",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-output-search-filter",
+          "description": "The search input filters visible output lines by text content. The filtered result set is also virtualized. Clearing the search restores the full buffered output.",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Search output..."
+            },
+            "label": "Output search input"
+          },
+          "assertionType": "exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-output-no-oom",
+          "description": "Viewing a process with extensive output (thousands of lines) does not cause the webview to crash with 'Error code: Out of Memory'. The page remains responsive.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Out of Memory"
+            },
+            "label": "OOM error indicator"
+          },
+          "assertionType": "notExists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
   ],
   "metadata": {
     "component": "ProcessManagerTab",

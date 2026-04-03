@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Shield, Check, Info, FileSearch, RefreshCw } from "lucide-react";
+import {
+  Shield,
+  Check,
+  Info,
+  FileSearch,
+  RefreshCw,
+  Download,
+  Sliders,
+} from "lucide-react";
 import { getApiBase } from "@/lib/runner-api";
 
 interface SecuritySettingsData {
@@ -136,6 +144,247 @@ function ToggleSwitch({
   );
 }
 
+// ============================================================================
+// Security Posture Visualization (Task #21)
+// ============================================================================
+
+const LAYER_SCORES: Record<string, Record<string, number>> = {
+  permissive: { L1: 2, L2: 1, L3: 1, L4: 0, L5: 1, L6: 1, L7: 1 },
+  standard: { L1: 3, L2: 3, L3: 3, L4: 2, L5: 3, L6: 3, L7: 2 },
+  strict: { L1: 3, L2: 3, L3: 3, L4: 3, L5: 3, L6: 3, L7: 3 },
+  custom: { L1: 2, L2: 2, L3: 2, L4: 2, L5: 2, L6: 2, L7: 2 },
+};
+
+const LAYER_NAMES = ["L1:Compute", "L2:Resources", "L3:Filesystem", "L4:Network", "L5:Credentials", "L6:Actions", "L7:Audit"];
+const SCORE_COLORS = ["bg-red-500", "bg-orange-500", "bg-yellow-500", "bg-green-500"];
+const SCORE_LABELS = ["None", "Cooperative", "Software", "Kernel"];
+
+function SecurityPosture({ profile }: { profile: string }) {
+  const scores = LAYER_SCORES[profile] || LAYER_SCORES.custom;
+
+  return (
+    <div className="rounded-lg bg-neutral-800/50 border border-neutral-700/50 overflow-hidden">
+      <div className="px-4 py-3 border-b border-neutral-700/50">
+        <h4 className="text-sm font-medium text-neutral-200">Security Posture</h4>
+      </div>
+      <div className="p-4 space-y-2">
+        {LAYER_NAMES.map((label, i) => {
+          const key = label.split(":")[0];
+          const score = scores[key] ?? 0;
+          return (
+            <div key={key} className="flex items-center gap-2">
+              <span className="text-[10px] text-neutral-500 font-mono w-24">{label}</span>
+              <div className="flex-1 flex gap-0.5">
+                {[0, 1, 2, 3].map((level) => (
+                  <div
+                    key={level}
+                    className={`h-2.5 flex-1 rounded-sm ${
+                      level < score ? SCORE_COLORS[score - 1] : "bg-neutral-700/50"
+                    }`}
+                  />
+                ))}
+              </div>
+              <span className="text-[10px] text-neutral-500 w-16 text-right">
+                {SCORE_LABELS[score] || "None"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Custom Profile Editor (Task #20)
+// ============================================================================
+
+function CustomProfileEditor({
+  policy,
+  onChange,
+}: {
+  policy: SecurityPolicy | null;
+  onChange: (policy: SecurityPolicy) => void;
+}) {
+  const p: SecurityPolicy = policy || {
+    profile_name: "custom",
+    filesystem: { read_write_paths: [], read_only_paths: [], denied_paths: [], read_only_root: false },
+    network: { mode: "unrestricted", allowed_domains: [], denied_domains: [], block_metadata_endpoints: true, allowed_protocols: [], log_requests: true },
+    actions: { allowed_commands: null, blocked_commands: [], block_destructive: false, max_recursion_depth: 10 },
+    resources: { cpu_limit: null, memory_limit_mb: null, pids_limit: null, timeout_secs: 300 },
+    credentials: { mode: "direct", allowed_credentials: [] },
+  };
+
+  const updateNetwork = (update: Partial<NetworkPolicy>) =>
+    onChange({ ...p, network: { ...p.network, ...update } });
+  const updateActions = (update: Partial<ActionPolicy>) =>
+    onChange({ ...p, actions: { ...p.actions, ...update } });
+  const updateResources = (update: Partial<ResourcePolicy>) =>
+    onChange({ ...p, resources: { ...p.resources, ...update } });
+  const updateFilesystem = (update: Partial<FilesystemPolicy>) =>
+    onChange({ ...p, filesystem: { ...p.filesystem, ...update } });
+
+  return (
+    <div className="rounded-lg bg-neutral-800/50 border border-neutral-700/50 overflow-hidden">
+      <div className="px-4 py-3 border-b border-neutral-700/50 flex items-center gap-2">
+        <Sliders className="w-4 h-4 text-neutral-400" />
+        <h4 className="text-sm font-medium text-neutral-200">Custom Policy Editor</h4>
+      </div>
+      <div className="p-4 space-y-5">
+        {/* Network */}
+        <div className="space-y-2">
+          <h5 className="text-xs font-medium text-neutral-300">Network</h5>
+          <div className="flex gap-2 items-center">
+            <label className="text-[10px] text-neutral-500 w-14">Mode</label>
+            <select
+              value={p.network.mode}
+              onChange={(e) => updateNetwork({ mode: e.target.value })}
+              className="flex-1 px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
+            >
+              <option value="unrestricted">Unrestricted</option>
+              <option value="allow_list">Allow List</option>
+              <option value="deny_list">Deny List</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </div>
+          {(p.network.mode === "allow_list" || p.network.mode === "deny_list") && (
+            <div className="space-y-1">
+              <label className="text-[10px] text-neutral-500">
+                {p.network.mode === "allow_list" ? "Allowed" : "Denied"} domains (one per line)
+              </label>
+              <textarea
+                value={(p.network.mode === "allow_list" ? p.network.allowed_domains : p.network.denied_domains).join("\n")}
+                onChange={(e) => {
+                  const domains = e.target.value.split("\n").filter(Boolean);
+                  if (p.network.mode === "allow_list") updateNetwork({ allowed_domains: domains });
+                  else updateNetwork({ denied_domains: domains });
+                }}
+                rows={3}
+                className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none font-mono"
+                placeholder="api.anthropic.com&#10;*.openai.com"
+              />
+            </div>
+          )}
+          <div className="flex items-center gap-2">
+            <ToggleSwitch
+              checked={p.network.block_metadata_endpoints}
+              onChange={(v) => updateNetwork({ block_metadata_endpoints: v })}
+            />
+            <span className="text-[10px] text-neutral-400">Block cloud metadata endpoints</span>
+          </div>
+        </div>
+
+        {/* Actions */}
+        <div className="space-y-2">
+          <h5 className="text-xs font-medium text-neutral-300">Actions</h5>
+          <div className="flex items-center gap-2">
+            <ToggleSwitch
+              checked={p.actions.block_destructive}
+              onChange={(v) => updateActions({ block_destructive: v })}
+            />
+            <span className="text-[10px] text-neutral-400">Block destructive commands</span>
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] text-neutral-500">Blocked command patterns (regex, one per line)</label>
+            <textarea
+              value={p.actions.blocked_commands.join("\n")}
+              onChange={(e) => updateActions({ blocked_commands: e.target.value.split("\n").filter(Boolean) })}
+              rows={2}
+              className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none font-mono"
+              placeholder="^\s*sudo\b&#10;^\s*su\b"
+            />
+          </div>
+        </div>
+
+        {/* Filesystem */}
+        <div className="space-y-2">
+          <h5 className="text-xs font-medium text-neutral-300">Filesystem</h5>
+          <div className="flex items-center gap-2">
+            <ToggleSwitch
+              checked={p.filesystem.read_only_root}
+              onChange={(v) => updateFilesystem({ read_only_root: v })}
+            />
+            <span className="text-[10px] text-neutral-400">Read-only root filesystem</span>
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] text-neutral-500">Denied paths (glob, one per line)</label>
+            <textarea
+              value={p.filesystem.denied_paths.join("\n")}
+              onChange={(e) => updateFilesystem({ denied_paths: e.target.value.split("\n").filter(Boolean) })}
+              rows={2}
+              className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none font-mono"
+              placeholder="/etc/shadow&#10;/home/*/.ssh/**"
+            />
+          </div>
+        </div>
+
+        {/* Resources */}
+        <div className="space-y-2">
+          <h5 className="text-xs font-medium text-neutral-300">Resources</h5>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-0.5">
+              <label className="text-[10px] text-neutral-500">CPU limit (cores)</label>
+              <input
+                type="number" step="0.5" min="0.5" max="16"
+                value={p.resources.cpu_limit ?? ""}
+                onChange={(e) => updateResources({ cpu_limit: e.target.value ? parseFloat(e.target.value) : null })}
+                className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
+                placeholder="No limit"
+              />
+            </div>
+            <div className="space-y-0.5">
+              <label className="text-[10px] text-neutral-500">Memory (MB)</label>
+              <input
+                type="number" min="64" max="32768"
+                value={p.resources.memory_limit_mb ?? ""}
+                onChange={(e) => updateResources({ memory_limit_mb: e.target.value ? parseInt(e.target.value) : null })}
+                className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
+                placeholder="No limit"
+              />
+            </div>
+            <div className="space-y-0.5">
+              <label className="text-[10px] text-neutral-500">PID limit</label>
+              <input
+                type="number" min="16" max="4096"
+                value={p.resources.pids_limit ?? ""}
+                onChange={(e) => updateResources({ pids_limit: e.target.value ? parseInt(e.target.value) : null })}
+                className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
+                placeholder="No limit"
+              />
+            </div>
+            <div className="space-y-0.5">
+              <label className="text-[10px] text-neutral-500">Timeout (sec)</label>
+              <input
+                type="number" min="10" max="3600"
+                value={p.resources.timeout_secs}
+                onChange={(e) => updateResources({ timeout_secs: parseInt(e.target.value) || 300 })}
+                className="w-full px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* Credentials */}
+        <div className="space-y-2">
+          <h5 className="text-xs font-medium text-neutral-300">Credentials</h5>
+          <div className="flex gap-2 items-center">
+            <label className="text-[10px] text-neutral-500 w-14">Mode</label>
+            <select
+              value={p.credentials.mode}
+              onChange={(e) => onChange({ ...p, credentials: { ...p.credentials, mode: e.target.value } })}
+              className="flex-1 px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
+            >
+              <option value="direct">Direct (current behavior)</option>
+              <option value="proxy">Proxy (placeholder injection)</option>
+              <option value="denied">Denied (no credentials)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SecuritySettings({ onLog }: SecuritySettingsProps) {
   const [config, setConfig] = useState<SecuritySettingsData>(DEFAULT_SETTINGS);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
@@ -212,6 +461,47 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
       loadAuditData();
     }
   }, [config.audit_enabled, loadAuditData]);
+
+  const exportAuditLog = async (format: "json" | "csv") => {
+    try {
+      const base = getApiBase();
+      const resp = await fetch(`${base}/security/audit/events?limit=10000`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const events = data.data || [];
+
+      let content: string;
+      let mimeType: string;
+      let ext: string;
+
+      if (format === "csv") {
+        const headers = "timestamp,event_type,decision,action,reason,step_name\n";
+        const rows = events
+          .map(
+            (e: AuditEvent) =>
+              `"${e.timestamp}","${e.event_type}","${e.decision}","${e.action.replace(/"/g, '""')}","${(e.reason || "").replace(/"/g, '""')}","${e.step_name || ""}"`
+          )
+          .join("\n");
+        content = headers + rows;
+        mimeType = "text/csv";
+        ext = "csv";
+      } else {
+        content = JSON.stringify(events, null, 2);
+        mimeType = "application/json";
+        ext = "json";
+      }
+
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `security-audit-${new Date().toISOString().slice(0, 10)}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to export audit log:", err);
+    }
+  };
 
   const saveSettings = async () => {
     try {
@@ -306,6 +596,19 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
           )}
         </div>
       </div>
+
+      {/* Security Posture Visualization */}
+      <SecurityPosture profile={config.default_profile} />
+
+      {/* Custom Profile Editor */}
+      {config.default_profile === "custom" && (
+        <CustomProfileEditor
+          policy={config.custom_policy}
+          onChange={(custom_policy) =>
+            setConfig((prev) => ({ ...prev, custom_policy }))
+          }
+        />
+      )}
 
       {/* Features */}
       <div className="rounded-lg bg-neutral-800/50 border border-neutral-700/50 overflow-hidden">
@@ -423,6 +726,15 @@ export function SecuritySettings({ onLog }: SecuritySettingsProps) {
                   className={`w-3.5 h-3.5 text-neutral-400 ${auditLoading ? "animate-spin" : ""}`}
                 />
               </button>
+              {auditEvents.length > 0 && (
+                <button
+                  onClick={() => exportAuditLog("json")}
+                  className="p-1 hover:bg-neutral-700 rounded transition-colors"
+                  title="Export as JSON"
+                >
+                  <Download className="w-3.5 h-3.5 text-neutral-400" />
+                </button>
+              )}
             </div>
           </div>
           <div className="max-h-64 overflow-y-auto">

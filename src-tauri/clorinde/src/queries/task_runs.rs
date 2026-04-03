@@ -69,17 +69,13 @@ pub struct StopTaskRunParams<T1: crate::StringSql, T2: crate::StringSql> {
     pub id: T2,
 }
 #[derive(Debug)]
-pub struct UpdateTaskSummaryParams<
-    T1: crate::StringSql,
-    T2: crate::StringSql,
-    T3: crate::StringSql,
-    T4: crate::StringSql,
-> {
+pub struct UpdateTaskSummaryParams<T1: crate::StringSql, T2: crate::StringSql, T3: crate::StringSql>
+{
     pub summary: Option<T1>,
     pub goal_achieved: Option<bool>,
     pub remaining_work: Option<T2>,
-    pub summary_generated_at: T3,
-    pub id: T4,
+    pub summary_generated_at: chrono::DateTime<chrono::FixedOffset>,
+    pub id: T3,
 }
 #[derive(Debug)]
 pub struct AppendTaskOutputParams<T1: crate::StringSql, T2: crate::StringSql> {
@@ -1530,15 +1526,14 @@ impl UpdateTaskSummaryStmt {
         T1: crate::StringSql,
         T2: crate::StringSql,
         T3: crate::StringSql,
-        T4: crate::StringSql,
     >(
         &'s self,
         client: &'c C,
         summary: &'a Option<T1>,
         goal_achieved: &'a Option<bool>,
         remaining_work: &'a Option<T2>,
-        summary_generated_at: &'a T3,
-        id: &'a T4,
+        summary_generated_at: &'a chrono::DateTime<chrono::FixedOffset>,
+        id: &'a T3,
     ) -> StringQuery<'c, 'a, 's, C, String, 5> {
         StringQuery {
             client,
@@ -1556,21 +1551,12 @@ impl UpdateTaskSummaryStmt {
         }
     }
 }
-impl<
-    'c,
-    'a,
-    's,
-    C: GenericClient,
-    T1: crate::StringSql,
-    T2: crate::StringSql,
-    T3: crate::StringSql,
-    T4: crate::StringSql,
->
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql, T3: crate::StringSql>
     crate::client::async_::Params<
         'c,
         'a,
         's,
-        UpdateTaskSummaryParams<T1, T2, T3, T4>,
+        UpdateTaskSummaryParams<T1, T2, T3>,
         StringQuery<'c, 'a, 's, C, String, 5>,
         C,
     > for UpdateTaskSummaryStmt
@@ -1578,7 +1564,7 @@ impl<
     fn params(
         &'s self,
         client: &'c C,
-        params: &'a UpdateTaskSummaryParams<T1, T2, T3, T4>,
+        params: &'a UpdateTaskSummaryParams<T1, T2, T3>,
     ) -> StringQuery<'c, 'a, 's, C, String, 5> {
         self.bind(
             client,
@@ -1906,7 +1892,10 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
 }
 pub struct GetTaskOutputStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_output() -> GetTaskOutputStmt {
-    GetTaskOutputStmt("SELECT COALESCE(output_log, '') as output_log FROM task_runs WHERE id = $1", None)
+    GetTaskOutputStmt(
+        "SELECT COALESCE(output_log, '') as output_log FROM task_runs WHERE id = $1",
+        None,
+    )
 }
 impl GetTaskOutputStmt {
     pub async fn prepare<'a, C: GenericClient>(

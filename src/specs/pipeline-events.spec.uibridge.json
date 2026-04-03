@@ -312,6 +312,63 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "pipeline-events-virtualization",
+      "name": "Virtualized Rendering and Pagination",
+      "description": "The Pipeline Events timeline uses react-window virtualized rendering to handle large event lists efficiently. Events are paginated client-side (50 per page) with a 'Load more' button. The header shows a count indicator like '50 of 8297'. Only visible event rows plus a 10-row overscan buffer are rendered in the DOM.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "pipe-virtual-count-indicator",
+          "description": "When events are paginated, the header shows a count indicator in the format 'N of M' (e.g., '50 of 8297') so the user knows how many events exist and how many are currently loaded",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "precondition": "More than 50 pipeline events exist for the task run",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "of" },
+            "label": "Event count indicator"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "pipe-virtual-load-more",
+          "description": "When more events exist beyond the current page, a 'Load more' button appears at the bottom showing the remaining count. Clicking it loads the next 50 events. The button disappears when all events are loaded.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "precondition": "More than 50 pipeline events exist",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Load more" },
+            "label": "Load more events button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "pipe-virtual-smooth-scroll",
+          "description": "Scrolling through the virtualized event list is smooth without jank, even when hundreds of events are loaded. The react-window List renders only visible rows plus buffer.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "precondition": "200+ pipeline events are loaded",
+          "target": {
+            "type": "search",
+            "criteria": { "textContains": "Pipeline Events" },
+            "label": "Virtualized event list"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "metadata": {

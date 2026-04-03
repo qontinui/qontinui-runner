@@ -178,3 +178,67 @@ pub fn build_workflow_input(
             .map_err(|e| format!("Failed to serialize completion prompt steps: {}", e))?,
     })
 }
+
+/// Extract a minimal JSON representation of the essential LoopConfig fields
+/// for Restate transport. LoopConfig doesn't implement Serialize (too many
+/// non-serializable runtime fields), so we extract only what's needed.
+pub fn loop_config_to_json(
+    max_iterations: u32,
+    execution_id: &str,
+    workflow_name: &str,
+    workflow_id: &str,
+    base_prompt: &str,
+) -> String {
+    serde_json::json!({
+        "max_iterations": max_iterations,
+        "execution_id": execution_id,
+        "workflow_name": workflow_name,
+        "workflow_id": workflow_id,
+        "base_prompt": base_prompt,
+    })
+    .to_string()
+}
+
+/// Build a complete `WorkflowInput` from a LoopConfig by extracting steps
+/// from stages. Most workflows store all steps inside stages (the direct
+/// step parameters to `LoopController::run()` are `Vec::new()`).
+///
+/// For multi-stage workflows, all stages' steps are concatenated.
+pub fn build_workflow_input_from_loop_config(
+    loop_config: &crate::unified_workflow_executor::types::LoopConfig,
+) -> Result<WorkflowInput, String> {
+    let config_json = loop_config_to_json(
+        loop_config.max_iterations,
+        &loop_config.execution_id,
+        &loop_config.workflow_name,
+        &loop_config.workflow_id,
+        &loop_config.base_prompt,
+    );
+
+    // Collect steps from all stages
+    let mut setup_auto = Vec::new();
+    let mut setup_prompt = Vec::new();
+    let mut verification = Vec::new();
+    let mut agentic = Vec::new();
+    let mut completion_auto = Vec::new();
+    let mut completion_prompt = Vec::new();
+
+    for stage in &loop_config.stages {
+        setup_auto.extend(stage.setup_automation_steps.iter().cloned());
+        setup_prompt.extend(stage.setup_prompt_steps.iter().cloned());
+        verification.extend(stage.verification_steps.iter().cloned());
+        agentic.extend(stage.agentic_steps.iter().cloned());
+        completion_auto.extend(stage.completion_automation_steps.iter().cloned());
+        completion_prompt.extend(stage.completion_prompt_steps.iter().cloned());
+    }
+
+    build_workflow_input(
+        &config_json,
+        &setup_auto,
+        &setup_prompt,
+        &verification,
+        &agentic,
+        &completion_auto,
+        &completion_prompt,
+    )
+}

@@ -1312,6 +1312,16 @@ impl LoopController {
                                 agentic_iteration, error
                             )
                         }
+                        AgenticOutcome::BudgetExceeded { reason } => {
+                            warn!(
+                                "Stage {} agentic-first budget exceeded: {}, stopping",
+                                stage_num, reason
+                            );
+                            format!(
+                                "\n=== Agentic Phase (iteration {}, BUDGET EXCEEDED: {}) ===\n",
+                                agentic_iteration, reason
+                            )
+                        }
                         AgenticOutcome::Skipped => String::new(),
                     };
                     if !output_text.is_empty() {
@@ -1321,6 +1331,12 @@ impl LoopController {
                             true,
                             false,
                         ).await;
+                    }
+
+                    // If budget was exceeded, stop the run gracefully
+                    if matches!(&outcome, AgenticOutcome::BudgetExceeded { .. }) {
+                        warn!("Stopping run due to budget exceeded");
+                        break;
                     }
 
                     self.persist_workflow_state(
@@ -2788,6 +2804,15 @@ impl LoopController {
                         iteration + 1,
                         max_iterations,
                         error
+                    )
+                }
+                AgenticOutcome::BudgetExceeded { reason } => {
+                    warn!("SWEEP: Iteration {} budget exceeded: {}", iteration + 1, reason);
+                    format!(
+                        "\n\n=== Completion Sweep (Iteration {}/{}, BUDGET EXCEEDED: {}) ===\n\n",
+                        iteration + 1,
+                        max_iterations,
+                        reason
                     )
                 }
                 AgenticOutcome::Skipped => String::new(),

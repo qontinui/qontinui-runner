@@ -560,6 +560,7 @@ impl CanvasPanelManager {
                 AgenticOutcome::Success { .. } => "Completed".to_string(),
                 AgenticOutcome::Failed { .. } => "Failed".to_string(),
                 AgenticOutcome::Error { .. } => "Error".to_string(),
+                AgenticOutcome::BudgetExceeded { .. } => "Budget Exceeded".to_string(),
                 AgenticOutcome::Skipped => "Skipped".to_string(),
             });
             snapshot.findings_count = findings.len();
@@ -613,6 +614,9 @@ impl CanvasPanelManager {
             }
             AgenticOutcome::Error { error } => {
                 format!("AI error: {}", truncate_str(error, 80))
+            }
+            AgenticOutcome::BudgetExceeded { reason } => {
+                format!("AI budget exceeded: {}", truncate_str(reason, 80))
             }
             AgenticOutcome::Skipped => "AI phase skipped".to_string(),
         };

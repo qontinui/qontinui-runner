@@ -131,55 +131,236 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
         let config_storage = get_config_storage()?;
         let pg_db = &app_state.pg_db;
 
-        // Execute the full workflow via the durable executor.
-        // The entire workflow runs as a single Restate side effect (ctx.run).
-        // On crash + replay, Restate returns the cached output without re-executing.
-        let input_clone = input.clone();
-        let execution_id_clone = execution_id.clone();
-        let app_state_clone = app_state.clone();
-        let config_storage_clone = config_storage.clone();
-        let pg_db_clone = pg_db.clone();
+        // Parse max_iterations from config
+        let max_iterations: u32 = serde_json::from_str::<serde_json::Value>(&input.loop_config_json)
+            .ok()
+            .and_then(|v| v.get("max_iterations")?.as_u64())
+            .unwrap_or(5) as u32;
 
-        let output: WorkflowOutput = ctx
-            .run(|| async move {
-                super::durable_executor::execute_workflow(
-                    &app_state_clone,
-                    &config_storage_clone,
-                    &input_clone,
-                    &execution_id_clone,
-                    &pg_db_clone,
-                )
-                .await
-            })
-            .name("workflow-execution")
-            .await
-            .map_err(|e| TerminalError::new(format!("Workflow execution failed: {}", e)))?;
+        let start_time = std::time::Instant::now();
+        let mut verification_passed = false;
+        let mut was_stopped = false;
+        let mut iterations_run = 0u32;
 
-        // Update final state in Restate K/V
-        let final_phase = if output.was_stopped {
-            DurablePhase::Stopped
-        } else if output.success {
-            DurablePhase::Completed
-        } else {
-            DurablePhase::Failed
+        // Update task run status
+        if let Err(e) = pg_db.update_task_run_status(&execution_id, "running").await {
+            warn!(execution_id = %execution_id, "Failed to update task run status: {}", e);
+        }
+
+        // =====================================================================
+        // PHASE 1: SETUP (each phase is a separate ctx.run() for journal replay)
+        // =====================================================================
+        info!(execution_id = %execution_id, "Phase 1/4: Setup");
+        ctx.set(STATE_KEY, DurableWorkflowState {
+            execution_id: execution_id.clone(),
+            workflow_name: String::from("workflow"),
+            phase: DurablePhase::Setup,
+            ..Default::default()
+        });
+
+        // Setup automation steps — journaled as a single side effect
+        let setup_result: super::durable_executor::PhaseResult = {
+            let as_clone = app_state.clone();
+            let cs_clone = config_storage.clone();
+            let steps = input.setup_automation_steps_json.clone();
+            let eid = execution_id.clone();
+            ctx.run(|| async move {
+                super::durable_executor::execute_steps_batch(
+                    &as_clone, &cs_clone, &steps, "setup", None, &eid, None,
+                ).await
+            }).name("phase-setup-auto").await
+                .map_err(|e| TerminalError::new(format!("Setup failed: {}", e)))?
         };
 
-        let final_state = DurableWorkflowState {
+        if !setup_result.success {
+            let output = WorkflowOutput {
+                success: false, verification_passed: false, iterations_run: 0,
+                critical_failure: true, was_stopped: false,
+                duration_ms: start_time.elapsed().as_millis() as u64,
+                files_modified: vec![], error: setup_result.failure_context,
+            };
+            if let Err(e) = pg_db.update_task_run_status(&execution_id, "failed").await {
+                warn!(execution_id = %execution_id, "Failed to update status: {}", e);
+            }
+            return Ok(output);
+        }
+
+        // Setup prompt steps — journaled separately
+        let _setup_prompt_result: super::durable_executor::PhaseResult = {
+            let as_clone = app_state.clone();
+            let cs_clone = config_storage.clone();
+            let steps = input.setup_prompt_steps_json.clone();
+            let eid = execution_id.clone();
+            ctx.run(|| async move {
+                super::durable_executor::execute_steps_batch(
+                    &as_clone, &cs_clone, &steps, "setup_prompt", None, &eid, None,
+                ).await
+            }).name("phase-setup-prompt").await
+                .map_err(|e| TerminalError::new(format!("Setup prompts failed: {}", e)))?
+        };
+
+        // =====================================================================
+        // PHASE 2-3: VERIFICATION-AGENTIC LOOP (each iteration journaled)
+        // =====================================================================
+        let mut iteration = 1u32;
+        while iteration <= max_iterations {
+            // Check stop via PG (not journaled — side-effect-free read)
+            let stopped = {
+                match pg_db.get_task_run(&execution_id).await {
+                    Ok(Some(tr)) => tr.status == "stopped" || tr.status == "cancelling",
+                    _ => false,
+                }
+            };
+            if stopped {
+                info!(execution_id = %execution_id, iteration, "Stop requested");
+                was_stopped = true;
+                break;
+            }
+
+            // Update state for this iteration
+            ctx.set(STATE_KEY, DurableWorkflowState {
+                execution_id: execution_id.clone(),
+                workflow_name: String::from("workflow"),
+                phase: DurablePhase::Verification,
+                iteration,
+                ..Default::default()
+            });
+
+            // Verification — journaled per iteration
+            let v_result: super::durable_executor::PhaseResult = {
+                let as_clone = app_state.clone();
+                let cs_clone = config_storage.clone();
+                let steps = input.verification_steps_json.clone();
+                let eid = execution_id.clone();
+                let iter = iteration;
+                ctx.run(|| async move {
+                    super::durable_executor::execute_steps_batch(
+                        &as_clone, &cs_clone, &steps, "verification", Some(iter), &eid, None,
+                    ).await
+                }).name(&format!("phase-verify-{}", iteration)).await
+                    .map_err(|e| TerminalError::new(format!("Verification failed: {}", e)))?
+            };
+
+            iterations_run = iteration;
+
+            if v_result.all_passed {
+                info!(execution_id = %execution_id, iteration, "Verification PASSED");
+                verification_passed = true;
+                break;
+            }
+
+            let failure_ctx = v_result.failure_context
+                .unwrap_or_else(|| "Verification failed".to_string());
+
+            // Agentic — journaled per iteration
+            if iteration < max_iterations {
+                ctx.set(STATE_KEY, DurableWorkflowState {
+                    execution_id: execution_id.clone(),
+                    workflow_name: String::from("workflow"),
+                    phase: DurablePhase::Agentic,
+                    iteration,
+                    ..Default::default()
+                });
+
+                let _a_result: super::durable_executor::PhaseResult = {
+                    let as_clone = app_state.clone();
+                    let cs_clone = config_storage.clone();
+                    let steps = input.agentic_steps_json.clone();
+                    let eid = execution_id.clone();
+                    let iter = iteration;
+                    let fail_ctx = failure_ctx.clone();
+                    ctx.run(|| async move {
+                        super::durable_executor::execute_steps_batch(
+                            &as_clone, &cs_clone, &steps, "agentic", Some(iter), &eid,
+                            Some(&fail_ctx),
+                        ).await
+                    }).name(&format!("phase-agentic-{}", iteration)).await
+                        .map_err(|e| TerminalError::new(format!("Agentic failed: {}", e)))?
+                };
+            }
+
+            iteration += 1;
+        }
+
+        // =====================================================================
+        // PHASE 4: COMPLETION (journaled separately)
+        // =====================================================================
+        if verification_passed {
+            info!(execution_id = %execution_id, "Phase 4/4: Completion");
+            ctx.set(STATE_KEY, DurableWorkflowState {
+                execution_id: execution_id.clone(),
+                workflow_name: String::from("workflow"),
+                phase: DurablePhase::Completion,
+                verification_passed: true,
+                ..Default::default()
+            });
+
+            // Completion automation
+            let _c_result: super::durable_executor::PhaseResult = {
+                let as_clone = app_state.clone();
+                let cs_clone = config_storage.clone();
+                let steps = input.completion_automation_steps_json.clone();
+                let eid = execution_id.clone();
+                ctx.run(|| async move {
+                    super::durable_executor::execute_steps_batch(
+                        &as_clone, &cs_clone, &steps, "completion", None, &eid, None,
+                    ).await
+                }).name("phase-completion-auto").await
+                    .map_err(|e| TerminalError::new(format!("Completion failed: {}", e)))?
+            };
+
+            // Completion prompts
+            let _cp_result: super::durable_executor::PhaseResult = {
+                let as_clone = app_state.clone();
+                let cs_clone = config_storage.clone();
+                let steps = input.completion_prompt_steps_json.clone();
+                let eid = execution_id.clone();
+                ctx.run(|| async move {
+                    super::durable_executor::execute_steps_batch(
+                        &as_clone, &cs_clone, &steps, "completion_prompt", None, &eid, None,
+                    ).await
+                }).name("phase-completion-prompt").await
+                    .map_err(|e| TerminalError::new(format!("Completion prompts failed: {}", e)))?
+            };
+        }
+
+        // =====================================================================
+        // FINALIZE
+        // =====================================================================
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let success = verification_passed && !was_stopped;
+
+        // Collect modified files via git
+        let files_modified: Vec<String> = {
+            let as_clone = app_state.clone();
+            ctx.run(|| async move {
+                super::durable_executor::get_modified_files().await
+            }).name("collect-modified-files").await
+                .unwrap_or_default()
+        };
+
+        let final_status = if success { "complete" } else if was_stopped { "stopped" } else { "failed" };
+        if let Err(e) = pg_db.update_task_run_status(&execution_id, final_status).await {
+            warn!(execution_id = %execution_id, "Failed to update final status: {}", e);
+        }
+
+        // Update final Restate state
+        let final_phase = if was_stopped { DurablePhase::Stopped }
+            else if success { DurablePhase::Completed }
+            else { DurablePhase::Failed };
+
+        ctx.set(STATE_KEY, DurableWorkflowState {
             execution_id: execution_id.clone(),
             workflow_name: String::from("workflow"),
             phase: final_phase,
-            iteration: output.iterations_run,
-            stage_index: None,
-            verification_passed: output.verification_passed,
-            stop_requested: output.was_stopped,
-            approval_awakeable_id: None,
-            total_steps_completed: 0,
-            last_completed_step: None,
-        };
-        ctx.set(STATE_KEY, final_state);
+            iteration: iterations_run,
+            verification_passed,
+            stop_requested: was_stopped,
+            ..Default::default()
+        });
 
-        // If the workflow failed and compensations exist, execute them
-        if !output.success && !output.was_stopped {
+        // If failed, execute saga compensations
+        if !success && !was_stopped {
             let compensations: Option<Vec<CompensationAction>> =
                 ctx.get(COMPENSATIONS_KEY).await.map_err(|e| {
                     TerminalError::new(format!("Failed to read compensations: {}", e))
@@ -187,24 +368,27 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
 
             if let Some(actions) = compensations {
                 if !actions.is_empty() {
-                    info!(
-                        execution_id = %execution_id,
-                        count = actions.len(),
-                        "Executing saga compensations for failed workflow"
-                    );
-                    let results =
-                        super::compensation::execute_all_compensations(&actions).await;
+                    info!(execution_id = %execution_id, count = actions.len(),
+                        "Executing saga compensations for failed workflow");
+                    let results = super::compensation::execute_all_compensations(&actions).await;
                     let failed = results.iter().filter(|r| !r.success).count();
                     if failed > 0 {
-                        warn!(
-                            execution_id = %execution_id,
-                            failed = failed,
-                            "Some compensations failed"
-                        );
+                        warn!(execution_id = %execution_id, failed, "Some compensations failed");
                     }
                 }
             }
         }
+
+        let output = WorkflowOutput {
+            success,
+            verification_passed,
+            iterations_run,
+            critical_failure: false,
+            was_stopped,
+            duration_ms,
+            files_modified,
+            error: None,
+        };
 
         info!(
             execution_id = %execution_id,
@@ -239,15 +423,29 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             "Stop requested for durable workflow"
         );
 
-        // NOTE: SharedWorkflowContext is read-only — it cannot call set().
-        // The stop signal must be communicated through a different mechanism.
-        //
-        // TODO(Phase 3): Use a Restate awakeable or signal to communicate
-        // the stop request to the running workflow. Possible approaches:
-        // 1. Use ctx.run_client() to call a Virtual Object that stores the flag
-        // 2. Use an external signal channel (e.g., tokio watch channel)
-        // 3. Store the flag in the WorkflowStateObject and poll from run()
+        // SharedWorkflowContext is read-only — cannot call set().
+        // Instead, signal the stop through the database. The running workflow's
+        // is_stop_requested() polls PG for status == "cancelling" || "stopped".
+        let app_state = get_app_state()?;
+        if let Err(e) = app_state
+            .pg_db
+            .update_task_run_status(&execution_id, "cancelling")
+            .await
+        {
+            error!(
+                execution_id = %execution_id,
+                "Failed to set cancelling status in PG: {}", e
+            );
+            return Err(TerminalError::new(format!(
+                "Failed to request stop: {}",
+                e
+            )));
+        }
 
+        info!(
+            execution_id = %execution_id,
+            "Stop signal stored in PG (status=cancelling)"
+        );
         Ok(())
     }
 
@@ -263,14 +461,66 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             "Approval response submitted for durable workflow"
         );
 
-        // NOTE: SharedWorkflowContext is read-only — it cannot resolve awakeables.
-        //
-        // TODO(Phase 3): Resolve the approval awakeable. The awakeable ID is stored
-        // in the workflow state's `approval_awakeable_id` field. The resolution
-        // needs to happen through:
-        // 1. A Restate admin API call to resolve the awakeable externally
-        // 2. Or routing through the WorkflowStateObject to store the response
-        //    and having run() poll for it
+        // SharedWorkflowContext is read-only — cannot resolve awakeables directly.
+        // Instead, resolve the awakeable via the Restate ingress API.
+        // The awakeable ID is stored in PG (restate_awakeables table).
+        let app_state = get_app_state()?;
+        let pending = app_state
+            .pg_db
+            .get_pending_awakeables(&execution_id)
+            .await
+            .map_err(|e| {
+                TerminalError::new(format!("Failed to get pending awakeables: {}", e))
+            })?;
+
+        if let Some(awakeable) = pending.first() {
+            let restate_settings = crate::settings::load_settings().restate;
+            let payload = serde_json::json!({
+                "approved": response.approved,
+                "comment": response.comment,
+                "reviewer": response.reviewer,
+            });
+
+            if let Err(e) = super::launch::resolve_awakeable(
+                &awakeable.awakeable_id,
+                &payload,
+                &restate_settings.ingress_url(),
+            )
+            .await
+            {
+                error!(
+                    execution_id = %execution_id,
+                    "Failed to resolve awakeable: {}", e
+                );
+                return Err(TerminalError::new(format!(
+                    "Failed to resolve awakeable: {}",
+                    e
+                )));
+            }
+
+            // Mark as resolved in PG
+            if let Err(e) = app_state
+                .pg_db
+                .resolve_restate_awakeable(&awakeable.awakeable_id)
+                .await
+            {
+                warn!(
+                    execution_id = %execution_id,
+                    "Failed to update awakeable status in PG: {}", e
+                );
+            }
+
+            info!(
+                execution_id = %execution_id,
+                awakeable_id = %awakeable.awakeable_id,
+                "Approval awakeable resolved"
+            );
+        } else {
+            warn!(
+                execution_id = %execution_id,
+                "No pending awakeables found for approval"
+            );
+        }
 
         Ok(())
     }

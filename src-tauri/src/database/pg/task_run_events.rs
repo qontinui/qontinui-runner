@@ -304,6 +304,54 @@ impl PgDb {
             .collect())
     }
 
+    /// Get Playwright results for a task run with SQL-level LIMIT/OFFSET.
+    pub async fn get_task_run_playwright_results_paginated(
+        &self,
+        task_run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskRunPlaywrightResult>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = qontinui_db::queries::task_run_events::get_task_run_playwright_results_limited()
+            .bind(&conn, &task_run_id, &limit, &offset)
+            .all()
+            .await
+            .map_err(|e| format!("PG query task_run_playwright_results: {}", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let spec_file = if r.spec_file.is_empty() { None } else { Some(r.spec_file) };
+                let duration_ms = if r.duration_ms == 0 { None } else { Some(r.duration_ms) };
+                let stdout = if r.stdout.is_empty() { None } else { Some(r.stdout) };
+                let stderr = if r.stderr.is_empty() { None } else { Some(r.stderr) };
+                let console_output = if r.console_output.is_empty() { None } else { Some(r.console_output) };
+                let page_snapshot = if r.page_snapshot.is_empty() { None } else { Some(r.page_snapshot) };
+                let error_message = if r.error_message.is_empty() { None } else { Some(r.error_message) };
+                let failure_screenshot_path = if r.failure_screenshot_path.is_empty() { None } else { Some(r.failure_screenshot_path) };
+
+                TaskRunPlaywrightResult {
+                    id: r.id,
+                    task_run_id: r.task_run_id,
+                    test_name: r.test_name,
+                    spec_file,
+                    status: r.status,
+                    duration_ms,
+                    stdout,
+                    stderr,
+                    console_output,
+                    page_snapshot,
+                    error_message,
+                    failure_screenshot_path,
+                    assertions_passed: r.assertions_passed,
+                    assertions_failed: r.assertions_failed,
+                    created_at: r.created_at.to_rfc3339(),
+                }
+            })
+            .collect())
+    }
+
     /// Create a task run API request record.
     pub async fn create_task_run_api_request(
         &self,
@@ -370,6 +418,62 @@ impl PgDb {
             .into_iter()
             .map(|r| {
                 // Clorinde returns non-optional (COALESCE'd) — convert empty to None
+                let step_name = if r.step_name.is_empty() { None } else { Some(r.step_name) };
+                let request_headers = if r.request_headers.is_empty() { None } else { Some(r.request_headers) };
+                let request_body = if r.request_body.is_empty() { None } else { Some(r.request_body) };
+                let status_text = if r.status_text.is_empty() { None } else { Some(r.status_text) };
+                let response_headers = if r.response_headers.is_empty() { None } else { Some(r.response_headers) };
+                let response_body = if r.response_body.is_empty() { None } else { Some(r.response_body) };
+                let response_size_bytes = if r.response_size_bytes == 0 { None } else { Some(r.response_size_bytes) };
+                let extractions = if r.extractions.is_empty() { None } else { Some(r.extractions) };
+                let assertions = if r.assertions.is_empty() { None } else { Some(r.assertions) };
+                let error_message = if r.error_message.is_empty() { None } else { Some(r.error_message) };
+
+                TaskRunApiRequest {
+                    id: r.id,
+                    task_run_id: r.task_run_id,
+                    step_id: r.step_id,
+                    step_name,
+                    method: r.method,
+                    url: r.url,
+                    resolved_url: r.resolved_url,
+                    request_headers,
+                    request_body,
+                    status_code: r.status_code,
+                    status_text,
+                    response_headers,
+                    response_time_ms: r.response_time_ms,
+                    response_body_type: r.response_body_type,
+                    response_body,
+                    response_size_bytes,
+                    extractions,
+                    assertions,
+                    success: r.success,
+                    error_message,
+                    created_at: r.created_at.to_rfc3339(),
+                }
+            })
+            .collect())
+    }
+
+    /// Get API requests for a task run with SQL-level LIMIT/OFFSET.
+    pub async fn get_task_run_api_requests_paginated(
+        &self,
+        task_run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskRunApiRequest>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = qontinui_db::queries::task_run_events::get_task_run_api_requests_limited()
+            .bind(&conn, &task_run_id, &limit, &offset)
+            .all()
+            .await
+            .map_err(|e| format!("PG query task_run_api_requests: {}", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
                 let step_name = if r.step_name.is_empty() { None } else { Some(r.step_name) };
                 let request_headers = if r.request_headers.is_empty() { None } else { Some(r.request_headers) };
                 let request_body = if r.request_body.is_empty() { None } else { Some(r.request_body) };
@@ -489,5 +593,65 @@ impl PgDb {
                 }
             })
             .collect())
+    }
+
+    /// Get AWAS steps for a task run with SQL-level LIMIT/OFFSET.
+    pub async fn get_task_run_awas_steps_paginated(
+        &self,
+        task_run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TaskRunAwasStep>, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = qontinui_db::queries::task_run_events::get_task_run_awas_steps_limited()
+            .bind(&conn, &task_run_id, &limit, &offset)
+            .all()
+            .await
+            .map_err(|e| format!("PG query task_run_awas_steps: {}", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let step_id = if r.step_id.is_empty() { None } else { Some(r.step_id) };
+                let step_name = if r.step_name.is_empty() { None } else { Some(r.step_name) };
+                let url = if r.url.is_empty() { None } else { Some(r.url) };
+                let action_id = if r.action_id.is_empty() { None } else { Some(r.action_id) };
+                let parameters = if r.parameters.is_empty() { None } else { Some(r.parameters) };
+                let response_data = if r.response_data.is_empty() { None } else { Some(r.response_data) };
+                let error_message = if r.error_message.is_empty() { None } else { Some(r.error_message) };
+                let duration_ms = if r.duration_ms == 0 { None } else { Some(r.duration_ms) };
+
+                TaskRunAwasStep {
+                    id: r.id,
+                    task_run_id: r.task_run_id,
+                    step_id,
+                    step_name,
+                    step_type: r.step_type,
+                    url,
+                    action_id,
+                    parameters,
+                    response_data,
+                    success: r.success,
+                    error_message,
+                    duration_ms,
+                    created_at: r.created_at.to_rfc3339(),
+                }
+            })
+            .collect())
+    }
+
+    /// Count rows in a table for a task run (for pagination total_count).
+    pub async fn count_task_run_table(
+        &self,
+        table: &str,
+        task_run_id: &str,
+    ) -> Result<i64, String> {
+        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let query = format!("SELECT COUNT(*)::bigint FROM {} WHERE task_run_id = $1", table);
+        let row = conn.query_one(&query, &[&task_run_id])
+            .await
+            .map_err(|e| format!("PG count {}: {}", table, e))?;
+        Ok(row.get(0))
     }
 }

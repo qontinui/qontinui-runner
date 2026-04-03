@@ -244,26 +244,66 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let wf_name = follow_up_name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
-    crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-        exec_id,
-        wf_name,
-        url_lock,
-        file_registry,
-        deps.app_state.pg_db.clone(),
-        Box::pin(async move {
-            controller
-                .run(
-                    loop_config,
-                    setup_steps,        // setup automation steps (API requests)
-                    Vec::new(),         // setup prompt steps (none)
-                    verification_steps, // verification steps
-                    Vec::new(),         // agentic steps (prompt is in loop_config.base_prompt)
-                    Vec::new(),         // completion automation steps (none)
-                    Vec::new(),         // completion prompt steps (none)
-                )
-                .await
-        }),
-    );
+
+    // Check if Restate durable execution should be used
+    let mut use_legacy = true;
+    let restate_settings = crate::settings::load_settings().restate;
+    let pg_db_restate = deps.app_state.pg_db.clone();
+    let exec_id_restate = exec_id.clone();
+    let restate_workflow_input = crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            if crate::restate::launch::should_use_restate(&restate_settings).await {
+                match restate_workflow_input {
+                    Ok(input) => {
+                        if let Err(e) = pg_db_restate.save_restate_workflow_execution(
+                            &exec_id_restate,
+                            &exec_id_restate,
+                            None,
+                        ).await {
+                            tracing::error!("Failed to record Restate workflow: {}", e);
+                        }
+
+                        if let Err(e) = crate::restate::launch::launch_workflow_via_restate(
+                            &exec_id_restate,
+                            &input,
+                            &restate_settings.ingress_url(),
+                        ).await {
+                            tracing::error!("Restate launch failed, falling back to legacy: {}", e);
+                        } else {
+                            use_legacy = false;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to build WorkflowInput for Restate: {}", e);
+                    }
+                }
+            }
+        })
+    });
+
+    if use_legacy {
+        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+            exec_id,
+            wf_name,
+            url_lock,
+            file_registry,
+            deps.app_state.pg_db.clone(),
+            Box::pin(async move {
+                controller
+                    .run(
+                        loop_config,
+                        setup_steps,        // setup automation steps (API requests)
+                        Vec::new(),         // setup prompt steps (none)
+                        verification_steps, // verification steps
+                        Vec::new(),         // agentic steps (prompt is in loop_config.base_prompt)
+                        Vec::new(),         // completion automation steps (none)
+                        Vec::new(),         // completion prompt steps (none)
+                    )
+                    .await
+            }),
+        );
+    }
 
     info!(
         "Follow-up workflow '{}' spawned for source {}",

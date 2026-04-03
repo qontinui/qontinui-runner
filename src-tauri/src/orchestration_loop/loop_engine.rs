@@ -1515,69 +1515,76 @@ async fn run_pipeline_loop(
         }
 
         // --- Phase 2b: Diagnose (if configured) ---
+        // Skip diagnostics if the workflow crashed/failed — page state is undefined
+        // and the diagnostician would produce misleading triage results.
+        let workflow_completed = matches!(workflow_status.as_str(), "completed" | "complete");
         let mut diagnostic_result_this_iteration: Option<DiagnosticResult> = None;
         if let Some(diagnose_config) = &pipeline.diagnose {
-            {
-                let mut state = loop_state.lock().await;
-                state.phase = LoopPhase::Diagnosing;
-            }
-
-            info!("Running diagnostic evaluation...");
-            match diagnostician::run_diagnostic(
-                &runner,
-                diagnose_config,
-                &diagnostic_history,
-                iteration,
-            )
-            .await
-            {
-                Ok(result) => {
-                    info!(
-                        "Diagnostic result: passed={}, root_cause={:?}",
-                        result.passed, result.root_cause
-                    );
-                    diagnostic_history.push(result.clone());
-                    diagnostic_result_this_iteration = Some(result);
+            if !workflow_completed {
+                info!("Skipping diagnostic phase — workflow status '{}' indicates incomplete execution", workflow_status);
+            } else {
+                {
+                    let mut state = loop_state.lock().await;
+                    state.phase = LoopPhase::Diagnosing;
                 }
-                Err(e) => {
-                    warn!("Diagnostic evaluation failed: {}", e);
-                }
-            }
 
-            // DiagnosticEvaluation exit strategy: exit if diagnostic passed
-            if matches!(config.exit_strategy, ExitStrategy::DiagnosticEvaluation) {
-                if let Some(ref diag) = diagnostic_result_this_iteration {
-                    if diag.passed {
-                        info!("Diagnostic evaluation passed — exiting pipeline loop");
-                        record_pipeline_result(
-                            &loop_state,
-                            iteration,
-                            &iter_start,
-                            &task_run_id,
-                            None,
-                            None,
-                            true,
-                            "Diagnostic evaluation passed — all assertions pass, page healthy",
-                            generated_workflow_id,
-                            fixes_implemented,
-                            rebuild_triggered,
-                            stall_detected_this_iteration,
-                            None,
-                            diagnostic_result_this_iteration,
-                        )
-                        .await;
-                        break;
+                info!("Running diagnostic evaluation...");
+                match diagnostician::run_diagnostic(
+                    &runner,
+                    diagnose_config,
+                    &diagnostic_history,
+                    iteration,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        info!(
+                            "Diagnostic result: passed={}, root_cause={:?}",
+                            result.passed, result.root_cause
+                        );
+                        diagnostic_history.push(result.clone());
+                        diagnostic_result_this_iteration = Some(result);
+                    }
+                    Err(e) => {
+                        warn!("Diagnostic evaluation failed: {}", e);
                     }
                 }
-            }
 
-            // If diagnostic failed, force rebuild so next iteration re-generates
-            // the workflow with diagnostic context injected
-            if let Some(ref diag) = diagnostic_result_this_iteration {
-                if !diag.passed && pipeline.build.is_some() {
-                    info!("Diagnostic failed — will rebuild workflow next iteration with diagnostic context");
-                    rebuild_needed = true;
-                    rebuild_triggered = Some(true);
+                // DiagnosticEvaluation exit strategy: exit if diagnostic passed
+                if matches!(config.exit_strategy, ExitStrategy::DiagnosticEvaluation) {
+                    if let Some(ref diag) = diagnostic_result_this_iteration {
+                        if diag.passed {
+                            info!("Diagnostic evaluation passed — exiting pipeline loop");
+                            record_pipeline_result(
+                                &loop_state,
+                                iteration,
+                                &iter_start,
+                                &task_run_id,
+                                None,
+                                None,
+                                true,
+                                "Diagnostic evaluation passed — all assertions pass, page healthy",
+                                generated_workflow_id,
+                                fixes_implemented,
+                                rebuild_triggered,
+                                stall_detected_this_iteration,
+                                None,
+                                diagnostic_result_this_iteration,
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
+
+                // If diagnostic failed, force rebuild so next iteration re-generates
+                // the workflow with diagnostic context injected
+                if let Some(ref diag) = diagnostic_result_this_iteration {
+                    if !diag.passed && pipeline.build.is_some() {
+                        info!("Diagnostic failed — will rebuild workflow next iteration with diagnostic context");
+                        rebuild_needed = true;
+                        rebuild_triggered = Some(true);
+                    }
                 }
             }
         }
@@ -1663,7 +1670,7 @@ async fn run_pipeline_loop(
                 generated_workflow_id,
                 fixes_implemented,
                 rebuild_triggered,
-                None,
+                stall_detected_this_iteration,
                 None,
                 diagnostic_result_this_iteration,
             )

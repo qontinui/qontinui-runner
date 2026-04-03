@@ -5,8 +5,10 @@
  * Fetches token usage, cost, and latency data from Tauri commands.
  */
 
+import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   TokenUsageSummary,
   DailyCostRow,
@@ -68,50 +70,60 @@ export function useLlmAnalytics(timeRange: LlmTimeRange = "7d"): UseLlmAnalytics
     queryKey: llmAnalyticsKeys.summary(days),
     queryFn: () => invoke<TokenUsageSummary>("get_token_usage_summary", { days }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
 
   const dailyCostQuery = useQuery({
     queryKey: llmAnalyticsKeys.dailyCost(days),
     queryFn: () => invoke<DailyCostRow[]>("get_daily_cost", { days }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
 
   const costByModelQuery = useQuery({
     queryKey: llmAnalyticsKeys.costByModel(days),
     queryFn: () => invoke<ModelCostRow[]>("get_cost_by_model", { days }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
 
   const costByPhaseQuery = useQuery({
     queryKey: llmAnalyticsKeys.costByPhase(days),
     queryFn: () => invoke<PhaseCostRow[]>("get_cost_by_phase", { days }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
 
   const providerLatencyQuery = useQuery({
     queryKey: llmAnalyticsKeys.providerLatency(days),
     queryFn: () => invoke<ProviderLatencyRow[]>("get_provider_latency", { days }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
 
   const taskRunCostsQuery = useQuery({
     queryKey: llmAnalyticsKeys.taskRunCosts(days),
     queryFn: () => invoke<TaskRunCostRow[]>("get_task_run_costs", { days, limit: 50 }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
 
   const costByTargetAppQuery = useQuery({
     queryKey: llmAnalyticsKeys.costByTargetApp(days),
     queryFn: () => invoke<TargetAppCostRow[]>("get_cost_by_target_app", { days }),
     staleTime: 30000,
-    refetchInterval: 60000,
   });
+
+  // Event-driven cache invalidation: listen for cost-update events
+  // and invalidate analytics queries with debounce to avoid burst refetches
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const unlistenPromise = listen("cost-update", () => {
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      debounceTimer.current = setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: llmAnalyticsKeys.all });
+      }, 300);
+    });
+
+    return () => {
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [queryClient]);
 
   const loading =
     summaryQuery.isLoading ||

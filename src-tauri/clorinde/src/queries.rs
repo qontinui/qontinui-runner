@@ -6,6 +6,7 @@ pub mod approval_gates;
 pub mod canary;
 pub mod checks;
 pub mod decisions;
+pub mod deferred_questions;
 pub mod error_monitor;
 pub mod findings;
 pub mod graph_ops;

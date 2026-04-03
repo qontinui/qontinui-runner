@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Terminal page -- an integrated multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, and findings tracking. Users execute shell commands in multiple concurrent terminal sessions, generate workflows from Claude Code session transcripts or command history, analyze terminal output with AI-powered analysis tools, and track findings (errors, warnings, issues) detected in real-time from terminal output. The terminal supports shell integration for structured command history and keyboard shortcuts for efficient tab management.",
+  "description": "Terminal page -- an integrated multi-page, multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, findings tracking, and concurrent session file conflict detection. Users can create multiple terminal pages (e.g., Development, Testing, Monitoring), each with its own independent zone layout, terminals, and saved configurations. Within each page, users execute shell commands in multiple concurrent terminal sessions organized in configurable zone layouts. The terminal supports session persistence across restarts (Claude Code session IDs are saved and auto-resumed), zone profiles that capture session assignments, shell integration for structured command history, keyboard shortcuts for efficient tab management, and an advisory file registry that auto-detects file conflicts across sessions.",
   "groups": [
     {
       "id": "term-multi-tab",
@@ -460,22 +460,484 @@
       ],
       "source": "manual"
     }
+    ,
+    {
+      "id": "term-file-conflict-banner",
+      "name": "File Conflict Detection Banner",
+      "description": "The Terminal page includes an advisory file conflict detection system that tracks which files are under active development by concurrent sessions (workflows and AI terminal sessions). When multiple sessions edit the same file, a warning banner appears below the notification bar showing conflicting files and which sessions hold them. Real-time toast alerts appear when a new conflict is detected (e.g., session B starts editing a file that session A already registered). The banner is collapsible — a summary line shows the count of conflicting files, and expanding reveals the full list with file paths and session names. The system auto-registers files when Claude Code uses Edit or Write tools, polls the runner's file registry API every 30 seconds, and listens for real-time Tauri events. The banner uses warning amber (#e0af68) coloring consistent with the 'needs-input' status style.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "term-conflict-banner-hidden-no-conflicts",
+          "description": "When no files are under concurrent development (no file registry conflicts), the FileConflictBanner component renders nothing — no banner, no summary line, no empty state. The banner only appears when there are active conflicts.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent"
+            },
+            "label": "File conflict summary line"
+          },
+          "precondition": "No files are registered by multiple sessions in the file registry (GET /file-registry/info returns entries with unique holder_task_run_id per file_path)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-conflict-banner-summary",
+          "description": "When files are under concurrent development, a collapsible summary line appears showing '{N} file(s) under concurrent development' with a FileWarning icon in amber (#e0af68) and a chevron toggle. The text uses 'file' (singular) when N=1 and 'files' (plural) when N>1.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent development"
+            },
+            "label": "Conflict count summary"
+          },
+          "precondition": "At least one file is registered by two or more distinct sessions in the file registry",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-conflict-banner-expand",
+          "description": "Clicking the summary line toggles an expanded view showing each conflicting file path (in monospace font, color #a9b1d6 at 90% opacity) and the session names holding that file (in parentheses, color #a9b1d6 at 50% opacity, comma-separated). Each file is preceded by a dash in amber at 60% opacity.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent development"
+            },
+            "label": "Conflict summary toggle button"
+          },
+          "precondition": "File conflict banner is visible with at least one conflict",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-conflict-toast-alert",
+          "description": "When a real-time 'file-conflict-detected' Tauri event fires (triggered when a session edits a file already held by another session), a toast-style alert appears at the top of the banner showing 'Conflict: {file_path} is also being edited by {holder_name}' with an AlertTriangle icon in amber. The alert has a dismiss X button and auto-dismisses after 10 seconds. Only the most recent alert is shown; new alerts replace previous ones.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Conflict:"
+            },
+            "label": "Real-time conflict toast alert"
+          },
+          "precondition": "A file-conflict-detected event has been emitted by the runner within the last 10 seconds",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-conflict-banner-design",
+          "description": "The conflict banner uses a consistent amber warning theme: text color #e0af68 at 80% opacity for the summary, border-bottom with #e0af68 at 20% opacity, and the FileWarning icon at full #e0af68. The toast alert uses background #e0af68 at 15% opacity with text at full #e0af68 and a border-bottom at 20% opacity. This matches the 'needs-input' status dot color used elsewhere in the Terminal page.",
+          "category": "design",
+          "severity": "info",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "under concurrent"
+            },
+            "label": "File conflict banner styling"
+          },
+          "precondition": "File conflict banner is visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "term-session-conflict-indicator",
+      "name": "Per-Session File Conflict Indicators",
+      "description": "Each session card in the SessionManagerPanel sidebar displays a file conflict warning icon when that session has files overlapping with other active sessions. The indicator shows a FileWarning icon in amber (#e0af68) with a numeric count badge showing how many conflicting files that session has. The count is derived from the file registry: for each file registered by this session, if any OTHER session also has that file registered, it counts as a conflict. The tooltip shows '{N} file(s) shared with other sessions'. Sessions with zero conflicts show no indicator. The conflict count is computed by the useFileConflicts hook's sessionConflictCounts Map, keyed by session task_run_id.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "term-session-card-conflict-icon",
+          "description": "When a session has fileConflictCount > 0, its SessionCard displays a FileWarning icon (w-3 h-3, color #e0af68) followed by the numeric count in 9px text at #e0af68 with 80% opacity. The icon and count are wrapped in a span with a title tooltip reading '{N} file(s) shared with other sessions' (using singular 'file' for count=1). The indicator appears between the session label badges and the pin icon in the card's first row.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Session file conflict indicator tooltip"
+          },
+          "precondition": "At least one session has files overlapping with another session in the file registry",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-session-card-no-conflict-hidden",
+          "description": "When a session has fileConflictCount === 0 (no file conflicts with other sessions), no FileWarning icon or count badge is rendered on its SessionCard. The indicator is completely absent, not just hidden or zeroed out.",
+          "category": "element-presence",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Absent conflict indicator on non-conflicting session"
+          },
+          "precondition": "The session has no files overlapping with other sessions",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-session-conflict-count-accuracy",
+          "description": "The numeric count shown on each session card accurately reflects the number of distinct files that session shares with at least one other session. For example, if session A edits files X, Y, Z and session B also edits files Y, Z, then session A's indicator shows '2' (files Y and Z are shared) and session B's indicator also shows '2'. The count updates when the file registry is refreshed (every 30 seconds or on real-time conflict events).",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Session conflict count accuracy"
+          },
+          "precondition": "Multiple sessions are actively editing files with at least some overlap",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-session-conflict-updates-realtime",
+          "description": "When a new file-conflict-detected Tauri event fires, the useFileConflicts hook immediately refreshes the file registry from GET /file-registry/info, which updates the sessionConflictCounts Map, causing affected SessionCards to re-render with updated conflict counts. This means users see conflict indicators appear within seconds of another session editing a shared file, not just at the 30-second poll interval.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "shared with other sessions"
+            },
+            "label": "Real-time conflict count update"
+          },
+          "precondition": "A file-conflict-detected event was just emitted",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "term-multi-page",
+      "name": "Multiple Terminal Pages",
+      "description": "Users can create multiple independent terminal pages, each with its own zone layout, terminals, labels, and saved configurations. A page tab bar at the top of the terminal area shows all pages. Clicking a page tab switches to that page by unmounting the current TerminalPage and remounting a new one connected to that page's PTY sessions. Each page's state (zone layout, labels, notes, pins, zone profiles, workspaces) is stored in page-namespaced localStorage keys. The default page uses un-prefixed keys for backward compatibility. PTY sessions are tagged with a page_id in the Rust backend, so each page only sees its own terminals.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "term-page-tab-bar",
+          "description": "A page tab bar is always visible above the terminal area, showing one button per page with the page name. The active page tab has a distinct background color (bg-[#2a2d3d]) while inactive tabs are muted (text-[#565f89]). Each tab is a button element with role='tab' and aria-selected indicating the active state.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Page tab button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-page-add-button",
+          "description": "A '+' button is present in the page tab bar allowing users to create a new terminal page. Clicking it creates a page named 'Page N' (where N is the next sequential number), switches to that page, and the new page starts with a single fresh terminal.",
+          "category": "interaction",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "accessibleName": "Add terminal page"
+            },
+            "label": "Add terminal page button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-page-switch-isolation",
+          "description": "Switching between pages preserves each page's terminals independently. If page A has 4 terminals and page B has 1, switching from A to B shows 1 terminal, and switching back to A shows 4 terminals. PTY processes stay alive during switches — they are filtered by page_id in the Rust backend.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Page tabs for switching"
+          },
+          "precondition": "At least two pages exist with different numbers of terminals",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-page-rename",
+          "description": "Double-clicking a page tab enters inline rename mode, replacing the tab label with a text input pre-filled with the current name. Pressing Enter commits the rename, Escape cancels. The input has a blue border (border-[#7aa2f7]) and is auto-focused with text selected.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Page tab for renaming"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-page-close",
+          "description": "Each page tab (when there are 2+ pages) shows a close button on hover. Clicking it removes the page, closes all its PTY sessions via terminal_close, cleans up namespaced localStorage keys, and switches to another page. The last remaining page cannot be closed.",
+          "category": "interaction",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Close page"
+            },
+            "label": "Close page button"
+          },
+          "precondition": "At least two pages exist",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-page-persist-restart",
+          "description": "Page configurations persist across runner restarts. After restarting, all previously created pages appear in the tab bar with their original names, and each page reconnects to its own PTY sessions (filtered by page_id).",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Page tabs after restart"
+          },
+          "precondition": "Runner was restarted after pages were created",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-page-loading-animation",
+          "description": "During page switch, a loading spinner with 'Loading terminals...' text is shown while the new page initializes and reconnects to its PTY sessions. The spinner is a border-spinning animation in primary blue (border-[#7aa2f7]).",
+          "category": "behavior",
+          "severity": "info",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Loading terminals"
+            },
+            "label": "Page switch loading indicator"
+          },
+          "precondition": "User just switched to a different page",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "term-session-persistence",
+      "name": "Session Persistence & Auto-Resume",
+      "description": "Claude Code session IDs are persisted alongside terminal tab configurations. When the runner restarts and reconnects to existing PTY sessions, saved claudeSessionId values are merged back into the reconnected tabs and the sessions are auto-resumed with 'claude --resume <id>'. This ensures that Claude Code sessions survive runner restarts without manual intervention. The saved layout includes zone assignments, labels, notes, pins, and Claude session IDs per tab.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "term-session-auto-resume",
+          "description": "After a runner restart, Claude Code sessions that were running before the restart are automatically resumed in their original terminal zones. The resume command 'claude --resume <sessionId>' is sent to each terminal that had an active Claude session. Session IDs are validated against a safe character set before being written to the terminal.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "textbox"
+            },
+            "label": "Terminal with resumed Claude session"
+          },
+          "precondition": "Runner was restarted after Claude sessions were running in terminal zones",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-zone-labels-restore",
+          "description": "Zone labels, notes, and pin states are restored after reconnection. If zone 0 was labeled 'Backend' with pinned state, after restart it still shows 'Backend' and remains pinned.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Zone"
+            },
+            "label": "Zone labels after restart"
+          },
+          "precondition": "Zones had labels/notes/pins before runner restart",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-profile-save-sessions",
+          "description": "Zone profiles (save/load configurations via the FolderOpen dropdown) capture Claude session IDs alongside layout, labels, notes, and pins. The profile display shows a session count badge (e.g., '3 sessions') in blue text when sessions are included. Loading a profile with sessions resumes those Claude sessions into the appropriate zones.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Zone profiles"
+            },
+            "label": "Zone profiles dropdown"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-profile-save-input",
+          "description": "The zone profile save flow has discoverable interactive elements: a 'Save current configuration' button (id=zone-profile-save-current) that reveals a text input (id=zone-profile-name-input) for the profile name, and a save confirmation button (id=zone-profile-save-btn). The input accepts up to 30 characters.",
+          "category": "element-presence",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "idPattern": "zone-profile-save-current"
+            },
+            "label": "Save current configuration button"
+          },
+          "precondition": "Zone profiles dropdown is open",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "term-page-storage-isolation",
+      "name": "Per-Page Storage Isolation",
+      "description": "Each terminal page has isolated storage for its configuration. Zone layouts, session persistence, zone profiles, workspaces, zone labels/notes/pins, and grid column/row ratios are all namespaced by pageId. The default page uses un-prefixed keys (backward compatible), while non-default pages use 'page:{pageId}:' prefixed keys. This ensures that creating a zone profile on page A does not appear when viewing page B's profiles.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "term-storage-profiles-isolated",
+          "description": "Zone profiles saved on one page are not visible on another page. If page A has a profile 'Dev Setup' and the user switches to page B and opens the zone profiles dropdown, 'Dev Setup' should not appear — page B has its own independent profile list.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Zone profiles"
+            },
+            "label": "Zone profiles dropdown"
+          },
+          "precondition": "Multiple pages exist, at least one has saved profiles",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-storage-layout-isolated",
+          "description": "Zone layout configurations (quad, six-pack, etc.) are independent per page. Changing page A to a 'six-pack' layout does not affect page B's layout, which remains at its own setting (e.g., 'quad').",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Page tabs for layout isolation check"
+          },
+          "precondition": "Multiple pages with different layouts",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-storage-labels-isolated",
+          "description": "Zone labels and notes are independent per page. Setting zone 0's label to 'Backend' on page A does not affect zone 0's label on page B.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "tab"
+            },
+            "label": "Page tabs for label isolation check"
+          },
+          "precondition": "Multiple pages with zone labels configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
   ],
   "metadata": {
     "component": "TerminalPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-02T00:00:00.000Z",
     "pageUrl": "/terminal",
     "elementSource": "sdk",
     "tags": [
       "terminal",
       "pty",
       "multi-tab",
+      "multi-page",
+      "session-persistence",
+      "zone-profiles",
       "workflow-generation",
       "transcript",
       "findings",
       "analysis",
+      "file-conflicts",
+      "concurrent-sessions",
       "run-group",
       "tier-1"
     ],

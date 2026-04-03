@@ -29,6 +29,12 @@ pub struct GetTaskRunEventsByTypeParams<T1: crate::StringSql, T2: crate::StringS
     pub event_type: T2,
 }
 #[derive(Debug)]
+pub struct GetTaskRunEventsByTypeLimitedParams<T1: crate::StringSql, T2: crate::StringSql> {
+    pub task_run_id: T1,
+    pub event_type: T2,
+    pub max_results: i64,
+}
+#[derive(Debug)]
 pub struct GetTaskRunEventsLimitedParams<T1: crate::StringSql> {
     pub task_run_id: T1,
     pub max_results: i64,
@@ -89,6 +95,12 @@ pub struct CreateTaskRunPlaywrightResultParams<
     pub assertions_failed: i32,
 }
 #[derive(Debug)]
+pub struct GetTaskRunPlaywrightResultsLimitedParams<T1: crate::StringSql> {
+    pub task_run_id: T1,
+    pub max_results: i64,
+    pub skip_results: i64,
+}
+#[derive(Debug)]
 pub struct CreateTaskRunApiRequestParams<
     T1: crate::StringSql,
     T2: crate::StringSql,
@@ -129,6 +141,12 @@ pub struct CreateTaskRunApiRequestParams<
     pub error_message: Option<T16>,
 }
 #[derive(Debug)]
+pub struct GetTaskRunApiRequestsLimitedParams<T1: crate::StringSql> {
+    pub task_run_id: T1,
+    pub max_results: i64,
+    pub skip_results: i64,
+}
+#[derive(Debug)]
 pub struct CreateTaskRunAwasStepParams<
     T1: crate::StringSql,
     T2: crate::StringSql,
@@ -153,6 +171,12 @@ pub struct CreateTaskRunAwasStepParams<
     pub success: bool,
     pub error_message: Option<T10>,
     pub duration_ms: Option<i64>,
+}
+#[derive(Debug)]
+pub struct GetTaskRunAwasStepsLimitedParams<T1: crate::StringSql> {
+    pub task_run_id: T1,
+    pub max_results: i64,
+    pub skip_results: i64,
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetTaskRunEventsAll {
@@ -254,6 +278,64 @@ impl<'a> From<GetTaskRunEventsByTypeBorrowed<'a>> for GetTaskRunEventsByType {
             timestamp,
             duration_ms,
         }: GetTaskRunEventsByTypeBorrowed<'a>,
+    ) -> Self {
+        Self {
+            id,
+            task_run_id: task_run_id.into(),
+            event_type: event_type.into(),
+            event_subtype: event_subtype.into(),
+            message: message.into(),
+            data: data.into(),
+            workflow_name: workflow_name.into(),
+            state_name: state_name.into(),
+            action_id: action_id.into(),
+            timestamp: timestamp.into(),
+            duration_ms,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunEventsByTypeLimited {
+    pub id: i64,
+    pub task_run_id: String,
+    pub event_type: String,
+    pub event_subtype: String,
+    pub message: String,
+    pub data: String,
+    pub workflow_name: String,
+    pub state_name: String,
+    pub action_id: String,
+    pub timestamp: String,
+    pub duration_ms: i64,
+}
+pub struct GetTaskRunEventsByTypeLimitedBorrowed<'a> {
+    pub id: i64,
+    pub task_run_id: &'a str,
+    pub event_type: &'a str,
+    pub event_subtype: &'a str,
+    pub message: &'a str,
+    pub data: &'a str,
+    pub workflow_name: &'a str,
+    pub state_name: &'a str,
+    pub action_id: &'a str,
+    pub timestamp: &'a str,
+    pub duration_ms: i64,
+}
+impl<'a> From<GetTaskRunEventsByTypeLimitedBorrowed<'a>> for GetTaskRunEventsByTypeLimited {
+    fn from(
+        GetTaskRunEventsByTypeLimitedBorrowed {
+            id,
+            task_run_id,
+            event_type,
+            event_subtype,
+            message,
+            data,
+            workflow_name,
+            state_name,
+            action_id,
+            timestamp,
+            duration_ms,
+        }: GetTaskRunEventsByTypeLimitedBorrowed<'a>,
     ) -> Self {
         Self {
             id,
@@ -527,6 +609,82 @@ impl<'a> From<GetTaskRunPlaywrightResultsAllBorrowed<'a>> for GetTaskRunPlaywrig
     }
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunPlaywrightResultsLimited {
+    pub id: String,
+    pub task_run_id: String,
+    pub test_name: String,
+    pub spec_file: String,
+    pub status: String,
+    pub duration_ms: i64,
+    pub stdout: String,
+    pub stderr: String,
+    pub console_output: String,
+    pub page_snapshot: String,
+    pub error_message: String,
+    pub failure_screenshot_path: String,
+    pub assertions_passed: i32,
+    pub assertions_failed: i32,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+}
+pub struct GetTaskRunPlaywrightResultsLimitedBorrowed<'a> {
+    pub id: &'a str,
+    pub task_run_id: &'a str,
+    pub test_name: &'a str,
+    pub spec_file: &'a str,
+    pub status: &'a str,
+    pub duration_ms: i64,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub console_output: &'a str,
+    pub page_snapshot: &'a str,
+    pub error_message: &'a str,
+    pub failure_screenshot_path: &'a str,
+    pub assertions_passed: i32,
+    pub assertions_failed: i32,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+}
+impl<'a> From<GetTaskRunPlaywrightResultsLimitedBorrowed<'a>>
+    for GetTaskRunPlaywrightResultsLimited
+{
+    fn from(
+        GetTaskRunPlaywrightResultsLimitedBorrowed {
+            id,
+            task_run_id,
+            test_name,
+            spec_file,
+            status,
+            duration_ms,
+            stdout,
+            stderr,
+            console_output,
+            page_snapshot,
+            error_message,
+            failure_screenshot_path,
+            assertions_passed,
+            assertions_failed,
+            created_at,
+        }: GetTaskRunPlaywrightResultsLimitedBorrowed<'a>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_run_id: task_run_id.into(),
+            test_name: test_name.into(),
+            spec_file: spec_file.into(),
+            status: status.into(),
+            duration_ms,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            console_output: console_output.into(),
+            page_snapshot: page_snapshot.into(),
+            error_message: error_message.into(),
+            failure_screenshot_path: failure_screenshot_path.into(),
+            assertions_passed,
+            assertions_failed,
+            created_at,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetTaskRunApiRequestsAll {
     pub id: String,
     pub task_run_id: String,
@@ -625,6 +783,104 @@ impl<'a> From<GetTaskRunApiRequestsAllBorrowed<'a>> for GetTaskRunApiRequestsAll
     }
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunApiRequestsLimited {
+    pub id: String,
+    pub task_run_id: String,
+    pub step_id: String,
+    pub step_name: String,
+    pub method: String,
+    pub url: String,
+    pub resolved_url: String,
+    pub request_headers: String,
+    pub request_body: String,
+    pub status_code: i32,
+    pub status_text: String,
+    pub response_headers: String,
+    pub response_time_ms: i64,
+    pub response_body_type: String,
+    pub response_body: String,
+    pub response_size_bytes: i64,
+    pub extractions: String,
+    pub assertions: String,
+    pub success: bool,
+    pub error_message: String,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+}
+pub struct GetTaskRunApiRequestsLimitedBorrowed<'a> {
+    pub id: &'a str,
+    pub task_run_id: &'a str,
+    pub step_id: &'a str,
+    pub step_name: &'a str,
+    pub method: &'a str,
+    pub url: &'a str,
+    pub resolved_url: &'a str,
+    pub request_headers: &'a str,
+    pub request_body: &'a str,
+    pub status_code: i32,
+    pub status_text: &'a str,
+    pub response_headers: &'a str,
+    pub response_time_ms: i64,
+    pub response_body_type: &'a str,
+    pub response_body: &'a str,
+    pub response_size_bytes: i64,
+    pub extractions: &'a str,
+    pub assertions: &'a str,
+    pub success: bool,
+    pub error_message: &'a str,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+}
+impl<'a> From<GetTaskRunApiRequestsLimitedBorrowed<'a>> for GetTaskRunApiRequestsLimited {
+    fn from(
+        GetTaskRunApiRequestsLimitedBorrowed {
+            id,
+            task_run_id,
+            step_id,
+            step_name,
+            method,
+            url,
+            resolved_url,
+            request_headers,
+            request_body,
+            status_code,
+            status_text,
+            response_headers,
+            response_time_ms,
+            response_body_type,
+            response_body,
+            response_size_bytes,
+            extractions,
+            assertions,
+            success,
+            error_message,
+            created_at,
+        }: GetTaskRunApiRequestsLimitedBorrowed<'a>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_run_id: task_run_id.into(),
+            step_id: step_id.into(),
+            step_name: step_name.into(),
+            method: method.into(),
+            url: url.into(),
+            resolved_url: resolved_url.into(),
+            request_headers: request_headers.into(),
+            request_body: request_body.into(),
+            status_code,
+            status_text: status_text.into(),
+            response_headers: response_headers.into(),
+            response_time_ms,
+            response_body_type: response_body_type.into(),
+            response_body: response_body.into(),
+            response_size_bytes,
+            extractions: extractions.into(),
+            assertions: assertions.into(),
+            success,
+            error_message: error_message.into(),
+            created_at,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetTaskRunAwasSteps {
     pub id: String,
     pub task_run_id: String,
@@ -672,6 +928,72 @@ impl<'a> From<GetTaskRunAwasStepsBorrowed<'a>> for GetTaskRunAwasSteps {
             duration_ms,
             created_at,
         }: GetTaskRunAwasStepsBorrowed<'a>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            task_run_id: task_run_id.into(),
+            step_id: step_id.into(),
+            step_name: step_name.into(),
+            step_type: step_type.into(),
+            url: url.into(),
+            action_id: action_id.into(),
+            parameters: parameters.into(),
+            response_data: response_data.into(),
+            success,
+            error_message: error_message.into(),
+            duration_ms,
+            created_at,
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GetTaskRunAwasStepsLimited {
+    pub id: String,
+    pub task_run_id: String,
+    pub step_id: String,
+    pub step_name: String,
+    pub step_type: String,
+    pub url: String,
+    pub action_id: String,
+    pub parameters: String,
+    pub response_data: String,
+    pub success: bool,
+    pub error_message: String,
+    pub duration_ms: i64,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+}
+pub struct GetTaskRunAwasStepsLimitedBorrowed<'a> {
+    pub id: &'a str,
+    pub task_run_id: &'a str,
+    pub step_id: &'a str,
+    pub step_name: &'a str,
+    pub step_type: &'a str,
+    pub url: &'a str,
+    pub action_id: &'a str,
+    pub parameters: &'a str,
+    pub response_data: &'a str,
+    pub success: bool,
+    pub error_message: &'a str,
+    pub duration_ms: i64,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+}
+impl<'a> From<GetTaskRunAwasStepsLimitedBorrowed<'a>> for GetTaskRunAwasStepsLimited {
+    fn from(
+        GetTaskRunAwasStepsLimitedBorrowed {
+            id,
+            task_run_id,
+            step_id,
+            step_name,
+            step_type,
+            url,
+            action_id,
+            parameters,
+            response_data,
+            success,
+            error_message,
+            duration_ms,
+            created_at,
+        }: GetTaskRunAwasStepsLimitedBorrowed<'a>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -842,6 +1164,75 @@ where
         mapper: fn(GetTaskRunEventsByTypeBorrowed) -> R,
     ) -> GetTaskRunEventsByTypeQuery<'c, 'a, 's, C, R, N> {
         GetTaskRunEventsByTypeQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetTaskRunEventsByTypeLimitedQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetTaskRunEventsByTypeLimitedBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunEventsByTypeLimitedBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskRunEventsByTypeLimitedQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunEventsByTypeLimitedBorrowed) -> R,
+    ) -> GetTaskRunEventsByTypeLimitedQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunEventsByTypeLimitedQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -1166,6 +1557,77 @@ where
         Ok(mapped)
     }
 }
+pub struct GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C: GenericClient, T, const N: usize>
+{
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetTaskRunPlaywrightResultsLimitedBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunPlaywrightResultsLimitedBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize>
+    GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunPlaywrightResultsLimitedBorrowed) -> R,
+    ) -> GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunPlaywrightResultsLimitedQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
 pub struct GetTaskRunApiRequestsAllQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -1234,6 +1696,75 @@ where
         Ok(mapped)
     }
 }
+pub struct GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetTaskRunApiRequestsLimitedBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunApiRequestsLimitedBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunApiRequestsLimitedBorrowed) -> R,
+    ) -> GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunApiRequestsLimitedQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
 pub struct GetTaskRunAwasStepsQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
     client: &'c C,
     params: [&'a (dyn postgres_types::ToSql + Sync); N],
@@ -1252,6 +1783,75 @@ where
         mapper: fn(GetTaskRunAwasStepsBorrowed) -> R,
     ) -> GetTaskRunAwasStepsQuery<'c, 'a, 's, C, R, N> {
         GetTaskRunAwasStepsQuery {
+            client: self.client,
+            params: self.params,
+            query: self.query,
+            cached: self.cached,
+            extractor: self.extractor,
+            mapper,
+        }
+    }
+    pub async fn one(self) -> Result<T, tokio_postgres::Error> {
+        let row =
+            crate::client::async_::one(self.client, self.query, &self.params, self.cached).await?;
+        Ok((self.mapper)((self.extractor)(&row)?))
+    }
+    pub async fn all(self) -> Result<Vec<T>, tokio_postgres::Error> {
+        self.iter().await?.try_collect().await
+    }
+    pub async fn opt(self) -> Result<Option<T>, tokio_postgres::Error> {
+        let opt_row =
+            crate::client::async_::opt(self.client, self.query, &self.params, self.cached).await?;
+        Ok(opt_row
+            .map(|row| {
+                let extracted = (self.extractor)(&row)?;
+                Ok((self.mapper)(extracted))
+            })
+            .transpose()?)
+    }
+    pub async fn iter(
+        self,
+    ) -> Result<
+        impl futures::Stream<Item = Result<T, tokio_postgres::Error>> + 'c,
+        tokio_postgres::Error,
+    > {
+        let stream = crate::client::async_::raw(
+            self.client,
+            self.query,
+            crate::slice_iter(&self.params),
+            self.cached,
+        )
+        .await?;
+        let mapped = stream
+            .map(move |res| {
+                res.and_then(|row| {
+                    let extracted = (self.extractor)(&row)?;
+                    Ok((self.mapper)(extracted))
+                })
+            })
+            .into_stream();
+        Ok(mapped)
+    }
+}
+pub struct GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C: GenericClient, T, const N: usize> {
+    client: &'c C,
+    params: [&'a (dyn postgres_types::ToSql + Sync); N],
+    query: &'static str,
+    cached: Option<&'s tokio_postgres::Statement>,
+    extractor: fn(
+        &tokio_postgres::Row,
+    ) -> Result<GetTaskRunAwasStepsLimitedBorrowed, tokio_postgres::Error>,
+    mapper: fn(GetTaskRunAwasStepsLimitedBorrowed) -> T,
+}
+impl<'c, 'a, 's, C, T: 'c, const N: usize> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, T, N>
+where
+    C: GenericClient,
+{
+    pub fn map<R>(
+        self,
+        mapper: fn(GetTaskRunAwasStepsLimitedBorrowed) -> R,
+    ) -> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, R, N> {
+        GetTaskRunAwasStepsLimitedQuery {
             client: self.client,
             params: self.params,
             query: self.query,
@@ -1521,6 +2121,77 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
         self.bind(client, &params.task_run_id, &params.event_type)
     }
 }
+pub struct GetTaskRunEventsByTypeLimitedStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_events_by_type_limited() -> GetTaskRunEventsByTypeLimitedStmt {
+    GetTaskRunEventsByTypeLimitedStmt(
+        "SELECT id, task_run_id, COALESCE(event_type, '') as event_type, COALESCE(event_subtype, '') as event_subtype, COALESCE(message, '') as message, COALESCE(data, '') as data, COALESCE(workflow_name, '') as workflow_name, COALESCE(state_name, '') as state_name, COALESCE(action_id, '') as action_id, COALESCE(timestamp, '') as timestamp, COALESCE(duration_ms, 0) as duration_ms FROM task_run_events WHERE task_run_id = $1 AND event_type = $2 ORDER BY timestamp ASC LIMIT $3",
+        None,
+    )
+}
+impl GetTaskRunEventsByTypeLimitedStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+        event_type: &'a T2,
+        max_results: &'a i64,
+    ) -> GetTaskRunEventsByTypeLimitedQuery<'c, 'a, 's, C, GetTaskRunEventsByTypeLimited, 3> {
+        GetTaskRunEventsByTypeLimitedQuery {
+            client,
+            params: [task_run_id, event_type, max_results],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetTaskRunEventsByTypeLimitedBorrowed, tokio_postgres::Error> {
+                Ok(GetTaskRunEventsByTypeLimitedBorrowed {
+                    id: row.try_get(0)?,
+                    task_run_id: row.try_get(1)?,
+                    event_type: row.try_get(2)?,
+                    event_subtype: row.try_get(3)?,
+                    message: row.try_get(4)?,
+                    data: row.try_get(5)?,
+                    workflow_name: row.try_get(6)?,
+                    state_name: row.try_get(7)?,
+                    action_id: row.try_get(8)?,
+                    timestamp: row.try_get(9)?,
+                    duration_ms: row.try_get(10)?,
+                })
+            },
+            mapper: |it| GetTaskRunEventsByTypeLimited::from(it),
+        }
+    }
+}
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        GetTaskRunEventsByTypeLimitedParams<T1, T2>,
+        GetTaskRunEventsByTypeLimitedQuery<'c, 'a, 's, C, GetTaskRunEventsByTypeLimited, 3>,
+        C,
+    > for GetTaskRunEventsByTypeLimitedStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a GetTaskRunEventsByTypeLimitedParams<T1, T2>,
+    ) -> GetTaskRunEventsByTypeLimitedQuery<'c, 'a, 's, C, GetTaskRunEventsByTypeLimited, 3> {
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.event_type,
+            &params.max_results,
+        )
+    }
+}
 pub struct GetTaskRunEventsLimitedStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_events_limited() -> GetTaskRunEventsLimitedStmt {
     GetTaskRunEventsLimitedStmt(
@@ -1744,7 +2415,7 @@ impl<
 pub struct GetTaskRunScreenshotsAllStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_screenshots_all() -> GetTaskRunScreenshotsAllStmt {
     GetTaskRunScreenshotsAllStmt(
-        "SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type, COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence, COALESCE(match_location, '') as match_location, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(file_size_bytes, 0) as file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, COALESCE(event_id, 0) as event_id, file_path, screenshot_type, COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence, COALESCE(match_location, '') as match_location, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(file_size_bytes, 0) as file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 ORDER BY created_at ASC",
         None,
     )
 }
@@ -1791,7 +2462,7 @@ impl GetTaskRunScreenshotsAllStmt {
 pub struct GetTaskRunScreenshotsByTypeStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run_screenshots_by_type() -> GetTaskRunScreenshotsByTypeStmt {
     GetTaskRunScreenshotsByTypeStmt(
-        "SELECT id, task_run_id, COALESCE(event_id, '') as event_id, file_path, screenshot_type, COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence, COALESCE(match_location, '') as match_location, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(file_size_bytes, 0) as file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 AND screenshot_type = $2 ORDER BY created_at ASC",
+        "SELECT id, task_run_id, COALESCE(event_id, 0) as event_id, file_path, screenshot_type, COALESCE(template_name, '') as template_name, COALESCE(confidence, 0) as confidence, COALESCE(match_location, '') as match_location, COALESCE(width, 0) as width, COALESCE(height, 0) as height, COALESCE(file_size_bytes, 0) as file_size_bytes, created_at FROM task_run_screenshots WHERE task_run_id = $1 AND screenshot_type = $2 ORDER BY created_at ASC",
         None,
     )
 }
@@ -2041,6 +2712,91 @@ impl GetTaskRunPlaywrightResultsAllStmt {
         }
     }
 }
+pub struct GetTaskRunPlaywrightResultsLimitedStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_playwright_results_limited() -> GetTaskRunPlaywrightResultsLimitedStmt {
+    GetTaskRunPlaywrightResultsLimitedStmt(
+        "SELECT id, task_run_id, test_name, COALESCE(spec_file, '') as spec_file, status, COALESCE(duration_ms, 0) as duration_ms, COALESCE(stdout, '') as stdout, COALESCE(stderr, '') as stderr, COALESCE(console_output, '') as console_output, COALESCE(page_snapshot, '') as page_snapshot, COALESCE(error_message, '') as error_message, COALESCE(failure_screenshot_path, '') as failure_screenshot_path, assertions_passed, assertions_failed, created_at FROM task_run_playwright_results WHERE task_run_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+        None,
+    )
+}
+impl GetTaskRunPlaywrightResultsLimitedStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+        max_results: &'a i64,
+        skip_results: &'a i64,
+    ) -> GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C, GetTaskRunPlaywrightResultsLimited, 3>
+    {
+        GetTaskRunPlaywrightResultsLimitedQuery {
+            client,
+            params: [task_run_id, max_results, skip_results],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |row: &tokio_postgres::Row| -> Result<
+                GetTaskRunPlaywrightResultsLimitedBorrowed,
+                tokio_postgres::Error,
+            > {
+                Ok(GetTaskRunPlaywrightResultsLimitedBorrowed {
+                    id: row.try_get(0)?,
+                    task_run_id: row.try_get(1)?,
+                    test_name: row.try_get(2)?,
+                    spec_file: row.try_get(3)?,
+                    status: row.try_get(4)?,
+                    duration_ms: row.try_get(5)?,
+                    stdout: row.try_get(6)?,
+                    stderr: row.try_get(7)?,
+                    console_output: row.try_get(8)?,
+                    page_snapshot: row.try_get(9)?,
+                    error_message: row.try_get(10)?,
+                    failure_screenshot_path: row.try_get(11)?,
+                    assertions_passed: row.try_get(12)?,
+                    assertions_failed: row.try_get(13)?,
+                    created_at: row.try_get(14)?,
+                })
+            },
+            mapper: |it| GetTaskRunPlaywrightResultsLimited::from(it),
+        }
+    }
+}
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        GetTaskRunPlaywrightResultsLimitedParams<T1>,
+        GetTaskRunPlaywrightResultsLimitedQuery<
+            'c,
+            'a,
+            's,
+            C,
+            GetTaskRunPlaywrightResultsLimited,
+            3,
+        >,
+        C,
+    > for GetTaskRunPlaywrightResultsLimitedStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a GetTaskRunPlaywrightResultsLimitedParams<T1>,
+    ) -> GetTaskRunPlaywrightResultsLimitedQuery<'c, 'a, 's, C, GetTaskRunPlaywrightResultsLimited, 3>
+    {
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.max_results,
+            &params.skip_results,
+        )
+    }
+}
 pub struct CreateTaskRunApiRequestStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn create_task_run_api_request() -> CreateTaskRunApiRequestStmt {
     CreateTaskRunApiRequestStmt(
@@ -2283,6 +3039,87 @@ impl GetTaskRunApiRequestsAllStmt {
         }
     }
 }
+pub struct GetTaskRunApiRequestsLimitedStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_api_requests_limited() -> GetTaskRunApiRequestsLimitedStmt {
+    GetTaskRunApiRequestsLimitedStmt(
+        "SELECT id, task_run_id, step_id, COALESCE(step_name, '') as step_name, method, url, resolved_url, COALESCE(request_headers, '{}') as request_headers, COALESCE(request_body, '') as request_body, status_code, COALESCE(status_text, '') as status_text, COALESCE(response_headers, '{}') as response_headers, response_time_ms, response_body_type, COALESCE(response_body, '') as response_body, COALESCE(response_size_bytes, 0) as response_size_bytes, COALESCE(extractions, '[]') as extractions, COALESCE(assertions, '[]') as assertions, success, COALESCE(error_message, '') as error_message, created_at FROM task_run_api_requests WHERE task_run_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+        None,
+    )
+}
+impl GetTaskRunApiRequestsLimitedStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+        max_results: &'a i64,
+        skip_results: &'a i64,
+    ) -> GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, GetTaskRunApiRequestsLimited, 3> {
+        GetTaskRunApiRequestsLimitedQuery {
+            client,
+            params: [task_run_id, max_results, skip_results],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetTaskRunApiRequestsLimitedBorrowed, tokio_postgres::Error> {
+                Ok(GetTaskRunApiRequestsLimitedBorrowed {
+                    id: row.try_get(0)?,
+                    task_run_id: row.try_get(1)?,
+                    step_id: row.try_get(2)?,
+                    step_name: row.try_get(3)?,
+                    method: row.try_get(4)?,
+                    url: row.try_get(5)?,
+                    resolved_url: row.try_get(6)?,
+                    request_headers: row.try_get(7)?,
+                    request_body: row.try_get(8)?,
+                    status_code: row.try_get(9)?,
+                    status_text: row.try_get(10)?,
+                    response_headers: row.try_get(11)?,
+                    response_time_ms: row.try_get(12)?,
+                    response_body_type: row.try_get(13)?,
+                    response_body: row.try_get(14)?,
+                    response_size_bytes: row.try_get(15)?,
+                    extractions: row.try_get(16)?,
+                    assertions: row.try_get(17)?,
+                    success: row.try_get(18)?,
+                    error_message: row.try_get(19)?,
+                    created_at: row.try_get(20)?,
+                })
+            },
+            mapper: |it| GetTaskRunApiRequestsLimited::from(it),
+        }
+    }
+}
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        GetTaskRunApiRequestsLimitedParams<T1>,
+        GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, GetTaskRunApiRequestsLimited, 3>,
+        C,
+    > for GetTaskRunApiRequestsLimitedStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a GetTaskRunApiRequestsLimitedParams<T1>,
+    ) -> GetTaskRunApiRequestsLimitedQuery<'c, 'a, 's, C, GetTaskRunApiRequestsLimited, 3> {
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.max_results,
+            &params.skip_results,
+        )
+    }
+}
 pub struct CreateTaskRunAwasStepStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn create_task_run_awas_step() -> CreateTaskRunAwasStepStmt {
     CreateTaskRunAwasStepStmt(
@@ -2445,5 +3282,78 @@ impl GetTaskRunAwasStepsStmt {
             },
             mapper: |it| GetTaskRunAwasSteps::from(it),
         }
+    }
+}
+pub struct GetTaskRunAwasStepsLimitedStmt(&'static str, Option<tokio_postgres::Statement>);
+pub fn get_task_run_awas_steps_limited() -> GetTaskRunAwasStepsLimitedStmt {
+    GetTaskRunAwasStepsLimitedStmt(
+        "SELECT id, task_run_id, COALESCE(step_id, '') as step_id, COALESCE(step_name, '') as step_name, step_type, COALESCE(url, '') as url, COALESCE(action_id, '') as action_id, COALESCE(parameters, '{}') as parameters, COALESCE(response_data, '') as response_data, success, COALESCE(error_message, '') as error_message, COALESCE(duration_ms, 0) as duration_ms, created_at FROM task_run_awas_steps WHERE task_run_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+        None,
+    )
+}
+impl GetTaskRunAwasStepsLimitedStmt {
+    pub async fn prepare<'a, C: GenericClient>(
+        mut self,
+        client: &'a C,
+    ) -> Result<Self, tokio_postgres::Error> {
+        self.1 = Some(client.prepare(self.0).await?);
+        Ok(self)
+    }
+    pub fn bind<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>(
+        &'s self,
+        client: &'c C,
+        task_run_id: &'a T1,
+        max_results: &'a i64,
+        skip_results: &'a i64,
+    ) -> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, GetTaskRunAwasStepsLimited, 3> {
+        GetTaskRunAwasStepsLimitedQuery {
+            client,
+            params: [task_run_id, max_results, skip_results],
+            query: self.0,
+            cached: self.1.as_ref(),
+            extractor: |
+                row: &tokio_postgres::Row,
+            | -> Result<GetTaskRunAwasStepsLimitedBorrowed, tokio_postgres::Error> {
+                Ok(GetTaskRunAwasStepsLimitedBorrowed {
+                    id: row.try_get(0)?,
+                    task_run_id: row.try_get(1)?,
+                    step_id: row.try_get(2)?,
+                    step_name: row.try_get(3)?,
+                    step_type: row.try_get(4)?,
+                    url: row.try_get(5)?,
+                    action_id: row.try_get(6)?,
+                    parameters: row.try_get(7)?,
+                    response_data: row.try_get(8)?,
+                    success: row.try_get(9)?,
+                    error_message: row.try_get(10)?,
+                    duration_ms: row.try_get(11)?,
+                    created_at: row.try_get(12)?,
+                })
+            },
+            mapper: |it| GetTaskRunAwasStepsLimited::from(it),
+        }
+    }
+}
+impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql>
+    crate::client::async_::Params<
+        'c,
+        'a,
+        's,
+        GetTaskRunAwasStepsLimitedParams<T1>,
+        GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, GetTaskRunAwasStepsLimited, 3>,
+        C,
+    > for GetTaskRunAwasStepsLimitedStmt
+{
+    fn params(
+        &'s self,
+        client: &'c C,
+        params: &'a GetTaskRunAwasStepsLimitedParams<T1>,
+    ) -> GetTaskRunAwasStepsLimitedQuery<'c, 'a, 's, C, GetTaskRunAwasStepsLimited, 3> {
+        self.bind(
+            client,
+            &params.task_run_id,
+            &params.max_results,
+            &params.skip_results,
+        )
     }
 }

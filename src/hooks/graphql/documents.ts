@@ -414,3 +414,40 @@ export const ORCHESTRATION_LOOP_STATUS_SUBSCRIPTION = gql`
     }
   }
 `;
+
+export const COST_EVENTS_SUBSCRIPTION = gql`
+  subscription CostEvents($taskRunId: String) {
+    costEvents(taskRunId: $taskRunId) {
+      ... on GqlCostUpdateEvent {
+        taskRunId
+        phase
+        iteration
+        inputTokens
+        outputTokens
+        cacheCreationTokens
+        cacheReadTokens
+        costUsd
+        cumulativeCostUsd
+        cacheHitRate
+        timestamp
+      }
+      ... on GqlBudgetWarningEvent {
+        taskRunId
+        remainingFraction
+        totalCostUsd
+        budgetLimitUsd
+        message
+        timestamp
+      }
+      ... on GqlCostAnomalyEvent {
+        taskRunId
+        costUsd
+        meanCostUsd
+        stdDev
+        zScore
+        message
+        timestamp
+      }
+    }
+  }
+`;

@@ -110,10 +110,19 @@ function TraceRow({ trace }: { trace: PipelineAgentTrace }) {
             </span>
           )}
         </td>
+        <td className="px-2 py-1 text-center">
+          {trace.schema_valid_first_attempt != null ? (
+            <span className={trace.schema_valid_first_attempt ? "text-green-400" : trace.validation_retries ? "text-yellow-400" : "text-red-400"}>
+              {trace.schema_valid_first_attempt ? "✓" : trace.validation_retries ? `R${trace.validation_retries}` : "✗"}
+            </span>
+          ) : (
+            <span className="text-zinc-600">—</span>
+          )}
+        </td>
       </tr>
       {expanded && (
         <tr className="border-t border-zinc-800/50">
-          <td colSpan={7} className="px-2 py-2">
+          <td colSpan={8} className="px-2 py-2">
             <div className="grid grid-cols-2 gap-2 text-xs">
               <div>
                 <span className="text-zinc-500">Input:</span>
@@ -127,6 +136,14 @@ function TraceRow({ trace }: { trace: PipelineAgentTrace }) {
                   {JSON.stringify(trace.output_snapshot, null, 2)}
                 </pre>
               </div>
+              {trace.validation_error_summary && (
+                <div className="col-span-2">
+                  <span className="text-zinc-500">Validation Errors:</span>
+                  <pre className="bg-red-950/30 border border-red-900/50 rounded p-1 mt-1 overflow-auto max-h-24 text-red-300 text-xs">
+                    {trace.validation_error_summary}
+                  </pre>
+                </div>
+              )}
             </div>
           </td>
         </tr>
@@ -185,6 +202,7 @@ export function PipelineTraceView({ result }: Props) {
               <th className="text-center px-2 py-1">Tokens Out</th>
               <th className="text-center px-2 py-1">Cost</th>
               <th className="text-center px-2 py-1">Success</th>
+              <th className="text-center px-2 py-1">Schema</th>
             </tr>
           </thead>
           <tbody>

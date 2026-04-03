@@ -98,6 +98,9 @@ image = { version = "0.25", default-features = false, features = ["png", "webp"]
 # MCP (Model Context Protocol) client
 rmcp = "0.1"
 
+# Restate durable execution (optional — behind `restate` feature flag)
+restate-sdk = { version = "0.4", optional = true }
+
 # Code analysis (tree-sitter for parsing)
 tree-sitter = "0.24"
 tree-sitter-python = "0.23"
@@ -137,6 +140,10 @@ core-foundation-sys = "0.8"
 [target.'cfg(target_os = "linux")'.dependencies]
 atspi = "0.22"
 zbus = "4"
+
+[features]
+default = []
+restate = ["restate-sdk"]
 
 [[bin]]
 name = "mock_claude_cli"

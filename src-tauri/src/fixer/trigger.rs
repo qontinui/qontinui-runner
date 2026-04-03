@@ -316,26 +316,59 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         let wf_name = fixer_name_clone.clone();
         let url_lock = Some(deps.app_state.url_lock_manager.clone());
         let file_registry = Some(deps.app_state.file_registry_manager.clone());
-        crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
-            exec_id,
-            wf_name,
-            url_lock,
-            file_registry,
-            deps.app_state.pg_db.clone(),
-            Box::pin(async move {
-                controller
-                    .run(
-                        loop_config,
-                        setup_steps,
-                        Vec::new(),
-                        verification_steps,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .await
-            }),
-        );
+
+        // Check if Restate durable execution should be used
+        let mut use_legacy = true;
+        let restate_settings = crate::settings::load_settings().restate;
+        if crate::restate::launch::should_use_restate(&restate_settings).await {
+            match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
+                Ok(input) => {
+                    if let Err(e) = deps.app_state.pg_db.save_restate_workflow_execution(
+                        &exec_id,
+                        &exec_id,
+                        None,
+                    ).await {
+                        tracing::error!("Failed to record Restate workflow: {}", e);
+                    }
+
+                    if let Err(e) = crate::restate::launch::launch_workflow_via_restate(
+                        &exec_id,
+                        &input,
+                        &restate_settings.ingress_url(),
+                    ).await {
+                        tracing::error!("Restate launch failed, falling back to legacy: {}", e);
+                    } else {
+                        use_legacy = false;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to build WorkflowInput for Restate: {}", e);
+                }
+            }
+        }
+
+        if use_legacy {
+            crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
+                exec_id,
+                wf_name,
+                url_lock,
+                file_registry,
+                deps.app_state.pg_db.clone(),
+                Box::pin(async move {
+                    controller
+                        .run(
+                            loop_config,
+                            setup_steps,
+                            Vec::new(),
+                            verification_steps,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await
+                }),
+            );
+        }
 
         info!(
             "Fixer workflow '{}' spawned for source {}",

@@ -30,21 +30,28 @@ fn client() -> Client {
 #[ignore]
 async fn test_temporal_search_returns_results() {
     let resp = client()
-        .get(format!("{BASE}/observations/temporal-search?max_results=10"))
+        .get(format!(
+            "{BASE}/observations/temporal-search?max_results=10"
+        ))
         .send()
         .await
         .expect("Temporal search should respond");
 
     assert!(resp.status().is_success(), "Should return 200");
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["success"].as_bool().unwrap_or(false), "Should be successful");
+    assert!(
+        body["success"].as_bool().unwrap_or(false),
+        "Should be successful"
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_temporal_search_with_fts_query() {
     let resp = client()
-        .get(format!("{BASE}/observations/temporal-search?q=architecture&max_results=5"))
+        .get(format!(
+            "{BASE}/observations/temporal-search?q=architecture&max_results=5"
+        ))
         .send()
         .await
         .expect("Temporal FTS search should respond");
@@ -84,7 +91,10 @@ async fn test_observation_history_empty_for_nonexistent() {
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
     let data = body["data"].as_array().unwrap();
-    assert!(data.is_empty(), "Non-existent observation should have empty history");
+    assert!(
+        data.is_empty(),
+        "Non-existent observation should have empty history"
+    );
 }
 
 // ============================================================================
@@ -119,7 +129,11 @@ async fn test_supersede_nonexistent_returns_not_found() {
         .await
         .expect("Supersede endpoint should respond");
 
-    assert_eq!(resp.status().as_u16(), 404, "Should return 404 for non-existent observation");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "Should return 404 for non-existent observation"
+    );
 }
 
 // ============================================================================
@@ -191,8 +205,14 @@ async fn test_observation_temporal_lifecycle() {
     let get_body: serde_json::Value = get_resp.json().await.unwrap();
     let obs = &get_body["data"];
     assert!(obs["validFrom"].is_string(), "Should have validFrom field");
-    assert!(obs["validUntil"].is_null(), "Current observation should have null validUntil");
-    assert!(obs["supersededBy"].is_null(), "Should not be superseded yet");
+    assert!(
+        obs["validUntil"].is_null(),
+        "Current observation should have null validUntil"
+    );
+    assert!(
+        obs["supersededBy"].is_null(),
+        "Should not be superseded yet"
+    );
 
     // 5. Create a new observation and supersede the old one
     let new_resp = c
@@ -226,7 +246,10 @@ async fn test_observation_temporal_lifecycle() {
         .expect("Get superseded should work");
     let get_body2: serde_json::Value = get_resp2.json().await.unwrap();
     let obs2 = &get_body2["data"];
-    assert!(obs2["validUntil"].is_string(), "Superseded observation should have validUntil");
+    assert!(
+        obs2["validUntil"].is_string(),
+        "Superseded observation should have validUntil"
+    );
     assert_eq!(
         obs2["supersededBy"].as_i64().unwrap(),
         new_id,
@@ -245,8 +268,12 @@ async fn test_observation_temporal_lifecycle() {
     let results = search_body["data"].as_array().unwrap();
 
     // Find our observations in results
-    let old_pos = results.iter().position(|r| r["id"].as_i64() == Some(obs_id));
-    let new_pos = results.iter().position(|r| r["id"].as_i64() == Some(new_id));
+    let old_pos = results
+        .iter()
+        .position(|r| r["id"].as_i64() == Some(obs_id));
+    let new_pos = results
+        .iter()
+        .position(|r| r["id"].as_i64() == Some(new_id));
 
     if let (Some(old_idx), Some(new_idx)) = (old_pos, new_pos) {
         assert!(
@@ -256,6 +283,12 @@ async fn test_observation_temporal_lifecycle() {
     }
 
     // Cleanup: soft-delete both
-    let _ = c.delete(format!("{BASE}/observations/{obs_id}")).send().await;
-    let _ = c.delete(format!("{BASE}/observations/{new_id}")).send().await;
+    let _ = c
+        .delete(format!("{BASE}/observations/{obs_id}"))
+        .send()
+        .await;
+    let _ = c
+        .delete(format!("{BASE}/observations/{new_id}"))
+        .send()
+        .await;
 }

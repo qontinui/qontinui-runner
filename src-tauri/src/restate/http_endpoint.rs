@@ -53,7 +53,7 @@ pub async fn start_restate_endpoint(
 
     HttpServer::new(endpoint)
         .listen_and_serve(
-            format!("0.0.0.0:{}", port)
+            format!("127.0.0.1:{}", port)
                 .parse()
                 .map_err(|e| format!("Invalid address: {}", e))?,
         )

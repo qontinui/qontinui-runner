@@ -94,6 +94,11 @@ export const METRIC_INFO: Record<
     category: "rag",
     description: "Is retrieved context useful for the task?",
   },
+  schema_compliance: {
+    label: "Schema Compliance",
+    category: "agentic",
+    description: "Output schema validation success rate (first-attempt, after coercion, after retry)",
+  },
 };
 
 export interface PushFeedbackScoresResult {
