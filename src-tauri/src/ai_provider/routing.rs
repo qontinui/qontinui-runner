@@ -478,8 +478,7 @@ pub fn run_structured_prompt_with_middleware(
 
     // Middleware only transforms the user message — cached system blocks
     // must remain stable to benefit from caching.
-    let transformed_user_message =
-        middleware.run_pre_call(&prompt.user_message, middleware_ctx);
+    let transformed_user_message = middleware.run_pre_call(&prompt.user_message, middleware_ctx);
 
     let transformed_prompt = StructuredPrompt {
         cached_system_blocks: prompt.cached_system_blocks.clone(),
@@ -531,7 +530,9 @@ pub fn run_prompt_multimodal(
     match ai_settings.provider {
         AiProvider::ClaudeCli => {
             if prompt.has_images() {
-                warn!("Claude CLI does not support image content blocks; falling back to text-only");
+                warn!(
+                    "Claude CLI does not support image content blocks; falling back to text-only"
+                );
             }
             run_claude_cli(
                 &prompt.text_content(),
@@ -550,7 +551,9 @@ pub fn run_prompt_multimodal(
         ),
         AiProvider::GeminiCli => {
             if prompt.has_images() {
-                warn!("Gemini CLI does not support image content blocks; falling back to text-only");
+                warn!(
+                    "Gemini CLI does not support image content blocks; falling back to text-only"
+                );
             }
             run_gemini_cli(
                 &prompt.text_content(),
@@ -606,7 +609,9 @@ pub fn run_prompt_with_routing_multimodal(
     match ai_settings.provider {
         AiProvider::ClaudeCli => {
             if prompt.has_images() {
-                warn!("Claude CLI does not support image content blocks; falling back to text-only");
+                warn!(
+                    "Claude CLI does not support image content blocks; falling back to text-only"
+                );
             }
             run_claude_cli(
                 &prompt.text_content(),
@@ -625,7 +630,9 @@ pub fn run_prompt_with_routing_multimodal(
         ),
         AiProvider::GeminiCli => {
             if prompt.has_images() {
-                warn!("Gemini CLI does not support image content blocks; falling back to text-only");
+                warn!(
+                    "Gemini CLI does not support image content blocks; falling back to text-only"
+                );
             }
             let effective_model = model_override.as_deref().and_then(|m| {
                 if m.starts_with("claude") {
@@ -832,11 +839,21 @@ pub fn run_prompt_with_structured_output(
         // The StructuredOutputMiddleware will handle validation and retries.
         AiProvider::ClaudeCli => {
             debug!("Claude CLI does not support structured output; using standard path");
-            run_claude_cli(prompt, &ai_settings.claude_cli, model_override, doctor_handle)
+            run_claude_cli(
+                prompt,
+                &ai_settings.claude_cli,
+                model_override,
+                doctor_handle,
+            )
         }
         AiProvider::GeminiCli => {
             debug!("Gemini CLI does not support structured output; using standard path");
-            run_gemini_cli(prompt, &ai_settings.gemini_cli, model_override, doctor_handle)
+            run_gemini_cli(
+                prompt,
+                &ai_settings.gemini_cli,
+                model_override,
+                doctor_handle,
+            )
         }
     }
 }

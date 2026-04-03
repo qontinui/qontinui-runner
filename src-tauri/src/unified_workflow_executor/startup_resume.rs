@@ -216,8 +216,16 @@ pub async fn resume_interrupted_workflows(
     for task_run in &running_workflows {
         // Skip Restate-managed workflows — Restate handles their resume automatically
         if crate::settings::load_settings().restate.enabled {
-            if app_state.pg_db.is_restate_workflow(&task_run.id).await.unwrap_or(false) {
-                info!("Skipping Restate-managed workflow {} — Restate handles resume", task_run.id);
+            if app_state
+                .pg_db
+                .is_restate_workflow(&task_run.id)
+                .await
+                .unwrap_or(false)
+            {
+                info!(
+                    "Skipping Restate-managed workflow {} — Restate handles resume",
+                    task_run.id
+                );
                 continue;
             }
         }
@@ -225,7 +233,11 @@ pub async fn resume_interrupted_workflows(
         // Check if the workflow state is actually complete but the task_run status
         // wasn't updated (e.g., runner crashed after workflow finished but before
         // the status was persisted).
-        if let Ok(Some(wf_state)) = app_state.pg_db.get_workflow_execution_state(&task_run.id).await {
+        if let Ok(Some(wf_state)) = app_state
+            .pg_db
+            .get_workflow_execution_state(&task_run.id)
+            .await
+        {
             if wf_state.state_name.contains("complete") || wf_state.state_name.contains("finished")
             {
                 info!(
@@ -233,7 +245,10 @@ pub async fn resume_interrupted_workflows(
                     task_run.task_name, task_run.id, wf_state.state_name
                 );
                 if let Err(e) = app_state.pg_db.complete_task_run(&task_run.id).await {
-                    error!("Failed to mark task {} as completed in PG: {}", task_run.id, e);
+                    error!(
+                        "Failed to mark task {} as completed in PG: {}",
+                        task_run.id, e
+                    );
                 }
                 processed_count += 1;
                 continue;
@@ -256,9 +271,15 @@ pub async fn resume_interrupted_workflows(
                 "Marking interrupted {} workflow '{}' (id: {}) as stopped — programmatic workflows cannot be resumed",
                 kind, task_run.task_name, task_run.id
             );
-            let reason = format!("Interrupted by app restart ({} workflow — not resumable)", kind);
+            let reason = format!(
+                "Interrupted by app restart ({} workflow — not resumable)",
+                kind
+            );
             if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
-                error!("Failed to mark task {} as stopped in PG: {}", task_run.id, e);
+                error!(
+                    "Failed to mark task {} as stopped in PG: {}",
+                    task_run.id, e
+                );
             }
             continue;
         }
@@ -279,7 +300,11 @@ pub async fn resume_interrupted_workflows(
                 task_run.task_name, task_run.id, reason
             );
             let reason_str = format!("Interrupted workflow marked as failed ({})", reason);
-            if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason_str).await {
+            if let Err(e) = app_state
+                .pg_db
+                .fail_task_run(&task_run.id, &reason_str)
+                .await
+            {
                 error!("Failed to mark workflow {} as failed: {}", task_run.id, e);
             } else {
                 processed_count += 1;
@@ -303,7 +328,7 @@ pub async fn resume_interrupted_workflows(
                     let task_id = task_run.id.clone();
                     let task_name = task_run.task_name.clone();
                     let starting_iteration = task_run.sessions_count; // Resume from after completed iterations
-                    // Capture values needed inside the async block
+                                                                      // Capture values needed inside the async block
                     let app_state_for_spawn = app_state.clone();
                     let config_storage_for_spawn = config_storage.clone();
                     let app_handle_for_spawn = app_handle.clone();
@@ -466,8 +491,12 @@ pub async fn resume_interrupted_workflows(
                             task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
                         let reason2 = format!("Failed to fetch workflow definition and task exceeded stale timeout ({}s): {}", STALE_RUNNING_TASK_TIMEOUT_SECS, e);
-                        if let Err(e2) = app_state.pg_db.fail_task_run(&task_run.id, &reason2).await {
-                            error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
+                        if let Err(e2) = app_state.pg_db.fail_task_run(&task_run.id, &reason2).await
+                        {
+                            error!(
+                                "Failed to mark stale task {} as failed: {}",
+                                task_run.id, e2
+                            );
                         } else {
                             processed_count += 1;
                         }
@@ -501,7 +530,8 @@ pub async fn resume_interrupted_workflows(
                     }
                     Err(e) => Err(e),
                 }
-            }.await;
+            }
+            .await;
 
             match workflow_result {
                 Ok(Some(workflow)) => {
@@ -678,8 +708,12 @@ pub async fn resume_interrupted_workflows(
                             task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
                         );
                         let reason = format!("Failed to look up workflow '{}' and task exceeded stale timeout ({}s): {}", wf_name, STALE_RUNNING_TASK_TIMEOUT_SECS, e);
-                        if let Err(e2) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
-                            error!("Failed to mark stale task {} as failed: {}", task_run.id, e2);
+                        if let Err(e2) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await
+                        {
+                            error!(
+                                "Failed to mark stale task {} as failed: {}",
+                                task_run.id, e2
+                            );
                         } else {
                             processed_count += 1;
                         }
@@ -691,7 +725,10 @@ pub async fn resume_interrupted_workflows(
                 "Could not extract workflow ID from task_id '{}' and no workflow_name set - task has been running for over {} seconds, marking as failed",
                 task_run.id, STALE_RUNNING_TASK_TIMEOUT_SECS
             );
-            let reason = format!("No workflow definition could be resolved and task exceeded stale timeout ({}s)", STALE_RUNNING_TASK_TIMEOUT_SECS);
+            let reason = format!(
+                "No workflow definition could be resolved and task exceeded stale timeout ({}s)",
+                STALE_RUNNING_TASK_TIMEOUT_SECS
+            );
             if let Err(e) = app_state.pg_db.fail_task_run(&task_run.id, &reason).await {
                 error!("Failed to mark stale task {} as failed: {}", task_run.id, e);
             } else {

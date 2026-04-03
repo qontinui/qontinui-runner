@@ -160,8 +160,7 @@ pub fn check_consistency(
     if !issues.is_empty() {
         warn!(
             issue_count = issues.len(),
-            score,
-            "Consistency check found issues"
+            score, "Consistency check found issues"
         );
     }
 
@@ -405,7 +404,9 @@ fn check_hint_contradictions(
             let cmd_lower = cmd.to_lowercase();
 
             // Contradiction: hint says typecheck but step runs lint
-            if (hint_lower.contains("typecheck") || hint_lower.contains("type check") || hint_lower.contains("tsc"))
+            if (hint_lower.contains("typecheck")
+                || hint_lower.contains("type check")
+                || hint_lower.contains("tsc"))
                 && !cmd_lower.contains("tsc")
                 && !cmd_lower.contains("typecheck")
                 && !cmd_lower.contains("type-check")
@@ -442,7 +443,10 @@ fn check_hint_contradictions(
             }
 
             // Contradiction: hint says "test" but step runs "build"
-            if (hint_lower.contains("run test") || hint_lower.contains("unit test") || hint_lower.contains("pytest") || hint_lower.contains("vitest"))
+            if (hint_lower.contains("run test")
+                || hint_lower.contains("unit test")
+                || hint_lower.contains("pytest")
+                || hint_lower.contains("vitest"))
                 && !cmd_lower.contains("test")
                 && (cmd_lower.contains("build") || cmd_lower.contains("compile"))
             {

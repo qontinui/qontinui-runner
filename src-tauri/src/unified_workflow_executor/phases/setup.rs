@@ -19,7 +19,9 @@ use crate::workflow_state::{CheckpointManager, StepCheckpoint};
 use crate::AppState;
 
 use super::super::phase_configs::{SetupConfig, SetupResult};
-use super::super::phase_helpers::{build_llm_metrics, execute_prompt_response_mode, record_phase_token_usage};
+use super::super::phase_helpers::{
+    build_llm_metrics, execute_prompt_response_mode, record_phase_token_usage,
+};
 
 /// Executes the setup phase (runs once at the start).
 ///
@@ -347,7 +349,12 @@ impl SetupExecutor {
                                     "\n--- AI Setup Output ({}) ---\n{}\n",
                                     step_name, output
                                 );
-                                if let Err(e) = self.app_state.pg_db.append_task_output_ex(execution_id, &formatted, false, false).await {
+                                if let Err(e) = self
+                                    .app_state
+                                    .pg_db
+                                    .append_task_output_ex(execution_id, &formatted, false, false)
+                                    .await
+                                {
                                     warn!("PG append_task_output_ex failed: {}", e);
                                 }
                                 // PG write already done above; SQLite fallback removed

@@ -425,7 +425,11 @@ async fn execute_hybrid_with_embedding_pg(
         "task_run_findings" => {
             // PG text-based search fallback for findings
             let search_text = request.search_text.as_deref().unwrap_or("");
-            let task_run_id = request.filters.get("task_run_id").map(|s| s.as_str()).unwrap_or("");
+            let task_run_id = request
+                .filters
+                .get("task_run_id")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             if task_run_id.is_empty() {
                 return Err("task_run_id filter is required for findings search".to_string());
             }
@@ -516,7 +520,9 @@ async fn execute_hybrid_with_embedding_pg(
             let workflows = if search_text.is_empty() {
                 pg.list_unified_workflows().await.unwrap_or_default()
             } else {
-                pg.search_unified_workflows(search_text).await.unwrap_or_default()
+                pg.search_unified_workflows(search_text)
+                    .await
+                    .unwrap_or_default()
             };
             workflows
                 .into_iter()

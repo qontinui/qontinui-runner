@@ -4,8 +4,8 @@
 //! recommendations before human review. Inspired by promptfoo's declarative
 //! YAML-based eval configs.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::info;
 
@@ -184,7 +184,12 @@ pub fn save_eval_spec(pg_db: &Arc<PgDb>, spec: &EvalSpec) -> Result<(), String> 
         serde_json::to_string(spec).map_err(|e| format!("Failed to serialize spec: {}", e))?;
 
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.save_eval_spec(&id, &name, &target_agent.clone().unwrap_or_default(), &spec_json))
+        Handle::current().block_on(pg_db.save_eval_spec(
+            &id,
+            &name,
+            &target_agent.clone().unwrap_or_default(),
+            &spec_json,
+        ))
     })?;
     info!("Saved eval spec {} ({})", id, name);
     Ok(())
@@ -198,26 +203,28 @@ pub fn list_eval_specs(
     let jsons = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.list_eval_specs(target_agent))
     })?;
-    let specs: Vec<EvalSpec> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+    let specs: Vec<EvalSpec> = jsons
+        .iter()
+        .filter_map(|j| serde_json::from_str(j).ok())
+        .collect();
     Ok(specs)
 }
 
 /// Get a single eval spec by ID.
 pub fn get_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<Option<EvalSpec>, String> {
-    let result = tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.get_eval_spec(spec_id))
-    })?;
+    let result =
+        tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_eval_spec(spec_id)))?;
     match result {
-        Some(json) => serde_json::from_str(&json).map(Some).map_err(|e| format!("Failed to deserialize eval spec: {}", e)),
+        Some(json) => serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|e| format!("Failed to deserialize eval spec: {}", e)),
         None => Ok(None),
     }
 }
 
 /// Delete an eval spec.
 pub fn delete_eval_spec(pg_db: &Arc<PgDb>, spec_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.delete_eval_spec(spec_id))
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.delete_eval_spec(spec_id)))
 }
 
 /// Save an eval result.
@@ -232,7 +239,15 @@ pub fn save_eval_result(pg_db: &Arc<PgDb>, result: &EvalResult) -> Result<(), St
     let trials_run = result.trials_run as i64;
 
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.save_eval_result(&id, &spec_id, recommendation_id.as_deref(), &status, &result_json, p_value, trials_run))
+        Handle::current().block_on(pg_db.save_eval_result(
+            &id,
+            &spec_id,
+            recommendation_id.as_deref(),
+            &status,
+            &result_json,
+            p_value,
+            trials_run,
+        ))
     })?;
     info!("Saved eval result {} (status={})", id, status);
     Ok(())
@@ -247,7 +262,10 @@ pub fn list_eval_results(
     let jsons = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.list_eval_results(spec_id, recommendation_id))
     })?;
-    let results: Vec<EvalResult> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+    let results: Vec<EvalResult> = jsons
+        .iter()
+        .filter_map(|j| serde_json::from_str(j).ok())
+        .collect();
     Ok(results)
 }
 
@@ -259,9 +277,16 @@ pub fn attach_eval_result(
     eval_status: &str,
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.attach_eval_result(recommendation_id, eval_result_id, eval_status))
+        Handle::current().block_on(pg_db.attach_eval_result(
+            recommendation_id,
+            eval_result_id,
+            eval_status,
+        ))
     })?;
-    info!("Attached eval result {} to recommendation {} (status={})", eval_result_id, recommendation_id, eval_status);
+    info!(
+        "Attached eval result {} to recommendation {} (status={})",
+        eval_result_id, recommendation_id, eval_status
+    );
     Ok(())
 }
 

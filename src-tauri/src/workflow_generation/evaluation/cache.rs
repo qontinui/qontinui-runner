@@ -116,12 +116,11 @@ impl EntailmentCache {
 
         let handle = tokio::runtime::Handle::try_current().ok()?;
         let pg_db_clone = pg_db.clone();
-        let pg_result = std::thread::spawn(move || {
-            handle.block_on(pg_db_clone.get_entailment_cache(ch, sh))
-        })
-        .join()
-        .ok()
-        .flatten()?;
+        let pg_result =
+            std::thread::spawn(move || handle.block_on(pg_db_clone.get_entailment_cache(ch, sh)))
+                .join()
+                .ok()
+                .flatten()?;
 
         let tier = pg_tier_to_scoring_tier(pg_result.tier.as_deref());
 
@@ -129,7 +128,10 @@ impl EntailmentCache {
         let explanation = pg_result.explanation.unwrap_or_default();
         self.insert_in_memory(key, pg_result.score, explanation.clone(), tier);
 
-        debug!("Entailment cache PG hit: criterion_hash={}, step_hash={}", ch, sh);
+        debug!(
+            "Entailment cache PG hit: criterion_hash={}, step_hash={}",
+            ch, sh
+        );
 
         Some(CachedEntailmentOwned {
             score: pg_result.score,

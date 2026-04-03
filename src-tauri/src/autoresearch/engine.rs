@@ -125,10 +125,12 @@ impl Mutator {
             MutationStrategy::QLearning => {
                 let mut q_router = super::q_router::QRouter::new();
                 // Use PG Q-table
-                let rows = pg_q_rows.or({
-                    // Fallback: try to load synchronously via block_on (best-effort)
-                    None
-                }).or(load_q_table_from_pg(pg).await.ok());
+                let rows = pg_q_rows
+                    .or({
+                        // Fallback: try to load synchronously via block_on (best-effort)
+                        None
+                    })
+                    .or(load_q_table_from_pg(pg).await.ok());
                 if let Some(rows) = rows {
                     q_router.load_from_rows(rows);
                     info!(
@@ -419,11 +421,7 @@ async fn run_single_trial(
 // =============================================================================
 
 /// Record experiment results into the learning_outcomes and learning_patterns tables.
-fn record_learning(
-    config: &ResearchConfig,
-    result: &ExperimentResult,
-    experiment_number: u32,
-) {
+fn record_learning(config: &ResearchConfig, result: &ExperimentResult, experiment_number: u32) {
     // SQLite removed - no-op
 }
 
@@ -508,11 +506,7 @@ fn start_config_watcher(config_path: &str) -> Option<std::sync::mpsc::Receiver<R
     Some(rx)
 }
 
-fn update_campaign_status(
-    campaign_id: &str,
-    status: &str,
-    campaign_status: &CampaignStatus,
-) {
+fn update_campaign_status(campaign_id: &str, status: &str, campaign_status: &CampaignStatus) {
     // SQLite removed - no-op
 }
 

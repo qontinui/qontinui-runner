@@ -23,7 +23,8 @@ impl IsolatedExecutor {
         command: &str,
         working_directory: Option<&str>,
     ) -> Result<ContainerResult, String> {
-        self.execute_with_policy(command, working_directory, None, &[]).await
+        self.execute_with_policy(command, working_directory, None, &[])
+            .await
     }
 
     /// Execute a command in a container with an optional security policy overlay
@@ -53,7 +54,9 @@ impl IsolatedExecutor {
         info!(
             "Executing in container: {} (profile={}, extra_env={})",
             &command[..command.len().min(100)],
-            security_policy.map(|p| p.profile_name.as_str()).unwrap_or("none"),
+            security_policy
+                .map(|p| p.profile_name.as_str())
+                .unwrap_or("none"),
             extra_env.len(),
         );
         self.docker
@@ -70,7 +73,8 @@ impl IsolatedExecutor {
         command: &str,
         working_directory: Option<&str>,
     ) -> Result<Option<ContainerResult>, String> {
-        self.try_execute_with_policy(command, working_directory, None, &[]).await
+        self.try_execute_with_policy(command, working_directory, None, &[])
+            .await
     }
 
     /// Execute with fallback to host execution and optional security policy overlay.
@@ -85,7 +89,10 @@ impl IsolatedExecutor {
             return Ok(None); // Signal to use host execution
         }
 
-        match self.execute_with_policy(command, working_directory, security_policy, extra_env).await {
+        match self
+            .execute_with_policy(command, working_directory, security_policy, extra_env)
+            .await
+        {
             Ok(result) => Ok(Some(result)),
             Err(e) => {
                 warn!(

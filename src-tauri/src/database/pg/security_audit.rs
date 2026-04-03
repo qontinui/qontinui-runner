@@ -138,8 +138,10 @@ impl PgDb {
 
         params.push(Box::new(limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&query, &param_refs)

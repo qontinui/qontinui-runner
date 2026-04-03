@@ -112,9 +112,13 @@ pub async fn create_scheduled_task(
 
     tracing::info!(
         "Created scheduled task: {} ({})",
-        scheduled_task.name, scheduled_task.id
+        scheduled_task.name,
+        scheduled_task.id
     );
-    Ok((StatusCode::CREATED, Json(ApiResponse::success(scheduled_task))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(scheduled_task)),
+    ))
 }
 
 /// Get a single scheduled task by ID
@@ -124,17 +128,21 @@ pub async fn get_scheduled_task(
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
 {
     let pg = &state.app_state.pg_db;
-    let task = pg.get_scheduled_task(&id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to get task: {}", e))),
-        )
-    })?.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Task not found: {}", id))),
-        )
-    })?;
+    let task = pg
+        .get_scheduled_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get task: {}", e))),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Task not found: {}", id))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(task)))
 }
@@ -147,17 +155,21 @@ pub async fn update_scheduled_task(
 ) -> Result<Json<ApiResponse<crate::scheduler::ScheduledTask>>, (StatusCode, Json<ApiResponse<()>>)>
 {
     let pg = &state.app_state.pg_db;
-    let mut scheduled_task = pg.get_scheduled_task(&id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to get task: {}", e))),
-        )
-    })?.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Task not found: {}", id))),
-        )
-    })?;
+    let mut scheduled_task = pg
+        .get_scheduled_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get task: {}", e))),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Task not found: {}", id))),
+            )
+        })?;
 
     if let Some(name) = request.name {
         scheduled_task.name = name;
@@ -196,16 +208,19 @@ pub async fn update_scheduled_task(
     };
 
     scheduled_task.touch();
-    pg.update_scheduled_task(&scheduled_task).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to update task: {}", e))),
-        )
-    })?;
+    pg.update_scheduled_task(&scheduled_task)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update task: {}", e))),
+            )
+        })?;
 
     tracing::info!(
         "Updated scheduled task: {} ({})",
-        scheduled_task.name, scheduled_task.id
+        scheduled_task.name,
+        scheduled_task.id
     );
     Ok(Json(ApiResponse::success(scheduled_task)))
 }
@@ -217,17 +232,20 @@ pub async fn delete_scheduled_task(
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
     // Verify task exists first
-    pg.get_scheduled_task(&id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to get task: {}", e))),
-        )
-    })?.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Task not found: {}", id))),
-        )
-    })?;
+    pg.get_scheduled_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get task: {}", e))),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Task not found: {}", id))),
+            )
+        })?;
 
     pg.delete_scheduled_task(&id).await.map_err(|e| {
         (
@@ -281,7 +299,9 @@ pub async fn get_scheduler_settings(
         Ok(settings) => Json(ApiResponse::success(settings)),
         Err(e) => {
             tracing::error!("Failed to get scheduler settings: {}", e);
-            Json(ApiResponse::success(crate::scheduler::SchedulerSettings::default()))
+            Json(ApiResponse::success(
+                crate::scheduler::SchedulerSettings::default(),
+            ))
         }
     }
 }

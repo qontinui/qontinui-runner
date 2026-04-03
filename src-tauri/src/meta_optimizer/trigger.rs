@@ -73,7 +73,8 @@ fn should_launch_meta_prompt_optimizer(pg_db: &std::sync::Arc<crate::database::p
     }
 
     // Adaptive cooldown based on consecutive rejections (circuit breaker)
-    let consecutive = super::prompt_evolution::count_consecutive_rejections(pg_db, &target.agent_type);
+    let consecutive =
+        super::prompt_evolution::count_consecutive_rejections(pg_db, &target.agent_type);
     let cooldown_hours = super::prompt_evolution::adaptive_cooldown_hours(consecutive);
     if super::prompt_evolution::is_in_cooldown(pg_db, &target.agent_type, cooldown_hours) {
         debug!(
@@ -181,7 +182,9 @@ pub fn check_and_launch_optimizers(
     // Fast — only queries learning_outcomes aggregates, no LLM calls.
     if let Err(e) = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.recompute_agentic_baselines())
-    }).map(|_| ()) {
+    })
+    .map(|_| ())
+    {
         debug!("Baseline recomputation skipped: {}", e);
     }
 
@@ -249,7 +252,10 @@ fn auto_evaluate_outcomes(pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
 ///
 /// When `app_handle` is provided and a rollback verdict is reached, a
 /// `canary-alert` Tauri event is emitted so the frontend can show a notification.
-fn auto_evaluate_canaries(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, app_handle: Option<&tauri::AppHandle>) {
+fn auto_evaluate_canaries(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    app_handle: Option<&tauri::AppHandle>,
+) {
     let canaries = match super::canary::get_active_canaries(pg_db) {
         Ok(c) => c,
         Err(_) => return,
@@ -312,11 +318,9 @@ fn auto_evaluate_canaries(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, app
                     // to gather more data faster (extend the evaluation period).
                     if canary.canary_run_count >= 30 && canary.percentage < 50 {
                         let new_pct = std::cmp::min(canary.percentage + 10, 50);
-                        if let Err(e) = super::canary::update_canary_percentage(
-                            pg_db,
-                            &canary.id,
-                            new_pct,
-                        ) {
+                        if let Err(e) =
+                            super::canary::update_canary_percentage(pg_db, &canary.id, new_pct)
+                        {
                             debug!(
                                 "Failed to extend canary {} traffic to {}%: {}",
                                 canary.id, new_pct, e
@@ -359,10 +363,11 @@ pub fn launch_optimizer_manual(
     // Meta-prompt optimizer has additional guards even for manual triggers
     // to prevent creating competing canaries for the same agent_type
     if optimizer_type == OptimizerType::MetaPrompt {
-        if let Ok(Some(target)) =
-            super::prompt_extractor::select_optimization_target(10, 0.30)
-        {
-            if super::prompt_evolution::has_active_evolution(&deps.app_state.pg_db, &target.agent_type) {
+        if let Ok(Some(target)) = super::prompt_extractor::select_optimization_target(10, 0.30) {
+            if super::prompt_evolution::has_active_evolution(
+                &deps.app_state.pg_db,
+                &target.agent_type,
+            ) {
                 return Err(format!(
                     "Cannot trigger MetaPrompt optimizer: active canary already in progress for {}",
                     target.agent_type
@@ -378,7 +383,6 @@ fn launch_optimizer_internal(
     optimizer_type: OptimizerType,
     trigger_type: &str,
 ) -> Result<String, String> {
-
     // Create task run for this optimizer
     let task_run_id = uuid::Uuid::new_v4().to_string();
     let task_name = format!("Meta-Optimizer: {}", optimizer_type.display_name());
@@ -399,9 +403,10 @@ fn launch_optimizer_internal(
     {
         let pg = deps.app_state.pg_db.clone();
         let input_clone = input.clone();
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "No tokio runtime".to_string())?;
-        handle.block_on(async move { pg.create_task_run(&input_clone).await })
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
+        handle
+            .block_on(async move { pg.create_task_run(&input_clone).await })
             .map_err(|e| format!("Failed to create task run: {}", e))?;
     }
 
@@ -422,8 +427,11 @@ fn launch_optimizer_internal(
 
     // Query completed optimizer run count for style rotation (PromptWizard-inspired diversity)
     let style_index: u32 = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(deps.app_state.pg_db.count_optimizer_runs_by_type(optimizer_type.as_str()))
+        tokio::runtime::Handle::current().block_on(
+            deps.app_state
+                .pg_db
+                .count_optimizer_runs_by_type(optimizer_type.as_str()),
+        )
     })
     .unwrap_or(0) as u32;
 
@@ -463,11 +471,8 @@ fn launch_optimizer_internal(
             (config, setup, verify)
         }
         OptimizerType::MetaPrompt => {
-            let config = super::meta_prompt_optimizer::build_config(
-                &task_run_id,
-                &task_name,
-                style_index,
-            );
+            let config =
+                super::meta_prompt_optimizer::build_config(&task_run_id, &task_name, style_index);
             let setup = super::meta_prompt_optimizer::build_setup_steps();
             let verify = super::meta_prompt_optimizer::build_verification_steps();
             (config, setup, verify)
@@ -511,11 +516,11 @@ fn launch_optimizer_internal(
         if crate::restate::launch::should_use_restate(&restate_settings).await {
             match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
                 Ok(input) => {
-                    if let Err(e) = app_state.pg_db.save_restate_workflow_execution(
-                        &exec_id,
-                        &exec_id,
-                        None,
-                    ).await {
+                    if let Err(e) = app_state
+                        .pg_db
+                        .save_restate_workflow_execution(&exec_id, &exec_id, None)
+                        .await
+                    {
                         tracing::error!("Failed to record Restate workflow: {}", e);
                     }
 
@@ -523,7 +528,9 @@ fn launch_optimizer_internal(
                         &exec_id,
                         &input,
                         &restate_settings.ingress_url(),
-                    ).await {
+                    )
+                    .await
+                    {
                         tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                     } else {
                         use_legacy = false;
@@ -581,7 +588,9 @@ pub fn check_and_launch_optimizers_with_pg(
     for optimizer_type in OptimizerType::all() {
         match should_launch_optimizer(pg_db, *optimizer_type, &source_task_run_id) {
             Ok(true) => {
-                if *optimizer_type == OptimizerType::MetaPrompt && !should_launch_meta_prompt_optimizer(pg_db) {
+                if *optimizer_type == OptimizerType::MetaPrompt
+                    && !should_launch_meta_prompt_optimizer(pg_db)
+                {
                     debug!("Skipping MetaPrompt — additional guards not met");
                     continue;
                 }
@@ -594,7 +603,8 @@ pub fn check_and_launch_optimizers_with_pg(
             Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
         }
     }
-    if let Err(e) = super::snapshots::capture_periodic(pg_db, super::types::WorkflowCategory::Main) {
+    if let Err(e) = super::snapshots::capture_periodic(pg_db, super::types::WorkflowCategory::Main)
+    {
         warn!("Failed to capture periodic snapshot: {}", e);
     }
     {
@@ -602,7 +612,10 @@ pub fn check_and_launch_optimizers_with_pg(
         let trid = source_task_run_id.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                crate::spec_experimentation::compliance::auto_extract_spec_compliance(&pg_clone, &trid).await;
+                crate::spec_experimentation::compliance::auto_extract_spec_compliance(
+                    &pg_clone, &trid,
+                )
+                .await;
             })
         });
     }
@@ -615,7 +628,9 @@ pub fn check_and_launch_optimizers_with_pg(
     run_cost_analysis(pg_db);
     if let Err(e) = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.recompute_agentic_baselines())
-    }).map(|_| ()) {
+    })
+    .map(|_| ())
+    {
         debug!("Baseline recomputation skipped: {}", e);
     }
     super::recommendations::auto_evaluate_with_agentic_scores(pg_db);

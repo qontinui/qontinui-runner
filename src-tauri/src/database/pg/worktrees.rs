@@ -8,7 +8,11 @@ impl PgDb {
         &self,
         status: Option<&str>,
     ) -> Result<Vec<crate::worktree::WorktreeRecord>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if let Some(s) = status {
             conn.query(
@@ -54,8 +58,15 @@ impl PgDb {
     }
 
     /// Insert a worktree record.
-    pub async fn insert_worktree(&self, record: &crate::worktree::WorktreeRecord) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn insert_worktree(
+        &self,
+        record: &crate::worktree::WorktreeRecord,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let status_str = record.status.to_string();
 
         conn.execute(

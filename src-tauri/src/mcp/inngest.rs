@@ -68,7 +68,9 @@ pub async fn get_flow_control_status(
 ) -> Json<ApiResponse<FlowControlStatus>> {
     Json(ApiResponse::success(FlowControlStatus {
         active: true,
-        description: "Per-workflow flow control enforcer (concurrency, throttle, debounce, rate limit)".to_string(),
+        description:
+            "Per-workflow flow control enforcer (concurrency, throttle, debounce, rate limit)"
+                .to_string(),
     }))
 }
 

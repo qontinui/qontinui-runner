@@ -24,9 +24,17 @@ pub async fn list_saved_api_requests(
     Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state.app_state.pg_db.list_saved_api_requests().await
-        .map(|v| serde_json::from_value::<Vec<crate::saved_api_requests::SavedApiRequest>>(serde_json::Value::Array(v)).unwrap_or_default())
-    {
+    match state
+        .app_state
+        .pg_db
+        .list_saved_api_requests()
+        .await
+        .map(|v| {
+            serde_json::from_value::<Vec<crate::saved_api_requests::SavedApiRequest>>(
+                serde_json::Value::Array(v),
+            )
+            .unwrap_or_default()
+        }) {
         Ok(requests) => Ok(Json(ApiResponse::success(requests))),
         Err(e) => {
             error!("Failed to list saved API requests: {}", e);
@@ -49,9 +57,16 @@ pub async fn get_saved_api_request(
     Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state.app_state.pg_db.get_saved_api_request(&id).await
-        .map(|opt| opt.and_then(|v| serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(v).ok()))
-    {
+    match state
+        .app_state
+        .pg_db
+        .get_saved_api_request(&id)
+        .await
+        .map(|opt| {
+            opt.and_then(|v| {
+                serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(v).ok()
+            })
+        }) {
         Ok(Some(request)) => Ok(Json(ApiResponse::success(request))),
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
@@ -83,7 +98,9 @@ pub async fn create_saved_api_request(
     let _ = request;
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Create saved API request: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Create saved API request: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -101,7 +118,9 @@ pub async fn update_saved_api_request(
     let _ = (id, request);
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Update saved API request: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Update saved API request: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -183,7 +202,9 @@ pub async fn duplicate_saved_api_request(
     let _ = id;
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Duplicate saved API request: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Duplicate saved API request: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 

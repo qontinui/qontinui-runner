@@ -75,7 +75,9 @@ async fn consolidate_handler(
     if !crate::memory::consolidation::can_run_consolidation(pg, config.cooldown_hours).await {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
-            Json(api_error("Consolidation is on cooldown. Try again later.".to_string())),
+            Json(api_error(
+                "Consolidation is on cooldown. Try again later.".to_string(),
+            )),
         ));
     }
 

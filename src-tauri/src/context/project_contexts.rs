@@ -143,15 +143,10 @@ pub fn create_project_context(
 /// The context name is derived from the filename (e.g., `api-guidelines.md` → "api-guidelines").
 /// Context IDs are deterministic: `proj-ctx-{filename_stem}` so they remain stable across loads.
 pub fn load_project_contexts_from_dir(project_path: &str) -> Vec<Context> {
-    let ctx_dir = Path::new(project_path)
-        .join(".qontinui")
-        .join("contexts");
+    let ctx_dir = Path::new(project_path).join(".qontinui").join("contexts");
 
     if !ctx_dir.is_dir() {
-        debug!(
-            "No .qontinui/contexts/ directory at {}",
-            ctx_dir.display()
-        );
+        debug!("No .qontinui/contexts/ directory at {}", ctx_dir.display());
         return Vec::new();
     }
 

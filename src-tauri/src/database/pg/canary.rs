@@ -32,12 +32,7 @@ impl PgDb {
                 baseline_run_count, canary_run_count,
                 baseline_metrics_json, canary_metrics_json, created_at)
                VALUES ($1, $2, $3, 'active', $4::timestamptz, 0, 0, '{}', '{}', $4::timestamptz)"#,
-            &[
-                &id,
-                &recommendation_id,
-                &percentage_i,
-                &now,
-            ],
+            &[&id, &recommendation_id, &percentage_i, &now],
         )
         .await
         .map_err(|e| format!("Failed to create canary rollout: {}", e))?;
@@ -100,10 +95,7 @@ impl PgDb {
     }
 
     /// Get the baseline and canary metrics JSON for a canary rollout.
-    pub async fn get_canary_metrics(
-        &self,
-        canary_id: &str,
-    ) -> Result<(String, String), String> {
+    pub async fn get_canary_metrics(&self, canary_id: &str) -> Result<(String, String), String> {
         let conn = self
             .pool()
             .get()
@@ -247,7 +239,11 @@ impl PgDb {
         &self,
         recommendation_id: &str,
     ) -> Result<std::collections::HashMap<String, String>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut overrides = std::collections::HashMap::new();
 
         let row = conn.query_one(
@@ -293,7 +289,11 @@ impl PgDb {
         &self,
         recommendation_id: &str,
     ) -> Result<Vec<(String, serde_json::Value)>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn.query_one(
             "SELECT recommendation_type, recommended_value FROM meta_optimizer_recommendations WHERE id = $1",
@@ -328,7 +328,11 @@ impl PgDb {
         &self,
         canary_id: &str,
     ) -> Result<crate::meta_optimizer::canary::CanaryEvaluation, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn.query_one(
             "SELECT baseline_metrics_json, canary_metrics_json, canary_run_count FROM canary_rollouts WHERE id = $1",
@@ -352,10 +356,14 @@ impl PgDb {
 
         let baseline_sr = if baseline_total > 0 {
             baseline.success_count as f64 / baseline_total as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let canary_sr = if canary_total > 0 {
             canary.success_count as f64 / canary_total as f64 * 100.0
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         let delta = canary_sr - baseline_sr;
 
@@ -370,22 +378,32 @@ impl PgDb {
             let canary_avg_cost = canary.total_cost_usd / canary_total as f64;
             if baseline_avg_cost > 0.0 {
                 Some((canary_avg_cost - baseline_avg_cost) / baseline_avg_cost * 100.0)
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let duration_delta_pct = if baseline_total > 0 && canary_total > 0 {
             let baseline_avg_dur = baseline.total_duration_ms / baseline_total as f64;
             let canary_avg_dur = canary.total_duration_ms / canary_total as f64;
             if baseline_avg_dur > 0.0 {
                 Some((canary_avg_dur - baseline_avg_dur) / baseline_avg_dur * 100.0)
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let verdict_enum = if !min_runs_met {
             crate::stats::Verdict::Neutral
         } else {
             crate::stats::compute_verdict(
-                delta, &analysis, canary_total,
+                delta,
+                &analysis,
+                canary_total,
                 &crate::stats::VerdictThresholds::canary(),
             )
         };

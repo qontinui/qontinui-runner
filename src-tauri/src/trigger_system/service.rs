@@ -402,7 +402,13 @@ impl TriggerService {
     /// Handle an incoming trigger event.
     async fn handle_event(&self, event: TriggerEvent) {
         // Load the trigger definition
-        let trigger = match self.deps.app_state.pg_db.get_trigger(&event.trigger_id).await {
+        let trigger = match self
+            .deps
+            .app_state
+            .pg_db
+            .get_trigger(&event.trigger_id)
+            .await
+        {
             Ok(Some(t)) => t,
             Ok(None) => {
                 warn!("Trigger not found for event: {}", event.trigger_id);
@@ -459,8 +465,12 @@ impl TriggerService {
                 match exec_result {
                     Ok(execution_id) => {
                         // Record success
-                        if let Err(e) =
-                            self.deps.app_state.pg_db.record_trigger_fired(&trigger.id, Some(&execution_id)).await
+                        if let Err(e) = self
+                            .deps
+                            .app_state
+                            .pg_db
+                            .record_trigger_fired(&trigger.id, Some(&execution_id))
+                            .await
                         {
                             error!("Failed to record trigger fired: {}", e);
                         }
@@ -480,7 +490,13 @@ impl TriggerService {
                             triggered_at: chrono::Utc::now().to_rfc3339(),
                         };
 
-                        if let Err(e) = self.deps.app_state.pg_db.record_trigger_history(&history).await {
+                        if let Err(e) = self
+                            .deps
+                            .app_state
+                            .pg_db
+                            .record_trigger_history(&history)
+                            .await
+                        {
                             error!("Failed to record trigger history: {}", e);
                         }
 
@@ -532,7 +548,13 @@ impl TriggerService {
                         triggered_at: chrono::Utc::now().to_rfc3339(),
                     };
 
-                    if let Err(e) = self.deps.app_state.pg_db.record_trigger_history(&history).await {
+                    if let Err(e) = self
+                        .deps
+                        .app_state
+                        .pg_db
+                        .record_trigger_history(&history)
+                        .await
+                    {
                         error!("Failed to record trigger history: {}", e);
                     }
                 }
@@ -552,7 +574,13 @@ impl TriggerService {
                 triggered_at: chrono::Utc::now().to_rfc3339(),
             };
 
-            if let Err(e) = self.deps.app_state.pg_db.record_trigger_history(&history).await {
+            if let Err(e) = self
+                .deps
+                .app_state
+                .pg_db
+                .record_trigger_history(&history)
+                .await
+            {
                 error!("Failed to record trigger history: {}", e);
             }
         }
@@ -560,7 +588,13 @@ impl TriggerService {
 
     /// Get overall system status.
     pub async fn get_status(&self) -> TriggerSystemStatus {
-        let (total, enabled) = self.deps.app_state.pg_db.get_trigger_stats().await.unwrap_or((0, 0));
+        let (total, enabled) = self
+            .deps
+            .app_state
+            .pg_db
+            .get_trigger_stats()
+            .await
+            .unwrap_or((0, 0));
         let active_watchers = {
             let handles = self.watcher_handles.read().await;
             handles.len() as u64

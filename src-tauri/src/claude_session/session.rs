@@ -235,9 +235,12 @@ impl ClaudeSession {
                         continue;
                     }
                     let formatted = format!("\n[AI_RESPONSE]\n{}\n[/AI_RESPONSE]\n", delta);
-                    if let Err(e) = pg_rt.block_on(
-                        pg.append_task_output_ex(&persist_task_run_id, &formatted, false, false)
-                    ) {
+                    if let Err(e) = pg_rt.block_on(pg.append_task_output_ex(
+                        &persist_task_run_id,
+                        &formatted,
+                        false,
+                        false,
+                    )) {
                         warn!("Failed to persist AI response to output_log: {}", e);
                     } else {
                         debug!(
@@ -457,7 +460,8 @@ impl ClaudeSession {
                                     &ctx.task_run_id,
                                     ctx.session_num,
                                     &parsed_finding,
-                                ).await
+                                )
+                                .await
                             })
                         });
                         match insert_result {
@@ -512,12 +516,16 @@ impl ClaudeSession {
                                     }));
 
                                 // Async-enrich security findings with vulnerability intelligence
-                                if parsed_finding.category == crate::findings::FindingCategory::Security {
+                                if parsed_finding.category
+                                    == crate::findings::FindingCategory::Security
+                                {
                                     let description = finding.description.clone();
                                     let task_run_id = ctx.task_run_id.clone();
                                     let finding_title = finding.title.clone();
                                     tokio::spawn(async move {
-                                        let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
+                                        let ka =
+                                            crate::knowledge_acquisition::KnowledgeAcquisition::new(
+                                            );
                                         if let Some(data) = crate::knowledge_acquisition::vuln_enrichment::enrich_from_description(&description, &ka).await {
                                             tracing::info!(
                                                 "[knowledge_acquisition] Enriched security finding '{}': {} CVEs, exploit_available={}",

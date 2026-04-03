@@ -167,11 +167,18 @@ pub async fn get_saved_requests_for_orchestration(
 ) -> Result<CommandResponse, String> {
     info!("Getting saved API requests for orchestration");
 
-    let requests_result: Result<serde_json::Value, String> = state.pg_db.list_saved_api_requests().await.map(|v| serde_json::to_value(&v).unwrap_or_default());
+    let requests_result: Result<serde_json::Value, String> = state
+        .pg_db
+        .list_saved_api_requests()
+        .await
+        .map(|v| serde_json::to_value(&v).unwrap_or_default());
     match requests_result {
         Ok(requests_json) => Ok(CommandResponse {
             success: true,
-            message: Some(format!("Found {} saved requests", requests_json.as_array().map(|a| a.len()).unwrap_or(0))),
+            message: Some(format!(
+                "Found {} saved requests",
+                requests_json.as_array().map(|a| a.len()).unwrap_or(0)
+            )),
             data: Some(requests_json),
         }),
         Err(e) => {
@@ -224,8 +231,11 @@ pub async fn list_orchestration_plans(
     info!("Listing saved orchestration plans");
 
     // Get all settings
-    let all_settings = state.pg_db.get_all_settings().await
-    .map_err(|e| format!("Failed to get settings: {}", e))?;
+    let all_settings = state
+        .pg_db
+        .get_all_settings()
+        .await
+        .map_err(|e| format!("Failed to get settings: {}", e))?;
 
     // Filter for orchestration plans
     let plans: Vec<TestOrchestrationPlan> = if let serde_json::Value::Object(map) = all_settings {
@@ -254,7 +264,11 @@ pub async fn delete_orchestration_plan(
 
     // Set the value to null to effectively delete the setting
     let key = format!("orchestration_plan_{}", plan_id);
-    let del_err = state.pg_db.set_setting(&key, &serde_json::Value::Null).await.err();
+    let del_err = state
+        .pg_db
+        .set_setting(&key, &serde_json::Value::Null)
+        .await
+        .err();
     if let Some(e) = del_err {
         error!("Failed to delete orchestration plan: {}", e);
         return Ok(CommandResponse {

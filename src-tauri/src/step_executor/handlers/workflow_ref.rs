@@ -281,7 +281,11 @@ impl StepHandler for WorkflowRefHandler {
                 if workflow_result.success {
                     info!("workflow_ref '{}' completed successfully", workflow.name);
                     // PG-primary
-                    let _ = context.app_state.pg_db.complete_task_run(&execution_id).await;
+                    let _ = context
+                        .app_state
+                        .pg_db
+                        .complete_task_run(&execution_id)
+                        .await;
 
                     StepHandlerResult::success_with_data(serde_json::json!({
                         "nested_workflow_id": workflow.id,
@@ -294,7 +298,11 @@ impl StepHandler for WorkflowRefHandler {
                     let error_msg = format!("workflow_ref '{}' failed", workflow.name);
                     warn!("{}", error_msg);
                     // PG-primary
-                    let _ = context.app_state.pg_db.fail_task_run(&execution_id, &error_msg).await;
+                    let _ = context
+                        .app_state
+                        .pg_db
+                        .fail_task_run(&execution_id, &error_msg)
+                        .await;
 
                     StepHandlerResult::failure_with_data(
                         error_msg,
@@ -315,7 +323,11 @@ impl StepHandler for WorkflowRefHandler {
                 );
                 warn!("{}", error_msg);
                 // PG-primary
-                let _ = context.app_state.pg_db.fail_task_run(&execution_id, &error_msg).await;
+                let _ = context
+                    .app_state
+                    .pg_db
+                    .fail_task_run(&execution_id, &error_msg)
+                    .await;
 
                 StepHandlerResult::failure_with_data(
                     error_msg,

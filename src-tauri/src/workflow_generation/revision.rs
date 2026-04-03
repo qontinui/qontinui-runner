@@ -92,8 +92,7 @@ pub struct QualityReport {
     /// Present when evaluation data is available; strictly more informative
     /// than the name-matching `coverage_matrix`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub semantic_coverage_matrix:
-        Option<super::evaluation::coverage::SemanticCoverageMatrix>,
+    pub semantic_coverage_matrix: Option<super::evaluation::coverage::SemanticCoverageMatrix>,
 }
 
 // ============================================================================

@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use serde::Serialize;
 use crate::commands::AppState;
 use crate::error_monitor::curator::{CuratedError, DebugContext};
 use crate::error_monitor::types::{ErrorStatus, ErrorSummary, StoredErrorEvent};
+use serde::Serialize;
 
 // Default limits for error monitor queries
 const DEFAULT_QUERY_LIMIT: usize = 100;
@@ -57,15 +57,21 @@ pub async fn query_error_events(
         query
     );
 
-    let status_strs: Option<Vec<String>> = query.status.as_ref().map(|statuses| {
-        statuses.iter().map(|s| s.as_str().to_string()).collect()
-    });
-    let status_refs: Option<Vec<&str>> = status_strs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+    let status_strs: Option<Vec<String>> = query
+        .status
+        .as_ref()
+        .map(|statuses| statuses.iter().map(|s| s.as_str().to_string()).collect());
+    let status_refs: Option<Vec<&str>> = status_strs
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
 
-    let severity_strs: Option<Vec<String>> = query.severity.as_ref().map(|sevs| {
-        sevs.iter().map(|s| s.as_str().to_string()).collect()
-    });
-    let severity_refs: Option<Vec<&str>> = severity_strs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+    let severity_strs: Option<Vec<String>> = query
+        .severity
+        .as_ref()
+        .map(|sevs| sevs.iter().map(|s| s.as_str().to_string()).collect());
+    let severity_refs: Option<Vec<&str>> = severity_strs
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
 
     let pg_rows = app_state
         .pg_db
@@ -149,10 +155,7 @@ pub async fn update_error_status(
 
 /// Acknowledge an error (mark as seen).
 #[tauri::command]
-pub async fn acknowledge_error(
-    app_state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
+pub async fn acknowledge_error(app_state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     app_state
         .pg_db
         .update_error_status(id, "acknowledged", None)
@@ -326,7 +329,9 @@ pub async fn get_debug_context(
 
     // PG-primary: build debug context from PG
     let pg = crate::database::pg::PgDb::global();
-    let errors = pg.get_unresolved_errors(task_run_id.as_deref(), max_err).await?;
+    let errors = pg
+        .get_unresolved_errors(task_run_id.as_deref(), max_err)
+        .await?;
 
     // Build a DebugContext from PG error records
     let mut critical_errors = Vec::new();
@@ -347,10 +352,16 @@ pub async fn get_debug_context(
             message: err["message"].as_str().unwrap_or("").to_string(),
             location,
             stack_excerpt: err["stack_trace"].as_str().map(|s| {
-                s.lines().take(STACK_TRACE_EXCERPT_LINES).collect::<Vec<_>>().join("\n")
+                s.lines()
+                    .take(STACK_TRACE_EXCERPT_LINES)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }),
             occurrence_count: err["occurrence_count"].as_i64().unwrap_or(1) as u32,
-            source: err["log_source_name"].as_str().unwrap_or("unknown").to_string(),
+            source: err["log_source_name"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string(),
             priority_score: match severity {
                 "critical" => PRIORITY_CRITICAL,
                 "error" => PRIORITY_ERROR,
@@ -369,18 +380,19 @@ pub async fn get_debug_context(
 
     let total_count = (critical_errors.len() + error_list.len() + warnings.len()) as u32;
     let has_critical = !critical_errors.is_empty();
-    let summary = format!("{} errors ({} critical, {} warnings)", total_count, critical_errors.len(), warnings.len());
+    let summary = format!(
+        "{} errors ({} critical, {} warnings)",
+        total_count,
+        critical_errors.len(),
+        warnings.len()
+    );
 
     // Enrich with unified memory search for context related to the errors
     let mut focus_areas = Vec::new();
     if total_count > 0 {
         let memory = crate::orchestrator::memory::MemorySystem::new();
         let unified_ctx = memory
-            .build_context_unified(
-                5,
-                &summary,
-                &app_state.pg_db,
-            )
+            .build_context_unified(5, &summary, &app_state.pg_db)
             .await;
 
         if !unified_ctx.is_empty() {
@@ -417,7 +429,6 @@ pub async fn get_debug_context_for_ai(
     app_state: State<'_, Arc<AppState>>,
     task_run_id: Option<String>,
 ) -> Result<String, String> {
-
     // PG-primary: build formatted debug context
     let pg = crate::database::pg::PgDb::global();
     let base_context = pg
@@ -431,11 +442,7 @@ pub async fn get_debug_context_for_ai(
             let search_query: String = context.chars().take(200).collect();
             let memory = crate::orchestrator::memory::MemorySystem::new();
             let unified_ctx = memory
-                .build_context_unified(
-                    5,
-                    &search_query,
-                    &app_state.pg_db,
-                )
+                .build_context_unified(5, &search_query, &app_state.pg_db)
                 .await;
 
             if unified_ctx.is_empty() {

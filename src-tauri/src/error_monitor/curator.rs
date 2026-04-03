@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-
 use crate::error_monitor::storage::{ErrorEventStorage, LogSourceStorage};
 use crate::error_monitor::types::{ErrorQuery, ErrorSeverity, ErrorStatus, StoredErrorEvent};
 
@@ -137,17 +136,12 @@ impl DebugContextCurator {
     }
 
     /// Build debug context from the database.
-    pub fn build_context(
-        &self,
-        task_run_id: Option<&str>,
-    ) -> Result<DebugContext, String> {
+    pub fn build_context(&self, task_run_id: Option<&str>) -> Result<DebugContext, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Build a map of source name -> description from the log_sources table.
-    fn build_source_descriptions(
-        errors: &[StoredErrorEvent],
-    ) -> HashMap<String, String> {
+    fn build_source_descriptions(errors: &[StoredErrorEvent]) -> HashMap<String, String> {
         // SQLite removed — returns empty map
         HashMap::new()
     }
@@ -414,10 +408,7 @@ impl DebugContextCurator {
 
     /// Detect embedding-based similarity patterns.
     /// This requires database access to read the message_embedding column.
-    pub fn detect_embedding_patterns(
-        &self,
-        error_ids: &[i64],
-    ) -> Vec<ErrorPattern> {
+    pub fn detect_embedding_patterns(&self, error_ids: &[i64]) -> Vec<ErrorPattern> {
         Vec::new()
     }
 
@@ -779,22 +770,14 @@ mod tests {
     /// Create a 384-dim f32 embedding as a little-endian byte blob, normalized to unit length.
     fn make_embedding(base_value: f32) -> Vec<u8> {
         let dim = 384;
-        let embedding: Vec<f32> = (0..dim)
-            .map(|i| base_value + (i as f32) * 0.001)
-            .collect();
+        let embedding: Vec<f32> = (0..dim).map(|i| base_value + (i as f32) * 0.001).collect();
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         let normalized: Vec<f32> = embedding.iter().map(|x| x / norm).collect();
-        normalized
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect()
+        normalized.iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
     /// Insert an error event with an embedding into the test DB and return its id.
-    fn insert_error_with_embedding(
-        message: &str,
-        embedding: &[u8],
-    ) -> i64 {
+    fn insert_error_with_embedding(message: &str, embedding: &[u8]) -> i64 {
         0
     }
 

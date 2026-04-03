@@ -40,9 +40,10 @@ pub fn launch_generated_workflow(
     let task_run = {
         let pg = pg_db.clone();
         let id = meta_task_run_id.to_string();
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "No tokio runtime".to_string())?;
-        handle.block_on(async move { pg.get_task_run(&id).await })
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
+        handle
+            .block_on(async move { pg.get_task_run(&id).await })
             .map_err(|e| format!("Failed to get task run: {}", e))?
             .ok_or_else(|| format!("Meta task run not found: {}", meta_task_run_id))?
     };
@@ -71,9 +72,10 @@ pub fn launch_generated_workflow(
     let workflow = {
         let pg = pg_db.clone();
         let wf_id = generated_workflow_id.clone();
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "No tokio runtime".to_string())?;
-        handle.block_on(async move { pg.get_unified_workflow(&wf_id).await })
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
+        handle
+            .block_on(async move { pg.get_unified_workflow(&wf_id).await })
             .map_err(|e| format!("Failed to load generated workflow: {}", e))?
             .ok_or_else(|| format!("Generated workflow not found: {}", generated_workflow_id))?
     };
@@ -127,9 +129,10 @@ pub fn launch_generated_workflow(
     {
         let pg = pg_db.clone();
         let input_clone = input.clone();
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "No tokio runtime".to_string())?;
-        handle.block_on(async move { pg.create_task_run(&input_clone).await })
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| "No tokio runtime".to_string())?;
+        handle
+            .block_on(async move { pg.create_task_run(&input_clone).await })
             .map_err(|e| format!("Failed to create task run: {}", e))?;
     }
 
@@ -196,17 +199,17 @@ pub fn launch_generated_workflow(
     // Check if Restate durable execution should be used
     let mut use_legacy = true;
     let restate_settings = crate::settings::load_settings().restate;
-    let restate_workflow_input = crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
+    let restate_workflow_input =
+        crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
                     Ok(input) => {
-                        if let Err(e) = pg_db_spawn.save_restate_workflow_execution(
-                            &execution_id,
-                            &execution_id,
-                            None,
-                        ).await {
+                        if let Err(e) = pg_db_spawn
+                            .save_restate_workflow_execution(&execution_id, &execution_id, None)
+                            .await
+                        {
                             tracing::error!("Failed to record Restate workflow: {}", e);
                         }
 
@@ -214,7 +217,9 @@ pub fn launch_generated_workflow(
                             &execution_id,
                             &input,
                             &restate_settings.ingress_url(),
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                         } else {
                             use_legacy = false;

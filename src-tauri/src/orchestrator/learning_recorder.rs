@@ -258,9 +258,7 @@ pub fn categorize_error(msg: &str) -> String {
 /// Writes to the `learning_outcomes` table with execution metrics and
 /// optionally computes a context embedding for semantic retrieval.
 /// Automatically enriches error_type from error_message if not already set.
-pub fn record_learning_outcome(
-    outcome: &WorkflowOutcome,
-) -> Result<String, String> {
+pub fn record_learning_outcome(outcome: &WorkflowOutcome) -> Result<String, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -276,9 +274,7 @@ pub struct PatternInput {
 ///
 /// If a pattern with the same type and description already exists,
 /// increments its occurrence count. Otherwise creates a new pattern.
-pub fn record_learning_pattern(
-    pattern: &PatternInput,
-) -> Result<String, String> {
+pub fn record_learning_pattern(pattern: &PatternInput) -> Result<String, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -288,9 +284,7 @@ pub fn record_learning_pattern(
 /// - Success/failure by category
 /// - Iteration count patterns
 /// - Common error types
-pub fn extract_and_record_patterns(
-    outcome: &WorkflowOutcome,
-) -> Result<Vec<String>, String> {
+pub fn extract_and_record_patterns(outcome: &WorkflowOutcome) -> Result<Vec<String>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -299,9 +293,7 @@ pub fn extract_and_record_patterns(
 /// This is the main entry point called from `loop_controller.rs` after
 /// a workflow completes. It records both the outcome, extracted patterns,
 /// and deterministic agentic metric scores.
-pub fn record_workflow_learning(
-    outcome: &WorkflowOutcome,
-) -> Result<(), String> {
+pub fn record_workflow_learning(outcome: &WorkflowOutcome) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -310,9 +302,7 @@ pub fn record_workflow_learning(
 /// Extracts TaskState from the outcome's tags, computes reward from the
 /// composite agentic score, and performs a Q-value update for the
 /// (state, architecture) pair.
-fn update_q_routing_table(
-    outcome: &WorkflowOutcome,
-) -> Result<(), String> {
+fn update_q_routing_table(outcome: &WorkflowOutcome) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -338,7 +328,8 @@ pub async fn update_q_routing_table_pg(
     }
 
     let technology_tags = infer_technology_tags(&outcome.files_modified);
-    let technology_tags_json = serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
+    let technology_tags_json =
+        serde_json::to_string(&technology_tags).unwrap_or_else(|_| "[]".into());
     let domain_tags = infer_domain_tags(
         &outcome.files_modified,
         &outcome.workflow_name,
@@ -353,12 +344,17 @@ pub async fn update_q_routing_table_pg(
         outcome.agentic_step_count,
     );
 
-    let task_state = TaskState::from_outcome_tags(&technology_tags_json, &domain_tags_json, &complexity_tier);
+    let task_state =
+        TaskState::from_outcome_tags(&technology_tags_json, &domain_tags_json, &complexity_tier);
     let state_key = task_state.to_key();
 
     // Load current Q-entry from PG
-    let entries = pg.get_q_entries_for_state(&state_key).await.unwrap_or_default();
-    let (current_q, current_visits) = entries.iter()
+    let entries = pg
+        .get_q_entries_for_state(&state_key)
+        .await
+        .unwrap_or_default();
+    let (current_q, current_visits) = entries
+        .iter()
         .find(|(a, _, _)| a == architecture)
         .map(|(_, q, v)| (*q, *v))
         .unwrap_or((0.0, 0));
@@ -368,7 +364,8 @@ pub async fn update_q_routing_table_pg(
     let new_q = current_q + alpha * (reward - current_q);
     let new_visits = current_visits + 1;
 
-    pg.upsert_q_entry(&state_key, architecture, new_q, new_visits).await?;
+    pg.upsert_q_entry(&state_key, architecture, new_q, new_visits)
+        .await?;
 
     info!(
         "PG Q-routing update: state={}, arch={}, reward={:.3}, Q={:.3}→{:.3}, visits={}",
@@ -382,9 +379,7 @@ pub async fn update_q_routing_table_pg(
 ///
 /// Runs synchronously after recording the learning outcome. Cost: zero LLM
 /// calls, milliseconds of wall time.
-fn score_and_persist_agentic_metrics(
-    outcome: &WorkflowOutcome,
-) -> Result<(), String> {
+fn score_and_persist_agentic_metrics(outcome: &WorkflowOutcome) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -417,21 +412,26 @@ pub fn spawn_llm_judge_if_eligible(
         let input = match gather_llm_judge_input_pg(&pg_db, &task_run_id).await {
             Ok(input) => input,
             Err(e) => {
-                warn!("LLM judge: failed to gather input for {}: {}", task_run_id, e);
+                warn!(
+                    "LLM judge: failed to gather input for {}: {}",
+                    task_run_id, e
+                );
                 return;
             }
         };
 
         // 2. Call the LLM judge (blocking AI call)
-        let results = match tokio::task::spawn_blocking(move || {
-            llm_judge::evaluate_sync(&input)
-        }).await {
-            Ok(results) => results,
-            Err(e) => {
-                warn!("LLM judge: spawn_blocking panicked for {}: {}", task_run_id, e);
-                return;
-            }
-        };
+        let results =
+            match tokio::task::spawn_blocking(move || llm_judge::evaluate_sync(&input)).await {
+                Ok(results) => results,
+                Err(e) => {
+                    warn!(
+                        "LLM judge: spawn_blocking panicked for {}: {}",
+                        task_run_id, e
+                    );
+                    return;
+                }
+            };
 
         if results.is_empty() {
             debug!("LLM judge: no results for task {}", task_run_id);
@@ -440,7 +440,10 @@ pub fn spawn_llm_judge_if_eligible(
 
         // 3. Persist scores to PG
         if let Err(e) = persist_judge_scores_pg(&pg_db, &task_run_id, &results).await {
-            warn!("LLM judge: failed to persist scores for {}: {}", task_run_id, e);
+            warn!(
+                "LLM judge: failed to persist scores for {}: {}",
+                task_run_id, e
+            );
         }
     });
 }
@@ -453,7 +456,6 @@ pub fn spawn_rag_judge_if_eligible(
     pg_db: std::sync::Arc<crate::database::pg::PgDb>,
     task_run_id: String,
 ) {
-
     info!("RAG judge: spawning evaluation for task {}", task_run_id);
 
     tokio::spawn(async move {
@@ -461,13 +463,19 @@ pub fn spawn_rag_judge_if_eligible(
         let retrieval_events = match pg_db.load_retrieval_events(&task_run_id).await {
             Ok(events) => events,
             Err(e) => {
-                warn!("RAG judge: failed to load retrieval events for {}: {}", task_run_id, e);
+                warn!(
+                    "RAG judge: failed to load retrieval events for {}: {}",
+                    task_run_id, e
+                );
                 return;
             }
         };
 
         if retrieval_events.is_empty() {
-            debug!("RAG judge: no retrieval events for task {}, skipping", task_run_id);
+            debug!(
+                "RAG judge: no retrieval events for task {}, skipping",
+                task_run_id
+            );
             return;
         }
 
@@ -475,13 +483,20 @@ pub fn spawn_rag_judge_if_eligible(
         let task_prompt = match pg_db.get_task_prompt(&task_run_id).await {
             Ok(prompt) => prompt,
             Err(e) => {
-                warn!("RAG judge: failed to get task prompt for {}: {}", task_run_id, e);
+                warn!(
+                    "RAG judge: failed to get task prompt for {}: {}",
+                    task_run_id, e
+                );
                 return;
             }
         };
 
         // 3. Get outcome summary as the generated output
-        let generated_output = pg_db.get_execution_trace_summary(&task_run_id).await.ok().flatten();
+        let generated_output = pg_db
+            .get_execution_trace_summary(&task_run_id)
+            .await
+            .ok()
+            .flatten();
 
         let input = crate::meta_optimizer::agentic_metrics::rag_judge::RagJudgeInput {
             task_run_id: task_run_id.clone(),
@@ -493,10 +508,15 @@ pub fn spawn_rag_judge_if_eligible(
         // 4. Call the RAG judge (blocking AI call)
         let results = match tokio::task::spawn_blocking(move || {
             crate::meta_optimizer::agentic_metrics::rag_judge::evaluate_rag_sync(&input)
-        }).await {
+        })
+        .await
+        {
             Ok(results) => results,
             Err(e) => {
-                warn!("RAG judge: spawn_blocking panicked for {}: {}", task_run_id, e);
+                warn!(
+                    "RAG judge: spawn_blocking panicked for {}: {}",
+                    task_run_id, e
+                );
                 return;
             }
         };
@@ -508,7 +528,10 @@ pub fn spawn_rag_judge_if_eligible(
 
         // 5. Persist scores to PG
         if let Err(e) = persist_judge_scores_pg(&pg_db, &task_run_id, &results).await {
-            warn!("RAG judge: failed to persist scores for {}: {}", task_run_id, e);
+            warn!(
+                "RAG judge: failed to persist scores for {}: {}",
+                task_run_id, e
+            );
         }
     });
 }
@@ -532,7 +555,8 @@ async fn persist_judge_scores_pg(
             score.is_llm_judged,
             score.model_used.as_deref(),
             &now,
-        ).await?;
+        )
+        .await?;
     }
 
     // Recompute composite
@@ -551,9 +575,13 @@ async fn persist_judge_scores_pg(
         })
         .collect();
     let composite = crate::meta_optimizer::agentic_metrics::composite_score(&all_scores);
-    pg.update_composite_agentic_score(task_run_id, composite).await?;
+    pg.update_composite_agentic_score(task_run_id, composite)
+        .await?;
 
-    info!("Judge scores persisted (PG) for {}: composite={:.3}", task_run_id, composite);
+    info!(
+        "Judge scores persisted (PG) for {}: composite={:.3}",
+        task_run_id, composite
+    );
     Ok(())
 }
 
@@ -564,17 +592,23 @@ async fn gather_llm_judge_input_pg(
 ) -> Result<crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput, String> {
     let (prompt, execution_steps, summary, goal_achieved, status) =
         pg.get_task_run_for_judge(task_run_id).await?;
-    let execution_trace_summary = pg.get_execution_trace_summary(task_run_id).await.ok().flatten();
+    let execution_trace_summary = pg
+        .get_execution_trace_summary(task_run_id)
+        .await
+        .ok()
+        .flatten();
 
-    Ok(crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
-        task_run_id: task_run_id.to_string(),
-        task_prompt: prompt.unwrap_or_default(),
-        execution_plan: execution_steps,
-        outcome_summary: summary,
-        goal_achieved,
-        status,
-        execution_trace_summary,
-    })
+    Ok(
+        crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
+            task_run_id: task_run_id.to_string(),
+            task_prompt: prompt.unwrap_or_default(),
+            execution_plan: execution_steps,
+            outcome_summary: summary,
+            goal_achieved,
+            status,
+            execution_trace_summary,
+        },
+    )
 }
 
 /// Parse a metric type string back to an AgenticMetric enum.

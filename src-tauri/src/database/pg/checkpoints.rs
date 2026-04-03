@@ -10,8 +10,15 @@ impl PgDb {
     // ========================================================================
 
     /// Get a checkpoint by workflow name.
-    pub async fn get_checkpoint(&self, workflow_name: &str) -> Result<Option<CheckpointData>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_checkpoint(
+        &self,
+        workflow_name: &str,
+    ) -> Result<Option<CheckpointData>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -42,22 +49,36 @@ impl PgDb {
                 current_phase: checkpoint_json["current_phase"].as_u64().unwrap_or(0) as u32,
                 total_phases: checkpoint_json["total_phases"].as_u64().map(|v| v as u32),
                 completed: r.get::<_, bool>(2),
-                restart_permitted: checkpoint_json["restart_permitted"].as_bool().unwrap_or(false),
+                restart_permitted: checkpoint_json["restart_permitted"]
+                    .as_bool()
+                    .unwrap_or(false),
                 status: checkpoint_json["status"].as_str().map(|s| s.to_string()),
                 run_id: r.get(3),
-                repos_to_process: checkpoint_json["repos_to_process"]
-                    .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                repos_to_process: checkpoint_json["repos_to_process"].as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                }),
                 work_completed: {
                     let v = &checkpoint_json["work_completed"];
-                    if v.is_null() { None } else { Some(v.clone()) }
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(v.clone())
+                    }
                 },
                 items_needing_user_input: checkpoint_json["items_needing_user_input"]
                     .as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()),
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    }),
                 created_at: r.get(4),
                 updated_at: r.get(5),
-                error_message: checkpoint_json["error_message"].as_str().map(|s| s.to_string()),
+                error_message: checkpoint_json["error_message"]
+                    .as_str()
+                    .map(|s| s.to_string()),
                 extra: Some(checkpoint_json),
             }
         }))
@@ -65,7 +86,11 @@ impl PgDb {
 
     /// Save or update a checkpoint.
     pub async fn save_checkpoint(&self, data: &CheckpointData) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let workflow_name = data
             .workflow_name
@@ -118,7 +143,11 @@ impl PgDb {
 
     /// Delete a checkpoint by workflow name.
     pub async fn delete_checkpoint(&self, workflow_name: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute(
@@ -133,7 +162,11 @@ impl PgDb {
 
     /// List all active (non-completed) checkpoints.
     pub async fn list_active_checkpoints(&self) -> Result<Vec<CheckpointData>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -186,7 +219,11 @@ impl PgDb {
 
     /// Get all unique task IDs that have orchestrator checkpoints.
     pub async fn get_checkpoint_task_ids(&self) -> Result<Vec<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -207,7 +244,11 @@ impl PgDb {
         trigger: Option<&str>,
         since: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Build dynamic query
         let mut conditions = Vec::new();
@@ -292,7 +333,11 @@ impl PgDb {
         state: &serde_json::Value,
         name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
         let state_json = state.to_string();
         let iteration_i32 = iteration as i32;
@@ -315,7 +360,11 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -348,7 +397,11 @@ impl PgDb {
         &self,
         task_id: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if let Some(tid) = task_id {
             conn.query(
@@ -396,13 +449,14 @@ impl PgDb {
 
     /// Delete an orchestrator checkpoint by ID.
     pub async fn delete_orchestrator_checkpoint(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
-            .execute(
-                "DELETE FROM orchestrator_checkpoints WHERE id = $1",
-                &[&id],
-            )
+            .execute("DELETE FROM orchestrator_checkpoints WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("Failed to delete orchestrator checkpoint: {}", e))?;
 
@@ -416,7 +470,11 @@ impl PgDb {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if let Some(tid) = task_id {
             conn.query(
@@ -444,7 +502,8 @@ impl PgDb {
             .iter()
             .map(|r| {
                 let state_str: Option<String> = r.get(4);
-                let state_val = state_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                let state_val =
+                    state_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
                 let created: chrono::DateTime<chrono::Utc> = r.get(6);
                 serde_json::json!({
                     "id": r.get::<_, String>(0),
@@ -463,7 +522,11 @@ impl PgDb {
 
     /// Get total count of checkpoints (for pagination).
     pub async fn get_checkpoints_count(&self, task_id: Option<&str>) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let count: i64 = if let Some(tid) = task_id {
             let row = conn
@@ -476,10 +539,7 @@ impl PgDb {
             row.get(0)
         } else {
             let row = conn
-                .query_one(
-                    "SELECT COUNT(*) FROM orchestrator_checkpoints",
-                    &[],
-                )
+                .query_one("SELECT COUNT(*) FROM orchestrator_checkpoints", &[])
                 .await
                 .map_err(|e| format!("PG get_checkpoints_count: {}", e))?;
             row.get(0)

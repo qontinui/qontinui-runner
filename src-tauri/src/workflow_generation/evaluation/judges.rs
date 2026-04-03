@@ -4,18 +4,18 @@
 //! AI reasoning. Inspired by haizelabs/verdict. Each judge evaluates one
 //! dimension and returns a score with natural language reasoning.
 
-use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use super::cache::EntailmentCache;
+use super::{DimensionScore, EvaluationDimension, ScoringTier};
 use crate::ai_provider;
 use crate::ai_router::TaskContext;
 use crate::doctor::DoctorHandle;
 use crate::workflow_generation::generator::extract_json_from_response;
 use crate::workflow_generation::specification::AcceptanceCriterion;
-use super::cache::EntailmentCache;
-use super::{DimensionScore, EvaluationDimension, ScoringTier};
 
 fn entailment_cache() -> &'static Mutex<EntailmentCache> {
     static CACHE: std::sync::OnceLock<Mutex<EntailmentCache>> = std::sync::OnceLock::new();
@@ -59,13 +59,23 @@ pub fn run_judge_pipeline(
     provider: Option<&str>,
 ) -> Vec<DimensionScore> {
     let step_summary = build_step_summary(step);
-    let step_name = step.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+    let step_name = step
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unnamed");
     info!("Running judge pipeline on step '{}'", step_name);
 
     let mut scores: Vec<DimensionScore> = Vec::new();
 
     // Judge 1: Entailment (most critical)
-    match run_entailment_judge(&step_summary, criterion, context, doctor_handle, model, provider) {
+    match run_entailment_judge(
+        &step_summary,
+        criterion,
+        context,
+        doctor_handle,
+        model,
+        provider,
+    ) {
         Some(score) => {
             debug!(
                 "Entailment judge for '{}': score={:.2}, confidence={:.2}",
@@ -221,10 +231,7 @@ Respond with ONLY a JSON object:
     );
 
     if !response.success {
-        warn!(
-            "Entailment judge AI call failed: {:?}",
-            response.error
-        );
+        warn!("Entailment judge AI call failed: {:?}", response.error);
         return None;
     }
 
@@ -296,10 +303,7 @@ Respond with ONLY a JSON object:
     );
 
     if !response.success {
-        warn!(
-            "Determinism judge AI call failed: {:?}",
-            response.error
-        );
+        warn!("Determinism judge AI call failed: {:?}", response.error);
         return None;
     }
 
@@ -345,8 +349,7 @@ Score 1.0 = no false positives possible, 0.0 = will frequently false-positive.
 
 Respond with ONLY a JSON object:
 {{"score": 0.0, "reasoning": "...", "evidence": ["false_positive_scenario1"]}}"#,
-        step_summary,
-        criterion_section,
+        step_summary, criterion_section,
     );
 
     let task_context = TaskContext::from_prompt("evaluation_judge: specificity");
@@ -364,10 +367,7 @@ Respond with ONLY a JSON object:
     );
 
     if !response.success {
-        warn!(
-            "Specificity judge AI call failed: {:?}",
-            response.error
-        );
+        warn!("Specificity judge AI call failed: {:?}", response.error);
         return None;
     }
 
@@ -389,11 +389,20 @@ Respond with ONLY a JSON object:
 
 /// Build a human-readable summary of a step for judge prompts.
 fn build_step_summary(step: &Value) -> String {
-    let step_type = step.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let name = step.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
+    let step_type = step
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let name = step
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unnamed");
     let command = step.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let prompt = step.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-    let expected = step.get("expected_output").and_then(|v| v.as_str()).unwrap_or("");
+    let expected = step
+        .get("expected_output")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let action = step.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut summary = format!("Type: {}\nName: {}", step_type, name);

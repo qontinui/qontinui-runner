@@ -44,9 +44,7 @@ pub fn post_run_analysis_with_skills(
 /// - Its source reflection_fix (if any) was evaluated as 'ineffective'
 ///
 /// This closes feedback loop break point #3: "ineffective rules stay active forever"
-pub fn auto_disable_ineffective_rules(
-    threshold: u32,
-) -> Result<u32, String> {
+pub fn auto_disable_ineffective_rules(threshold: u32) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -63,9 +61,7 @@ fn auto_apply_recurring_fixes(
 }
 
 /// Get the effectiveness of the reflection fix that created a generation rule.
-fn get_rule_source_fix_effectiveness(
-    rule_id: &str,
-) -> Result<Option<String>, String> {
+fn get_rule_source_fix_effectiveness(rule_id: &str) -> Result<Option<String>, String> {
     Err("SQLite removed".to_string())
 }
 

@@ -844,9 +844,7 @@ mod tests {
     #[test]
     fn test_schema_validation_is_retryable() {
         let service = RetryService::with_defaults();
-        assert!(service.is_retryable_error(
-            "schema_validation: Missing required field at /name"
-        ));
+        assert!(service.is_retryable_error("schema_validation: Missing required field at /name"));
     }
 
     #[test]

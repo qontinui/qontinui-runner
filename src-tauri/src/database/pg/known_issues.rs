@@ -16,7 +16,11 @@ impl PgDb {
         &self,
         query: &ListKnownIssuesQuery,
     ) -> Result<Vec<KnownIssue>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut where_clauses: Vec<String> = Vec::new();
         let mut param_values: Vec<String> = Vec::new();
@@ -74,20 +78,29 @@ impl PgDb {
             where_sql
         );
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            param_values.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
+            .iter()
+            .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &params)
             .await
             .map_err(|e| format!("PG list_known_issues: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::ki_row_to_known_issue(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::ki_row_to_known_issue(r))
+            .collect())
     }
 
     /// Get a single known issue by ID.
     pub async fn get_known_issue(&self, id: &str) -> Result<Option<KnownIssue>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -115,7 +128,11 @@ impl PgDb {
         &self,
         req: &CreateKnownIssueRequest,
     ) -> Result<KnownIssue, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -123,7 +140,9 @@ impl PgDb {
         let scope_tags_json = serde_json::to_string(&req.scope_tags.clone().unwrap_or_default())
             .unwrap_or_else(|_| "[]".to_string());
         let detection_config_json = serde_json::to_string(
-            &req.detection_config.clone().unwrap_or(serde_json::json!({})),
+            &req.detection_config
+                .clone()
+                .unwrap_or(serde_json::json!({})),
         )
         .unwrap_or_else(|_| "{}".to_string());
         let trigger_conditions_json =
@@ -218,36 +237,93 @@ impl PgDb {
             .await?
             .ok_or_else(|| format!("Known issue not found: {}", id))?;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let title = req.title.as_deref().unwrap_or(&existing.title).to_string();
-        let description = req.description.as_deref().unwrap_or(&existing.description).to_string();
-        let category = req.category.as_ref().unwrap_or(&existing.category).as_str().to_string();
-        let scope_type = req.scope_type.as_ref().unwrap_or(&existing.scope_type).as_str().to_string();
-        let scope_value = req.scope_value.as_ref().or(existing.scope_value.as_ref()).cloned();
+        let description = req
+            .description
+            .as_deref()
+            .unwrap_or(&existing.description)
+            .to_string();
+        let category = req
+            .category
+            .as_ref()
+            .unwrap_or(&existing.category)
+            .as_str()
+            .to_string();
+        let scope_type = req
+            .scope_type
+            .as_ref()
+            .unwrap_or(&existing.scope_type)
+            .as_str()
+            .to_string();
+        let scope_value = req
+            .scope_value
+            .as_ref()
+            .or(existing.scope_value.as_ref())
+            .cloned();
         let scope_tags_json = req
             .scope_tags
             .as_ref()
             .map(|tags| serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string()))
-            .unwrap_or_else(|| serde_json::to_string(&existing.scope_tags).unwrap_or_else(|_| "[]".to_string()));
-        let detection_method = req.detection_method.as_ref().unwrap_or(&existing.detection_method).as_str().to_string();
+            .unwrap_or_else(|| {
+                serde_json::to_string(&existing.scope_tags).unwrap_or_else(|_| "[]".to_string())
+            });
+        let detection_method = req
+            .detection_method
+            .as_ref()
+            .unwrap_or(&existing.detection_method)
+            .as_str()
+            .to_string();
         let detection_config_json = req
             .detection_config
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()))
-            .unwrap_or_else(|| serde_json::to_string(&existing.detection_config).unwrap_or_else(|_| "{}".to_string()));
-        let pattern_template_id = req.pattern_template_id.as_ref().or(existing.pattern_template_id.as_ref()).cloned();
-        let reproduction_context = req.reproduction_context.as_ref().or(existing.reproduction_context.as_ref()).cloned();
+            .unwrap_or_else(|| {
+                serde_json::to_string(&existing.detection_config)
+                    .unwrap_or_else(|_| "{}".to_string())
+            });
+        let pattern_template_id = req
+            .pattern_template_id
+            .as_ref()
+            .or(existing.pattern_template_id.as_ref())
+            .cloned();
+        let reproduction_context = req
+            .reproduction_context
+            .as_ref()
+            .or(existing.reproduction_context.as_ref())
+            .cloned();
         let trigger_conditions_json = req
             .trigger_conditions
             .as_ref()
             .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "[]".to_string()))
-            .unwrap_or_else(|| serde_json::to_string(&existing.trigger_conditions).unwrap_or_else(|_| "[]".to_string()));
-        let severity = req.severity.as_ref().unwrap_or(&existing.severity).as_str().to_string();
-        let status = req.status.as_ref().unwrap_or(&existing.status).as_str().to_string();
+            .unwrap_or_else(|| {
+                serde_json::to_string(&existing.trigger_conditions)
+                    .unwrap_or_else(|_| "[]".to_string())
+            });
+        let severity = req
+            .severity
+            .as_ref()
+            .unwrap_or(&existing.severity)
+            .as_str()
+            .to_string();
+        let status = req
+            .status
+            .as_ref()
+            .unwrap_or(&existing.status)
+            .as_str()
+            .to_string();
         let confidence = req.confidence.unwrap_or(existing.confidence);
-        let verification_hint = req.verification_hint.as_ref().or(existing.verification_hint.as_ref()).cloned();
+        let verification_hint = req
+            .verification_hint
+            .as_ref()
+            .or(existing.verification_hint.as_ref())
+            .cloned();
         let verification_step_template_json = req
             .verification_step_template
             .as_ref()
@@ -315,7 +391,11 @@ impl PgDb {
 
     /// Increment times_checked and update last_checked_at.
     pub async fn increment_known_issue_checked(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r#"UPDATE known_issues
@@ -331,7 +411,11 @@ impl PgDb {
 
     /// Increment times_detected and update last_detected_at.
     pub async fn increment_known_issue_detected(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r#"UPDATE known_issues
@@ -352,7 +436,11 @@ impl PgDb {
         const DECAY_FACTOR: f64 = 0.85;
         const AUTO_RESOLVE_THRESHOLD: f64 = 0.1;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let row = conn
@@ -393,7 +481,11 @@ impl PgDb {
 
     /// Delete a known issue by ID.
     pub async fn delete_known_issue(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM known_issues WHERE id = $1", &[&id])
@@ -409,7 +501,11 @@ impl PgDb {
         id: &str,
         resolution: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let affected = if let Some(note) = resolution {
@@ -456,7 +552,11 @@ impl PgDb {
         spec_id: &str,
         page_url: Option<&str>,
     ) -> Result<Vec<KnownIssue>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let url = page_url.unwrap_or("");
 
         let rows = conn
@@ -484,7 +584,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG find_issues_for_spec: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::ki_row_to_known_issue(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::ki_row_to_known_issue(r))
+            .collect())
     }
 
     // ========================================================================
@@ -493,7 +596,11 @@ impl PgDb {
 
     /// List all pattern templates.
     pub async fn list_pattern_templates(&self) -> Result<Vec<IssuePatternTemplate>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -509,7 +616,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_pattern_templates: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::ki_row_to_pattern_template(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::ki_row_to_pattern_template(r))
+            .collect())
     }
 
     /// Insert a new pattern template.
@@ -517,7 +627,11 @@ impl PgDb {
         &self,
         req: &CreatePatternTemplateRequest,
     ) -> Result<IssuePatternTemplate, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -594,7 +708,11 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Option<IssuePatternTemplate>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -620,7 +738,11 @@ impl PgDb {
         &self,
         depth: &str,
     ) -> Result<Vec<KnownIssue>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let sql = match depth {
             "thorough" => {
@@ -656,14 +778,19 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG find_relevant_issues_for_generation: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::ki_row_to_known_issue(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::ki_row_to_known_issue(r))
+            .collect())
     }
 
     // -- helpers --
 
     fn ki_row_to_pattern_template(row: &tokio_postgres::Row) -> IssuePatternTemplate {
         let step_template_json: Option<String> = row.get(5);
-        let parameters_json: String = row.get::<_, Option<String>>(7).unwrap_or_else(|| "[]".to_string());
+        let parameters_json: String = row
+            .get::<_, Option<String>>(7)
+            .unwrap_or_else(|| "[]".to_string());
         let built_in_val: bool = row.get(8);
 
         IssuePatternTemplate {
@@ -683,10 +810,18 @@ impl PgDb {
     }
 
     fn ki_row_to_known_issue(row: &tokio_postgres::Row) -> KnownIssue {
-        let scope_tags_json: String = row.get::<_, Option<String>>(6).unwrap_or_else(|| "[]".to_string());
-        let detection_config_json: String = row.get::<_, Option<String>>(8).unwrap_or_else(|| "{}".to_string());
-        let trigger_conditions_json: String = row.get::<_, Option<String>>(11).unwrap_or_else(|| "[]".to_string());
-        let source_finding_ids_json: String = row.get::<_, Option<String>>(16).unwrap_or_else(|| "[]".to_string());
+        let scope_tags_json: String = row
+            .get::<_, Option<String>>(6)
+            .unwrap_or_else(|| "[]".to_string());
+        let detection_config_json: String = row
+            .get::<_, Option<String>>(8)
+            .unwrap_or_else(|| "{}".to_string());
+        let trigger_conditions_json: String = row
+            .get::<_, Option<String>>(11)
+            .unwrap_or_else(|| "[]".to_string());
+        let source_finding_ids_json: String = row
+            .get::<_, Option<String>>(16)
+            .unwrap_or_else(|| "[]".to_string());
         let verification_step_json: Option<String> = row.get(19);
         let times_detected: i32 = row.get::<_, Option<i32>>(20).unwrap_or(1);
         let times_checked: i32 = row.get::<_, Option<i32>>(21).unwrap_or(0);
@@ -695,23 +830,29 @@ impl PgDb {
             id: row.get(0),
             title: row.get(1),
             description: row.get(2),
-            category: IssueCategory::from_str(&row.get::<_, String>(3)).unwrap_or(IssueCategory::Other),
+            category: IssueCategory::from_str(&row.get::<_, String>(3))
+                .unwrap_or(IssueCategory::Other),
             scope_type: ScopeType::from_str(&row.get::<_, String>(4)).unwrap_or(ScopeType::Global),
             scope_value: row.get(5),
             scope_tags: serde_json::from_str(&scope_tags_json).unwrap_or_default(),
-            detection_method: DetectionMethod::from_str(&row.get::<_, String>(7)).unwrap_or(DetectionMethod::AiJudgment),
-            detection_config: serde_json::from_str(&detection_config_json).unwrap_or(serde_json::json!({})),
+            detection_method: DetectionMethod::from_str(&row.get::<_, String>(7))
+                .unwrap_or(DetectionMethod::AiJudgment),
+            detection_config: serde_json::from_str(&detection_config_json)
+                .unwrap_or(serde_json::json!({})),
             pattern_template_id: row.get(9),
             reproduction_context: row.get(10),
             trigger_conditions: serde_json::from_str(&trigger_conditions_json).unwrap_or_default(),
-            severity: IssueSeverity::from_str(&row.get::<_, String>(12)).unwrap_or(IssueSeverity::Medium),
+            severity: IssueSeverity::from_str(&row.get::<_, String>(12))
+                .unwrap_or(IssueSeverity::Medium),
             status: IssueStatus::from_str(&row.get::<_, String>(13)).unwrap_or(IssueStatus::Active),
             confidence: row.get(14),
-            provenance: IssueProvenance::from_str(&row.get::<_, String>(15)).unwrap_or(IssueProvenance::Manual),
+            provenance: IssueProvenance::from_str(&row.get::<_, String>(15))
+                .unwrap_or(IssueProvenance::Manual),
             source_finding_ids: serde_json::from_str(&source_finding_ids_json).unwrap_or_default(),
             source_task_run_id: row.get(17),
             verification_hint: row.get(18),
-            verification_step_template: verification_step_json.and_then(|s| serde_json::from_str(&s).ok()),
+            verification_step_template: verification_step_json
+                .and_then(|s| serde_json::from_str(&s).ok()),
             times_detected: times_detected as u32,
             times_checked: times_checked as u32,
             last_detected_at: row.get(22),

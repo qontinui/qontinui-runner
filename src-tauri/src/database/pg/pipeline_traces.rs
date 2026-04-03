@@ -19,7 +19,11 @@ impl PgDb {
         task_run_id: &str,
         trace: &PipelineAgentTrace,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = format!("pat-{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
@@ -80,7 +84,10 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG save_pipeline_trace: {}", e))?;
 
-        debug!("Persisted PG trace for {} ({}) in run {}", trace.agent_type, trace.agent_id, task_run_id);
+        debug!(
+            "Persisted PG trace for {} ({}) in run {}",
+            trace.agent_type, trace.agent_id, task_run_id
+        );
         Ok(())
     }
 
@@ -103,7 +110,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<PipelineAgentTrace>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -147,7 +158,9 @@ impl PgDb {
                     downstream_success,
                     output_quality_score: row.get(11),
                     parent_span_id: row.get(12),
-                    span_type: row.get::<_, Option<String>>(13).unwrap_or_else(|| "agent".to_string()),
+                    span_type: row
+                        .get::<_, Option<String>>(13)
+                        .unwrap_or_else(|| "agent".to_string()),
                     guardrail_results: guardrail_json
                         .and_then(|j| serde_json::from_str::<Vec<GuardrailResult>>(&j).ok())
                         .unwrap_or_default(),
@@ -168,7 +181,11 @@ impl PgDb {
         task_run_id: &str,
         success: bool,
     ) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let updated = conn
             .execute(

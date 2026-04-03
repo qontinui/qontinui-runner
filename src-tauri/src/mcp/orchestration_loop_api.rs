@@ -107,11 +107,17 @@ async fn stop_by_id(
         .map_err(|e| {
             (
                 StatusCode::CONFLICT,
-                Json(api_error(format!("Failed to stop loop '{}': {}", loop_id, e))),
+                Json(api_error(format!(
+                    "Failed to stop loop '{}': {}",
+                    loop_id, e
+                ))),
             )
         })?;
 
-    Ok(Json(ApiResponse::success(format!("loop '{}' stopped", loop_id))))
+    Ok(Json(ApiResponse::success(format!(
+        "loop '{}' stopped",
+        loop_id
+    ))))
 }
 
 /// POST /orchestration-loop/stop-all
@@ -131,9 +137,7 @@ async fn stop_all(
 }
 
 /// GET /orchestration-loop/status-all
-async fn status_all(
-    State(state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<MultiLoopStatus>> {
+async fn status_all(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<MultiLoopStatus>> {
     let states = state.app_state.orchestration_loops.clone();
     let status = loop_engine::get_multi_status(states).await;
     Json(ApiResponse::success(status))
@@ -175,10 +179,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/orchestration-loop/start-multi", post(start_multi))
         .route("/orchestration-loop/stop-all", post(stop_all))
         .route("/orchestration-loop/status-all", get(status_all))
-        .route(
-            "/orchestration-loop/{loop_id}/stop",
-            post(stop_by_id),
-        )
+        .route("/orchestration-loop/{loop_id}/stop", post(stop_by_id))
         .route(
             "/orchestration-loop/{loop_id}/signal-restart",
             post(signal_restart_by_id),

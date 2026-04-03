@@ -55,7 +55,6 @@ pub fn record_evolution(
     score_before: Option<f64>,
 ) -> Result<String, String> {
     record_evolution_full(
-        
         pg_db,
         agent_type,
         parent_variant_id,
@@ -87,11 +86,20 @@ pub fn record_evolution_full(
 
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg_db.record_prompt_evolution_full(
-                &id, agent_type, parent_variant_id, variant_id,
-                recommendation_id, critique, changes_summary,
-                score_before, baseline_prompt_hash, consecutive_rejections,
-            ).await
+            pg_db
+                .record_prompt_evolution_full(
+                    &id,
+                    agent_type,
+                    parent_variant_id,
+                    variant_id,
+                    recommendation_id,
+                    critique,
+                    changes_summary,
+                    score_before,
+                    baseline_prompt_hash,
+                    consecutive_rejections,
+                )
+                .await
         })
     })?;
 
@@ -110,7 +118,16 @@ pub fn record_evolution_with_pg(
     changes_summary: Option<&str>,
     score_before: Option<f64>,
 ) -> Result<String, String> {
-    record_evolution(pg_db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before)
+    record_evolution(
+        pg_db,
+        agent_type,
+        parent_variant_id,
+        variant_id,
+        recommendation_id,
+        critique,
+        changes_summary,
+        score_before,
+    )
 }
 
 /// Update the canary verdict and post-canary score for an evolution entry.
@@ -122,10 +139,15 @@ pub fn update_verdict(
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg_db.update_evolution_verdict(evolution_id, verdict, score_after).await
+            pg_db
+                .update_evolution_verdict(evolution_id, verdict, score_after)
+                .await
         })
     })?;
-    info!("Updated prompt evolution {} verdict: {}", evolution_id, verdict);
+    info!(
+        "Updated prompt evolution {} verdict: {}",
+        evolution_id, verdict
+    );
     Ok(())
 }
 
@@ -149,7 +171,9 @@ pub fn update_verdict_by_variant(
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg_db.update_evolution_verdict_by_variant(variant_id, verdict, score_after).await
+            pg_db
+                .update_evolution_verdict_by_variant(variant_id, verdict, score_after)
+                .await
         })
     })
 }
@@ -171,9 +195,8 @@ pub fn get_evolution_history(
     limit: usize,
 ) -> Result<Vec<PromptEvolutionEntry>, String> {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.get_evolution_history(agent_type, limit as i64).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.get_evolution_history(agent_type, limit as i64).await })
     })
 }
 
@@ -181,9 +204,8 @@ pub fn get_evolution_history(
 /// This indicates a canary is in progress and we should NOT create another rewrite.
 pub fn has_active_evolution(pg_db: &Arc<PgDb>, agent_type: &str) -> bool {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.has_active_evolution(agent_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.has_active_evolution(agent_type).await })
     })
     .unwrap_or(false)
 }
@@ -195,9 +217,8 @@ pub fn get_latest_rejected(
     agent_type: &str,
 ) -> Result<Option<PromptEvolutionEntry>, String> {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.get_latest_rejected_evolution(agent_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.get_latest_rejected_evolution(agent_type).await })
     })
 }
 
@@ -206,9 +227,8 @@ pub fn get_latest_rejected(
 pub fn is_in_cooldown(pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) -> bool {
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(cooldown_hours)).to_rfc3339();
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.is_in_evolution_cooldown(agent_type, &cutoff).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.is_in_evolution_cooldown(agent_type, &cutoff).await })
     })
     .unwrap_or(false)
 }
@@ -220,9 +240,8 @@ pub fn is_in_cooldown(pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) 
 /// diminishing-returns circuit breaker.
 pub fn count_consecutive_rejections(pg_db: &Arc<PgDb>, agent_type: &str) -> i32 {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.count_consecutive_rejections(agent_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.count_consecutive_rejections(agent_type).await })
     })
     .unwrap_or(0)
 }
@@ -235,11 +254,11 @@ pub fn count_consecutive_rejections(pg_db: &Arc<PgDb>, agent_type: &str) -> i32 
 /// that prompt rewriting can't fix.
 pub fn adaptive_cooldown_hours(consecutive_rejections: i32) -> i64 {
     match consecutive_rejections {
-        0 => 24,      // No rejections: standard 24h cooldown
-        1 => 72,      // 1 rejection: 3 days
-        2 => 168,     // 2 rejections: 1 week
-        3 => 336,     // 3 rejections: 2 weeks
-        _ => 672,     // 4+ rejections: 4 weeks
+        0 => 24,  // No rejections: standard 24h cooldown
+        1 => 72,  // 1 rejection: 3 days
+        2 => 168, // 2 rejections: 1 week
+        3 => 336, // 3 rejections: 2 weeks
+        _ => 672, // 4+ rejections: 4 weeks
     }
 }
 
@@ -252,9 +271,8 @@ pub fn get_rejected_prompt_contents(
     agent_type: &str,
 ) -> Result<Vec<(String, String)>, String> {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.get_rejected_prompt_contents(agent_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.get_rejected_prompt_contents(agent_type).await })
     })
 }
 
@@ -271,7 +289,9 @@ pub fn has_baseline_drifted(
 ) -> bool {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg_db.has_baseline_drifted(agent_type, current_prompt_hash).await
+            pg_db
+                .has_baseline_drifted(agent_type, current_prompt_hash)
+                .await
         })
     })
     .unwrap_or(false)
@@ -289,10 +309,7 @@ pub fn get_evolution_history_with_pg(
 
 /// Check whether there is an active evolution (backward compat, delegates to primary).
 #[allow(dead_code)]
-pub fn has_active_evolution_with_pg(
-    pg_db: &Arc<PgDb>,
-    agent_type: &str,
-) -> bool {
+pub fn has_active_evolution_with_pg(pg_db: &Arc<PgDb>, agent_type: &str) -> bool {
     has_active_evolution(pg_db, agent_type)
 }
 
@@ -307,20 +324,13 @@ pub fn get_latest_rejected_with_pg(
 
 /// Check cooldown (backward compat, delegates to primary).
 #[allow(dead_code)]
-pub fn is_in_cooldown_with_pg(
-    pg_db: &Arc<PgDb>,
-    agent_type: &str,
-    cooldown_hours: i64,
-) -> bool {
+pub fn is_in_cooldown_with_pg(pg_db: &Arc<PgDb>, agent_type: &str, cooldown_hours: i64) -> bool {
     is_in_cooldown(pg_db, agent_type, cooldown_hours)
 }
 
 /// Count consecutive rejections (backward compat, delegates to primary).
 #[allow(dead_code)]
-pub fn count_consecutive_rejections_with_pg(
-    pg_db: &Arc<PgDb>,
-    agent_type: &str,
-) -> i32 {
+pub fn count_consecutive_rejections_with_pg(pg_db: &Arc<PgDb>, agent_type: &str) -> i32 {
     count_consecutive_rejections(pg_db, agent_type)
 }
 
@@ -367,7 +377,17 @@ pub fn record_evolution_full_with_pg(
     score_before: Option<f64>,
     baseline_prompt_hash: Option<&str>,
 ) -> Result<String, String> {
-    record_evolution_full(pg_db, agent_type, parent_variant_id, variant_id, recommendation_id, critique, changes_summary, score_before, baseline_prompt_hash)
+    record_evolution_full(
+        pg_db,
+        agent_type,
+        parent_variant_id,
+        variant_id,
+        recommendation_id,
+        critique,
+        changes_summary,
+        score_before,
+        baseline_prompt_hash,
+    )
 }
 
 // Tests removed during PG migration: all tests relied on SQLite in-memory

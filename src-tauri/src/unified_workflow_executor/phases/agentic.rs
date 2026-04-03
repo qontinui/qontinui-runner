@@ -18,10 +18,9 @@ use super::super::output_parser;
 use super::super::types::{get_parent_task_id, AgenticOutcome, LoopConfig};
 use super::{
     build_compressed_iteration_history, build_execution_timing_context, build_llm_metrics,
-    execute_prompt_response_mode, extract_and_preread_failure_files,
-    get_active_sdk_app_name, preread_previously_edited_files, record_phase_token_usage,
-    record_phase_token_usage_with_cache, record_phase_token_usage_with_target,
-    REFLECTION_MODE_PREAMBLE,
+    execute_prompt_response_mode, extract_and_preread_failure_files, get_active_sdk_app_name,
+    preread_previously_edited_files, record_phase_token_usage, record_phase_token_usage_with_cache,
+    record_phase_token_usage_with_target, REFLECTION_MODE_PREAMBLE,
 };
 
 // =============================================================================
@@ -200,7 +199,12 @@ impl AgenticExecutor {
                     }
                 });
             }
-            if let Err(e) = self.app_state.pg_db.create_task_run_event(&resp_start_event).await {
+            if let Err(e) = self
+                .app_state
+                .pg_db
+                .create_task_run_event(&resp_start_event)
+                .await
+            {
                 warn!("Failed to emit agentic response-mode start event: {}", e);
             }
             let resp_mode_start = std::time::Instant::now();
@@ -293,19 +297,29 @@ impl AgenticExecutor {
                             );
                             // Emit realtime cost update event
                             {
-                                let cost_usd = if let (Some(input), Some(output)) = (resp.input_tokens, resp.output_tokens) {
+                                let cost_usd = if let (Some(input), Some(output)) =
+                                    (resp.input_tokens, resp.output_tokens)
+                                {
                                     let cache_create = resp.cache_creation_tokens.unwrap_or(0);
                                     let cache_read = resp.cache_read_tokens.unwrap_or(0);
                                     crate::ai_pricing::calculate_cost_usd_with_cache(
-                                        input, output, cache_create, cache_read,
+                                        input,
+                                        output,
+                                        cache_create,
+                                        cache_read,
                                         step_model.as_deref().unwrap_or("claude-sonnet-4-20250514"),
                                     )
                                 } else {
                                     0.0
                                 };
 
-                                let cumulative = self.cost_trackers.lock().unwrap().as_ref()
-                                    .map(|t| t.budget.snapshot().total_cost_usd).unwrap_or(0.0);
+                                let cumulative = self
+                                    .cost_trackers
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map(|t| t.budget.snapshot().total_cost_usd)
+                                    .unwrap_or(0.0);
 
                                 self.broadcaster.cost_update(
                                     &config.execution_id,
@@ -322,8 +336,10 @@ impl AgenticExecutor {
                                 // Record cost in budget tracker and check safety limits
                                 let trackers = self.cost_trackers.lock().unwrap().clone();
                                 if let Some(ref trackers) = trackers {
-                                    let total_tokens = resp.input_tokens.unwrap_or(0) + resp.output_tokens.unwrap_or(0);
-                                    let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
+                                    let total_tokens = resp.input_tokens.unwrap_or(0)
+                                        + resp.output_tokens.unwrap_or(0);
+                                    let budget_result =
+                                        trackers.budget.record("agentic", total_tokens, cost_usd);
 
                                     match budget_result {
                                         crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
@@ -345,7 +361,8 @@ impl AgenticExecutor {
                                     }
 
                                     // Check circuit breaker
-                                    let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
+                                    let cb_result =
+                                        trackers.circuit_breaker.check_single_call(cost_usd);
                                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
                                         tracing::error!("Cost circuit breaker tripped: {}", reason);
                                         return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
@@ -354,7 +371,9 @@ impl AgenticExecutor {
                                     // Check cache health
                                     let cache_create = resp.cache_creation_tokens.unwrap_or(0);
                                     let cache_read = resp.cache_read_tokens.unwrap_or(0);
-                                    let cache_cb = trackers.circuit_breaker.record_cache_metrics(cache_create, cache_read);
+                                    let cache_cb = trackers
+                                        .circuit_breaker
+                                        .record_cache_metrics(cache_create, cache_read);
                                     if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cache_cb {
                                         tracing::error!("Cache circuit breaker tripped: {}", reason);
                                         return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
@@ -363,7 +382,10 @@ impl AgenticExecutor {
                                     // Anomaly detection
                                     if let Ok(mut detector) = trackers.anomaly_detector.lock() {
                                         if let Some(anomaly) = detector.check(cost_usd) {
-                                            warn!("Cost anomaly detected: ${:.4} (z-score: {:.2})", anomaly.cost_usd, anomaly.z_score);
+                                            warn!(
+                                                "Cost anomaly detected: ${:.4} (z-score: {:.2})",
+                                                anomaly.cost_usd, anomaly.z_score
+                                            );
                                             self.broadcaster.cost_anomaly(
                                                 &config.execution_id,
                                                 anomaly.cost_usd,
@@ -443,7 +465,12 @@ impl AgenticExecutor {
                                 }
                             });
                         }
-                        if let Err(e) = self.app_state.pg_db.create_task_run_event(&complete_event).await {
+                        if let Err(e) = self
+                            .app_state
+                            .pg_db
+                            .create_task_run_event(&complete_event)
+                            .await
+                        {
                             warn!(
                                 "Failed to emit agentic response-mode completion event: {}",
                                 e
@@ -524,7 +551,12 @@ impl AgenticExecutor {
                                 }
                             });
                         }
-                        if let Err(e2) = self.app_state.pg_db.create_task_run_event(&error_event).await {
+                        if let Err(e2) = self
+                            .app_state
+                            .pg_db
+                            .create_task_run_event(&error_event)
+                            .await
+                        {
                             warn!("Failed to emit agentic response-mode error event: {}", e2);
                         }
                         return (AgenticOutcome::Error { error: e }, Vec::new());
@@ -593,7 +625,12 @@ impl AgenticExecutor {
                 }
             });
         }
-        if let Err(e) = self.app_state.pg_db.create_task_run_event(&start_event).await {
+        if let Err(e) = self
+            .app_state
+            .pg_db
+            .create_task_run_event(&start_event)
+            .await
+        {
             warn!("Failed to emit agentic start event: {}", e);
         }
 
@@ -682,11 +719,7 @@ impl AgenticExecutor {
         let enhanced_prompt = {
             let mem = crate::orchestrator::memory::MemorySystem::new();
             let mem_ctx = mem
-                .build_context_unified(
-                    20,
-                    &config.base_prompt,
-                    &self.app_state.pg_db,
-                )
+                .build_context_unified(20, &config.base_prompt, &self.app_state.pg_db)
                 .await;
             if mem_ctx.trim().is_empty() {
                 enhanced_prompt
@@ -772,7 +805,8 @@ impl AgenticExecutor {
                         errors.len()
                     ));
                     for e in errors.iter().take(15) {
-                        let occurrence_count = e.get("occurrence_count")
+                        let occurrence_count = e
+                            .get("occurrence_count")
                             .and_then(|v| v.as_i64())
                             .unwrap_or(1);
                         let count_str = if occurrence_count > 1 {
@@ -780,12 +814,11 @@ impl AgenticExecutor {
                         } else {
                             String::new()
                         };
-                        let log_source_name = e.get("log_source_name")
+                        let log_source_name = e
+                            .get("log_source_name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
-                        let message = e.get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let message = e.get("message").and_then(|v| v.as_str()).unwrap_or("");
                         lines.push(format!(
                             "- [{}] {}{}",
                             log_source_name,
@@ -820,7 +853,9 @@ impl AgenticExecutor {
                 config.cross_workflow_learning,
                 config.project_path.as_deref(),
                 &self.app_state.pg_db,
-            ).await {
+            )
+            .await
+            {
                 Some(ctx) => {
                     let label = if iteration == 1 {
                         format!(
@@ -962,7 +997,12 @@ impl AgenticExecutor {
         // Check if there's an interrupted session we can resume via `--resume`.
         // If so, reuse its CLI session ID; otherwise generate a fresh one.
         let parent_task_id = get_parent_task_id(&config.execution_id);
-        let (cli_session_id, is_resume) = match self.app_state.pg_db.get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic").await {
+        let (cli_session_id, is_resume) = match self
+            .app_state
+            .pg_db
+            .get_workflow_ai_session(&parent_task_id, iteration as i32, "agentic")
+            .await
+        {
             Ok(Some((prev_cli_id, prev_status))) if prev_status == "interrupted" => {
                 info!(
                     "AGENTIC-PHASE: Found interrupted CLI session {} for iteration {} — will resume",
@@ -986,19 +1026,32 @@ impl AgenticExecutor {
         });
 
         // Record the AI session in the database for restart recovery
-        if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
-            &parent_task_id, iteration as i32, "agentic",
-            config.stage_index.map(|i| i as i32), &cli_session_id,
-        ).await {
+        if let Err(e) = self
+            .app_state
+            .pg_db
+            .create_workflow_ai_session(
+                &parent_task_id,
+                iteration as i32,
+                "agentic",
+                config.stage_index.map(|i| i as i32),
+                &cli_session_id,
+            )
+            .await
+        {
             warn!("PG create_workflow_ai_session failed: {}", e);
         }
-        if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
-            &parent_task_id,
-            iteration as i32,
-            "agentic",
-            config.stage_index.map(|i| i as i32),
-            &cli_session_id,
-        ).await {
+        if let Err(e) = self
+            .app_state
+            .pg_db
+            .create_workflow_ai_session(
+                &parent_task_id,
+                iteration as i32,
+                "agentic",
+                config.stage_index.map(|i| i as i32),
+                &cli_session_id,
+            )
+            .await
+        {
             warn!("Failed to create workflow AI session record: {}", e);
         }
 
@@ -1064,19 +1117,32 @@ impl AgenticExecutor {
                 is_resume: false,
             });
             // Update the DB record with the new session ID
-            if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
-                &parent_task_id, iteration as i32, "agentic",
-                config.stage_index.map(|i| i as i32), &fresh_cli_id,
-            ).await {
+            if let Err(e) = self
+                .app_state
+                .pg_db
+                .create_workflow_ai_session(
+                    &parent_task_id,
+                    iteration as i32,
+                    "agentic",
+                    config.stage_index.map(|i| i as i32),
+                    &fresh_cli_id,
+                )
+                .await
+            {
                 warn!("PG create fallback workflow AI session failed: {}", e);
             }
-            if let Err(e) = self.app_state.pg_db.create_workflow_ai_session(
-                &parent_task_id,
-                iteration as i32,
-                "agentic",
-                config.stage_index.map(|i| i as i32),
-                &fresh_cli_id,
-            ).await {
+            if let Err(e) = self
+                .app_state
+                .pg_db
+                .create_workflow_ai_session(
+                    &parent_task_id,
+                    iteration as i32,
+                    "agentic",
+                    config.stage_index.map(|i| i as i32),
+                    &fresh_cli_id,
+                )
+                .await
+            {
                 warn!(
                     "Failed to create fallback workflow AI session record: {}",
                     e
@@ -1151,10 +1217,8 @@ impl AgenticExecutor {
 
         // Record token usage for the main AI session and build LLM metrics
         let (session_input_tokens, session_output_tokens) = outcome.token_usage();
-        let session_model = config
-            .resolve_model_for_phase("agentic");
-        let session_provider = config
-            .resolve_provider_for_phase("agentic");
+        let session_model = config.resolve_model_for_phase("agentic");
+        let session_provider = config.resolve_provider_for_phase("agentic");
         {
             let target_app = get_active_sdk_app_name(&self.app_state);
             record_phase_token_usage_with_target(
@@ -1174,17 +1238,29 @@ impl AgenticExecutor {
 
             // Emit realtime cost update for the main AI session
             {
-                let cost_usd = if let (Some(input), Some(output)) = (session_input_tokens, session_output_tokens) {
+                let cost_usd = if let (Some(input), Some(output)) =
+                    (session_input_tokens, session_output_tokens)
+                {
                     crate::ai_pricing::calculate_cost_usd_with_cache(
-                        input, output, 0, 0,
-                        session_model.as_deref().unwrap_or("claude-sonnet-4-20250514"),
+                        input,
+                        output,
+                        0,
+                        0,
+                        session_model
+                            .as_deref()
+                            .unwrap_or("claude-sonnet-4-20250514"),
                     )
                 } else {
                     0.0
                 };
 
-                let cumulative = self.cost_trackers.lock().unwrap().as_ref()
-                    .map(|t| t.budget.snapshot().total_cost_usd).unwrap_or(0.0);
+                let cumulative = self
+                    .cost_trackers
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|t| t.budget.snapshot().total_cost_usd)
+                    .unwrap_or(0.0);
 
                 self.broadcaster.cost_update(
                     &config.execution_id,
@@ -1201,12 +1277,20 @@ impl AgenticExecutor {
                 // Record cost in budget tracker and check safety limits
                 let trackers = self.cost_trackers.lock().unwrap().clone();
                 if let Some(ref trackers) = trackers {
-                    let total_tokens = session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
+                    let total_tokens =
+                        session_input_tokens.unwrap_or(0) + session_output_tokens.unwrap_or(0);
                     let budget_result = trackers.budget.record("agentic", total_tokens, cost_usd);
 
                     match budget_result {
-                        crate::cost_management::budget::BudgetResult::Warning { remaining_fraction, message } => {
-                            warn!("Budget warning ({}% remaining): {}", (remaining_fraction * 100.0) as u32, message);
+                        crate::cost_management::budget::BudgetResult::Warning {
+                            remaining_fraction,
+                            message,
+                        } => {
+                            warn!(
+                                "Budget warning ({}% remaining): {}",
+                                (remaining_fraction * 100.0) as u32,
+                                message
+                            );
                             self.broadcaster.budget_warning(
                                 &config.execution_id,
                                 remaining_fraction,
@@ -1215,8 +1299,14 @@ impl AgenticExecutor {
                                 &message,
                             );
                         }
-                        crate::cost_management::budget::BudgetResult::Exceeded { ref phase, overage_usd } => {
-                            let reason = format!("Budget exceeded in phase {}: ${:.4} over limit", phase, overage_usd);
+                        crate::cost_management::budget::BudgetResult::Exceeded {
+                            ref phase,
+                            overage_usd,
+                        } => {
+                            let reason = format!(
+                                "Budget exceeded in phase {}: ${:.4} over limit",
+                                phase, overage_usd
+                            );
                             tracing::error!("{}", reason);
                             return (AgenticOutcome::BudgetExceeded { reason }, Vec::new());
                         }
@@ -1225,15 +1315,26 @@ impl AgenticExecutor {
 
                     // Check circuit breaker
                     let cb_result = trackers.circuit_breaker.check_single_call(cost_usd);
-                    if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(reason) = &cb_result {
+                    if let crate::cost_management::circuit_breaker::CircuitBreakerResult::Tripped(
+                        reason,
+                    ) = &cb_result
+                    {
                         tracing::error!("Cost circuit breaker tripped: {}", reason);
-                        return (AgenticOutcome::BudgetExceeded { reason: reason.clone() }, Vec::new());
+                        return (
+                            AgenticOutcome::BudgetExceeded {
+                                reason: reason.clone(),
+                            },
+                            Vec::new(),
+                        );
                     }
 
                     // Anomaly detection
                     if let Ok(mut detector) = trackers.anomaly_detector.lock() {
                         if let Some(anomaly) = detector.check(cost_usd) {
-                            warn!("Cost anomaly detected: ${:.4} (z-score: {:.2})", anomaly.cost_usd, anomaly.z_score);
+                            warn!(
+                                "Cost anomaly detected: ${:.4} (z-score: {:.2})",
+                                anomaly.cost_usd, anomaly.z_score
+                            );
                             self.broadcaster.cost_anomaly(
                                 &config.execution_id,
                                 anomaly.cost_usd,
@@ -1264,20 +1365,34 @@ impl AgenticExecutor {
                 AgenticOutcome::BudgetExceeded { .. } => "failed",
             };
             let output_len = outcome.output().map(|o| o.len() as i64).unwrap_or(0);
-            if let Err(e) = self.app_state.pg_db.complete_workflow_ai_session(
-                &parent_task_id, iteration as i32, "agentic",
-                config.stage_index.map(|i| i as i32), session_status, output_len,
-            ).await {
+            if let Err(e) = self
+                .app_state
+                .pg_db
+                .complete_workflow_ai_session(
+                    &parent_task_id,
+                    iteration as i32,
+                    "agentic",
+                    config.stage_index.map(|i| i as i32),
+                    session_status,
+                    output_len,
+                )
+                .await
+            {
                 warn!("PG complete_workflow_ai_session failed: {}", e);
             }
-            if let Err(e) = self.app_state.pg_db.complete_workflow_ai_session(
-                &parent_task_id,
-                iteration as i32,
-                "agentic",
-                config.stage_index.map(|i| i as i32),
-                session_status,
-                output_len,
-            ).await {
+            if let Err(e) = self
+                .app_state
+                .pg_db
+                .complete_workflow_ai_session(
+                    &parent_task_id,
+                    iteration as i32,
+                    "agentic",
+                    config.stage_index.map(|i| i as i32),
+                    session_status,
+                    output_len,
+                )
+                .await
+            {
                 warn!("Failed to complete workflow AI session: {}", e);
             }
             // Partial AI output deletion removed — all persistence now via PgDb.
@@ -1349,7 +1464,12 @@ impl AgenticExecutor {
                 }
             });
         }
-        if let Err(e) = self.app_state.pg_db.create_task_run_event(&completion_event).await {
+        if let Err(e) = self
+            .app_state
+            .pg_db
+            .create_task_run_event(&completion_event)
+            .await
+        {
             warn!("Failed to emit agentic completion event: {}", e);
         }
 

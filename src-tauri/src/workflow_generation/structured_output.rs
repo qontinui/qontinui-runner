@@ -31,7 +31,6 @@ pub enum ConstrainedDecodingBackend {
     None,
 }
 
-
 /// Detect the best available constrained decoding backend based on provider.
 ///
 /// Recognizes provider names commonly used in the runner's AI routing layer.
@@ -382,13 +381,18 @@ pub fn validate_against_schema(workflow_json: &Value) -> Vec<String> {
     let mut errors = Vec::new();
 
     // 1. Check required top-level fields
-    if workflow_json.get("name").and_then(|v| v.as_str()).is_none_or(|s| s.is_empty()) {
+    if workflow_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
+    {
         errors.push("Missing or empty required field: 'name'".to_string());
     }
 
     if workflow_json
         .get("description")
-        .and_then(|v| v.as_str()).is_none_or(|s| s.is_empty())
+        .and_then(|v| v.as_str())
+        .is_none_or(|s| s.is_empty())
     {
         errors.push("Missing or empty required field: 'description'".to_string());
     }
@@ -461,7 +465,8 @@ fn validate_steps_array(steps: &[Value], array_name: &str, errors: &mut Vec<Stri
         // 3. Each step must have name and step_type
         if obj
             .get("name")
-            .and_then(|v| v.as_str()).is_none_or(|s| s.is_empty())
+            .and_then(|v| v.as_str())
+            .is_none_or(|s| s.is_empty())
         {
             errors.push(format!("{prefix}: missing or empty required field 'name'"));
         }
@@ -518,9 +523,7 @@ fn validate_steps_array(steps: &[Value], array_name: &str, errors: &mut Vec<Stri
                 Some(arr) => {
                     for (j, dep) in arr.iter().enumerate() {
                         if dep.as_str().is_none() {
-                            errors.push(format!(
-                                "{prefix}.depends_on[{j}]: must be a string"
-                            ));
+                            errors.push(format!("{prefix}.depends_on[{j}]: must be a string"));
                         }
                     }
                 }
@@ -534,14 +537,10 @@ fn validate_steps_array(steps: &[Value], array_name: &str, errors: &mut Vec<Stri
         if let Some(ts) = obj.get("timeout_seconds") {
             if let Some(n) = ts.as_i64() {
                 if n < 1 {
-                    errors.push(format!(
-                        "{prefix}: 'timeout_seconds' must be >= 1"
-                    ));
+                    errors.push(format!("{prefix}: 'timeout_seconds' must be >= 1"));
                 }
             } else {
-                errors.push(format!(
-                    "{prefix}: 'timeout_seconds' must be an integer"
-                ));
+                errors.push(format!("{prefix}: 'timeout_seconds' must be an integer"));
             }
         }
 
@@ -549,9 +548,7 @@ fn validate_steps_array(steps: &[Value], array_name: &str, errors: &mut Vec<Stri
         if let Some(rc) = obj.get("retry_count") {
             if let Some(n) = rc.as_i64() {
                 if n < 0 {
-                    errors.push(format!(
-                        "{prefix}: 'retry_count' must be >= 0"
-                    ));
+                    errors.push(format!("{prefix}: 'retry_count' must be >= 0"));
                 }
             } else {
                 errors.push(format!("{prefix}: 'retry_count' must be an integer"));
@@ -888,8 +885,7 @@ mod tests {
             base_url: "http://localhost:8000".to_string(),
         };
         let serialized = serde_json::to_string(&backend).unwrap();
-        let deserialized: ConstrainedDecodingBackend =
-            serde_json::from_str(&serialized).unwrap();
+        let deserialized: ConstrainedDecodingBackend = serde_json::from_str(&serialized).unwrap();
         assert!(matches!(
             deserialized,
             ConstrainedDecodingBackend::VllmGuided { .. }
@@ -900,8 +896,7 @@ mod tests {
     fn test_backend_serialization_openai() {
         let backend = ConstrainedDecodingBackend::OpenAiStructuredOutput;
         let serialized = serde_json::to_string(&backend).unwrap();
-        let deserialized: ConstrainedDecodingBackend =
-            serde_json::from_str(&serialized).unwrap();
+        let deserialized: ConstrainedDecodingBackend = serde_json::from_str(&serialized).unwrap();
         assert!(matches!(
             deserialized,
             ConstrainedDecodingBackend::OpenAiStructuredOutput
@@ -912,8 +907,7 @@ mod tests {
     fn test_backend_serialization_gemini() {
         let backend = ConstrainedDecodingBackend::GeminiResponseSchema;
         let serialized = serde_json::to_string(&backend).unwrap();
-        let deserialized: ConstrainedDecodingBackend =
-            serde_json::from_str(&serialized).unwrap();
+        let deserialized: ConstrainedDecodingBackend = serde_json::from_str(&serialized).unwrap();
         assert!(matches!(
             deserialized,
             ConstrainedDecodingBackend::GeminiResponseSchema
@@ -936,7 +930,11 @@ mod tests {
             ]
         });
         let result = validate_workflow_with_schema_validator(&workflow);
-        assert!(result.valid, "Expected valid, got: {}", result.error_summary());
+        assert!(
+            result.valid,
+            "Expected valid, got: {}",
+            result.error_summary()
+        );
     }
 
     #[test]

@@ -77,7 +77,10 @@ impl PgDb {
             .map_err(|e| format!("PG get_unresolved_errors: {}", e))?
         };
 
-        Ok(rows.iter().map(|row| Self::error_row_to_json(row)).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Self::error_row_to_json(row))
+            .collect())
     }
 
     /// Get error summary statistics, optionally filtered by task_run_id.
@@ -189,13 +192,7 @@ impl PgDb {
                 resolved_at = COALESCE($4::TIMESTAMPTZ, resolved_at)
             WHERE id = $5
             "#,
-            &[
-                &status,
-                &resolution_notes,
-                &ack_at,
-                &resolved_at,
-                &id,
-            ],
+            &[&status, &resolution_notes, &ack_at, &resolved_at, &id],
         )
         .await
         .map_err(|e| format!("PG update_error_status: {}", e))?;
@@ -489,10 +486,14 @@ impl PgDb {
 
         if let Some(sts) = statuses {
             if !sts.is_empty() {
-                let placeholders: Vec<String> = sts.iter().enumerate().map(|(i, _)| {
-                    let idx = param_idx + i as u32;
-                    format!("${}", idx)
-                }).collect();
+                let placeholders: Vec<String> = sts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let idx = param_idx + i as u32;
+                        format!("${}", idx)
+                    })
+                    .collect();
                 conditions.push(format!("e.status IN ({})", placeholders.join(",")));
                 for s in sts {
                     params.push(Box::new(s.to_string()));
@@ -503,10 +504,14 @@ impl PgDb {
 
         if let Some(sevs) = severities {
             if !sevs.is_empty() {
-                let placeholders: Vec<String> = sevs.iter().enumerate().map(|(i, _)| {
-                    let idx = param_idx + i as u32;
-                    format!("${}", idx)
-                }).collect();
+                let placeholders: Vec<String> = sevs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let idx = param_idx + i as u32;
+                        format!("${}", idx)
+                    })
+                    .collect();
                 conditions.push(format!("e.severity IN ({})", placeholders.join(",")));
                 for s in sevs {
                     params.push(Box::new(s.to_string()));
@@ -558,15 +563,20 @@ impl PgDb {
             where_clause, limit_param
         );
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &param_refs)
             .await
             .map_err(|e| format!("PG query_error_events: {}", e))?;
 
-        Ok(rows.iter().map(|row| Self::error_row_to_json(row)).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Self::error_row_to_json(row))
+            .collect())
     }
 
     /// Search error events by message content using ILIKE.
@@ -605,15 +615,15 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG search_errors: {}", e))?;
 
-        Ok(rows.iter().map(|row| Self::error_row_to_json(row)).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Self::error_row_to_json(row))
+            .collect())
     }
 
     /// Acknowledge all new errors, optionally scoped to a task_run_id.
     /// Returns the count of acknowledged errors.
-    pub async fn acknowledge_all_errors(
-        &self,
-        task_run_id: Option<&str>,
-    ) -> Result<u32, String> {
+    pub async fn acknowledge_all_errors(&self, task_run_id: Option<&str>) -> Result<u32, String> {
         let conn = self
             .pool()
             .get()

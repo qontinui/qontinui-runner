@@ -17,10 +17,7 @@ pub struct UnifiedSearchResult {
 
 /// Search across all data stores with a text query.
 /// Results are ranked by text match relevance.
-pub fn unified_search(
-    query: &str,
-    limit: usize,
-) -> Result<Vec<UnifiedSearchResult>, String> {
+pub fn unified_search(query: &str, limit: usize) -> Result<Vec<UnifiedSearchResult>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -48,10 +45,7 @@ fn search_workflows(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 
-fn search_ui_elements(
-    pattern: &str,
-    results: &mut Vec<UnifiedSearchResult>,
-) {
+fn search_ui_elements(pattern: &str, results: &mut Vec<UnifiedSearchResult>) {
     // SQLite removed - no-op
 }
 

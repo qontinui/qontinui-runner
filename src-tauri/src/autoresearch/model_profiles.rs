@@ -212,7 +212,14 @@ pub async fn save_model_profile(pg: &PgDb, profile: &ModelProfile) -> Result<(),
         .map_err(|e| format!("Failed to serialize profile: {}", e))?;
     let trial_count = profile.trial_count as i64;
 
-    pg.save_model_profile(&id, &profile.model_id, &profile_json, trial_count, &profile.last_updated).await
+    pg.save_model_profile(
+        &id,
+        &profile.model_id,
+        &profile_json,
+        trial_count,
+        &profile.last_updated,
+    )
+    .await
 }
 
 /// Load all saved model profiles.

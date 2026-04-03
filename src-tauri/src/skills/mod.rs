@@ -276,9 +276,8 @@ impl SkillRegistry {
         let mut registry = Self::new();
         if let Some(pg) = pg_db {
             let pg_clone = pg.clone();
-            let user_skills = tokio::runtime::Handle::current().block_on(async {
-                pg_clone.list_user_skills().await.unwrap_or_default()
-            });
+            let user_skills = tokio::runtime::Handle::current()
+                .block_on(async { pg_clone.list_user_skills().await.unwrap_or_default() });
             if !user_skills.is_empty() {
                 tracing::debug!("Loaded {} user skills from PG", user_skills.len());
                 registry.user = user_skills;
@@ -753,7 +752,7 @@ fn step_matches_skill(step: &Value, skill: &SkillDefinition) -> bool {
         SkillTemplate::SingleStep { step } => step,
         SkillTemplate::MultiStep { .. } => return false, // skip multi-step skills
         SkillTemplate::Composition { .. } => return false, // skip composition skills
-        SkillTemplate::Playbook { .. } => return false, // skip playbook skills
+        SkillTemplate::Playbook { .. } => return false,  // skip playbook skills
     };
 
     let step_obj = match step.as_object() {

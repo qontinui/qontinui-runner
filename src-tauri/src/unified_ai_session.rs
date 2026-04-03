@@ -640,7 +640,8 @@ impl UnifiedAiSessionExecutor {
             let _prompt_span = tracing::info_span!("qontinui.ai.prompt_build",
                 execution_id = %config.task_run_id,
                 step_name = %config.step_name,
-            ).entered();
+            )
+            .entered();
             self.transform_prompt(config, prompt)
         };
 
@@ -768,8 +769,13 @@ impl UnifiedAiSessionExecutor {
                 }
                 // Cost computation
                 if let (Some(input_t), Some(output_t)) = (cli_input_tokens, cli_output_tokens) {
-                    let model_id = config.model_override.as_deref().unwrap_or("claude-sonnet-4-20250514");
-                    if let Some(cost) = crate::ai_pricing::calculate_cost_cents(input_t, output_t, model_id) {
+                    let model_id = config
+                        .model_override
+                        .as_deref()
+                        .unwrap_or("claude-sonnet-4-20250514");
+                    if let Some(cost) =
+                        crate::ai_pricing::calculate_cost_cents(input_t, output_t, model_id)
+                    {
                         tracing::Span::current().record("ai.cost_cents", cost as i64);
                     }
                     tracing::Span::current().record("gen_ai.request.model", model_id);
@@ -803,10 +809,16 @@ impl UnifiedAiSessionExecutor {
                     let exec_id = config.task_run_id.clone();
                     let ctx_str = context.to_string();
                     tokio::spawn(async move {
-                        let _ = pg.record_state_snapshot(
-                            &exec_id, "", &ts, "ai_session",
-                            Some(&snapshot_summary), Some(&ctx_str),
-                        ).await;
+                        let _ = pg
+                            .record_state_snapshot(
+                                &exec_id,
+                                "",
+                                &ts,
+                                "ai_session",
+                                Some(&snapshot_summary),
+                                Some(&ctx_str),
+                            )
+                            .await;
                     });
                 }
 
@@ -853,7 +865,8 @@ impl UnifiedAiSessionExecutor {
                         let id = task_run_id.clone();
                         let text = formatted.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = pg.append_task_output_ex(&id, &text, false, false).await {
+                            if let Err(e) = pg.append_task_output_ex(&id, &text, false, false).await
+                            {
                                 tracing::warn!("PG append_task_output_ex failed: {}", e);
                             }
                         });

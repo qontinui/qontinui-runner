@@ -153,18 +153,27 @@ async fn handle_scan(
 
     // Resolve the project root: walk up from current exe or CWD to find src-tauri/,
     // or fall back to the known dev path.
-    let project_root = find_project_root()
-        .unwrap_or_else(|| PathBuf::from("D:/qontinui-root/qontinui-runner"));
+    let project_root =
+        find_project_root().unwrap_or_else(|| PathBuf::from("D:/qontinui-root/qontinui-runner"));
 
     let src_tauri = project_root.join("src-tauri");
     let src_frontend = project_root.join("src");
     let python_bridge = project_root.join("python-bridge");
 
-    info!("API Surface scan starting — project_root={}", project_root.display());
+    info!(
+        "API Surface scan starting — project_root={}",
+        project_root.display()
+    );
 
     // Run the file-system scan on a blocking thread to avoid holding the async executor
     let surface = tokio::task::spawn_blocking(move || {
-        scan_codebase(&project_root, &src_tauri, &src_frontend, &python_bridge, start)
+        scan_codebase(
+            &project_root,
+            &src_tauri,
+            &src_frontend,
+            &python_bridge,
+            start,
+        )
     })
     .await
     .map_err(|e| {
@@ -194,7 +203,9 @@ fn find_project_root() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         let mut cur = exe.clone();
         for _ in 0..8 {
-            if !cur.pop() { break; }
+            if !cur.pop() {
+                break;
+            }
             if cur.join("src-tauri").join("Cargo.toml").exists() && cur.join("src").exists() {
                 return Some(cur);
             }
@@ -207,7 +218,9 @@ fn find_project_root() -> Option<PathBuf> {
             if cur.join("src-tauri").join("Cargo.toml").exists() && cur.join("src").exists() {
                 return Some(cur);
             }
-            if !cur.pop() { break; }
+            if !cur.pop() {
+                break;
+            }
         }
     }
     // Fallback: check common dev locations
@@ -256,10 +269,20 @@ fn scan_codebase(
     resolve_mcp_callers(src_frontend, &mut mcp_routes);
 
     // Tauri command → PgDb method calls
-    resolve_command_to_pg(&mut connections, src_tauri, &tauri_commands, &mut pg_methods);
+    resolve_command_to_pg(
+        &mut connections,
+        src_tauri,
+        &tauri_commands,
+        &mut pg_methods,
+    );
 
     // PgDb → Clorinde query calls
-    resolve_pg_to_clorinde(&mut connections, &mut pg_methods, &mut clorinde_queries, src_tauri);
+    resolve_pg_to_clorinde(
+        &mut connections,
+        &mut pg_methods,
+        &mut clorinde_queries,
+        src_tauri,
+    );
 
     // Python event → Rust intercepts
     resolve_event_intercepts(src_tauri, &mut python_events, &mut connections);
@@ -420,7 +443,8 @@ fn parse_route_line(line: &str) -> Option<(String, String, String)> {
     let rest = &after_route[path_end + 1..];
     let method_handler = rest.trim().trim_start_matches(',').trim();
 
-    let method = if method_handler.starts_with("get(") || method_handler.starts_with("get_service(") {
+    let method = if method_handler.starts_with("get(") || method_handler.starts_with("get_service(")
+    {
         "GET"
     } else if method_handler.starts_with("post(") {
         "POST"
@@ -435,8 +459,13 @@ fn parse_route_line(line: &str) -> Option<(String, String, String)> {
     };
 
     let handler_start = method_handler.find('(')? + 1;
-    let handler_end = method_handler[handler_start..].find(')').unwrap_or(method_handler.len() - handler_start) + handler_start;
-    let handler = method_handler[handler_start..handler_end].trim().to_string();
+    let handler_end = method_handler[handler_start..]
+        .find(')')
+        .unwrap_or(method_handler.len() - handler_start)
+        + handler_start;
+    let handler = method_handler[handler_start..handler_end]
+        .trim()
+        .to_string();
 
     Some((method.to_string(), path, handler))
 }
@@ -569,8 +598,12 @@ fn scan_pg_methods(src_tauri: &Path) -> Vec<PgMethod> {
             if in_impl {
                 // Track brace depth to detect end of impl block
                 for ch in trimmed.chars() {
-                    if ch == '{' { brace_depth += 1; }
-                    if ch == '}' { brace_depth -= 1; }
+                    if ch == '{' {
+                        brace_depth += 1;
+                    }
+                    if ch == '}' {
+                        brace_depth -= 1;
+                    }
                 }
                 if brace_depth <= 0 && in_impl && !trimmed.starts_with("impl") {
                     in_impl = false;
@@ -619,7 +652,10 @@ fn scan_clorinde_queries(src_tauri: &Path) -> Vec<ClorindeQuery> {
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let lines: Vec<&str> = content.lines().collect();
-                let rel = format!("queries/{}", path.file_name().unwrap_or_default().to_string_lossy());
+                let rel = format!(
+                    "queries/{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
 
                 for (i, line) in lines.iter().enumerate() {
                     let trimmed = line.trim();
@@ -810,7 +846,8 @@ fn resolve_mcp_callers(src_frontend: &Path, routes: &mut [McpRoute]) {
         let rel = relative_path(src_frontend.parent().unwrap_or(src_frontend), path);
 
         for (i, line) in lines.iter().enumerate() {
-            if line.contains("fetch(") || line.contains("getApiBase()") || line.contains("apiBase") {
+            if line.contains("fetch(") || line.contains("getApiBase()") || line.contains("apiBase")
+            {
                 for (route_idx, route_path) in route_paths.iter().enumerate() {
                     if line.contains(route_path) {
                         routes[route_idx].callers.push(Caller {
@@ -853,7 +890,11 @@ fn resolve_command_to_pg(
             let trimmed = line.trim();
 
             // Reset command context at any new function boundary
-            if trimmed.starts_with("pub async fn ") || trimmed.starts_with("pub fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("fn ") {
+            if trimmed.starts_with("pub async fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("fn ")
+            {
                 let fn_name = trimmed
                     .split("fn ")
                     .nth(1)
@@ -874,7 +915,12 @@ fn resolve_command_to_pg(
                 // Look for pg.method_name( or pg_db.method_name(
                 for method_name in &pg_method_names {
                     if trimmed.contains(&format!(".{}(", method_name)) {
-                        found.push((cmd_name.clone(), method_name.clone(), rel.clone(), (i + 1) as u32));
+                        found.push((
+                            cmd_name.clone(),
+                            method_name.clone(),
+                            rel.clone(),
+                            (i + 1) as u32,
+                        ));
                     }
                 }
             }
@@ -1189,7 +1235,13 @@ fn parse_fn_signature(sig: &str) -> (String, Vec<String>, String) {
 }
 
 fn extract_quoted_string(s: &str) -> Option<String> {
-    let quote = if s.contains('"') { '"' } else if s.contains('\'') { '\'' } else { return None };
+    let quote = if s.contains('"') {
+        '"'
+    } else if s.contains('\'') {
+        '\''
+    } else {
+        return None;
+    };
     let start = s.find(quote)? + 1;
     let end = s[start..].find(quote)? + start;
     Some(s[start..end].to_string())

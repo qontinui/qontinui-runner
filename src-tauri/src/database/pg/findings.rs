@@ -2,8 +2,8 @@
 
 use super::PgDb;
 use crate::findings::{
-    Finding, FindingActionType, FindingCategory, FindingCodeContext,
-    FindingSeverity, FindingStatus, FindingSummary, FindingUserInput,
+    Finding, FindingActionType, FindingCategory, FindingCodeContext, FindingSeverity,
+    FindingStatus, FindingSummary, FindingUserInput,
 };
 
 impl PgDb {
@@ -15,9 +15,14 @@ impl PgDb {
         resolution: Option<&str>,
         session_num: Option<u32>,
     ) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let resolved_at: Option<String> = if matches!(status, "resolved" | "wont_fix" | "deferred") {
+        let resolved_at: Option<String> = if matches!(status, "resolved" | "wont_fix" | "deferred")
+        {
             Some(chrono::Utc::now().to_rfc3339())
         } else {
             None
@@ -42,7 +47,11 @@ impl PgDb {
 
     /// Get a finding by ID.
     pub async fn get_finding(&self, id: &str) -> Result<Option<Finding>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -63,7 +72,11 @@ impl PgDb {
 
     /// Get all findings for a task run.
     pub async fn get_findings_for_task(&self, task_run_id: &str) -> Result<Vec<Finding>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -207,7 +220,11 @@ impl PgDb {
     ) -> Result<String, String> {
         use sha2::{Digest, Sha256};
 
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let signature = format!("test_failure:{}:{}", task_run_id, test_name);
         let mut hasher = Sha256::new();
@@ -253,12 +270,12 @@ impl PgDb {
     }
 
     /// Set a user response on a finding.
-    pub async fn set_finding_user_response(
-        &self,
-        id: &str,
-        response: &str,
-    ) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn set_finding_user_response(&self, id: &str, response: &str) -> Result<(), String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_run_findings SET user_response = $1, updated_at = NOW() WHERE id = $2",
             &[&response, &id],
@@ -278,7 +295,11 @@ impl PgDb {
     ) -> Result<Finding, String> {
         use sha2::{Digest, Sha256};
 
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let now = chrono::Utc::now();
         let now_str = now.to_rfc3339();
@@ -307,7 +328,9 @@ impl PgDb {
 
         if let Some(row) = existing {
             let existing_id: String = row.get(0);
-            return self.get_finding(&existing_id).await?
+            return self
+                .get_finding(&existing_id)
+                .await?
                 .ok_or_else(|| "Existing finding not found after dedup".to_string());
         }
 
@@ -316,7 +339,9 @@ impl PgDb {
             "needs_user_input"
         } else {
             match parsed.category {
-                FindingCategory::AlreadyFixed | FindingCategory::ExpectedBehavior => "informational",
+                FindingCategory::AlreadyFixed | FindingCategory::ExpectedBehavior => {
+                    "informational"
+                }
                 _ => "auto_fix",
             }
         };
@@ -369,7 +394,8 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG insert_parsed_finding: {}", e))?;
 
-        self.get_finding(&id).await?
+        self.get_finding(&id)
+            .await?
             .ok_or_else(|| "Finding not found after PG insert".to_string())
     }
 }

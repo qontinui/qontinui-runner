@@ -169,8 +169,12 @@ pub async fn get_task_run_events(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let events = state.app_state.pg_db.get_task_run_events(&id, query.event_type.as_deref(), query.limit).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let events = state
+        .app_state
+        .pg_db
+        .get_task_run_events(&id, query.event_type.as_deref(), query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -199,8 +203,12 @@ pub async fn get_task_run_checkpoints(
 
     let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
 
-    let (checkpoints, next_cursor) = state.app_state.pg_db.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (checkpoints, next_cursor) = state
+        .app_state
+        .pg_db
+        .get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -257,21 +265,28 @@ pub async fn get_task_run_verification_results(
 
     // Filter by failed_only if requested
     let results_array: Vec<_> = if query.failed_only {
-        results_array.into_iter().filter(|r| {
-            r.get("passed").and_then(|v| v.as_bool()) != Some(true)
-        }).collect()
+        results_array
+            .into_iter()
+            .filter(|r| r.get("passed").and_then(|v| v.as_bool()) != Some(true))
+            .collect()
     } else {
         results_array
     };
 
     // Calculate summary stats
     let total = results_array.len();
-    let passed = results_array.iter().filter(|r| r.get("passed").and_then(|v| v.as_bool()) == Some(true)).count();
+    let passed = results_array
+        .iter()
+        .filter(|r| r.get("passed").and_then(|v| v.as_bool()) == Some(true))
+        .count();
     let failed = total - passed;
-    let critical_failed = results_array.iter().filter(|r| {
-        r.get("passed").and_then(|v| v.as_bool()) != Some(true)
-            && r.get("is_critical").and_then(|v| v.as_bool()) == Some(true)
-    }).count();
+    let critical_failed = results_array
+        .iter()
+        .filter(|r| {
+            r.get("passed").and_then(|v| v.as_bool()) != Some(true)
+                && r.get("is_critical").and_then(|v| v.as_bool()) == Some(true)
+        })
+        .count();
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -410,8 +425,12 @@ pub async fn get_task_run_api_requests(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get API requests
-    let requests = state.app_state.pg_db.get_task_run_api_requests(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let requests = state
+        .app_state
+        .pg_db
+        .get_task_run_api_requests(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
     let requests = if let Some(limit) = query.limit {
@@ -463,8 +482,12 @@ pub async fn get_task_run_playwright_results(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get Playwright results
-    let results = state.app_state.pg_db.get_task_run_playwright_results(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let results = state
+        .app_state
+        .pg_db
+        .get_task_run_playwright_results(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
     let results = if let Some(limit) = query.limit {
@@ -513,8 +536,12 @@ pub async fn get_task_run_awas_steps(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get AWAS steps
-    let steps = state.app_state.pg_db.get_task_run_awas_steps(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let steps = state
+        .app_state
+        .pg_db
+        .get_task_run_awas_steps(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Calculate summary
     let total = steps.len();
@@ -687,8 +714,12 @@ pub async fn get_current_execution_steps(
     let task = &running_tasks[0];
 
     // Get all events for this task (don't filter by event_type, we'll filter in code)
-    let events = state.app_state.pg_db.get_task_run_events(&task.id, None, query.limit).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let events = state
+        .app_state
+        .pg_db
+        .get_task_run_events(&task.id, None, query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Aggregate events by action_id (preferred) or step_name + step_index to merge start/complete events
     // Using action_id is more reliable because it's generated from metadata and consistent across events
@@ -1086,8 +1117,12 @@ pub async fn get_task_run_screenshots(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let screenshots = state.app_state.pg_db.get_task_run_screenshots(&id, None).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let screenshots = state
+        .app_state
+        .pg_db
+        .get_task_run_screenshots(&id, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -1416,8 +1451,15 @@ pub async fn get_current_execution_batch(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // get_running_task_step_data / get_completed_verification_iterations not yet on PgDb
     // Fall back to composing from existing PgDb methods
-    let port = state.app_state.api_port.load(std::sync::atomic::Ordering::Relaxed);
-    let running_tasks = state.app_state.pg_db.get_running_task_runs(Some(port)).await
+    let port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let running_tasks = state
+        .app_state
+        .pg_db
+        .get_running_task_runs(Some(port))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     if running_tasks.is_empty() {
@@ -1432,11 +1474,17 @@ pub async fn get_current_execution_batch(
     }
 
     let task = &running_tasks[0];
-    let events = state.app_state.pg_db.get_task_run_events(&task.id, None, None).await
+    let events = state
+        .app_state
+        .pg_db
+        .get_task_run_events(&task.id, None, None)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let aggregated = aggregate_step_events(&events);
 
-    let completed_iterations = state.app_state.pg_db
+    let completed_iterations = state
+        .app_state
+        .pg_db
         .get_all_verification_phase_results(&task.id)
         .await
         .unwrap_or_default()
@@ -1464,8 +1512,12 @@ pub async fn get_task_run_usage(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let usage = state.app_state.pg_db.get_phase_token_usage(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let usage = state
+        .app_state
+        .pg_db
+        .get_phase_token_usage(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Compute totals
     let total_input: u64 = usage.iter().map(|u| u.input_tokens).sum();
@@ -1492,7 +1544,11 @@ pub async fn get_trace_correlation(
     axum::extract::Path(trace_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Trace correlation uses execution_spans — use PG get_execution_spans
-    let spans = state.app_state.pg_db.get_execution_spans(&trace_id).await
+    let spans = state
+        .app_state
+        .pg_db
+        .get_execution_spans(&trace_id)
+        .await
         .unwrap_or_default();
 
     // error_events not yet queryable by trace_id on PgDb — return empty

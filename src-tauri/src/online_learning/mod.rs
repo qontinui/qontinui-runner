@@ -62,7 +62,8 @@ pub fn model_router() -> Option<&'static Mutex<model_router::ModelRouterBandit>>
 }
 
 /// Get the global drift monitor. Returns None if not initialized.
-pub fn drift_monitor() -> Option<&'static Mutex<crate::meta_optimizer::drift_detection::DriftMonitor>> {
+pub fn drift_monitor(
+) -> Option<&'static Mutex<crate::meta_optimizer::drift_detection::DriftMonitor>> {
     GLOBAL_DRIFT_MONITOR.get()
 }
 
@@ -81,7 +82,10 @@ pub async fn initialize(pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
     }
     match pg_db.load_model_routing_overrides().await {
         Ok(overrides) if !overrides.is_empty() => {
-            tracing::info!("Loading {} model routing overrides from PG", overrides.len());
+            tracing::info!(
+                "Loading {} model routing overrides from PG",
+                overrides.len()
+            );
             router.load_overrides(overrides);
         }
         _ => {}
@@ -93,11 +97,17 @@ pub async fn initialize(pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
         Ok(Some(json)) => {
             match crate::meta_optimizer::drift_detection::DriftMonitor::deserialize_state(&json) {
                 Ok(m) => {
-                    tracing::info!("Loaded drift monitor state from PG ({} detectors)", m.detector_count());
+                    tracing::info!(
+                        "Loaded drift monitor state from PG ({} detectors)",
+                        m.detector_count()
+                    );
                     m
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to deserialize drift monitor state: {} — starting fresh", e);
+                    tracing::warn!(
+                        "Failed to deserialize drift monitor state: {} — starting fresh",
+                        e
+                    );
                     crate::meta_optimizer::drift_detection::DriftMonitor::new()
                 }
             }
@@ -151,10 +161,7 @@ pub async fn run_post_completion(
         }
     };
 
-    let status = lo["status"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
+    let status = lo["status"].as_str().unwrap_or("unknown").to_string();
 
     let composite_score = lo["composite_agentic_score"].as_f64().filter(|&s| s > 0.0);
 
@@ -182,9 +189,7 @@ pub async fn run_post_completion(
         has_ui: lo["has_ui_bridge"].as_bool().unwrap_or(false),
         prompt_length: 0, // Not available from learning_outcomes
         file_count: files_modified.len(),
-        workflow_architecture: lo["workflow_architecture"]
-            .as_str()
-            .map(|s| s.to_string()),
+        workflow_architecture: lo["workflow_architecture"].as_str().map(|s| s.to_string()),
         strategy_id: None,
         step_attributions: Vec::new(),
         step_reflections: Vec::new(),
@@ -302,18 +307,16 @@ pub async fn run_post_completion(
         }
 
         // Persist experience summary
-        let summary = reflection::summarize_experience(
-            &reflection::RunReflectionInput {
-                task_run_id: task_run_id.to_string(),
-                domain: outcome.domain.clone(),
-                complexity_tier: outcome.complexity_tier.clone(),
-                outcome_status: outcome.status.clone(),
-                composite_score: outcome.composite_score,
-                steps: outcome.step_reflections.clone(),
-                total_iterations: outcome.total_iterations,
-                total_cost_usd: outcome.cost_usd,
-            },
-        );
+        let summary = reflection::summarize_experience(&reflection::RunReflectionInput {
+            task_run_id: task_run_id.to_string(),
+            domain: outcome.domain.clone(),
+            complexity_tier: outcome.complexity_tier.clone(),
+            outcome_status: outcome.status.clone(),
+            composite_score: outcome.composite_score,
+            steps: outcome.step_reflections.clone(),
+            total_iterations: outcome.total_iterations,
+            total_cost_usd: outcome.cost_usd,
+        });
         let summary_id = format!("exp-{}", task_run_id);
         let kd = serde_json::to_string(&summary.key_decisions).unwrap_or_default();
         let fp = serde_json::to_string(&summary.failure_points).unwrap_or_default();
@@ -337,9 +340,7 @@ pub async fn run_post_completion(
 
         // Backfill model_used
         if let Some(ref model) = outcome.model_used {
-            let _ = pg
-                .update_learning_outcome_model(task_run_id, model)
-                .await;
+            let _ = pg.update_learning_outcome_model(task_run_id, model).await;
         }
 
         // Strategy extraction: P90+ runs → candidate strategies
@@ -355,29 +356,26 @@ pub async fn run_post_completion(
             );
             if let Ok(p90) = pg.get_score_percentile(&context_key, 90).await {
                 if score > p90 {
-                    let strategy =
-                        strategy_evolution::extract_strategy_from_run(
-                            &strategy_evolution::HighPerformingRun {
-                                task_run_id: task_run_id.to_string(),
-                                domain: outcome.domain.clone(),
-                                complexity_tier: outcome.complexity_tier.clone(),
-                                technology_tags: outcome.technology_tags.clone(),
-                                workflow_architecture: outcome
-                                    .workflow_architecture
-                                    .clone()
-                                    .unwrap_or_default(),
-                                model_used: outcome.model_used.clone(),
-                                composite_score: score,
-                                cost_usd: outcome.cost_usd.unwrap_or(0.0),
-                                duration_secs: outcome.duration_secs.unwrap_or(0.0),
-                            },
-                        );
+                    let strategy = strategy_evolution::extract_strategy_from_run(
+                        &strategy_evolution::HighPerformingRun {
+                            task_run_id: task_run_id.to_string(),
+                            domain: outcome.domain.clone(),
+                            complexity_tier: outcome.complexity_tier.clone(),
+                            technology_tags: outcome.technology_tags.clone(),
+                            workflow_architecture: outcome
+                                .workflow_architecture
+                                .clone()
+                                .unwrap_or_default(),
+                            model_used: outcome.model_used.clone(),
+                            composite_score: score,
+                            cost_usd: outcome.cost_usd.unwrap_or(0.0),
+                            duration_secs: outcome.duration_secs.unwrap_or(0.0),
+                        },
+                    );
                     let app_json =
                         serde_json::to_string(&strategy.applicability).unwrap_or_default();
-                    let comp_json =
-                        serde_json::to_string(&strategy.components).unwrap_or_default();
-                    let prov_json =
-                        serde_json::to_string(&strategy.provenance).unwrap_or_default();
+                    let comp_json = serde_json::to_string(&strategy.components).unwrap_or_default();
+                    let prov_json = serde_json::to_string(&strategy.provenance).unwrap_or_default();
                     if pg
                         .insert_strategy(
                             &strategy.id,

@@ -314,7 +314,9 @@ You do NOT implement anything. You only define what "done" looks like.
     // Inject project constitution so criteria respect project-wide principles
     if let Some(constitution_text) = constitution {
         prompt.push('\n');
-        prompt.push_str(&super::constitution::format_constitution_for_prompt(constitution_text));
+        prompt.push_str(&super::constitution::format_constitution_for_prompt(
+            constitution_text,
+        ));
         prompt.push_str("\nGenerated criteria MUST respect these principles. Any criterion that violates the constitution is invalid.\n");
     }
 
@@ -867,7 +869,10 @@ mod tests {
         }"#;
         let parsed: AcceptanceCriteria = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.criteria.len(), 1);
-        assert_eq!(parsed.criteria[0].ears_category, EarsCategory::NotApplicable);
+        assert_eq!(
+            parsed.criteria[0].ears_category,
+            EarsCategory::NotApplicable
+        );
         assert!(parsed.criteria[0].trigger.is_none());
         assert!(parsed.criteria[0].action.is_none());
         assert!(parsed.bugfix_context.is_none());
@@ -892,7 +897,10 @@ mod tests {
             "assumptions": []
         }"#;
         let parsed: AcceptanceCriteria = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.criteria[0].ears_category, EarsCategory::NotApplicable);
+        assert_eq!(
+            parsed.criteria[0].ears_category,
+            EarsCategory::NotApplicable
+        );
     }
 
     #[test]

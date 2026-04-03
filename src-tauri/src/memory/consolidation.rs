@@ -128,7 +128,10 @@ impl Default for ConsolidationConfig {
 // =============================================================================
 
 /// Group observations by topic-key prefix, same type, and content overlap.
-pub fn group_observations(observations: &[ConsolidationObservation], min_group_size: usize) -> Vec<ObservationGroup> {
+pub fn group_observations(
+    observations: &[ConsolidationObservation],
+    min_group_size: usize,
+) -> Vec<ObservationGroup> {
     let mut groups: Vec<ObservationGroup> = Vec::new();
     let mut assigned: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
@@ -145,10 +148,8 @@ pub fn group_observations(observations: &[ConsolidationObservation], min_group_s
     }
     for (prefix, obs_list) in &prefix_map {
         if obs_list.len() >= min_group_size {
-            let group_obs: Vec<ConsolidationObservation> = obs_list
-                .iter()
-                .map(|o| (*o).clone())
-                .collect();
+            let group_obs: Vec<ConsolidationObservation> =
+                obs_list.iter().map(|o| (*o).clone()).collect();
             for o in &group_obs {
                 assigned.insert(o.id);
             }
@@ -164,15 +165,16 @@ pub fn group_observations(observations: &[ConsolidationObservation], min_group_s
     let mut type_map: HashMap<String, Vec<&ConsolidationObservation>> = HashMap::new();
     for obs in observations {
         if !assigned.contains(&obs.id) {
-            type_map.entry(obs.observation_type.clone()).or_default().push(obs);
+            type_map
+                .entry(obs.observation_type.clone())
+                .or_default()
+                .push(obs);
         }
     }
     for (obs_type, obs_list) in &type_map {
         if obs_list.len() >= min_group_size {
-            let group_obs: Vec<ConsolidationObservation> = obs_list
-                .iter()
-                .map(|o| (*o).clone())
-                .collect();
+            let group_obs: Vec<ConsolidationObservation> =
+                obs_list.iter().map(|o| (*o).clone()).collect();
             for o in &group_obs {
                 assigned.insert(o.id);
             }
@@ -281,11 +283,10 @@ pub fn group_observations(observations: &[ConsolidationObservation], min_group_s
 // =============================================================================
 
 const STOP_WORDS: &[&str] = &[
-    "the", "and", "for", "that", "this", "with", "from", "are", "was", "were",
-    "been", "have", "has", "had", "not", "but", "all", "can", "her", "his",
-    "its", "may", "will", "each", "which", "their", "then", "them", "some",
-    "into", "over", "such", "when", "very", "just", "about", "also", "more",
-    "other", "than", "only", "should", "could", "would", "after", "before",
+    "the", "and", "for", "that", "this", "with", "from", "are", "was", "were", "been", "have",
+    "has", "had", "not", "but", "all", "can", "her", "his", "its", "may", "will", "each", "which",
+    "their", "then", "them", "some", "into", "over", "such", "when", "very", "just", "about",
+    "also", "more", "other", "than", "only", "should", "could", "would", "after", "before",
 ];
 
 /// Extract term frequencies from text, filtering stop words and short tokens.
@@ -382,7 +383,11 @@ fn build_consolidation_prompt(group: &ObservationGroup) -> String {
 
     // Sort by importance DESC
     let mut sorted: Vec<&ConsolidationObservation> = group.observations.iter().collect();
-    sorted.sort_by(|a, b| b.importance.partial_cmp(&a.importance).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     for obs in &sorted {
         prompt.push_str(&format!(
@@ -426,8 +431,13 @@ fn parse_consolidation_response(response: &str) -> Result<ConsolidationResult, S
         .trim_end_matches("```")
         .trim();
 
-    serde_json::from_str(cleaned)
-        .map_err(|e| format!("Failed to parse consolidation response: {}. Response: {}", e, &cleaned[..cleaned.len().min(200)]))
+    serde_json::from_str(cleaned).map_err(|e| {
+        format!(
+            "Failed to parse consolidation response: {}. Response: {}",
+            e,
+            &cleaned[..cleaned.len().min(200)]
+        )
+    })
 }
 
 // =============================================================================
@@ -444,18 +454,19 @@ pub async fn run_consolidation(
     let mut stats = ConsolidationStats::default();
 
     // Insert consolidation log entry
-    let log_id = pg.insert_consolidation_log().await
+    let log_id = pg
+        .insert_consolidation_log()
+        .await
         .map_err(|e| format!("Failed to insert consolidation log: {}", e))?;
 
     let result = run_consolidation_inner(pg, config, &mut stats).await;
 
     // Complete the log entry
     let error_msg = result.as_ref().err().cloned();
-    if let Err(e) = pg.complete_consolidation_log(
-        log_id,
-        &stats,
-        error_msg.as_deref(),
-    ).await {
+    if let Err(e) = pg
+        .complete_consolidation_log(log_id, &stats, error_msg.as_deref())
+        .await
+    {
         warn!("Failed to complete consolidation log: {}", e);
     }
 
@@ -469,7 +480,9 @@ async fn run_consolidation_inner(
 ) -> Result<(), String> {
     // Phase A: Orient — fetch and group observations
     info!("Memory consolidation: Phase A — Orient (fetching observations)");
-    let observations = pg.get_observations_for_consolidation(config.max_observations).await
+    let observations = pg
+        .get_observations_for_consolidation(config.max_observations)
+        .await
         .map_err(|e| format!("Failed to fetch observations: {}", e))?;
 
     stats.observations_scanned = observations.len() as i32;
@@ -490,9 +503,17 @@ async fn run_consolidation_inner(
         );
         let new_decay = importance::compute_decay_rate(new_importance, obs.is_mental_model);
 
-        if (new_importance - obs.importance).abs() > 0.01 || (new_decay - obs.decay_rate).abs() > 0.001 {
-            if let Err(e) = pg.update_observation_importance(obs.id, new_importance, new_decay).await {
-                tracing::warn!("Failed to update observation importance for id {}: {e}", obs.id);
+        if (new_importance - obs.importance).abs() > 0.01
+            || (new_decay - obs.decay_rate).abs() > 0.001
+        {
+            if let Err(e) = pg
+                .update_observation_importance(obs.id, new_importance, new_decay)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to update observation importance for id {}: {e}",
+                    obs.id
+                );
             }
         }
     }
@@ -501,9 +522,15 @@ async fn run_consolidation_inner(
     stats.groups_found = groups.len() as i32;
 
     if groups.is_empty() {
-        info!("Memory consolidation: no groups of {} or more observations found", config.min_group_size);
+        info!(
+            "Memory consolidation: no groups of {} or more observations found",
+            config.min_group_size
+        );
     } else {
-        info!("Memory consolidation: Phase B/C — Consolidating {} groups", groups.len());
+        info!(
+            "Memory consolidation: Phase B/C — Consolidating {} groups",
+            groups.len()
+        );
     }
 
     // Phase B+C: For each group, build prompt and call LLM
@@ -537,7 +564,10 @@ async fn run_consolidation_inner(
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                warn!("Consolidation spawn_blocking failed for group '{}': {}", group.group_key, e);
+                warn!(
+                    "Consolidation spawn_blocking failed for group '{}': {}",
+                    group.group_key, e
+                );
                 continue;
             }
         };
@@ -553,7 +583,10 @@ async fn run_consolidation_inner(
         let result = match parse_consolidation_response(&response.output) {
             Ok(r) => r,
             Err(e) => {
-                warn!("Failed to parse consolidation for group '{}': {}", group.group_key, e);
+                warn!(
+                    "Failed to parse consolidation for group '{}': {}",
+                    group.group_key, e
+                );
                 continue;
             }
         };
@@ -576,14 +609,16 @@ async fn run_consolidation_inner(
             "personal"
         };
 
-        let model_id = pg.save_mental_model(
-            &result.title,
-            &result.content,
-            &result.observation_type,
-            scope,
-            mental_model_importance,
-            &source_ids,
-        ).await;
+        let model_id = pg
+            .save_mental_model(
+                &result.title,
+                &result.content,
+                &result.observation_type,
+                scope,
+                mental_model_importance,
+                &source_ids,
+            )
+            .await;
 
         match model_id {
             Ok(_id) => {
@@ -593,23 +628,32 @@ async fn run_consolidation_inner(
                 for &obs_id in &result.supersedes {
                     if source_ids.contains(&obs_id) {
                         if let Err(e) = pg.reduce_observation_importance(obs_id, 0.5).await {
-                            tracing::warn!("Failed to reduce observation importance for id {obs_id}: {e}");
+                            tracing::warn!(
+                                "Failed to reduce observation importance for id {obs_id}: {e}"
+                            );
                         }
                         stats.observations_merged += 1;
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to save mental model for group '{}': {}", group.group_key, e);
+                warn!(
+                    "Failed to save mental model for group '{}': {}",
+                    group.group_key, e
+                );
             }
         }
     }
 
     // Phase D continued: Run decay pass
     info!("Memory consolidation: Phase D — Decay pass");
-    let archived_obs = pg.decay_and_archive_observations(config.archive_threshold).await
+    let archived_obs = pg
+        .decay_and_archive_observations(config.archive_threshold)
+        .await
         .unwrap_or(0);
-    let archived_models = pg.decay_and_archive_mental_models(config.archive_threshold).await
+    let archived_models = pg
+        .decay_and_archive_mental_models(config.archive_threshold)
+        .await
         .unwrap_or(0);
 
     stats.observations_archived = (archived_obs + archived_models) as i32;
@@ -644,7 +688,13 @@ pub async fn can_run_consolidation(pg: &Arc<PgDb>, cooldown_hours: f64) -> bool 
 mod tests {
     use super::*;
 
-    fn make_obs(id: i64, title: &str, obs_type: &str, topic_key: Option<&str>, importance: f64) -> ConsolidationObservation {
+    fn make_obs(
+        id: i64,
+        title: &str,
+        obs_type: &str,
+        topic_key: Option<&str>,
+        importance: f64,
+    ) -> ConsolidationObservation {
         ConsolidationObservation {
             id,
             title: title.to_string(),
@@ -673,9 +723,27 @@ mod tests {
     #[test]
     fn test_group_by_topic_prefix() {
         let obs = vec![
-            make_obs(1, "Auth token expiry", "bugfix", Some("auth/token-expiry"), 0.6),
-            make_obs(2, "Auth middleware update", "architecture", Some("auth/middleware"), 0.8),
-            make_obs(3, "Auth session handling", "pattern", Some("auth/sessions"), 0.5),
+            make_obs(
+                1,
+                "Auth token expiry",
+                "bugfix",
+                Some("auth/token-expiry"),
+                0.6,
+            ),
+            make_obs(
+                2,
+                "Auth middleware update",
+                "architecture",
+                Some("auth/middleware"),
+                0.8,
+            ),
+            make_obs(
+                3,
+                "Auth session handling",
+                "pattern",
+                Some("auth/sessions"),
+                0.5,
+            ),
             make_obs(4, "CSS grid layout fix", "bugfix", Some("css/grid"), 0.5),
         ];
 
@@ -764,8 +832,20 @@ mod tests {
             reason: GroupingReason::TopicPrefix("auth".to_string()),
             observations: vec![
                 make_obs(1, "Auth token expiry", "bugfix", Some("auth/token"), 0.6),
-                make_obs(2, "Auth session handling", "pattern", Some("auth/session"), 0.5),
-                make_obs(3, "Auth middleware update", "architecture", Some("auth/mw"), 0.8),
+                make_obs(
+                    2,
+                    "Auth session handling",
+                    "pattern",
+                    Some("auth/session"),
+                    0.5,
+                ),
+                make_obs(
+                    3,
+                    "Auth middleware update",
+                    "architecture",
+                    Some("auth/mw"),
+                    0.8,
+                ),
             ],
         };
 
@@ -882,7 +962,8 @@ mod tests {
 
     #[test]
     fn test_tfidf_cosine_identical() {
-        let a: HashMap<String, f64> = [("auth".to_string(), 0.5), ("token".to_string(), 0.3)].into();
+        let a: HashMap<String, f64> =
+            [("auth".to_string(), 0.5), ("token".to_string(), 0.3)].into();
         let b = a.clone();
         let sim = tfidf_cosine_similarity(&a, &b);
         assert!((sim - 1.0).abs() < 0.01);
@@ -898,8 +979,10 @@ mod tests {
 
     #[test]
     fn test_tfidf_cosine_partial_overlap() {
-        let a: HashMap<String, f64> = [("auth".to_string(), 0.5), ("token".to_string(), 0.5)].into();
-        let b: HashMap<String, f64> = [("auth".to_string(), 0.5), ("session".to_string(), 0.5)].into();
+        let a: HashMap<String, f64> =
+            [("auth".to_string(), 0.5), ("token".to_string(), 0.5)].into();
+        let b: HashMap<String, f64> =
+            [("auth".to_string(), 0.5), ("session".to_string(), 0.5)].into();
         let sim = tfidf_cosine_similarity(&a, &b);
         assert!(sim > 0.0);
         assert!(sim < 1.0);
@@ -908,9 +991,27 @@ mod tests {
     #[test]
     fn test_similarity_grouping_clusters_related_content() {
         let obs = vec![
-            make_obs(1, "Database connection pool timeout error handling", "bugfix", None, 0.5),
-            make_obs(2, "Database connection retry timeout strategy", "bugfix", None, 0.5),
-            make_obs(3, "Database pool connection error recovery", "bugfix", None, 0.5),
+            make_obs(
+                1,
+                "Database connection pool timeout error handling",
+                "bugfix",
+                None,
+                0.5,
+            ),
+            make_obs(
+                2,
+                "Database connection retry timeout strategy",
+                "bugfix",
+                None,
+                0.5,
+            ),
+            make_obs(
+                3,
+                "Database pool connection error recovery",
+                "bugfix",
+                None,
+                0.5,
+            ),
             make_obs(4, "CSS grid layout alignment issue", "bugfix", None, 0.5),
         ];
 

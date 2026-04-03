@@ -12,11 +12,11 @@ use tauri::Emitter;
 use tracing::{error, info, warn};
 
 use crate::config::ConfigLoader;
+use crate::database::CreateTaskRunInput;
 use crate::executor::with_default_bridge;
 use crate::mcp::misc::{generate_id_from_path, path_to_name};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, GoToStateRequest, GoToStateResult};
 use crate::settings;
-use crate::database::CreateTaskRunInput;
 use crate::timeout_config::Timeouts;
 
 // ============================================================================
@@ -343,10 +343,17 @@ pub async fn load_config(
                 .unwrap_or_else(|| path_to_name(&config_path_for_event));
 
             // Upsert: update if exists, insert if new
-            let save_result = state.app_state.pg_db.save_config_with_id(
-                &config_id, config_data.clone(), &config_name,
-                "file", Some(&config_path_for_event),
-            ).await;
+            let save_result = state
+                .app_state
+                .pg_db
+                .save_config_with_id(
+                    &config_id,
+                    config_data.clone(),
+                    &config_name,
+                    "file",
+                    Some(&config_path_for_event),
+                )
+                .await;
             if let Err(e) = save_result {
                 warn!(
                     "MCP API: Failed to auto-store config in ConfigStorage: {}",
@@ -574,7 +581,8 @@ pub async fn run_workflow(
     // Create a TaskRun for this automation execution via PG directly.
     // This ensures ALL automation runs go through the unified TaskRun system.
     let task_run_id = uuid::Uuid::new_v4().to_string();
-    let mut input = CreateTaskRunInput::new(&task_run_id, format!("Workflow: {}", request.workflow_name));
+    let mut input =
+        CreateTaskRunInput::new(&task_run_id, format!("Workflow: {}", request.workflow_name));
     input.task_type = Some("automation".to_string());
     input.config_id = config_id.clone();
     input.workflow_name = Some(request.workflow_name.clone());
@@ -583,8 +591,7 @@ pub async fn run_workflow(
         Ok(tr) => {
             info!(
                 "MCP API: Created TaskRun {} for workflow {}",
-                tr.id,
-                request.workflow_name
+                tr.id, request.workflow_name
             );
             tr
         }
@@ -639,7 +646,12 @@ pub async fn run_workflow(
                     .error
                     .as_deref()
                     .unwrap_or("Workflow failed");
-                if let Err(e) = state.app_state.pg_db.fail_task_run(&task_run.id, error_msg).await {
+                if let Err(e) = state
+                    .app_state
+                    .pg_db
+                    .fail_task_run(&task_run.id, error_msg)
+                    .await
+                {
                     warn!("MCP API: Failed to mark task run as failed: {}", e);
                 }
             }
@@ -654,7 +666,12 @@ pub async fn run_workflow(
             error!("MCP API: Workflow execution failed: {}", e);
 
             // Mark task run as failed
-            if let Err(fail_err) = state.app_state.pg_db.fail_task_run(&task_run.id, &e.to_string()).await {
+            if let Err(fail_err) = state
+                .app_state
+                .pg_db
+                .fail_task_run(&task_run.id, &e.to_string())
+                .await
+            {
                 warn!("MCP API: Failed to mark task run as failed: {}", fail_err);
             }
 

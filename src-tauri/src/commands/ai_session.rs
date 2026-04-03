@@ -136,7 +136,10 @@ pub async fn send_user_message(
     // Persist user message to output_log for recap/summary generation
     if let Some(pg) = crate::database::pg::PgDb::try_global() {
         let formatted = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", message);
-        if let Err(e) = pg.append_task_output_ex(&task_run_id, &formatted, false, false).await {
+        if let Err(e) = pg
+            .append_task_output_ex(&task_run_id, &formatted, false, false)
+            .await
+        {
             warn!("Failed to persist user message to output_log: {}", e);
         }
     }
@@ -398,7 +401,10 @@ pub async fn close_ai_session(
     }
 
     // Update DB status
-    let _ = app_state.pg_db.update_task_run_status(&task_run_id, "stopped").await;
+    let _ = app_state
+        .pg_db
+        .update_task_run_status(&task_run_id, "stopped")
+        .await;
 
     // Emit closed state
     emit_session_state(
@@ -461,7 +467,10 @@ pub async fn get_ai_output(
     session_manager: tauri::State<'_, Arc<SessionManager>>,
     task_run_id: String,
 ) -> Result<CommandResponse, String> {
-    let db_output = app_state.pg_db.get_task_output(&task_run_id).await
+    let db_output = app_state
+        .pg_db
+        .get_task_output(&task_run_id)
+        .await
         .unwrap_or_default();
 
     // If there's a live session, append any unpersisted AI output.
@@ -744,7 +753,11 @@ pub async fn generate_workflow_from_session(
                             "generated_workflow_name": wf_name,
                         });
                         let rd_str = result_data.to_string();
-                        if let Err(e) = app_state.pg_db.update_task_result_data(&task_run_id, &rd_str).await {
+                        if let Err(e) = app_state
+                            .pg_db
+                            .update_task_result_data(&task_run_id, &rd_str)
+                            .await
+                        {
                             warn!("Failed to update AI session task run result_data: {}", e);
                         }
                     }
@@ -797,8 +810,10 @@ pub async fn generate_workflow_from_session(
                     {
                         let formatted =
                             format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", system_note);
-                        if let Err(e) =
-                            app_state.pg_db.append_task_output_ex(&task_run_id, &formatted, false, false).await
+                        if let Err(e) = app_state
+                            .pg_db
+                            .append_task_output_ex(&task_run_id, &formatted, false, false)
+                            .await
                         {
                             warn!("Failed to persist system note to output_log: {}", e);
                         }
@@ -842,7 +857,10 @@ pub async fn generate_workflow_from_session(
 
                 {
                     let formatted = format!("\n[SYSTEM_NOTE]\n{}\n[/SYSTEM_NOTE]\n", fail_note);
-                    if let Err(e) = app_state.pg_db.append_task_output_ex(&task_run_id, &formatted, false, false).await
+                    if let Err(e) = app_state
+                        .pg_db
+                        .append_task_output_ex(&task_run_id, &formatted, false, false)
+                        .await
                     {
                         warn!("Failed to persist generation-failed system note: {}", e);
                     }
@@ -891,7 +909,6 @@ pub async fn resume_ai_sessions(
     info!("AI session resume: skipped (SQLite removed, PG support pending)");
     0
 }
-
 
 /// Tries both the cached external app specs and the runner's own specs.
 /// Returns a JSON string of whatever specs are available, or an empty message.

@@ -24,7 +24,8 @@ pub fn comparison_to_recommendation(
     // Load the comparison run from PG
     let comparison: ComparisonRun = {
         let row = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
+            tokio::runtime::Handle::current()
+                .block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
         })?
         .ok_or_else(|| format!("Comparison not found: {}", comp_id))?;
 
@@ -87,7 +88,6 @@ pub fn comparison_to_recommendation(
 
     // Create the recommendation
     let recommendation = super::recommendations::create_recommendation(
-        
         pg_db,
         "comparison",
         "config_change",
@@ -112,7 +112,7 @@ pub fn comparison_to_recommendation(
     // Link the comparison back to the recommendation via PG
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(
-            pg_db.update_comparison_recommendation_link(&recommendation.id, &comparison.id)
+            pg_db.update_comparison_recommendation_link(&recommendation.id, &comparison.id),
         )
     })?;
 
@@ -157,7 +157,9 @@ pub fn build_validation_comparison(
     // Find a recent workflow to use as benchmark
     let workflow_id: Option<String> = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(pg_db.get_most_recent_workflow_id())
-    }).ok().flatten();
+    })
+    .ok()
+    .flatten();
 
     let workflow_id = match workflow_id {
         Some(id) => id,
@@ -203,9 +205,7 @@ pub fn build_validation_comparison_with_pg(
 /// Check if bridge columns exist. SQLite-only (uses PRAGMA).
 /// PG always has these columns so this always returns true when PG is available.
 #[allow(dead_code)]
-pub fn has_bridge_columns_with_pg(
-    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
-) -> bool {
+pub fn has_bridge_columns_with_pg(_pg_db: &std::sync::Arc<crate::database::pg::PgDb>) -> bool {
     // PG schema always has these columns; SQLite may not if migration hasn't run
     true
 }

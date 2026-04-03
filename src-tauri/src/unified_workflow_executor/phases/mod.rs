@@ -26,7 +26,6 @@
 
 use tracing::{debug, info};
 
-
 // Token tracking, UI Bridge, environment readiness, response mode, and token
 // estimation extracted to phase_helpers module.
 pub(super) use super::phase_helpers::{
@@ -55,9 +54,7 @@ pub use verification::VerificationExecutor;
 /// Build a timing context string from execution spans for the current execution.
 ///
 /// Returns None if no spans exist or the query fails.
-fn build_execution_timing_context(
-    _execution_id: &str,
-) -> Option<String> {
+fn build_execution_timing_context(_execution_id: &str) -> Option<String> {
     // Execution timing context removed — all persistence now via PgDb.
     None
 }
@@ -114,7 +111,10 @@ async fn build_compressed_iteration_history(
 
     // 1. Latest verification feedback from knowledge base (most actionable -- show first)
     // Priority: CRITICAL -- always included regardless of budget
-    if let Ok(feedback) = pg_db.list_task_knowledge(execution_id, Some("verification_feedback"), false).await {
+    if let Ok(feedback) = pg_db
+        .list_task_knowledge(execution_id, Some("verification_feedback"), false)
+        .await
+    {
         if let Some(latest) = feedback.last() {
             let mut lines = vec!["### Last Verification Feedback".to_string()];
             lines.push(String::new());
@@ -173,11 +173,15 @@ async fn build_compressed_iteration_history(
     let recent_cutoff = current_iteration.saturating_sub(full_fidelity_iterations);
 
     // Load all observations once for efficient per-iteration lookup
-    let all_observations = pg_db.list_task_knowledge(execution_id, Some("observation"), false).await
+    let all_observations = pg_db
+        .list_task_knowledge(execution_id, Some("observation"), false)
+        .await
         .unwrap_or_default();
 
     // Load all solutions for fix descriptions
-    let all_solutions = pg_db.list_task_knowledge(execution_id, Some("solution"), false).await
+    let all_solutions = pg_db
+        .list_task_knowledge(execution_id, Some("solution"), false)
+        .await
         .unwrap_or_default();
 
     // --- 3a. Recent iteration (full fidelity) ---
@@ -191,7 +195,10 @@ async fn build_compressed_iteration_history(
         recent_lines.push(String::new());
 
         // Full verification results for recent iteration
-        if let Ok(Some(result)) = pg_db.get_verification_phase_result(execution_id, recent_iter).await {
+        if let Ok(Some(result)) = pg_db
+            .get_verification_phase_result(execution_id, recent_iter)
+            .await
+        {
             let passed = result
                 .get("passed_steps")
                 .and_then(|v| v.as_u64())
@@ -275,7 +282,10 @@ async fn build_compressed_iteration_history(
             let mut current_failed_names: Vec<String> = Vec::new();
 
             // Verification pass/fail summary
-            if let Ok(Some(result)) = pg_db.get_verification_phase_result(execution_id, iter).await {
+            if let Ok(Some(result)) = pg_db
+                .get_verification_phase_result(execution_id, iter)
+                .await
+            {
                 let passed = result
                     .get("passed_steps")
                     .and_then(|v| v.as_u64())
@@ -525,7 +535,15 @@ async fn build_compressed_iteration_history(
                 }
             } else {
                 // Fallback: chronological ordering (pre-v99 databases)
-                if let Ok(historical) = pg_db.list_workflow_knowledge(wf_name, execution_id, &["recurring_pattern", "context"], 10).await {
+                if let Ok(historical) = pg_db
+                    .list_workflow_knowledge(
+                        wf_name,
+                        execution_id,
+                        &["recurring_pattern", "context"],
+                        10,
+                    )
+                    .await
+                {
                     if !historical.is_empty() {
                         let mut lines =
                             vec!["### Historical Knowledge (from previous runs)".to_string()];
@@ -559,7 +577,10 @@ async fn build_compressed_iteration_history(
     // Priority: MEDIUM -- only on first iteration when cross_workflow_learning is enabled
     if cross_workflow_learning && current_iteration <= 1 && budget_remaining > 200 {
         if let Some(wf_name) = workflow_name {
-            if let Ok(insights) = pg_db.get_cross_workflow_knowledge(wf_name, execution_id, 3).await {
+            if let Ok(insights) = pg_db
+                .get_cross_workflow_knowledge(wf_name, execution_id, 3)
+                .await
+            {
                 if !insights.is_empty() {
                     let mut lines = vec!["## Insights from similar workflows".to_string()];
                     lines.push(String::new());
@@ -658,12 +679,14 @@ async fn build_compressed_iteration_history(
                             prediction_count += 1;
 
                             // Record that this fix was shown to the AI (PG: save_fix_application)
-                            let _ = pg_db.save_fix_application(
-                                &predicted.fix_id,
-                                execution_id,
-                                Some(sig),
-                                "shown",
-                            ).await;
+                            let _ = pg_db
+                                .save_fix_application(
+                                    &predicted.fix_id,
+                                    execution_id,
+                                    Some(sig),
+                                    "shown",
+                                )
+                                .await;
                         }
                     }
                 }
@@ -761,13 +784,13 @@ async fn build_compressed_iteration_history(
 
         // Fall back to SQL-only retrieval if hybrid search failed
         let fixes_to_inject: Vec<(String, String, Option<String>)> = match universal_fixes {
-            Some(results) if !results.is_empty() => {
-                results
-            }
+            Some(results) if !results.is_empty() => results,
             _ => {
                 // SQL-only fallback: get universal fixes by reuse_count
                 // PG: get_universal_fixes
-                pg_db.get_universal_fixes(5).await
+                pg_db
+                    .get_universal_fixes(5)
+                    .await
                     .ok()
                     .unwrap_or_default()
                     .into_iter()
@@ -1079,10 +1102,7 @@ fn extract_changed_files_from_observation(content: &str) -> Vec<String> {
 ///
 /// For each changed file, looks up the architecture model for impact data.
 /// Returns None if no architecture data exists or no impacts found.
-async fn build_impact_context(
-    workflow_name: &str,
-    changed_files: &[String],
-) -> Option<String> {
+async fn build_impact_context(workflow_name: &str, changed_files: &[String]) -> Option<String> {
     if changed_files.is_empty() {
         return None;
     }
@@ -1304,11 +1324,12 @@ fn preread_previously_edited_files(
     let mut seen = HashSet::new();
     let mut valid_paths = Vec::new();
 
-    for obs in all_observations
-        .iter()
-        .filter(|o| o.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0) < current_iteration as u64)
-    {
-        for file_str in extract_changed_files_from_observation(obs.get("content").and_then(|v| v.as_str()).unwrap_or("")) {
+    for obs in all_observations.iter().filter(|o| {
+        o.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0) < current_iteration as u64
+    }) {
+        for file_str in extract_changed_files_from_observation(
+            obs.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+        ) {
             if seen.contains(&file_str) {
                 continue;
             }

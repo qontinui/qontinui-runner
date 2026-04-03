@@ -132,8 +132,11 @@ pub async fn start_flow_execution(
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
     // Get flow from database
-    let flow_json = app_state.pg_db.get_flow(&flow_id).await?
-    .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
+    let flow_json = app_state
+        .pg_db
+        .get_flow(&flow_id)
+        .await?
+        .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     let flow: Flow = serde_json::from_value(flow_json)
         .map_err(|e| format!("Failed to deserialize flow: {}", e))?;
@@ -667,11 +670,10 @@ pub async fn get_flow_executions_paginated(
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedFlowExecutionResult, String> {
-    let executions_json =
-        state
-            .pg_db
-            .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)
-            .await?;
+    let executions_json = state
+        .pg_db
+        .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)
+        .await?;
 
     let summaries = executions_json
         .into_iter()
@@ -1010,12 +1012,15 @@ pub async fn create_flow_version(
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     // Create version
-    let version = state.pg_db.create_flow_version(
-        &flow_id,
-        &flow_json,
-        message.as_deref(),
-        created_by.as_deref(),
-    ).await?;
+    let version = state
+        .pg_db
+        .create_flow_version(
+            &flow_id,
+            &flow_json,
+            message.as_deref(),
+            created_by.as_deref(),
+        )
+        .await?;
 
     Ok(FlowVersionSummary {
         id: version["id"].as_str().unwrap_or("").to_string(),

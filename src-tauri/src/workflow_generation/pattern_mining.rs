@@ -128,10 +128,7 @@ pub fn mine_patterns() -> Result<MiningReport, String> {
 ///
 /// Only patterns with `occurrence_count >= min_occurrences` are promoted to rules.
 /// Returns the count of newly created rules.
-pub fn patterns_to_rules(
-    patterns: &[MinedPattern],
-    min_occurrences: u32,
-) -> Result<u32, String> {
+pub fn patterns_to_rules(patterns: &[MinedPattern], min_occurrences: u32) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 

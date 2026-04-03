@@ -3,7 +3,9 @@
 //! Provides CRUD for the `generation_rules` table using raw SQL.
 
 use super::PgDb;
-use crate::workflow_generation::rules::{GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput};
+use crate::workflow_generation::rules::{
+    GenerationRule, InsertRuleInput, ListRulesQuery, UpdateRuleInput,
+};
 use tracing::{info, warn};
 
 fn row_to_rule(row: &tokio_postgres::Row) -> GenerationRule {
@@ -37,7 +39,11 @@ impl PgDb {
         agent: &str,
         section: Option<&str>,
     ) -> Result<Vec<GenerationRule>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if let Some(section) = section {
             conn.query(
@@ -69,7 +75,11 @@ impl PgDb {
 
     /// Get a single rule by ID.
     pub async fn get_rule_by_id(&self, id: &str) -> Result<Option<GenerationRule>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -87,7 +97,11 @@ impl PgDb {
 
     /// Upsert a generation rule (INSERT ON CONFLICT DO UPDATE).
     pub async fn upsert_rule(&self, input: &InsertRuleInput) -> Result<GenerationRule, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = format!("rule-{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
@@ -148,7 +162,11 @@ impl PgDb {
         &self,
         query: &ListRulesQuery,
     ) -> Result<Vec<GenerationRule>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, agent, section, rule_number, title, content, condition, status,
@@ -180,8 +198,10 @@ impl PgDb {
         }
         sql.push_str(" ORDER BY agent, section, rule_number");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &param_refs)
@@ -197,7 +217,11 @@ impl PgDb {
         id: &str,
         input: &UpdateRuleInput,
     ) -> Result<GenerationRule, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let mut sets = vec!["updated_at = $1".to_string()];
@@ -248,8 +272,10 @@ impl PgDb {
         );
         param_values.push(Box::new(id.to_string()));
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            param_values.iter().map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
+            .iter()
+            .map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         conn.execute(&sql, &params)
             .await
@@ -262,7 +288,11 @@ impl PgDb {
 
     /// Delete a generation rule by ID.
     pub async fn delete_rule(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM generation_rules WHERE id = $1", &[&id])
@@ -277,7 +307,11 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -312,7 +346,11 @@ impl PgDb {
         &self,
         domain_filter: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Check if the step_templates table exists in PG
         let exists = conn
@@ -360,7 +398,11 @@ impl PgDb {
 
     /// Get the next rule number for a given agent/section.
     pub async fn next_rule_number(&self, agent: &str, section: &str) -> Result<i32, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_one(
             "SELECT COALESCE(MAX(rule_number), 0) + 1 FROM generation_rules WHERE agent = $1 AND section = $2",
             &[&agent, &section],
@@ -378,49 +420,83 @@ impl PgDb {
 
     /// Check if a generation rule exists by ID.
     pub async fn rule_exists(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_one(
-            "SELECT COUNT(*) > 0 FROM generation_rules WHERE id = $1",
-            &[&id],
-        ).await.map_err(|e| format!("PG rule_exists: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*) > 0 FROM generation_rules WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG rule_exists: {}", e))?;
         Ok(row.get(0))
     }
 
     /// Get examples_json for a rule.
     pub async fn get_rule_examples_json(&self, id: &str) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            "SELECT examples_json FROM generation_rules WHERE id = $1",
-            &[&id],
-        ).await.map_err(|e| format!("PG get_rule_examples: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT examples_json FROM generation_rules WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_rule_examples: {}", e))?;
         Ok(row.and_then(|r| r.get(0)))
     }
 
     /// Update examples_json for a rule.
     pub async fn update_rule_examples(&self, id: &str, examples_json: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE generation_rules SET examples_json = $1, updated_at = $2 WHERE id = $3",
             &[&examples_json, &now, &id],
-        ).await.map_err(|e| format!("PG update_rule_examples: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG update_rule_examples: {}", e))?;
         Ok(())
     }
 
     /// Find a rule by source_fix_id (used for rollback).
-    pub async fn find_rule_by_source_fix_id(&self, source_fix_id: &str) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            "SELECT id FROM generation_rules WHERE source_fix_id = $1 LIMIT 1",
-            &[&source_fix_id],
-        ).await.map_err(|e| format!("PG find_rule_by_source_fix_id: {}", e))?;
+    pub async fn find_rule_by_source_fix_id(
+        &self,
+        source_fix_id: &str,
+    ) -> Result<Option<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT id FROM generation_rules WHERE source_fix_id = $1 LIMIT 1",
+                &[&source_fix_id],
+            )
+            .await
+            .map_err(|e| format!("PG find_rule_by_source_fix_id: {}", e))?;
         Ok(row.map(|r| r.get(0)))
     }
 
     /// Increment the failure_count for a rule and auto-promote to 'critical'
     /// once failure_count reaches 5.
     pub async fn increment_rule_failure_count(&self, rule_id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             r#"UPDATE generation_rules
                SET failure_count = failure_count + 1,

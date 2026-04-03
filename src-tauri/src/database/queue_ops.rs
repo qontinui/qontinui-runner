@@ -29,7 +29,10 @@ impl QueueEntryStatus {
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
             other => {
-                tracing::warn!("Unknown queue entry status '{}', defaulting to Pending", other);
+                tracing::warn!(
+                    "Unknown queue entry status '{}', defaulting to Pending",
+                    other
+                );
                 Self::Pending
             }
         }

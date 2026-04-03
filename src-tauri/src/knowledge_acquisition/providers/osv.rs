@@ -164,7 +164,10 @@ impl Osv {
         ecosystem: OsvEcosystem,
         version: &str,
     ) -> Result<Vec<KnowledgeResult>, String> {
-        let query = format!("{name}@{version} ({ecosystem})", ecosystem = ecosystem.as_str());
+        let query = format!(
+            "{name}@{version} ({ecosystem})",
+            ecosystem = ecosystem.as_str()
+        );
 
         let request = OsvQueryRequest {
             package: Some(OsvPackage {
@@ -309,10 +312,7 @@ fn vuln_to_result(
         query: query.to_string(),
         title: format!("{} — {}", vuln.id, vuln.summary),
         content,
-        url: vuln
-            .references
-            .first()
-            .map(|r| r.url.clone()),
+        url: vuln.references.first().map(|r| r.url.clone()),
         relevance_score: Some(1.0), // structured data = high relevance
         metadata: KnowledgeMetadata {
             domain: Some(KnowledgeDomain::VulnerabilityIntelligence),
@@ -407,7 +407,13 @@ mod tests {
             modified: "2021-12-15".to_string(),
         };
 
-        let result = vuln_to_result(&vuln, "log4j@2.14.1", "log4j", OsvEcosystem::Maven, "2.14.1");
+        let result = vuln_to_result(
+            &vuln,
+            "log4j@2.14.1",
+            "log4j",
+            OsvEcosystem::Maven,
+            "2.14.1",
+        );
         assert_eq!(result.provider, SearchProvider::OsvDev);
         assert!(result.content.contains("CRITICAL"));
         assert!(result.content.contains("10.0"));

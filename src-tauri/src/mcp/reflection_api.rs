@@ -464,13 +464,17 @@ pub struct ReflectionSettingsResponse {
 pub async fn get_reflection_settings_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ReflectionSettingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let dev_mode = state.app_state.pg_db.get_setting("dev_mode").await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to get setting: {}", e))),
-        )
-    })?;
+    let dev_mode = state
+        .app_state
+        .pg_db
+        .get_setting("dev_mode")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get setting: {}", e))),
+            )
+        })?;
 
     let reflection_enabled = dev_mode
         .and_then(|v| v.get("reflection_enabled").cloned())
@@ -490,14 +494,18 @@ pub async fn update_reflection_settings_handler(
     Json(req): Json<ReflectionSettingsResponse>,
 ) -> Result<Json<ApiResponse<ReflectionSettingsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Read current dev_mode setting or start with empty object
-    let mut dev_mode = state.app_state.pg_db.get_setting("dev_mode").await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to get setting: {}", e))),
-        )
-    })?
-    .unwrap_or_else(|| serde_json::json!({}));
+    let mut dev_mode = state
+        .app_state
+        .pg_db
+        .get_setting("dev_mode")
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get setting: {}", e))),
+            )
+        })?
+        .unwrap_or_else(|| serde_json::json!({}));
 
     // Update the reflection_enabled field
     if let Some(obj) = dev_mode.as_object_mut() {
@@ -508,13 +516,17 @@ pub async fn update_reflection_settings_handler(
     }
 
     // Write back
-    state.app_state.pg_db.set_setting("dev_mode", &dev_mode).await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to update setting: {}", e))),
-        )
-    })?;
+    state
+        .app_state
+        .pg_db
+        .set_setting("dev_mode", &dev_mode)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update setting: {}", e))),
+            )
+        })?;
 
     info!(
         "HTTP: Updated reflection_enabled to {}",
@@ -721,16 +733,18 @@ pub async fn causal_chain_handler(
 ) -> Result<Json<ApiResponse<CausalChain>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
     let chain = if query.direction == "backward" {
-        pg.trace_causal_chain_backward(&query.event_type, &query.event_id, query.max_depth).await
+        pg.trace_causal_chain_backward(&query.event_type, &query.event_id, query.max_depth)
+            .await
     } else {
-        pg.trace_causal_chain_forward(&query.event_type, &query.event_id, query.max_depth).await
+        pg.trace_causal_chain_forward(&query.event_type, &query.event_id, query.max_depth)
+            .await
     }
     .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to trace causal chain: {}", e))),
-            )
-        })?;
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to trace causal chain: {}", e))),
+        )
+    })?;
 
     Ok(Json(ApiResponse::success(chain)))
 }
@@ -742,7 +756,9 @@ pub async fn causal_events_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalWorkflowQuery>,
 ) -> Result<Json<ApiResponse<Vec<CausalEvent>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let events = state.app_state.pg_db
+    let events = state
+        .app_state
+        .pg_db
         .get_causal_events_typed(&query.workflow_name, query.limit)
         .await
         .map_err(|e| {
@@ -762,7 +778,9 @@ pub async fn build_causal_links_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<BuildCausalLinksQuery>,
 ) -> Result<Json<ApiResponse<u32>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let count = state.app_state.pg_db
+    let count = state
+        .app_state
+        .pg_db
         .build_automated_causal_links(&query.task_run_id, &query.workflow_name)
         .await
         .map_err(|e| {
@@ -792,7 +810,9 @@ pub async fn causal_summary_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<CausalWorkflowQuery>,
 ) -> Result<Json<ApiResponse<CausalSummary>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let summary = state.app_state.pg_db
+    let summary = state
+        .app_state
+        .pg_db
         .get_causal_summary(&query.workflow_name)
         .await
         .map_err(|e| {
@@ -860,8 +880,14 @@ pub async fn effectiveness_trend_handler(
     Query(query): Query<EffectivenessTrendQuery>,
 ) -> Result<Json<ApiResponse<EffectivenessOverTime>>, (StatusCode, Json<ApiResponse<()>>)> {
     let bucket_type = query.bucket.as_deref().unwrap_or("week");
-    let result = state.app_state.pg_db
-        .get_effectiveness_over_time(&query.workflow_name, bucket_type, query.time_range.as_deref())
+    let result = state
+        .app_state
+        .pg_db
+        .get_effectiveness_over_time(
+            &query.workflow_name,
+            bucket_type,
+            query.time_range.as_deref(),
+        )
         .await
         .map_err(|e| {
             (
@@ -883,7 +909,9 @@ pub async fn architecture_graph_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> Result<Json<ApiResponse<ComponentGraph>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let graph = state.app_state.pg_db
+    let graph = state
+        .app_state
+        .pg_db
         .get_component_graph(&query.workflow_name)
         .await
         .map_err(|e| {
@@ -906,7 +934,9 @@ pub async fn architecture_rebuild_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ArchitectureQuery>,
 ) -> Result<Json<ApiResponse<RebuildResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = state.app_state.pg_db
+    let result = state
+        .app_state
+        .pg_db
         .rebuild_architecture_model(&query.workflow_name)
         .await
         .map_err(|e| {
@@ -934,7 +964,9 @@ pub async fn architecture_component_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ComponentQuery>,
 ) -> Result<Json<ApiResponse<ComponentDetails>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let details = state.app_state.pg_db
+    let details = state
+        .app_state
+        .pg_db
         .get_component_details(&query.workflow_name, &query.path)
         .await
         .map_err(|e| {
@@ -954,7 +986,9 @@ pub async fn architecture_impact_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ImpactQuery>,
 ) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let impact = state.app_state.pg_db
+    let impact = state
+        .app_state
+        .pg_db
         .get_architecture_impact_analysis(&query.workflow_name, &query.component)
         .await
         .map_err(|e| {
@@ -972,7 +1006,9 @@ pub async fn architecture_impact_graph_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ImpactQuery>,
 ) -> Result<Json<ApiResponse<ImpactAnalysis>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let impact = state.app_state.pg_db
+    let impact = state
+        .app_state
+        .pg_db
         .get_impact_analysis_with_graph(&query.workflow_name, &query.component)
         .await
         .map_err(|e| {
@@ -995,7 +1031,9 @@ pub async fn workflow_trends_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TrendsQuery>,
 ) -> Result<Json<ApiResponse<WorkflowTrends>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let wf_trends = state.app_state.pg_db
+    let wf_trends = state
+        .app_state
+        .pg_db
         .get_workflow_trends(&query.workflow_name, query.time_range.as_deref())
         .await
         .map_err(|e| {
@@ -1015,8 +1053,14 @@ pub async fn component_trend_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ComponentTrendQuery>,
 ) -> Result<Json<ApiResponse<ComponentTrend>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let trend = state.app_state.pg_db
-        .get_component_trend(&query.workflow_name, &query.path, query.time_range.as_deref())
+    let trend = state
+        .app_state
+        .pg_db
+        .get_component_trend(
+            &query.workflow_name,
+            &query.path,
+            query.time_range.as_deref(),
+        )
         .await
         .map_err(|e| {
             (

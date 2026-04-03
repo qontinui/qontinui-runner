@@ -433,7 +433,11 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<crate::database::graph_ops::StepProvenance>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -472,7 +476,11 @@ impl PgDb {
         &self,
         rule_id: &str,
     ) -> Result<Vec<crate::database::graph_ops::RuleInfluence>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -506,7 +514,11 @@ impl PgDb {
         &self,
         min_no_effect_count: i64,
     ) -> Result<Vec<crate::database::graph_ops::IneffectiveRule>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -541,7 +553,11 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<crate::database::graph_ops::PhaseStats>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -579,7 +595,11 @@ impl PgDb {
         &self,
         limit: i64,
     ) -> Result<Vec<crate::database::cross_run_ops::FixEffectivenessScore>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -620,7 +640,11 @@ impl PgDb {
     ) -> Result<Vec<crate::reflection::unified_search::UnifiedSearchResult>, String> {
         use crate::reflection::unified_search::UnifiedSearchResult;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let pattern = format!("%{}%", query);
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
@@ -635,25 +659,37 @@ impl PgDb {
         }
 
         // 1. Search task_run_findings
-        if let Ok(rows) = conn.query(
-            r#"SELECT id, title, description, category, severity
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT id, title, description, category, severity
                FROM task_run_findings
                WHERE title ILIKE $1 OR description ILIKE $1
                ORDER BY detected_at DESC LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let id: String = r.get(0);
                 let title: String = r.get(1);
                 let description: String = r.get(2);
                 let category: String = r.get(3);
                 let severity: String = r.get(4);
-                let score = if title.to_lowercase().contains(&query_lower) { 1.0 } else { 0.7 };
+                let score = if title.to_lowercase().contains(&query_lower) {
+                    1.0
+                } else {
+                    0.7
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "finding".to_string(),
                     entity_id: id,
                     title,
-                    snippet: format!("[{}][{}] {}", category, severity, truncate_str(&description, 120)),
+                    snippet: format!(
+                        "[{}][{}] {}",
+                        category,
+                        severity,
+                        truncate_str(&description, 120)
+                    ),
                     relevance_score: score,
                     source_table: "task_run_findings".to_string(),
                 });
@@ -661,25 +697,37 @@ impl PgDb {
         }
 
         // 2. Search reflection_fixes
-        if let Ok(rows) = conn.query(
-            r#"SELECT id, fix_type, fix_description, COALESCE(reflection_scope, ''), status
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT id, fix_type, fix_description, COALESCE(reflection_scope, ''), status
                FROM reflection_fixes
                WHERE fix_description ILIKE $1 OR fix_type ILIKE $1
                ORDER BY created_at DESC LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let id: String = r.get(0);
                 let fix_type: String = r.get(1);
                 let fix_description: String = r.get(2);
                 let scope: String = r.get(3);
                 let status: String = r.get(4);
-                let score = if fix_type.to_lowercase().contains(&query_lower) { 1.0 } else { 0.7 };
+                let score = if fix_type.to_lowercase().contains(&query_lower) {
+                    1.0
+                } else {
+                    0.7
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "fix".to_string(),
                     entity_id: id,
                     title: fix_type,
-                    snippet: format!("[{}][{}] {}", scope, status, truncate_str(&fix_description, 120)),
+                    snippet: format!(
+                        "[{}][{}] {}",
+                        scope,
+                        status,
+                        truncate_str(&fix_description, 120)
+                    ),
                     relevance_score: score,
                     source_table: "reflection_fixes".to_string(),
                 });
@@ -687,24 +735,36 @@ impl PgDb {
         }
 
         // 3. Search task_knowledge
-        if let Ok(rows) = conn.query(
-            r#"SELECT id, category, content, confidence
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT id, category, content, confidence
                FROM task_knowledge
                WHERE content ILIKE $1 OR category ILIKE $1
                ORDER BY created_at DESC LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let id: String = r.get(0);
                 let category: String = r.get(1);
                 let content: String = r.get(2);
                 let confidence: String = r.get(3);
-                let score = if category.to_lowercase().contains(&query_lower) { 1.0 } else { 0.7 };
+                let score = if category.to_lowercase().contains(&query_lower) {
+                    1.0
+                } else {
+                    0.7
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "knowledge".to_string(),
                     entity_id: id,
                     title: format!("{} knowledge", category),
-                    snippet: format!("[{}][conf:{}] {}", category, confidence, truncate_str(&content, 120)),
+                    snippet: format!(
+                        "[{}][conf:{}] {}",
+                        category,
+                        confidence,
+                        truncate_str(&content, 120)
+                    ),
                     relevance_score: score,
                     source_table: "task_knowledge".to_string(),
                 });
@@ -712,20 +772,30 @@ impl PgDb {
         }
 
         // 4. Search error_events
-        if let Ok(rows) = conn.query(
-            r#"SELECT id, log_source_name, severity, message, error_type
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT id, log_source_name, severity, message, error_type
                FROM error_events
                WHERE message ILIKE $1 OR error_type ILIKE $1
                ORDER BY last_seen_at DESC LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let id: i64 = r.get(0);
                 let source: String = r.get(1);
                 let severity: String = r.get(2);
                 let message: String = r.get(3);
                 let error_type: Option<String> = r.get(4);
-                let score = if error_type.as_deref().is_some_and(|t| t.to_lowercase().contains(&query_lower)) { 1.0 } else { 0.7 };
+                let score = if error_type
+                    .as_deref()
+                    .is_some_and(|t| t.to_lowercase().contains(&query_lower))
+                {
+                    1.0
+                } else {
+                    0.7
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "error".to_string(),
                     entity_id: id.to_string(),
@@ -738,13 +808,16 @@ impl PgDb {
         }
 
         // 5. Search generation_rules
-        if let Ok(rows) = conn.query(
-            r#"SELECT id, agent, title, content, severity, status
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT id, agent, title, content, severity, status
                FROM generation_rules
                WHERE title ILIKE $1 OR content ILIKE $1
                ORDER BY created_at DESC LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let id: String = r.get(0);
                 let agent: String = r.get(1);
@@ -752,12 +825,22 @@ impl PgDb {
                 let content: String = r.get(3);
                 let severity: String = r.get(4);
                 let status: String = r.get(5);
-                let score = if title.to_lowercase().contains(&query_lower) { 1.0 } else { 0.7 };
+                let score = if title.to_lowercase().contains(&query_lower) {
+                    1.0
+                } else {
+                    0.7
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "rule".to_string(),
                     entity_id: id,
                     title: format!("{} ({})", title, agent),
-                    snippet: format!("[{}][{}][{}] {}", agent, severity, status, truncate_str(&content, 120)),
+                    snippet: format!(
+                        "[{}][{}][{}] {}",
+                        agent,
+                        severity,
+                        status,
+                        truncate_str(&content, 120)
+                    ),
                     relevance_score: score,
                     source_table: "generation_rules".to_string(),
                 });
@@ -765,19 +848,26 @@ impl PgDb {
         }
 
         // 6. Search unified_workflows
-        if let Ok(rows) = conn.query(
-            r#"SELECT id, name, description, category
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT id, name, description, category
                FROM unified_workflows
                WHERE name ILIKE $1 OR description ILIKE $1
                ORDER BY updated_at DESC LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let id: String = r.get(0);
                 let name: String = r.get(1);
                 let description: String = r.get(2);
                 let category: String = r.get(3);
-                let score = if name.to_lowercase().contains(&query_lower) { 1.0 } else { 0.7 };
+                let score = if name.to_lowercase().contains(&query_lower) {
+                    1.0
+                } else {
+                    0.7
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "workflow".to_string(),
                     entity_id: id,
@@ -790,27 +880,44 @@ impl PgDb {
         }
 
         // 7. Search ui_bridge_elements
-        if let Ok(rows) = conn.query(
-            r#"SELECT DISTINCT element_id, element_type, label, text_content
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT DISTINCT element_id, element_type, label, text_content
                FROM ui_bridge_elements
                WHERE element_id ILIKE $1 OR label ILIKE $1 OR text_content ILIKE $1
                LIMIT 20"#,
-            &[&pattern],
-        ).await {
+                &[&pattern],
+            )
+            .await
+        {
             for r in &rows {
                 let element_id: String = r.get(0);
                 let element_type: Option<String> = r.get(1);
                 let label: Option<String> = r.get(2);
                 let text_content: Option<String> = r.get(3);
                 let id_matches = element_id.to_lowercase().contains(&query_lower);
-                let label_matches = label.as_deref().is_some_and(|l| l.to_lowercase().contains(&query_lower));
-                let score = if id_matches { 1.0 } else if label_matches { 0.8 } else { 0.6 };
+                let label_matches = label
+                    .as_deref()
+                    .is_some_and(|l| l.to_lowercase().contains(&query_lower));
+                let score = if id_matches {
+                    1.0
+                } else if label_matches {
+                    0.8
+                } else {
+                    0.6
+                };
                 results.push(UnifiedSearchResult {
                     entity_type: "ui_element".to_string(),
                     entity_id: element_id.clone(),
                     title: label.unwrap_or(element_id),
-                    snippet: format!("[{}] {}", element_type.as_deref().unwrap_or("unknown"),
-                        text_content.as_deref().map(|t| truncate_str(t, 120)).unwrap_or_default()),
+                    snippet: format!(
+                        "[{}] {}",
+                        element_type.as_deref().unwrap_or("unknown"),
+                        text_content
+                            .as_deref()
+                            .map(|t| truncate_str(t, 120))
+                            .unwrap_or_default()
+                    ),
                     relevance_score: score,
                     source_table: "ui_bridge_elements".to_string(),
                 });
@@ -818,14 +925,22 @@ impl PgDb {
         }
 
         // Sort by relevance DESC, truncate
-        results.sort_by(|a, b| b.relevance_score.partial_cmp(&a.relevance_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.relevance_score
+                .partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         Ok(results)
     }
 
     /// Get skill metrics for the /graph/skill-metrics endpoint.
     pub async fn get_skill_metrics(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Status counts
         let status_rows = conn

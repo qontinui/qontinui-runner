@@ -47,7 +47,9 @@ fn resolve_binary_path(config: &RestateSettings, app_data_dir: &Path) -> Option<
     }
 
     // 2. Managed binary in app data
-    let managed_path = config.resolve_binary_dir(app_data_dir).join(RESTATE_BINARY_NAME);
+    let managed_path = config
+        .resolve_binary_dir(app_data_dir)
+        .join(RESTATE_BINARY_NAME);
     if managed_path.exists() {
         debug!("Using managed Restate binary: {}", managed_path.display());
         return Some(managed_path);
@@ -143,7 +145,10 @@ async fn download_restate_binary(
         .replace("{version}", &config.target_version)
         .replace("{target}", target);
 
-    info!("Downloading Restate server v{} from {}", config.target_version, url);
+    info!(
+        "Downloading Restate server v{} from {}",
+        config.target_version, url
+    );
 
     let binary_dir = config.resolve_binary_dir(app_data_dir);
     tokio::fs::create_dir_all(&binary_dir)
@@ -219,11 +224,9 @@ pub async fn ensure_restate_binary(
     if config.auto_download {
         download_restate_binary(config, app_data_dir).await
     } else {
-        Err(
-            "Restate binary not found and auto_download is disabled. \
+        Err("Restate binary not found and auto_download is disabled. \
              Install restate-server manually or set restate.binary_path in settings."
-                .to_string(),
-        )
+            .to_string())
     }
 }
 
@@ -345,10 +348,7 @@ pub async fn register_service_endpoint(
 }
 
 /// Spawn a background watchdog that monitors Restate health and restarts it if needed.
-pub fn spawn_restate_watchdog(
-    manager: Arc<ProcessCaptureManager>,
-    config: RestateSettings,
-) {
+pub fn spawn_restate_watchdog(manager: Arc<ProcessCaptureManager>, config: RestateSettings) {
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(30);
         let mut consecutive_failures = 0u32;
@@ -359,7 +359,10 @@ pub fn spawn_restate_watchdog(
 
             if is_restate_healthy(config.admin_port).await {
                 if consecutive_failures > 0 {
-                    info!("Restate server recovered (was unhealthy for {} checks)", consecutive_failures);
+                    info!(
+                        "Restate server recovered (was unhealthy for {} checks)",
+                        consecutive_failures
+                    );
                     consecutive_failures = 0;
                 }
             } else {
@@ -370,7 +373,10 @@ pub fn spawn_restate_watchdog(
                 );
 
                 if consecutive_failures >= max_failures_before_restart {
-                    error!("Restate server unresponsive after {} checks, attempting restart", consecutive_failures);
+                    error!(
+                        "Restate server unresponsive after {} checks, attempting restart",
+                        consecutive_failures
+                    );
                     match manager.restart_process("restate-server").await {
                         Ok(_) => {
                             info!("Restate server restart initiated");

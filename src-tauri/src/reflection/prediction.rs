@@ -60,9 +60,7 @@ pub struct ScoredKnowledge {
 ///
 /// Queries `fix_applications` for previous fixes applied to the same error signature,
 /// filters to resolved outcomes, and scores candidates by reuse_count × effective_rate × recency.
-pub fn predict_fix_for_error(
-    error_signature_hash: &str,
-) -> Result<Option<PredictedFix>, String> {
+pub fn predict_fix_for_error(error_signature_hash: &str) -> Result<Option<PredictedFix>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -104,10 +102,7 @@ fn compute_novelty_score(workflow_name: &str) -> Result<f64, String> {
     Err("SQLite removed".to_string())
 }
 
-fn compute_effective_fix_rate(
-    workflow_name: &str,
-    scope: &str,
-) -> Result<(u32, u32, f64), String> {
+fn compute_effective_fix_rate(workflow_name: &str, scope: &str) -> Result<(u32, u32, f64), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -126,10 +121,7 @@ fn compute_change_velocity_for_workflow(
 ///
 /// Returns fixes per run targeting `component_path` over the last `window_size` runs.
 /// Higher values indicate more volatile areas whose knowledge decays faster.
-pub fn compute_change_velocity(
-    component_path: &str,
-    window_size: u32,
-) -> Result<f64, String> {
+pub fn compute_change_velocity(component_path: &str, window_size: u32) -> Result<f64, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -171,10 +163,7 @@ pub fn record_fix_application(
 }
 
 /// Update the outcome of a fix application after evaluation.
-pub fn update_fix_application_outcome(
-    application_id: &str,
-    outcome: &str,
-) -> Result<(), String> {
+pub fn update_fix_application_outcome(application_id: &str, outcome: &str) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 

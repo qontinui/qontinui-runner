@@ -408,17 +408,24 @@ impl LibrarySyncService {
         info!("Syncing {} shell commands to backend", commands.len());
 
         for cmd_val in &commands {
-            let cmd_name = cmd_val.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let cmd_name = cmd_val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             // Deserialize the JSON value into a typed struct for the sync request
-            let cmd: crate::database::types::ShellCommand = match serde_json::from_value(cmd_val.clone()) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to parse shell command '{}': {}", cmd_name, e);
-                    result.failed += 1;
-                    result.errors.push(format!("ShellCommand '{}': parse error: {}", cmd_name, e));
-                    continue;
-                }
-            };
+            let cmd: crate::database::types::ShellCommand =
+                match serde_json::from_value(cmd_val.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to parse shell command '{}': {}", cmd_name, e);
+                        result.failed += 1;
+                        result
+                            .errors
+                            .push(format!("ShellCommand '{}': parse error: {}", cmd_name, e));
+                        continue;
+                    }
+                };
             let payload = ShellCommandSyncRequest {
                 name: cmd.name.clone(),
                 description: cmd.description.clone(),
@@ -484,17 +491,45 @@ impl LibrarySyncService {
         info!("Syncing {} saved API requests to backend", requests.len());
 
         for req_val in &requests {
-            let req_name = req_val.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let req_name = req_val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             // Deserialize and sync - send the raw JSON value directly
             let payload = SavedApiRequestSyncRequest {
                 name: req_name.clone(),
-                description: req_val.get("description").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string()),
-                method: req_val.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase(),
-                url: req_val.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                headers: req_val.get("headers").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
-                body: req_val.get("body").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                timeout_ms: req_val.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30000),
-                tags: req_val.get("tags").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
+                description: req_val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                method: req_val
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("GET")
+                    .to_uppercase(),
+                url: req_val
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                headers: req_val
+                    .get("headers")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
+                body: req_val
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                timeout_ms: req_val
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30000),
+                tags: req_val
+                    .get("tags")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
             };
 
             match self
@@ -789,9 +824,7 @@ pub async fn sync_api_requests_to_backend(
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<LibrarySyncResult, String> {
     let service = LibrarySyncService::new();
-    Ok(service
-        .sync_saved_api_requests(&app_state.pg_db)
-        .await)
+    Ok(service.sync_saved_api_requests(&app_state.pg_db).await)
 }
 
 /// Sync only contexts to the backend.

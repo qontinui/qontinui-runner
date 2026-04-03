@@ -34,10 +34,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             post(search_vulnerabilities),
         )
         .route("/knowledge/audit-dependencies", post(audit_dependencies))
-        .route(
-            "/knowledge/audit-manifest",
-            post(audit_manifest),
-        )
+        .route("/knowledge/audit-manifest", post(audit_manifest))
 }
 
 // ============================================================================
@@ -167,7 +164,10 @@ async fn get_stats(
     State(_state): State<Arc<ApiState>>,
 ) -> (StatusCode, Json<ApiResponse<StatsSnapshot>>) {
     let ka = KnowledgeAcquisition::new();
-    (StatusCode::OK, Json(ApiResponse::success(ka.stats.snapshot())))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(ka.stats.snapshot())),
+    )
 }
 
 /// Web search (DuckDuckGo / Tavily) with knowledge flywheel
@@ -208,9 +208,7 @@ async fn research_error(
     if let Some(ref trace) = req.stack_trace {
         if let Some(line) = trace.lines().find(|l| {
             let trimmed = l.trim();
-            !trimmed.is_empty()
-                && !trimmed.starts_with("at ")
-                && !trimmed.contains("node_modules")
+            !trimmed.is_empty() && !trimmed.starts_with("at ") && !trimmed.contains("node_modules")
         }) {
             query = format!("{query} {}", line.trim());
         }
@@ -341,9 +339,7 @@ async fn audit_manifest(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error(format!(
-                    "Failed to parse manifest: {e}"
-                ))),
+                Json(ApiResponse::error(format!("Failed to parse manifest: {e}"))),
             );
         }
     };
@@ -468,8 +464,7 @@ fn parse_package_inputs(
 
 /// Parse a manifest file and extract (name, ecosystem, version) tuples
 fn parse_manifest(path: &str) -> Result<Vec<(String, OsvEcosystem, String)>, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
     let filename = std::path::Path::new(path)
         .file_name()
         .and_then(|f| f.to_str())
@@ -515,8 +510,7 @@ fn parse_package_json(content: &str) -> Result<Vec<(String, OsvEcosystem, String
 
 /// Parse Cargo.toml dependencies
 fn parse_cargo_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, String)>, String> {
-    let toml: toml::Value =
-        toml::from_str(content).map_err(|e| format!("Invalid TOML: {e}"))?;
+    let toml: toml::Value = toml::from_str(content).map_err(|e| format!("Invalid TOML: {e}"))?;
 
     // Warn if this looks like a workspace root (no [package], has [workspace])
     if toml.get("workspace").is_some() && toml.get("package").is_none() {
@@ -534,9 +528,10 @@ fn parse_cargo_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, String)>
             for (name, value) in deps {
                 let version = match value {
                     toml::Value::String(v) => Some(v.clone()),
-                    toml::Value::Table(t) => {
-                        t.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
-                    }
+                    toml::Value::Table(t) => t
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     _ => None,
                 };
                 if let Some(ver) = version {
@@ -554,8 +549,7 @@ fn parse_cargo_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, String)>
 
 /// Parse pyproject.toml dependencies
 fn parse_pyproject_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, String)>, String> {
-    let toml: toml::Value =
-        toml::from_str(content).map_err(|e| format!("Invalid TOML: {e}"))?;
+    let toml: toml::Value = toml::from_str(content).map_err(|e| format!("Invalid TOML: {e}"))?;
 
     let mut packages = Vec::new();
 
@@ -587,9 +581,10 @@ fn parse_pyproject_toml(content: &str) -> Result<Vec<(String, OsvEcosystem, Stri
             }
             let version = match value {
                 toml::Value::String(v) => Some(v.clone()),
-                toml::Value::Table(t) => {
-                    t.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
-                }
+                toml::Value::Table(t) => t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 _ => None,
             };
             if let Some(ver) = version {
@@ -674,7 +669,9 @@ dependencies = [
 "#;
         let pkgs = parse_pyproject_toml(toml).unwrap();
         assert_eq!(pkgs.len(), 2);
-        assert!(pkgs.iter().any(|(n, _, v)| n == "requests" && v == "2.28.0"));
+        assert!(pkgs
+            .iter()
+            .any(|(n, _, v)| n == "requests" && v == "2.28.0"));
         assert!(pkgs.iter().any(|(n, _, v)| n == "click" && v == "8.1.7"));
     }
 
@@ -687,7 +684,9 @@ fastapi = "^0.100.0"
 "#;
         let pkgs = parse_pyproject_toml(toml).unwrap();
         assert_eq!(pkgs.len(), 1); // python excluded
-        assert!(pkgs.iter().any(|(n, _, v)| n == "fastapi" && v == "0.100.0"));
+        assert!(pkgs
+            .iter()
+            .any(|(n, _, v)| n == "fastapi" && v == "0.100.0"));
     }
 
     #[test]

@@ -142,7 +142,11 @@ mod tests {
             "TypeError: cannot read property 'foo' of undefined",
             "TypeError: cannot read property 'bar' of undefined",
         );
-        assert!(sim > 0.7, "Similar error messages should have high similarity: {}", sim);
+        assert!(
+            sim > 0.7,
+            "Similar error messages should have high similarity: {}",
+            sim
+        );
     }
 
     #[test]
@@ -151,7 +155,11 @@ mod tests {
             "connection timeout after 30s",
             "invalid JSON syntax at line 5",
         );
-        assert!(sim < 0.3, "Different errors should have low similarity: {}", sim);
+        assert!(
+            sim < 0.3,
+            "Different errors should have low similarity: {}",
+            sim
+        );
     }
 
     #[test]

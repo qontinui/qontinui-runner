@@ -79,25 +79,52 @@ mod tests {
         // Verify root types exist
         assert!(sdl.contains("type QueryRoot"), "Missing QueryRoot");
         assert!(sdl.contains("type MutationRoot"), "Missing MutationRoot");
-        assert!(sdl.contains("type SubscriptionRoot"), "Missing SubscriptionRoot");
+        assert!(
+            sdl.contains("type SubscriptionRoot"),
+            "Missing SubscriptionRoot"
+        );
 
         // Verify domain entity types
         assert!(sdl.contains("type GqlTaskRun"), "Missing GqlTaskRun");
-        assert!(sdl.contains("type GqlWorkflowSummary"), "Missing GqlWorkflowSummary");
+        assert!(
+            sdl.contains("type GqlWorkflowSummary"),
+            "Missing GqlWorkflowSummary"
+        );
         assert!(sdl.contains("type GqlWorkflow"), "Missing GqlWorkflow");
         assert!(sdl.contains("type GqlFinding"), "Missing GqlFinding");
-        assert!(sdl.contains("type GqlFindingSummary"), "Missing GqlFindingSummary");
-        assert!(sdl.contains("type GqlRunnerStatus"), "Missing GqlRunnerStatus");
-        assert!(sdl.contains("type GqlOrchestrationLoopStatus"), "Missing GqlOrchestrationLoopStatus");
+        assert!(
+            sdl.contains("type GqlFindingSummary"),
+            "Missing GqlFindingSummary"
+        );
+        assert!(
+            sdl.contains("type GqlRunnerStatus"),
+            "Missing GqlRunnerStatus"
+        );
+        assert!(
+            sdl.contains("type GqlOrchestrationLoopStatus"),
+            "Missing GqlOrchestrationLoopStatus"
+        );
 
         // Verify UI Bridge types
-        assert!(sdl.contains("type UiBridgeHealth"), "Missing UiBridgeHealth");
+        assert!(
+            sdl.contains("type UiBridgeHealth"),
+            "Missing UiBridgeHealth"
+        );
         assert!(sdl.contains("type ActionResult"), "Missing ActionResult");
-        assert!(sdl.contains("type SdkConnectionInfo"), "Missing SdkConnectionInfo");
+        assert!(
+            sdl.contains("type SdkConnectionInfo"),
+            "Missing SdkConnectionInfo"
+        );
 
         // Verify input types
-        assert!(sdl.contains("input CreateTaskRunInput"), "Missing CreateTaskRunInput");
-        assert!(sdl.contains("input UpdateFindingStatusInput"), "Missing UpdateFindingStatusInput");
+        assert!(
+            sdl.contains("input CreateTaskRunInput"),
+            "Missing CreateTaskRunInput"
+        );
+        assert!(
+            sdl.contains("input UpdateFindingStatusInput"),
+            "Missing UpdateFindingStatusInput"
+        );
 
         // Verify key query resolvers
         assert!(sdl.contains("taskRuns("), "Missing taskRuns query");
@@ -105,36 +132,81 @@ mod tests {
         assert!(sdl.contains("workflows:"), "Missing workflows query");
         assert!(sdl.contains("findings("), "Missing findings query");
         assert!(sdl.contains("runnerStatus:"), "Missing runnerStatus query");
-        assert!(sdl.contains("uiBridgeHealth:"), "Missing uiBridgeHealth query");
+        assert!(
+            sdl.contains("uiBridgeHealth:"),
+            "Missing uiBridgeHealth query"
+        );
 
         // Verify key mutation resolvers
         assert!(sdl.contains("stopTaskRun("), "Missing stopTaskRun mutation");
-        assert!(sdl.contains("createTaskRun("), "Missing createTaskRun mutation");
+        assert!(
+            sdl.contains("createTaskRun("),
+            "Missing createTaskRun mutation"
+        );
         assert!(sdl.contains("runWorkflow("), "Missing runWorkflow mutation");
-        assert!(sdl.contains("updateFindingStatus("), "Missing updateFindingStatus mutation");
+        assert!(
+            sdl.contains("updateFindingStatus("),
+            "Missing updateFindingStatus mutation"
+        );
 
         // Verify subscription resolvers
-        assert!(sdl.contains("uiBridgeHealthStream("), "Missing uiBridgeHealthStream subscription");
-        assert!(sdl.contains("runnerEvents("), "Missing runnerEvents subscription");
-        assert!(sdl.contains("taskRunProgress("), "Missing taskRunProgress subscription");
-        assert!(sdl.contains("findingUpdates("), "Missing findingUpdates subscription");
-        assert!(sdl.contains("orchestrationLoopStatusStream("), "Missing orchestrationLoopStatusStream subscription");
+        assert!(
+            sdl.contains("uiBridgeHealthStream("),
+            "Missing uiBridgeHealthStream subscription"
+        );
+        assert!(
+            sdl.contains("runnerEvents("),
+            "Missing runnerEvents subscription"
+        );
+        assert!(
+            sdl.contains("taskRunProgress("),
+            "Missing taskRunProgress subscription"
+        );
+        assert!(
+            sdl.contains("findingUpdates("),
+            "Missing findingUpdates subscription"
+        );
+        assert!(
+            sdl.contains("orchestrationLoopStatusStream("),
+            "Missing orchestrationLoopStatusStream subscription"
+        );
 
         // Verify error monitor types
         assert!(sdl.contains("type GqlErrorEvent"), "Missing GqlErrorEvent");
-        assert!(sdl.contains("type GqlErrorSummary"), "Missing GqlErrorSummary");
-        assert!(sdl.contains("type GqlErrorPattern"), "Missing GqlErrorPattern");
+        assert!(
+            sdl.contains("type GqlErrorSummary"),
+            "Missing GqlErrorSummary"
+        );
+        assert!(
+            sdl.contains("type GqlErrorPattern"),
+            "Missing GqlErrorPattern"
+        );
 
         // Verify error monitor queries
         assert!(sdl.contains("errorEvents("), "Missing errorEvents query");
         assert!(sdl.contains("errorSummary("), "Missing errorSummary query");
-        assert!(sdl.contains("errorPatterns("), "Missing errorPatterns query");
+        assert!(
+            sdl.contains("errorPatterns("),
+            "Missing errorPatterns query"
+        );
 
         // Verify enums
-        assert!(sdl.contains("enum GqlFindingCategory"), "Missing GqlFindingCategory enum");
-        assert!(sdl.contains("enum GqlFindingSeverity"), "Missing GqlFindingSeverity enum");
-        assert!(sdl.contains("enum GqlFindingStatus"), "Missing GqlFindingStatus enum");
-        assert!(sdl.contains("enum CircuitBreakerState"), "Missing CircuitBreakerState enum");
+        assert!(
+            sdl.contains("enum GqlFindingCategory"),
+            "Missing GqlFindingCategory enum"
+        );
+        assert!(
+            sdl.contains("enum GqlFindingSeverity"),
+            "Missing GqlFindingSeverity enum"
+        );
+        assert!(
+            sdl.contains("enum GqlFindingStatus"),
+            "Missing GqlFindingStatus enum"
+        );
+        assert!(
+            sdl.contains("enum CircuitBreakerState"),
+            "Missing CircuitBreakerState enum"
+        );
 
         // Write SDL to file for frontend codegen reference
         let sdl_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -143,6 +215,10 @@ mod tests {
             .join("schema.graphql");
         std::fs::write(&sdl_path, &sdl).expect("Failed to write schema.graphql");
         println!("Schema exported to: {}", sdl_path.display());
-        println!("Schema length: {} bytes, {} lines", sdl.len(), sdl.lines().count());
+        println!(
+            "Schema length: {} bytes, {} lines",
+            sdl.len(),
+            sdl.lines().count()
+        );
     }
 }

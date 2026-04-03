@@ -4,7 +4,6 @@
 
 #![allow(dead_code)]
 
-
 use super::types::{
     Finding, FindingActionType, FindingCategory, FindingCodeContext, FindingSeverity,
     FindingStatus, FindingSummary, FindingUserInput, ParsedFinding,
@@ -69,9 +68,7 @@ pub fn set_user_response(id: &str, response: &str) -> Result<(), String> {
 ///
 /// This prevents the AI from re-detecting already-resolved issues and
 /// provides context about what work remains.
-pub fn format_findings_for_continuation_prompt(
-    task_run_id: &str,
-) -> Result<String, String> {
+pub fn format_findings_for_continuation_prompt(task_run_id: &str) -> Result<String, String> {
     Err("SQLite removed".to_string())
 }
 

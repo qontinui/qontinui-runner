@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-
 // =============================================================================
 // Types
 // =============================================================================
@@ -326,8 +325,6 @@ pub fn all_entries_done(entries: &[ComparisonEntry]) -> bool {
 }
 
 /// Build a comparison summary for the AI comparison prompt.
-pub fn build_entry_summaries(
-    entries: &[ComparisonEntry],
-) -> Vec<(String, String, String)> {
+pub fn build_entry_summaries(entries: &[ComparisonEntry]) -> Vec<(String, String, String)> {
     Vec::new()
 }

@@ -434,9 +434,10 @@ pub struct GqlTaskRun {
 impl GqlTaskRun {
     /// Convert from the database TaskRun struct.
     pub fn from_db(tr: crate::database::TaskRun) -> Self {
-        let result_data = tr.result_data.as_ref().and_then(|s| {
-            serde_json::from_str::<serde_json::Value>(s).ok().map(Json)
-        });
+        let result_data = tr
+            .result_data
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok().map(Json));
         Self {
             id: tr.id,
             task_name: tr.task_name,
@@ -837,7 +838,10 @@ impl GqlErrorEvent {
             message: e.message,
             stack_trace: e.stack_trace,
             file_path: e.location.as_ref().map(|l| l.file_path.clone()),
-            line_number: e.location.as_ref().and_then(|l| l.line_number.map(|n| n as i32)),
+            line_number: e
+                .location
+                .as_ref()
+                .and_then(|l| l.line_number.map(|n| n as i32)),
             status: e.status.as_str().to_string(),
             occurrence_count: e.occurrence_count as i32,
             first_seen_at: e.first_seen_at,

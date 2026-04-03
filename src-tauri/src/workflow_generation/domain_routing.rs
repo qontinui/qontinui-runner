@@ -87,36 +87,115 @@ impl VerificationDomain {
     fn keywords(&self) -> &'static [&'static str] {
         match self {
             VerificationDomain::Compilation => &[
-                "compile", "build", "lint", "typecheck", "tsc", "eslint", "format", "cargo",
-                "rustc", "gcc", "make", "webpack", "vite",
+                "compile",
+                "build",
+                "lint",
+                "typecheck",
+                "tsc",
+                "eslint",
+                "format",
+                "cargo",
+                "rustc",
+                "gcc",
+                "make",
+                "webpack",
+                "vite",
             ],
             VerificationDomain::ApiEndpoint => &[
-                "endpoint", "api", "status", "response", "curl", "http", "rest", "graphql",
-                "fetch", "route", "handler", "middleware",
+                "endpoint",
+                "api",
+                "status",
+                "response",
+                "curl",
+                "http",
+                "rest",
+                "graphql",
+                "fetch",
+                "route",
+                "handler",
+                "middleware",
             ],
             VerificationDomain::UiContent => &[
-                "button", "page", "element", "click", "display", "visible", "render", "component",
-                "dom", "css", "style", "layout", "text", "ui bridge",
+                "button",
+                "page",
+                "element",
+                "click",
+                "display",
+                "visible",
+                "render",
+                "component",
+                "dom",
+                "css",
+                "style",
+                "layout",
+                "text",
+                "ui bridge",
             ],
             VerificationDomain::DatabaseState => &[
-                "table", "column", "migration", "query", "database", "sql", "schema", "index",
-                "constraint", "row", "insert", "select",
+                "table",
+                "column",
+                "migration",
+                "query",
+                "database",
+                "sql",
+                "schema",
+                "index",
+                "constraint",
+                "row",
+                "insert",
+                "select",
             ],
             VerificationDomain::Security => &[
-                "auth", "permission", "token", "cors", "sanitize", "csrf", "xss", "injection",
-                "encrypt", "password", "session", "jwt", "rbac",
+                "auth",
+                "permission",
+                "token",
+                "cors",
+                "sanitize",
+                "csrf",
+                "xss",
+                "injection",
+                "encrypt",
+                "password",
+                "session",
+                "jwt",
+                "rbac",
             ],
             VerificationDomain::Performance => &[
-                "latency", "throughput", "load", "benchmark", "memory", "cpu", "cache", "timeout",
-                "response time", "concurrent",
+                "latency",
+                "throughput",
+                "load",
+                "benchmark",
+                "memory",
+                "cpu",
+                "cache",
+                "timeout",
+                "response time",
+                "concurrent",
             ],
             VerificationDomain::Integration => &[
-                "service", "webhook", "queue", "message", "pubsub", "grpc", "socket", "event",
-                "upstream", "downstream",
+                "service",
+                "webhook",
+                "queue",
+                "message",
+                "pubsub",
+                "grpc",
+                "socket",
+                "event",
+                "upstream",
+                "downstream",
             ],
             VerificationDomain::CiCd => &[
-                "pipeline", "deploy", "artifact", "docker", "ci", "cd", "github actions",
-                "workflow", "release", "container", "registry",
+                "pipeline",
+                "deploy",
+                "artifact",
+                "docker",
+                "ci",
+                "cd",
+                "github actions",
+                "workflow",
+                "release",
+                "container",
+                "registry",
             ],
             VerificationDomain::General => &[],
         }
@@ -348,17 +427,13 @@ fn domain_description(domain: &VerificationDomain) -> &'static str {
         VerificationDomain::ApiEndpoint => {
             "HTTP endpoints, status codes, request/response verification"
         }
-        VerificationDomain::UiContent => {
-            "DOM elements, visual state, user interaction, rendering"
-        }
+        VerificationDomain::UiContent => "DOM elements, visual state, user interaction, rendering",
         VerificationDomain::DatabaseState => "Schema, data integrity, migrations, queries",
         VerificationDomain::Security => {
             "Authentication, permissions, input validation, CORS, tokens"
         }
         VerificationDomain::Performance => "Latency, throughput, resource usage, caching",
-        VerificationDomain::Integration => {
-            "Service-to-service communication, webhooks, queues"
-        }
+        VerificationDomain::Integration => "Service-to-service communication, webhooks, queues",
         VerificationDomain::CiCd => "CI/CD pipelines, deployments, Docker, artifacts",
         VerificationDomain::General => "General verification (fallback)",
     }
@@ -366,8 +441,8 @@ fn domain_description(domain: &VerificationDomain) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::specification::{AcceptanceCriterion, CriterionPriority, VerificationMethod};
     use super::*;
-    use super::super::specification::{AcceptanceCriterion, VerificationMethod, CriterionPriority};
     use std::collections::HashSet;
 
     fn make_criterion(id: &str, desc: &str, hint: &str, category: &str) -> AcceptanceCriterion {
@@ -391,7 +466,9 @@ mod tests {
         ];
         let result = classify_criteria_domains(&criteria);
         assert_eq!(
-            result.get(&VerificationDomain::Compilation).map(|v| v.len()),
+            result
+                .get(&VerificationDomain::Compilation)
+                .map(|v| v.len()),
             Some(3),
             "All three criteria should be classified as Compilation"
         );
@@ -406,7 +483,9 @@ mod tests {
         ];
         let result = classify_criteria_domains(&criteria);
         assert_eq!(
-            result.get(&VerificationDomain::ApiEndpoint).map(|v| v.len()),
+            result
+                .get(&VerificationDomain::ApiEndpoint)
+                .map(|v| v.len()),
             Some(3),
             "All three criteria should be classified as ApiEndpoint"
         );
@@ -416,8 +495,18 @@ mod tests {
     fn test_classify_ui_criteria() {
         let criteria = vec![
             make_criterion("u1", "button is rendered", "check button", "general"),
-            make_criterion("u2", "element is visible on page", "look for visible element", "general"),
-            make_criterion("u3", "element appears in DOM", "check element presence", "general"),
+            make_criterion(
+                "u2",
+                "element is visible on page",
+                "look for visible element",
+                "general",
+            ),
+            make_criterion(
+                "u3",
+                "element appears in DOM",
+                "check element presence",
+                "general",
+            ),
         ];
         let result = classify_criteria_domains(&criteria);
         assert_eq!(
@@ -436,7 +525,9 @@ mod tests {
         ];
         let result = classify_criteria_domains(&criteria);
         assert_eq!(
-            result.get(&VerificationDomain::DatabaseState).map(|v| v.len()),
+            result
+                .get(&VerificationDomain::DatabaseState)
+                .map(|v| v.len()),
             Some(3),
             "All three criteria should be classified as DatabaseState"
         );
@@ -459,9 +550,12 @@ mod tests {
 
     #[test]
     fn test_classify_general_fallback() {
-        let criteria = vec![
-            make_criterion("g1", "something happens", "verify it", "general"),
-        ];
+        let criteria = vec![make_criterion(
+            "g1",
+            "something happens",
+            "verify it",
+            "general",
+        )];
         let result = classify_criteria_domains(&criteria);
         assert_eq!(
             result.get(&VerificationDomain::General).map(|v| v.len()),
@@ -473,36 +567,93 @@ mod tests {
     #[test]
     fn test_category_to_domain_mapping() {
         // Compilation / build
-        assert_eq!(category_to_domain("compilation"), Some(VerificationDomain::Compilation));
-        assert_eq!(category_to_domain("build"), Some(VerificationDomain::Compilation));
+        assert_eq!(
+            category_to_domain("compilation"),
+            Some(VerificationDomain::Compilation)
+        );
+        assert_eq!(
+            category_to_domain("build"),
+            Some(VerificationDomain::Compilation)
+        );
         // ApiEndpoint
-        assert_eq!(category_to_domain("api"), Some(VerificationDomain::ApiEndpoint));
-        assert_eq!(category_to_domain("endpoint"), Some(VerificationDomain::ApiEndpoint));
-        assert_eq!(category_to_domain("api-endpoint"), Some(VerificationDomain::ApiEndpoint));
+        assert_eq!(
+            category_to_domain("api"),
+            Some(VerificationDomain::ApiEndpoint)
+        );
+        assert_eq!(
+            category_to_domain("endpoint"),
+            Some(VerificationDomain::ApiEndpoint)
+        );
+        assert_eq!(
+            category_to_domain("api-endpoint"),
+            Some(VerificationDomain::ApiEndpoint)
+        );
         // UiContent
-        assert_eq!(category_to_domain("ui"), Some(VerificationDomain::UiContent));
-        assert_eq!(category_to_domain("ui-content"), Some(VerificationDomain::UiContent));
-        assert_eq!(category_to_domain("frontend"), Some(VerificationDomain::UiContent));
+        assert_eq!(
+            category_to_domain("ui"),
+            Some(VerificationDomain::UiContent)
+        );
+        assert_eq!(
+            category_to_domain("ui-content"),
+            Some(VerificationDomain::UiContent)
+        );
+        assert_eq!(
+            category_to_domain("frontend"),
+            Some(VerificationDomain::UiContent)
+        );
         // DatabaseState
-        assert_eq!(category_to_domain("database"), Some(VerificationDomain::DatabaseState));
-        assert_eq!(category_to_domain("db"), Some(VerificationDomain::DatabaseState));
-        assert_eq!(category_to_domain("data"), Some(VerificationDomain::DatabaseState));
+        assert_eq!(
+            category_to_domain("database"),
+            Some(VerificationDomain::DatabaseState)
+        );
+        assert_eq!(
+            category_to_domain("db"),
+            Some(VerificationDomain::DatabaseState)
+        );
+        assert_eq!(
+            category_to_domain("data"),
+            Some(VerificationDomain::DatabaseState)
+        );
         // Security
-        assert_eq!(category_to_domain("security"), Some(VerificationDomain::Security));
-        assert_eq!(category_to_domain("auth"), Some(VerificationDomain::Security));
-        assert_eq!(category_to_domain("authentication"), Some(VerificationDomain::Security));
+        assert_eq!(
+            category_to_domain("security"),
+            Some(VerificationDomain::Security)
+        );
+        assert_eq!(
+            category_to_domain("auth"),
+            Some(VerificationDomain::Security)
+        );
+        assert_eq!(
+            category_to_domain("authentication"),
+            Some(VerificationDomain::Security)
+        );
         // Performance
-        assert_eq!(category_to_domain("performance"), Some(VerificationDomain::Performance));
-        assert_eq!(category_to_domain("perf"), Some(VerificationDomain::Performance));
+        assert_eq!(
+            category_to_domain("performance"),
+            Some(VerificationDomain::Performance)
+        );
+        assert_eq!(
+            category_to_domain("perf"),
+            Some(VerificationDomain::Performance)
+        );
         // Integration
-        assert_eq!(category_to_domain("integration"), Some(VerificationDomain::Integration));
-        assert_eq!(category_to_domain("e2e"), Some(VerificationDomain::Integration));
+        assert_eq!(
+            category_to_domain("integration"),
+            Some(VerificationDomain::Integration)
+        );
+        assert_eq!(
+            category_to_domain("e2e"),
+            Some(VerificationDomain::Integration)
+        );
         // CiCd
         assert_eq!(category_to_domain("ci"), Some(VerificationDomain::CiCd));
         assert_eq!(category_to_domain("cd"), Some(VerificationDomain::CiCd));
         assert_eq!(category_to_domain("cicd"), Some(VerificationDomain::CiCd));
         assert_eq!(category_to_domain("ci-cd"), Some(VerificationDomain::CiCd));
-        assert_eq!(category_to_domain("deployment"), Some(VerificationDomain::CiCd));
+        assert_eq!(
+            category_to_domain("deployment"),
+            Some(VerificationDomain::CiCd)
+        );
         // Unknown
         assert_eq!(category_to_domain("unknown"), None);
         assert_eq!(category_to_domain("random"), None);
@@ -512,8 +663,10 @@ mod tests {
     fn test_dependency_order_covers_all_specific() {
         let specific: HashSet<VerificationDomain> =
             VerificationDomain::all_specific().iter().copied().collect();
-        let ordered: HashSet<VerificationDomain> =
-            VerificationDomain::dependency_order().iter().copied().collect();
+        let ordered: HashSet<VerificationDomain> = VerificationDomain::dependency_order()
+            .iter()
+            .copied()
+            .collect();
         assert_eq!(
             specific, ordered,
             "dependency_order() must contain exactly the same domains as all_specific()"
@@ -524,15 +677,13 @@ mod tests {
     fn test_dependencies_no_cycles() {
         for domain in VerificationDomain::all_specific() {
             let deps = domain.dependencies();
-            assert!(
-                !deps.contains(domain),
-                "{:?} depends on itself",
-                domain
-            );
+            assert!(!deps.contains(domain), "{:?} depends on itself", domain);
         }
         // General should also not depend on itself
         assert!(
-            !VerificationDomain::General.dependencies().contains(&VerificationDomain::General),
+            !VerificationDomain::General
+                .dependencies()
+                .contains(&VerificationDomain::General),
             "General depends on itself"
         );
     }
@@ -548,22 +699,26 @@ mod tests {
         let result = classify_criteria_domains(&criteria);
 
         assert!(
-            result.get(&VerificationDomain::Compilation)
+            result
+                .get(&VerificationDomain::Compilation)
                 .map_or(false, |v| v.contains(&"c1".to_string())),
             "c1 should be in Compilation"
         );
         assert!(
-            result.get(&VerificationDomain::ApiEndpoint)
+            result
+                .get(&VerificationDomain::ApiEndpoint)
                 .map_or(false, |v| v.contains(&"a1".to_string())),
             "a1 should be in ApiEndpoint"
         );
         assert!(
-            result.get(&VerificationDomain::UiContent)
+            result
+                .get(&VerificationDomain::UiContent)
                 .map_or(false, |v| v.contains(&"u1".to_string())),
             "u1 should be in UiContent"
         );
         assert!(
-            result.get(&VerificationDomain::General)
+            result
+                .get(&VerificationDomain::General)
                 .map_or(false, |v| v.contains(&"g1".to_string())),
             "g1 should be in General"
         );
@@ -571,18 +726,54 @@ mod tests {
 
     #[test]
     fn test_str_to_domain_all_variants() {
-        assert_eq!(str_to_domain("compilation"), Some(VerificationDomain::Compilation));
-        assert_eq!(str_to_domain("Compilation"), Some(VerificationDomain::Compilation));
-        assert_eq!(str_to_domain("api_endpoint"), Some(VerificationDomain::ApiEndpoint));
-        assert_eq!(str_to_domain("apiendpoint"), Some(VerificationDomain::ApiEndpoint));
-        assert_eq!(str_to_domain("ApiEndpoint"), Some(VerificationDomain::ApiEndpoint));
-        assert_eq!(str_to_domain("ui_content"), Some(VerificationDomain::UiContent));
-        assert_eq!(str_to_domain("uicontent"), Some(VerificationDomain::UiContent));
-        assert_eq!(str_to_domain("database_state"), Some(VerificationDomain::DatabaseState));
-        assert_eq!(str_to_domain("databasestate"), Some(VerificationDomain::DatabaseState));
-        assert_eq!(str_to_domain("security"), Some(VerificationDomain::Security));
-        assert_eq!(str_to_domain("performance"), Some(VerificationDomain::Performance));
-        assert_eq!(str_to_domain("integration"), Some(VerificationDomain::Integration));
+        assert_eq!(
+            str_to_domain("compilation"),
+            Some(VerificationDomain::Compilation)
+        );
+        assert_eq!(
+            str_to_domain("Compilation"),
+            Some(VerificationDomain::Compilation)
+        );
+        assert_eq!(
+            str_to_domain("api_endpoint"),
+            Some(VerificationDomain::ApiEndpoint)
+        );
+        assert_eq!(
+            str_to_domain("apiendpoint"),
+            Some(VerificationDomain::ApiEndpoint)
+        );
+        assert_eq!(
+            str_to_domain("ApiEndpoint"),
+            Some(VerificationDomain::ApiEndpoint)
+        );
+        assert_eq!(
+            str_to_domain("ui_content"),
+            Some(VerificationDomain::UiContent)
+        );
+        assert_eq!(
+            str_to_domain("uicontent"),
+            Some(VerificationDomain::UiContent)
+        );
+        assert_eq!(
+            str_to_domain("database_state"),
+            Some(VerificationDomain::DatabaseState)
+        );
+        assert_eq!(
+            str_to_domain("databasestate"),
+            Some(VerificationDomain::DatabaseState)
+        );
+        assert_eq!(
+            str_to_domain("security"),
+            Some(VerificationDomain::Security)
+        );
+        assert_eq!(
+            str_to_domain("performance"),
+            Some(VerificationDomain::Performance)
+        );
+        assert_eq!(
+            str_to_domain("integration"),
+            Some(VerificationDomain::Integration)
+        );
         assert_eq!(str_to_domain("ci_cd"), Some(VerificationDomain::CiCd));
         assert_eq!(str_to_domain("cicd"), Some(VerificationDomain::CiCd));
         assert_eq!(str_to_domain("CICD"), Some(VerificationDomain::CiCd));

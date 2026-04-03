@@ -28,8 +28,14 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/observations/stats", get(stats_handler))
         .route("/observations/cleanup", post(cleanup_handler))
         .route("/observations/export", get(export_handler))
-        .route("/observations/by-task-run/{task_run_id}", get(by_task_run_handler))
-        .route("/observations/temporal-search", get(temporal_search_handler))
+        .route(
+            "/observations/by-task-run/{task_run_id}",
+            get(by_task_run_handler),
+        )
+        .route(
+            "/observations/temporal-search",
+            get(temporal_search_handler),
+        )
         .route("/observations/snapshot", get(snapshot_handler))
         .route("/observations/trends", get(trends_handler))
         .route("/observations/most-revised", get(most_revised_handler))
@@ -166,12 +172,15 @@ async fn by_task_run_handler(
 ) -> Result<Json<ApiResponse<Vec<ObservationSearchResult>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
 
-    let results = pg.get_observations_by_task_run(&task_run_id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Query failed: {}", e))),
-        )
-    })?;
+    let results = pg
+        .get_observations_by_task_run(&task_run_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Query failed: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(results)))
 }
@@ -253,7 +262,9 @@ async fn delete_handler(
 
     if deleted {
         crate::mcp::graph_api::invalidate_graph_cache(&state, "observation_deleted").await;
-        Ok(Json(ApiResponse::success(serde_json::json!({ "deleted": true }))))
+        Ok(Json(ApiResponse::success(
+            serde_json::json!({ "deleted": true }),
+        )))
     } else {
         Err((
             StatusCode::NOT_FOUND,
@@ -312,8 +323,10 @@ async fn cleanup_handler(
 
 async fn export_handler(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<crate::database::types::Observation>>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::types::Observation>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let pg = &state.app_state.pg_db;
 
     let observations = pg.get_all_observations_full(10000).await.map_err(|e| {
@@ -505,7 +518,10 @@ async fn supersede_handler(
 async fn snapshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SnapshotQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::types::Observation>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::types::Observation>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let pg = &state.app_state.pg_db;
 
     let observations = pg

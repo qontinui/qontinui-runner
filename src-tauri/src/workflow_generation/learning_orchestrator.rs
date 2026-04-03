@@ -112,19 +112,13 @@ impl LearningOrchestrator {
     ///
     /// Runs all learning components in sequence. Each component is independent
     /// and failures in one don't affect others.
-    pub fn on_run_complete(
-        &mut self,
-        run_context: &RunContext,
-    ) -> LearningActions {
+    pub fn on_run_complete(&mut self, run_context: &RunContext) -> LearningActions {
         // SQLite removed — return empty actions (no-op)
         LearningActions::default()
     }
 
     /// Reflect on a run and curate any lessons learned.
-    fn reflect_and_curate(
-        &self,
-        ctx: &RunContext,
-    ) -> Result<CurationResult, String> {
+    fn reflect_and_curate(&self, ctx: &RunContext) -> Result<CurationResult, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -132,9 +126,7 @@ impl LearningOrchestrator {
     fn gepa_cooldown_elapsed(&self) -> bool {
         match self.last_gepa_time {
             None => true,
-            Some(last) => {
-                last.elapsed() >= Duration::from_secs(self.config.gepa_cooldown_secs)
-            }
+            Some(last) => last.elapsed() >= Duration::from_secs(self.config.gepa_cooldown_secs),
         }
     }
 }

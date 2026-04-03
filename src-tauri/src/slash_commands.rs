@@ -237,7 +237,9 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
 ///
 /// Scans the commands directory, compares with existing DB entries,
 /// and creates/updates/deletes as needed.
-pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>) -> Result<SyncResult, String> {
+pub async fn sync_slash_commands(
+    pg: &std::sync::Arc<crate::database::pg::PgDb>,
+) -> Result<SyncResult, String> {
     let (workspace_root, commands_dir) = find_commands_directory()?;
 
     // Parse all command files from disk
@@ -264,7 +266,11 @@ pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>)
     let existing_map: HashMap<String, (String, String)> = existing
         .into_iter()
         .filter_map(|(id, _name, source)| {
-            if source.is_empty() { None } else { Some((source, (id, _name))) }
+            if source.is_empty() {
+                None
+            } else {
+                Some((source, (id, _name)))
+            }
         })
         .collect();
 
@@ -280,32 +286,55 @@ pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>)
     for (rel_path, parsed) in &disk_commands {
         if let Some((existing_id, _)) = existing_map.get(rel_path) {
             // Check if content hash changed — if so, update
-            let conn = pg.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-            let current_hash: Option<String> = conn.query_opt(
-                "SELECT source_content_hash FROM unified_workflows WHERE id = $1",
-                &[existing_id],
-            ).await.ok().flatten().and_then(|r| r.get(0));
+            let conn = pg
+                .pool()
+                .get()
+                .await
+                .map_err(|e| format!("PG pool: {}", e))?;
+            let current_hash: Option<String> = conn
+                .query_opt(
+                    "SELECT source_content_hash FROM unified_workflows WHERE id = $1",
+                    &[existing_id],
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.get(0));
 
             if current_hash.as_deref() == Some(&parsed.content_hash) {
                 result.unchanged += 1;
             } else {
                 // Update the workflow content via direct SQL (simpler than full UpdateRequest)
                 let req = build_workflow_request(parsed);
-                let agentic_json = serde_json::to_string(&req.agentic_steps).unwrap_or_else(|_| "[]".to_string());
-                let tags_json = serde_json::to_string(&req.tags).unwrap_or_else(|_| "[]".to_string());
-                match conn.execute(
-                    r#"UPDATE unified_workflows
+                let agentic_json =
+                    serde_json::to_string(&req.agentic_steps).unwrap_or_else(|_| "[]".to_string());
+                let tags_json =
+                    serde_json::to_string(&req.tags).unwrap_or_else(|_| "[]".to_string());
+                match conn
+                    .execute(
+                        r#"UPDATE unified_workflows
                        SET name = $2, description = $3, agentic_steps = $4, tags = $5,
                            source_file_path = $6, source_content_hash = $7, updated_at = NOW()
                        WHERE id = $1"#,
-                    &[existing_id, &parsed.title, &parsed.description, &agentic_json,
-                      &tags_json, &parsed.relative_path, &parsed.content_hash],
-                ).await {
+                        &[
+                            existing_id,
+                            &parsed.title,
+                            &parsed.description,
+                            &agentic_json,
+                            &tags_json,
+                            &parsed.relative_path,
+                            &parsed.content_hash,
+                        ],
+                    )
+                    .await
+                {
                     Ok(_) => {
                         result.updated += 1;
                         info!("Updated slash command workflow: {}", parsed.title);
                     }
-                    Err(e) => result.errors.push(format!("Update {}: {}", parsed.command_name, e)),
+                    Err(e) => result
+                        .errors
+                        .push(format!("Update {}: {}", parsed.command_name, e)),
                 }
             }
         } else {
@@ -323,7 +352,9 @@ pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>)
                     result.created += 1;
                     info!("Created slash command workflow: {}", parsed.title);
                 }
-                Err(e) => result.errors.push(format!("Create {}: {}", parsed.command_name, e)),
+                Err(e) => result
+                    .errors
+                    .push(format!("Create {}: {}", parsed.command_name, e)),
             }
         }
     }
@@ -337,7 +368,10 @@ pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>)
                     info!("Deleted slash command workflow: {} ({})", name, rel_path);
                 }
                 Ok(false) => {
-                    warn!("Slash command workflow {} not found for deletion", existing_id);
+                    warn!(
+                        "Slash command workflow {} not found for deletion",
+                        existing_id
+                    );
                 }
                 Err(e) => result.errors.push(format!("Delete {}: {}", name, e)),
             }
@@ -346,7 +380,11 @@ pub async fn sync_slash_commands(pg: &std::sync::Arc<crate::database::pg::PgDb>)
 
     info!(
         "Slash command sync: {} created, {} updated, {} deleted, {} unchanged, {} errors",
-        result.created, result.updated, result.deleted, result.unchanged, result.errors.len()
+        result.created,
+        result.updated,
+        result.deleted,
+        result.unchanged,
+        result.errors.len()
     );
 
     Ok(result)

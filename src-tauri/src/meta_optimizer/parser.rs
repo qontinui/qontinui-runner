@@ -414,8 +414,7 @@ fn is_duplicate_recommendation(
     }
     // Fallback: title match for rejected recs (rejected can't be re-created with same title)
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(pg_db.count_rejected_by_title(title))
+        tokio::runtime::Handle::current().block_on(pg_db.count_rejected_by_title(title))
     })
     .map(|c| c > 0)
     .unwrap_or(false)
@@ -472,7 +471,6 @@ pub fn save_parsed_recommendations(
                 .to_string();
 
                 if is_duplicate_recommendation(
-                    
                     pg_db,
                     &title,
                     optimizer_type,
@@ -485,7 +483,6 @@ pub fn save_parsed_recommendations(
                 }
 
                 recommendations::create_recommendation(
-                    
                     pg_db,
                     optimizer_type,
                     "prompt_rewrite",
@@ -546,7 +543,6 @@ pub fn save_parsed_recommendations(
                 .to_string();
 
                 if is_duplicate_recommendation(
-                    
                     pg_db,
                     &title,
                     optimizer_type,
@@ -559,7 +555,6 @@ pub fn save_parsed_recommendations(
                 }
 
                 recommendations::create_recommendation(
-                    
                     pg_db,
                     optimizer_type,
                     "config_change",
@@ -620,7 +615,6 @@ pub fn save_parsed_recommendations(
                 .to_string();
 
                 if is_duplicate_recommendation(
-                    
                     pg_db,
                     &title,
                     optimizer_type,
@@ -633,7 +627,6 @@ pub fn save_parsed_recommendations(
                 }
 
                 recommendations::create_recommendation(
-                    
                     pg_db,
                     optimizer_type,
                     "config_change",
@@ -665,7 +658,6 @@ pub fn save_parsed_recommendations(
                 })
                 .to_string();
                 if is_duplicate_recommendation(
-                    
                     pg_db,
                     &title,
                     optimizer_type,
@@ -677,7 +669,6 @@ pub fn save_parsed_recommendations(
                     continue;
                 }
                 recommendations::create_recommendation(
-                    
                     pg_db,
                     optimizer_type,
                     "finding", // Not actionable as config_change
@@ -750,7 +741,6 @@ pub fn save_parsed_recommendations(
                 };
 
                 if is_duplicate_recommendation(
-                    
                     pg_db,
                     &title,
                     optimizer_type,
@@ -763,7 +753,6 @@ pub fn save_parsed_recommendations(
                 }
 
                 recommendations::create_recommendation(
-                    
                     pg_db,
                     optimizer_type,
                     rec_type,
@@ -827,7 +816,6 @@ pub fn save_parsed_recommendations(
                 .to_string();
 
                 if is_duplicate_recommendation(
-                    
                     pg_db,
                     &title,
                     optimizer_type,
@@ -840,12 +828,9 @@ pub fn save_parsed_recommendations(
                 }
 
                 // Semantic similarity guard: reject near-duplicate rewrites
-                let rejected_prompts = super::prompt_evolution::get_rejected_prompt_contents(
-                    
-                    pg_db,
-                    &rec.target_agent,
-                )
-                .unwrap_or_default();
+                let rejected_prompts =
+                    super::prompt_evolution::get_rejected_prompt_contents(pg_db, &rec.target_agent)
+                        .unwrap_or_default();
 
                 let mut too_similar = false;
                 for (rejected_variant_id, rejected_content) in &rejected_prompts {
@@ -899,7 +884,6 @@ pub fn save_parsed_recommendations(
 
                 // Create the recommendation
                 let recommendation = recommendations::create_recommendation(
-                    
                     pg_db,
                     optimizer_type,
                     "prompt_rewrite",
@@ -915,7 +899,6 @@ pub fn save_parsed_recommendations(
 
                 // Create prompt variant immediately (inactive)
                 let variant = super::prompt_registry::create_variant(
-                    
                     pg_db,
                     &rec.target_agent,
                     &variant_name,
@@ -939,16 +922,18 @@ pub fn save_parsed_recommendations(
                     .map(|g| g.mean_score);
 
                 // Compute baseline prompt hash for drift detection
-                let baseline_prompt = super::prompt_extractor::get_default_agent_prompt(&rec.target_agent);
+                let baseline_prompt =
+                    super::prompt_extractor::get_default_agent_prompt(&rec.target_agent);
                 let baseline_hash = if baseline_prompt.is_empty() {
                     None
                 } else {
-                    Some(super::prompt_evolution::compute_prompt_hash(&baseline_prompt))
+                    Some(super::prompt_evolution::compute_prompt_hash(
+                        &baseline_prompt,
+                    ))
                 };
 
                 // Record evolution entry with baseline hash
                 let _ = super::prompt_evolution::record_evolution_full(
-                    
                     pg_db,
                     &rec.target_agent,
                     parent_id.as_deref(),
@@ -962,9 +947,7 @@ pub fn save_parsed_recommendations(
 
                 // Auto-start canary for the new variant
                 if rec.confidence >= 0.60 {
-                    if let Err(e) =
-                        super::canary::start_canary(pg_db, &recommendation.id, 20)
-                    {
+                    if let Err(e) = super::canary::start_canary(pg_db, &recommendation.id, 20) {
                         warn!(
                             "Failed to auto-start canary for meta-prompt rewrite {}: {}",
                             recommendation.id, e
@@ -1027,13 +1010,11 @@ pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&s
 
     // Auto-apply rule changes (safest, most reversible)
     let rule_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            pg_db.query_pending_recommendations_by_type(
-                &["rule_create", "rule_update"],
-                0.85,
-                optimizer_run_id,
-            ),
-        )
+        tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
+            &["rule_create", "rule_update"],
+            0.85,
+            optimizer_run_id,
+        ))
     })
     .unwrap_or_default();
 
@@ -1063,13 +1044,11 @@ pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&s
     // These are started as canary rollouts at 20% rather than applied directly,
     // since prompt changes have broader impact and benefit from A/B evaluation.
     let prompt_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            pg_db.query_pending_recommendations_by_type(
-                &["prompt_rewrite"],
-                0.75,
-                optimizer_run_id,
-            ),
-        )
+        tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
+            &["prompt_rewrite"],
+            0.75,
+            optimizer_run_id,
+        ))
     })
     .unwrap_or_default();
 
@@ -1100,13 +1079,11 @@ pub fn auto_apply_high_confidence(pg_db: &Arc<PgDb>, optimizer_run_id: Option<&s
     // Auto-canary config changes with high confidence (>= 0.85) at conservative 10% rollout.
     // Config changes affect global behavior, so use lower rollout than prompt rewrites.
     let config_candidates: Vec<(String, f64)> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            pg_db.query_pending_recommendations_by_type(
-                &["config_change"],
-                0.75,
-                optimizer_run_id,
-            ),
-        )
+        tokio::runtime::Handle::current().block_on(pg_db.query_pending_recommendations_by_type(
+            &["config_change"],
+            0.75,
+            optimizer_run_id,
+        ))
     })
     .unwrap_or_default();
 

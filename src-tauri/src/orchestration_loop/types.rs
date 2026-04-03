@@ -18,7 +18,12 @@ pub struct StallDetectorConfig {
 
 impl Default for StallDetectorConfig {
     fn default() -> Self {
-        Self { max_repeated_actions: 5, max_total_steps: 100, stall_timeout_secs: 300, oscillation_window: 10 }
+        Self {
+            max_repeated_actions: 5,
+            max_total_steps: 100,
+            stall_timeout_secs: 300,
+            oscillation_window: 10,
+        }
     }
 }
 
@@ -33,7 +38,13 @@ pub struct SummarizationConfig {
 
 impl Default for SummarizationConfig {
     fn default() -> Self {
-        Self { enabled: true, token_threshold_pct: 0.75, max_tokens_budget: 80000, preserve_last_n_iterations: 2, summary_max_tokens: 2000 }
+        Self {
+            enabled: true,
+            token_threshold_pct: 0.75,
+            max_tokens_budget: 80000,
+            preserve_last_n_iterations: 2,
+            summary_max_tokens: 2000,
+        }
     }
 }
 
@@ -47,7 +58,12 @@ pub struct DecomposerConfig {
 
 impl Default for DecomposerConfig {
     fn default() -> Self {
-        Self { enabled: true, min_subtasks: 3, max_subtasks: 7, model_override: None }
+        Self {
+            enabled: true,
+            min_subtasks: 3,
+            max_subtasks: 7,
+            model_override: None,
+        }
     }
 }
 

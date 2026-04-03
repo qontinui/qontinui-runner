@@ -30,8 +30,7 @@ pub struct EvaluateWorkflowRequest {
     pub workflow: crate::unified_workflows::UnifiedWorkflow,
     /// Acceptance criteria to evaluate against
     #[serde(default)]
-    pub acceptance_criteria:
-        Option<crate::workflow_generation::specification::AcceptanceCriteria>,
+    pub acceptance_criteria: Option<crate::workflow_generation::specification::AcceptanceCriteria>,
     /// Scoring strategy: "fast_only", "standard", "full"
     #[serde(default = "default_strategy")]
     pub strategy: String,
@@ -50,8 +49,7 @@ pub struct EvaluateStepRequest {
     pub step: serde_json::Value,
     /// Acceptance criteria to evaluate against
     #[serde(default)]
-    pub acceptance_criteria:
-        Option<crate::workflow_generation::specification::AcceptanceCriteria>,
+    pub acceptance_criteria: Option<crate::workflow_generation::specification::AcceptanceCriteria>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,8 +58,7 @@ pub struct RepairGuidanceRequest {
     pub workflow: crate::unified_workflows::UnifiedWorkflow,
     /// Acceptance criteria
     #[serde(default)]
-    pub acceptance_criteria:
-        Option<crate::workflow_generation::specification::AcceptanceCriteria>,
+    pub acceptance_criteria: Option<crate::workflow_generation::specification::AcceptanceCriteria>,
 }
 
 // ============================================================================
@@ -84,7 +81,8 @@ async fn evaluate_workflow_handler(
     // Default PRM service URL when strategy is "full" and no URL was provided
     let prm_url = body.prm_base_url.or_else(|| {
         if matches!(strategy, evaluation::ScoringStrategy::Full) {
-            std::env::var("QONTINUI_PRM_URL").ok()
+            std::env::var("QONTINUI_PRM_URL")
+                .ok()
                 .or_else(|| Some("http://localhost:8400".to_string()))
         } else {
             None
@@ -196,20 +194,8 @@ async fn cache_stats_handler(
 
 pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
-        .route(
-            "/evaluation/workflow",
-            post(evaluate_workflow_handler),
-        )
-        .route(
-            "/evaluation/step",
-            post(evaluate_step_handler),
-        )
-        .route(
-            "/evaluation/repair-guidance",
-            post(repair_guidance_handler),
-        )
-        .route(
-            "/evaluation/cache-stats",
-            get(cache_stats_handler),
-        )
+        .route("/evaluation/workflow", post(evaluate_workflow_handler))
+        .route("/evaluation/step", post(evaluate_step_handler))
+        .route("/evaluation/repair-guidance", post(repair_guidance_handler))
+        .route("/evaluation/cache-stats", get(cache_stats_handler))
 }

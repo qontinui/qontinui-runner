@@ -5,10 +5,10 @@
 //! - Launching Chrome with remote debugging enabled
 //! - Native accessibility tree capture, querying, and interaction via AccessibilityManager
 
+use crate::settings::{self, AccessibilitySettings};
 use qontinui_runner_lib::accessibility::model::UnifiedRole;
 use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
 use qontinui_runner_lib::accessibility::AccessibilityManager;
-use crate::settings::{self, AccessibilitySettings};
 
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
@@ -338,10 +338,9 @@ pub async fn a11y_query(
     let mut builder = mgr.query();
 
     if let Some(ref role_str) = role {
-        let parsed_role: UnifiedRole = serde_json::from_value(
-            serde_json::Value::String(role_str.clone()),
-        )
-        .map_err(|_| format!("Unknown role: {}", role_str))?;
+        let parsed_role: UnifiedRole =
+            serde_json::from_value(serde_json::Value::String(role_str.clone()))
+                .map_err(|_| format!("Unknown role: {}", role_str))?;
         builder = builder.by_role(parsed_role);
     }
 
@@ -350,7 +349,9 @@ pub async fn a11y_query(
     }
 
     if let Some(ref substr) = label_contains {
-        builder = builder.by_label_contains(substr.as_str()).case_insensitive();
+        builder = builder
+            .by_label_contains(substr.as_str())
+            .case_insensitive();
     }
 
     if interactive_only {

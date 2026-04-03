@@ -268,7 +268,12 @@ pub async fn search_skills(
 ) -> Result<Json<ApiResponse<Vec<SkillDefinition>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
 
-    let user_skills = state.app_state.pg_db.list_user_skills().await.unwrap_or_default();
+    let user_skills = state
+        .app_state
+        .pg_db
+        .list_user_skills()
+        .await
+        .unwrap_or_default();
 
     let mut registry = crate::skills::SkillRegistry::new();
     registry.set_user_skills(user_skills);
@@ -284,7 +289,12 @@ pub async fn instantiate_skill(
     Json(request): Json<InstantiateSkillRequest>,
 ) -> Result<Json<ApiResponse<Vec<Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Load user skills for registry
-    let user_skills = state.app_state.pg_db.list_user_skills().await.unwrap_or_default();
+    let user_skills = state
+        .app_state
+        .pg_db
+        .list_user_skills()
+        .await
+        .unwrap_or_default();
 
     let mut registry = crate::skills::SkillRegistry::new();
     registry.set_user_skills(user_skills);
@@ -310,7 +320,12 @@ pub async fn export_skills(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExportSkillsRequest>,
 ) -> Result<Json<ApiResponse<crate::skills::SkillExport>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let mut skills = match state.app_state.pg_db.export_user_skills(&request.skill_ids).await {
+    let mut skills = match state
+        .app_state
+        .pg_db
+        .export_user_skills(&request.skill_ids)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             return Err((
@@ -371,7 +386,12 @@ pub async fn import_skills(
         }
     }
 
-    match state.app_state.pg_db.import_skills(&request.skills, &request.conflict_mode).await {
+    match state
+        .app_state
+        .pg_db
+        .import_skills(&request.skills, &request.conflict_mode)
+        .await
+    {
         Ok(mut result) => {
             result.warnings.extend(checksum_warnings);
             Ok(Json(ApiResponse::success(result)))
@@ -399,7 +419,12 @@ pub async fn approve_skill(
         ));
     }
 
-    match state.app_state.pg_db.update_skill_approval(&id, &req.status).await {
+    match state
+        .app_state
+        .pg_db
+        .update_skill_approval(&id, &req.status)
+        .await
+    {
         Ok(_) => Ok(Json(ApiResponse::success(serde_json::json!({
             "id": id,
             "approval_status": req.status
@@ -420,7 +445,12 @@ pub async fn fork_skill(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<ForkSkillRequest>,
 ) -> Result<Json<ApiResponse<SkillDefinition>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.pg_db.fork_skill(&id, req.new_name.as_deref()).await {
+    match state
+        .app_state
+        .pg_db
+        .fork_skill(&id, req.new_name.as_deref())
+        .await
+    {
         Ok(new_skill) => Ok(Json(ApiResponse::success(new_skill))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -456,7 +486,12 @@ pub async fn sync_push(
     Json(req): Json<SyncPushRequest>,
 ) -> Result<Json<ApiResponse<SyncPushResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Export skills from local DB
-    let mut skills = match state.app_state.pg_db.export_user_skills(&req.skill_ids).await {
+    let mut skills = match state
+        .app_state
+        .pg_db
+        .export_user_skills(&req.skill_ids)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             return Err((
@@ -742,7 +777,12 @@ pub async fn bump_version(
     let checksum = crate::skills::compute_skill_checksum(&updated);
 
     // Update in DB
-    match state.app_state.pg_db.update_skill_version(&id, &new_version, &checksum).await {
+    match state
+        .app_state
+        .pg_db
+        .update_skill_version(&id, &new_version, &checksum)
+        .await
+    {
         Ok(_) => Ok(Json(ApiResponse::success(serde_json::json!({
             "id": id,
             "previous_version": current_version,

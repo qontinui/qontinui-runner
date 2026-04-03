@@ -13,16 +13,38 @@ impl PgDb {
 
     /// Save a new decision. Returns the decision ID.
     pub async fn save_decision(&self, input: &CreateDecisionInput) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let status = "active";
-        let alts = input.alternatives_json.clone().unwrap_or_else(|| "[]".to_string());
-        let tradeoffs = input.tradeoffs_json.clone().unwrap_or_else(|| "[]".to_string());
-        let related = input.related_decisions_json.clone().unwrap_or_else(|| "[]".to_string());
-        let files = input.affected_files_json.clone().unwrap_or_else(|| "[]".to_string());
-        let endpoints = input.affected_endpoints_json.clone().unwrap_or_else(|| "[]".to_string());
-        let tables = input.affected_tables_json.clone().unwrap_or_else(|| "[]".to_string());
+        let alts = input
+            .alternatives_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let tradeoffs = input
+            .tradeoffs_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let related = input
+            .related_decisions_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let files = input
+            .affected_files_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let endpoints = input
+            .affected_endpoints_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let tables = input
+            .affected_tables_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
         let tags = input.tags_json.clone().unwrap_or_else(|| "[]".to_string());
         let superseded_by: Option<String> = None;
 
@@ -57,7 +79,11 @@ impl PgDb {
 
     /// Get a single decision by ID (full content).
     pub async fn get_decision(&self, id: &str) -> Result<Option<Decision>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = qontinui_db::queries::decisions::get_decision()
             .bind(&conn, &id)
@@ -93,7 +119,11 @@ impl PgDb {
 
     /// List recent decisions (truncated previews).
     pub async fn list_decisions(&self, max_results: i64) -> Result<Vec<DecisionPreview>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::decisions::list_decisions()
             .bind(&conn, &max_results)
@@ -101,20 +131,23 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_decisions: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| DecisionPreview {
-            id: r.id,
-            timestamp: r.timestamp.to_rfc3339(),
-            scale: r.scale,
-            category: r.category,
-            status: r.status,
-            title: r.title,
-            summary_preview: r.summary_preview,
-            triggered_by: r.triggered_by,
-            tags_json: r.tags_json,
-            created_by: r.created_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| DecisionPreview {
+                id: r.id,
+                timestamp: r.timestamp.to_rfc3339(),
+                scale: r.scale,
+                category: r.category,
+                status: r.status,
+                title: r.title,
+                summary_preview: r.summary_preview,
+                triggered_by: r.triggered_by,
+                tags_json: r.tags_json,
+                created_by: r.created_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// List decisions filtered by category.
@@ -123,7 +156,11 @@ impl PgDb {
         category: &str,
         max_results: i64,
     ) -> Result<Vec<DecisionPreview>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::decisions::list_decisions_by_category()
             .bind(&conn, &category, &max_results)
@@ -131,20 +168,23 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_decisions_by_category: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| DecisionPreview {
-            id: r.id,
-            timestamp: r.timestamp.to_rfc3339(),
-            scale: r.scale,
-            category: r.category,
-            status: r.status,
-            title: r.title,
-            summary_preview: r.summary_preview,
-            triggered_by: r.triggered_by,
-            tags_json: r.tags_json,
-            created_by: r.created_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| DecisionPreview {
+                id: r.id,
+                timestamp: r.timestamp.to_rfc3339(),
+                scale: r.scale,
+                category: r.category,
+                status: r.status,
+                title: r.title,
+                summary_preview: r.summary_preview,
+                triggered_by: r.triggered_by,
+                tags_json: r.tags_json,
+                created_by: r.created_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// List decisions filtered by scale.
@@ -153,7 +193,11 @@ impl PgDb {
         scale: &str,
         max_results: i64,
     ) -> Result<Vec<DecisionPreview>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::decisions::list_decisions_by_scale()
             .bind(&conn, &scale, &max_results)
@@ -161,20 +205,23 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_decisions_by_scale: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| DecisionPreview {
-            id: r.id,
-            timestamp: r.timestamp.to_rfc3339(),
-            scale: r.scale,
-            category: r.category,
-            status: r.status,
-            title: r.title,
-            summary_preview: r.summary_preview,
-            triggered_by: r.triggered_by,
-            tags_json: r.tags_json,
-            created_by: r.created_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| DecisionPreview {
+                id: r.id,
+                timestamp: r.timestamp.to_rfc3339(),
+                scale: r.scale,
+                category: r.category,
+                status: r.status,
+                title: r.title,
+                summary_preview: r.summary_preview,
+                triggered_by: r.triggered_by,
+                tags_json: r.tags_json,
+                created_by: r.created_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Full-text search decisions.
@@ -183,7 +230,11 @@ impl PgDb {
         query: &str,
         max_results: i64,
     ) -> Result<Vec<DecisionSearchResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::decisions::search_decisions()
             .bind(&conn, &query, &max_results)
@@ -191,30 +242,33 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG search_decisions: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| DecisionSearchResult {
-            id: r.id,
-            timestamp: r.timestamp.to_rfc3339(),
-            scale: r.scale,
-            category: r.category,
-            status: r.status,
-            title: r.title,
-            summary_preview: r.summary_preview,
-            triggered_by: r.triggered_by,
-            tags_json: r.tags_json,
-            created_by: r.created_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            rank: r.rank,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| DecisionSearchResult {
+                id: r.id,
+                timestamp: r.timestamp.to_rfc3339(),
+                scale: r.scale,
+                category: r.category,
+                status: r.status,
+                title: r.title,
+                summary_preview: r.summary_preview,
+                triggered_by: r.triggered_by,
+                tags_json: r.tags_json,
+                created_by: r.created_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                rank: r.rank,
+            })
+            .collect())
     }
 
     /// Update decision status (active/superseded/reversed).
-    pub async fn update_decision_status(
-        &self,
-        id: &str,
-        status: &str,
-    ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn update_decision_status(&self, id: &str, status: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::decisions::update_decision_status()
             .bind(&conn, &status, &id)
@@ -226,12 +280,12 @@ impl PgDb {
     }
 
     /// Supersede a decision with a new one.
-    pub async fn supersede_decision(
-        &self,
-        id: &str,
-        superseded_by: &str,
-    ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn supersede_decision(&self, id: &str, superseded_by: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::decisions::supersede_decision()
             .bind(&conn, &superseded_by, &id)
@@ -244,7 +298,11 @@ impl PgDb {
 
     /// Update decision fields.
     pub async fn update_decision(&self, input: &UpdateDecisionInput) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::decisions::update_decision()
             .bind(
@@ -272,7 +330,11 @@ impl PgDb {
 
     /// Soft-delete a decision.
     pub async fn delete_decision(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::decisions::soft_delete_decision()
             .bind(&conn, &id)
@@ -292,12 +354,25 @@ impl PgDb {
         &self,
         input: &CreateConceptSummaryInput,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let benefits = input.benefits_json.clone().unwrap_or_else(|| "[]".to_string());
-        let components = input.components_json.clone().unwrap_or_else(|| "[]".to_string());
-        let related = input.related_decisions_json.clone().unwrap_or_else(|| "[]".to_string());
+        let benefits = input
+            .benefits_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let components = input
+            .components_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
+        let related = input
+            .related_decisions_json
+            .clone()
+            .unwrap_or_else(|| "[]".to_string());
 
         qontinui_db::queries::decisions::save_concept_summary()
             .bind(
@@ -324,7 +399,11 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Option<ConceptSummaryRecord>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = qontinui_db::queries::decisions::get_concept_summary()
             .bind(&conn, &id)
@@ -353,7 +432,11 @@ impl PgDb {
         &self,
         max_results: i64,
     ) -> Result<Vec<ConceptSummaryPreview>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::decisions::list_concept_summaries()
             .bind(&conn, &max_results)
@@ -361,19 +444,22 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_concept_summaries: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ConceptSummaryPreview {
-            id: r.id,
-            name: r.name,
-            tagline: r.tagline,
-            description_preview: r.description_preview,
-            inspiration_json: r.inspiration_json,
-            benefits_json: r.benefits_json,
-            components_json: r.components_json,
-            related_decisions_json: r.related_decisions_json,
-            metrics_json: r.metrics_json,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ConceptSummaryPreview {
+                id: r.id,
+                name: r.name,
+                tagline: r.tagline,
+                description_preview: r.description_preview,
+                inspiration_json: r.inspiration_json,
+                benefits_json: r.benefits_json,
+                components_json: r.components_json,
+                related_decisions_json: r.related_decisions_json,
+                metrics_json: r.metrics_json,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Full-text search concept summaries.
@@ -382,7 +468,11 @@ impl PgDb {
         query: &str,
         max_results: i64,
     ) -> Result<Vec<ConceptSummaryPreview>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::decisions::search_concept_summaries()
             .bind(&conn, &query, &max_results)
@@ -390,19 +480,22 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG search_concept_summaries: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ConceptSummaryPreview {
-            id: r.id,
-            name: r.name,
-            tagline: r.tagline,
-            description_preview: r.description_preview,
-            inspiration_json: r.inspiration_json,
-            benefits_json: r.benefits_json,
-            components_json: r.components_json,
-            related_decisions_json: r.related_decisions_json,
-            metrics_json: r.metrics_json,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ConceptSummaryPreview {
+                id: r.id,
+                name: r.name,
+                tagline: r.tagline,
+                description_preview: r.description_preview,
+                inspiration_json: r.inspiration_json,
+                benefits_json: r.benefits_json,
+                components_json: r.components_json,
+                related_decisions_json: r.related_decisions_json,
+                metrics_json: r.metrics_json,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Update concept summary fields.
@@ -410,7 +503,11 @@ impl PgDb {
         &self,
         input: &UpdateConceptSummaryInput,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::decisions::update_concept_summary()
             .bind(
@@ -434,7 +531,11 @@ impl PgDb {
 
     /// Soft-delete a concept summary.
     pub async fn delete_concept_summary(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::decisions::soft_delete_concept_summary()
             .bind(&conn, &id)

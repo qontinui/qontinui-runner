@@ -187,9 +187,7 @@ fn domain_dependency_order() -> Vec<VerificationDomain> {
 ///
 /// Phases are ordered according to `domain_dependency_order()`. Each phase
 /// lists the domains that precede it in the canonical order as dependencies.
-fn build_phases(
-    domain_groups: &HashMap<VerificationDomain, Vec<String>>,
-) -> Vec<Phase> {
+fn build_phases(domain_groups: &HashMap<VerificationDomain, Vec<String>>) -> Vec<Phase> {
     let canonical_order = domain_dependency_order();
 
     // Collect only the domains that actually appear in the criteria, preserving
@@ -345,7 +343,10 @@ pub fn classify_pipeline_depth_from_description(description: &str) -> PipelineDe
 
 /// Refine pipeline depth using criteria-based complexity assessment.
 /// Called after Specification phase produces criteria, can upgrade (but not downgrade) depth.
-pub fn refine_pipeline_depth(current: PipelineDepth, criteria_level: ComplexityLevel) -> PipelineDepth {
+pub fn refine_pipeline_depth(
+    current: PipelineDepth,
+    criteria_level: ComplexityLevel,
+) -> PipelineDepth {
     match (current, criteria_level) {
         // If criteria-based assessment says Complex, upgrade regardless
         (_, ComplexityLevel::Complex) => PipelineDepth::Complex,

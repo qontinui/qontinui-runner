@@ -116,7 +116,12 @@ impl AdwinDetector {
     }
 
     /// Add a new observation. Returns `Some(DriftSignal)` if drift is detected.
-    pub fn update(&mut self, value: f64, metric_name: &str, context_key: &str) -> Option<DriftSignal> {
+    pub fn update(
+        &mut self,
+        value: f64,
+        metric_name: &str,
+        context_key: &str,
+    ) -> Option<DriftSignal> {
         // 1. Add new observation as a single-element bucket
         self.buckets.push_front(AdwinBucket {
             total: value,
@@ -173,8 +178,16 @@ impl AdwinDetector {
                 let combined_count = a.count + b.count;
                 let combined_total = a.total + b.total;
                 // Approximate combined variance using parallel algorithm
-                let mean_a = if a.count > 0 { a.total / a.count as f64 } else { 0.0 };
-                let mean_b = if b.count > 0 { b.total / b.count as f64 } else { 0.0 };
+                let mean_a = if a.count > 0 {
+                    a.total / a.count as f64
+                } else {
+                    0.0
+                };
+                let mean_b = if b.count > 0 {
+                    b.total / b.count as f64
+                } else {
+                    0.0
+                };
                 let delta_mean = mean_a - mean_b;
                 let combined_variance = a.variance
                     + b.variance
@@ -229,8 +242,8 @@ impl AdwinDetector {
             // ADWIN bound: epsilon_cut = sqrt((1/2m) * ln(4n/delta))
             // where m = harmonic mean of n0 and n1, n = total count
             let m_harmonic = 2.0 * (n0 as f64 * n1 as f64) / (n0 + n1) as f64;
-            let epsilon_cut = ((1.0 / (2.0 * m_harmonic)) * (4.0 * self.count as f64 / self.delta).ln())
-                .sqrt();
+            let epsilon_cut =
+                ((1.0 / (2.0 * m_harmonic)) * (4.0 * self.count as f64 / self.delta).ln()).sqrt();
 
             if abs_diff >= epsilon_cut {
                 // Drift detected! Remove old sub-window (buckets from i+1 onward)
@@ -549,28 +562,30 @@ impl DriftMonitor {
     /// Get or create the detector ensemble for a (metric, context) pair.
     fn get_or_create(&mut self, metric_name: &str, context_key: &str) -> &mut DetectorEnsemble {
         let key = format!("{}:{}", metric_name, context_key);
-        self.detectors.entry(key).or_insert_with(|| match metric_name {
-            METRIC_SUCCESS_RATE => DetectorEnsemble {
-                adwin: None,
-                ddm: Some(DdmDetector::new()),
-                page_hinkley: None,
-            },
-            METRIC_COMPOSITE_SCORE => DetectorEnsemble {
-                adwin: Some(AdwinDetector::default_sensitivity()),
-                ddm: None,
-                page_hinkley: Some(PageHinkleyDetector::default_for_score()),
-            },
-            METRIC_COST_USD | METRIC_DURATION_SECS => DetectorEnsemble {
-                adwin: Some(AdwinDetector::default_sensitivity()),
-                ddm: None,
-                page_hinkley: Some(PageHinkleyDetector::default_for_cost()),
-            },
-            _ => DetectorEnsemble {
-                adwin: Some(AdwinDetector::default_sensitivity()),
-                ddm: None,
-                page_hinkley: None,
-            },
-        })
+        self.detectors
+            .entry(key)
+            .or_insert_with(|| match metric_name {
+                METRIC_SUCCESS_RATE => DetectorEnsemble {
+                    adwin: None,
+                    ddm: Some(DdmDetector::new()),
+                    page_hinkley: None,
+                },
+                METRIC_COMPOSITE_SCORE => DetectorEnsemble {
+                    adwin: Some(AdwinDetector::default_sensitivity()),
+                    ddm: None,
+                    page_hinkley: Some(PageHinkleyDetector::default_for_score()),
+                },
+                METRIC_COST_USD | METRIC_DURATION_SECS => DetectorEnsemble {
+                    adwin: Some(AdwinDetector::default_sensitivity()),
+                    ddm: None,
+                    page_hinkley: Some(PageHinkleyDetector::default_for_cost()),
+                },
+                _ => DetectorEnsemble {
+                    adwin: Some(AdwinDetector::default_sensitivity()),
+                    ddm: None,
+                    page_hinkley: None,
+                },
+            })
     }
 
     /// Observe a continuous-valued metric (composite_score, cost, duration).
@@ -703,7 +718,8 @@ impl DriftMonitor {
 
     /// Deserialize monitor state from persistence.
     pub fn deserialize_state(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json).map_err(|e| format!("Failed to deserialize drift monitor: {}", e))
+        serde_json::from_str(json)
+            .map_err(|e| format!("Failed to deserialize drift monitor: {}", e))
     }
 }
 
@@ -738,7 +754,7 @@ mod tests {
     #[test]
     fn test_adwin_detects_mean_shift() {
         let mut adwin = AdwinDetector::new(0.01); // slightly less sensitive for test stability
-        // Phase 1: stable at 0.8
+                                                  // Phase 1: stable at 0.8
         for _ in 0..100 {
             adwin.update(0.8, "test", "ctx");
         }
@@ -780,7 +796,10 @@ mod tests {
                 break;
             }
         }
-        assert!(detected, "DDM should detect error rate increase from 5% to ~100%");
+        assert!(
+            detected,
+            "DDM should detect error rate increase from 5% to ~100%"
+        );
     }
 
     #[test]
@@ -795,7 +814,7 @@ mod tests {
     #[test]
     fn test_page_hinkley_detects_increase() {
         let mut ph = PageHinkleyDetector::new(0.005, 20.0); // sensitive settings
-        // Phase 1: stable around 1.0
+                                                            // Phase 1: stable around 1.0
         for _ in 0..50 {
             ph.update(1.0);
         }
@@ -808,7 +827,10 @@ mod tests {
                 break;
             }
         }
-        assert!(detected, "Page-Hinkley should detect gradual increase from 1.0 to 2.0+");
+        assert!(
+            detected,
+            "Page-Hinkley should detect gradual increase from 1.0 to 2.0+"
+        );
     }
 
     #[test]

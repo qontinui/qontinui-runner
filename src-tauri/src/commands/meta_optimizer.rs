@@ -66,10 +66,7 @@ pub fn get_prompt_variants(
     app_state: State<'_, Arc<AppState>>,
     agent_type: Option<String>,
 ) -> Result<Vec<PromptVariant>, String> {
-    crate::meta_optimizer::prompt_registry::list_variants(
-        &app_state.pg_db,
-        agent_type.as_deref(),
-    )
+    crate::meta_optimizer::prompt_registry::list_variants(&app_state.pg_db, agent_type.as_deref())
 }
 
 #[tauri::command]
@@ -77,10 +74,7 @@ pub fn activate_prompt_variant(
     app_state: State<'_, Arc<AppState>>,
     variant_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::prompt_registry::activate_variant(
-        &app_state.pg_db,
-        &variant_id,
-    )
+    crate::meta_optimizer::prompt_registry::activate_variant(&app_state.pg_db, &variant_id)
 }
 
 // ── Optimizer Runs ─────────────────────────────────────────────────────
@@ -89,9 +83,7 @@ pub fn activate_prompt_variant(
 pub fn get_meta_optimizer_runs(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<MetaOptimizerRun>, String> {
-    crate::meta_optimizer::recommendations::list_optimizer_runs(
-        &app_state.pg_db,
-    )
+    crate::meta_optimizer::recommendations::list_optimizer_runs(&app_state.pg_db)
 }
 
 // ── Progress Tracking ─────────────────────────────────────────────────
@@ -102,11 +94,7 @@ pub fn get_meta_optimizer_progress(
     category: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
-    let summary =
-        crate::meta_optimizer::snapshots::get_progress_summary(
-            &app_state.pg_db,
-            cat,
-        )?;
+    let summary = crate::meta_optimizer::snapshots::get_progress_summary(&app_state.pg_db, cat)?;
     serde_json::to_value(summary).map_err(|e| format!("Serialization error: {}", e))
 }
 
@@ -116,11 +104,7 @@ pub fn capture_meta_optimizer_baseline(
     category: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let cat = crate::meta_optimizer::types::WorkflowCategory::from_str_opt(category.as_deref());
-    let snapshot =
-        crate::meta_optimizer::snapshots::capture_baseline(
-            &app_state.pg_db,
-            cat,
-        )?;
+    let snapshot = crate::meta_optimizer::snapshots::capture_baseline(&app_state.pg_db, cat)?;
     serde_json::to_value(snapshot).map_err(|e| format!("Serialization error: {}", e))
 }
 
@@ -143,9 +127,7 @@ pub fn get_agent_effectiveness(
     app_state: State<'_, Arc<AppState>>,
     limit: Option<u32>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentTraceAggregate>, String> {
-    crate::database::pipeline_traces::get_agent_trace_aggregates(
-        limit.unwrap_or(200),
-    )
+    crate::database::pipeline_traces::get_agent_trace_aggregates(limit.unwrap_or(200))
 }
 
 // ── Failure Analysis ─────────────────────────────────────────────────────
@@ -223,9 +205,7 @@ pub fn get_agent_interaction_matrix(
     app_state: State<'_, Arc<AppState>>,
     days: Option<i64>,
 ) -> Result<Vec<crate::database::pipeline_traces::AgentInteraction>, String> {
-    crate::database::pipeline_traces::get_agent_interaction_matrix(
-        days.unwrap_or(30),
-    )
+    crate::database::pipeline_traces::get_agent_interaction_matrix(days.unwrap_or(30))
 }
 
 #[tauri::command]
@@ -233,9 +213,7 @@ pub fn get_agent_cascade_effect(
     app_state: State<'_, Arc<AppState>>,
     recommendation_id: String,
 ) -> Result<Vec<crate::database::pipeline_traces::CascadeEffect>, String> {
-    crate::database::pipeline_traces::get_agent_cascade_effect(
-        &recommendation_id,
-    )
+    crate::database::pipeline_traces::get_agent_cascade_effect(&recommendation_id)
 }
 
 // ── Canary Rollout ──────────────────────────────────────────────────────
@@ -257,15 +235,10 @@ pub fn start_canary_rollout(
 pub fn get_canary_rollouts(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let rollouts = crate::meta_optimizer::canary::get_active_canaries(
-        &app_state.pg_db,
-    )?;
-    let recs = crate::meta_optimizer::recommendations::list_recommendations(
-        &app_state.pg_db,
-        None,
-        None,
-    )
-    .unwrap_or_default();
+    let rollouts = crate::meta_optimizer::canary::get_active_canaries(&app_state.pg_db)?;
+    let recs =
+        crate::meta_optimizer::recommendations::list_recommendations(&app_state.pg_db, None, None)
+            .unwrap_or_default();
 
     let values: Vec<serde_json::Value> = rollouts
         .into_iter()
@@ -287,10 +260,7 @@ pub fn promote_canary_rollout(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::canary::promote_canary(
-        &app_state.pg_db,
-        &canary_id,
-    )
+    crate::meta_optimizer::canary::promote_canary(&app_state.pg_db, &canary_id)
 }
 
 #[tauri::command]
@@ -298,10 +268,7 @@ pub fn rollback_canary_rollout(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::canary::rollback_canary(
-        &app_state.pg_db,
-        &canary_id,
-    )
+    crate::meta_optimizer::canary::rollback_canary(&app_state.pg_db, &canary_id)
 }
 
 // ── Prompt Template A/B Testing ──────────────────────────────────────────
@@ -314,7 +281,14 @@ pub async fn create_prompt_canary(
     candidate_version: i32,
     traffic_pct: f64,
 ) -> Result<String, String> {
-    app_state.pg_db.create_template_canary(&template_id, baseline_version, candidate_version, traffic_pct)
+    app_state
+        .pg_db
+        .create_template_canary(
+            &template_id,
+            baseline_version,
+            candidate_version,
+            traffic_pct,
+        )
         .await
 }
 
@@ -323,7 +297,9 @@ pub async fn get_prompt_canary_status(
     app_state: State<'_, Arc<AppState>>,
     canary_id: String,
 ) -> Result<serde_json::Value, String> {
-    let canary = app_state.pg_db.get_template_canary(&canary_id)
+    let canary = app_state
+        .pg_db
+        .get_template_canary(&canary_id)
         .await?
         .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?;
     let evaluation = crate::meta_optimizer::canary::evaluate_prompt_canary(&canary);
@@ -373,10 +349,7 @@ pub fn get_eval_specs(
     app_state: State<'_, Arc<AppState>>,
     target_agent: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::EvalSpec>, String> {
-    crate::meta_optimizer::eval_spec::list_eval_specs(
-        &app_state.pg_db,
-        target_agent.as_deref(),
-    )
+    crate::meta_optimizer::eval_spec::list_eval_specs(&app_state.pg_db, target_agent.as_deref())
 }
 
 #[tauri::command]
@@ -384,10 +357,7 @@ pub fn create_eval_spec(
     app_state: State<'_, Arc<AppState>>,
     spec: crate::meta_optimizer::eval_spec::EvalSpec,
 ) -> Result<(), String> {
-    crate::meta_optimizer::eval_spec::save_eval_spec(
-        &app_state.pg_db,
-        &spec,
-    )
+    crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.pg_db, &spec)
 }
 
 #[tauri::command]
@@ -395,10 +365,7 @@ pub fn delete_eval_spec(
     app_state: State<'_, Arc<AppState>>,
     spec_id: String,
 ) -> Result<(), String> {
-    crate::meta_optimizer::eval_spec::delete_eval_spec(
-        &app_state.pg_db,
-        &spec_id,
-    )
+    crate::meta_optimizer::eval_spec::delete_eval_spec(&app_state.pg_db, &spec_id)
 }
 
 #[tauri::command]
@@ -430,13 +397,8 @@ pub fn generate_default_eval_spec(
     app_state: State<'_, Arc<AppState>>,
     target_agent: String,
 ) -> Result<crate::meta_optimizer::eval_spec::EvalSpec, String> {
-    let spec = crate::meta_optimizer::eval_spec::generate_default_spec(
-        &target_agent,
-    )?;
-    crate::meta_optimizer::eval_spec::save_eval_spec(
-        &app_state.pg_db,
-        &spec,
-    )?;
+    let spec = crate::meta_optimizer::eval_spec::generate_default_spec(&target_agent)?;
+    crate::meta_optimizer::eval_spec::save_eval_spec(&app_state.pg_db, &spec)?;
     Ok(spec)
 }
 
@@ -456,9 +418,8 @@ pub fn evaluate_with_io(
     output: String,
     context: Option<String>,
 ) -> Result<Vec<crate::meta_optimizer::eval_spec::AssertionResult>, String> {
-    let spec: crate::meta_optimizer::eval_spec::EvalSpec =
-        serde_json::from_str(&eval_spec_json)
-            .map_err(|e| format!("Failed to parse eval spec: {}", e))?;
+    let spec: crate::meta_optimizer::eval_spec::EvalSpec = serde_json::from_str(&eval_spec_json)
+        .map_err(|e| format!("Failed to parse eval spec: {}", e))?;
 
     // Build dummy aggregate metrics for non-judge assertions.
     // If a target agent is specified, try to load real metrics from the database.
@@ -473,17 +434,19 @@ pub fn evaluate_with_io(
         )
         .ok()
         .flatten()
-        .map(|agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
-            success_rate: if agg.run_count > 0 {
-                agg.success_count as f64 / agg.run_count as f64
-            } else {
-                0.0
+        .map(
+            |agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+                success_rate: if agg.run_count > 0 {
+                    agg.success_count as f64 / agg.run_count as f64
+                } else {
+                    0.0
+                },
+                mean_duration_ms: agg.avg_duration_ms,
+                mean_iterations: 0.0,
+                mean_cost_cents: agg.avg_cost_usd * 100.0,
+                trial_count: agg.run_count as u32,
             },
-            mean_duration_ms: agg.avg_duration_ms,
-            mean_iterations: 0.0,
-            mean_cost_cents: agg.avg_cost_usd * 100.0,
-            trial_count: agg.run_count as u32,
-        })
+        )
         .unwrap_or_else(default_aggregate_metrics)
     } else {
         default_aggregate_metrics()
@@ -586,10 +549,8 @@ pub async fn refresh_model_profiles(
     app_state: State<'_, Arc<AppState>>,
     days: Option<i64>,
 ) -> Result<Vec<crate::autoresearch::model_profiles::ModelProfile>, String> {
-    crate::autoresearch::model_profiles::refresh_all_profiles(
-        &app_state.pg_db,
-        days.unwrap_or(30),
-    ).await
+    crate::autoresearch::model_profiles::refresh_all_profiles(&app_state.pg_db, days.unwrap_or(30))
+        .await
 }
 
 #[tauri::command]
@@ -597,10 +558,8 @@ pub async fn get_model_recommendations(
     app_state: State<'_, Arc<AppState>>,
     budget_usd: Option<f64>,
 ) -> Result<Vec<crate::autoresearch::model_profiles::ModelRecommendation>, String> {
-    crate::autoresearch::model_profiles::get_model_recommendation(
-        &app_state.pg_db,
-        budget_usd,
-    ).await
+    crate::autoresearch::model_profiles::get_model_recommendation(&app_state.pg_db, budget_usd)
+        .await
 }
 
 // ── Comparison Bridge ─────────────────────────────────────────────────
@@ -626,7 +585,8 @@ pub fn get_prompt_optimization_status(
 
     // Get prompt group metrics
     let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
+    let groups =
+        crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
 
     // Get active evolution entries (canaries in progress)
     let evolution =
@@ -649,14 +609,13 @@ pub fn get_prompt_group_metrics(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::meta_optimizer::prompt_extractor::PromptGroupMetrics>, String> {
     let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(
+        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(&app_state.pg_db, 500)?;
+    Ok(
+        crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(
+            &samples,
             &app_state.pg_db,
-            500,
-        )?;
-    Ok(crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(
-        &samples,
-        &app_state.pg_db,
-    ))
+        ),
+    )
 }
 
 #[tauri::command]
@@ -700,7 +659,10 @@ pub async fn get_prompt_variant_content(
     app_state: State<'_, Arc<AppState>>,
     variant_id: String,
 ) -> Result<Option<String>, String> {
-    app_state.pg_db.get_prompt_variant_content(&variant_id).await
+    app_state
+        .pg_db
+        .get_prompt_variant_content(&variant_id)
+        .await
 }
 
 #[tauri::command]

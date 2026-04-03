@@ -5,13 +5,7 @@
 //! offline by reading spec files, test files, component source, and git
 //! history — no UI Bridge connection required.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -291,10 +285,7 @@ fn scan_test_files_recursive(dir: &Path, results: &mut Vec<TestFileInfo>) {
 
 fn count_test_assertions(content: &str) -> usize {
     let patterns = ["expect(", "assert(", "assert.", "it(", "test("];
-    patterns
-        .iter()
-        .map(|p| content.matches(p).count())
-        .sum()
+    patterns.iter().map(|p| content.matches(p).count()).sum()
 }
 
 fn extract_component_refs(content: &str) -> Vec<String> {
@@ -393,12 +384,7 @@ pub async fn coverage_analysis(
                 .as_deref()
                 .unwrap_or("unknown")
                 .to_string();
-            let component = spec
-                .metadata
-                .component
-                .as_deref()
-                .unwrap_or("")
-                .to_string();
+            let component = spec.metadata.component.as_deref().unwrap_or("").to_string();
 
             let groups = spec.groups.as_deref().unwrap_or(&[]);
 
@@ -406,12 +392,13 @@ pub async fn coverage_analysis(
             let matching_tests: Vec<&TestFileInfo> = test_files
                 .iter()
                 .filter(|tf| {
-                    tf.referenced_components.iter().any(|r| {
-                        r == &component || r.to_lowercase() == page_id.to_lowercase()
-                    }) || tf
-                        .file_path
-                        .to_lowercase()
-                        .contains(&page_id.to_lowercase())
+                    tf.referenced_components
+                        .iter()
+                        .any(|r| r == &component || r.to_lowercase() == page_id.to_lowercase())
+                        || tf
+                            .file_path
+                            .to_lowercase()
+                            .contains(&page_id.to_lowercase())
                 })
                 .collect();
 
@@ -435,8 +422,7 @@ pub async fn coverage_analysis(
                         .unwrap_or(&[])
                         .iter()
                         .filter(|a| {
-                            a.enabled.unwrap_or(true)
-                                && a.severity.as_deref() == Some("critical")
+                            a.enabled.unwrap_or(true) && a.severity.as_deref() == Some("critical")
                         })
                         .count()
                 })
@@ -464,9 +450,9 @@ pub async fn coverage_analysis(
                     let group_name = group.name.as_deref().unwrap_or("").to_string();
                     let keywords = extract_keywords(&group_name);
                     let has_test = matching_tests.iter().any(|tf| {
-                        keywords.iter().any(|kw| {
-                            tf.content.to_lowercase().contains(kw)
-                        })
+                        keywords
+                            .iter()
+                            .any(|kw| tf.content.to_lowercase().contains(kw))
                     });
 
                     let max_severity = group
@@ -520,9 +506,11 @@ pub async fn coverage_analysis(
         gaps.sort_by(|a, b| {
             let a_critical = a.gaps.iter().filter(|g| g.severity == "critical").count();
             let b_critical = b.gaps.iter().filter(|g| g.severity == "critical").count();
-            b_critical
-                .cmp(&a_critical)
-                .then(a.coverage_score.partial_cmp(&b.coverage_score).unwrap_or(std::cmp::Ordering::Equal))
+            b_critical.cmp(&a_critical).then(
+                a.coverage_score
+                    .partial_cmp(&b.coverage_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
 
         let well_covered = gaps.iter().filter(|g| g.coverage_score > 0.7).count();
@@ -585,12 +573,7 @@ pub async fn complexity_scores(
                     .as_deref()
                     .unwrap_or("unknown")
                     .to_string();
-                let route = spec
-                    .metadata
-                    .page_url
-                    .as_deref()
-                    .unwrap_or("/")
-                    .to_string();
+                let route = spec.metadata.page_url.as_deref().unwrap_or("/").to_string();
 
                 let groups = spec.groups.as_deref().unwrap_or(&[]);
                 let all_assertions: Vec<&SpecAssertion> = groups
@@ -745,18 +728,8 @@ pub async fn feature_health(
                     .as_deref()
                     .unwrap_or("unknown")
                     .to_string();
-                let route = spec
-                    .metadata
-                    .page_url
-                    .as_deref()
-                    .unwrap_or("/")
-                    .to_string();
-                let component = spec
-                    .metadata
-                    .component
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_string();
+                let route = spec.metadata.page_url.as_deref().unwrap_or("/").to_string();
+                let component = spec.metadata.component.as_deref().unwrap_or("").to_string();
 
                 // Get spec file path
                 let spec_file = format!("src/specs/{}.spec.uibridge.json", page_id);
@@ -776,8 +749,7 @@ pub async fn feature_health(
 
                 let code_age = days_since(&last_code_change);
                 let spec_age = days_since(&last_spec_change);
-                let code_commits_30d =
-                    git_commit_count_since(&project_path, &component_path, 30);
+                let code_commits_30d = git_commit_count_since(&project_path, &component_path, 30);
 
                 let has_test_files = test_files.iter().any(|tf| {
                     tf.referenced_components.iter().any(|r| r == &component)
@@ -809,7 +781,10 @@ pub async fn feature_health(
                     signals.push("No test files reference this component".to_string());
                 } else if code_age > 60.0 {
                     status = "stale".to_string();
-                    signals.push(format!("No code changes in {} days", code_age.round() as u32));
+                    signals.push(format!(
+                        "No code changes in {} days",
+                        code_age.round() as u32
+                    ));
                 } else {
                     status = "active".to_string();
                 }
@@ -934,8 +909,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/development-intelligence/feature-health",
             post(feature_health),
         )
-        .route(
-            "/development-intelligence/trends",
-            post(get_trends),
-        )
+        .route("/development-intelligence/trends", post(get_trends))
 }

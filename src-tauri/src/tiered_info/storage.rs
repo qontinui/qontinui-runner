@@ -14,34 +14,22 @@ use super::types::{
 
 /// Get recent automation runs from task_run_automation table for a config.
 /// Joins with task_runs to get config_id.
-pub fn get_recent_automation_runs(
-    config_id: &str,
-    limit: u32,
-) -> Result<Vec<RunDetails>, String> {
+pub fn get_recent_automation_runs(config_id: &str, limit: u32) -> Result<Vec<RunDetails>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get failed automation runs from task_run_automation table for a config.
-pub fn get_failed_automation_runs(
-    config_id: &str,
-    limit: u32,
-) -> Result<Vec<RunDetails>, String> {
+pub fn get_failed_automation_runs(config_id: &str, limit: u32) -> Result<Vec<RunDetails>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get all recent runs from task_run_automation.
-pub fn get_all_recent_runs(
-    config_id: &str,
-    limit: u32,
-) -> Result<Vec<RunDetails>, String> {
+pub fn get_all_recent_runs(config_id: &str, limit: u32) -> Result<Vec<RunDetails>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get all failed runs from task_run_automation.
-pub fn get_all_failed_runs(
-    config_id: &str,
-    limit: u32,
-) -> Result<Vec<RunDetails>, String> {
+pub fn get_all_failed_runs(config_id: &str, limit: u32) -> Result<Vec<RunDetails>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -50,16 +38,12 @@ pub fn get_all_failed_runs(
 // ==============================================================================
 
 /// Get or create config statistics.
-pub fn get_or_create_config_statistics(
-    config_id: &str,
-) -> Result<ConfigStatistics, String> {
+pub fn get_or_create_config_statistics(config_id: &str) -> Result<ConfigStatistics, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get config statistics by config_id.
-pub fn get_config_statistics(
-    config_id: &str,
-) -> Result<Option<ConfigStatistics>, String> {
+pub fn get_config_statistics(config_id: &str) -> Result<Option<ConfigStatistics>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -84,18 +68,12 @@ pub fn update_statistics_after_run(run: &RunDetails) -> Result<(), String> {
 // ==============================================================================
 
 /// Get flaky transitions with details.
-pub fn get_flaky_transitions(
-    config_id: &str,
-    threshold: f64,
-) -> Result<Vec<FlakyItem>, String> {
+pub fn get_flaky_transitions(config_id: &str, threshold: f64) -> Result<Vec<FlakyItem>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get flaky templates with details.
-pub fn get_flaky_templates(
-    config_id: &str,
-    threshold: f64,
-) -> Result<Vec<FlakyItem>, String> {
+pub fn get_flaky_templates(config_id: &str, threshold: f64) -> Result<Vec<FlakyItem>, String> {
     Err("SQLite removed".to_string())
 }
 

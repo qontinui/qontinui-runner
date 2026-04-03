@@ -31,9 +31,7 @@ impl RunCostTrackers {
     pub fn with_budget(budget: TokenBudget) -> Self {
         Self {
             budget: Arc::new(BudgetTracker::new(budget)),
-            circuit_breaker: Arc::new(CostCircuitBreaker::new(
-                CostCircuitBreakerConfig::default(),
-            )),
+            circuit_breaker: Arc::new(CostCircuitBreaker::new(CostCircuitBreakerConfig::default())),
             anomaly_detector: Arc::new(Mutex::new(CostAnomalyDetector::new())),
         }
     }

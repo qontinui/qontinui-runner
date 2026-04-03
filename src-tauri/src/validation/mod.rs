@@ -17,7 +17,7 @@ pub mod validator;
 
 pub use coercion::CoercionPolicy;
 pub use constrained_decoding::{
-    prepare_schema_for_backend, prepare_raw_schema_for_backend, schema_to_gbnf,
+    prepare_raw_schema_for_backend, prepare_schema_for_backend, schema_to_gbnf,
     ConstrainedDecodingPayload,
 };
 pub use feedback::validation_feedback_prompt;

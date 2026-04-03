@@ -614,18 +614,35 @@ pub async fn update_hook(
     };
 
     // Apply updates
-    let name = request.name.unwrap_or_else(|| current["name"].as_str().unwrap_or("").to_string());
-    let description = request.description.unwrap_or_else(|| current["description"].as_str().map(|s| s.to_string()));
-    let trigger = request.trigger.unwrap_or_else(|| current["trigger"].as_str().unwrap_or("").to_string());
-    let action_type = request.action_type.unwrap_or_else(|| current["action_type"].as_str().unwrap_or("").to_string());
+    let name = request
+        .name
+        .unwrap_or_else(|| current["name"].as_str().unwrap_or("").to_string());
+    let description = request
+        .description
+        .unwrap_or_else(|| current["description"].as_str().map(|s| s.to_string()));
+    let trigger = request
+        .trigger
+        .unwrap_or_else(|| current["trigger"].as_str().unwrap_or("").to_string());
+    let action_type = request
+        .action_type
+        .unwrap_or_else(|| current["action_type"].as_str().unwrap_or("").to_string());
     let action_config_str = match request.action_config {
         Some(config) => serde_json::to_string(&config)
             .map_err(|e| format!("Failed to serialize action config: {}", e))?,
-        None => current["action_config"].as_str().unwrap_or("{}").to_string(),
+        None => current["action_config"]
+            .as_str()
+            .unwrap_or("{}")
+            .to_string(),
     };
-    let enabled = request.enabled.unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(true));
-    let execution_order = request.execution_order.unwrap_or_else(|| current["execution_order"].as_i64().unwrap_or(0) as i32);
-    let continue_on_failure = request.continue_on_failure.unwrap_or_else(|| current["continue_on_failure"].as_bool().unwrap_or(true));
+    let enabled = request
+        .enabled
+        .unwrap_or_else(|| current["enabled"].as_bool().unwrap_or(true));
+    let execution_order = request
+        .execution_order
+        .unwrap_or_else(|| current["execution_order"].as_i64().unwrap_or(0) as i32);
+    let continue_on_failure = request
+        .continue_on_failure
+        .unwrap_or_else(|| current["continue_on_failure"].as_bool().unwrap_or(true));
     let conditions_str = match request.conditions {
         Some(conditions) => serde_json::to_string(&conditions)
             .map_err(|e| format!("Failed to serialize conditions: {}", e))?,
@@ -784,7 +801,10 @@ pub async fn test_hook(
     };
 
     let action_type = hook_json["action_type"].as_str().unwrap_or("").to_string();
-    let action_config_str = hook_json["action_config"].as_str().unwrap_or("{}").to_string();
+    let action_config_str = hook_json["action_config"]
+        .as_str()
+        .unwrap_or("{}")
+        .to_string();
 
     let action_config: serde_json::Value = serde_json::from_str(&action_config_str)
         .map_err(|e| format!("Failed to parse action config: {}", e))?;

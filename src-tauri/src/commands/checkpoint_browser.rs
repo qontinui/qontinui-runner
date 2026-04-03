@@ -155,14 +155,17 @@ pub async fn create_orchestrator_checkpoint(
 
     // Persist to database
     let state_json = serde_json::to_value(&snapshot).unwrap_or(serde_json::json!(state));
-    app_state.pg_db.save_orchestrator_checkpoint(
-        &id,
-        &task_id,
-        iteration,
-        "Manual",
-        &state_json,
-        name.as_deref(),
-    ).await?;
+    app_state
+        .pg_db
+        .save_orchestrator_checkpoint(
+            &id,
+            &task_id,
+            iteration,
+            "Manual",
+            &state_json,
+            name.as_deref(),
+        )
+        .await?;
 
     Ok(id)
 }
@@ -236,7 +239,9 @@ pub async fn get_checkpoint_count(state: State<'_, Arc<AppState>>) -> Result<usi
 
 /// Get unique task IDs that have checkpoints.
 #[tauri::command]
-pub async fn get_checkpoint_task_ids(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+pub async fn get_checkpoint_task_ids(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>, String> {
     state.pg_db.get_checkpoint_task_ids().await
 }
 
@@ -254,7 +259,8 @@ pub async fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Resu
     let task_id = "sample-task-001";
 
     // Collect items to save to PG after releasing the mutex
-    let mut pg_saves: Vec<(String, u32, String, serde_json::Value, Option<&'static str>)> = Vec::new();
+    let mut pg_saves: Vec<(String, u32, String, serde_json::Value, Option<&'static str>)> =
+        Vec::new();
 
     // Save to in-memory manager (sync, mutex held briefly)
     {
@@ -349,14 +355,10 @@ pub async fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Resu
 
     // Now persist to PG (async, no mutex held)
     for (id, i, trigger_str, state_json, name) in &pg_saves {
-        let _ = app_state.pg_db.save_orchestrator_checkpoint(
-            id,
-            task_id,
-            *i,
-            trigger_str,
-            state_json,
-            *name,
-        ).await;
+        let _ = app_state
+            .pg_db
+            .save_orchestrator_checkpoint(id, task_id, *i, trigger_str, state_json, *name)
+            .await;
     }
 
     Ok(())
@@ -372,7 +374,9 @@ pub struct CheckpointStats {
 
 /// Get checkpoint statistics.
 #[tauri::command]
-pub async fn get_checkpoint_stats(state: State<'_, Arc<AppState>>) -> Result<CheckpointStats, String> {
+pub async fn get_checkpoint_stats(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CheckpointStats, String> {
     let checkpoints = state.pg_db.get_orchestrator_checkpoints(None).await?;
     let task_ids = state.pg_db.get_checkpoint_task_ids().await?;
 
@@ -445,7 +449,9 @@ pub async fn replay_from_checkpoint(
         RestorationInstructions::from_checkpoint(&checkpoint, &restoration_config);
 
     // Create a new task run in the database (branched from checkpoint)
-    let original_prompt = app_state.pg_db.get_task_run(&checkpoint.task_id)
+    let original_prompt = app_state
+        .pg_db
+        .get_task_run(&checkpoint.task_id)
         .await
         .ok()
         .flatten()
@@ -481,7 +487,10 @@ pub async fn replay_from_checkpoint(
         "restored_state": checkpoint.state.state,
     })
     .to_string();
-    app_state.pg_db.update_task_run_runtime_context(&new_task_run_id, &runtime_ctx).await?;
+    app_state
+        .pg_db
+        .update_task_run_runtime_context(&new_task_run_id, &runtime_ctx)
+        .await?;
 
     Ok(ReplayFromCheckpointResponse {
         session: replay_result.session,
@@ -608,11 +617,14 @@ pub async fn get_checkpoints_filtered(
     state: State<'_, Arc<AppState>>,
     filter: CheckpointFilter,
 ) -> Result<Vec<CheckpointSummary>, String> {
-    let checkpoints_json = state.pg_db.get_checkpoints_filtered(
-        filter.task_id.as_deref(),
-        filter.trigger.as_deref(),
-        filter.since.as_deref(),
-    ).await?;
+    let checkpoints_json = state
+        .pg_db
+        .get_checkpoints_filtered(
+            filter.task_id.as_deref(),
+            filter.trigger.as_deref(),
+            filter.since.as_deref(),
+        )
+        .await?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -646,11 +658,10 @@ pub async fn get_checkpoints_paginated(
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedCheckpointResult, String> {
-    let checkpoints_json =
-        state
-            .pg_db
-            .get_checkpoints_paginated(task_id.as_deref(), offset, limit)
-            .await?;
+    let checkpoints_json = state
+        .pg_db
+        .get_checkpoints_paginated(task_id.as_deref(), offset, limit)
+        .await?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -692,8 +703,5 @@ pub async fn get_checkpoints_count(
     state: State<'_, Arc<AppState>>,
     task_id: Option<String>,
 ) -> Result<i64, String> {
-    state
-        .pg_db
-        .get_checkpoints_count(task_id.as_deref())
-        .await
+    state.pg_db.get_checkpoints_count(task_id.as_deref()).await
 }

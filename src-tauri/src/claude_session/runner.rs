@@ -145,7 +145,11 @@ fn extract_tool_call_data(json_line: &str) -> Vec<(String, String)> {
     if parsed.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return results;
     }
-    let content = match parsed.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+    let content = match parsed
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
         Some(c) => c,
         None => return results,
     };
@@ -558,9 +562,7 @@ fn run_claude_session_inline(
                     let output_snapshot =
                         flush_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
                     if !output_snapshot.is_empty() {
-                        if let Err(e) =
-                            Err::<(), String>("SQLite removed".into())
-                        {
+                        if let Err(e) = Err::<(), String>("SQLite removed".into()) {
                             warn!("Failed to flush partial AI output: {}", e);
                         } else {
                             last_flushed_len = output_snapshot.len();
@@ -650,7 +652,8 @@ fn run_claude_session_inline(
                     for (tool_name, _tool_id) in extract_tool_call_data(&line) {
                         let _tool_span = tracing::info_span!("qontinui.ai.tool_call",
                             ai.tool_name = %tool_name,
-                        ).entered();
+                        )
+                        .entered();
                         // Span closes immediately — tool calls are point-in-time events
                         // since we can't track when the tool finishes from the stream
                     }
@@ -878,11 +881,13 @@ fn run_claude_session_inline(
                             }));
 
                             // Async-enrich security findings with vulnerability intelligence
-                            if parsed_finding.category == crate::findings::FindingCategory::Security {
+                            if parsed_finding.category == crate::findings::FindingCategory::Security
+                            {
                                 let description = finding.description.clone();
                                 let task_run_id = ctx.task_run_id.clone();
                                 let finding_title = finding.title.clone();
-                                if let Some(ref rt) = pg_rt { rt.spawn(async move {
+                                if let Some(ref rt) = pg_rt {
+                                    rt.spawn(async move {
                                     let ka = crate::knowledge_acquisition::KnowledgeAcquisition::new();
                                     if let Some(data) = crate::knowledge_acquisition::vuln_enrichment::enrich_from_description(&description, &ka).await {
                                         tracing::info!(
@@ -914,7 +919,8 @@ fn run_claude_session_inline(
                                             }
                                         }
                                     }
-                                }); }
+                                });
+                                }
                             }
 
                             detected_findings.push(finding);
@@ -1171,46 +1177,49 @@ fn run_claude_session_inline(
                         alternatives_considered: parsed_fix.alternatives_considered,
                     };
 
-                    let insert_result: Result<crate::reflection::types::ReflectionFix, String> = if let Some(ref rt) = pg_rt {
-                        let pg = crate::database::pg::PgDb::global();
-                        match rt.block_on(pg.save_reflection_fix(&input)) {
-                            Ok(fix) => {
-                                // Set reflection_scope via PG
-                                if parsed_fix.scope.as_deref() == Some("universal") {
-                                    let _ = rt.block_on(pg.update_fix_scope(
-                                        &fix.id,
-                                        "universal",
-                                        None,
-                                        parsed_fix.applicability.as_deref(),
-                                    ));
-                                } else {
-                                    let is_project_fix = matches!(
-                                        fix.fix_type.as_str(),
-                                        "project_environment"
-                                            | "project_architecture"
-                                            | "project_test_pattern"
-                                            | "project_recurring_issue"
-                                    );
-                                    if is_project_fix {
+                    let insert_result: Result<crate::reflection::types::ReflectionFix, String> =
+                        if let Some(ref rt) = pg_rt {
+                            let pg = crate::database::pg::PgDb::global();
+                            match rt.block_on(pg.save_reflection_fix(&input)) {
+                                Ok(fix) => {
+                                    // Set reflection_scope via PG
+                                    if parsed_fix.scope.as_deref() == Some("universal") {
                                         let _ = rt.block_on(pg.update_fix_scope(
                                             &fix.id,
-                                            "project",
-                                            ctx.project_path.as_deref(),
+                                            "universal",
                                             None,
+                                            parsed_fix.applicability.as_deref(),
                                         ));
+                                    } else {
+                                        let is_project_fix = matches!(
+                                            fix.fix_type.as_str(),
+                                            "project_environment"
+                                                | "project_architecture"
+                                                | "project_test_pattern"
+                                                | "project_recurring_issue"
+                                        );
+                                        if is_project_fix {
+                                            let _ = rt.block_on(pg.update_fix_scope(
+                                                &fix.id,
+                                                "project",
+                                                ctx.project_path.as_deref(),
+                                                None,
+                                            ));
+                                        }
                                     }
+                                    // Link error_events via PG
+                                    if let Some(ref finding_id) = fix.source_finding_id {
+                                        let _ = rt.block_on(
+                                            pg.link_error_events_to_fix(&fix.id, finding_id),
+                                        );
+                                    }
+                                    Ok(fix)
                                 }
-                                // Link error_events via PG
-                                if let Some(ref finding_id) = fix.source_finding_id {
-                                    let _ = rt.block_on(pg.link_error_events_to_fix(&fix.id, finding_id));
-                                }
-                                Ok(fix)
+                                Err(e) => Err(e),
                             }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Err("No PG runtime available for reflection fix insert".to_string())
-                    };
+                        } else {
+                            Err("No PG runtime available for reflection fix insert".to_string())
+                        };
                     match insert_result {
                         Ok(fix) => {
                             fix_count += 1;
@@ -1265,7 +1274,9 @@ fn run_claude_session_inline(
                                         let knowledge_result = if let Some(ref rt) = pg_rt {
                                             let pg = crate::database::pg::PgDb::global();
                                             let kid = uuid::Uuid::new_v4().to_string();
-                                            let related_files_json = serde_json::to_string(&related_files).unwrap_or_default();
+                                            let related_files_json =
+                                                serde_json::to_string(&related_files)
+                                                    .unwrap_or_default();
                                             rt.block_on(pg.create_task_knowledge(
                                                 &kid,
                                                 &ctx.source_task_run_id,
@@ -1285,8 +1296,14 @@ fn run_claude_session_inline(
                                                 // Set project_path on the knowledge entry
                                                 if let Some(ref pp) = ctx.project_path {
                                                     if let Some(ref rt) = pg_rt {
-                                                        let pg = crate::database::pg::PgDb::global();
-                                                        let _ = rt.block_on(pg.update_task_knowledge_project_path(&knowledge_id, pp));
+                                                        let pg =
+                                                            crate::database::pg::PgDb::global();
+                                                        let _ = rt.block_on(
+                                                            pg.update_task_knowledge_project_path(
+                                                                &knowledge_id,
+                                                                pp,
+                                                            ),
+                                                        );
                                                     }
                                                 }
 
@@ -1330,7 +1347,9 @@ fn run_claude_session_inline(
                                         let kb_result = if let Some(ref rt) = pg_rt {
                                             let pg = crate::database::pg::PgDb::global();
                                             let kid = uuid::Uuid::new_v4().to_string();
-                                            let related_files_json = serde_json::to_string(&related_files).unwrap_or_default();
+                                            let related_files_json =
+                                                serde_json::to_string(&related_files)
+                                                    .unwrap_or_default();
                                             rt.block_on(pg.create_task_knowledge(
                                                 &kid,
                                                 &ctx.source_task_run_id,
@@ -1383,18 +1402,21 @@ fn run_claude_session_inline(
                                             // Create step type knowledge entry (system-specific layer)
                                             let title =
                                                 rules::truncate_to_title(&fix.fix_description);
-                                            let stk_input = step_type_knowledge::InsertKnowledgeInput {
-                                                step_type: step_type.clone(),
-                                                layer: "system_specific".to_string(),
-                                                title: title.clone(),
-                                                content: fix.fix_description.clone(),
-                                                priority: 5,
-                                                provenance: "reflection".to_string(),
-                                                source_fix_id: Some(fix.id.clone()),
-                                            };
+                                            let stk_input =
+                                                step_type_knowledge::InsertKnowledgeInput {
+                                                    step_type: step_type.clone(),
+                                                    layer: "system_specific".to_string(),
+                                                    title: title.clone(),
+                                                    content: fix.fix_description.clone(),
+                                                    priority: 5,
+                                                    provenance: "reflection".to_string(),
+                                                    source_fix_id: Some(fix.id.clone()),
+                                                };
                                             let stk_result = if let Some(ref rt) = pg_rt {
                                                 let pg = crate::database::pg::PgDb::global();
-                                                rt.block_on(pg.insert_step_type_knowledge(&stk_input))
+                                                rt.block_on(
+                                                    pg.insert_step_type_knowledge(&stk_input),
+                                                )
                                             } else {
                                                 Err("No PG runtime".to_string())
                                             };
@@ -1752,7 +1774,9 @@ fn run_claude_session_inline(
 
                 // Resolve workflow_name from PG
                 let workflow_name: Option<String> = task_run_id.and_then(|id| {
-                    causal_rt.block_on(pg.get_workflow_name_for_task_run(id)).ok()
+                    causal_rt
+                        .block_on(pg.get_workflow_name_for_task_run(id))
+                        .ok()
                 });
 
                 for link in &causal_links {

@@ -71,22 +71,29 @@ pub async fn build_historical_context_pg(
     };
 
     // 2. Similar workflows (text-based, no pgvector)
-    let similar_section = match similar_workflows::find_similar_workflows_pg(pg, description, category, 5).await {
-        Ok(similar) if !similar.is_empty() => similar_workflows::format_similar_workflows(&similar),
-        _ => String::new(),
-    };
+    let similar_section =
+        match similar_workflows::find_similar_workflows_pg(pg, description, category, 5).await {
+            Ok(similar) if !similar.is_empty() => {
+                similar_workflows::format_similar_workflows(&similar)
+            }
+            _ => String::new(),
+        };
 
     // 3. Ground truth reference workflows
-    let (gt_reference_section, verifier_focus_items) = match similar_workflows::find_gt_reference_workflows_pg(pg, description, 3).await {
-        Ok(gt) if !gt.is_empty() => (similar_workflows::format_gt_references(&gt), vec![]),
-        _ => (String::new(), vec![]),
-    };
+    let (gt_reference_section, verifier_focus_items) =
+        match similar_workflows::find_gt_reference_workflows_pg(pg, description, 3).await {
+            Ok(gt) if !gt.is_empty() => (similar_workflows::format_gt_references(&gt), vec![]),
+            _ => (String::new(), vec![]),
+        };
 
     // 4. Past fixes section (extracted from self-improvement common verifier issues)
     let past_fixes_section = String::new(); // Covered by improvement_section
 
     // Only return Some if we have at least some useful data
-    if improvement_section.is_empty() && similar_section.is_empty() && gt_reference_section.is_empty() {
+    if improvement_section.is_empty()
+        && similar_section.is_empty()
+        && gt_reference_section.is_empty()
+    {
         return None;
     }
 

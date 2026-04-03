@@ -25,11 +25,11 @@
 //! - `agentic_metrics` — DeepEval-inspired 0.0–1.0 metric scoring for runs
 
 pub mod agentic_metrics;
-pub mod drift_detection;
 pub mod architecture_optimizer;
 pub mod canary;
 pub mod comparison_bridge;
 pub mod cost_optimizer;
+pub mod drift_detection;
 pub mod eval_runner;
 pub mod eval_spec;
 pub mod failure_analysis;

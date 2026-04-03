@@ -4,11 +4,19 @@ use super::PgDb;
 use crate::skills::SkillDefinition;
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn json_or_default<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
-    if s.is_empty() { T::default() } else { serde_json::from_str(s).unwrap_or_default() }
+    if s.is_empty() {
+        T::default()
+    } else {
+        serde_json::from_str(s).unwrap_or_default()
+    }
 }
 
 /// Map a Clorinde row to SkillDefinition.
@@ -19,13 +27,29 @@ macro_rules! row_to_skill {
             name: $r.name,
             slug: $r.slug,
             description: $r.description,
-            category: if $r.category.is_empty() { "custom".to_string() } else { $r.category },
+            category: if $r.category.is_empty() {
+                "custom".to_string()
+            } else {
+                $r.category
+            },
             tags: json_or_default(&$r.tags),
-            icon: if $r.icon.is_empty() { "puzzle".to_string() } else { $r.icon },
-            color: if $r.color.is_empty() { "gray".to_string() } else { $r.color },
+            icon: if $r.icon.is_empty() {
+                "puzzle".to_string()
+            } else {
+                $r.icon
+            },
+            color: if $r.color.is_empty() {
+                "gray".to_string()
+            } else {
+                $r.color
+            },
             allowed_phases: {
                 let v: Vec<String> = json_or_default(&$r.allowed_phases);
-                if v.is_empty() { vec!["setup".to_string()] } else { v }
+                if v.is_empty() {
+                    vec!["setup".to_string()]
+                } else {
+                    v
+                }
             },
             parameters: json_or_default(&$r.parameters),
             template: serde_json::from_str(&$r.template).unwrap_or(
@@ -33,18 +57,34 @@ macro_rules! row_to_skill {
                     step: std::collections::HashMap::new(),
                 },
             ),
-            source: if $r.source.is_empty() { "user".to_string() } else { $r.source },
+            source: if $r.source.is_empty() {
+                "user".to_string()
+            } else {
+                $r.source
+            },
             version: non_empty($r.version),
             author: {
                 let s = &$r.author;
-                if s.is_empty() { None } else { serde_json::from_str(s).ok() }
+                if s.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(s).ok()
+                }
             },
             checksum: non_empty($r.checksum),
             depends_on: {
                 let s = &$r.depends_on;
-                if s.is_empty() { None } else { serde_json::from_str(s).ok() }
+                if s.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(s).ok()
+                }
             },
-            usage_count: if $r.usage_count == 0 { None } else { Some($r.usage_count as u64) },
+            usage_count: if $r.usage_count == 0 {
+                None
+            } else {
+                Some($r.usage_count as u64)
+            },
             approval_status: non_empty($r.approval_status),
             forked_from: non_empty($r.forked_from),
         }
@@ -54,7 +94,11 @@ macro_rules! row_to_skill {
 impl PgDb {
     /// List all user skills.
     pub async fn list_user_skills(&self) -> Result<Vec<SkillDefinition>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::skills::list_user_skills()
             .bind(&conn)
             .all()
@@ -65,7 +109,11 @@ impl PgDb {
 
     /// Get a single user skill by ID.
     pub async fn get_user_skill(&self, id: &str) -> Result<Option<SkillDefinition>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::skills::get_user_skill()
             .bind(&conn, &id)
             .opt()
@@ -76,7 +124,11 @@ impl PgDb {
 
     /// Delete a user skill by ID.
     pub async fn delete_user_skill(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::skills::delete_user_skill()
             .bind(&conn, &id)
             .opt()
@@ -87,7 +139,11 @@ impl PgDb {
 
     /// Increment usage count for a skill.
     pub async fn increment_skill_usage(&self, id: &str) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let count = qontinui_db::queries::skills::increment_skill_usage()
             .bind(&conn, &id)
             .one()
@@ -98,25 +154,37 @@ impl PgDb {
 
     /// Get approved auto-extracted skills for prompt injection.
     /// Returns (name, slug, description, category) tuples ordered by usage_count DESC, limited to 10.
-    pub async fn get_approved_auto_skills(&self) -> Result<Vec<(String, String, String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT name, slug, description, category
+    pub async fn get_approved_auto_skills(
+        &self,
+    ) -> Result<Vec<(String, String, String, String)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT name, slug, description, category
                FROM user_skills
                WHERE approval_status = 'approved'
                AND source = 'auto'
                ORDER BY usage_count DESC
                LIMIT 10"#,
-            &[],
-        ).await.map_err(|e| format!("PG get_approved_auto_skills: {}", e))?;
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_approved_auto_skills: {}", e))?;
 
-        Ok(rows.iter().map(|row| {
-            let name: String = row.get(0);
-            let slug: String = row.get(1);
-            let description: String = row.try_get(2).unwrap_or_default();
-            let category: String = row.try_get(3).unwrap_or_else(|_| "custom".to_string());
-            (name, slug, description, category)
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let name: String = row.get(0);
+                let slug: String = row.get(1);
+                let description: String = row.try_get(2).unwrap_or_default();
+                let category: String = row.try_get(3).unwrap_or_else(|_| "custom".to_string());
+                (name, slug, description, category)
+            })
+            .collect())
     }
 
     /// Import skills from an export. Sets source to "community" and id to "community:<slug>".
@@ -126,7 +194,11 @@ impl PgDb {
         skills: &[crate::skills::SkillDefinition],
         conflict_mode: &str,
     ) -> Result<crate::skills::SkillImportResult, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut imported = 0usize;
         let mut skipped = 0usize;
@@ -136,17 +208,28 @@ impl PgDb {
         for skill in skills {
             let id = format!("community:{}", skill.slug);
             let tags_json = serde_json::to_string(&skill.tags).unwrap_or_else(|_| "[]".to_string());
-            let phases_json = serde_json::to_string(&skill.allowed_phases).unwrap_or_else(|_| "[]".to_string());
-            let params_json = serde_json::to_string(&skill.parameters).unwrap_or_else(|_| "[]".to_string());
+            let phases_json =
+                serde_json::to_string(&skill.allowed_phases).unwrap_or_else(|_| "[]".to_string());
+            let params_json =
+                serde_json::to_string(&skill.parameters).unwrap_or_else(|_| "[]".to_string());
             let template_json = match serde_json::to_string(&skill.template) {
                 Ok(j) => j,
                 Err(e) => {
-                    errors.push(format!("Failed to serialize template for '{}': {}", skill.slug, e));
+                    errors.push(format!(
+                        "Failed to serialize template for '{}': {}",
+                        skill.slug, e
+                    ));
                     continue;
                 }
             };
-            let author_json: Option<String> = skill.author.as_ref().and_then(|a| serde_json::to_string(a).ok());
-            let depends_json: Option<String> = skill.depends_on.as_ref().and_then(|d| serde_json::to_string(d).ok());
+            let author_json: Option<String> = skill
+                .author
+                .as_ref()
+                .and_then(|a| serde_json::to_string(a).ok());
+            let depends_json: Option<String> = skill
+                .depends_on
+                .as_ref()
+                .and_then(|d| serde_json::to_string(d).ok());
             let version = skill.version.as_deref().unwrap_or("1.0.0");
             let checksum = skill.checksum.as_deref();
             let usage_count = skill.usage_count.unwrap_or(0) as i64;
@@ -158,7 +241,10 @@ impl PgDb {
                 conn.query_one(
                     "SELECT EXISTS(SELECT 1 FROM user_skills WHERE slug = $1)",
                     &[&skill.slug.as_str()],
-                ).await.map(|r| r.get::<_, bool>(0)).unwrap_or(false)
+                )
+                .await
+                .map(|r| r.get::<_, bool>(0))
+                .unwrap_or(false)
             } else {
                 false
             };
@@ -265,10 +351,16 @@ impl PgDb {
         id: &str,
         request: &crate::mcp::skills::UpdateSkillRequest,
     ) -> Result<SkillDefinition, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Read existing skill to merge optional fields
-        let current = self.get_user_skill(id).await?
+        let current = self
+            .get_user_skill(id)
+            .await?
             .ok_or_else(|| format!("User skill not found: {}", id))?;
 
         let name = request.name.as_ref().unwrap_or(&current.name);
@@ -278,12 +370,16 @@ impl PgDb {
         let tags = request.tags.as_ref().unwrap_or(&current.tags);
         let icon = request.icon.as_ref().unwrap_or(&current.icon);
         let color = request.color.as_ref().unwrap_or(&current.color);
-        let allowed_phases = request.allowed_phases.as_ref().unwrap_or(&current.allowed_phases);
+        let allowed_phases = request
+            .allowed_phases
+            .as_ref()
+            .unwrap_or(&current.allowed_phases);
         let parameters = request.parameters.as_ref().unwrap_or(&current.parameters);
         let template = request.template.as_ref().unwrap_or(&current.template);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
-        let phases_json = serde_json::to_string(allowed_phases).unwrap_or_else(|_| "[]".to_string());
+        let phases_json =
+            serde_json::to_string(allowed_phases).unwrap_or_else(|_| "[]".to_string());
         let params_json = serde_json::to_string(parameters).unwrap_or_else(|_| "[]".to_string());
         let template_json = serde_json::to_string(template)
             .map_err(|e| format!("Failed to serialize template: {}", e))?;
@@ -310,17 +406,17 @@ impl PgDb {
                 &template_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
-        ).await.map_err(|e| format!("PG update_user_skill: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG update_user_skill: {}", e))?;
 
-        self.get_user_skill(&new_id).await?
+        self.get_user_skill(&new_id)
+            .await?
             .ok_or_else(|| "Failed to retrieve updated skill".to_string())
     }
 
     /// Export user skills. If `ids` is empty, exports all.
-    pub async fn export_user_skills(
-        &self,
-        ids: &[String],
-    ) -> Result<Vec<SkillDefinition>, String> {
+    pub async fn export_user_skills(&self, ids: &[String]) -> Result<Vec<SkillDefinition>, String> {
         if ids.is_empty() {
             return self.list_user_skills().await;
         }
@@ -332,14 +428,21 @@ impl PgDb {
 
     /// Update the approval status of a skill.
     pub async fn update_skill_approval(&self, skill_id: &str, status: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.execute(
-            "UPDATE user_skills SET approval_status = $1, updated_at = NOW() WHERE id = $2",
-            &[
-                &status as &(dyn tokio_postgres::types::ToSql + Sync),
-                &skill_id as &(dyn tokio_postgres::types::ToSql + Sync),
-            ],
-        ).await.map_err(|e| format!("PG update_skill_approval: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .execute(
+                "UPDATE user_skills SET approval_status = $1, updated_at = NOW() WHERE id = $2",
+                &[
+                    &status as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &skill_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_skill_approval: {}", e))?;
 
         if rows == 0 {
             return Err(format!("Skill not found: {}", skill_id));
@@ -353,7 +456,9 @@ impl PgDb {
         skill_id: &str,
         new_name: Option<&str>,
     ) -> Result<SkillDefinition, String> {
-        let original = self.get_user_skill(skill_id).await?
+        let original = self
+            .get_user_skill(skill_id)
+            .await?
             .ok_or_else(|| format!("Skill not found: {}", skill_id))?;
 
         let fork_name = new_name
@@ -367,14 +472,26 @@ impl PgDb {
         let fork_id = format!("user:{}", fork_slug);
 
         let tags_json = serde_json::to_string(&original.tags).unwrap_or_else(|_| "[]".to_string());
-        let phases_json = serde_json::to_string(&original.allowed_phases).unwrap_or_else(|_| "[]".to_string());
-        let params_json = serde_json::to_string(&original.parameters).unwrap_or_else(|_| "[]".to_string());
+        let phases_json =
+            serde_json::to_string(&original.allowed_phases).unwrap_or_else(|_| "[]".to_string());
+        let params_json =
+            serde_json::to_string(&original.parameters).unwrap_or_else(|_| "[]".to_string());
         let template_json = serde_json::to_string(&original.template)
             .map_err(|e| format!("Failed to serialize template: {}", e))?;
-        let author_json: Option<String> = original.author.as_ref().and_then(|a| serde_json::to_string(a).ok());
-        let depends_json: Option<String> = original.depends_on.as_ref().and_then(|d| serde_json::to_string(d).ok());
+        let author_json: Option<String> = original
+            .author
+            .as_ref()
+            .and_then(|a| serde_json::to_string(a).ok());
+        let depends_json: Option<String> = original
+            .depends_on
+            .as_ref()
+            .and_then(|d| serde_json::to_string(d).ok());
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO user_skills (id, name, slug, description, category, tags, icon, color,
                 allowed_phases, parameters, template, source, version, author, checksum,
@@ -398,7 +515,8 @@ impl PgDb {
             ],
         ).await.map_err(|e| format!("PG fork_skill: {}", e))?;
 
-        self.get_user_skill(&fork_id).await?
+        self.get_user_skill(&fork_id)
+            .await?
             .ok_or_else(|| "Failed to retrieve forked skill".to_string())
     }
 
@@ -409,7 +527,11 @@ impl PgDb {
         version: &str,
         checksum: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn.execute(
             "UPDATE user_skills SET version = $1, checksum = $2, updated_at = NOW() WHERE id = $3",
             &[
@@ -430,11 +552,17 @@ impl PgDb {
         &self,
         request: &crate::mcp::skills::CreateSkillRequest,
     ) -> Result<SkillDefinition, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("user:{}", request.slug);
         let tags_json = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
-        let phases_json = serde_json::to_string(&request.allowed_phases).unwrap_or_else(|_| "[]".to_string());
-        let params_json = serde_json::to_string(&request.parameters).unwrap_or_else(|_| "[]".to_string());
+        let phases_json =
+            serde_json::to_string(&request.allowed_phases).unwrap_or_else(|_| "[]".to_string());
+        let params_json =
+            serde_json::to_string(&request.parameters).unwrap_or_else(|_| "[]".to_string());
         let template_json = serde_json::to_string(&request.template)
             .map_err(|e| format!("Failed to serialize template: {}", e))?;
         let version = "1.0.0";
@@ -457,19 +585,20 @@ impl PgDb {
                 &template_json.as_str(),
                 &source,
                 &version,
-                &no_str,     // author
-                &no_str,     // checksum
-                &no_str,     // depends_on
-                &no_str,     // approval_status
-                &no_str,     // forked_from
-                &no_str,     // source_fix_id
-                &no_str,     // source_pattern_id
+                &no_str, // author
+                &no_str, // checksum
+                &no_str, // depends_on
+                &no_str, // approval_status
+                &no_str, // forked_from
+                &no_str, // source_fix_id
+                &no_str, // source_pattern_id
             )
             .one()
             .await
             .map_err(|e| format!("PG create_user_skill: {}", e))?;
 
-        self.get_user_skill(&id).await?
+        self.get_user_skill(&id)
+            .await?
             .ok_or_else(|| "Failed to retrieve created skill".to_string())
     }
 }

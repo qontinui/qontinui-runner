@@ -511,8 +511,7 @@ mod tests {
 // ============================================================================
 
 /// Compression mode for iteration history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum IterationCompressionMode {
     /// Character-based truncation/merging (existing behavior, always available).
     #[default]
@@ -521,7 +520,6 @@ pub enum IterationCompressionMode {
     /// Falls back to CharBased if the LLM call fails.
     LlmSummarized,
 }
-
 
 /// Summarize a list of iteration descriptions using an LLM.
 ///
@@ -564,13 +562,13 @@ pub fn summarize_iterations_with_llm(
     let response = crate::ai_provider::run_prompt_with_model_override(
         &prompt,
         &context,
-        None, // no doctor handle
-        None, // let routing pick the model (will route to simple for short prompt)
-        None, // default provider
+        None,                              // no doctor handle
+        None,      // let routing pick the model (will route to simple for short prompt)
+        None,      // default provider
         Some(0.3), // low temperature for factual summarization
         Some(max_output_chars as u32 / 3), // rough tokens estimate
-        None, // no fallback model
-        None, // no fallback provider
+        None,      // no fallback model
+        None,      // no fallback provider
     );
 
     if response.success {
@@ -588,8 +586,13 @@ pub fn summarize_iterations_with_llm(
         );
         Ok(summary)
     } else {
-        let error = response.error.unwrap_or_else(|| "Unknown error".to_string());
-        warn!("LLM summarization failed ({}), falling back to char-based", error);
+        let error = response
+            .error
+            .unwrap_or_else(|| "Unknown error".to_string());
+        warn!(
+            "LLM summarization failed ({}), falling back to char-based",
+            error
+        );
         Err(error)
     }
 }
@@ -598,10 +601,7 @@ pub fn summarize_iterations_with_llm(
 ///
 /// Concatenates entries and truncates to max_chars. Used when LLM summarization
 /// is unavailable or fails.
-pub fn summarize_iterations_char_based(
-    entries: &[String],
-    max_chars: usize,
-) -> String {
+pub fn summarize_iterations_char_based(entries: &[String], max_chars: usize) -> String {
     let combined = entries.join(" | ");
     if combined.chars().count() <= max_chars {
         combined
@@ -622,9 +622,7 @@ pub fn summarize_iterations(
     mode: IterationCompressionMode,
 ) -> String {
     match mode {
-        IterationCompressionMode::CharBased => {
-            summarize_iterations_char_based(entries, max_chars)
-        }
+        IterationCompressionMode::CharBased => summarize_iterations_char_based(entries, max_chars),
         IterationCompressionMode::LlmSummarized => {
             match summarize_iterations_with_llm(entries, max_chars) {
                 Ok(summary) => summary,
@@ -636,4 +634,3 @@ pub fn summarize_iterations(
         }
     }
 }
-

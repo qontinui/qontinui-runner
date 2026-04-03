@@ -235,10 +235,17 @@ pub async fn get_performance_dashboard(
         _ => 30,
     };
 
-    match state.pg_db.get_performance_dashboard(&config_id, range_days).await {
+    match state
+        .pg_db
+        .get_performance_dashboard(&config_id, range_days)
+        .await
+    {
         Ok(val) => match serde_json::from_value(val) {
             Ok(dashboard) => Ok(PerformanceMetricsResponse::ok(dashboard)),
-            Err(e) => Ok(PerformanceMetricsResponse::err(format!("Deserialization error: {}", e))),
+            Err(e) => Ok(PerformanceMetricsResponse::err(format!(
+                "Deserialization error: {}",
+                e
+            ))),
         },
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
     }
@@ -251,12 +258,26 @@ pub async fn get_action_performance(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<ActionPerformanceMetrics>>, String> {
-    let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
-    let range_days = match range { TimeRange::TwentyFourHours => 1, TimeRange::SevenDays => 7, TimeRange::ThirtyDays => 30, _ => 30 };
+    let range = time_range
+        .map(|s| TimeRange::from_str(&s))
+        .unwrap_or(TimeRange::SevenDays);
+    let range_days = match range {
+        TimeRange::TwentyFourHours => 1,
+        TimeRange::SevenDays => 7,
+        TimeRange::ThirtyDays => 30,
+        _ => 30,
+    };
 
-    match state.pg_db.get_action_performance(&config_id, range_days).await {
+    match state
+        .pg_db
+        .get_action_performance(&config_id, range_days)
+        .await
+    {
         Ok(vals) => {
-            let metrics: Vec<ActionPerformanceMetrics> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let metrics: Vec<ActionPerformanceMetrics> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(PerformanceMetricsResponse::ok(metrics))
         }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
@@ -271,7 +292,10 @@ pub async fn get_transition_reliability(
 ) -> Result<PerformanceMetricsResponse<Vec<StateTransitionMetrics>>, String> {
     match state.pg_db.get_transition_metrics(&config_id).await {
         Ok(vals) => {
-            let metrics: Vec<StateTransitionMetrics> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let metrics: Vec<StateTransitionMetrics> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(PerformanceMetricsResponse::ok(metrics))
         }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
@@ -286,7 +310,10 @@ pub async fn get_element_resolution_metrics(
 ) -> Result<PerformanceMetricsResponse<Vec<ElementResolutionMetrics>>, String> {
     match state.pg_db.get_element_metrics(&config_id).await {
         Ok(vals) => {
-            let metrics: Vec<ElementResolutionMetrics> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let metrics: Vec<ElementResolutionMetrics> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(PerformanceMetricsResponse::ok(metrics))
         }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
@@ -300,12 +327,26 @@ pub async fn get_success_rate_trend(
     config_id: String,
     time_range: Option<String>,
 ) -> Result<PerformanceMetricsResponse<Vec<TimeSeriesDataPoint>>, String> {
-    let range = time_range.map(|s| TimeRange::from_str(&s)).unwrap_or(TimeRange::SevenDays);
-    let range_days = match range { TimeRange::TwentyFourHours => 1, TimeRange::SevenDays => 7, TimeRange::ThirtyDays => 30, _ => 30 };
+    let range = time_range
+        .map(|s| TimeRange::from_str(&s))
+        .unwrap_or(TimeRange::SevenDays);
+    let range_days = match range {
+        TimeRange::TwentyFourHours => 1,
+        TimeRange::SevenDays => 7,
+        TimeRange::ThirtyDays => 30,
+        _ => 30,
+    };
 
-    match state.pg_db.get_success_rate_trend(&config_id, range_days).await {
+    match state
+        .pg_db
+        .get_success_rate_trend(&config_id, range_days)
+        .await
+    {
         Ok(vals) => {
-            let trend: Vec<TimeSeriesDataPoint> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let trend: Vec<TimeSeriesDataPoint> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(PerformanceMetricsResponse::ok(trend))
         }
         Err(e) => Ok(PerformanceMetricsResponse::err(e)),
@@ -317,18 +358,12 @@ pub async fn get_success_rate_trend(
 // =============================================================================
 
 /// Aggregate summary metrics for the dashboard header.
-fn aggregate_summary(
-    config_id: &str,
-    range: &TimeRange,
-) -> Result<PerformanceSummary, String> {
+fn aggregate_summary(config_id: &str, range: &TimeRange) -> Result<PerformanceSummary, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Count actions within the time range.
-fn count_actions_in_range(
-    config_id: &str,
-    range: &TimeRange,
-) -> Result<u32, String> {
+fn count_actions_in_range(config_id: &str, range: &TimeRange) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -364,16 +399,12 @@ fn calculate_percentiles(durations: &[u64]) -> (u64, u64, u64) {
 }
 
 /// Get transition metrics from config_statistics.
-fn get_transition_metrics(
-    config_id: &str,
-) -> Result<Vec<StateTransitionMetrics>, String> {
+fn get_transition_metrics(config_id: &str) -> Result<Vec<StateTransitionMetrics>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get element resolution metrics from config_statistics.
-fn get_element_metrics(
-    config_id: &str,
-) -> Result<Vec<ElementResolutionMetrics>, String> {
+fn get_element_metrics(config_id: &str) -> Result<Vec<ElementResolutionMetrics>, String> {
     Err("SQLite removed".to_string())
 }
 

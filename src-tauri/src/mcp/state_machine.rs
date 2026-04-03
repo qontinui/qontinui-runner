@@ -17,8 +17,8 @@ use tracing::{error, info};
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::state_machine_configs::{
-    CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig,
-    SmConfigFull, SmImportRequest, SmState, SmTransition,
+    CreateSmConfigRequest, CreateSmStateRequest, CreateSmTransitionRequest, SmConfig, SmConfigFull,
+    SmImportRequest, SmState, SmTransition,
 };
 
 // ============================================================================
@@ -494,9 +494,7 @@ pub async fn clear_state_machine(
 // ============================================================================
 
 /// Helper to get PG DB reference and map errors to HTTP responses.
-fn pg_db(
-    state: &Arc<ApiState>,
-) -> &std::sync::Arc<crate::database::pg::PgDb> {
+fn pg_db(state: &Arc<ApiState>) -> &std::sync::Arc<crate::database::pg::PgDb> {
     &state.app_state.pg_db
 }
 
@@ -518,7 +516,10 @@ pub async fn create_config(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<CreateSmConfigRequest>,
 ) -> Result<Json<ApiResponse<SmConfig>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let config = pg_db(&state).insert_sm_config(&request).await.map_err(pg_err)?;
+    let config = pg_db(&state)
+        .insert_sm_config(&request)
+        .await
+        .map_err(pg_err)?;
     info!(
         "State Machine CRUD: Created config '{}' ({})",
         config.name, config.id
@@ -531,7 +532,10 @@ pub async fn get_config(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<SmConfigFull>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let config = pg_db(&state).get_sm_config_full(&id).await.map_err(pg_err)?;
+    let config = pg_db(&state)
+        .get_sm_config_full(&id)
+        .await
+        .map_err(pg_err)?;
     match config {
         Some(c) => Ok(Json(ApiResponse::success(c))),
         None => Err((
@@ -566,7 +570,10 @@ pub async fn create_state(
     Path(config_id): Path<String>,
     Json(request): Json<CreateSmStateRequest>,
 ) -> Result<Json<ApiResponse<SmState>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let sm_state = pg_db(&state).insert_sm_state(&config_id, &request).await.map_err(pg_err)?;
+    let sm_state = pg_db(&state)
+        .insert_sm_state(&config_id, &request)
+        .await
+        .map_err(pg_err)?;
     info!(
         "State Machine CRUD: Created state '{}' in config {}",
         sm_state.name, config_id
@@ -598,7 +605,10 @@ pub async fn create_transition(
     Path(config_id): Path<String>,
     Json(request): Json<CreateSmTransitionRequest>,
 ) -> Result<Json<ApiResponse<SmTransition>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let transition = pg_db(&state).insert_sm_transition(&config_id, &request).await.map_err(pg_err)?;
+    let transition = pg_db(&state)
+        .insert_sm_transition(&config_id, &request)
+        .await
+        .map_err(pg_err)?;
     info!(
         "State Machine CRUD: Created transition '{}' in config {}",
         transition.name, config_id
@@ -611,7 +621,10 @@ pub async fn delete_transition(
     State(state): State<Arc<ApiState>>,
     Path((_config_id, id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let deleted = pg_db(&state).delete_sm_transition(&id).await.map_err(pg_err)?;
+    let deleted = pg_db(&state)
+        .delete_sm_transition(&id)
+        .await
+        .map_err(pg_err)?;
     if deleted {
         Ok(Json(ApiResponse::success(
             serde_json::json!({"deleted": true}),
@@ -629,7 +642,10 @@ pub async fn import_config(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<SmImportRequest>,
 ) -> Result<Json<ApiResponse<SmConfigFull>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = pg_db(&state).import_sm_config(&request).await.map_err(pg_err)?;
+    let result = pg_db(&state)
+        .import_sm_config(&request)
+        .await
+        .map_err(pg_err)?;
     info!(
         "State Machine CRUD: Imported config '{}' ({} states, {} transitions)",
         result.config.name,

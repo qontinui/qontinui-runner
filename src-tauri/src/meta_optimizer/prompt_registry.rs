@@ -16,9 +16,7 @@ pub fn get_active_prompt(
     pg_db: &Arc<PgDb>,
     agent_type: &str,
 ) -> Result<Option<PromptVariant>, String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.get_active_prompt(agent_type))
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_active_prompt(agent_type)))
 }
 
 /// Create a new prompt variant (initially inactive).
@@ -30,15 +28,18 @@ pub fn create_variant(
     source_recommendation_id: Option<&str>,
 ) -> Result<PromptVariant, String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.create_prompt_variant(agent_type, variant_name, prompt_content, source_recommendation_id))
+        Handle::current().block_on(pg_db.create_prompt_variant(
+            agent_type,
+            variant_name,
+            prompt_content,
+            source_recommendation_id,
+        ))
     })
 }
 
 /// Activate a prompt variant (deactivating any previously active variant for that agent_type).
 pub fn activate_variant(pg_db: &Arc<PgDb>, variant_id: &str) -> Result<(), String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.activate_variant(variant_id))
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.activate_variant(variant_id)))
 }
 
 /// List all prompt variants, optionally filtered by agent type.
@@ -46,9 +47,7 @@ pub fn list_variants(
     pg_db: &Arc<PgDb>,
     agent_type: Option<&str>,
 ) -> Result<Vec<PromptVariant>, String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.list_variants(agent_type))
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.list_variants(agent_type)))
 }
 
 /// Get a prompt variant by agent_type and version number.
@@ -79,21 +78,40 @@ pub fn update_performance_metrics(
 /// Create a prompt variant with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use create_variant directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn create_variant_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, variant_name: &str, prompt_content: &str, source_recommendation_id: Option<&str>) -> Result<PromptVariant, String> {
-    create_variant(pg_db, agent_type, variant_name, prompt_content, source_recommendation_id)
+pub fn create_variant_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    variant_name: &str,
+    prompt_content: &str,
+    source_recommendation_id: Option<&str>,
+) -> Result<PromptVariant, String> {
+    create_variant(
+        pg_db,
+        agent_type,
+        variant_name,
+        prompt_content,
+        source_recommendation_id,
+    )
 }
 
 /// Activate a prompt variant with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use activate_variant directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn activate_variant_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, variant_id: &str) -> Result<(), String> {
+pub fn activate_variant_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    variant_id: &str,
+) -> Result<(), String> {
     activate_variant(pg_db, variant_id)
 }
 
 /// Update performance metrics with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use update_performance_metrics directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn update_performance_metrics_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, variant_id: &str, metrics_json: &str) -> Result<(), String> {
+pub fn update_performance_metrics_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    variant_id: &str,
+    metrics_json: &str,
+) -> Result<(), String> {
     update_performance_metrics(pg_db, variant_id, metrics_json)
 }
 

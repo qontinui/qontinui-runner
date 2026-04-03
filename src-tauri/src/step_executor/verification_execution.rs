@@ -616,8 +616,7 @@ impl StepExecutor {
             // Update step checkpoint to reflect completion progressively
             // (enables real-time UI updates via /task-runs/{id}/full-state)
             {
-                let checkpoint_mgr =
-                    CheckpointManager::new("unified");
+                let checkpoint_mgr = CheckpointManager::new("unified");
                 let cp_step_type =
                     StepType::from_str_compat(&step.step_type).unwrap_or(StepType::Command);
                 let mut checkpoint = StepCheckpoint::new(

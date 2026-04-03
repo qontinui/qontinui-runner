@@ -6,7 +6,11 @@ use crate::database::token_analytics::*;
 impl PgDb {
     /// Get daily cost breakdown for the last N days.
     pub async fn get_daily_cost(&self, days: u32) -> Result<Vec<DailyCostRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let rows = qontinui_db::queries::token_analytics::get_daily_cost()
             .bind(&conn, &days_i)
@@ -28,7 +32,11 @@ impl PgDb {
 
     /// Get cost breakdown by model for the last N days.
     pub async fn get_cost_by_model(&self, days: u32) -> Result<Vec<ModelCostRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let rows = qontinui_db::queries::token_analytics::get_cost_by_model()
             .bind(&conn, &days_i)
@@ -51,7 +59,11 @@ impl PgDb {
 
     /// Get cost breakdown by workflow phase for the last N days.
     pub async fn get_cost_by_phase(&self, days: u32) -> Result<Vec<PhaseCostRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let rows = qontinui_db::queries::token_analytics::get_cost_by_phase()
             .bind(&conn, &days_i)
@@ -72,7 +84,11 @@ impl PgDb {
 
     /// Get latency stats by provider for the last N days.
     pub async fn get_provider_latency(&self, days: u32) -> Result<Vec<ProviderLatencyRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let rows = qontinui_db::queries::token_analytics::get_provider_latency()
             .bind(&conn, &days_i)
@@ -98,7 +114,11 @@ impl PgDb {
         days: u32,
         limit: u32,
     ) -> Result<Vec<TaskRunCostRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let limit_i = limit as i64;
         let rows = qontinui_db::queries::token_analytics::get_task_run_costs()
@@ -122,7 +142,11 @@ impl PgDb {
 
     /// Get an aggregate summary of token usage for the last N days.
     pub async fn get_token_usage_summary(&self, days: u32) -> Result<TokenUsageSummary, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
 
         let totals = qontinui_db::queries::token_analytics::get_token_usage_totals()
@@ -165,7 +189,11 @@ impl PgDb {
 
     /// Get cost breakdown by target app for the last N days.
     pub async fn get_cost_by_target_app(&self, days: u32) -> Result<Vec<TargetAppCostRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let rows = qontinui_db::queries::token_analytics::get_cost_by_target_app()
             .bind(&conn, &days_i)
@@ -233,8 +261,15 @@ impl PgDb {
     }
 
     /// Get cost breakdown by target page for the last N days.
-    pub async fn get_cost_by_target_page(&self, days: u32) -> Result<Vec<TargetPageCostRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_cost_by_target_page(
+        &self,
+        days: u32,
+    ) -> Result<Vec<TargetPageCostRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let days_i = days as i32;
         let rows = qontinui_db::queries::token_analytics::get_cost_by_target_page()
             .bind(&conn, &days_i)
@@ -286,11 +321,7 @@ impl PgDb {
         };
 
         let total = cache_read + cache_create + input;
-        let hit_rate = if total > 0.0 {
-            cache_read / total
-        } else {
-            0.0
-        };
+        let hit_rate = if total > 0.0 { cache_read / total } else { 0.0 };
         // Savings estimate: cache reads avoid ~90% of input cost.
         // Using ~$3/MTok Sonnet baseline => cache read saves $2.70/MTok.
         let savings = cache_read * 2.70 / 1_000_000.0;

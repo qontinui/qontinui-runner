@@ -230,7 +230,10 @@ pub fn summarize_experience(input: &RunReflectionInput) -> ExperienceSummary {
             failure_points.push(FailurePoint {
                 step_index: step.step_index,
                 step_type: step.step_type.clone(),
-                error_type: step.error_type.clone().unwrap_or_else(|| "unknown".to_string()),
+                error_type: step
+                    .error_type
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
                 recoverable: step.step_index < input.steps.len() - 1, // Not the last step
                 recovery_action: if step.step_index < input.steps.len() - 1 {
                     Some("continued to next step".to_string())
@@ -363,7 +366,11 @@ mod tests {
             duration_ms,
             success,
             tool_calls: vec!["tool1".to_string()],
-            error_type: if success { None } else { Some("runtime_error".to_string()) },
+            error_type: if success {
+                None
+            } else {
+                Some("runtime_error".to_string())
+            },
             retry_count,
         }
     }

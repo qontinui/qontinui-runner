@@ -263,7 +263,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::get;
 
     axum::Router::new()
-        .route("/online-learning/model-routing", get(get_model_routing_state))
+        .route(
+            "/online-learning/model-routing",
+            get(get_model_routing_state),
+        )
         .route(
             "/online-learning/model-routing/table",
             get(get_model_routing_table),

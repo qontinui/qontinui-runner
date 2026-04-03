@@ -36,10 +36,10 @@ pub use python_bridge::PythonBridge;
 pub use results::{ExecutionOutcome, IntoOutcome};
 pub use state::ExecutorState;
 
+pub use file_registry::FileRegistryManager;
 #[allow(unused_imports)]
 pub use url_lock::UrlLockInfo;
 pub use url_lock::UrlLockManager;
-pub use file_registry::FileRegistryManager;
 // Re-export unified execution utilities (primary integration point for executor traits)
 // Note: These are public API exports used by external consumers (e.g., MCP API)
 #[allow(unused_imports)]

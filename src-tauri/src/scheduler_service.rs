@@ -206,7 +206,10 @@ impl SchedulerService {
             }
 
             // For Condition schedule tasks, check rearm delay.
-            if matches!(task.schedule, crate::scheduler::ScheduleExpression::Condition(_)) {
+            if matches!(
+                task.schedule,
+                crate::scheduler::ScheduleExpression::Condition(_)
+            ) {
                 if task.last_run.is_none() {
                     if let Ok(history) = pg.get_execution_history(&task.id, 1).await {
                         if let Some(latest) = history.into_iter().next() {
@@ -263,7 +266,10 @@ impl SchedulerService {
     async fn record_skipped(&self, task: &ScheduledTask) {
         let pg = match self.pg() {
             Ok(pg) => pg,
-            Err(e) => { error!("record_skipped: {}", e); return; }
+            Err(e) => {
+                error!("record_skipped: {}", e);
+                return;
+            }
         };
         let mut record = TaskExecutionRecord::new();
         record.status = ScheduledTaskStatus::Skipped;
@@ -321,9 +327,7 @@ impl SchedulerService {
                 check_findings,
                 force_run,
             } => self.execute_auto_fix(*check_findings, *force_run).await,
-            ScheduledTaskType::Watcher { watcher_id } => {
-                self.execute_watcher(watcher_id).await
-            }
+            ScheduledTaskType::Watcher { watcher_id } => self.execute_watcher(watcher_id).await,
             ScheduledTaskType::BackgroundCapture {
                 monitor_index,
                 capture_interval_secs,
@@ -407,7 +411,10 @@ impl SchedulerService {
     async fn update_task_next_run_db(&self, task_id: &str) {
         let pg = match self.pg() {
             Ok(pg) => pg,
-            Err(e) => { error!("update_task_next_run_db: {}", e); return; }
+            Err(e) => {
+                error!("update_task_next_run_db: {}", e);
+                return;
+            }
         };
         let task = match pg.get_scheduled_task(task_id).await {
             Ok(Some(t)) => t,
@@ -705,12 +712,10 @@ After making fixes, run tests if applicable to verify the fixes work."#
 
     /// Execute a watcher: query the activity timeline, format results into an AI prompt,
     /// and trigger the configured action if the AI determines the condition is met.
-    async fn execute_watcher(
-        &self,
-        watcher_id: &str,
-    ) -> Result<(bool, Option<String>), String> {
-        let pg = self.pg_db.as_ref()
-            .ok_or_else(|| "PostgreSQL database not configured; cannot execute watcher".to_string())?;
+    async fn execute_watcher(&self, watcher_id: &str) -> Result<(bool, Option<String>), String> {
+        let pg = self.pg_db.as_ref().ok_or_else(|| {
+            "PostgreSQL database not configured; cannot execute watcher".to_string()
+        })?;
 
         // 1. Load watcher definition
         let watcher = pg
@@ -823,7 +828,6 @@ After making fixes, run tests if applicable to verify the fixes work."#
     // ========================================================================
     // Condition Checking
     // ========================================================================
-
 }
 
 /// Parse a human-friendly lookback window string (e.g., "15 minutes", "1 hour", "30 seconds")
@@ -831,7 +835,10 @@ After making fixes, run tests if applicable to verify the fixes work."#
 fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let parts: Vec<&str> = window.split_whitespace().collect();
     if parts.len() != 2 {
-        warn!("Cannot parse lookback_window '{}': expected '<number> <unit>'", window);
+        warn!(
+            "Cannot parse lookback_window '{}': expected '<number> <unit>'",
+            window
+        );
         return None;
     }
 
@@ -858,7 +865,6 @@ fn parse_lookback_window(window: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 }
 
 impl SchedulerService {
-
     /// Check if a task's conditions are met
     /// Returns (all_conditions_met, updated_status)
     async fn check_conditions(&self, task: &ScheduledTask) -> (bool, ConditionStatus) {
@@ -981,7 +987,10 @@ impl SchedulerService {
     async fn record_condition_timeout(&self, task: &ScheduledTask) {
         let pg = match self.pg() {
             Ok(pg) => pg,
-            Err(e) => { error!("record_condition_timeout: {}", e); return; }
+            Err(e) => {
+                error!("record_condition_timeout: {}", e);
+                return;
+            }
         };
         let mut record = TaskExecutionRecord::new();
         record.status = ScheduledTaskStatus::Skipped;

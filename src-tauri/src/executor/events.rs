@@ -36,10 +36,7 @@ impl EventForwarder {
     /// Extracts capture data from the event payload, applies content filtering
     /// (PII scrubbing + sensitive window skipping), and inserts into the
     /// activity timeline via PgDb.
-    async fn handle_timeline_capture(
-        app_handle: &tauri::AppHandle,
-        data: &serde_json::Value,
-    ) {
+    async fn handle_timeline_capture(app_handle: &tauri::AppHandle, data: &serde_json::Value) {
         let app_state = match app_handle.try_state::<Arc<AppState>>() {
             Some(s) => s,
             None => return,
@@ -99,9 +96,7 @@ impl EventForwarder {
                 .get("elementCount")
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32),
-            confidence: data
-                .get("confidence")
-                .and_then(|v| v.as_f64()),
+            confidence: data.get("confidence").and_then(|v| v.as_f64()),
             metadata_json: None,
         };
 

@@ -36,9 +36,7 @@ pub async fn get_watcher(
 
 /// List all watchers.
 #[tauri::command]
-pub async fn list_watchers(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<Watcher>, String> {
+pub async fn list_watchers(state: State<'_, Arc<AppState>>) -> Result<Vec<Watcher>, String> {
     let pg = &state.pg_db;
 
     pg.list_watchers().await
@@ -61,10 +59,7 @@ pub async fn update_watcher(
 
 /// Delete a watcher permanently.
 #[tauri::command]
-pub async fn delete_watcher(
-    id: String,
-    state: State<'_, Arc<AppState>>,
-) -> Result<bool, String> {
+pub async fn delete_watcher(id: String, state: State<'_, Arc<AppState>>) -> Result<bool, String> {
     let pg = &state.pg_db;
 
     let deleted = pg.delete_watcher(&id).await?;

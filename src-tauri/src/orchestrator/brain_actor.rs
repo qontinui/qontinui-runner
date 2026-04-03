@@ -168,17 +168,13 @@ impl BrainActorOrchestrator {
     /// - The cache has expired (iteration delta exceeds TTL)
     /// - A `RequestContext` signal forced re-invocation
     /// - The first iteration (always invoke Brain)
-    pub fn should_invoke_brain(
-        &self,
-        current_iteration: u32,
-    ) -> bool {
+    pub fn should_invoke_brain(&self, current_iteration: u32) -> bool {
         // Forced by RequestContext signal
         if self.force_brain_reinvocation {
             if self.brain_reinvocations_this_iteration >= self.config.max_brain_reinvocations {
                 warn!(
                     "Brain re-invocation limit reached ({}/{}), skipping",
-                    self.brain_reinvocations_this_iteration,
-                    self.config.max_brain_reinvocations
+                    self.brain_reinvocations_this_iteration, self.config.max_brain_reinvocations
                 );
                 return false;
             }
@@ -252,7 +248,11 @@ impl BrainActorOrchestrator {
                     self.force_brain_reinvocation = true;
                 }
                 StructuredSignal::RecordStore { key, value } => {
-                    debug!("Storing record: {} = {}", key, &value[..value.len().min(100)]);
+                    debug!(
+                        "Storing record: {} = {}",
+                        key,
+                        &value[..value.len().min(100)]
+                    );
                     self.record_store.insert(key.clone(), value.clone());
                 }
                 _ => {} // Other signals handled by the main loop

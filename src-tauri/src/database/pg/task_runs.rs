@@ -7,7 +7,11 @@ use super::PgDb;
 use crate::database::types::*;
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Map a Clorinde GetTaskRun row to TaskRun.
@@ -17,10 +21,18 @@ macro_rules! full_task_run {
             id: $r.id,
             task_name: $r.task_name,
             prompt: non_empty($r.prompt),
-            task_type: if $r.task_type.is_empty() { "task".to_string() } else { $r.task_type },
+            task_type: if $r.task_type.is_empty() {
+                "task".to_string()
+            } else {
+                $r.task_type
+            },
             status: $r.status,
             sessions_count: $r.sessions_count as u32,
-            max_sessions: if $r.max_sessions == 0 { None } else { Some($r.max_sessions as u32) },
+            max_sessions: if $r.max_sessions == 0 {
+                None
+            } else {
+                Some($r.max_sessions as u32)
+            },
             output_log: String::new(), // filled separately
             error_message: non_empty($r.error_message),
             auto_continue: $r.auto_continue,
@@ -52,7 +64,11 @@ macro_rules! full_task_run {
             is_meta_optimizer: $r.is_meta_optimizer,
             created_at: $r.created_at.to_rfc3339(),
             updated_at: $r.updated_at.to_rfc3339(),
-            completed_at: if $r.completed_at.timestamp() == 0 { None } else { Some($r.completed_at.to_rfc3339()) },
+            completed_at: if $r.completed_at.timestamp() == 0 {
+                None
+            } else {
+                Some($r.completed_at.to_rfc3339())
+            },
         }
     }};
 }
@@ -60,11 +76,21 @@ macro_rules! full_task_run {
 impl PgDb {
     /// Create a new task run.
     pub async fn create_task_run(&self, input: &CreateTaskRunInput) -> Result<TaskRun, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let task_type: Option<String> = Some(input.task_type.as_deref().unwrap_or("task").to_string());
+        let task_type: Option<String> =
+            Some(input.task_type.as_deref().unwrap_or("task").to_string());
         let auto_continue = input.auto_continue.unwrap_or(true);
-        let effective_root: Option<String> = Some(input.root_task_run_id.clone().unwrap_or_else(|| input.id.clone()));
+        let effective_root: Option<String> = Some(
+            input
+                .root_task_run_id
+                .clone()
+                .unwrap_or_else(|| input.id.clone()),
+        );
         let depth = input.depth as i32;
         let max_sessions: Option<i32> = input.max_sessions.map(|v| v as i32);
         let runner_port: Option<i32> = input.runner_port.map(|v| v as i32);
@@ -107,13 +133,18 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG create_task_run: {}", e))?;
 
-        self.get_task_run(&input.id).await?
+        self.get_task_run(&input.id)
+            .await?
             .ok_or_else(|| "Failed to retrieve created task run".to_string())
     }
 
     /// Get a single task run by ID.
     pub async fn get_task_run(&self, id: &str) -> Result<Option<TaskRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::task_runs::get_task_run()
             .bind(&conn, &id)
             .opt()
@@ -137,7 +168,11 @@ impl PgDb {
         limit: u32,
         runner_port: Option<u16>,
     ) -> Result<Vec<TaskRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let port: Option<i32> = runner_port.map(|p| p as i32);
         let max_results = limit as i64;
 
@@ -147,47 +182,62 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_recent_task_runs: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| TaskRun {
-            id: r.id,
-            task_name: r.task_name,
-            prompt: non_empty(r.prompt),
-            task_type: if r.task_type.is_empty() { "task".to_string() } else { r.task_type },
-            status: r.status,
-            sessions_count: r.sessions_count as u32,
-            max_sessions: if r.max_sessions == 0 { None } else { Some(r.max_sessions as u32) },
-            output_log: String::new(),
-            error_message: non_empty(r.error_message),
-            auto_continue: r.auto_continue,
-            execution_steps_json: None,
-            log_sources_json: None,
-            config_id: non_empty(r.config_id),
-            workflow_name: non_empty(r.workflow_name),
-            workflow_id: non_empty(r.workflow_id),
-            summary: non_empty(r.summary),
-            ai_summary: non_empty(r.ai_summary),
-            goal_achieved: Some(r.goal_achieved),
-            remaining_work: non_empty(r.remaining_work),
-            summary_generated_at: non_empty(r.summary_generated_at),
-            transition_history_json: None,
-            workflow_type: None,
-            workspace_id: non_empty(r.workspace_id),
-            triggered_by: non_empty(r.triggered_by),
-            parent_task_run_id: None,
-            root_task_run_id: None,
-            depth: 0,
-            bridge_id: None,
-            result_data: None,
-            is_reflection: false,
-            reflection_source_task_run_id: None,
-            is_follow_up: false,
-            follow_up_source_task_run_id: None,
-            is_fixer: false,
-            fixer_source_task_run_id: None,
-            is_meta_optimizer: false,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            completed_at: if r.completed_at.timestamp() == 0 { None } else { Some(r.completed_at.to_rfc3339()) },
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| TaskRun {
+                id: r.id,
+                task_name: r.task_name,
+                prompt: non_empty(r.prompt),
+                task_type: if r.task_type.is_empty() {
+                    "task".to_string()
+                } else {
+                    r.task_type
+                },
+                status: r.status,
+                sessions_count: r.sessions_count as u32,
+                max_sessions: if r.max_sessions == 0 {
+                    None
+                } else {
+                    Some(r.max_sessions as u32)
+                },
+                output_log: String::new(),
+                error_message: non_empty(r.error_message),
+                auto_continue: r.auto_continue,
+                execution_steps_json: None,
+                log_sources_json: None,
+                config_id: non_empty(r.config_id),
+                workflow_name: non_empty(r.workflow_name),
+                workflow_id: non_empty(r.workflow_id),
+                summary: non_empty(r.summary),
+                ai_summary: non_empty(r.ai_summary),
+                goal_achieved: Some(r.goal_achieved),
+                remaining_work: non_empty(r.remaining_work),
+                summary_generated_at: non_empty(r.summary_generated_at),
+                transition_history_json: None,
+                workflow_type: None,
+                workspace_id: non_empty(r.workspace_id),
+                triggered_by: non_empty(r.triggered_by),
+                parent_task_run_id: None,
+                root_task_run_id: None,
+                depth: 0,
+                bridge_id: None,
+                result_data: None,
+                is_reflection: false,
+                reflection_source_task_run_id: None,
+                is_follow_up: false,
+                follow_up_source_task_run_id: None,
+                is_fixer: false,
+                fixer_source_task_run_id: None,
+                is_meta_optimizer: false,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                completed_at: if r.completed_at.timestamp() == 0 {
+                    None
+                } else {
+                    Some(r.completed_at.to_rfc3339())
+                },
+            })
+            .collect())
     }
 
     /// Get recent task runs with optional workflow_type filter (lightweight).
@@ -197,7 +247,11 @@ impl PgDb {
         workflow_type: Option<&str>,
         runner_port: Option<u16>,
     ) -> Result<Vec<TaskRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let port: Option<i32> = runner_port.map(|p| p as i32);
         let max_results = limit as i64;
         let wt: Option<&str> = workflow_type;
@@ -208,52 +262,71 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_recent_task_runs_filtered: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| TaskRun {
-            id: r.id,
-            task_name: r.task_name,
-            prompt: non_empty(r.prompt),
-            task_type: if r.task_type.is_empty() { "task".to_string() } else { r.task_type },
-            status: r.status,
-            sessions_count: r.sessions_count as u32,
-            max_sessions: if r.max_sessions == 0 { None } else { Some(r.max_sessions as u32) },
-            output_log: String::new(),
-            error_message: non_empty(r.error_message),
-            auto_continue: r.auto_continue,
-            execution_steps_json: None,
-            log_sources_json: None,
-            config_id: non_empty(r.config_id),
-            workflow_name: non_empty(r.workflow_name),
-            workflow_id: non_empty(r.workflow_id),
-            summary: non_empty(r.summary),
-            ai_summary: non_empty(r.ai_summary),
-            goal_achieved: Some(r.goal_achieved),
-            remaining_work: non_empty(r.remaining_work),
-            summary_generated_at: non_empty(r.summary_generated_at),
-            transition_history_json: None,
-            workflow_type: None,
-            workspace_id: non_empty(r.workspace_id),
-            triggered_by: non_empty(r.triggered_by),
-            parent_task_run_id: None,
-            root_task_run_id: None,
-            depth: 0,
-            bridge_id: None,
-            result_data: None,
-            is_reflection: false,
-            reflection_source_task_run_id: None,
-            is_follow_up: false,
-            follow_up_source_task_run_id: None,
-            is_fixer: false,
-            fixer_source_task_run_id: None,
-            is_meta_optimizer: false,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            completed_at: if r.completed_at.timestamp() == 0 { None } else { Some(r.completed_at.to_rfc3339()) },
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| TaskRun {
+                id: r.id,
+                task_name: r.task_name,
+                prompt: non_empty(r.prompt),
+                task_type: if r.task_type.is_empty() {
+                    "task".to_string()
+                } else {
+                    r.task_type
+                },
+                status: r.status,
+                sessions_count: r.sessions_count as u32,
+                max_sessions: if r.max_sessions == 0 {
+                    None
+                } else {
+                    Some(r.max_sessions as u32)
+                },
+                output_log: String::new(),
+                error_message: non_empty(r.error_message),
+                auto_continue: r.auto_continue,
+                execution_steps_json: None,
+                log_sources_json: None,
+                config_id: non_empty(r.config_id),
+                workflow_name: non_empty(r.workflow_name),
+                workflow_id: non_empty(r.workflow_id),
+                summary: non_empty(r.summary),
+                ai_summary: non_empty(r.ai_summary),
+                goal_achieved: Some(r.goal_achieved),
+                remaining_work: non_empty(r.remaining_work),
+                summary_generated_at: non_empty(r.summary_generated_at),
+                transition_history_json: None,
+                workflow_type: None,
+                workspace_id: non_empty(r.workspace_id),
+                triggered_by: non_empty(r.triggered_by),
+                parent_task_run_id: None,
+                root_task_run_id: None,
+                depth: 0,
+                bridge_id: None,
+                result_data: None,
+                is_reflection: false,
+                reflection_source_task_run_id: None,
+                is_follow_up: false,
+                follow_up_source_task_run_id: None,
+                is_fixer: false,
+                fixer_source_task_run_id: None,
+                is_meta_optimizer: false,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                completed_at: if r.completed_at.timestamp() == 0 {
+                    None
+                } else {
+                    Some(r.completed_at.to_rfc3339())
+                },
+            })
+            .collect())
     }
 
     /// Update task run status.
     pub async fn update_task_run_status(&self, id: &str, status: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::update_task_run_status()
             .bind(&conn, &status, &id)
             .opt()
@@ -264,7 +337,11 @@ impl PgDb {
 
     /// Complete a task run (status='complete', set completed_at).
     pub async fn complete_task_run(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::complete_task_run()
             .bind(&conn, &id)
             .opt()
@@ -275,7 +352,11 @@ impl PgDb {
 
     /// Fail a task run (status='failed', set error_message and completed_at).
     pub async fn fail_task_run(&self, id: &str, error_message: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::fail_task_run()
             .bind(&conn, &error_message, &id)
             .opt()
@@ -286,7 +367,11 @@ impl PgDb {
 
     /// Stop a task run with a reason (status='stopped', set error_message and completed_at).
     pub async fn stop_task_run(&self, id: &str, reason: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::stop_task_run()
             .bind(&conn, &reason, &id)
             .opt()
@@ -297,7 +382,11 @@ impl PgDb {
 
     /// Delete a task run.
     pub async fn delete_task_run(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::task_runs::delete_task_run()
             .bind(&conn, &id)
             .opt()
@@ -315,11 +404,27 @@ impl PgDb {
         remaining_work: Option<&str>,
         summary_generated_at: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let parsed_at: chrono::DateTime<chrono::FixedOffset> = chrono::DateTime::parse_from_rfc3339(summary_generated_at)
-            .map_err(|e| format!("PG update_task_summary: invalid timestamp '{}': {}", summary_generated_at, e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let parsed_at: chrono::DateTime<chrono::FixedOffset> =
+            chrono::DateTime::parse_from_rfc3339(summary_generated_at).map_err(|e| {
+                format!(
+                    "PG update_task_summary: invalid timestamp '{}': {}",
+                    summary_generated_at, e
+                )
+            })?;
         qontinui_db::queries::task_runs::update_task_summary()
-            .bind(&conn, &summary, &goal_achieved, &remaining_work, &parsed_at, &id)
+            .bind(
+                &conn,
+                &summary,
+                &goal_achieved,
+                &remaining_work,
+                &parsed_at,
+                &id,
+            )
             .opt()
             .await
             .map_err(|e| format!("PG update_task_summary: {}", e))?;
@@ -328,7 +433,11 @@ impl PgDb {
 
     /// Append output to a task run.
     pub async fn append_task_output(&self, id: &str, output: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::append_task_output()
             .bind(&conn, &output, &id)
             .await
@@ -338,7 +447,11 @@ impl PgDb {
 
     /// Get task run output.
     pub async fn get_task_output(&self, id: &str) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let output = qontinui_db::queries::task_runs::get_task_output()
             .bind(&conn, &id)
             .opt()
@@ -349,7 +462,11 @@ impl PgDb {
 
     /// Update task run name.
     pub async fn update_task_name(&self, id: &str, name: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::update_task_name()
             .bind(&conn, &name, &id)
             .opt()
@@ -360,7 +477,11 @@ impl PgDb {
 
     /// Update task run result data.
     pub async fn update_task_result_data(&self, id: &str, result_data: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::task_runs::update_task_result_data()
             .bind(&conn, &result_data, &id)
             .opt()
@@ -378,7 +499,11 @@ impl PgDb {
         increment_session: bool,
         _check_completion_marker: bool,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Append output
         qontinui_db::queries::task_runs::append_task_output()
@@ -400,7 +525,11 @@ impl PgDb {
 
     /// Set the verification_passed flag on a task run.
     pub async fn set_verification_passed(&self, id: &str, passed: bool) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_runs SET verification_passed = $1 WHERE id = $2",
             &[&passed, &id],
@@ -415,7 +544,11 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Vec<crate::unified_workflow_executor::IterationCommit>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 "SELECT iteration_commits FROM task_runs WHERE id = $1",
@@ -437,7 +570,11 @@ impl PgDb {
         id: &str,
         commit: &crate::unified_workflow_executor::IterationCommit,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Read existing commits
         let row = conn
@@ -483,7 +620,11 @@ impl PgDb {
         id: &str,
         runtime_context_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_runs SET runtime_context_json = $1, updated_at = NOW() WHERE id = $2",
             &[&runtime_context_json, &id],
@@ -495,7 +636,11 @@ impl PgDb {
 
     /// Get the most recent task run that has orchestrator checkpoints.
     pub async fn get_most_recent_task_with_checkpoints(&self) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 r#"SELECT DISTINCT t.id
@@ -516,7 +661,11 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Vec<crate::unified_workflow_executor::IterationDiff>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 "SELECT iteration_diffs FROM task_runs WHERE id = $1",
@@ -533,12 +682,23 @@ impl PgDb {
     }
 
     /// Clear iteration diffs from a given iteration onward (for replay).
-    pub async fn clear_iteration_diffs_from(&self, id: &str, from_iteration: u32) -> Result<(), String> {
+    pub async fn clear_iteration_diffs_from(
+        &self,
+        id: &str,
+        from_iteration: u32,
+    ) -> Result<(), String> {
         let diffs = self.get_iteration_diffs(id).await?;
-        let filtered: Vec<_> = diffs.into_iter().filter(|d| d.iteration < from_iteration).collect();
+        let filtered: Vec<_> = diffs
+            .into_iter()
+            .filter(|d| d.iteration < from_iteration)
+            .collect();
         let json = serde_json::to_string(&filtered)
             .map_err(|e| format!("Failed to serialize filtered diffs: {}", e))?;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_runs SET iteration_diffs = $1, updated_at = NOW() WHERE id = $2",
             &[&json, &id],
@@ -549,12 +709,23 @@ impl PgDb {
     }
 
     /// Clear iteration commits from a given iteration onward (for replay).
-    pub async fn clear_iteration_commits_from(&self, id: &str, from_iteration: u32) -> Result<(), String> {
+    pub async fn clear_iteration_commits_from(
+        &self,
+        id: &str,
+        from_iteration: u32,
+    ) -> Result<(), String> {
         let commits = self.get_iteration_commits(id).await?;
-        let filtered: Vec<_> = commits.into_iter().filter(|c| c.iteration < from_iteration).collect();
+        let filtered: Vec<_> = commits
+            .into_iter()
+            .filter(|c| c.iteration < from_iteration)
+            .collect();
         let json = serde_json::to_string(&filtered)
             .map_err(|e| format!("Failed to serialize filtered commits: {}", e))?;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_runs SET iteration_commits = $1, updated_at = NOW() WHERE id = $2",
             &[&json, &id],
@@ -565,8 +736,16 @@ impl PgDb {
     }
 
     /// Clear step checkpoints from a given iteration onward (for replay).
-    pub async fn clear_checkpoints_from_iteration(&self, execution_id: &str, from_iteration: u32) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn clear_checkpoints_from_iteration(
+        &self,
+        execution_id: &str,
+        from_iteration: u32,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let from_i32 = from_iteration as i32;
         conn.execute(
             "DELETE FROM workflow_step_checkpoints WHERE execution_id = $1 AND iteration >= $2",
@@ -591,7 +770,11 @@ impl PgDb {
         &self,
         execution_id: &str,
     ) -> Result<Vec<crate::database::types::VerificationPhaseSummary>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT iteration, all_passed, passed_steps, failed_steps, created_at::TEXT
@@ -603,18 +786,28 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_workflow_verification_results: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::database::types::VerificationPhaseSummary {
-            iteration: r.get(0),
-            all_passed: r.get(1),
-            passed_steps: r.get(2),
-            failed_steps: r.get(3),
-            created_at: r.get(4),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| crate::database::types::VerificationPhaseSummary {
+                iteration: r.get(0),
+                all_passed: r.get(1),
+                passed_steps: r.get(2),
+                failed_steps: r.get(3),
+                created_at: r.get(4),
+            })
+            .collect())
     }
 
     /// Get currently running task runs.
-    pub async fn get_running_task_runs(&self, runner_port: Option<u16>) -> Result<Vec<TaskRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_running_task_runs(
+        &self,
+        runner_port: Option<u16>,
+    ) -> Result<Vec<TaskRun>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let port: Option<i32> = runner_port.map(|p| p as i32);
 
         let rows = qontinui_db::queries::task_runs::get_running_task_runs()
@@ -623,15 +816,24 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_running_task_runs: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| {
-            TaskRun {
+        Ok(rows
+            .into_iter()
+            .map(|r| TaskRun {
                 id: r.id,
                 task_name: r.task_name,
                 prompt: non_empty(r.prompt),
-                task_type: if r.task_type.is_empty() { "task".to_string() } else { r.task_type },
+                task_type: if r.task_type.is_empty() {
+                    "task".to_string()
+                } else {
+                    r.task_type
+                },
                 status: r.status,
                 sessions_count: r.sessions_count as u32,
-                max_sessions: if r.max_sessions == 0 { None } else { Some(r.max_sessions as u32) },
+                max_sessions: if r.max_sessions == 0 {
+                    None
+                } else {
+                    Some(r.max_sessions as u32)
+                },
                 output_log: String::new(),
                 error_message: non_empty(r.error_message),
                 auto_continue: r.auto_continue,
@@ -663,9 +865,13 @@ impl PgDb {
                 is_meta_optimizer: r.is_meta_optimizer,
                 created_at: r.created_at.to_rfc3339(),
                 updated_at: r.updated_at.to_rfc3339(),
-                completed_at: if r.completed_at.timestamp() == 0 { None } else { Some(r.completed_at.to_rfc3339()) },
-            }
-        }).collect())
+                completed_at: if r.completed_at.timestamp() == 0 {
+                    None
+                } else {
+                    Some(r.completed_at.to_rfc3339())
+                },
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -679,7 +885,11 @@ impl PgDb {
         workflow_name: Option<&str>,
         iteration_number: u32,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         let iter_num = iteration_number as i64;
@@ -705,7 +915,11 @@ impl PgDb {
         template_matches: Option<&str>,
         anomalies: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Get start time to calculate duration
         let row = conn
@@ -719,7 +933,8 @@ impl PgDb {
         let started_at: String = row.get(0);
         let now = chrono::Utc::now();
         let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
-            now.signed_duration_since(start.with_timezone(&chrono::Utc)).num_milliseconds()
+            now.signed_duration_since(start.with_timezone(&chrono::Utc))
+                .num_milliseconds()
         } else {
             0i64
         };
@@ -766,7 +981,11 @@ impl PgDb {
         template_matches: Option<&str>,
         anomalies: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Get start time to calculate duration
         let row = conn
@@ -780,7 +999,8 @@ impl PgDb {
         let started_at: String = row.get(0);
         let now = chrono::Utc::now();
         let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
-            now.signed_duration_since(start.with_timezone(&chrono::Utc)).num_milliseconds()
+            now.signed_duration_since(start.with_timezone(&chrono::Utc))
+                .num_milliseconds()
         } else {
             0i64
         };
@@ -825,7 +1045,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<crate::database::types::TaskRunAutomation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -869,7 +1093,11 @@ impl PgDb {
         &self,
         automation_id: &str,
     ) -> Result<Option<crate::database::types::TaskRunAutomation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -913,7 +1141,11 @@ impl PgDb {
         &self,
         input: &crate::mcp_client::CreateMcpCallInput,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -958,7 +1190,11 @@ impl PgDb {
         task_run_id: &str,
         success_filter: Option<bool>,
     ) -> Result<crate::mcp_client::McpCallsResult, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if let Some(success) = success_filter {
             conn.query(
@@ -1032,7 +1268,11 @@ impl PgDb {
 
     /// Pause a running task run, setting it to 'paused'.
     pub async fn pause_task_run(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .execute(
                 "UPDATE task_runs SET status = 'paused', updated_at = NOW() WHERE id = $1 AND status = 'running'",
@@ -1045,7 +1285,11 @@ impl PgDb {
 
     /// Unpause a paused task run, setting it back to 'running'.
     pub async fn unpause_task_run(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .execute(
                 "UPDATE task_runs SET status = 'running', updated_at = NOW() WHERE id = $1 AND status = 'paused'",
@@ -1061,7 +1305,11 @@ impl PgDb {
         &self,
         limit: u32,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
 
         let rows = conn
@@ -1131,7 +1379,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = $1",
@@ -1143,8 +1395,16 @@ impl PgDb {
     }
 
     /// Reopen a completed/failed task run for additional iterations.
-    pub async fn reopen_task_run(&self, id: &str, additional_sessions: u32) -> Result<TaskRun, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn reopen_task_run(
+        &self,
+        id: &str,
+        additional_sessions: u32,
+    ) -> Result<TaskRun, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let add_i32 = additional_sessions as i32;
         conn.execute(
             r#"UPDATE task_runs SET
@@ -1154,19 +1414,29 @@ impl PgDb {
                 updated_at = NOW()
                WHERE id = $1"#,
             &[&id, &add_i32],
-        ).await.map_err(|e| format!("PG reopen_task_run: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG reopen_task_run: {}", e))?;
 
-        self.get_task_run(id).await?
+        self.get_task_run(id)
+            .await?
             .ok_or_else(|| format!("Task run not found after reopen: {}", id))
     }
 
     /// Get child task runs for a parent task run.
     pub async fn get_child_task_runs(&self, parent_id: &str) -> Result<Vec<TaskRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT id FROM task_runs WHERE parent_task_run_id = $1 ORDER BY created_at ASC",
-            &[&parent_id],
-        ).await.map_err(|e| format!("PG get_child_task_runs: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id FROM task_runs WHERE parent_task_run_id = $1 ORDER BY created_at ASC",
+                &[&parent_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_child_task_runs: {}", e))?;
 
         let mut results = Vec::new();
         for row in &rows {
@@ -1180,16 +1450,24 @@ impl PgDb {
 
     /// Get result_data for a task run.
     pub async fn get_task_run_result_data(&self, id: &str) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            "SELECT result_data FROM task_runs WHERE id = $1",
-            &[&id],
-        ).await.map_err(|e| format!("PG get_task_run_result_data: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt("SELECT result_data FROM task_runs WHERE id = $1", &[&id])
+            .await
+            .map_err(|e| format!("PG get_task_run_result_data: {}", e))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
     /// Get task output tail (last N characters).
-    pub async fn get_task_output_tail(&self, id: &str, tail_chars: usize) -> Result<String, String> {
+    pub async fn get_task_output_tail(
+        &self,
+        id: &str,
+        tail_chars: usize,
+    ) -> Result<String, String> {
         let output = self.get_task_output(id).await?;
         if output.len() <= tail_chars {
             Ok(output)
@@ -1199,42 +1477,74 @@ impl PgDb {
     }
 
     /// Get the latest mobile state for a task run.
-    pub async fn get_latest_mobile_state(&self, task_run_id: &str) -> Result<Option<crate::database::types::MobileState>, String> {
-        let states = crate::database::pg::PgDb::get_mobile_states(self, task_run_id, Some(1)).await?;
+    pub async fn get_latest_mobile_state(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<crate::database::types::MobileState>, String> {
+        let states =
+            crate::database::pg::PgDb::get_mobile_states(self, task_run_id, Some(1)).await?;
         Ok(states.into_iter().next())
     }
 
     /// Delete mobile data for a task run.
     pub async fn delete_mobile_data_for_task(&self, task_run_id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "DELETE FROM task_run_mobile_logs WHERE task_run_id = $1",
             &[&task_run_id],
-        ).await.map_err(|e| format!("PG delete_mobile_logs: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG delete_mobile_logs: {}", e))?;
         conn.execute(
             "DELETE FROM task_run_mobile_state WHERE task_run_id = $1",
             &[&task_run_id],
-        ).await.map_err(|e| format!("PG delete_mobile_state: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG delete_mobile_state: {}", e))?;
         Ok(())
     }
 
     /// Set auto_continue for a task run.
-    pub async fn set_task_auto_continue(&self, id: &str, auto_continue: bool) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn set_task_auto_continue(
+        &self,
+        id: &str,
+        auto_continue: bool,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_runs SET auto_continue = $2, updated_at = NOW() WHERE id = $1",
             &[&id, &auto_continue],
-        ).await.map_err(|e| format!("PG set_task_auto_continue: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG set_task_auto_continue: {}", e))?;
         Ok(())
     }
 
     /// Update execution steps JSON for a task run.
-    pub async fn update_task_run_execution_steps(&self, id: &str, steps_json: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn update_task_run_execution_steps(
+        &self,
+        id: &str,
+        steps_json: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE task_runs SET execution_steps_json = $2, updated_at = NOW() WHERE id = $1",
             &[&id, &steps_json],
-        ).await.map_err(|e| format!("PG update_task_run_execution_steps: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG update_task_run_execution_steps: {}", e))?;
         Ok(())
     }
 
@@ -1243,7 +1553,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn.query(
             "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 ORDER BY iteration ASC",
             &[&task_run_id],
@@ -1264,7 +1578,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 ORDER BY iteration DESC LIMIT 1",
             &[&task_run_id],
@@ -1285,7 +1603,8 @@ impl PgDb {
         task_run_id: &str,
         iteration: u32,
     ) -> Result<Option<serde_json::Value>, String> {
-        self.get_verification_phase_result(task_run_id, iteration).await
+        self.get_verification_phase_result(task_run_id, iteration)
+            .await
     }
 
     /// Get execution spans for a task run with optional server-side filtering.
@@ -1293,7 +1612,8 @@ impl PgDb {
         &self,
         execution_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        self.get_execution_spans_filtered(execution_id, None, None, None).await
+        self.get_execution_spans_filtered(execution_id, None, None, None)
+            .await
     }
 
     /// Get execution spans with optional filtering pushed down to SQL.
@@ -1308,7 +1628,11 @@ impl PgDb {
         min_duration_ms: Option<i64>,
         limit: Option<u32>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Build dynamic query with optional WHERE clauses
         let mut query = String::from(
@@ -1319,9 +1643,8 @@ impl PgDb {
         );
 
         let mut param_idx = 2u32;
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![
-            Box::new(execution_id.to_string()),
-        ];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+            vec![Box::new(execution_id.to_string())];
 
         if let Some(pattern) = name_pattern {
             query.push_str(&format!(" AND name ILIKE ${}", param_idx));
@@ -1342,26 +1665,32 @@ impl PgDb {
             params.push(Box::new(lim as i64));
         }
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
-        let rows = conn.query(&query, &param_refs)
+        let rows = conn
+            .query(&query, &param_refs)
             .await
             .map_err(|e| format!("PG get_execution_spans_filtered: {}", e))?;
 
-        Ok(rows.iter().map(|r| {
-            serde_json::json!({
-                "id": r.get::<_, i64>(0),
-                "execution_id": r.get::<_, Option<String>>(1),
-                "span_type": r.get::<_, String>(2),
-                "phase": r.get::<_, Option<String>>(3),
-                "iteration": r.get::<_, Option<i32>>(4),
-                "started_at": r.get::<_, String>(5),
-                "completed_at": r.get::<_, Option<String>>(6),
-                "duration_ms": r.get::<_, Option<i64>>(7),
-                "metadata": r.get::<_, Option<String>>(8),
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, i64>(0),
+                    "execution_id": r.get::<_, Option<String>>(1),
+                    "span_type": r.get::<_, String>(2),
+                    "phase": r.get::<_, Option<String>>(3),
+                    "iteration": r.get::<_, Option<i32>>(4),
+                    "started_at": r.get::<_, String>(5),
+                    "completed_at": r.get::<_, Option<String>>(6),
+                    "duration_ms": r.get::<_, Option<i64>>(7),
+                    "metadata": r.get::<_, Option<String>>(8),
+                })
             })
-        }).collect())
+            .collect())
     }
 
     /// Get step progress markers for a checkpoint.
@@ -1369,29 +1698,39 @@ impl PgDb {
         &self,
         checkpoint_id: &str,
     ) -> Result<Vec<crate::workflow_state::StepProgressMarker>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT id, checkpoint_id, marker_type, current_value, total_value,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, checkpoint_id, marker_type, current_value, total_value,
                       description, data_json, created_at
                FROM step_progress_markers
                WHERE checkpoint_id = $1
                ORDER BY created_at DESC"#,
-            &[&checkpoint_id],
-        ).await.map_err(|e| format!("PG get_step_progress_markers: {}", e))?;
+                &[&checkpoint_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_step_progress_markers: {}", e))?;
 
-        Ok(rows.iter().map(|r| {
-            let created: chrono::DateTime<chrono::Utc> = r.get(7);
-            crate::workflow_state::StepProgressMarker {
-                id: r.get(0),
-                checkpoint_id: r.get(1),
-                marker_type: r.get(2),
-                current_value: r.get::<_, i64>(3) as u64,
-                total_value: r.get::<_, Option<i64>>(4).map(|v| v as u64),
-                description: r.get(5),
-                data_json: r.get(6),
-                created_at: created.to_rfc3339(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let created: chrono::DateTime<chrono::Utc> = r.get(7);
+                crate::workflow_state::StepProgressMarker {
+                    id: r.get(0),
+                    checkpoint_id: r.get(1),
+                    marker_type: r.get(2),
+                    current_value: r.get::<_, i64>(3) as u64,
+                    total_value: r.get::<_, Option<i64>>(4).map(|v| v as u64),
+                    description: r.get(5),
+                    data_json: r.get(6),
+                    created_at: created.to_rfc3339(),
+                }
+            })
+            .collect())
     }
 
     /// Get latest step progress marker for a checkpoint.

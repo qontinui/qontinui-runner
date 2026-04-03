@@ -156,10 +156,7 @@ impl AuditLogger {
     /// The receiver is intentionally dropped — `enabled: false` prevents any sends.
     pub fn noop() -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        Self {
-            tx,
-            enabled: false,
-        }
+        Self { tx, enabled: false }
     }
 
     /// Log a security audit event (non-blocking).
@@ -240,7 +237,10 @@ impl AuditLogger {
         if let Some(pg_db) = crate::database::pg::PgDb::try_global() {
             match pg_db.insert_security_audit_events(batch).await {
                 Ok(inserted) => {
-                    debug!("Flushed {} audit events to PG ({} inserted)", count, inserted);
+                    debug!(
+                        "Flushed {} audit events to PG ({} inserted)",
+                        count, inserted
+                    );
                 }
                 Err(e) => {
                     warn!("Failed to flush audit events to PG: {}", e);

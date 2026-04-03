@@ -5,7 +5,6 @@
 
 #![allow(dead_code)]
 
-
 use super::types::{
     CreateKnownIssueRequest, CreatePatternTemplateRequest, DetectionMethod, IssueCategory,
     IssuePatternTemplate, IssueProvenance, IssueSeverity, IssueStatus, KnownIssue,
@@ -18,17 +17,12 @@ pub fn ensure_tables() -> Result<(), String> {
 }
 
 /// Insert a new known issue. Returns the created KnownIssue.
-pub fn insert_known_issue(
-    req: &CreateKnownIssueRequest,
-) -> Result<KnownIssue, String> {
+pub fn insert_known_issue(req: &CreateKnownIssueRequest) -> Result<KnownIssue, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Update an existing known issue.
-pub fn update_known_issue(
-    id: &str,
-    req: &UpdateKnownIssueRequest,
-) -> Result<KnownIssue, String> {
+pub fn update_known_issue(id: &str, req: &UpdateKnownIssueRequest) -> Result<KnownIssue, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -38,9 +32,7 @@ pub fn get_known_issue(id: &str) -> Result<Option<KnownIssue>, String> {
 }
 
 /// List known issues with optional filters.
-pub fn list_known_issues(
-    query: &ListKnownIssuesQuery,
-) -> Result<Vec<KnownIssue>, String> {
+pub fn list_known_issues(query: &ListKnownIssuesQuery) -> Result<Vec<KnownIssue>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -50,10 +42,7 @@ pub fn delete_known_issue(id: &str) -> Result<bool, String> {
 }
 
 /// Resolve a known issue (set status to resolved + resolved_at).
-pub fn resolve_known_issue(
-    id: &str,
-    resolution: Option<&str>,
-) -> Result<(), String> {
+pub fn resolve_known_issue(id: &str, resolution: Option<&str>) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -89,9 +78,7 @@ pub fn list_pattern_templates() -> Result<Vec<IssuePatternTemplate>, String> {
 }
 
 /// Get a pattern template by ID.
-pub fn get_pattern_template(
-    id: &str,
-) -> Result<Option<IssuePatternTemplate>, String> {
+pub fn get_pattern_template(id: &str) -> Result<Option<IssuePatternTemplate>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -107,9 +94,7 @@ pub fn insert_pattern_template(
 /// Find active known issues relevant for workflow generation based on depth level.
 /// - "thorough": only critical + high severity
 /// - "regression": all active issues
-pub fn find_relevant_issues_for_generation(
-    depth: &str,
-) -> Result<Vec<KnownIssue>, String> {
+pub fn find_relevant_issues_for_generation(depth: &str) -> Result<Vec<KnownIssue>, String> {
     Err("SQLite removed".to_string())
 }
 

@@ -15,7 +15,11 @@ impl PgDb {
         &self,
         artifact: &PipelineArtifact,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let investigation_ms = artifact.investigation_duration_ms.map(|v| v as i64);
         let specification_ms = artifact.specification_duration_ms.map(|v| v as i64);
@@ -28,13 +32,24 @@ impl PgDb {
         let revision_ms = artifact.revision_duration_ms.map(|v| v as i64);
         let revision_cycles = artifact.revision_cycles.map(|v| v as i32);
         let confidence_score = artifact.confidence_score.map(|v| v as f64);
-        let spec_criteria = artifact.specification_criteria.as_ref().map(|v| v.to_string());
-        let verification_prompts = artifact.verification_prompts.as_ref().map(|v| v.to_string());
+        let spec_criteria = artifact
+            .specification_criteria
+            .as_ref()
+            .map(|v| v.to_string());
+        let verification_prompts = artifact
+            .verification_prompts
+            .as_ref()
+            .map(|v| v.to_string());
         let discovery_calls = artifact.discovery_calls.as_ref().map(|v| v.to_string());
         let builder_parsed = artifact.builder_parsed_json.as_ref().map(|v| v.to_string());
         let autofix_diff = artifact.autofix_diff.as_ref().map(|v| v.to_string());
-        let verification_iter = artifact.verification_iterations.as_ref().map(|v| v.to_string());
-        let fixer_snaps = artifact.fixer_snapshots.as_ref()
+        let verification_iter = artifact
+            .verification_iterations
+            .as_ref()
+            .map(|v| v.to_string());
+        let fixer_snaps = artifact
+            .fixer_snapshots
+            .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
         let hardening_summary = artifact.hardening_summary.as_ref().map(|v| v.to_string());
         let hardened_json = artifact.hardened_json.as_ref().map(|v| v.to_string());
@@ -110,7 +125,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(

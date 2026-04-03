@@ -66,9 +66,9 @@ mod logging;
 mod macros;
 mod mcp;
 mod mcp_api;
-mod memory;
 mod mcp_client;
 mod mcp_embedded;
+mod memory;
 mod meta_optimizer;
 mod middleware;
 mod online_learning;
@@ -85,14 +85,14 @@ mod prompts;
 mod rag;
 mod recording;
 mod reflection;
-mod rework;
 mod restate;
+mod rework;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
-mod schema_registry;
 mod scheduler;
 mod scheduler_service;
+mod schema_registry;
 mod secure_storage;
 mod security;
 mod semantic_conventions;
@@ -128,11 +128,11 @@ mod unified_workflow_executor;
 mod unified_workflows;
 mod validation;
 mod video_recorder;
+mod vision;
 mod workflow_event_bus;
 mod workflow_generation;
 mod workflow_queue;
 mod workflow_state;
-mod vision;
 mod worktree;
 mod zombie_sweep;
 
@@ -253,7 +253,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 pg
             }
             Err(e) => {
-                error!("PostgreSQL connection failed: {}. Ensure docker-compose PG is running.", e);
+                error!(
+                    "PostgreSQL connection failed: {}. Ensure docker-compose PG is running.",
+                    e
+                );
                 panic!("PostgreSQL connection required — {}", e);
             }
         }

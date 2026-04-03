@@ -784,10 +784,18 @@ pub struct MemoryConsolidationSettings {
     pub provider_override: Option<String>,
 }
 
-fn default_min_group_size() -> usize { 3 }
-fn default_cooldown_hours() -> f64 { 6.0 }
-fn default_archive_threshold() -> f64 { 0.05 }
-fn default_max_observations() -> i64 { 500 }
+fn default_min_group_size() -> usize {
+    3
+}
+fn default_cooldown_hours() -> f64 {
+    6.0
+}
+fn default_archive_threshold() -> f64 {
+    0.05
+}
+fn default_max_observations() -> i64 {
+    500
+}
 
 impl Default for MemoryConsolidationSettings {
     fn default() -> Self {
@@ -987,7 +995,9 @@ pub fn get_container_settings() -> crate::container::container_config::Container
     settings.container
 }
 
-pub fn save_container_settings(config: crate::container::container_config::ContainerConfig) -> Result<(), String> {
+pub fn save_container_settings(
+    config: crate::container::container_config::ContainerConfig,
+) -> Result<(), String> {
     let mut settings = load_settings();
     settings.container = config;
     save_settings(&settings)
@@ -998,7 +1008,9 @@ pub fn get_security_settings() -> crate::security::engine::SecuritySettings {
     settings.security
 }
 
-pub fn save_security_settings(config: crate::security::engine::SecuritySettings) -> Result<(), String> {
+pub fn save_security_settings(
+    config: crate::security::engine::SecuritySettings,
+) -> Result<(), String> {
     let mut settings = load_settings();
     settings.security = config;
     save_settings(&settings)

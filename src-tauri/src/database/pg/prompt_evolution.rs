@@ -47,7 +47,10 @@ impl PgDb {
         .await
         .map_err(|e| format!("Failed to record prompt evolution: {}", e))?;
 
-        info!("PG: Recorded prompt evolution {} for agent {}", id, agent_type);
+        info!(
+            "PG: Recorded prompt evolution {} for agent {}",
+            id, agent_type
+        );
         Ok(())
     }
 

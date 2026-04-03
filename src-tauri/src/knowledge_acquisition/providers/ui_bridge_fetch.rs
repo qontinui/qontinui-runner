@@ -42,13 +42,7 @@ impl UiBridgeFetch {
     /// Check if UI Bridge is connected and healthy
     pub async fn is_available(&self) -> bool {
         let url = format!("{}/health", self.base_url);
-        match self
-            .client
-            .get(&url)
-            .timeout(HEALTH_TIMEOUT)
-            .send()
-            .await
-        {
+        match self.client.get(&url).timeout(HEALTH_TIMEOUT).send().await {
             Ok(resp) => {
                 if let Ok(health) = resp.json::<HealthResponse>().await {
                     health.status == "ok" || health.status == "healthy"

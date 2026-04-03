@@ -89,7 +89,16 @@ pub async fn session_create(
     workflow_name: Option<String>,
     run_id: Option<String>,
 ) -> Result<CommandResponse, String> {
-    app_state.pg_db.create_session(&id, &session_type, &name, workflow_name.as_deref(), run_id.as_deref()).await?;
+    app_state
+        .pg_db
+        .create_session(
+            &id,
+            &session_type,
+            &name,
+            workflow_name.as_deref(),
+            run_id.as_deref(),
+        )
+        .await?;
     Ok(CommandResponse {
         success: true,
         message: Some("Session created".to_string()),
@@ -106,7 +115,15 @@ pub async fn session_update_status(
     current_phase: Option<u32>,
     error_message: Option<String>,
 ) -> Result<CommandResponse, String> {
-    app_state.pg_db.update_session_status(&session_id, &status, current_phase, error_message.as_deref()).await?;
+    app_state
+        .pg_db
+        .update_session_status(
+            &session_id,
+            &status,
+            current_phase,
+            error_message.as_deref(),
+        )
+        .await?;
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Session status updated to {}", status)),

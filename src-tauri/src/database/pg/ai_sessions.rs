@@ -11,7 +11,11 @@ impl PgDb {
         limit: u32,
         runner_port: Option<u16>,
     ) -> Result<Vec<AiSessionSummary>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
         let port_i64: Option<i64> = runner_port.map(|p| p as i64);
 
@@ -52,7 +56,11 @@ impl PgDb {
         &self,
         runner_port: Option<u16>,
     ) -> Result<Vec<crate::database::types::TaskRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let port_i64: Option<i64> = runner_port.map(|p| p as i64);
 
         let rows = conn
@@ -99,7 +107,9 @@ impl PgDb {
                 created_at: r.get::<_, Option<String>>(17).unwrap_or_default(),
                 updated_at: r.get::<_, Option<String>>(18).unwrap_or_default(),
                 completed_at: r.get(19),
-                task_type: r.get::<_, Option<String>>(20).unwrap_or_else(|| "task".to_string()),
+                task_type: r
+                    .get::<_, Option<String>>(20)
+                    .unwrap_or_else(|| "task".to_string()),
                 config_id: r.get(21),
                 workflow_name: r.get(22),
                 workflow_id: None,
@@ -131,7 +141,11 @@ impl PgDb {
         stage_index: Option<i32>,
         claude_cli_session_id: &str,
     ) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Use ON CONFLICT on the unique index (task_run_id, iteration, phase, COALESCE(stage_index, -1)).
         // PG doesn't allow COALESCE in ON CONFLICT target directly, so we do a manual check-then-upsert.
@@ -190,7 +204,11 @@ impl PgDb {
         status: &str,
         output_length: i64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let coalesced_stage = stage_index.unwrap_or(-1);
         let output_len_i32 = output_length as i32;
 
@@ -199,7 +217,14 @@ impl PgDb {
                SET status = $1, session_completed_at = NOW(), output_length = $2
                WHERE task_run_id = $3 AND iteration = $4 AND phase = $5
                  AND COALESCE(stage_index, -1) = $6"#,
-            &[&status, &output_len_i32, &task_run_id, &iteration, &phase, &coalesced_stage],
+            &[
+                &status,
+                &output_len_i32,
+                &task_run_id,
+                &iteration,
+                &phase,
+                &coalesced_stage,
+            ],
         )
         .await
         .map_err(|e| format!("PG complete_workflow_ai_session: {}", e))?;
@@ -216,7 +241,11 @@ impl PgDb {
         workflow_name: Option<&str>,
         run_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         conn.execute(
             r#"INSERT INTO sessions (id, session_type, name, status, created_at, updated_at, workflow_name, run_id)
@@ -252,7 +281,11 @@ impl PgDb {
         current_phase: Option<u32>,
         error_message: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let completed = status == "completed" || status == "failed";
         let phase: Option<i32> = current_phase.map(|p| p as i32);
@@ -302,7 +335,11 @@ impl PgDb {
         iteration: i32,
         phase: &str,
     ) -> Result<Option<(String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(

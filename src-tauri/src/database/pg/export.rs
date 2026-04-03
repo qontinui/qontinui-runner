@@ -10,9 +10,16 @@ use super::PgDb;
 impl PgDb {
     /// Export all settings.
     pub async fn export_all_settings(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
-            .query("SELECT key, value, updated_at FROM settings ORDER BY key", &[])
+            .query(
+                "SELECT key, value, updated_at FROM settings ORDER BY key",
+                &[],
+            )
             .await
             .map_err(|e| format!("PG export_all_settings: {}", e))?;
 
@@ -48,7 +55,11 @@ impl PgDb {
 
     /// Export all verification tests.
     pub async fn export_all_verification_tests(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, name, description, workflow_id, test_type, command,
@@ -90,7 +101,11 @@ impl PgDb {
 
     /// Export all task hooks.
     pub async fn export_all_task_hooks(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, name, hook_type, trigger_event, command, working_directory,
@@ -125,7 +140,11 @@ impl PgDb {
 
     /// Export all prompts.
     pub async fn export_all_prompts(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, name, category, content, variables, created_at, updated_at
@@ -158,7 +177,11 @@ impl PgDb {
 
     /// Export all configs.
     pub async fn export_all_configs(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, name, config_json, source_type, source_path, created_at, updated_at
@@ -191,7 +214,11 @@ impl PgDb {
 
     /// Export all scheduled tasks.
     pub async fn export_all_scheduled_tasks(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, name, schedule, workflow_id, workflow_name, enabled,
@@ -226,8 +253,14 @@ impl PgDb {
     }
 
     /// Export all orchestrator checkpoints.
-    pub async fn export_all_orchestrator_checkpoints(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn export_all_orchestrator_checkpoints(
+        &self,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, task_id, iteration, trigger, state, name, created_at
@@ -259,7 +292,11 @@ impl PgDb {
 
     /// Export all flows (orchestrator_flows).
     pub async fn export_all_flows(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, name, description, definition_json, tags, version, created_at, updated_at
@@ -296,7 +333,11 @@ impl PgDb {
 
     /// Get a summary of all exportable data counts.
     pub async fn get_export_summary(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_one(
                 r#"SELECT
@@ -340,7 +381,11 @@ impl PgDb {
 
     /// Get database statistics from PostgreSQL.
     pub async fn get_database_stats(&self) -> Result<DatabaseStats, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Get table sizes using pg_stat_user_tables
         let rows = conn
@@ -361,20 +406,17 @@ impl PgDb {
 
         // Get total database size
         let size_row = conn
-            .query_one(
-                "SELECT pg_database_size(current_database())",
-                &[],
-            )
+            .query_one("SELECT pg_database_size(current_database())", &[])
             .await
             .map_err(|e| format!("PG database size: {}", e))?;
         let total_size: i64 = size_row.get(0);
 
         Ok(DatabaseStats {
             total_size_bytes: total_size,
-            page_count: 0,       // Not applicable for PG
-            page_size: 8192,     // PG default page size
-            freelist_count: 0,   // Not applicable for PG
-            wal_pages: 0,        // Not directly queryable the same way
+            page_count: 0,     // Not applicable for PG
+            page_size: 8192,   // PG default page size
+            freelist_count: 0, // Not applicable for PG
+            wal_pages: 0,      // Not directly queryable the same way
             wal_frames: 0,
             table_counts,
         })
@@ -392,7 +434,11 @@ impl PgDb {
             return Err("Multiple statements are not allowed".to_string());
         }
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let explain_query = format!("EXPLAIN {}", trimmed);
         let rows = conn
@@ -400,17 +446,18 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG EXPLAIN failed: {}", e))?;
 
-        let plan_lines: Vec<String> = rows
-            .iter()
-            .map(|r| r.get::<_, String>(0))
-            .collect();
+        let plan_lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
         Ok(plan_lines.join("\n"))
     }
 
     /// Export all flow executions.
     pub async fn export_all_flow_executions(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT instance_id, flow_id, current_step, context_json, status, error,

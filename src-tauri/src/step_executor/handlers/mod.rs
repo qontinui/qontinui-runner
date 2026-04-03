@@ -356,7 +356,10 @@ impl HandlerContext {
     }
 
     /// Store a NetworkMediator to keep it alive for this context's lifetime.
-    pub fn with_network_mediator(mut self, mediator: crate::security::network_proxy::NetworkMediator) -> Self {
+    pub fn with_network_mediator(
+        mut self,
+        mediator: crate::security::network_proxy::NetworkMediator,
+    ) -> Self {
         self._network_mediator = Some(mediator);
         self
     }

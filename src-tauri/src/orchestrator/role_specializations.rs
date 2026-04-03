@@ -26,9 +26,7 @@
 
 #![allow(dead_code)]
 
-use super::agent_roles::{
-    AgentRole, AutonomyLevel, CommunicationStyle, ModelTier, RoleRegistry,
-};
+use super::agent_roles::{AgentRole, AutonomyLevel, CommunicationStyle, ModelTier, RoleRegistry};
 
 // ============================================================================
 // Analyzer
@@ -40,55 +38,59 @@ use super::agent_roles::{
 /// Whitelisted tools are read-only MCP endpoints for querying task runs,
 /// automation history, screenshots, DOM captures, state machine status, and logs.
 pub fn analyzer_role() -> AgentRole {
-    AgentRole::new("analyzer", "Analyzer", "Inspect and understand the current state")
-        .with_backstory(
-            "You are an expert at reading code, logs, and state without modifying anything. \
+    AgentRole::new(
+        "analyzer",
+        "Analyzer",
+        "Inspect and understand the current state",
+    )
+    .with_backstory(
+        "You are an expert at reading code, logs, and state without modifying anything. \
              You gather evidence, identify patterns, and produce clear summaries so that \
              downstream roles can act on solid information.",
-        )
-        .with_allowed_tools(vec![
-            // Task run queries
-            "get_task_runs".to_string(),
-            "get_task_run".to_string(),
-            "get_task_run_events".to_string(),
-            "get_task_run_screenshots".to_string(),
-            "get_task_run_playwright_results".to_string(),
-            // Automation run queries
-            "get_automation_runs".to_string(),
-            "get_automation_run".to_string(),
-            // Config queries
-            "get_executor_status".to_string(),
-            "get_loaded_config".to_string(),
-            "list_monitors".to_string(),
-            // Screenshot & log queries
-            "list_screenshots".to_string(),
-            "read_runner_logs".to_string(),
-            "get_annotated_screenshot".to_string(),
-            // DOM capture queries
-            "list_dom_captures".to_string(),
-            "get_dom_capture".to_string(),
-            "get_dom_capture_html".to_string(),
-            // State machine queries
-            "get_state_machine_status".to_string(),
-            "get_active_states".to_string(),
-            "get_available_transitions".to_string(),
-            // Test queries (read-only)
-            "list_tests".to_string(),
-            "get_test".to_string(),
-            "list_test_results".to_string(),
-            "get_test_history".to_string(),
-            // AWAS queries
-            "awas_list_actions".to_string(),
-            "awas_check_support".to_string(),
-        ])
-        .with_model_tier(ModelTier::Simple)
-        .with_max_tokens_budget(2000)
-        .with_style(CommunicationStyle::Concise)
-        .with_autonomy(AutonomyLevel::Autonomous)
-        .with_constraint("Never modify state — read-only operations only.".to_string())
-        .with_constraint("Summarize findings with supporting evidence.".to_string())
-        .with_tag("analysis")
-        .with_tag("read-only")
+    )
+    .with_allowed_tools(vec![
+        // Task run queries
+        "get_task_runs".to_string(),
+        "get_task_run".to_string(),
+        "get_task_run_events".to_string(),
+        "get_task_run_screenshots".to_string(),
+        "get_task_run_playwright_results".to_string(),
+        // Automation run queries
+        "get_automation_runs".to_string(),
+        "get_automation_run".to_string(),
+        // Config queries
+        "get_executor_status".to_string(),
+        "get_loaded_config".to_string(),
+        "list_monitors".to_string(),
+        // Screenshot & log queries
+        "list_screenshots".to_string(),
+        "read_runner_logs".to_string(),
+        "get_annotated_screenshot".to_string(),
+        // DOM capture queries
+        "list_dom_captures".to_string(),
+        "get_dom_capture".to_string(),
+        "get_dom_capture_html".to_string(),
+        // State machine queries
+        "get_state_machine_status".to_string(),
+        "get_active_states".to_string(),
+        "get_available_transitions".to_string(),
+        // Test queries (read-only)
+        "list_tests".to_string(),
+        "get_test".to_string(),
+        "list_test_results".to_string(),
+        "get_test_history".to_string(),
+        // AWAS queries
+        "awas_list_actions".to_string(),
+        "awas_check_support".to_string(),
+    ])
+    .with_model_tier(ModelTier::Simple)
+    .with_max_tokens_budget(2000)
+    .with_style(CommunicationStyle::Concise)
+    .with_autonomy(AutonomyLevel::Autonomous)
+    .with_constraint("Never modify state — read-only operations only.".to_string())
+    .with_constraint("Summarize findings with supporting evidence.".to_string())
+    .with_tag("analysis")
+    .with_tag("read-only")
 }
 
 // ============================================================================
@@ -216,51 +218,55 @@ pub fn executor_role() -> AgentRole {
 /// Has read tools for inspecting results plus test execution, visual diff,
 /// and state verification tools.
 pub fn verifier_role() -> AgentRole {
-    AgentRole::new("verifier", "Verifier", "Validate results and verify correctness")
-        .with_backstory(
-            "You are a QA specialist who verifies outcomes match expectations. You run \
+    AgentRole::new(
+        "verifier",
+        "Verifier",
+        "Validate results and verify correctness",
+    )
+    .with_backstory(
+        "You are a QA specialist who verifies outcomes match expectations. You run \
              tests, compare before/after state, and produce a clear pass/fail verdict \
              with evidence. You are skeptical by nature and look for subtle regressions.",
-        )
-        .with_allowed_tools(vec![
-            // Task run inspection
-            "get_task_runs".to_string(),
-            "get_task_run".to_string(),
-            "get_task_run_events".to_string(),
-            "get_task_run_screenshots".to_string(),
-            "get_task_run_playwright_results".to_string(),
-            // Test execution & results
-            "execute_test".to_string(),
-            "list_tests".to_string(),
-            "get_test".to_string(),
-            "list_test_results".to_string(),
-            "get_test_history".to_string(),
-            // Visual verification
-            "get_annotated_screenshot".to_string(),
-            "get_visual_diff".to_string(),
-            "list_screenshots".to_string(),
-            // DOM state verification
-            "list_dom_captures".to_string(),
-            "get_dom_capture".to_string(),
-            "get_dom_capture_html".to_string(),
-            // State machine verification
-            "get_state_machine_status".to_string(),
-            "get_active_states".to_string(),
-            "get_available_transitions".to_string(),
-            // Automation run results
-            "get_automation_runs".to_string(),
-            "get_automation_run".to_string(),
-            // Logs for evidence
-            "read_runner_logs".to_string(),
-        ])
-        .with_model_tier(ModelTier::Medium)
-        .with_max_tokens_budget(2000)
-        .with_style(CommunicationStyle::Technical)
-        .with_autonomy(AutonomyLevel::Autonomous)
-        .with_constraint("Always produce an explicit pass/fail verdict.".to_string())
-        .with_constraint("Include evidence for every verdict.".to_string())
-        .with_tag("verification")
-        .with_tag("qa")
+    )
+    .with_allowed_tools(vec![
+        // Task run inspection
+        "get_task_runs".to_string(),
+        "get_task_run".to_string(),
+        "get_task_run_events".to_string(),
+        "get_task_run_screenshots".to_string(),
+        "get_task_run_playwright_results".to_string(),
+        // Test execution & results
+        "execute_test".to_string(),
+        "list_tests".to_string(),
+        "get_test".to_string(),
+        "list_test_results".to_string(),
+        "get_test_history".to_string(),
+        // Visual verification
+        "get_annotated_screenshot".to_string(),
+        "get_visual_diff".to_string(),
+        "list_screenshots".to_string(),
+        // DOM state verification
+        "list_dom_captures".to_string(),
+        "get_dom_capture".to_string(),
+        "get_dom_capture_html".to_string(),
+        // State machine verification
+        "get_state_machine_status".to_string(),
+        "get_active_states".to_string(),
+        "get_available_transitions".to_string(),
+        // Automation run results
+        "get_automation_runs".to_string(),
+        "get_automation_run".to_string(),
+        // Logs for evidence
+        "read_runner_logs".to_string(),
+    ])
+    .with_model_tier(ModelTier::Medium)
+    .with_max_tokens_budget(2000)
+    .with_style(CommunicationStyle::Technical)
+    .with_autonomy(AutonomyLevel::Autonomous)
+    .with_constraint("Always produce an explicit pass/fail verdict.".to_string())
+    .with_constraint("Include evidence for every verdict.".to_string())
+    .with_tag("verification")
+    .with_tag("qa")
 }
 
 // ============================================================================
@@ -349,7 +355,12 @@ mod tests {
     #[test]
     fn test_specializations_build_system_prompts() {
         // Ensure all four roles produce valid system prompts without panicking
-        for role in &[analyzer_role(), planner_role(), executor_role(), verifier_role()] {
+        for role in &[
+            analyzer_role(),
+            planner_role(),
+            executor_role(),
+            verifier_role(),
+        ] {
             let prompt = role.build_system_prompt();
             assert!(!prompt.is_empty());
             assert!(prompt.contains(&role.role));
@@ -359,7 +370,12 @@ mod tests {
     #[test]
     fn test_no_duplicate_tools_in_roles() {
         // Verify no role has duplicate tool entries
-        for role in &[analyzer_role(), planner_role(), executor_role(), verifier_role()] {
+        for role in &[
+            analyzer_role(),
+            planner_role(),
+            executor_role(),
+            verifier_role(),
+        ] {
             let tools = role.allowed_tools.as_ref().unwrap();
             let mut seen = std::collections::HashSet::new();
             for tool in tools {

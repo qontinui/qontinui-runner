@@ -28,13 +28,11 @@ const VERBOSE_OUTPUT_TAIL_LINES: usize = 10;
 const VERBOSE_OUTPUT_MIN_LINES: usize = 40;
 
 // Precompiled regex patterns
-static JSON_ARRAY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\[(\s*\{[^{}\[\]]*\}\s*,?\s*){3,}\]"#).unwrap()
-});
+static JSON_ARRAY_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\[(\s*\{[^{}\[\]]*\}\s*,?\s*){3,}\]"#).unwrap());
 
-static VERBOSE_BLOCK_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?s)```(?:text|output|log|console|bash|sh)?\n(.*?)```").unwrap()
-});
+static VERBOSE_BLOCK_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)```(?:text|output|log|console|bash|sh)?\n(.*?)```").unwrap());
 
 /// Context compaction middleware that reduces token usage on dynamic prompt content.
 pub struct ContextCompactionMiddleware {
@@ -120,7 +118,9 @@ fn compact_json_arrays(text: &str) -> String {
         if let Some(json_end) = find_matching_bracket(&result, abs_start) {
             let json_str = &result[abs_start..=json_end];
 
-            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(json_str) {
+            if let Ok(arr) =
+                serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(json_str)
+            {
                 if arr.len() >= 3 {
                     if let Some(psv) = json_array_to_psv(&arr) {
                         result.replace_range(abs_start..=json_end, &psv);
@@ -192,7 +192,13 @@ fn json_array_to_psv(arr: &[serde_json::Map<String, serde_json::Value>]) -> Opti
     let mut output = String::new();
 
     // Header row
-    output.push_str(&keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join("|"));
+    output.push_str(
+        &keys
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join("|"),
+    );
     output.push('\n');
 
     // Data rows
@@ -298,8 +304,7 @@ fn trim_verbose_outputs(text: &str) -> String {
             }
 
             let head: Vec<&str> = lines[..VERBOSE_OUTPUT_HEAD_LINES].to_vec();
-            let tail: Vec<&str> =
-                lines[lines.len() - VERBOSE_OUTPUT_TAIL_LINES..].to_vec();
+            let tail: Vec<&str> = lines[lines.len() - VERBOSE_OUTPUT_TAIL_LINES..].to_vec();
             let omitted = lines.len() - VERBOSE_OUTPUT_HEAD_LINES - VERBOSE_OUTPUT_TAIL_LINES;
 
             format!(

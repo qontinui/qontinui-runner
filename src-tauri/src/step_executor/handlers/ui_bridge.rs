@@ -706,7 +706,9 @@ impl StepHandler for UiBridgeHandler {
         );
 
         // Security: check network policy for UI Bridge URLs (when not unrestricted)
-        if context.security_policy.network.mode != crate::security::policy::NetworkMode::Unrestricted {
+        if context.security_policy.network.mode
+            != crate::security::policy::NetworkMode::Unrestricted
+        {
             let (domain, protocol) = extract_domain_from_url(raw_url);
             if !domain.is_empty() {
                 if let Err(denial) = crate::security::PolicyEngine::evaluate_network(
@@ -714,8 +716,15 @@ impl StepHandler for UiBridgeHandler {
                     &domain,
                     &protocol,
                 ) {
-                    warn!("UI Bridge step '{}' URL blocked by network policy: {}", step_name, denial);
-                    context.audit_logger.log_denial(&denial, context.task_run_id.as_deref(), Some(step_name));
+                    warn!(
+                        "UI Bridge step '{}' URL blocked by network policy: {}",
+                        step_name, denial
+                    );
+                    context.audit_logger.log_denial(
+                        &denial,
+                        context.task_run_id.as_deref(),
+                        Some(step_name),
+                    );
                     return StepHandlerResult::failure(format!(
                         "Security policy violation: {}",
                         denial.reason
@@ -744,11 +753,7 @@ impl StepHandler for UiBridgeHandler {
             context
                 .app_state
                 .url_lock_manager
-                .acquire(
-                    base_url,
-                    task_run_id,
-                    workflow_name,
-                )
+                .acquire(base_url, task_run_id, workflow_name)
                 .await;
         }
 
@@ -1033,10 +1038,8 @@ impl StepHandler for UiBridgeHandler {
                             );
                         }
                     };
-                    let endpoint = format!(
-                        "{}/control/action-plan",
-                        base_url.trim_end_matches('/')
-                    );
+                    let endpoint =
+                        format!("{}/control/action-plan", base_url.trim_end_matches('/'));
                     client.post(&endpoint).json(&plan_json).send().await
                 }
                 other => {
@@ -2192,6 +2195,13 @@ fn extract_domain_from_url(url: &str) -> (String, String) {
     } else {
         ("http".to_string(), url)
     };
-    let domain = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
+    let domain = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
     (domain, protocol)
 }

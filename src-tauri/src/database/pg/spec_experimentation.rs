@@ -288,9 +288,7 @@ impl PgDb {
     }
 
     /// Get compliance summary: latest score + run count per spec_id.
-    pub async fn get_compliance_summary(
-        &self,
-    ) -> Result<Vec<(Option<String>, f64, i64)>, String> {
+    pub async fn get_compliance_summary(&self) -> Result<Vec<(Option<String>, f64, i64)>, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         let rows = conn
@@ -320,10 +318,7 @@ impl PgDb {
     }
 
     /// Compute trend from last 5 scores for a spec.
-    pub async fn get_compliance_trend(
-        &self,
-        spec_id: Option<&str>,
-    ) -> Result<String, String> {
+    pub async fn get_compliance_trend(&self, spec_id: Option<&str>) -> Result<String, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         let rows = if let Some(sid) = spec_id {
@@ -399,9 +394,7 @@ impl PgDb {
     }
 
     /// Get distinct spec_ids with their latest scores.
-    pub async fn get_spec_ids_with_latest_scores(
-        &self,
-    ) -> Result<Vec<(String, f64)>, String> {
+    pub async fn get_spec_ids_with_latest_scores(&self) -> Result<Vec<(String, f64)>, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         let rows = conn
@@ -691,14 +684,17 @@ impl PgDb {
             }
         }.map_err(|e| format!("Failed to query accuracy results: {e}"))?;
 
-        Ok(rows.iter().map(|r| PgSpecAccuracyRow {
-            id: r.get(0),
-            spec_id: r.get(1),
-            analysis_type: r.get(2),
-            score: r.get(3),
-            detail_json: r.get(4),
-            created_at: r.get(5),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| PgSpecAccuracyRow {
+                id: r.get(0),
+                spec_id: r.get(1),
+                analysis_type: r.get(2),
+                score: r.get(3),
+                detail_json: r.get(4),
+                created_at: r.get(5),
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -727,24 +723,38 @@ impl PgDb {
             ).await
         }.map_err(|e| format!("Failed to query campaigns: {e}"))?;
 
-        Ok(rows.iter().map(|r| {
-            (
-                r.get::<_, String>(0),
-                r.get::<_, String>(1),
-                r.get::<_, String>(2),
-                r.get::<_, i64>(3),
-                r.get::<_, i64>(4),
-                r.get::<_, String>(5),
-                r.get::<_, String>(6),
-            )
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, i64>(3),
+                    r.get::<_, i64>(4),
+                    r.get::<_, String>(5),
+                    r.get::<_, String>(6),
+                )
+            })
+            .collect())
     }
 
     /// Get experiments for a campaign.
     pub async fn get_autoresearch_experiments(
         &self,
         campaign_id: &str,
-    ) -> Result<Vec<(i32, String, String, String, bool, Option<String>, Option<f64>)>, String> {
+    ) -> Result<
+        Vec<(
+            i32,
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<f64>,
+        )>,
+        String,
+    > {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         let rows = conn.query(
@@ -754,17 +764,20 @@ impl PgDb {
         ).await
         .map_err(|e| format!("Failed to query experiments: {e}"))?;
 
-        Ok(rows.iter().map(|r| {
-            (
-                r.get::<_, i32>(0),
-                r.get::<_, String>(1),
-                r.get::<_, String>(2),
-                r.get::<_, String>(3),
-                r.get::<_, bool>(4),
-                r.get::<_, Option<String>>(5),
-                r.get::<_, Option<f64>>(6),
-            )
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, i32>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, String>(3),
+                    r.get::<_, bool>(4),
+                    r.get::<_, Option<String>>(5),
+                    r.get::<_, Option<f64>>(6),
+                )
+            })
+            .collect())
     }
 
     /// Get campaign config JSON by id.
@@ -823,13 +836,16 @@ impl PgDb {
             .await
             .map_err(|e| format!("Failed to query experiments: {e}"))?;
 
-        Ok(rows.iter().map(|r| {
-            (
-                r.get::<_, i32>(0),
-                r.get::<_, String>(1),
-                r.get::<_, bool>(2),
-            )
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, i32>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, bool>(2),
+                )
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -847,10 +863,7 @@ impl PgDb {
     }
 
     /// Delete Q-routing override (SQLite fallback mirror).
-    pub async fn delete_q_override_sqlite_mirror(
-        &self,
-        state_key: &str,
-    ) -> Result<bool, String> {
+    pub async fn delete_q_override_sqlite_mirror(&self, state_key: &str) -> Result<bool, String> {
         self.delete_q_override(state_key).await
     }
 
@@ -952,7 +965,13 @@ impl PgDb {
             .map(|r| r.get(0))
             .unwrap_or(0.0);
 
-        Ok(Some((run_count, success_count, avg_iterations, avg_duration_ms, avg_cost)))
+        Ok(Some((
+            run_count,
+            success_count,
+            avg_iterations,
+            avg_duration_ms,
+            avg_cost,
+        )))
     }
 
     /// Get distinct models used in the period.
@@ -994,7 +1013,10 @@ impl PgDb {
         .await
         .map_err(|e| format!("Failed to save model profile: {e}"))?;
 
-        info!("Saved model profile for {} ({} trials)", model_id, trial_count);
+        info!(
+            "Saved model profile for {} ({} trials)",
+            model_id, trial_count
+        );
         Ok(())
     }
 
@@ -1050,7 +1072,8 @@ impl PgDb {
                      WHERE s.workflow_name = (
                          SELECT workflow_name FROM task_runs WHERE id = $1
                      )
-                 )"#.to_string()
+                 )"#
+            .to_string()
         };
 
         let has_running: bool = conn
@@ -1179,10 +1202,7 @@ impl PgDb {
     }
 
     /// Count running children of a task (excluding fixers, excluding self).
-    pub async fn count_running_children(
-        &self,
-        parent_task_run_id: &str,
-    ) -> Result<i64, String> {
+    pub async fn count_running_children(&self, parent_task_run_id: &str) -> Result<i64, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         conn.query_one(
@@ -1441,7 +1461,16 @@ impl PgDb {
     pub async fn get_task_run_for_judge(
         &self,
         task_run_id: &str,
-    ) -> Result<(Option<String>, Option<String>, Option<String>, Option<bool>, String), String> {
+    ) -> Result<
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            String,
+        ),
+        String,
+    > {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
 
         let row = conn
@@ -1588,8 +1617,15 @@ impl PgDb {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO NOTHING"#,
             &[
-                &id, &task_run_id, &session_num, &title, &description,
-                &category, &severity, &signature_hash, &status,
+                &id,
+                &task_run_id,
+                &session_num,
+                &title,
+                &description,
+                &category,
+                &severity,
+                &signature_hash,
+                &status,
                 &is_resolved,
                 &evidence as &(dyn tokio_postgres::types::ToSql + Sync),
                 &ai_model as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -1894,7 +1930,8 @@ impl PgDb {
             None, // technology_tags
             None, // domain_tags
             None, // complexity_tier
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -1945,15 +1982,17 @@ impl PgDb {
             None
         };
 
-        Ok(crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
-            task_run_id: task_run_id.to_string(),
-            task_prompt: prompt.unwrap_or_default(),
-            execution_plan: execution_steps,
-            outcome_summary: summary,
-            goal_achieved,
-            status,
-            execution_trace_summary,
-        })
+        Ok(
+            crate::meta_optimizer::agentic_metrics::llm_judge::LlmJudgeInput {
+                task_run_id: task_run_id.to_string(),
+                task_prompt: prompt.unwrap_or_default(),
+                execution_plan: execution_steps,
+                outcome_summary: summary,
+                goal_achieved,
+                status,
+                execution_trace_summary,
+            },
+        )
     }
 
     // ========================================================================
@@ -1974,7 +2013,10 @@ impl PgDb {
         }
 
         let mut lines = Vec::new();
-        lines.push(format!("## Error Monitor ({} unresolved errors)", errors.len()));
+        lines.push(format!(
+            "## Error Monitor ({} unresolved errors)",
+            errors.len()
+        ));
 
         for err in &errors {
             let severity = err["severity"].as_str().unwrap_or("unknown");
@@ -1985,7 +2027,13 @@ impl PgDb {
             if file.is_empty() {
                 lines.push(format!("- [{}] {}", severity.to_uppercase(), message));
             } else {
-                lines.push(format!("- [{}] {} ({}:{})", severity.to_uppercase(), message, file, line_num));
+                lines.push(format!(
+                    "- [{}] {} ({}:{})",
+                    severity.to_uppercase(),
+                    message,
+                    file,
+                    line_num
+                ));
             }
         }
 
@@ -2013,8 +2061,11 @@ impl PgDb {
             // Only qualifying fix types
             if !matches!(
                 fix.fix_type.as_str(),
-                "instruction_clarification" | "workflow_step_rewrite" | "prompt_refinement"
-                    | "verification_improvement" | "error_handling"
+                "instruction_clarification"
+                    | "workflow_step_rewrite"
+                    | "prompt_refinement"
+                    | "verification_improvement"
+                    | "error_handling"
             ) {
                 continue;
             }

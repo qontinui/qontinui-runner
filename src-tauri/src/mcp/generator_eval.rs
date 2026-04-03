@@ -160,7 +160,10 @@ async fn get_artifact_handler(
     Path(_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_FOUND, Json(api_error("Artifact not found (SQLite removed)"))))
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(api_error("Artifact not found (SQLite removed)")),
+    ))
 }
 
 async fn get_artifact_by_workflow_handler(
@@ -170,7 +173,9 @@ async fn get_artifact_by_workflow_handler(
     // checkpoint_db removed — generator eval not yet migrated to PG
     Err((
         StatusCode::NOT_FOUND,
-        Json(api_error("No artifact found for this workflow (SQLite removed)")),
+        Json(api_error(
+            "No artifact found for this workflow (SQLite removed)",
+        )),
     ))
 }
 
@@ -201,7 +206,12 @@ async fn create_benchmark_handler(
     Json(_body): Json<CreateBenchmarkRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Benchmarks: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Benchmarks: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 async fn get_benchmark_handler(
@@ -209,7 +219,10 @@ async fn get_benchmark_handler(
     Path(_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_FOUND, Json(api_error("Benchmark not found (SQLite removed)"))))
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(api_error("Benchmark not found (SQLite removed)")),
+    ))
 }
 
 async fn update_benchmark_handler(
@@ -218,7 +231,12 @@ async fn update_benchmark_handler(
     Json(_body): Json<BenchmarkUpdate>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Benchmarks: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Benchmarks: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 async fn delete_benchmark_handler(
@@ -226,7 +244,12 @@ async fn delete_benchmark_handler(
     Path(_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Benchmarks: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Benchmarks: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 async fn run_benchmark_handler(
@@ -234,7 +257,12 @@ async fn run_benchmark_handler(
     Path(_id): Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — benchmarks not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Benchmarks: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Benchmarks: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 async fn list_benchmark_results_handler(
@@ -255,7 +283,12 @@ async fn save_feedback_handler(
     Json(_body): Json<FeedbackRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator feedback not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Generator feedback: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Generator feedback: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 // ============================================================================
@@ -289,7 +322,12 @@ async fn import_benchmarks_handler(
     Json(_body): Json<ImportBenchmarksRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Benchmarks: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Benchmarks: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 // ============================================================================
@@ -309,7 +347,12 @@ async fn update_example_status_handler(
     Json(_body): Json<UpdateExampleStatusRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — generator eval not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Example status: SQLite removed, not yet migrated to PG"))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Example status: SQLite removed, not yet migrated to PG",
+        )),
+    ))
 }
 
 // ============================================================================

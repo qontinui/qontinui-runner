@@ -184,8 +184,7 @@ impl StepExecutor {
         if let Some(ref wf_profile) = self.workflow_security_profile {
             security_settings.default_profile = wf_profile.clone();
         }
-        let security_policy =
-            crate::security::PolicyEngine::resolve(None, &security_settings);
+        let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
         let audit_logger =
             crate::security::audit::AuditLogger::new(security_settings.audit_enabled);
 
@@ -217,8 +216,7 @@ impl StepExecutor {
                         .map(|s| s.as_str())
                         .collect()
                 };
-            let cred_proxy =
-                crate::security::credential_proxy::CredentialProxy::new(&cred_names);
+            let cred_proxy = crate::security::credential_proxy::CredentialProxy::new(&cred_names);
             ctx = ctx.with_credential_placeholders(cred_proxy.placeholder_env_vars());
             Some(cred_proxy)
         } else {
@@ -662,13 +660,18 @@ impl StepExecutor {
             if let Some(ref task_run_id) = self.task_run_id {
                 let sn_c = step_name.clone();
                 let idx_c = index as i32;
-                match self.app_state.pg_db.link_findings_to_steps_by_timestamp(
-                    task_run_id,
-                    &sn_c,
-                    idx_c,
-                    &started_at,
-                    &ended_at,
-                ).await {
+                match self
+                    .app_state
+                    .pg_db
+                    .link_findings_to_steps_by_timestamp(
+                        task_run_id,
+                        &sn_c,
+                        idx_c,
+                        &started_at,
+                        &ended_at,
+                    )
+                    .await
+                {
                     Ok(count) if count > 0 => {
                         info!(
                             "Linked {} findings to step '{}' (index {})",

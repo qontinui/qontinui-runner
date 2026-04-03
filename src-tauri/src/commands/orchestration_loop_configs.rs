@@ -5,9 +5,7 @@ use tauri::State;
 use tracing::info;
 
 use crate::commands::AppState;
-use crate::orchestration_loop_configs::{
-    CreateOlConfigRequest, OlConfig, UpdateOlConfigRequest,
-};
+use crate::orchestration_loop_configs::{CreateOlConfigRequest, OlConfig, UpdateOlConfigRequest};
 
 #[tauri::command]
 pub async fn ol_list_configs(app_state: State<'_, Arc<AppState>>) -> Result<Vec<OlConfig>, String> {

@@ -12,7 +12,11 @@ impl PgDb {
 
     /// List all log sources ordered by name.
     pub async fn list_log_sources(&self) -> Result<Vec<LogSourceConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -29,12 +33,19 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_log_sources: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::log_source_row_to_config(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::log_source_row_to_config(r))
+            .collect())
     }
 
     /// Get a single log source by ID.
     pub async fn get_log_source(&self, id: i64) -> Result<Option<LogSourceConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -56,7 +67,11 @@ impl PgDb {
 
     /// Create a new log source. Returns the assigned ID.
     pub async fn create_log_source(&self, config: &LogSourceConfig) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let error_patterns_json = config
             .error_patterns
@@ -107,7 +122,11 @@ impl PgDb {
 
     /// Update an existing log source by ID.
     pub async fn update_log_source(&self, id: i64, config: &LogSourceConfig) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let error_patterns_json = config
             .error_patterns
@@ -157,7 +176,11 @@ impl PgDb {
 
     /// Delete a log source by ID.
     pub async fn delete_log_source(&self, id: i64) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM log_sources WHERE id = $1", &[&id])
@@ -168,8 +191,15 @@ impl PgDb {
     }
 
     /// Get log sources filtered by enabled status.
-    pub async fn get_log_sources_enabled(&self, enabled_only: bool) -> Result<Vec<LogSourceConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_log_sources_enabled(
+        &self,
+        enabled_only: bool,
+    ) -> Result<Vec<LogSourceConfig>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if enabled_only {
             conn.query(
@@ -201,12 +231,19 @@ impl PgDb {
         }
         .map_err(|e| format!("PG get_log_sources_enabled: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::log_source_row_to_config(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::log_source_row_to_config(r))
+            .collect())
     }
 
     /// Delete a log source by name.
     pub async fn delete_log_source_by_name(&self, name: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM log_sources WHERE name = $1", &[&name])
             .await
             .map_err(|e| format!("PG delete_log_source_by_name: {}", e))?;
@@ -215,7 +252,11 @@ impl PgDb {
 
     /// Sync log sources: clear all and re-insert from provided list.
     pub async fn sync_log_sources(&self, sources: &[LogSourceConfig]) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM log_sources", &[])
             .await
             .map_err(|e| format!("PG clear log_sources: {}", e))?;
@@ -284,7 +325,9 @@ impl PgDb {
             format: LogFormat::from_str(&format_str).unwrap_or_default(),
             parser: ParserType::from_str(&parser_str).unwrap_or_default(),
             timestamp_pattern: row.get(7),
-            timezone: row.get::<_, Option<String>>(8).unwrap_or_else(|| "local".to_string()),
+            timezone: row
+                .get::<_, Option<String>>(8)
+                .unwrap_or_else(|| "local".to_string()),
             error_patterns: error_patterns_json.and_then(|s| serde_json::from_str(&s).ok()),
             warning_patterns: warning_patterns_json.and_then(|s| serde_json::from_str(&s).ok()),
             ignore_patterns: ignore_patterns_json.and_then(|s| serde_json::from_str(&s).ok()),

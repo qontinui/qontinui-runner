@@ -86,7 +86,9 @@ impl SelectionPolicy for EpsilonGreedy {
             let best = arms
                 .iter()
                 .max_by(|(_, a), (_, b)| {
-                    a.q_value.partial_cmp(&b.q_value).unwrap_or(std::cmp::Ordering::Equal)
+                    a.q_value
+                        .partial_cmp(&b.q_value)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
             (best.0.clone(), false)
@@ -159,7 +161,9 @@ impl SelectionPolicy for UCB1 {
             .max_by(|(_, a), (_, b)| {
                 let ucb_a = self.ucb_score(a.q_value, a.visit_count, total_visits);
                 let ucb_b = self.ucb_score(b.q_value, b.visit_count, total_visits);
-                ucb_a.partial_cmp(&ucb_b).unwrap_or(std::cmp::Ordering::Equal)
+                ucb_a
+                    .partial_cmp(&ucb_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap();
 
@@ -167,7 +171,9 @@ impl SelectionPolicy for UCB1 {
         let greedy = arms
             .iter()
             .max_by(|(_, a), (_, b)| {
-                a.q_value.partial_cmp(&b.q_value).unwrap_or(std::cmp::Ordering::Equal)
+                a.q_value
+                    .partial_cmp(&b.q_value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap();
 
@@ -368,8 +374,24 @@ mod tests {
     fn test_epsilon_greedy_always_exploit() {
         let mut policy = EpsilonGreedy::new(0.0, 0.0, 1.0); // No exploration
         let arms = vec![
-            ("a".to_string(), ArmStats { q_value: 0.3, visit_count: 10, sum_of_squares: 1.0, last_updated: chrono::Utc::now() }),
-            ("b".to_string(), ArmStats { q_value: 0.9, visit_count: 10, sum_of_squares: 8.0, last_updated: chrono::Utc::now() }),
+            (
+                "a".to_string(),
+                ArmStats {
+                    q_value: 0.3,
+                    visit_count: 10,
+                    sum_of_squares: 1.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
+            (
+                "b".to_string(),
+                ArmStats {
+                    q_value: 0.9,
+                    visit_count: 10,
+                    sum_of_squares: 8.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
         ];
         let (selected, is_explore) = policy.select(&arms);
         assert_eq!(selected, "b");
@@ -380,8 +402,24 @@ mod tests {
     fn test_ucb1_favors_unvisited() {
         let mut policy = UCB1::default_optimal();
         let arms = vec![
-            ("a".to_string(), ArmStats { q_value: 0.9, visit_count: 100, sum_of_squares: 80.0, last_updated: chrono::Utc::now() }),
-            ("b".to_string(), ArmStats { q_value: 0.1, visit_count: 0, sum_of_squares: 0.0, last_updated: chrono::Utc::now() }),
+            (
+                "a".to_string(),
+                ArmStats {
+                    q_value: 0.9,
+                    visit_count: 100,
+                    sum_of_squares: 80.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
+            (
+                "b".to_string(),
+                ArmStats {
+                    q_value: 0.1,
+                    visit_count: 0,
+                    sum_of_squares: 0.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
         ];
         let (selected, _) = policy.select(&arms);
         assert_eq!(selected, "b"); // Unvisited arm gets infinite UCB
@@ -391,8 +429,24 @@ mod tests {
     fn test_ucb1_converges_to_best() {
         let mut policy = UCB1::default_optimal();
         let arms = vec![
-            ("a".to_string(), ArmStats { q_value: 0.9, visit_count: 100, sum_of_squares: 80.0, last_updated: chrono::Utc::now() }),
-            ("b".to_string(), ArmStats { q_value: 0.3, visit_count: 100, sum_of_squares: 10.0, last_updated: chrono::Utc::now() }),
+            (
+                "a".to_string(),
+                ArmStats {
+                    q_value: 0.9,
+                    visit_count: 100,
+                    sum_of_squares: 80.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
+            (
+                "b".to_string(),
+                ArmStats {
+                    q_value: 0.3,
+                    visit_count: 100,
+                    sum_of_squares: 10.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
         ];
         let (selected, _) = policy.select(&arms);
         assert_eq!(selected, "a"); // With equal visits, best Q-value wins
@@ -403,8 +457,24 @@ mod tests {
         let mut policy = ThompsonSampling::new();
         // With very few visits, Thompson should be highly exploratory
         let arms = vec![
-            ("a".to_string(), ArmStats { q_value: 0.5, visit_count: 1, sum_of_squares: 0.25, last_updated: chrono::Utc::now() }),
-            ("b".to_string(), ArmStats { q_value: 0.5, visit_count: 1, sum_of_squares: 0.25, last_updated: chrono::Utc::now() }),
+            (
+                "a".to_string(),
+                ArmStats {
+                    q_value: 0.5,
+                    visit_count: 1,
+                    sum_of_squares: 0.25,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
+            (
+                "b".to_string(),
+                ArmStats {
+                    q_value: 0.5,
+                    visit_count: 1,
+                    sum_of_squares: 0.25,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
         ];
         // With equal stats and low data, both arms should get selected roughly equally
         let mut a_count = 0;
@@ -415,7 +485,11 @@ mod tests {
             }
         }
         // Should be roughly 50/50 (allow wide range due to randomness)
-        assert!(a_count > 20 && a_count < 80, "Expected ~50/50 split, got a={}", a_count);
+        assert!(
+            a_count > 20 && a_count < 80,
+            "Expected ~50/50 split, got a={}",
+            a_count
+        );
     }
 
     #[test]
@@ -423,8 +497,24 @@ mod tests {
         let mut policy = ThompsonSampling::new();
         // With lots of data, should converge to the better arm
         let arms = vec![
-            ("a".to_string(), ArmStats { q_value: 0.9, visit_count: 1000, sum_of_squares: 800.0, last_updated: chrono::Utc::now() }),
-            ("b".to_string(), ArmStats { q_value: 0.3, visit_count: 1000, sum_of_squares: 100.0, last_updated: chrono::Utc::now() }),
+            (
+                "a".to_string(),
+                ArmStats {
+                    q_value: 0.9,
+                    visit_count: 1000,
+                    sum_of_squares: 800.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
+            (
+                "b".to_string(),
+                ArmStats {
+                    q_value: 0.3,
+                    visit_count: 1000,
+                    sum_of_squares: 100.0,
+                    last_updated: chrono::Utc::now(),
+                },
+            ),
         ];
         let mut a_count = 0;
         for _ in 0..100 {
@@ -433,6 +523,10 @@ mod tests {
                 a_count += 1;
             }
         }
-        assert!(a_count > 90, "Expected strong preference for a, got a={}", a_count);
+        assert!(
+            a_count > 90,
+            "Expected strong preference for a, got a={}",
+            a_count
+        );
     }
 }

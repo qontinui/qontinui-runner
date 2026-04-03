@@ -105,10 +105,7 @@ mod tests {
     #[test]
     fn test_only_optional_steps_no_inflation() {
         // With only unmapped/optional steps, score should NOT inflate to 0.9+
-        let evals = vec![
-            make_eval(0.2, None),
-            make_eval(0.3, None),
-        ];
+        let evals = vec![make_eval(0.2, None), make_eval(0.3, None)];
         let score = aggregate_evaluation(&evals);
         // overall_min = 0.2, critical_min = 0.2 (fallback), important_min = 0.2 (fallback)
         // 0.2 * 0.6 + 0.2 * 0.3 + 0.2 * 0.1 = 0.12 + 0.06 + 0.02 = 0.20

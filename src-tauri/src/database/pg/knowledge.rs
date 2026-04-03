@@ -174,7 +174,11 @@ impl PgDb {
         category: Option<&str>,
         unresolved_only: bool,
     ) -> Result<Vec<crate::database::types::StoredTaskKnowledge>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
 
         // Build query dynamically based on filters
         let mut sql = String::from(
@@ -201,7 +205,10 @@ impl PgDb {
         }
         .map_err(|e| format!("PG list_task_knowledge: {e}"))?;
 
-        Ok(rows.iter().map(|r| Self::row_to_stored_knowledge(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::row_to_stored_knowledge(r))
+            .collect())
     }
 
     /// List reflection knowledge from previous runs of the same workflow.
@@ -216,7 +223,11 @@ impl PgDb {
             return Ok(Vec::new());
         }
 
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
 
         // Build IN clause with numbered params starting from $3
         let placeholders: Vec<String> = (0..categories.len())
@@ -257,7 +268,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_workflow_knowledge: {e}"))?;
 
-        Ok(rows.iter().map(|r| Self::row_to_stored_knowledge(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::row_to_stored_knowledge(r))
+            .collect())
     }
 
     /// Query project-scoped knowledge entries for a given project path.
@@ -267,7 +281,11 @@ impl PgDb {
         exclude_task_run_id: &str,
         limit: usize,
     ) -> Result<Vec<(String, String)>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
         let limit_i64 = limit as i64;
 
         let rows = conn
@@ -310,7 +328,11 @@ impl PgDb {
             return Ok(Vec::new());
         }
 
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
 
         // Build LIKE conditions: tr.workflow_name LIKE $3, $4, ...
         let like_conditions: Vec<String> = (0..keywords.len())
@@ -371,11 +393,21 @@ impl PgDb {
             return Ok(Vec::new());
         }
 
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
 
         // Build LIKE conditions for each keyword
         let conditions: Vec<String> = (0..keywords.len())
-            .map(|i| format!("(LOWER(content) LIKE ${} OR LOWER(category) LIKE ${})", i + 1, i + 1))
+            .map(|i| {
+                format!(
+                    "(LOWER(content) LIKE ${} OR LOWER(category) LIKE ${})",
+                    i + 1,
+                    i + 1
+                )
+            })
             .collect();
         let where_clause = conditions.join(" AND ");
         let limit_idx = keywords.len() + 1;
@@ -389,7 +421,10 @@ impl PgDb {
             where_clause, limit_idx
         );
 
-        let like_patterns: Vec<String> = keywords.iter().map(|k| format!("%{}%", k.to_lowercase())).collect();
+        let like_patterns: Vec<String> = keywords
+            .iter()
+            .map(|k| format!("%{}%", k.to_lowercase()))
+            .collect();
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
         for pattern in &like_patterns {
             params.push(pattern);
@@ -417,7 +452,9 @@ impl PgDb {
     }
 
     /// Helper: convert a PG row to StoredTaskKnowledge.
-    fn row_to_stored_knowledge(row: &tokio_postgres::Row) -> crate::database::types::StoredTaskKnowledge {
+    fn row_to_stored_knowledge(
+        row: &tokio_postgres::Row,
+    ) -> crate::database::types::StoredTaskKnowledge {
         let related_files_str: Option<String> = row.get(8);
         crate::database::types::StoredTaskKnowledge {
             id: row.get(0),
@@ -446,7 +483,11 @@ impl PgDb {
         categories: &[&str],
         limit: i64,
     ) -> Result<Vec<(String, String)>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool error: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
 
         // Build IN clause dynamically
         let placeholders: Vec<String> = categories
@@ -463,17 +504,25 @@ impl PgDb {
         );
 
         let params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            std::iter::once(Box::new(task_run_id.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>)
-                .chain(categories.iter().map(|c| Box::new(c.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>))
-                .collect();
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+            std::iter::once(Box::new(task_run_id.to_string())
+                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>)
+            .chain(categories.iter().map(|c| {
+                Box::new(c.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }))
+            .collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &param_refs)
             .await
             .map_err(|e| format!("PG get_task_knowledge_by_categories: {e}"))?;
 
-        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
     }
 }

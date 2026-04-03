@@ -267,10 +267,7 @@ pub fn evaluate_workflow(
     prm_base_url: Option<&str>,
 ) -> WorkflowEvaluation {
     let start = Instant::now();
-    info!(
-        "Starting workflow evaluation with strategy {:?}",
-        strategy
-    );
+    info!("Starting workflow evaluation with strategy {:?}", strategy);
 
     // Collect all verification steps from top-level + stages
     let mut all_steps: Vec<&Value> = Vec::new();
@@ -302,7 +299,10 @@ pub fn evaluate_workflow(
             .to_string();
 
         if step_id.is_empty() {
-            info!("Skipping verification step with empty ID (name='{}')", step_name);
+            info!(
+                "Skipping verification step with empty ID (name='{}')",
+                step_name
+            );
             continue;
         }
 
@@ -324,9 +324,7 @@ pub fn evaluate_workflow(
 
                 let judge_context = judges::JudgeContext {
                     workflow_description: workflow.description.clone(),
-                    all_criteria: criteria
-                        .map(|c| c.criteria.clone())
-                        .unwrap_or_default(),
+                    all_criteria: criteria.map(|c| c.criteria.clone()).unwrap_or_default(),
                     project_context: None,
                 };
 
@@ -341,9 +339,7 @@ pub fn evaluate_workflow(
 
                 // Merge: prefer judge scores over deterministic for overlapping dimensions
                 for js in judge_scores {
-                    if let Some(existing) = scores
-                        .iter_mut()
-                        .find(|s| s.dimension == js.dimension)
+                    if let Some(existing) = scores.iter_mut().find(|s| s.dimension == js.dimension)
                     {
                         // Keep the judge score if it has higher confidence
                         if js.confidence > existing.confidence {
@@ -395,10 +391,7 @@ pub fn evaluate_workflow(
     }
 
     // Build semantic coverage matrix
-    let coverage_matrix = coverage::build_semantic_coverage_matrix(
-        &step_evaluations,
-        criteria,
-    );
+    let coverage_matrix = coverage::build_semantic_coverage_matrix(&step_evaluations, criteria);
 
     // Compute overall score via PURE min-form aggregation
     let overall_score = aggregation::aggregate_evaluation(&step_evaluations);
@@ -470,11 +463,17 @@ fn generate_flags_from_scores(
 ) -> Vec<EvaluationFlag> {
     let mut flags = Vec::new();
 
-    if let Some(ds) = scores.iter().find(|s| s.dimension == EvaluationDimension::Executability) {
+    if let Some(ds) = scores
+        .iter()
+        .find(|s| s.dimension == EvaluationDimension::Executability)
+    {
         if ds.score < 0.3 {
             flags.push(EvaluationFlag {
                 flag_type: EvaluationFlagType::Unexecutable,
-                message: ds.explanation.clone().unwrap_or_else(|| "Step may not be executable".into()),
+                message: ds
+                    .explanation
+                    .clone()
+                    .unwrap_or_else(|| "Step may not be executable".into()),
                 step_id: Some(step_id.to_string()),
             });
         }
@@ -487,7 +486,10 @@ fn generate_flags_from_scores(
         }
     }
 
-    if let Some(ds) = scores.iter().find(|s| s.dimension == EvaluationDimension::Determinism) {
+    if let Some(ds) = scores
+        .iter()
+        .find(|s| s.dimension == EvaluationDimension::Determinism)
+    {
         if ds.score == 0.0 {
             flags.push(EvaluationFlag {
                 flag_type: EvaluationFlagType::NonDeterministic,
@@ -497,22 +499,34 @@ fn generate_flags_from_scores(
         }
     }
 
-    if let Some(ds) = scores.iter().find(|s| s.dimension == EvaluationDimension::Specificity) {
+    if let Some(ds) = scores
+        .iter()
+        .find(|s| s.dimension == EvaluationDimension::Specificity)
+    {
         if ds.score < 0.3 {
             flags.push(EvaluationFlag {
                 flag_type: EvaluationFlagType::FalsePositive,
-                message: ds.explanation.clone().unwrap_or_else(|| "Step may frequently false-positive".into()),
+                message: ds
+                    .explanation
+                    .clone()
+                    .unwrap_or_else(|| "Step may frequently false-positive".into()),
                 step_id: Some(step_id.to_string()),
             });
         }
     }
 
     // Only flag NoEntailment when the dimension was actually scored
-    if let Some(ds) = scores.iter().find(|s| s.dimension == EvaluationDimension::Entailment) {
+    if let Some(ds) = scores
+        .iter()
+        .find(|s| s.dimension == EvaluationDimension::Entailment)
+    {
         if ds.score < 0.2 && criterion_id.is_some() {
             flags.push(EvaluationFlag {
                 flag_type: EvaluationFlagType::NoEntailment,
-                message: format!("Step has very low entailment ({:.2}) with mapped criterion", ds.score),
+                message: format!(
+                    "Step has very low entailment ({:.2}) with mapped criterion",
+                    ds.score
+                ),
                 step_id: Some(step_id.to_string()),
             });
         }
@@ -528,10 +542,11 @@ pub fn generate_repair_guidance(evaluation: &WorkflowEvaluation) -> Vec<RepairIn
         .iter()
         .filter(|e| e.min_score < 0.5)
         .filter_map(|e| {
-            let weakest = e
-                .scores
-                .iter()
-                .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))?;
+            let weakest = e.scores.iter().min_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
 
             Some(RepairInstruction {
                 step_id: e.step_id.clone(),
@@ -611,7 +626,11 @@ fn run_quality_gate(
                 }
             }
         }
-        if eval.flags.iter().any(|f| f.flag_type == EvaluationFlagType::Unexecutable) {
+        if eval
+            .flags
+            .iter()
+            .any(|f| f.flag_type == EvaluationFlagType::Unexecutable)
+        {
             minimum_passed = false;
             failures.push(QualityGateFailure {
                 gate_level: QualityGateLevel::Minimum,
@@ -698,10 +717,7 @@ fn run_quality_gate(
                 strict_passed = false;
                 failures.push(QualityGateFailure {
                     gate_level: QualityGateLevel::Strict,
-                    reason: format!(
-                        "{:?} score below 0.7: {:.2}",
-                        ds.dimension, ds.score
-                    ),
+                    reason: format!("{:?} score below 0.7: {:.2}", ds.dimension, ds.score),
                     step_id: Some(eval.step_id.clone()),
                     criterion_id: eval.criterion_id.clone(),
                 });
@@ -732,10 +748,7 @@ fn generate_fix_suggestion(score: &DimensionScore) -> String {
             } else {
                 score.evidence.join(", ")
             };
-            format!(
-                "Step doesn't test criterion. Gaps: {}",
-                gaps
-            )
+            format!("Step doesn't test criterion. Gaps: {}", gaps)
         }
         EvaluationDimension::Specificity => {
             "Add more specific pattern matching to avoid false positives".into()

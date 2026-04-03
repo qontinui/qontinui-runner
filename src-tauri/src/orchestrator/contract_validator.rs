@@ -174,34 +174,20 @@ impl ContractValidator {
 #[derive(Debug, Clone)]
 pub enum ContractValidationError {
     /// The JSON did not conform to the agent's output schema.
-    SchemaViolation {
-        role: String,
-        errors: String,
-    },
+    SchemaViolation { role: String, errors: String },
     /// The JSON was schema-valid but could not be deserialized into the Rust type.
     /// This typically indicates a mismatch between the JsonSchema derive and serde.
-    DeserializationFailed {
-        role: String,
-        error: String,
-    },
+    DeserializationFailed { role: String, error: String },
 }
 
 impl std::fmt::Display for ContractValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SchemaViolation { role, errors } => {
-                write!(
-                    f,
-                    "Contract validation failed for {}: {}",
-                    role, errors
-                )
+                write!(f, "Contract validation failed for {}: {}", role, errors)
             }
             Self::DeserializationFailed { role, error } => {
-                write!(
-                    f,
-                    "Contract deserialization failed for {}: {}",
-                    role, error
-                )
+                write!(f, "Contract deserialization failed for {}: {}", role, error)
             }
         }
     }
@@ -237,7 +223,11 @@ mod tests {
             "complexity_rationale": ""
         });
         let result = validator.validate_output("spec_analyst", &data);
-        assert!(result.valid, "Expected valid, got: {}", result.error_summary());
+        assert!(
+            result.valid,
+            "Expected valid, got: {}",
+            result.error_summary()
+        );
     }
 
     #[test]
@@ -267,7 +257,11 @@ mod tests {
             "fail_count": 0
         });
         let result = validator.validate_output("verifier", &data);
-        assert!(result.valid, "Expected valid, got: {}", result.error_summary());
+        assert!(
+            result.valid,
+            "Expected valid, got: {}",
+            result.error_summary()
+        );
     }
 
     #[test]
@@ -292,7 +286,10 @@ mod tests {
         let err = validator
             .validate_and_parse::<VerifierOutput>("verifier", &data)
             .unwrap_err();
-        assert!(matches!(err, ContractValidationError::SchemaViolation { .. }));
+        assert!(matches!(
+            err,
+            ContractValidationError::SchemaViolation { .. }
+        ));
     }
 
     #[test]

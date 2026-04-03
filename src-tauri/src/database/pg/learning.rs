@@ -5,11 +5,19 @@
 use super::PgDb;
 
 fn non_empty(s: &str) -> Option<String> {
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 fn json_opt(s: &str) -> Option<serde_json::Value> {
-    if s.is_empty() { None } else { serde_json::from_str(s).ok() }
+    if s.is_empty() {
+        None
+    } else {
+        serde_json::from_str(s).ok()
+    }
 }
 
 impl PgDb {
@@ -38,7 +46,11 @@ impl PgDb {
         domain_tags: Option<&str>,
         complexity_tier: Option<&str>,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let result_id = qontinui_db::queries::learning::record_learning_outcome()
             .bind(
                 &conn,
@@ -77,7 +89,11 @@ impl PgDb {
         task_id: &str,
         model_used: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE learning_outcomes SET model_used = $2 WHERE task_id = $1 AND model_used IS NULL",
             &[&task_id, &model_used],
@@ -92,7 +108,11 @@ impl PgDb {
         &self,
         limit: Option<u32>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let max_results = limit.unwrap_or(100) as i64;
 
         let rows = qontinui_db::queries::learning::get_learning_outcomes()
@@ -140,9 +160,21 @@ impl PgDb {
         occurrences: i32,
         context: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::learning::save_learning_pattern()
-            .bind(&conn, &id, &pattern_type, &description, &confidence, &occurrences, &context)
+            .bind(
+                &conn,
+                &id,
+                &pattern_type,
+                &description,
+                &confidence,
+                &occurrences,
+                &context,
+            )
             .one()
             .await
             .map_err(|e| format!("PG save_learning_pattern: {}", e))?;
@@ -151,30 +183,41 @@ impl PgDb {
 
     /// Get all learning patterns.
     pub async fn get_learning_patterns(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::learning::get_learning_patterns()
             .bind(&conn)
             .all()
             .await
             .map_err(|e| format!("PG get_learning_patterns: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "pattern_type": r.pattern_type,
-                "description": r.description,
-                "confidence": r.confidence,
-                "occurrences": r.occurrences,
-                "context": json_opt(&r.context),
-                "created_at": r.created_at.to_rfc3339(),
-                "updated_at": r.updated_at.to_rfc3339(),
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "pattern_type": r.pattern_type,
+                    "description": r.description,
+                    "confidence": r.confidence,
+                    "occurrences": r.occurrences,
+                    "context": json_opt(&r.context),
+                    "created_at": r.created_at.to_rfc3339(),
+                    "updated_at": r.updated_at.to_rfc3339(),
+                })
             })
-        }).collect())
+            .collect())
     }
 
     /// Get learning outcomes count.
     pub async fn get_learning_outcomes_count(&self) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let count = qontinui_db::queries::learning::get_learning_outcomes_count()
             .bind(&conn)
             .one()
@@ -191,7 +234,11 @@ impl PgDb {
         since: Option<&str>,
         limit: Option<i64>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_val = limit.unwrap_or(100);
 
         // Build dynamic WHERE clause
@@ -246,8 +293,10 @@ impl PgDb {
         }
         params.push(Box::new(limit_val));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&query, &param_refs)
@@ -295,7 +344,11 @@ impl PgDb {
 
     /// Get learning stats summary.
     pub async fn get_learning_stats_summary(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::learning::get_learning_stats_summary()
             .bind(&conn)
             .one()
@@ -322,7 +375,11 @@ impl PgDb {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -381,7 +438,11 @@ impl PgDb {
         start: &str,
         end: &str,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Parse the date strings into timestamps for PG comparison
         let start_ts = start.to_string();
@@ -456,7 +517,11 @@ impl PgDb {
 
     /// Get composite agentic score for a task run.
     pub async fn get_composite_agentic_score(&self, task_id: &str) -> Result<f64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(

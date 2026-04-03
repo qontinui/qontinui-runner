@@ -53,12 +53,7 @@ impl UrlLockManager {
     /// When a `db` reference is provided, periodically checks whether the
     /// holding task is still running and cleans up stale locks automatically.
     /// This prevents indefinite hangs when `release_all_sync()` fails.
-    pub async fn acquire(
-        &self,
-        url: &str,
-        task_run_id: &str,
-        holder_name: &str,
-    ) {
+    pub async fn acquire(&self, url: &str, task_run_id: &str, holder_name: &str) {
         // SQLite removed - no-op
     }
 

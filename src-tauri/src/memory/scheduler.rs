@@ -9,8 +9,8 @@ use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
-use crate::database::pg::PgDb;
 use super::consolidation::{self, ConsolidationConfig};
+use crate::database::pg::PgDb;
 
 /// Configuration for the memory consolidation scheduler.
 pub struct MemorySchedulerConfig {

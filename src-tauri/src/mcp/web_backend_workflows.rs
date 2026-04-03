@@ -248,9 +248,7 @@ impl WebBackendWorkflowClient {
 
 /// Sync all workflows from the web backend to local SQLite cache.
 /// Called on startup and periodically.
-pub async fn sync_workflows_from_backend(
-    db: &crate::database::pg::PgDb,
-) -> Result<usize, String> {
+pub async fn sync_workflows_from_backend(db: &crate::database::pg::PgDb) -> Result<usize, String> {
     let client = WebBackendWorkflowClient::new();
 
     let workflows = match client.fetch_all_workflows().await {
@@ -391,10 +389,7 @@ pub async fn sync_workflows_from_backend(
 }
 
 /// Push locally-created/modified workflows to the web backend.
-async fn push_pending_workflows(
-    db: &crate::database::pg::PgDb,
-    client: &WebBackendWorkflowClient,
-) {
+async fn push_pending_workflows(db: &crate::database::pg::PgDb, client: &WebBackendWorkflowClient) {
     let pending = match db.get_pending_sync_workflows().await {
         Ok(w) => w,
         Err(e) => {

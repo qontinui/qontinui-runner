@@ -258,17 +258,12 @@ pub fn evaluate_rag_sync(input: &RagJudgeInput) -> Vec<MetricResult> {
 /// Store a retrieval event as a task_run_event for post-hoc RAG evaluation.
 ///
 /// Uses event_type='retrieval' so they can be queried later by the RAG judge.
-pub fn persist_retrieval_event(
-    task_run_id: &str,
-    event: &RetrievalEvent,
-) -> Result<(), String> {
+pub fn persist_retrieval_event(task_run_id: &str, event: &RetrievalEvent) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Load retrieval events for a task run (for RAG judge input).
-pub fn load_retrieval_events(
-    task_run_id: &str,
-) -> Result<Vec<RetrievalEvent>, String> {
+pub fn load_retrieval_events(task_run_id: &str) -> Result<Vec<RetrievalEvent>, String> {
     Err("SQLite removed".to_string())
 }
 

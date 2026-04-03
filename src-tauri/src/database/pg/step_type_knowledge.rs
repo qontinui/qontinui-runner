@@ -22,7 +22,11 @@ impl PgDb {
             return Ok(vec![]);
         }
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Build IN clause with positional parameters
         let placeholders: Vec<String> = (1..=step_types.len()).map(|i| format!("${}", i)).collect();
@@ -36,8 +40,10 @@ impl PgDb {
             placeholders.join(", ")
         );
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            step_types.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = step_types
+            .iter()
+            .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &params)
@@ -52,7 +58,11 @@ impl PgDb {
         &self,
         query: &ListKnowledgeQuery,
     ) -> Result<Vec<StepTypeKnowledge>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             "SELECT id, step_type, layer, title, content, priority, status, provenance, source_fix_id, created_at, updated_at
@@ -74,8 +84,10 @@ impl PgDb {
         }
         sql.push_str(" ORDER BY step_type, priority DESC");
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            param_values.iter().map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
+            .iter()
+            .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &params)
@@ -86,8 +98,15 @@ impl PgDb {
     }
 
     /// Get a single knowledge entry by ID.
-    pub async fn get_step_type_knowledge(&self, id: &str) -> Result<Option<StepTypeKnowledge>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_step_type_knowledge(
+        &self,
+        id: &str,
+    ) -> Result<Option<StepTypeKnowledge>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -106,7 +125,11 @@ impl PgDb {
         &self,
         input: &InsertKnowledgeInput,
     ) -> Result<StepTypeKnowledge, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Dedup guard
         if let Some(ref fix_id) = input.source_fix_id {
@@ -169,7 +192,11 @@ impl PgDb {
         id: &str,
         input: &UpdateKnowledgeInput,
     ) -> Result<StepTypeKnowledge, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let mut sets = vec!["updated_at = $1".to_string()];
@@ -210,8 +237,10 @@ impl PgDb {
         );
         param_values.push(Box::new(id.to_string()));
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            param_values.iter().map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
+            .iter()
+            .map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         conn.execute(&sql, &params)
             .await
@@ -224,7 +253,11 @@ impl PgDb {
 
     /// Delete a knowledge entry by ID.
     pub async fn delete_step_type_knowledge(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM step_type_knowledge WHERE id = $1", &[&id])

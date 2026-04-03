@@ -474,10 +474,7 @@ mod tests {
     fn test_reward_computation() {
         // Basic: no cost, no cache savings
         assert_eq!(PhaseModelRouter::compute_reward(0.8, None, None), 0.8);
-        assert_eq!(
-            PhaseModelRouter::compute_reward(0.8, Some(0.0), None),
-            0.8
-        );
+        assert_eq!(PhaseModelRouter::compute_reward(0.8, Some(0.0), None), 0.8);
 
         // With cost penalty: 0.8 - 0.01 * 5.0 = 0.75
         let reward = PhaseModelRouter::compute_reward(0.8, Some(5.0), None);
@@ -647,7 +644,10 @@ mod tests {
         router.update(&state, "setup", &ModelTier::Medium, 0.4);
         router.update(&state, "setup", &ModelTier::Complex, 0.3);
 
-        assert_eq!(router.greedy_tier(&state, "verification"), ModelTier::Complex);
+        assert_eq!(
+            router.greedy_tier(&state, "verification"),
+            ModelTier::Complex
+        );
         assert_eq!(router.greedy_tier(&state, "setup"), ModelTier::Simple);
     }
 }

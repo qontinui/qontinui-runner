@@ -41,11 +41,15 @@ pub async fn get_token_usage_summary(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let summary = state.app_state.pg_db.get_token_usage_summary(days).await
-    .map_err(|e| {
-        error!("Failed to get token usage summary: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let summary = state
+        .app_state
+        .pg_db
+        .get_token_usage_summary(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get token usage summary: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -61,11 +65,15 @@ pub async fn get_daily_cost(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state.app_state.pg_db.get_daily_cost(days).await
-    .map_err(|e| {
-        error!("Failed to get daily cost: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_daily_cost(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get daily cost: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -82,11 +90,15 @@ pub async fn get_cost_by_model(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state.app_state.pg_db.get_cost_by_model(days).await
-    .map_err(|e| {
-        error!("Failed to get cost by model: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_cost_by_model(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get cost by model: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -103,11 +115,15 @@ pub async fn get_cost_by_phase(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state.app_state.pg_db.get_cost_by_phase(days).await
-    .map_err(|e| {
-        error!("Failed to get cost by phase: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_cost_by_phase(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get cost by phase: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -124,11 +140,15 @@ pub async fn get_provider_latency(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state.app_state.pg_db.get_provider_latency(days).await
-    .map_err(|e| {
-        error!("Failed to get provider latency: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_provider_latency(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get provider latency: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -146,11 +166,15 @@ pub async fn get_task_run_costs(
     let days = params.days.unwrap_or(7);
     let limit = params.limit.unwrap_or(50);
 
-    let rows = state.app_state.pg_db.get_task_run_costs(days, limit).await
-    .map_err(|e| {
-        error!("Failed to get task run costs: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_task_run_costs(days, limit)
+        .await
+        .map_err(|e| {
+            error!("Failed to get task run costs: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -172,11 +196,15 @@ pub async fn get_cost_by_target_app(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state.app_state.pg_db.get_cost_by_target_app(days).await
-    .map_err(|e| {
-        error!("Failed to get cost by target app: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_cost_by_target_app(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get cost by target app: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -193,11 +221,15 @@ pub async fn get_cost_by_target_page(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let days = params.days.unwrap_or(7);
 
-    let rows = state.app_state.pg_db.get_cost_by_target_page(days).await
-    .map_err(|e| {
-        error!("Failed to get cost by target page: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let rows = state
+        .app_state
+        .pg_db
+        .get_cost_by_target_page(days)
+        .await
+        .map_err(|e| {
+            error!("Failed to get cost by target page: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -215,7 +247,9 @@ pub async fn get_cost_per_interaction(
     // checkpoint_db removed — token analytics not yet migrated to PG
     let days = params.days.unwrap_or(7);
     let rows: Vec<serde_json::Value> = vec![];
-    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 }),
+    ))
 }
 
 /// GET /analytics/token-usage/page-complexity
@@ -226,7 +260,9 @@ pub async fn get_page_complexity(
     // checkpoint_db removed — token analytics not yet migrated to PG
     let days = params.days.unwrap_or(7);
     let rows: Vec<serde_json::Value> = vec![];
-    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 }),
+    ))
 }
 
 /// GET /analytics/token-usage/model-action-matrix
@@ -237,7 +273,9 @@ pub async fn get_model_action_matrix(
     // checkpoint_db removed — token analytics not yet migrated to PG
     let days = params.days.unwrap_or(7);
     let rows: Vec<serde_json::Value> = vec![];
-    Ok(Json(serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "data": rows, "days": days, "count": 0 }),
+    ))
 }
 
 pub fn routes() -> Router<Arc<ApiState>> {
@@ -253,10 +291,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/analytics/token-usage/by-provider",
             get(get_provider_latency),
         )
-        .route(
-            "/analytics/token-usage/task-runs",
-            get(get_task_run_costs),
-        )
+        .route("/analytics/token-usage/task-runs", get(get_task_run_costs))
         .route(
             "/analytics/token-usage/by-target-app",
             get(get_cost_by_target_app),

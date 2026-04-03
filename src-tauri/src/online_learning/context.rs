@@ -65,7 +65,10 @@ impl ContextEncoder for ModelRoutingEncoder {
         let complexity = normalize_complexity(&input.complexity_tier);
         let ui = if input.has_ui { "ui" } else { "no_ui" };
 
-        format!("{}:{}:{}:{}:{}", prompt_bucket, file_bucket, complexity, domain, ui)
+        format!(
+            "{}:{}:{}:{}:{}",
+            prompt_bucket, file_bucket, complexity, domain, ui
+        )
     }
 }
 
@@ -101,7 +104,10 @@ fn normalize_domain(domain: &str) -> &'static str {
         "database"
     } else if lower.contains("testing") {
         "testing"
-    } else if lower.contains("infra") || lower.contains("orchestration") || lower.contains("meta-optimizer") {
+    } else if lower.contains("infra")
+        || lower.contains("orchestration")
+        || lower.contains("meta-optimizer")
+    {
         "infra"
     } else if lower.contains("backend") || lower.contains("api") {
         "backend"

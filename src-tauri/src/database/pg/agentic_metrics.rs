@@ -196,7 +196,12 @@ impl PgDb {
         conn.execute(
             r#"INSERT INTO task_run_events (id, task_run_id, event_type, event_subtype, data)
                VALUES ($1, $2, 'retrieval', $3, $4)"#,
-            &[&id.as_str(), &task_run_id, &event.source_table.as_str(), &data_json.as_str()],
+            &[
+                &id.as_str(),
+                &task_run_id,
+                &event.source_table.as_str(),
+                &data_json.as_str(),
+            ],
         )
         .await
         .map_err(|e| format!("PG persist_retrieval_event: {}", e))?;
@@ -208,7 +213,8 @@ impl PgDb {
     pub async fn load_retrieval_events(
         &self,
         task_run_id: &str,
-    ) -> Result<Vec<crate::meta_optimizer::agentic_metrics::rag_judge::RetrievalEvent>, String> {
+    ) -> Result<Vec<crate::meta_optimizer::agentic_metrics::rag_judge::RetrievalEvent>, String>
+    {
         let conn = self
             .pool()
             .get()

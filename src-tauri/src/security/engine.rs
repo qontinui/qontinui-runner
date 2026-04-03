@@ -41,7 +41,11 @@ use serde::{Deserialize, Serialize};
 
 impl fmt::Display for PolicyDenial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{:?}] {}: {}", self.denial_type, self.action, self.reason)
+        write!(
+            f,
+            "[{:?}] {}: {}",
+            self.denial_type, self.action, self.reason
+        )
     }
 }
 
@@ -198,7 +202,10 @@ impl PolicyEngine {
 
         // Check protocol restrictions
         if !np.allowed_protocols.is_empty()
-            && !np.allowed_protocols.iter().any(|p| p.eq_ignore_ascii_case(protocol))
+            && !np
+                .allowed_protocols
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(protocol))
         {
             return Err(PolicyDenial {
                 denial_type: DenialType::ProtocolDenied,
@@ -289,8 +296,7 @@ impl PolicyEngine {
                 return Err(PolicyDenial {
                     denial_type: DenialType::FilesystemDenied,
                     action: path.to_string(),
-                    reason: "Read access denied: path is not in any allowed paths list"
-                        .to_string(),
+                    reason: "Read access denied: path is not in any allowed paths list".to_string(),
                 });
             }
         }
@@ -347,10 +353,7 @@ static DESTRUCTIVE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\bkillall\b",
         r"\bpkill\s+-9\b",
     ];
-    patterns
-        .iter()
-        .filter_map(|p| Regex::new(p).ok())
-        .collect()
+    patterns.iter().filter_map(|p| Regex::new(p).ok()).collect()
 });
 
 /// Cache for compiled blocked_commands regexes (keyed by pattern string).
@@ -384,9 +387,9 @@ fn is_destructive_command(command: &str) -> bool {
 /// Check if a domain is a cloud metadata endpoint.
 fn is_metadata_endpoint(domain: &str) -> bool {
     let metadata_addresses = [
-        "169.254.169.254",       // AWS/GCP/Azure metadata
-        "169.254.170.2",         // AWS ECS task metadata
-        "fd00:ec2::254",         // AWS IPv6 metadata
+        "169.254.169.254", // AWS/GCP/Azure metadata
+        "169.254.170.2",   // AWS ECS task metadata
+        "fd00:ec2::254",   // AWS IPv6 metadata
         "metadata.google.internal",
         "metadata.goog",
     ];
@@ -647,10 +650,7 @@ mod tests {
         let policy = SecurityPolicy {
             network: NetworkPolicy {
                 mode: NetworkMode::AllowList,
-                allowed_domains: vec![
-                    "api.anthropic.com".to_string(),
-                    "*.openai.com".to_string(),
-                ],
+                allowed_domains: vec!["api.anthropic.com".to_string(), "*.openai.com".to_string()],
                 ..NetworkPolicy::default()
             },
             ..SecurityPolicy::default()
@@ -740,11 +740,26 @@ mod tests {
 
     #[test]
     fn test_domain_wildcard_matching() {
-        assert!(domain_matches_list("api.openai.com", &["*.openai.com".to_string()]));
-        assert!(domain_matches_list("openai.com", &["*.openai.com".to_string()]));
-        assert!(!domain_matches_list("notopenai.com", &["*.openai.com".to_string()]));
-        assert!(domain_matches_list("api.anthropic.com", &["api.anthropic.com".to_string()]));
-        assert!(!domain_matches_list("evil.anthropic.com", &["api.anthropic.com".to_string()]));
+        assert!(domain_matches_list(
+            "api.openai.com",
+            &["*.openai.com".to_string()]
+        ));
+        assert!(domain_matches_list(
+            "openai.com",
+            &["*.openai.com".to_string()]
+        ));
+        assert!(!domain_matches_list(
+            "notopenai.com",
+            &["*.openai.com".to_string()]
+        ));
+        assert!(domain_matches_list(
+            "api.anthropic.com",
+            &["api.anthropic.com".to_string()]
+        ));
+        assert!(!domain_matches_list(
+            "evil.anthropic.com",
+            &["api.anthropic.com".to_string()]
+        ));
     }
 
     #[test]
@@ -766,7 +781,10 @@ mod tests {
     #[test]
     fn test_glob_matches_nested_wildcards() {
         assert!(glob_matches("/home/*/.ssh/**", "/home/user/.ssh/id_rsa"));
-        assert!(glob_matches("/home/*/.ssh/**", "/home/admin/.ssh/authorized_keys"));
+        assert!(glob_matches(
+            "/home/*/.ssh/**",
+            "/home/admin/.ssh/authorized_keys"
+        ));
         assert!(glob_matches("/home/*/.ssh/**", "/home/user/.ssh/config"));
         assert!(!glob_matches("/home/*/.ssh/**", "/home/user/.bashrc"));
         assert!(!glob_matches("/home/*/.ssh/**", "/root/.ssh/id_rsa"));

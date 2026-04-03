@@ -78,7 +78,10 @@ impl ContentFilter {
         for pattern in &self.pii_patterns {
             let matches: Vec<_> = pattern.regex.find_iter(&result).collect();
             total_matches += matches.len();
-            result = pattern.regex.replace_all(&result, pattern.replacement).to_string();
+            result = pattern
+                .regex
+                .replace_all(&result, pattern.replacement)
+                .to_string();
         }
 
         FilterResult {
@@ -88,12 +91,7 @@ impl ContentFilter {
     }
 
     /// Convenience: scrub text and return None if the window should be skipped.
-    pub fn filter(
-        &self,
-        text: &str,
-        app_name: &str,
-        window_title: &str,
-    ) -> Option<FilterResult> {
+    pub fn filter(&self, text: &str, app_name: &str, window_title: &str) -> Option<FilterResult> {
         if self.should_skip(app_name, window_title) {
             return None;
         }

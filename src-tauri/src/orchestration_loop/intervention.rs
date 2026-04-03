@@ -52,10 +52,7 @@ pub fn build_intervention_prompt(pattern: &StallPattern, recent_actions: &[Strin
 }
 
 /// Parse the AI response into a StallIntervention.
-pub fn parse_intervention_response(
-    pattern: &StallPattern,
-    response: &str,
-) -> StallIntervention {
+pub fn parse_intervention_response(pattern: &StallPattern, response: &str) -> StallIntervention {
     // Try to parse JSON from response
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response) {
         let strategy = parsed
@@ -173,7 +170,10 @@ mod tests {
         let pattern = test_pattern();
         let response = r#"{"strategy": "Try a different selector", "action": "retry_alternative"}"#;
         let intervention = parse_intervention_response(&pattern, response);
-        assert_eq!(intervention.alternative_strategy, "Try a different selector");
+        assert_eq!(
+            intervention.alternative_strategy,
+            "Try a different selector"
+        );
         match intervention.suggested_action {
             InterventionAction::RetryWithAlternativePrompt(s) => {
                 assert_eq!(s, "Try a different selector");

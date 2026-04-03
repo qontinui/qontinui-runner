@@ -118,15 +118,18 @@ impl StepHandler for ShellCommandHandler {
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
 
         // Enforce security policy: evaluate command against action policy
-        if let Err(denial) = crate::security::PolicyEngine::evaluate_command(
-            &context.security_policy,
-            &command,
-        ) {
+        if let Err(denial) =
+            crate::security::PolicyEngine::evaluate_command(&context.security_policy, &command)
+        {
             warn!(
                 "Shell command '{}' blocked by security policy: {}",
                 step_name, denial
             );
-            context.audit_logger.log_denial(&denial, context.task_run_id.as_deref(), Some(step_name));
+            context.audit_logger.log_denial(
+                &denial,
+                context.task_run_id.as_deref(),
+                Some(step_name),
+            );
             return StepHandlerResult::failure(format!(
                 "Security policy violation: {}",
                 denial.reason
@@ -164,7 +167,11 @@ impl StepHandler for ShellCommandHandler {
                     "Shell command '{}' working directory blocked by security policy: {}",
                     step_name, denial
                 );
-                context.audit_logger.log_denial(&denial, context.task_run_id.as_deref(), Some(step_name));
+                context.audit_logger.log_denial(
+                    &denial,
+                    context.task_run_id.as_deref(),
+                    Some(step_name),
+                );
                 return StepHandlerResult::failure(format!(
                     "Security policy violation: {}",
                     denial.reason

@@ -47,10 +47,7 @@ fn insert_example(example: &CuratedExample) -> Result<(), String> {
 }
 
 /// Query examples for a given domain, ordered by quality descending.
-fn query_by_domain(
-    domain: &str,
-    limit: usize,
-) -> Result<Vec<CuratedExample>, String> {
+fn query_by_domain(domain: &str, limit: usize) -> Result<Vec<CuratedExample>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -60,17 +57,12 @@ fn count_by_domain(domain: &str) -> Result<usize, String> {
 }
 
 /// Get the weakest (lowest quality_score) example for a domain.
-fn get_weakest_by_domain(
-    domain: &str,
-) -> Result<Option<CuratedExample>, String> {
+fn get_weakest_by_domain(domain: &str) -> Result<Option<CuratedExample>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Replace an existing example (by id) with a new one.
-fn replace_example(
-    old_id: &str,
-    new_example: &CuratedExample,
-) -> Result<(), String> {
+fn replace_example(old_id: &str, new_example: &CuratedExample) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -175,7 +167,11 @@ impl FewShotCurator {
         );
 
         for (i, ex) in examples.iter().enumerate() {
-            out.push_str(&format!("### Example {} (score: {:.2})\n\n", i + 1, ex.quality_score));
+            out.push_str(&format!(
+                "### Example {} (score: {:.2})\n\n",
+                i + 1,
+                ex.quality_score
+            ));
             out.push_str(&format!("**Criterion:** {}\n\n", ex.criterion_description));
             out.push_str(&format!("**Steps:**\n```json\n{}\n```\n\n", ex.steps_json));
         }
@@ -228,12 +224,7 @@ mod tests {
     fn test_skips_non_first_attempt() {
         let conn = setup_db();
         let curator = FewShotCurator::new();
-        let evals = vec![(
-            "s1".into(),
-            "criterion".into(),
-            0.95,
-            "[]".into(),
-        )];
+        let evals = vec![("s1".into(), "criterion".into(), 0.95, "[]".into())];
         let count = curator
             .consider_extraction("run-1", 1, &evals, "perf", &conn)
             .unwrap();
@@ -261,12 +252,7 @@ mod tests {
     fn test_skips_low_quality() {
         let conn = setup_db();
         let curator = FewShotCurator::new();
-        let evals = vec![(
-            "s1".into(),
-            "criterion".into(),
-            0.5,
-            "[]".into(),
-        )];
+        let evals = vec![("s1".into(), "criterion".into(), 0.5, "[]".into())];
         let count = curator
             .consider_extraction("run-1", 0, &evals, "perf", &conn)
             .unwrap();

@@ -135,10 +135,7 @@ impl PgDb {
             );
         }
 
-        pairs
-            .iter()
-            .map(|pair| map.remove(pair))
-            .collect()
+        pairs.iter().map(|pair| map.remove(pair)).collect()
     }
 
     /// Truncate the entailment cache (full invalidation).

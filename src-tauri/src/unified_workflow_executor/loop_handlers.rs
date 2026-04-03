@@ -325,7 +325,11 @@ impl LoopController {
         // sessions_count is incremented in the database on each agentic session,
         // so this enforces the overall session budget even in multi-stage workflows.
         if let Some(max) = config.max_sessions {
-            let task_run_result = self.app_state.pg_db.get_task_run(&config.execution_id).await;
+            let task_run_result = self
+                .app_state
+                .pg_db
+                .get_task_run(&config.execution_id)
+                .await;
             if let Ok(Some(task_run)) = task_run_result {
                 if task_run.sessions_count >= max {
                     warn!(
@@ -342,7 +346,10 @@ impl LoopController {
 
         // Check escalation policy time limit (wall-clock).
         // This prevents workflows from running indefinitely when a time budget is set.
-        if config.escalation_policy.is_time_exceeded(ctx.loop_start_time.elapsed().as_secs()) {
+        if config
+            .escalation_policy
+            .is_time_exceeded(ctx.loop_start_time.elapsed().as_secs())
+        {
             let elapsed = ctx.loop_start_time.elapsed().as_secs();
             warn!(
                 "ESCALATION-TIMEOUT: Wall-clock time limit exceeded ({}s elapsed, limit={}s) - stopping loop",
@@ -362,7 +369,11 @@ impl LoopController {
         // This ensures that any external modifications (e.g., AI calling APIs) don't
         // prematurely mark the task as complete or failed. The loop controller is
         // the ONLY authority on task completion in unified workflows.
-        let status_result = self.app_state.pg_db.update_task_run_status(&config.execution_id, "running").await;
+        let status_result = self
+            .app_state
+            .pg_db
+            .update_task_run_status(&config.execution_id, "running")
+            .await;
         if let Err(e) = status_result {
             warn!(
                 "Failed to reset task status to running for iteration {}: {}",
@@ -410,15 +421,19 @@ impl LoopController {
         // Use append_task_output_ex with check_completion_marker=false
         // because in unified workflows, VERIFICATION is the authority on completion,
         // not the [TASK_COMPLETE] marker from the AI
-        let _ = self.app_state.pg_db.append_task_output_ex(
-            &config.execution_id,
-            &format!(
-                "\n\n=== Verification-Agentic Loop: Iteration {} ===\n",
-                ctx.iteration
-            ),
-            false,
-            false,
-        ).await;
+        let _ = self
+            .app_state
+            .pg_db
+            .append_task_output_ex(
+                &config.execution_id,
+                &format!(
+                    "\n\n=== Verification-Agentic Loop: Iteration {} ===\n",
+                    ctx.iteration
+                ),
+                false,
+                false,
+            )
+            .await;
 
         LoopState::CheckEnvironment
     }
@@ -452,15 +467,19 @@ impl LoopController {
 
             if !env_result.ready {
                 // Log environment issue to task output
-                let _ = self.app_state.pg_db.append_task_output_ex(
-                    &config.execution_id,
-                    &format!(
-                        "\n--- Environment Check (Iteration {}): NOT READY ---\n{}\n",
-                        ctx.iteration, env_result.summary
-                    ),
-                    false,
-                    false,
-                ).await;
+                let _ = self
+                    .app_state
+                    .pg_db
+                    .append_task_output_ex(
+                        &config.execution_id,
+                        &format!(
+                            "\n--- Environment Check (Iteration {}): NOT READY ---\n{}\n",
+                            ctx.iteration, env_result.summary
+                        ),
+                        false,
+                        false,
+                    )
+                    .await;
 
                 // Merge env failure context with any existing health regression from the
                 // previous iteration (don't clobber — both are valuable diagnostic context).
@@ -479,15 +498,19 @@ impl LoopController {
                 );
             } else {
                 if env_result.recovery_attempted {
-                    let _ = self.app_state.pg_db.append_task_output_ex(
-                        &config.execution_id,
-                        &format!(
-                            "\n--- Environment Check (Iteration {}): RECOVERED ---\n{}\n",
-                            ctx.iteration, env_result.summary
-                        ),
-                        false,
-                        false,
-                    ).await;
+                    let _ = self
+                        .app_state
+                        .pg_db
+                        .append_task_output_ex(
+                            &config.execution_id,
+                            &format!(
+                                "\n--- Environment Check (Iteration {}): RECOVERED ---\n{}\n",
+                                ctx.iteration, env_result.summary
+                            ),
+                            false,
+                            false,
+                        )
+                        .await;
                 }
                 debug!("ENV-DOCTOR: {}", env_result.summary);
             }
@@ -522,14 +545,21 @@ impl LoopController {
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self.app_state.pg_db.record_state_snapshot(
-                &config.execution_id,
-                "",
-                &ts,
-                "phase_transition",
-                Some(&format!("Entered verification phase, iteration {}", ctx.iteration)),
-                None,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .record_state_snapshot(
+                    &config.execution_id,
+                    "",
+                    &ts,
+                    "phase_transition",
+                    Some(&format!(
+                        "Entered verification phase, iteration {}",
+                        ctx.iteration
+                    )),
+                    None,
+                )
+                .await;
         }
 
         self.record_activity(
@@ -628,23 +658,41 @@ impl LoopController {
 
         // Track regression issue step results
         {
-            let step_results_clone: Vec<_> = verification_result.step_results.iter()
+            let step_results_clone: Vec<_> = verification_result
+                .step_results
+                .iter()
                 .filter_map(|sr| {
-                    sr.step_id.as_ref()
+                    sr.step_id
+                        .as_ref()
                         .and_then(|sid| sid.strip_prefix("regression-"))
                         .map(|issue_id| (issue_id.to_string(), sr.success))
                 })
                 .collect();
             for (issue_id, success) in &step_results_clone {
-                if let Err(e) = self.app_state.pg_db.increment_known_issue_checked(issue_id).await {
+                if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .increment_known_issue_checked(issue_id)
+                    .await
+                {
                     tracing::debug!("Failed to increment checked for {}: {}", issue_id, e);
                 }
                 if !*success {
-                    if let Err(e) = self.app_state.pg_db.increment_known_issue_detected(issue_id).await {
+                    if let Err(e) = self
+                        .app_state
+                        .pg_db
+                        .increment_known_issue_detected(issue_id)
+                        .await
+                    {
                         tracing::debug!("Failed to increment detected for {}: {}", issue_id, e);
                     }
                 } else {
-                    if let Err(e) = self.app_state.pg_db.decay_known_issue_confidence(issue_id).await {
+                    if let Err(e) = self
+                        .app_state
+                        .pg_db
+                        .decay_known_issue_confidence(issue_id)
+                        .await
+                    {
                         tracing::debug!("Failed to decay confidence for {}: {}", issue_id, e);
                     }
                 }
@@ -742,23 +790,27 @@ impl LoopController {
                 }
             }
 
-            let _ = self.app_state.pg_db.append_task_output_ex(
-                &config.execution_id,
-                &format!("{}{}", summary_line, details),
-                false,
-                false,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(
+                    &config.execution_id,
+                    &format!("{}{}", summary_line, details),
+                    false,
+                    false,
+                )
+                .await;
         }
 
         // Store verification result in database for Recap page
         // Use parent task ID for workflow sequences (same remapping as step checkpoints)
         if let Ok(result_json) = serde_json::to_value(&verification_result) {
             let parent_id = get_parent_task_id(&config.execution_id);
-            let _ = self.app_state.pg_db.store_verification_phase_result(
-                &parent_id,
-                ctx.iteration,
-                &result_json,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .store_verification_phase_result(&parent_id, ctx.iteration, &result_json)
+                .await;
 
             // Sync to web backend (best-effort, non-blocking)
             let parent_id_clone = parent_id.clone();
@@ -780,7 +832,11 @@ impl LoopController {
             let snapshot_summary = format!(
                 "Verification iteration {} {}: {}/{} passed",
                 ctx.iteration,
-                if verification_result.all_passed { "PASSED" } else { "FAILED" },
+                if verification_result.all_passed {
+                    "PASSED"
+                } else {
+                    "FAILED"
+                },
                 verification_result.passed_steps,
                 verification_result.total_steps,
             );
@@ -794,14 +850,18 @@ impl LoopController {
                 "critical_failure": verification_result.critical_failure,
             });
             let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self.app_state.pg_db.record_state_snapshot(
-                &config.execution_id,
-                "",
-                &ts,
-                "verification_result",
-                Some(&snapshot_summary),
-                Some(&context.to_string()),
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .record_state_snapshot(
+                    &config.execution_id,
+                    "",
+                    &ts,
+                    "verification_result",
+                    Some(&snapshot_summary),
+                    Some(&context.to_string()),
+                )
+                .await;
         }
 
         // Emit canvas panel for verification completion
@@ -825,14 +885,21 @@ impl LoopController {
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self.app_state.pg_db.record_state_snapshot(
-                &config.execution_id,
-                "",
-                &ts,
-                "phase_transition",
-                Some(&format!("Entered verification_complete phase, iteration {}", ctx.iteration)),
-                None,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .record_state_snapshot(
+                    &config.execution_id,
+                    "",
+                    &ts,
+                    "phase_transition",
+                    Some(&format!(
+                        "Entered verification_complete phase, iteration {}",
+                        ctx.iteration
+                    )),
+                    None,
+                )
+                .await;
         }
 
         // Run convergence detector and emit metrics for the frontend dashboard
@@ -1216,14 +1283,21 @@ impl LoopController {
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self.app_state.pg_db.record_state_snapshot(
-                &config.execution_id,
-                "",
-                &ts,
-                "phase_transition",
-                Some(&format!("Entered agentic phase, iteration {}", ctx.iteration)),
-                None,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .record_state_snapshot(
+                    &config.execution_id,
+                    "",
+                    &ts,
+                    "phase_transition",
+                    Some(&format!(
+                        "Entered agentic phase, iteration {}",
+                        ctx.iteration
+                    )),
+                    None,
+                )
+                .await;
         }
 
         self.record_stage_transition(
@@ -1295,7 +1369,10 @@ impl LoopController {
                 None
             };
             if !blame_section.is_empty() {
-                (format!("{}\n\n{}", failure_context, blame_section), blame_json)
+                (
+                    format!("{}\n\n{}", failure_context, blame_section),
+                    blame_json,
+                )
             } else {
                 (failure_context, blame_json)
             }
@@ -1310,7 +1387,11 @@ impl LoopController {
         if let Some(ref json) = blame_json {
             if let Ok(report) = serde_json::from_str::<super::blame::BlameReport>(json) {
                 for attr in &report.attributions {
-                    let files: Vec<&str> = attr.implicated_changes.iter().map(|c| c.file_path.as_str()).collect();
+                    let files: Vec<&str> = attr
+                        .implicated_changes
+                        .iter()
+                        .map(|c| c.file_path.as_str())
+                        .collect();
                     warn!(
                         "BLAME iteration={} step={} confidence={:.1} files={} reason={}",
                         attr.blamed_iteration,
@@ -1384,22 +1465,37 @@ impl LoopController {
                         for attr in &report_c.attributions {
                             let cause_id = format!("iter-{}-change", attr.blamed_iteration);
                             let effect_id = format!("verification-{}", attr.failed_step);
-                            let confidence = if attr.confidence >= 0.8 { "high" }
-                                else if attr.confidence >= 0.5 { "medium" }
-                                else { "low" };
-                            let files: Vec<&str> = attr.implicated_changes.iter()
-                                .map(|c| c.file_path.as_str()).collect();
+                            let confidence = if attr.confidence >= 0.8 {
+                                "high"
+                            } else if attr.confidence >= 0.5 {
+                                "medium"
+                            } else {
+                                "low"
+                            };
+                            let files: Vec<&str> = attr
+                                .implicated_changes
+                                .iter()
+                                .map(|c| c.file_path.as_str())
+                                .collect();
                             let description = format!(
                                 "Iteration {} change to [{}] caused '{}' to fail (confidence: {:.0}%)",
                                 attr.blamed_iteration, files.join(", "),
                                 attr.failed_step, attr.confidence * 100.0,
                             );
-                            let _ = pg.insert_causal_event(
-                                "iteration_change", &cause_id,
-                                "verification_failure", &effect_id,
-                                "caused_by_change", confidence, "blame_engine",
-                                Some(&wf_c), Some(&eid_c), Some(&description),
-                            ).await;
+                            let _ = pg
+                                .insert_causal_event(
+                                    "iteration_change",
+                                    &cause_id,
+                                    "verification_failure",
+                                    &effect_id,
+                                    "caused_by_change",
+                                    confidence,
+                                    "blame_engine",
+                                    Some(&wf_c),
+                                    Some(&eid_c),
+                                    Some(&description),
+                                )
+                                .await;
                         }
                         for osc in &report_c.oscillating_files {
                             let cause_id = format!("oscillation-{}", osc.file_path);
@@ -1408,12 +1504,20 @@ impl LoopController {
                                 "File '{}' oscillating across {} consecutive iterations",
                                 osc.file_path, osc.consecutive_blames,
                             );
-                            let _ = pg.insert_causal_event(
-                                "oscillation", &cause_id,
-                                "stuck_pattern", &effect_id,
-                                "oscillation_detected", "high", "blame_engine",
-                                Some(&wf_c), Some(&eid_c), Some(&description),
-                            ).await;
+                            let _ = pg
+                                .insert_causal_event(
+                                    "oscillation",
+                                    &cause_id,
+                                    "stuck_pattern",
+                                    &effect_id,
+                                    "oscillation_detected",
+                                    "high",
+                                    "blame_engine",
+                                    Some(&wf_c),
+                                    Some(&eid_c),
+                                    Some(&description),
+                                )
+                                .await;
                         }
                     });
                 }
@@ -1422,18 +1526,25 @@ impl LoopController {
 
         // Check escalation policy: inject "rethink" meta-prompt if stuck too long
         let failure_context = if ctx.verification_failures >= 3 {
-            if config.escalation_policy.should_warn(ctx.verification_failures) {
+            if config
+                .escalation_policy
+                .should_warn(ctx.verification_failures)
+            {
                 warn!(
                     "ESCALATION-WARN: {} iterations without progress (iteration {})",
                     ctx.verification_failures, ctx.iteration,
                 );
             }
-            if config.escalation_policy.should_rethink(ctx.verification_failures) {
+            if config
+                .escalation_policy
+                .should_rethink(ctx.verification_failures)
+            {
                 warn!(
                     "ESCALATION-RETHINK: Injecting rethink meta-prompt after {} fruitless iterations",
                     ctx.verification_failures,
                 );
-                let rethink = super::blame::EscalationPolicy::rethink_prompt(ctx.verification_failures);
+                let rethink =
+                    super::blame::EscalationPolicy::rethink_prompt(ctx.verification_failures);
                 format!("{}\n{}", failure_context, rethink)
             } else {
                 failure_context
@@ -1611,11 +1722,11 @@ impl LoopController {
 
                 // Persist constraint results to database for post-run review
                 let parent_id = get_parent_task_id(&config.execution_id);
-                let constraint_store_result = self.app_state.pg_db.store_constraint_results(
-                    &parent_id,
-                    ctx.iteration,
-                    &constraint_results,
-                ).await;
+                let constraint_store_result = self
+                    .app_state
+                    .pg_db
+                    .store_constraint_results(&parent_id, ctx.iteration, &constraint_results)
+                    .await;
                 if let Err(e) = constraint_store_result {
                     warn!(
                         "Failed to store constraint results: {} - continuing anyway",
@@ -1692,7 +1803,8 @@ impl LoopController {
                 "Injected {} dynamic verification step(s) from agentic phase (iteration {})",
                 new_injected_count, ctx.iteration
             );
-            let step_names: Vec<&str> = new_injected_steps.iter()
+            let step_names: Vec<&str> = new_injected_steps
+                .iter()
                 .filter_map(|s| s.name.as_deref())
                 .collect();
             let snapshot_summary = format!(
@@ -1707,14 +1819,18 @@ impl LoopController {
                 "step_names": step_names,
             });
             let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self.app_state.pg_db.record_state_snapshot(
-                &config.execution_id,
-                "",
-                &ts,
-                "step_injection",
-                Some(&snapshot_summary),
-                Some(&context.to_string()),
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .record_state_snapshot(
+                    &config.execution_id,
+                    "",
+                    &ts,
+                    "step_injection",
+                    Some(&snapshot_summary),
+                    Some(&context.to_string()),
+                )
+                .await;
             ctx.dynamic_steps.extend(new_injected_steps);
         }
 
@@ -1760,14 +1876,21 @@ impl LoopController {
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
-            let _ = self.app_state.pg_db.record_state_snapshot(
-                &config.execution_id,
-                "",
-                &ts,
-                "phase_transition",
-                Some(&format!("Entered agentic_complete phase, iteration {}", ctx.iteration)),
-                None,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .record_state_snapshot(
+                    &config.execution_id,
+                    "",
+                    &ts,
+                    "phase_transition",
+                    Some(&format!(
+                        "Entered agentic_complete phase, iteration {}",
+                        ctx.iteration
+                    )),
+                    None,
+                )
+                .await;
         }
 
         // Compute token usage for the agentic phase trace
@@ -1848,12 +1971,11 @@ impl LoopController {
                     ctx.iteration
                 ),
             };
-            let _ = self.app_state.pg_db.append_task_output_ex(
-                &config.execution_id,
-                &output_text,
-                true,
-                false,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(&config.execution_id, &output_text, true, false)
+                .await;
         }
 
         // Sync session to web backend (best-effort, non-blocking).
@@ -2083,7 +2205,12 @@ impl LoopController {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     duration_ms: None,
                 };
-                if let Err(e) = self.app_state.pg_db.create_task_run_event(&findings_event).await {
+                if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .create_task_run_event(&findings_event)
+                    .await
+                {
                     warn!("Failed to store agentic findings event (PG): {}", e);
                 }
             }
@@ -2131,12 +2258,11 @@ impl LoopController {
                 "\n=== AI SIGNALED UNFIXABLE ERRORS ===\nThe AI has determined that some errors cannot be fixed automatically.\nReason: {}\nProceeding to completion phase.\n",
                 reason
             );
-            let _ = self.app_state.pg_db.append_task_output_ex(
-                &config.execution_id,
-                &unfixable_msg,
-                false,
-                false,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(&config.execution_id, &unfixable_msg, false, false)
+                .await;
 
             return LoopState::Complete {
                 reason: CompletionReason::UnfixableErrors,
@@ -2201,17 +2327,22 @@ impl LoopController {
         // displays it (in case a user is watching), and continues immediately.
         if needs_approval && outcome.is_success() && !config.blocking_approval {
             use crate::unified_workflow_executor::deferred_feedback::{
-                classify_risk, compute_decision_confidence, should_emit_question,
-                AutoDecision, DeferredQuestion, RiskLevel,
+                classify_risk, compute_decision_confidence, should_emit_question, AutoDecision,
+                DeferredQuestion, RiskLevel,
             };
 
             // Load learned confidence threshold if available
-            let effective_threshold = match self.app_state.pg_db
+            let effective_threshold = match self
+                .app_state
+                .pg_db
                 .get_deferred_confidence_threshold(&config.workflow_id)
                 .await
             {
                 Ok(Some(learned)) => {
-                    debug!("Using learned confidence threshold {:.2} for workflow {}", learned, config.workflow_id);
+                    debug!(
+                        "Using learned confidence threshold {:.2} for workflow {}",
+                        learned, config.workflow_id
+                    );
                     learned
                 }
                 _ => config.confidence_threshold,
@@ -2225,40 +2356,47 @@ impl LoopController {
             {
                 Ok(o) if o.status.success() => {
                     let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
                 }
                 _ => None,
             };
 
             let files_modified = outcome
                 .parsed()
-                .map(|p| p.files_modified.iter().map(|f| f.path.clone()).collect::<Vec<_>>())
+                .map(|p| {
+                    p.files_modified
+                        .iter()
+                        .map(|f| f.path.clone())
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
 
             let ai_output = outcome.output();
 
             // Determine convergence health from the last iteration results
-            let convergence_healthy = ctx.iteration_results.last()
+            let convergence_healthy = ctx
+                .iteration_results
+                .last()
                 .map(|r| r.failed_checks < r.passed_checks || r.verification_passed)
                 .unwrap_or(true);
 
             // Compute confidence and risk
-            let confidence = compute_decision_confidence(
-                &ctx.iteration_results,
-                convergence_healthy,
-            );
-            let risk_level = classify_risk(
-                diff_for_risk.as_deref(),
-                ai_output,
-                &files_modified,
-            );
+            let confidence =
+                compute_decision_confidence(&ctx.iteration_results, convergence_healthy);
+            let risk_level = classify_risk(diff_for_risk.as_deref(), ai_output, &files_modified);
 
             if should_emit_question(confidence, risk_level, effective_threshold) {
                 // Build and record the deferred question
                 let summary = outcome
                     .parsed()
                     .map(|p| p.summary.clone())
-                    .unwrap_or_else(|| format!("Agentic phase completed (iteration {})", ctx.iteration));
+                    .unwrap_or_else(|| {
+                        format!("Agentic phase completed (iteration {})", ctx.iteration)
+                    });
 
                 let context = super::approval::ApprovalContext {
                     summary: summary.clone(),
@@ -2286,39 +2424,44 @@ impl LoopController {
 
                 // Display the question in terminal output (visible if user is watching)
                 let display_block = dq.display_block();
-                let _ = self.app_state.pg_db.append_task_output_ex(
-                    &config.execution_id,
-                    &display_block,
-                    false,
-                    false,
-                ).await;
+                let _ = self
+                    .app_state
+                    .pg_db
+                    .append_task_output_ex(&config.execution_id, &display_block, false, false)
+                    .await;
 
                 // Store to database
-                let context_json = serde_json::to_string(&dq.context).unwrap_or_else(|_| "{}".to_string());
+                let context_json =
+                    serde_json::to_string(&dq.context).unwrap_or_else(|_| "{}".to_string());
                 let auto_decision_detail = match &dq.auto_decision {
                     AutoDecision::Proceeded => None,
-                    AutoDecision::BestGuess { chosen, reasoning } => {
-                        Some(serde_json::json!({ "chosen": chosen, "reasoning": reasoning }).to_string())
-                    }
+                    AutoDecision::BestGuess { chosen, reasoning } => Some(
+                        serde_json::json!({ "chosen": chosen, "reasoning": reasoning }).to_string(),
+                    ),
                 };
-                let _ = self.app_state.pg_db.insert_deferred_question(
-                    &dq.id,
-                    &config.execution_id,
-                    ctx.iteration as i32,
-                    &dq.question,
-                    &context_json,
-                    match &dq.auto_decision {
-                        AutoDecision::Proceeded => "proceeded",
-                        AutoDecision::BestGuess { .. } => "best_guess",
-                    },
-                    auto_decision_detail.as_deref(),
-                    dq.confidence,
-                    dq.risk_level.as_str(),
-                    dq.git_checkpoint.as_deref(),
-                ).await;
+                let _ = self
+                    .app_state
+                    .pg_db
+                    .insert_deferred_question(
+                        &dq.id,
+                        &config.execution_id,
+                        ctx.iteration as i32,
+                        &dq.question,
+                        &context_json,
+                        match &dq.auto_decision {
+                            AutoDecision::Proceeded => "proceeded",
+                            AutoDecision::BestGuess { .. } => "best_guess",
+                        },
+                        auto_decision_detail.as_deref(),
+                        dq.confidence,
+                        dq.risk_level.as_str(),
+                        dq.git_checkpoint.as_deref(),
+                    )
+                    .await;
 
                 // Emit event for real-time frontend visibility
-                let broadcaster = crate::event_system::EventBroadcaster::new(self.app_handle.clone());
+                let broadcaster =
+                    crate::event_system::EventBroadcaster::new(self.app_handle.clone());
                 broadcaster.deferred_question_created(
                     &config.execution_id,
                     &dq.id,
@@ -2333,7 +2476,10 @@ impl LoopController {
 
                 info!(
                     "Deferred question {} recorded (iteration {}, confidence={:.2}, risk={})",
-                    dq.id, ctx.iteration, confidence, risk_level.as_str()
+                    dq.id,
+                    ctx.iteration,
+                    confidence,
+                    risk_level.as_str()
                 );
 
                 // Sync deferred questions to web backend (best-effort, non-blocking)
@@ -2341,7 +2487,9 @@ impl LoopController {
                     let pg = self.app_state.pg_db.clone();
                     let exec_id = config.execution_id.clone();
                     tokio::spawn(async move {
-                        if let Ok(questions) = pg.get_deferred_questions_for_task_run(&exec_id).await {
+                        if let Ok(questions) =
+                            pg.get_deferred_questions_for_task_run(&exec_id).await
+                        {
                             let sync_questions: Vec<_> = questions
                                 .iter()
                                 .map(crate::commands::task_sync::json_to_deferred_question_sync)
@@ -2362,7 +2510,9 @@ impl LoopController {
             } else {
                 debug!(
                     "Auto-approved (confidence={:.2}, risk={}) on iteration {}",
-                    confidence, risk_level.as_str(), ctx.iteration
+                    confidence,
+                    risk_level.as_str(),
+                    ctx.iteration
                 );
             }
 
@@ -2464,13 +2614,17 @@ impl LoopController {
 
             // Record to database for audit trail
             let context_json = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
-            let _ = self.app_state.pg_db.insert_approval_gate(
-                &approval_id,
-                &config.execution_id,
-                ctx.iteration as i32,
-                &request.prompt,
-                &context_json,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .insert_approval_gate(
+                    &approval_id,
+                    &config.execution_id,
+                    ctx.iteration as i32,
+                    &request.prompt,
+                    &context_json,
+                )
+                .await;
 
             // Persist workflow state: ApprovalPending
             self.persist_workflow_state(
@@ -2497,15 +2651,19 @@ impl LoopController {
             );
 
             // Log the pause
-            let _ = self.app_state.pg_db.append_task_output_ex(
-                &config.execution_id,
-                &format!(
-                    "\n=== APPROVAL GATE (Iteration {}) ===\nWaiting for human review...\n",
-                    ctx.iteration
-                ),
-                false,
-                false,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "\n=== APPROVAL GATE (Iteration {}) ===\nWaiting for human review...\n",
+                        ctx.iteration
+                    ),
+                    false,
+                    false,
+                )
+                .await;
 
             // Wait for the human response (or stop signal)
             let approval_response = tokio::select! {
@@ -2550,12 +2708,16 @@ impl LoopController {
                 "abort" => "aborted",
                 other => other,
             };
-            let _ = self.app_state.pg_db.resolve_approval_gate(
-                &approval_id,
-                &approval_response.action,
-                approval_response.comment.as_deref(),
-                status,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .resolve_approval_gate(
+                    &approval_id,
+                    &approval_response.action,
+                    approval_response.comment.as_deref(),
+                    status,
+                )
+                .await;
 
             // Emit resolved event
             broadcaster.approval_resolved(
@@ -2566,16 +2728,20 @@ impl LoopController {
             );
 
             // Log the decision
-            let _ = self.app_state.pg_db.append_task_output_ex(
-                &config.execution_id,
-                &format!(
-                    "Approval decision: {} (comment: {})\n",
-                    approval_response.action,
-                    approval_response.comment.as_deref().unwrap_or("none")
-                ),
-                false,
-                false,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "Approval decision: {} (comment: {})\n",
+                        approval_response.action,
+                        approval_response.comment.as_deref().unwrap_or("none")
+                    ),
+                    false,
+                    false,
+                )
+                .await;
 
             // Handle the response
             if approval_response.action == "abort" {
@@ -2735,8 +2901,13 @@ impl LoopController {
         // ran after the decision was made, for targeted rework on rejection.
         if !ctx.active_contingencies.is_empty() {
             for question_id in &ctx.active_contingencies {
-                let _ = self.app_state.pg_db
-                    .append_deferred_question_contingent_iteration(question_id, ctx.iteration as i32)
+                let _ = self
+                    .app_state
+                    .pg_db
+                    .append_deferred_question_contingent_iteration(
+                        question_id,
+                        ctx.iteration as i32,
+                    )
                     .await;
             }
         }

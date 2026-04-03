@@ -35,7 +35,6 @@ impl SearchBudget {
         self.actions_used += 1;
         self.content_bytes_used += content_bytes;
     }
-
 }
 
 /// Which search provider produced a result

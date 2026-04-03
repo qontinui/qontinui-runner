@@ -496,7 +496,10 @@ mod tests {
         }
         match detector.check().unwrap() {
             StallPattern::StepLimitExceeded { .. } => {}
-            other => panic!("Expected StepLimitExceeded (highest priority), got {:?}", other),
+            other => panic!(
+                "Expected StepLimitExceeded (highest priority), got {:?}",
+                other
+            ),
         }
     }
 

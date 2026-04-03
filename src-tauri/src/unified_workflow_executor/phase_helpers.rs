@@ -17,9 +17,9 @@ use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 
+use crate::commands::execution_reporting::LLMMetrics;
 use crate::findings::{FindingParser, ParsedFinding};
 use crate::mcp::types::MCP_API_PORT;
-use crate::commands::execution_reporting::LLMMetrics;
 use crate::step_executor::ExecutionStepConfig;
 
 // =============================================================================
@@ -29,14 +29,10 @@ use crate::step_executor::ExecutionStepConfig;
 /// Extract the active SDK app name from AppState without blocking.
 /// Returns None if the connection manager lock is contended or no app is connected.
 pub(super) fn get_active_sdk_app_name(app_state: &crate::commands::AppState) -> Option<String> {
-    app_state
-        .sdk_connection
-        .try_lock()
-        .ok()
-        .and_then(|mgr| {
-            mgr.active_connection()
-                .map(|conn| conn.app_info.app_name.clone())
-        })
+    app_state.sdk_connection.try_lock().ok().and_then(|mgr| {
+        mgr.active_connection()
+            .map(|conn| conn.app_info.app_name.clone())
+    })
 }
 
 /// Record token usage for a phase to the database.
@@ -55,9 +51,18 @@ pub(super) fn record_phase_token_usage(
     duration_ms: Option<u64>,
 ) {
     record_phase_token_usage_with_target(
-        pg_db, task_run_id, phase, stage_index, iteration,
-        model_used, provider_used, input_tokens, output_tokens,
-        duration_ms, None, None,
+        pg_db,
+        task_run_id,
+        phase,
+        stage_index,
+        iteration,
+        model_used,
+        provider_used,
+        input_tokens,
+        output_tokens,
+        duration_ms,
+        None,
+        None,
     );
 }
 
@@ -77,9 +82,20 @@ pub(super) fn record_phase_token_usage_with_target(
     target_page_url: Option<&str>,
 ) {
     record_phase_token_usage_with_cache(
-        pg_db, task_run_id, phase, stage_index, iteration,
-        model_used, provider_used, input_tokens, output_tokens,
-        duration_ms, None, None, target_app, target_page_url,
+        pg_db,
+        task_run_id,
+        phase,
+        stage_index,
+        iteration,
+        model_used,
+        provider_used,
+        input_tokens,
+        output_tokens,
+        duration_ms,
+        None,
+        None,
+        target_app,
+        target_page_url,
     );
 }
 
@@ -117,12 +133,16 @@ pub(super) fn record_phase_token_usage_with_cache(
         if let Some(model) = model_used {
             if cache_creation > 0 || cache_read > 0 {
                 crate::ai_pricing::calculate_cost_cents_with_cache(
-                    input_t, output_t, cache_creation, cache_read, model,
+                    input_t,
+                    output_t,
+                    cache_creation,
+                    cache_read,
+                    model,
                 )
                 .unwrap_or(0) as u64
             } else {
-                crate::ai_pricing::calculate_cost_cents(input_t, output_t, model)
-                    .unwrap_or(0) as u64
+                crate::ai_pricing::calculate_cost_cents(input_t, output_t, model).unwrap_or(0)
+                    as u64
             }
         } else {
             0u64
@@ -1158,20 +1178,27 @@ pub(super) async fn store_parsed_findings(
         use sha2::{Digest, Sha256};
         let signature_hash = format!("{:x}", Sha256::digest(signature.as_bytes()));
 
-        match pg_db.insert_finding_pg(
-            &id,
-            task_run_id,
-            session_num,
-            &parsed.title,
-            &parsed.description,
-            parsed.category.as_str(),
-            parsed.severity.as_str(),
-            &signature_hash,
-            if parsed.is_resolved { "resolved" } else { "detected" },
-            parsed.is_resolved,
-            None, // evidence not available in ParsedFinding
-            None,
-        ).await {
+        match pg_db
+            .insert_finding_pg(
+                &id,
+                task_run_id,
+                session_num,
+                &parsed.title,
+                &parsed.description,
+                parsed.category.as_str(),
+                parsed.severity.as_str(),
+                &signature_hash,
+                if parsed.is_resolved {
+                    "resolved"
+                } else {
+                    "detected"
+                },
+                parsed.is_resolved,
+                None, // evidence not available in ParsedFinding
+                None,
+            )
+            .await
+        {
             Ok(()) => {
                 info!(
                     "Response mode: stored finding [{}:{}] '{}'",

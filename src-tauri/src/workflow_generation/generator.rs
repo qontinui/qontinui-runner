@@ -15,21 +15,26 @@
 //! Steps 2–3 loop until the verification agent reports zero issues or
 //! `max_fix_iterations` is reached.
 
+use super::complexity::assess_complexity;
+use super::domain_routing::VerificationDomain;
+use super::explorer::{explore_candidates, ExplorationConfig, ExplorationResult};
+use super::template_library;
 use crate::ai_provider::AiResponse;
 use crate::ai_router::TaskContext;
 use crate::commands::logging::AiOutputEntry;
 use crate::context;
+use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
 use crate::skills::SkillRegistry;
 use crate::unified_workflows::UnifiedWorkflow;
 use crate::workflow_generation::dependency_analysis;
+use crate::workflow_generation::evaluation;
 use crate::workflow_generation::hardener::{self, HardeningSummary};
 use crate::workflow_generation::investigator;
 use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
 use crate::workflow_generation::prompt_analysis;
-use crate::workflow_generation::evaluation;
 use crate::workflow_generation::revision;
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{
@@ -40,11 +45,6 @@ use crate::workflow_generation::self_improve;
 use crate::workflow_generation::spec_synthesis;
 use crate::workflow_generation::specification;
 use crate::workflow_generation::validation::{fix_workflow, validate_workflow};
-use super::complexity::assess_complexity;
-use super::domain_routing::VerificationDomain;
-use super::explorer::{explore_candidates, ExplorationConfig, ExplorationResult};
-use super::template_library;
-use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -304,7 +304,15 @@ pub fn merge_candidates(
 /// Count how many key fields are present and non-empty on a step.
 fn step_completeness(step: &serde_json::Value) -> u32 {
     let mut score = 0u32;
-    for field in &["command", "check_type", "expected", "url", "name", "description", "criterion_id"] {
+    for field in &[
+        "command",
+        "check_type",
+        "expected",
+        "url",
+        "name",
+        "description",
+        "criterion_id",
+    ] {
         if let Some(v) = step.get(*field) {
             match v {
                 serde_json::Value::String(s) if !s.is_empty() => score += 1,
@@ -490,9 +498,8 @@ fn inject_known_issue_steps(
                 if let (Some(template_id), Some(pg)) = (&issue.pattern_template_id, pg_db) {
                     let pg_clone = pg.clone();
                     let tid = template_id.clone();
-                    let result = tokio::runtime::Handle::current().block_on(async {
-                        pg_clone.get_pattern_template(&tid).await
-                    });
+                    let result = tokio::runtime::Handle::current()
+                        .block_on(async { pg_clone.get_pattern_template(&tid).await });
                     match result {
                         Ok(Some(template)) => {
                             if let Some(ref step_tmpl) = template.step_template {
@@ -649,7 +656,7 @@ pub fn generate_workflow(
 
     artifact_builder.discovery_duration_ms = Some(discovery_start.elapsed().as_millis() as u64);
     artifact_builder.discovery_calls = serde_json::to_value(&discovery_calls).ok();
-        // Instrumentation: skipped (requires PG instrumentation migration)
+    // Instrumentation: skipped (requires PG instrumentation migration)
 
     // ── Code Graph (tree-sitter AST analysis) ────────────────────────────
     let code_graph = if discovery_mode != "disabled" {
@@ -663,7 +670,10 @@ pub fn generate_workflow(
             }
             info!(
                 "Code graph: {} files, {} functions, {} classes in {}ms",
-                graph.files.len(), graph.functions.len(), graph.classes.len(), graph.build_duration_ms
+                graph.files.len(),
+                graph.functions.len(),
+                graph.classes.len(),
+                graph.build_duration_ms
             );
             artifact_builder.code_graph_stats = Some(serde_json::json!({
                 "files": graph.files.len(),
@@ -698,16 +708,25 @@ pub fn generate_workflow(
         super::complexity::classify_pipeline_depth_from_description(&request.description)
     };
 
-    info!("Pipeline depth: {} (from {})", pipeline_depth,
-          if request.pipeline_depth.is_some() { "user override" }
-          else if effective_simple { "simple_mode flag" }
-          else { "auto-classification" });
+    info!(
+        "Pipeline depth: {} (from {})",
+        pipeline_depth,
+        if request.pipeline_depth.is_some() {
+            "user override"
+        } else if effective_simple {
+            "simple_mode flag"
+        } else {
+            "auto-classification"
+        }
+    );
 
     artifact_builder.pipeline_depth = Some(pipeline_depth.to_string());
 
     let max_fix_iters = match pipeline_depth {
         super::complexity::PipelineDepth::Trivial => 0,
-        super::complexity::PipelineDepth::Simple => std::cmp::min(request.max_fix_iterations.unwrap_or(3), 1),
+        super::complexity::PipelineDepth::Simple => {
+            std::cmp::min(request.max_fix_iterations.unwrap_or(3), 1)
+        }
         _ => request.max_fix_iterations.unwrap_or(3),
     };
 
@@ -803,7 +822,10 @@ pub fn generate_workflow(
     };
 
     let effective_request = if !effective_simple
-        && !matches!(pipeline_depth, super::complexity::PipelineDepth::Trivial | super::complexity::PipelineDepth::Simple)
+        && !matches!(
+            pipeline_depth,
+            super::complexity::PipelineDepth::Trivial | super::complexity::PipelineDepth::Simple
+        )
         && request.investigate_codebase.unwrap_or(true)
         && !discovery_context.is_empty()
     {
@@ -884,9 +906,9 @@ pub fn generate_workflow(
     // ── Load self-improvement insights for prompt injection ─────────────
     let self_improve_ctx = pg_db.and_then(|pg| {
         let pg_clone = pg.clone();
-        match tokio::runtime::Handle::current().block_on(async {
-            self_improve::analyze_generation_patterns_pg(&pg_clone).await
-        }) {
+        match tokio::runtime::Handle::current()
+            .block_on(async { self_improve::analyze_generation_patterns_pg(&pg_clone).await })
+        {
             Ok(ctx) if !ctx.is_empty() => Some(ctx),
             Ok(_) => None,
             Err(e) => {
@@ -898,51 +920,49 @@ pub fn generate_workflow(
 
     // ── Query Known Issues for Regression/Thorough ─────────────────────
     let verification_depth = request.verification_depth.as_deref().unwrap_or("standard");
-    let relevant_issues: Vec<crate::known_issues::KnownIssue> = if matches!(
-        verification_depth,
-        "thorough" | "regression"
-    ) {
-        if let Some(pg) = pg_db {
-            let pg_clone = pg.clone();
-            let depth_str = verification_depth.to_string();
-            match tokio::runtime::Handle::current().block_on(async {
-                pg_clone.find_relevant_issues_for_generation(&depth_str).await
-            }) {
-                Ok(issues) => {
-                    if !issues.is_empty() {
-                        info!(
-                            "Found {} known issues for {} verification depth",
-                            issues.len(),
-                            verification_depth
+    let relevant_issues: Vec<crate::known_issues::KnownIssue> =
+        if matches!(verification_depth, "thorough" | "regression") {
+            if let Some(pg) = pg_db {
+                let pg_clone = pg.clone();
+                let depth_str = verification_depth.to_string();
+                match tokio::runtime::Handle::current().block_on(async {
+                    pg_clone
+                        .find_relevant_issues_for_generation(&depth_str)
+                        .await
+                }) {
+                    Ok(issues) => {
+                        if !issues.is_empty() {
+                            info!(
+                                "Found {} known issues for {} verification depth",
+                                issues.len(),
+                                verification_depth
+                            );
+                        }
+                        // Apply relevance sorting based on task description
+                        let mut issues = issues;
+                        crate::known_issues::storage::sort_issues_by_relevance(
+                            &mut issues,
+                            &request.description,
                         );
+                        issues
                     }
-                    // Apply relevance sorting based on task description
-                    let mut issues = issues;
-                    crate::known_issues::storage::sort_issues_by_relevance(
-                        &mut issues,
-                        &request.description,
-                    );
-                    issues
+                    Err(e) => {
+                        warn!("Failed to query known issues: {}", e);
+                        vec![]
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to query known issues: {}", e);
-                    vec![]
-                }
+            } else {
+                vec![]
             }
         } else {
             vec![]
-        }
-    } else {
-        vec![]
-    };
+        };
 
     // ── Load Project Constitution ────────────────────────────────────────
-    let constitution = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| {
-            cwd.to_str()
-                .and_then(|s| super::constitution::load_constitution(s))
-        });
+    let constitution = std::env::current_dir().ok().and_then(|cwd| {
+        cwd.to_str()
+            .and_then(|s| super::constitution::load_constitution(s))
+    });
     if constitution.is_some() {
         info!("Project constitution loaded — will be injected into generation prompts");
     }
@@ -951,7 +971,8 @@ pub fn generate_workflow(
     // If we have a code graph, compute blast radius and append regression
     // hints so the specification agent auto-generates regression criteria.
     if let Some(ref graph) = code_graph {
-        if let Some(br_context) = graph.format_blast_radius_for_specification(&request.description) {
+        if let Some(br_context) = graph.format_blast_radius_for_specification(&request.description)
+        {
             discovery_context.push_str("\n\n");
             discovery_context.push_str(&br_context);
             info!("Blast radius context appended to discovery for specification phase");
@@ -962,7 +983,8 @@ pub fn generate_workflow(
     let should_skip_specification = effective_simple
         || matches!(pipeline_depth, super::complexity::PipelineDepth::Trivial)
         || request.generate_specification == Some(false);
-    let acceptance_criteria = if !should_skip_specification && request.generate_specification.unwrap_or(true)
+    let acceptance_criteria = if !should_skip_specification
+        && request.generate_specification.unwrap_or(true)
     {
         info!("Running specification agent...");
         let spec_insights = self_improve_ctx
@@ -1068,10 +1090,7 @@ pub fn generate_workflow(
                         );
                     }
                     if !spec_update.errors.is_empty() {
-                        warn!(
-                            "Page spec update errors: {:?}",
-                            spec_update.errors
-                        );
+                        warn!("Page spec update errors: {:?}", spec_update.errors);
                     }
                 }
             }
@@ -1132,31 +1151,36 @@ pub fn generate_workflow(
     let mut exploration_stats: Option<ExplorationStats> = None;
     let exploration_result: Option<ExplorationResult> = if !effective_simple
         && acceptance_criteria.is_some()
-        && request.exploration_settings.as_ref().and_then(|s| s.exploration_enabled) != Some(false)
+        && request
+            .exploration_settings
+            .as_ref()
+            .and_then(|s| s.exploration_enabled)
+            != Some(false)
     {
         let criteria = acceptance_criteria.as_ref().unwrap();
         let assessment = assess_complexity(&criteria.criteria);
 
         // Re-classify any General-bucket criteria using LLM fallback
-        let assessment = if assessment.domains.contains(&VerificationDomain::General) && !effective_simple {
-            use super::domain_routing::classify_criteria_domains_with_llm_fallback;
-            let reclassified = classify_criteria_domains_with_llm_fallback(
-                &criteria.criteria,
-                doctor_handle,
-                generation_model,
-                generation_provider,
-            );
-            // Rebuild assessment with reclassified domains
-            let new_domains: Vec<VerificationDomain> = reclassified.keys().copied().collect();
-            let domain_count = new_domains.len();
-            super::complexity::ComplexityAssessment {
-                domains: new_domains,
-                domain_count,
-                ..assessment
-            }
-        } else {
-            assessment
-        };
+        let assessment =
+            if assessment.domains.contains(&VerificationDomain::General) && !effective_simple {
+                use super::domain_routing::classify_criteria_domains_with_llm_fallback;
+                let reclassified = classify_criteria_domains_with_llm_fallback(
+                    &criteria.criteria,
+                    doctor_handle,
+                    generation_model,
+                    generation_provider,
+                );
+                // Rebuild assessment with reclassified domains
+                let new_domains: Vec<VerificationDomain> = reclassified.keys().copied().collect();
+                let domain_count = new_domains.len();
+                super::complexity::ComplexityAssessment {
+                    domains: new_domains,
+                    domain_count,
+                    ..assessment
+                }
+            } else {
+                assessment
+            };
 
         info!(
             "Exploration complexity: {:?} ({} criteria, {} domains)",
@@ -1166,7 +1190,8 @@ pub fn generate_workflow(
         // Only run exploration for Moderate/Complex workflows
         if matches!(
             assessment.level,
-            super::complexity::ComplexityLevel::Moderate | super::complexity::ComplexityLevel::Complex
+            super::complexity::ComplexityLevel::Moderate
+                | super::complexity::ComplexityLevel::Complex
         ) {
             let context = super::domain_generators::DomainContext {
                 discovery_context: discovery_context.clone(),
@@ -1239,9 +1264,12 @@ pub fn generate_workflow(
 
                     for phase in phases {
                         // Get criteria for this phase
-                        let phase_criteria: Vec<&super::specification::AcceptanceCriterion> = criteria.criteria.iter()
-                            .filter(|c| phase.criteria_ids.contains(&c.id))
-                            .collect();
+                        let phase_criteria: Vec<&super::specification::AcceptanceCriterion> =
+                            criteria
+                                .criteria
+                                .iter()
+                                .filter(|c| phase.criteria_ids.contains(&c.id))
+                                .collect();
 
                         if phase_criteria.is_empty() {
                             continue;
@@ -1250,11 +1278,12 @@ pub fn generate_workflow(
                         let phase_criteria_owned: Vec<super::specification::AcceptanceCriterion> =
                             phase_criteria.iter().map(|c| (*c).clone()).collect();
 
-                        let domain_templates = template_library::find_matching_templates_for_criteria(
-                            &phase_criteria_owned,
-                            &phase.domain,
-                            pg_db,
-                        );
+                        let domain_templates =
+                            template_library::find_matching_templates_for_criteria(
+                                &phase_criteria_owned,
+                                &phase.domain,
+                                pg_db,
+                            );
                         let template_refs: Vec<super::template_library::StepTemplate> =
                             domain_templates.iter().map(|(t, _)| t.clone()).collect();
 
@@ -1292,7 +1321,10 @@ pub fn generate_workflow(
                         all_steps.extend(phase_result.best_candidate.steps.clone());
 
                         // Keep the exploration result with the best score for backtracking
-                        if best_exploration.as_ref().map(|e| e.best_candidate.score.unwrap_or(0.0)).unwrap_or(0.0)
+                        if best_exploration
+                            .as_ref()
+                            .map(|e| e.best_candidate.score.unwrap_or(0.0))
+                            .unwrap_or(0.0)
                             < phase_result.best_candidate.score.unwrap_or(0.0)
                         {
                             best_exploration = Some(phase_result);
@@ -1305,7 +1337,9 @@ pub fn generate_workflow(
                             best_candidate: super::explorer::SearchNode {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 steps: all_steps,
-                                score: best_exploration.as_ref().and_then(|e| e.best_candidate.score),
+                                score: best_exploration
+                                    .as_ref()
+                                    .and_then(|e| e.best_candidate.score),
                                 parent_id: None,
                                 children: vec![],
                                 visits: 1,
@@ -1313,10 +1347,22 @@ pub fn generate_workflow(
                                 depth: 0,
                             },
                             runner_up: best_exploration.as_ref().and_then(|e| e.runner_up.clone()),
-                            total_candidates_explored: best_exploration.as_ref().map(|e| e.total_candidates_explored).unwrap_or(0),
-                            search_depth_reached: best_exploration.as_ref().map(|e| e.search_depth_reached).unwrap_or(0),
-                            search_duration_ms: best_exploration.as_ref().map(|e| e.search_duration_ms).unwrap_or(0),
-                            score_progression: best_exploration.as_ref().map(|e| e.score_progression.clone()).unwrap_or_default(),
+                            total_candidates_explored: best_exploration
+                                .as_ref()
+                                .map(|e| e.total_candidates_explored)
+                                .unwrap_or(0),
+                            search_depth_reached: best_exploration
+                                .as_ref()
+                                .map(|e| e.search_depth_reached)
+                                .unwrap_or(0),
+                            search_duration_ms: best_exploration
+                                .as_ref()
+                                .map(|e| e.search_duration_ms)
+                                .unwrap_or(0),
+                            score_progression: best_exploration
+                                .as_ref()
+                                .map(|e| e.score_progression.clone())
+                                .unwrap_or_default(),
                         };
 
                         exploration_stats = Some(ExplorationStats {
@@ -1479,8 +1525,7 @@ pub fn generate_workflow(
                     Some(builder_start.elapsed().as_millis() as u64);
                 artifact_builder.success = false;
                 artifact_builder.error_message = resp.error.clone();
-                let artifact =
-                    artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
+                let artifact = artifact_builder.build(pipeline_start.elapsed().as_millis() as u64);
                 return (*resp, artifact);
             }
         }
@@ -1530,38 +1575,45 @@ pub fn generate_workflow(
     }
 
     // ── Cross-Artifact Consistency Check ────────────────────────────────
-    let consistency_context_for_fixer: Option<String> = if let Some(ref criteria) = acceptance_criteria {
-        if let Ok(workflow_json) = serde_json::to_value(&workflow) {
-            let consistency = super::consistency::check_consistency(
-                criteria,
-                &workflow_json,
-                constitution.as_deref(),
-            );
-            info!(
-                "Consistency check: score={:.2}, {}/{} criteria covered, {} issues",
-                consistency.score,
-                consistency.criteria_covered,
-                consistency.criteria_checked,
-                consistency.issues.len()
-            );
-            let result = if consistency.score < 0.5 {
-                let ctx = super::consistency::format_consistency_issues_for_fixer(&consistency);
-                if !ctx.is_empty() {
-                    info!("Low consistency score ({:.2}) — injecting issues into fixer context", consistency.score);
-                }
-                if ctx.is_empty() { None } else { Some(ctx) }
+    let consistency_context_for_fixer: Option<String> =
+        if let Some(ref criteria) = acceptance_criteria {
+            if let Ok(workflow_json) = serde_json::to_value(&workflow) {
+                let consistency = super::consistency::check_consistency(
+                    criteria,
+                    &workflow_json,
+                    constitution.as_deref(),
+                );
+                info!(
+                    "Consistency check: score={:.2}, {}/{} criteria covered, {} issues",
+                    consistency.score,
+                    consistency.criteria_covered,
+                    consistency.criteria_checked,
+                    consistency.issues.len()
+                );
+                let result = if consistency.score < 0.5 {
+                    let ctx = super::consistency::format_consistency_issues_for_fixer(&consistency);
+                    if !ctx.is_empty() {
+                        info!(
+                            "Low consistency score ({:.2}) — injecting issues into fixer context",
+                            consistency.score
+                        );
+                    }
+                    if ctx.is_empty() {
+                        None
+                    } else {
+                        Some(ctx)
+                    }
+                } else {
+                    None
+                };
+                artifact_builder.consistency_report = serde_json::to_value(&consistency).ok();
+                result
             } else {
                 None
-            };
-            artifact_builder.consistency_report =
-                serde_json::to_value(&consistency).ok();
-            result
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     // ── Load skill registry once (built-in + user skills from DB) ───────
     let skill_registry = SkillRegistry::with_pg(pg_db);
@@ -1633,9 +1685,10 @@ pub fn generate_workflow(
                     if fixer_state.should_backtrack() {
                         if let Some(runner_up_steps) = fixer_state.backtrack() {
                             info!("Backtracking to exploration runner-up candidate");
-                            if let Some(backtrack_wf) =
-                                build_workflow_from_explored_steps(&effective_request, &runner_up_steps)
-                            {
+                            if let Some(backtrack_wf) = build_workflow_from_explored_steps(
+                                &effective_request,
+                                &runner_up_steps,
+                            ) {
                                 workflow = backtrack_wf;
                                 fix_workflow(&mut workflow);
                                 previous_issue_count = None; // Reset convergence detection
@@ -1705,17 +1758,16 @@ pub fn generate_workflow(
                         let violated_ids = tokio::runtime::Handle::current().block_on(async {
                             // Load all active rules for schema_context agent, check overlap
                             match pg_clone.get_active_rules("schema_context", None).await {
-                                Ok(all_rules) => {
-                                    all_rules.iter()
-                                        .filter(|r| {
-                                            let t = r.title.to_lowercase();
-                                            let c = r.content.to_lowercase();
-                                            issues_text.to_lowercase().contains(&t)
-                                                || issues_text.to_lowercase().contains(&c)
-                                        })
-                                        .map(|r| r.id.clone())
-                                        .collect::<Vec<_>>()
-                                }
+                                Ok(all_rules) => all_rules
+                                    .iter()
+                                    .filter(|r| {
+                                        let t = r.title.to_lowercase();
+                                        let c = r.content.to_lowercase();
+                                        issues_text.to_lowercase().contains(&t)
+                                            || issues_text.to_lowercase().contains(&c)
+                                    })
+                                    .map(|r| r.id.clone())
+                                    .collect::<Vec<_>>(),
                                 Err(_) => vec![],
                             }
                         });
@@ -2181,14 +2233,17 @@ pub fn generate_workflow(
     info!(
         "Step quality evaluation: overall={:.3}, gate={}, duration={}ms",
         workflow_evaluation.overall_score,
-        if workflow_evaluation.quality_gate.passed { "PASS" } else { "FAIL" },
+        if workflow_evaluation.quality_gate.passed {
+            "PASS"
+        } else {
+            "FAIL"
+        },
         workflow_evaluation.evaluation_duration_ms,
     );
 
     // Enrich quality report with semantic coverage matrix from evaluation
     let mut quality_report = quality_report;
-    quality_report.semantic_coverage_matrix =
-        Some(workflow_evaluation.coverage_matrix.clone());
+    quality_report.semantic_coverage_matrix = Some(workflow_evaluation.coverage_matrix.clone());
 
     let response = GenerateWorkflowResponse {
         workflow: Some(workflow),
@@ -2237,15 +2292,8 @@ fn build_workflow_from_explored_steps(
         }
     };
 
-    let category = request
-        .category
-        .as_deref()
-        .unwrap_or("generated");
-    let tags = request
-        .tags
-        .as_ref()
-        .cloned()
-        .unwrap_or_default();
+    let category = request.category.as_deref().unwrap_or("generated");
+    let tags = request.tags.as_ref().cloned().unwrap_or_default();
 
     // Build a minimal JSON that serde can deserialize into a UnifiedWorkflow.
     // Missing fields will use their serde defaults.
@@ -2411,7 +2459,9 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
 
     // Inject project constitution (before criteria so builder sees constraints first)
     if let Some(constitution_text) = constitution {
-        sections.push(super::constitution::format_constitution_for_prompt(constitution_text));
+        sections.push(super::constitution::format_constitution_for_prompt(
+            constitution_text,
+        ));
     }
 
     // Inject acceptance criteria section (before user prompt so builder sees it)
@@ -2614,7 +2664,10 @@ fn build_verification_prompt(
     let check_rules_section = if let Some(pg) = pg_db {
         let pg_clone = pg.clone();
         let check_rules = tokio::runtime::Handle::current().block_on(async {
-            pg_clone.get_active_rules("verification", Some("check_rules")).await.unwrap_or_default()
+            pg_clone
+                .get_active_rules("verification", Some("check_rules"))
+                .await
+                .unwrap_or_default()
         });
         if !check_rules.is_empty() {
             let mut s = String::from("## What to check\n\nFor EVERY step in setup_steps, verification_steps, and completion_steps, verify:\n\n");
@@ -3036,7 +3089,13 @@ fn run_fixer_agent(
     let workflow_json = serde_json::to_string_pretty(workflow)
         .map_err(|e| format!("Failed to serialize workflow: {}", e))?;
 
-    let prompt = build_fix_prompt(&workflow_json, issues, user_description, pg_db, consistency_context);
+    let prompt = build_fix_prompt(
+        &workflow_json,
+        issues,
+        user_description,
+        pg_db,
+        consistency_context,
+    );
     let task_context = TaskContext::from_prompt(&prompt);
     let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
         &prompt,
@@ -3083,7 +3142,12 @@ fn build_fix_prompt(
     let full_rules = build_rules_section_for_tier(pg_db, rules::RuleTier::Full);
 
     let consistency_section = consistency_context
-        .map(|c| format!("\n{}\nAddress these consistency gaps in addition to the verification issues.\n", c))
+        .map(|c| {
+            format!(
+                "\n{}\nAddress these consistency gaps in addition to the verification issues.\n",
+                c
+            )
+        })
         .unwrap_or_default();
 
     format!(
@@ -3323,9 +3387,9 @@ fn write_back_verification_templates(
 
         let pg_clone = pg_db.clone();
         let issue_id = issue.id.clone();
-        match tokio::runtime::Handle::current().block_on(async {
-            pg_clone.update_known_issue(&issue_id, &req).await
-        }) {
+        match tokio::runtime::Handle::current()
+            .block_on(async { pg_clone.update_known_issue(&issue_id, &req).await })
+        {
             Ok(_) => info!(
                 "Wrote verification_step_template to known issue '{}' ({})",
                 issue.title, issue.id

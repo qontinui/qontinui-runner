@@ -790,12 +790,26 @@ pub enum SpecTarget {
 fn is_ops_prompt(description: &str) -> bool {
     let d = description.to_lowercase();
     let ops_patterns = [
-        "git pull", "git push", "git commit", "git rebase", "git merge",
-        "git checkout", "git stash", "git reset", "git cherry-pick",
-        "create a pr", "create a pull request", "open a pr",
-        "push the branch", "pull latest", "rebase onto",
-        "npm publish", "cargo publish", "deploy to",
-        "run the migration", "database backup",
+        "git pull",
+        "git push",
+        "git commit",
+        "git rebase",
+        "git merge",
+        "git checkout",
+        "git stash",
+        "git reset",
+        "git cherry-pick",
+        "create a pr",
+        "create a pull request",
+        "open a pr",
+        "push the branch",
+        "pull latest",
+        "rebase onto",
+        "npm publish",
+        "cargo publish",
+        "deploy to",
+        "run the migration",
+        "database backup",
     ];
     ops_patterns.iter().any(|p| d.contains(p))
 }
@@ -859,7 +873,10 @@ fn write_group_to_spec_file(
     }
 
     // Update metadata.updatedAt
-    if let Some(metadata) = spec_json.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+    if let Some(metadata) = spec_json
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+    {
         metadata.insert(
             "updatedAt".to_string(),
             json!(chrono::Utc::now().to_rfc3339()),
@@ -930,10 +947,7 @@ pub fn update_page_specs_from_criteria(
 
         for entry in entries.flatten() {
             let path = entry.path();
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if !file_name.ends_with(".spec.uibridge.json") {
                 continue;
@@ -947,11 +961,9 @@ pub fn update_page_specs_from_criteria(
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    result.errors.push(format!(
-                        "Failed to read {}: {}",
-                        path.display(),
-                        e
-                    ));
+                    result
+                        .errors
+                        .push(format!("Failed to read {}: {}", path.display(), e));
                     continue;
                 }
             };
@@ -959,11 +971,9 @@ pub fn update_page_specs_from_criteria(
             let spec_json: Value = match serde_json::from_str(&content) {
                 Ok(v) => v,
                 Err(e) => {
-                    result.errors.push(format!(
-                        "Failed to parse {}: {}",
-                        path.display(),
-                        e
-                    ));
+                    result
+                        .errors
+                        .push(format!("Failed to parse {}: {}", path.display(), e));
                     continue;
                 }
             };
@@ -1420,8 +1430,14 @@ mod tests {
 
     #[test]
     fn test_priority_to_severity_mapping() {
-        assert_eq!(priority_to_severity(&CriterionPriority::Critical), "critical");
-        assert_eq!(priority_to_severity(&CriterionPriority::Important), "warning");
+        assert_eq!(
+            priority_to_severity(&CriterionPriority::Critical),
+            "critical"
+        );
+        assert_eq!(
+            priority_to_severity(&CriterionPriority::Important),
+            "warning"
+        );
         assert_eq!(priority_to_severity(&CriterionPriority::Optional), "info");
     }
 
@@ -1482,7 +1498,11 @@ mod tests {
                 }
             ]
         });
-        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+        std::fs::write(
+            &spec_path,
+            serde_json::to_string_pretty(&spec_content).unwrap(),
+        )
+        .unwrap();
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Dark mode settings toggle works".to_string(),
@@ -1538,7 +1558,11 @@ mod tests {
                 }
             ]
         });
-        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+        std::fs::write(
+            &spec_path,
+            serde_json::to_string_pretty(&spec_content).unwrap(),
+        )
+        .unwrap();
 
         let criteria = AcceptanceCriteria {
             goal_summary: "New goal".to_string(),
@@ -1589,7 +1613,11 @@ mod tests {
             "metadata": { "pageUrl": "/dashboard", "component": "Dashboard" },
             "groups": []
         });
-        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+        std::fs::write(
+            &spec_path,
+            serde_json::to_string_pretty(&spec_content).unwrap(),
+        )
+        .unwrap();
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Fix auth".to_string(),
@@ -1627,12 +1655,8 @@ mod tests {
             bugfix_context: None,
         };
 
-        let result = update_page_specs_from_criteria(
-            &criteria,
-            "some description",
-            &[dir.path()],
-            0.3,
-        );
+        let result =
+            update_page_specs_from_criteria(&criteria, "some description", &[dir.path()], 0.3);
 
         assert_eq!(result.specs_updated, 0);
     }
@@ -1718,7 +1742,11 @@ mod tests {
             "metadata": { "pageUrl": "/settings", "tags": ["settings"] },
             "groups": []
         });
-        std::fs::write(&spec_path, serde_json::to_string_pretty(&spec_content).unwrap()).unwrap();
+        std::fs::write(
+            &spec_path,
+            serde_json::to_string_pretty(&spec_content).unwrap(),
+        )
+        .unwrap();
 
         let criteria = AcceptanceCriteria {
             goal_summary: "Push succeeds".to_string(),
@@ -1757,8 +1785,11 @@ mod tests {
             "metadata": { "pageUrl": "/workflows", "tags": ["catch-all"] },
             "groups": []
         });
-        std::fs::write(&catchall_path, serde_json::to_string_pretty(&catchall_spec).unwrap())
-            .unwrap();
+        std::fs::write(
+            &catchall_path,
+            serde_json::to_string_pretty(&catchall_spec).unwrap(),
+        )
+        .unwrap();
 
         let criteria = AcceptanceCriteria {
             goal_summary: "WAL checkpoint works".to_string(),

@@ -155,16 +155,50 @@ struct KnowledgeDbStub;
 
 impl KnowledgeDbStub {
     #[allow(clippy::too_many_arguments)]
-    fn create_task_knowledge(&self, _task_run_id: &str, _category: &str, _agent: &str, _iteration: u32, _content: &str, _evidence: Option<&str>, _confidence: &str, _related: &[String]) -> Result<crate::database::types::StoredTaskKnowledge, String> { Err("SQLite removed".into()) }
-    fn list_task_knowledge(&self, _task_run_id: &str, _category: Option<&str>, _active_only: bool) -> Result<Vec<crate::database::types::StoredTaskKnowledge>, String> { Err("SQLite removed".into()) }
-    fn resolve_task_knowledge(&self, _id: &str, _notes: Option<&str>) -> Result<(), String> { Err("SQLite removed".into()) }
-    fn get_iteration_verification_results(&self, _task_run_id: &str, _iteration: u32) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> { Err("SQLite removed".into()) }
-    fn get_latest_verification_results(&self, _task_run_id: &str) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> { Err("SQLite removed".into()) }
+    fn create_task_knowledge(
+        &self,
+        _task_run_id: &str,
+        _category: &str,
+        _agent: &str,
+        _iteration: u32,
+        _content: &str,
+        _evidence: Option<&str>,
+        _confidence: &str,
+        _related: &[String],
+    ) -> Result<crate::database::types::StoredTaskKnowledge, String> {
+        Err("SQLite removed".into())
+    }
+    fn list_task_knowledge(
+        &self,
+        _task_run_id: &str,
+        _category: Option<&str>,
+        _active_only: bool,
+    ) -> Result<Vec<crate::database::types::StoredTaskKnowledge>, String> {
+        Err("SQLite removed".into())
+    }
+    fn resolve_task_knowledge(&self, _id: &str, _notes: Option<&str>) -> Result<(), String> {
+        Err("SQLite removed".into())
+    }
+    fn get_iteration_verification_results(
+        &self,
+        _task_run_id: &str,
+        _iteration: u32,
+    ) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> {
+        Err("SQLite removed".into())
+    }
+    fn get_latest_verification_results(
+        &self,
+        _task_run_id: &str,
+    ) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> {
+        Err("SQLite removed".into())
+    }
 }
 
 impl KnowledgeBase {
     pub fn new() -> Self {
-        Self { db: KnowledgeDbStub }
+        Self {
+            db: KnowledgeDbStub,
+        }
     }
 
     /// Compress knowledge if needed based on the provided configuration.
@@ -795,9 +829,7 @@ pub fn process_worker_output_full(
 // ============================================================================
 
 /// Query execution spans for a task run from the database.
-fn query_execution_spans(
-    task_run_id: &str,
-) -> Result<Vec<ExecutionSpan>, String> {
+fn query_execution_spans(task_run_id: &str) -> Result<Vec<ExecutionSpan>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -1512,11 +1544,7 @@ pub fn search_similar_knowledge(
         ..Default::default()
     };
 
-    crate::database::hybrid_search::hybrid_search_knowledge(
-        query_embedding,
-        category,
-        &config,
-    )
+    crate::database::hybrid_search::hybrid_search_knowledge(query_embedding, category, &config)
 }
 
 /// Format cross-task knowledge results for injection into AI context.

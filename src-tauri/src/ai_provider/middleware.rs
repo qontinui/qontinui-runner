@@ -188,28 +188,24 @@ impl AiMiddleware for StructuredOutputMiddleware {
             None => return,
         };
 
-        let config = ctx
-            .validation_config
-            .clone()
-            .unwrap_or_default();
+        let config = ctx.validation_config.clone().unwrap_or_default();
 
         // Extract JSON from the response
-        let json_str =
-            match crate::validation::extract_json_from_output(&response.output) {
-                Some(json) => json,
-                None => {
-                    debug!(
-                        "StructuredOutputMiddleware: no JSON found in response for schema '{}'",
-                        schema_name
-                    );
-                    response.success = false;
-                    response.error = Some(format!(
-                        "schema_validation: No JSON block found in response (expected schema '{}')",
-                        schema_name
-                    ));
-                    return;
-                }
-            };
+        let json_str = match crate::validation::extract_json_from_output(&response.output) {
+            Some(json) => json,
+            None => {
+                debug!(
+                    "StructuredOutputMiddleware: no JSON found in response for schema '{}'",
+                    schema_name
+                );
+                response.success = false;
+                response.error = Some(format!(
+                    "schema_validation: No JSON block found in response (expected schema '{}')",
+                    schema_name
+                ));
+                return;
+            }
+        };
 
         // Parse and validate the JSON
         let raw_value: serde_json::Value = match serde_json::from_str(&json_str) {
@@ -220,10 +216,7 @@ impl AiMiddleware for StructuredOutputMiddleware {
                     schema_name, e
                 );
                 response.success = false;
-                response.error = Some(format!(
-                    "schema_validation: JSON parse error: {}",
-                    e
-                ));
+                response.error = Some(format!("schema_validation: JSON parse error: {}", e));
                 return;
             }
         };
@@ -263,12 +256,11 @@ impl AiMiddleware for StructuredOutputMiddleware {
             };
 
         // Apply coercion before validation
-        let (value_to_validate, _coercion_records) =
-            crate::validation::coercion::apply_coercions(
-                &raw_value,
-                &schema_value,
-                config.coercion_policy,
-            );
+        let (value_to_validate, _coercion_records) = crate::validation::coercion::apply_coercions(
+            &raw_value,
+            &schema_value,
+            config.coercion_policy,
+        );
 
         let result = validator.validate(&value_to_validate);
         if result.valid {
@@ -280,14 +272,9 @@ impl AiMiddleware for StructuredOutputMiddleware {
         }
 
         // Validation failed — build error details for retry
-        let error_details: Vec<String> = result
-            .errors
-            .iter()
-            .map(|e| e.to_string())
-            .collect();
+        let error_details: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
 
-        let feedback =
-            crate::validation::validation_feedback_prompt(&result, &schema_name);
+        let feedback = crate::validation::validation_feedback_prompt(&result, &schema_name);
 
         debug!(
             "StructuredOutputMiddleware: validation failed for '{}' with {} errors",

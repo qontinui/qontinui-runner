@@ -643,7 +643,13 @@ pub async fn get_status(
     })?;
 
     // Check AI analysis status via PG
-    let ai_running = !state.app_state.pg_db.get_running_task_runs(None).await.unwrap_or_default().is_empty();
+    let ai_running = !state
+        .app_state
+        .pg_db
+        .get_running_task_runs(None)
+        .await
+        .unwrap_or_default()
+        .is_empty();
 
     let instance_name = std::env::var("QONTINUI_INSTANCE_NAME").ok();
     let api_port = state
@@ -1259,9 +1265,7 @@ pub async fn get_screenshot_monitors_ipc(
 // Playwright State Collector handlers moved to crate::mcp::playwright_collection
 
 // AI session management handlers moved to crate::mcp::ai_session
-use crate::mcp::ai_session::{
-    InlinePythonRequest, InlinePythonResponse,
-};
+use crate::mcp::ai_session::{InlinePythonRequest, InlinePythonResponse};
 
 // ============================================================================
 // Inline Python Execution

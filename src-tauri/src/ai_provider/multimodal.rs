@@ -24,12 +24,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    Image {
-        source: ImageSource,
-    },
+    Text { text: String },
+    Image { source: ImageSource },
 }
 
 /// Image source for a content block (base64-encoded).
@@ -93,11 +89,7 @@ impl MultimodalPrompt {
     }
 
     /// Create a prompt with a system message, text, and a screenshot.
-    pub fn with_system_and_screenshot(
-        system: &str,
-        text: &str,
-        screenshot_base64: &str,
-    ) -> Self {
+    pub fn with_system_and_screenshot(system: &str, text: &str, screenshot_base64: &str) -> Self {
         Self {
             system: Some(system.to_string()),
             content: vec![

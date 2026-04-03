@@ -96,14 +96,22 @@ pub fn parse_playbook(path: &Path) -> Result<SkillDefinition, String> {
 }
 
 /// Parse playbook content (for testing without filesystem).
-pub fn parse_playbook_content(content: &str, source_path: &Path) -> Result<SkillDefinition, String> {
+pub fn parse_playbook_content(
+    content: &str,
+    source_path: &Path,
+) -> Result<SkillDefinition, String> {
     // Split frontmatter from body
     let (frontmatter_str, body) = split_frontmatter(content)
         .ok_or_else(|| format!("No YAML frontmatter found in {}", source_path.display()))?;
 
     // Parse YAML frontmatter
-    let frontmatter: PlaybookFrontmatter = serde_yaml::from_str(frontmatter_str)
-        .map_err(|e| format!("Invalid YAML frontmatter in {}: {}", source_path.display(), e))?;
+    let frontmatter: PlaybookFrontmatter = serde_yaml::from_str(frontmatter_str).map_err(|e| {
+        format!(
+            "Invalid YAML frontmatter in {}: {}",
+            source_path.display(),
+            e
+        )
+    })?;
 
     // Generate ID from filename
     let id = source_path
@@ -168,10 +176,7 @@ pub fn parse_playbook_content(content: &str, source_path: &Path) -> Result<Skill
         tags,
         icon: "book".to_string(),
         color: "#6366f1".to_string(),
-        allowed_phases: vec![
-            "setup".to_string(),
-            "agentic".to_string(),
-        ],
+        allowed_phases: vec!["setup".to_string(), "agentic".to_string()],
         parameters,
         template: SkillTemplate::Playbook {
             content: body.to_string(),
@@ -217,7 +222,10 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 /// Files that fail to parse are logged as warnings but do not block other files.
 pub fn load_playbooks_from_dir(dir: &Path) -> Vec<SkillDefinition> {
     if !dir.exists() || !dir.is_dir() {
-        debug!("Playbook directory {} does not exist, skipping", dir.display());
+        debug!(
+            "Playbook directory {} does not exist, skipping",
+            dir.display()
+        );
         return vec![];
     }
 
@@ -246,7 +254,11 @@ pub fn load_playbooks_from_dir(dir: &Path) -> Vec<SkillDefinition> {
         }
     }
 
-    debug!("Loaded {} playbooks from {}", playbooks.len(), dir.display());
+    debug!(
+        "Loaded {} playbooks from {}",
+        playbooks.len(),
+        dir.display()
+    );
     playbooks
 }
 
@@ -266,11 +278,9 @@ pub fn playbooks_for_context<'a>(
                 }
                 triggers.iter().any(|trigger| {
                     match trigger.trigger_type.as_str() {
-                        "app_name" => {
-                            app_name.is_some_and(|name| {
-                                name.to_lowercase().contains(&trigger.value.to_lowercase())
-                            })
-                        }
+                        "app_name" => app_name.is_some_and(|name| {
+                            name.to_lowercase().contains(&trigger.value.to_lowercase())
+                        }),
                         "url_pattern" => {
                             url.is_some_and(|u| {
                                 // Simple glob matching: split on * and check segments
@@ -304,9 +314,7 @@ pub fn playbooks_for_context<'a>(
                                 true
                             })
                         }
-                        "tag" => {
-                            tags.iter().any(|t| t == &trigger.value)
-                        }
+                        "tag" => tags.iter().any(|t| t == &trigger.value),
                         _ => false,
                     }
                 })
@@ -358,7 +366,10 @@ triggers:
         let skill = parse_playbook_content(SAMPLE_PLAYBOOK, &path).unwrap();
 
         assert_eq!(skill.name, "Salesforce Login Flow");
-        assert_eq!(skill.description, "How to log into Salesforce and navigate to Setup");
+        assert_eq!(
+            skill.description,
+            "How to log into Salesforce and navigate to Setup"
+        );
         assert_eq!(skill.category, "domain-knowledge");
         assert!(skill.tags.contains(&"salesforce".to_string()));
         assert!(skill.tags.contains(&"authentication".to_string()));

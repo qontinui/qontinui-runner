@@ -54,7 +54,12 @@ pub async fn get_task_findings_handler(
     Path(task_run_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<Finding>>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — use PG for findings
-    match state.app_state.pg_db.get_findings_for_task(&task_run_id).await {
+    match state
+        .app_state
+        .pg_db
+        .get_findings_for_task(&task_run_id)
+        .await
+    {
         Ok(findings) => Ok(Json(ApiResponse::success(findings))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -79,13 +84,22 @@ pub async fn update_finding_status_handler(
         )
     })?;
 
-    state.app_state.pg_db.update_finding_status(&finding_id, status.as_str(), req.resolution.as_deref(), None).await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to update finding status: {}", e))),
+    state
+        .app_state
+        .pg_db
+        .update_finding_status(
+            &finding_id,
+            status.as_str(),
+            req.resolution.as_deref(),
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update finding status: {}", e))),
+            )
+        })?;
 
     // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
     crate::mcp::graph_api::invalidate_graph_cache(&state, "finding_mutation").await;
@@ -111,13 +125,17 @@ pub async fn resolve_finding_handler(
     Path(finding_id): Path<String>,
     Json(req): Json<ResolveFindingRequest>,
 ) -> Result<Json<ApiResponse<FindingMutationResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    state.app_state.pg_db.update_finding_status(&finding_id, "resolved", Some(&req.resolution), None).await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to resolve finding: {}", e))),
-        )
-    })?;
+    state
+        .app_state
+        .pg_db
+        .update_finding_status(&finding_id, "resolved", Some(&req.resolution), None)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to resolve finding: {}", e))),
+            )
+        })?;
 
     // Invalidate graph cache and emit event so the knowledge graph rebuilds on next access
     crate::mcp::graph_api::invalidate_graph_cache(&state, "finding_mutation").await;
@@ -192,7 +210,12 @@ pub async fn clear_all_findings_handler(
     // Resolve each non-terminal finding
     for finding in &findings {
         if !finding.status.is_terminal() {
-            if let Err(e) = state.app_state.pg_db.update_finding_status(&finding.id, "resolved", Some("Cleared by user"), None).await {
+            if let Err(e) = state
+                .app_state
+                .pg_db
+                .update_finding_status(&finding.id, "resolved", Some("Cleared by user"), None)
+                .await
+            {
                 info!("HTTP: Failed to clear finding {}: {}", finding.id, e);
                 continue;
             }

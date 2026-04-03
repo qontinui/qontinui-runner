@@ -20,14 +20,9 @@ use tracing::{debug, warn};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CredentialSource {
     /// Retrieve from the OS keychain.
-    Keychain {
-        service: String,
-        key: String,
-    },
+    Keychain { service: String, key: String },
     /// Retrieve from an environment variable.
-    Environment {
-        var_name: String,
-    },
+    Environment { var_name: String },
 }
 
 // ============================================================================
@@ -172,9 +167,7 @@ impl CredentialProxy {
 /// Map a credential name to its keychain service and key.
 fn credential_source_for_name(name: &str) -> (&str, &str) {
     match name {
-        "claude_api" | "claude" | "anthropic" => {
-            ("com.qontinui.runner.ai", "claude_api_key")
-        }
+        "claude_api" | "claude" | "anthropic" => ("com.qontinui.runner.ai", "claude_api_key"),
         "openai" => ("com.qontinui.runner.ai", "openai_api_key"),
         "gemini" | "google" => ("com.qontinui.runner.gemini", "gemini_api_key"),
         _ => ("com.qontinui.runner.ai", name),
@@ -216,9 +209,7 @@ fn resolve_credential(source: &CredentialSource) -> Option<String> {
                 }
             }
         }
-        CredentialSource::Environment { var_name } => {
-            std::env::var(var_name).ok()
-        }
+        CredentialSource::Environment { var_name } => std::env::var(var_name).ok(),
     }
 }
 
@@ -235,17 +226,17 @@ mod tests {
 
         // Check that env vars contain placeholder tokens, not real keys
         for var in &env_vars {
-            assert!(var.contains("QCRED_"), "Env var should contain placeholder token");
+            assert!(
+                var.contains("QCRED_"),
+                "Env var should contain placeholder token"
+            );
             let (name, value) = var.split_once('=').unwrap();
             assert!(
                 name == "ANTHROPIC_API_KEY" || name == "OPENAI_API_KEY",
                 "Unexpected env var name: {}",
                 name
             );
-            assert!(
-                value.starts_with("QCRED_"),
-                "Value should be a placeholder"
-            );
+            assert!(value.starts_with("QCRED_"), "Value should be a placeholder");
         }
     }
 

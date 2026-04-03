@@ -12,7 +12,9 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-use crate::database::{CreateShellCommandInput, ShellCommand, ShellCommandResult, UpdateShellCommandInput};
+use crate::database::{
+    CreateShellCommandInput, ShellCommand, ShellCommandResult, UpdateShellCommandInput,
+};
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 // ============================================================================
@@ -95,7 +97,9 @@ pub async fn update_shell_command_handler(
     let _ = (id, input);
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Update shell command: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Update shell command: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -145,16 +149,16 @@ pub async fn run_shell_command_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<RunShellCommandRequest>,
-) -> Result<
-    Json<ApiResponse<ShellCommandResult>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<ShellCommandResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("HTTP: Running shell command: {}", id);
 
     let task_run_id = request.task_run_id.clone();
 
     // Fetch the shell command metadata from PG
-    let shell_cmd = state.app_state.pg_db.get_shell_command(&id)
+    let shell_cmd = state
+        .app_state
+        .pg_db
+        .get_shell_command(&id)
         .await
         .map_err(|e| {
             error!("HTTP: error fetching shell command: {}", e);
@@ -189,16 +193,26 @@ pub async fn run_shell_command_handler(
     let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
 
     // Enforce command policy before execution
-    if let Err(denial) = crate::security::PolicyEngine::evaluate_command(&security_policy, &shell_cmd.command) {
-        tracing::warn!("MCP shell command '{}' blocked by security policy: {}", shell_cmd.name, denial);
+    if let Err(denial) =
+        crate::security::PolicyEngine::evaluate_command(&security_policy, &shell_cmd.command)
+    {
+        tracing::warn!(
+            "MCP shell command '{}' blocked by security policy: {}",
+            shell_cmd.name,
+            denial
+        );
         return Err((
             StatusCode::FORBIDDEN,
-            Json(api_error(format!("Security policy violation: {}", denial.reason))),
+            Json(api_error(format!(
+                "Security policy violation: {}",
+                denial.reason
+            ))),
         ));
     }
 
     // Build extra container env vars from security settings
-    let extra_env = crate::security::build_container_security_env(&security_policy, &security_settings);
+    let extra_env =
+        crate::security::build_container_security_env(&security_policy, &security_settings);
 
     let container_result = {
         let executor_guard = state.app_state.container_executor.lock().await;
@@ -208,7 +222,12 @@ pub async fn run_shell_command_handler(
                 shell_cmd.name
             );
             match executor
-                .try_execute_with_policy(&shell_cmd.command, shell_cmd.working_directory.as_deref(), Some(&security_policy), &extra_env)
+                .try_execute_with_policy(
+                    &shell_cmd.command,
+                    shell_cmd.working_directory.as_deref(),
+                    Some(&security_policy),
+                    &extra_env,
+                )
                 .await
             {
                 Ok(Some(cr)) => {
@@ -217,7 +236,11 @@ pub async fn run_shell_command_handler(
                         shell_cmd.name, cr.container_id, cr.exit_code, cr.duration_ms
                     );
                     let exit_code_i32 = cr.exit_code.map(|c| c as i32);
-                    let status = if cr.exit_code == Some(0) { "success" } else { "failed" };
+                    let status = if cr.exit_code == Some(0) {
+                        "success"
+                    } else {
+                        "failed"
+                    };
                     let started_at = chrono::Utc::now().to_rfc3339();
                     let completed_at = chrono::Utc::now().to_rfc3339();
                     let duration_ms = cr.duration_ms as i64;
@@ -270,11 +293,16 @@ pub async fn run_shell_command_handler(
 
     // ── Host execution fallback ───────────────────────────────────────
     // checkpoint_db removed — host execution (execute_shell_command) not yet migrated to PG
-    debug!("HTTP: Executing shell command '{}' on host (not available, SQLite removed)", id);
+    debug!(
+        "HTTP: Executing shell command '{}' on host (not available, SQLite removed)",
+        id
+    );
     let _ = task_run_id;
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Shell command host execution: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Shell command host execution: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 

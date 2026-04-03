@@ -47,8 +47,12 @@ pub async fn list_task_runs(
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    let runs = state.app_state.pg_db.get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port)).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let runs = state
+        .app_state
+        .pg_db
+        .get_recent_task_runs_filtered(limit, workflow_type.as_deref(), Some(port))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(ApiResponse::success(runs)))
 }
@@ -62,7 +66,11 @@ pub async fn list_running_task_runs(
         .api_port
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    state.app_state.pg_db.get_running_task_runs(Some(port)).await
+    state
+        .app_state
+        .pg_db
+        .get_running_task_runs(Some(port))
+        .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
@@ -129,7 +137,11 @@ pub async fn create_task_run(
         input = input.with_log_sources_json(lsj);
     }
 
-    state.app_state.pg_db.create_task_run(&input).await
+    state
+        .app_state
+        .pg_db
+        .create_task_run(&input)
+        .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
@@ -139,7 +151,11 @@ pub async fn get_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Option<TaskRun>>, (StatusCode, String)> {
-    state.app_state.pg_db.get_task_run(&id).await
+    state
+        .app_state
+        .pg_db
+        .get_task_run(&id)
+        .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
@@ -152,9 +168,13 @@ pub async fn stop_task_run(
     info!("Stopping task run: {}", id);
 
     // Verify task exists first
-    let task_run = state.app_state.pg_db.get_task_run(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+    let task_run = state
+        .app_state
+        .pg_db
+        .get_task_run(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     if task_run.status != "running" {
         return Ok(Json(serde_json::json!({
@@ -196,8 +216,12 @@ pub async fn stop_task_run(
     }
 
     // Mark as stopped in database
-    state.app_state.pg_db.stop_task_run(&id, "User stopped").await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state
+        .app_state
+        .pg_db
+        .stop_task_run(&id, "User stopped")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Explicitly release URL locks for this task (don't rely solely on
     // WorkflowDropGuard's sync release, which can fail under contention)
@@ -347,7 +371,11 @@ pub async fn delete_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    state.app_state.pg_db.delete_task_run(&id).await
+    state
+        .app_state
+        .pg_db
+        .delete_task_run(&id)
+        .await
         .map(|deleted| {
             Json(serde_json::json!({
                 "success": deleted,
@@ -369,13 +397,8 @@ pub async fn generate_task_summary(
     info!("MCP API: Generating summary for task run: {}", id);
 
     let doctor_handle = state.doctor_handle.clone();
-    let result = summary_generator::generate_task_summary_async(
-        id.clone(),
-        doctor_handle,
-        None,
-        None,
-    )
-    .await;
+    let result =
+        summary_generator::generate_task_summary_async(id.clone(), doctor_handle, None, None).await;
 
     match result {
         Ok(summary_result) => Ok(Json(serde_json::json!({
@@ -397,7 +420,11 @@ pub async fn get_task_auto_continue(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // get_task_auto_continue not on PgDb — get from task_run
-    let task = state.app_state.pg_db.get_task_run(&id).await
+    let task = state
+        .app_state
+        .pg_db
+        .get_task_run(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
     Ok(Json(serde_json::json!({
@@ -513,9 +540,8 @@ pub async fn resume_task_run(
                     .or_else(|| wf_name.strip_prefix("Reflection: "));
                 stripped.and_then(|name| {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            state.app_state.pg_db.get_unified_workflow_by_name(name)
-                        )
+                        tokio::runtime::Handle::current()
+                            .block_on(state.app_state.pg_db.get_unified_workflow_by_name(name))
                     })
                     .ok()
                     .flatten()
@@ -652,11 +678,16 @@ pub async fn resume_task_run(
     if crate::restate::launch::should_use_restate(&restate_settings).await {
         match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
             Ok(input) => {
-                if let Err(e) = state.app_state.pg_db.save_restate_workflow_execution(
-                    &execution_id_for_guard,
-                    &execution_id_for_guard,
-                    None,
-                ).await {
+                if let Err(e) = state
+                    .app_state
+                    .pg_db
+                    .save_restate_workflow_execution(
+                        &execution_id_for_guard,
+                        &execution_id_for_guard,
+                        None,
+                    )
+                    .await
+                {
                     tracing::error!("Failed to record Restate workflow: {}", e);
                 }
 
@@ -664,7 +695,9 @@ pub async fn resume_task_run(
                     &execution_id_for_guard,
                     &input,
                     &restate_settings.ingress_url(),
-                ).await {
+                )
+                .await
+                {
                     tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                 } else {
                     use_legacy = false;
@@ -729,12 +762,17 @@ pub async fn get_task_run_events(
     axum::extract::Query(query): axum::extract::Query<TaskRunEventsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task exists
-    pg_get_task_run(&state, &id).await
+    pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let events = state.app_state.pg_db.get_task_run_events(&id, query.event_type.as_deref(), query.limit).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let events = state
+        .app_state
+        .pg_db
+        .get_task_run_events(&id, query.event_type.as_deref(), query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -762,14 +800,19 @@ pub async fn get_task_run_checkpoints(
     axum::extract::Query(query): axum::extract::Query<CheckpointsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task exists
-    pg_get_task_run(&state, &id).await
+    pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     let limit = query.limit.unwrap_or(50).min(100); // Cap at 100 per page
 
-    let (checkpoints, next_cursor) = state.app_state.pg_db.get_workflow_step_checkpoints_paginated(&id, query.cursor, limit).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (checkpoints, next_cursor) = state
+        .app_state
+        .pg_db
+        .get_workflow_step_checkpoints_paginated(&id, query.cursor, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -836,20 +879,27 @@ pub async fn get_task_run_verification_results(
 
     // Filter by failed_only if requested
     let results_array: Vec<_> = if query.failed_only {
-        results_array.into_iter().filter(|r| {
-            r.get("passed").and_then(|v| v.as_bool()) != Some(true)
-        }).collect()
+        results_array
+            .into_iter()
+            .filter(|r| r.get("passed").and_then(|v| v.as_bool()) != Some(true))
+            .collect()
     } else {
         results_array
     };
 
     let total = results_array.len();
-    let passed = results_array.iter().filter(|r| r.get("passed").and_then(|v| v.as_bool()) == Some(true)).count();
+    let passed = results_array
+        .iter()
+        .filter(|r| r.get("passed").and_then(|v| v.as_bool()) == Some(true))
+        .count();
     let failed = total - passed;
-    let critical_failed = results_array.iter().filter(|r| {
-        r.get("passed").and_then(|v| v.as_bool()) != Some(true)
-            && r.get("is_critical").and_then(|v| v.as_bool()) == Some(true)
-    }).count();
+    let critical_failed = results_array
+        .iter()
+        .filter(|r| {
+            r.get("passed").and_then(|v| v.as_bool()) != Some(true)
+                && r.get("is_critical").and_then(|v| v.as_bool()) == Some(true)
+        })
+        .count();
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -1006,8 +1056,12 @@ pub async fn get_task_run_api_requests(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get API requests
-    let requests = state.app_state.pg_db.get_task_run_api_requests(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let requests = state
+        .app_state
+        .pg_db
+        .get_task_run_api_requests(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
     let requests = if let Some(limit) = query.limit {
@@ -1068,8 +1122,12 @@ pub async fn get_task_run_playwright_results(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get Playwright results
-    let results = state.app_state.pg_db.get_task_run_playwright_results(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let results = state
+        .app_state
+        .pg_db
+        .get_task_run_playwright_results(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Apply limit if specified
     let results = if let Some(limit) = query.limit {
@@ -1118,8 +1176,12 @@ pub async fn get_task_run_awas_steps(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get AWAS steps
-    let steps = state.app_state.pg_db.get_task_run_awas_steps(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let steps = state
+        .app_state
+        .pg_db
+        .get_task_run_awas_steps(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Calculate summary
     let total = steps.len();
@@ -1350,8 +1412,12 @@ pub async fn get_current_execution_steps(
     let task = &running_tasks[0];
 
     // Get all events for this task (don't filter by event_type, we'll filter in code)
-    let events = state.app_state.pg_db.get_task_run_events(&task.id, None, query.limit).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let events = state
+        .app_state
+        .pg_db
+        .get_task_run_events(&task.id, None, query.limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Aggregate events by action_id (preferred) or step_name + step_index to merge start/complete events
     // Using action_id is more reliable because it's generated from metadata and consistent across events
@@ -1741,12 +1807,17 @@ pub async fn get_task_run_screenshots(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task exists
-    pg_get_task_run(&state, &id).await
+    pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
-    let screenshots = state.app_state.pg_db.get_task_run_screenshots(&id, None).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let screenshots = state
+        .app_state
+        .pg_db
+        .get_task_run_screenshots(&id, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
         "task_run_id": id,
@@ -1868,7 +1939,8 @@ pub async fn send_message_to_session(
     );
 
     // Verify task run exists
-    pg_get_task_run(&state, &id).await
+    pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -1905,7 +1977,12 @@ pub async fn send_message_to_session(
 
     // Persist user message to output_log for recap/summary generation
     let msg = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", req.message);
-    let append_err = state.app_state.pg_db.append_task_output_ex(&id, &msg, false, false).await.err();
+    let append_err = state
+        .app_state
+        .pg_db
+        .append_task_output_ex(&id, &msg, false, false)
+        .await
+        .err();
     if let Some(e) = append_err {
         warn!("Failed to persist user message to output_log: {}", e);
     }
@@ -1990,7 +2067,8 @@ pub async fn get_session_state(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Verify task run exists
-    pg_get_task_run(&state, &id).await
+    pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -2169,7 +2247,11 @@ pub async fn create_ai_session(
     let input = CreateTaskRunInput::new(&task_run_id, &req.task_name)
         .with_prompt("Ad-hoc AI session")
         .with_workflow_type("chat");
-    state.app_state.pg_db.create_task_run(&input).await
+    state
+        .app_state
+        .pg_db
+        .create_task_run(&input)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Get SessionManager and spawn a new session
@@ -2270,7 +2352,11 @@ pub async fn generate_workflow_from_session(
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Get output log from DB
-    let output_log = state.app_state.pg_db.get_task_output(&id).await
+    let output_log = state
+        .app_state
+        .pg_db
+        .get_task_output(&id)
+        .await
         .unwrap_or_default();
 
     if output_log.is_empty() {
@@ -2361,7 +2447,12 @@ pub async fn generate_workflow_from_session(
                 "generated_workflow_name": &workflow.name,
             });
             let rd_str = result_data.to_string();
-            if let Err(e) = state.app_state.pg_db.update_task_result_data(&id, &rd_str).await {
+            if let Err(e) = state
+                .app_state
+                .pg_db
+                .update_task_result_data(&id, &rd_str)
+                .await
+            {
                 tracing::warn!("Failed to update chat task run result_data: {}", e);
             }
         }
@@ -2388,7 +2479,11 @@ pub async fn rename_task_run(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'name' field".to_string()))?
         .to_string();
 
-    state.app_state.pg_db.update_task_name(&id, &new_name).await
+    state
+        .app_state
+        .pg_db
+        .update_task_name(&id, &new_name)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -2474,8 +2569,17 @@ pub async fn get_approval_gates(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(task_run_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let gates = state.app_state.pg_db.get_approval_gates_for_task_run(&task_run_id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+    let gates = state
+        .app_state
+        .pg_db
+        .get_approval_gates_for_task_run(&task_run_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+        })?;
 
     Ok(Json(serde_json::json!(gates)))
 }
@@ -2491,11 +2595,24 @@ pub async fn list_deferred_questions(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let questions = if let Some(status) = params.get("status") {
-        state.app_state.pg_db.get_deferred_questions_by_status(&task_run_id, status).await
+        state
+            .app_state
+            .pg_db
+            .get_deferred_questions_by_status(&task_run_id, status)
+            .await
     } else {
-        state.app_state.pg_db.get_deferred_questions_for_task_run(&task_run_id).await
+        state
+            .app_state
+            .pg_db
+            .get_deferred_questions_for_task_run(&task_run_id)
+            .await
     }
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+    })?;
 
     Ok(Json(serde_json::json!(questions)))
 }
@@ -2505,19 +2622,31 @@ pub async fn get_deferred_question(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path((_task_run_id, question_id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let question = state.app_state.pg_db.get_deferred_question_by_id(&question_id).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+    let question = state
+        .app_state
+        .pg_db
+        .get_deferred_question_by_id(&question_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+        })?;
 
     match question {
         Some(q) => Ok(Json(q)),
-        None => Err((StatusCode::NOT_FOUND, format!("Deferred question '{}' not found", question_id))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("Deferred question '{}' not found", question_id),
+        )),
     }
 }
 
 /// Review a deferred question (approve or reject).
 #[derive(serde::Deserialize)]
 pub struct ReviewDeferredQuestionRequest {
-    pub status: String,    // "approved" or "rejected"
+    pub status: String, // "approved" or "rejected"
     pub comment: Option<String>,
 }
 
@@ -2528,15 +2657,23 @@ pub async fn review_deferred_question(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Validate status
     if body.status != "approved" && body.status != "rejected" {
-        return Err((StatusCode::BAD_REQUEST, "Status must be 'approved' or 'rejected'".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Status must be 'approved' or 'rejected'".to_string(),
+        ));
     }
 
-    state.app_state.pg_db.review_deferred_question(
-        &question_id,
-        &body.status,
-        body.comment.as_deref(),
-    ).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)))?;
+    state
+        .app_state
+        .pg_db
+        .review_deferred_question(&question_id, &body.status, body.comment.as_deref())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+        })?;
 
     // Emit event for frontend
     {
@@ -2632,20 +2769,25 @@ pub async fn bulk_review_deferred_questions(
     Json(body): Json<BulkReviewRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if body.status != "approved" && body.status != "rejected" {
-        return Err((StatusCode::BAD_REQUEST, "Status must be 'approved' or 'rejected'".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Status must be 'approved' or 'rejected'".to_string(),
+        ));
     }
 
     let mut reviewed = 0;
     for qid in &body.question_ids {
-        if let Ok(()) = state.app_state.pg_db.review_deferred_question(
-            qid,
-            &body.status,
-            body.comment.as_deref(),
-        ).await {
+        if let Ok(()) = state
+            .app_state
+            .pg_db
+            .review_deferred_question(qid, &body.status, body.comment.as_deref())
+            .await
+        {
             reviewed += 1;
 
             {
-                let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+                let broadcaster =
+                    crate::event_system::EventBroadcaster::new(state.app_handle.clone());
                 broadcaster.deferred_question_reviewed(
                     &task_run_id,
                     qid,
@@ -2763,10 +2905,22 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             post(respond_to_approval),
         )
         .route("/task-runs/{id}/approval-gates", get(get_approval_gates))
-        .route("/task-runs/{id}/deferred-questions", get(list_deferred_questions))
-        .route("/task-runs/{id}/deferred-questions/{qid}", get(get_deferred_question))
-        .route("/task-runs/{id}/deferred-questions/{qid}/review", post(review_deferred_question))
-        .route("/task-runs/{id}/deferred-questions/bulk-review", post(bulk_review_deferred_questions))
+        .route(
+            "/task-runs/{id}/deferred-questions",
+            get(list_deferred_questions),
+        )
+        .route(
+            "/task-runs/{id}/deferred-questions/{qid}",
+            get(get_deferred_question),
+        )
+        .route(
+            "/task-runs/{id}/deferred-questions/{qid}/review",
+            post(review_deferred_question),
+        )
+        .route(
+            "/task-runs/{id}/deferred-questions/bulk-review",
+            post(bulk_review_deferred_questions),
+        )
         .route("/current-execution/steps", get(get_current_execution_steps))
         .route("/current-execution/batch", get(get_current_execution_batch))
         .route("/task-runs/{id}/usage", get(get_task_run_usage))

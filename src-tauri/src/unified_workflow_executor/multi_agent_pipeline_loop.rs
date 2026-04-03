@@ -49,7 +49,6 @@ pub struct PipelineContext {
     // ── Typed contract outputs (Phase 5) ─────────────────────────────
     // Optional typed versions of the above fields, populated by ContractValidator.
     // Existing fields are preserved for backward compatibility.
-
     /// Typed Spec Analyst output validated against the SpecAnalystOutput contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_contract_output: Option<crate::orchestrator::contracts::SpecAnalystOutput>,
@@ -527,7 +526,13 @@ impl LoopController {
             let mut variants = std::collections::HashMap::new();
             for agent_type in &["spec_analyst", "locator", "implementer", "verifier"] {
                 // Use PG prompt registry when available, fall back to SQLite
-                let variant_opt = self.app_state.pg_db.get_active_prompt(agent_type).await.ok().flatten();
+                let variant_opt = self
+                    .app_state
+                    .pg_db
+                    .get_active_prompt(agent_type)
+                    .await
+                    .ok()
+                    .flatten();
                 if let Some(variant) = variant_opt {
                     debug!(
                         "MULTI-AGENT-PIPELINE: Using prompt variant '{}' v{} for {}",
@@ -546,7 +551,11 @@ impl LoopController {
                             "MULTI-AGENT-PIPELINE: Canary {} active for {}, using {} version",
                             cid,
                             agent_type,
-                            if resolved.used_candidate { "candidate" } else { "baseline" },
+                            if resolved.used_candidate {
+                                "candidate"
+                            } else {
+                                "baseline"
+                            },
                         );
                         canary_assignments.insert(
                             agent_type.to_string(),
@@ -725,8 +734,14 @@ impl LoopController {
                         errors
                     );
                     spec_validation_errors = Some(
-                        serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
-                            .unwrap_or_default(),
+                        serde_json::to_string(
+                            &result
+                                .errors
+                                .iter()
+                                .map(|e| e.to_string())
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_default(),
                     );
                 }
             }
@@ -794,7 +809,8 @@ impl LoopController {
 
         drop(_spec_phase_span);
         {
-            let _msg = info_span!("qontinui.agent.message",
+            let _msg = info_span!(
+                "qontinui.agent.message",
                 agent.source_id = "spec_analyst",
                 agent.target_id = "locator",
                 agent.message_type = "delegation",
@@ -1043,8 +1059,14 @@ Only output the JSON array, nothing else."#,
                             errors
                         );
                         locator_validation_errors = Some(
-                            serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
-                                .unwrap_or_default(),
+                            serde_json::to_string(
+                                &result
+                                    .errors
+                                    .iter()
+                                    .map(|e| e.to_string())
+                                    .collect::<Vec<_>>(),
+                            )
+                            .unwrap_or_default(),
                         );
                     }
                 }
@@ -1161,7 +1183,13 @@ Only output the JSON array, nothing else."#,
                         }
                     }
                     crate::meta_optimizer::canary::record_canary_outcome(
-                        &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
+                        &self.app_state.pg_db,
+                        canary_id,
+                        *used_candidate,
+                        false,
+                        ac,
+                        al,
+                        at,
                     );
                 }
                 // Canary config restoration is handled at the loop_controller::run() level.
@@ -1197,7 +1225,8 @@ Only output the JSON array, nothing else."#,
 
         drop(_locator_phase_span);
         {
-            let _msg = info_span!("qontinui.agent.message",
+            let _msg = info_span!(
+                "qontinui.agent.message",
                 agent.source_id = "locator",
                 agent.target_id = "implementer",
                 agent.message_type = "delegation",
@@ -1257,21 +1286,22 @@ Only output the JSON array, nothing else."#,
             let mut all_outputs: Vec<SubtreeOutput> = Vec::with_capacity(pending_subtrees.len());
             for subtree in &pending_subtrees {
                 all_outputs.push(
-                    shared.process_subtree(
-                        subtree,
-                        config,
-                        &pipeline_config,
-                        &dag.levels,
-                        &located_criteria,
-                        &active_prompt_variants,
-                        verification_steps,
-                        has_agentic_steps,
-                        agentic_steps,
-                        logger,
-                        &pipeline_ctx,
-                        &contract_validator,
-                    )
-                    .await,
+                    shared
+                        .process_subtree(
+                            subtree,
+                            config,
+                            &pipeline_config,
+                            &dag.levels,
+                            &located_criteria,
+                            &active_prompt_variants,
+                            verification_steps,
+                            has_agentic_steps,
+                            agentic_steps,
+                            logger,
+                            &pipeline_ctx,
+                            &contract_validator,
+                        )
+                        .await,
                 );
             }
 
@@ -1303,7 +1333,6 @@ Only output the JSON array, nothing else."#,
                     warn!("MULTI-AGENT-PIPELINE: Failed to update checkpoint: {}", e);
                 }
             }
-
         }
 
         // Build aggregated contract outputs for implementer and verifier after all subtrees.
@@ -1319,9 +1348,10 @@ Only output the JSON array, nothing else."#,
             }
             if !pipeline_ctx.verifier_failures.is_empty() || !criteria.is_empty() {
                 let all_criteria_ids: Vec<String> = criteria.iter().map(|c| c.id.clone()).collect();
-                pipeline_ctx.verifier_contract_output = Some(
-                    VerifierOutput::from_pipeline_data(&pipeline_ctx.verifier_failures, &all_criteria_ids),
-                );
+                pipeline_ctx.verifier_contract_output = Some(VerifierOutput::from_pipeline_data(
+                    &pipeline_ctx.verifier_failures,
+                    &all_criteria_ids,
+                ));
                 debug!(
                     "MULTI-AGENT-PIPELINE: Populated verifier_contract_output ({} failures across {} criteria)",
                     pipeline_ctx.verifier_failures.len(),
@@ -1376,7 +1406,13 @@ Only output the JSON array, nothing else."#,
                         }
                     }
                     crate::meta_optimizer::canary::record_canary_outcome(
-                        &self.app_state.pg_db, canary_id, *used_candidate, false, ac, al, at,
+                        &self.app_state.pg_db,
+                        canary_id,
+                        *used_candidate,
+                        false,
+                        ac,
+                        al,
+                        at,
                     );
                 }
                 // Canary config restoration is handled at the loop_controller::run() level.
@@ -1566,9 +1602,9 @@ Only output the JSON array, nothing else."#,
 
         // Clear the checkpoint now that the pipeline completed successfully.
         // This prevents stale checkpoint data from being used on a future re-run.
-        if let Err(e) = crate::database::pipeline_traces::clear_pipeline_checkpoint(
-            &config.execution_id,
-        ) {
+        if let Err(e) =
+            crate::database::pipeline_traces::clear_pipeline_checkpoint(&config.execution_id)
+        {
             warn!("Failed to clear pipeline checkpoint: {}", e);
         }
 
@@ -1580,11 +1616,7 @@ Only output the JSON array, nothing else."#,
     /// For each unique agent type in the traces, looks up eval specs that target
     /// that agent. If any spec contains LLM judge assertions, evaluates them
     /// against the agent's actual input/output snapshots.
-    fn run_llm_judge_evaluations(
-        &self,
-        _config: &LoopConfig,
-        result: &MultiAgentPipelineResult,
-    ) {
+    fn run_llm_judge_evaluations(&self, _config: &LoopConfig, result: &MultiAgentPipelineResult) {
         // Collect unique agent types that have traces
         let agent_types: HashSet<&str> = result
             .agent_traces
@@ -1600,10 +1632,7 @@ Only output the JSON array, nothing else."#,
             ) {
                 Ok(specs) => specs,
                 Err(e) => {
-                    debug!(
-                        "No eval specs for agent type {}: {}",
-                        agent_type, e
-                    );
+                    debug!("No eval specs for agent type {}: {}", agent_type, e);
                     continue;
                 }
             };
@@ -1632,8 +1661,7 @@ Only output the JSON array, nothing else."#,
             }
 
             // Build aggregate metrics for this agent type
-            let period_start =
-                (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            let period_start = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
             let period_end = chrono::Utc::now().to_rfc3339();
             let metrics = crate::database::pipeline_traces::get_agent_aggregates_for_period(
                 agent_type,
@@ -1642,17 +1670,19 @@ Only output the JSON array, nothing else."#,
             )
             .ok()
             .flatten()
-            .map(|agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
-                success_rate: if agg.run_count > 0 {
-                    agg.success_count as f64 / agg.run_count as f64
-                } else {
-                    0.0
+            .map(
+                |agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+                    success_rate: if agg.run_count > 0 {
+                        agg.success_count as f64 / agg.run_count as f64
+                    } else {
+                        0.0
+                    },
+                    mean_duration_ms: agg.avg_duration_ms,
+                    mean_iterations: 0.0,
+                    mean_cost_cents: agg.avg_cost_usd * 100.0,
+                    trial_count: agg.run_count as u32,
                 },
-                mean_duration_ms: agg.avg_duration_ms,
-                mean_iterations: 0.0,
-                mean_cost_cents: agg.avg_cost_usd * 100.0,
-                trial_count: agg.run_count as u32,
-            })
+            )
             .unwrap_or(crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
                 success_rate: 0.0,
                 mean_duration_ms: 0.0,
@@ -1705,10 +1735,7 @@ Only output the JSON array, nothing else."#,
 
                             for r in &judge_results {
                                 if !r.passed {
-                                    warn!(
-                                        "  FAILED: {} — {}",
-                                        r.assertion_type, r.message
-                                    );
+                                    warn!("  FAILED: {} — {}", r.assertion_type, r.message);
                                 }
                             }
                         }
@@ -1884,11 +1911,8 @@ impl PipelineShared {
                 // Query token usage recorded during the implementer's run_agentic call.
                 // PipelineShared doesn't carry pg_db — use SQLite only here.
                 // PG data is always available via dual-write.
-                let (mut impl_tokens_in, mut impl_tokens_out) = query_iteration_tokens(
-                    &self.pg_db,
-                    &config.execution_id,
-                    local_iterations,
-                );
+                let (mut impl_tokens_in, mut impl_tokens_out) =
+                    query_iteration_tokens(&self.pg_db, &config.execution_id, local_iterations);
                 if impl_tokens_in == 0 && impl_tokens_out == 0 {
                     let (ot_in, ot_out) = agentic_outcome.token_usage();
                     impl_tokens_in = ot_in.unwrap_or(0);
@@ -1935,8 +1959,14 @@ impl PipelineShared {
                                 errors
                             );
                             impl_validation_errors = Some(
-                                serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
-                                    .unwrap_or_default(),
+                                serde_json::to_string(
+                                    &result
+                                        .errors
+                                        .iter()
+                                        .map(|e| e.to_string())
+                                        .collect::<Vec<_>>(),
+                                )
+                                .unwrap_or_default(),
                             );
                         }
                     }
@@ -2075,7 +2105,8 @@ impl PipelineShared {
                 let mut verifier_schema_valid = None;
                 let mut verifier_validation_errors: Option<String> = None;
                 if let Some(ref cv) = contract_validator {
-                    let all_criteria_ids: Vec<String> = level_criteria.iter().map(|s| s.to_string()).collect();
+                    let all_criteria_ids: Vec<String> =
+                        level_criteria.iter().map(|s| s.to_string()).collect();
                     let verifier_output = VerifierOutput::from_pipeline_data(
                         &local_verifier_failures,
                         &all_criteria_ids,
@@ -2084,7 +2115,9 @@ impl PipelineShared {
                         let result = cv.validate_output("verifier", &verifier_json);
                         verifier_schema_valid = Some(result.valid);
                         if result.valid {
-                            debug!("MULTI-AGENT-PIPELINE: Verifier output passed contract validation");
+                            debug!(
+                                "MULTI-AGENT-PIPELINE: Verifier output passed contract validation"
+                            );
                         } else {
                             let errors = result.error_summary();
                             warn!(
@@ -2092,8 +2125,14 @@ impl PipelineShared {
                                 errors
                             );
                             verifier_validation_errors = Some(
-                                serde_json::to_string(&result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())
-                                    .unwrap_or_default(),
+                                serde_json::to_string(
+                                    &result
+                                        .errors
+                                        .iter()
+                                        .map(|e| e.to_string())
+                                        .collect::<Vec<_>>(),
+                                )
+                                .unwrap_or_default(),
                             );
                         }
                     }

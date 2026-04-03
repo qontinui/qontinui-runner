@@ -38,15 +38,12 @@ pub struct ReflectionDeps {
 /// - The source task run is itself a reflection run
 /// - Reflection is disabled in settings
 /// - The workflow failed catastrophically (no useful data to analyze)
-pub fn should_launch_reflection(
-    source_task_run_id: &str,
-) -> Result<bool, String> {
+pub fn should_launch_reflection(source_task_run_id: &str) -> Result<bool, String> {
     // PG-primary: sync function context, use block_in_place
     let pg = crate::database::pg::PgDb::global();
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg.should_launch_reflection(source_task_run_id).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg.should_launch_reflection(source_task_run_id).await })
     })
 }
 
@@ -80,9 +77,7 @@ pub struct ConvergenceStatus {
 
 /// Analyze the convergence status of a workflow.
 /// SQLite implementation removed; returns insufficient_data until PG equivalent.
-pub fn analyze_convergence_status(
-    _workflow_name: &str,
-) -> Result<ConvergenceStatus, String> {
+pub fn analyze_convergence_status(_workflow_name: &str) -> Result<ConvergenceStatus, String> {
     debug!("analyze_convergence_status stub (SQLite removed)");
     Ok(ConvergenceStatus {
         status: "insufficient_data".to_string(),
@@ -107,7 +102,6 @@ pub fn launch_reflection(
     deps: ReflectionDeps,
     source_task_run_id: String,
 ) -> Result<String, String> {
-
     // Final check before launching
     if !should_launch_reflection(&source_task_run_id)? {
         return Ok("skipped".to_string());
@@ -116,9 +110,8 @@ pub fn launch_reflection(
     // Get source task run details via PG
     let pg = crate::database::pg::PgDb::global();
     let workflow_name = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg.get_workflow_name_for_task_run(&source_task_run_id).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg.get_workflow_name_for_task_run(&source_task_run_id).await })
     })?;
 
     // Create reflection task run ID
@@ -206,17 +199,21 @@ pub fn launch_reflection(
     let restate_settings = crate::settings::load_settings().restate;
     let pg_db_restate = deps.app_state.pg_db.clone();
     let exec_id_restate = exec_id.clone();
-    let restate_workflow_input = crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
+    let restate_workflow_input =
+        crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
                     Ok(input) => {
-                        if let Err(e) = pg_db_restate.save_restate_workflow_execution(
-                            &exec_id_restate,
-                            &exec_id_restate,
-                            None,
-                        ).await {
+                        if let Err(e) = pg_db_restate
+                            .save_restate_workflow_execution(
+                                &exec_id_restate,
+                                &exec_id_restate,
+                                None,
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to record Restate workflow: {}", e);
                         }
 
@@ -224,7 +221,9 @@ pub fn launch_reflection(
                             &exec_id_restate,
                             &input,
                             &restate_settings.ingress_url(),
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                         } else {
                             use_legacy = false;
@@ -249,12 +248,12 @@ pub fn launch_reflection(
                 controller
                     .run(
                         loop_config,
-                        setup_steps,                 // setup automation steps (API requests)
-                        Vec::new(),                  // setup prompt steps (none)
-                        verification_steps,          // verification steps
-                        Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
+                        setup_steps,        // setup automation steps (API requests)
+                        Vec::new(),         // setup prompt steps (none)
+                        verification_steps, // verification steps
+                        Vec::new(),         // agentic steps (prompt is in loop_config.base_prompt)
                         completion_automation_steps, // completion automation steps (batch evaluation)
-                        completion_prompt_steps, // completion prompt steps
+                        completion_prompt_steps,     // completion prompt steps
                     )
                     .await
             }),
@@ -277,14 +276,13 @@ pub fn launch_reflection(
 ///
 /// Similar to `should_launch_reflection` but uses project-scoped convergence
 /// and has its own "already running" guard keyed by project path.
-pub fn should_launch_project_reflection(
-    source_task_run_id: &str,
-) -> Result<bool, String> {
+pub fn should_launch_project_reflection(source_task_run_id: &str) -> Result<bool, String> {
     // PG-primary: sync function context, use block_in_place
     let pg = crate::database::pg::PgDb::global();
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg.should_launch_project_reflection(source_task_run_id).await
+            pg.should_launch_project_reflection(source_task_run_id)
+                .await
         })
     })
 }
@@ -305,7 +303,6 @@ pub fn launch_project_reflection(
     deps: ReflectionDeps,
     source_task_run_id: String,
 ) -> Result<String, String> {
-
     if !should_launch_project_reflection(&source_task_run_id)? {
         return Ok("skipped".to_string());
     }
@@ -314,7 +311,8 @@ pub fn launch_project_reflection(
     let pg = crate::database::pg::PgDb::global();
     let (workflow_name, project_path) = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg.get_workflow_name_and_project_path(&source_task_run_id).await
+            pg.get_workflow_name_and_project_path(&source_task_run_id)
+                .await
         })
     })?;
 
@@ -396,17 +394,21 @@ pub fn launch_project_reflection(
     let restate_settings = crate::settings::load_settings().restate;
     let pg_db_restate = deps.app_state.pg_db.clone();
     let exec_id_restate = exec_id.clone();
-    let restate_workflow_input = crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
+    let restate_workflow_input =
+        crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
                     Ok(input) => {
-                        if let Err(e) = pg_db_restate.save_restate_workflow_execution(
-                            &exec_id_restate,
-                            &exec_id_restate,
-                            None,
-                        ).await {
+                        if let Err(e) = pg_db_restate
+                            .save_restate_workflow_execution(
+                                &exec_id_restate,
+                                &exec_id_restate,
+                                None,
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to record Restate workflow: {}", e);
                         }
 
@@ -414,7 +416,9 @@ pub fn launch_project_reflection(
                             &exec_id_restate,
                             &input,
                             &restate_settings.ingress_url(),
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                         } else {
                             use_legacy = false;
@@ -467,14 +471,13 @@ pub fn launch_project_reflection(
 ///
 /// Similar guards to other reflection types, plus checks for UI Bridge
 /// activity in the source workflow (skips if workflow had no UI Bridge usage).
-pub fn should_launch_ui_bridge_reflection(
-    source_task_run_id: &str,
-) -> Result<bool, String> {
+pub fn should_launch_ui_bridge_reflection(source_task_run_id: &str) -> Result<bool, String> {
     // PG-primary: sync function context, use block_in_place
     let pg = crate::database::pg::PgDb::global();
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg.should_launch_ui_bridge_reflection(source_task_run_id).await
+            pg.should_launch_ui_bridge_reflection(source_task_run_id)
+                .await
         })
     })
 }
@@ -495,7 +498,6 @@ pub fn launch_ui_bridge_reflection(
     deps: ReflectionDeps,
     source_task_run_id: String,
 ) -> Result<String, String> {
-
     if !should_launch_ui_bridge_reflection(&source_task_run_id)? {
         return Ok("skipped".to_string());
     }
@@ -503,9 +505,8 @@ pub fn launch_ui_bridge_reflection(
     // Get source task run details via PG
     let pg = crate::database::pg::PgDb::global();
     let workflow_name = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg.get_workflow_name_for_task_run(&source_task_run_id).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg.get_workflow_name_for_task_run(&source_task_run_id).await })
     })?;
 
     let reflection_id = uuid::Uuid::new_v4().to_string();
@@ -586,17 +587,21 @@ pub fn launch_ui_bridge_reflection(
     let restate_settings = crate::settings::load_settings().restate;
     let pg_db_restate = deps.app_state.pg_db.clone();
     let exec_id_restate = exec_id.clone();
-    let restate_workflow_input = crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
+    let restate_workflow_input =
+        crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
                     Ok(input) => {
-                        if let Err(e) = pg_db_restate.save_restate_workflow_execution(
-                            &exec_id_restate,
-                            &exec_id_restate,
-                            None,
-                        ).await {
+                        if let Err(e) = pg_db_restate
+                            .save_restate_workflow_execution(
+                                &exec_id_restate,
+                                &exec_id_restate,
+                                None,
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to record Restate workflow: {}", e);
                         }
 
@@ -604,7 +609,9 @@ pub fn launch_ui_bridge_reflection(
                             &exec_id_restate,
                             &input,
                             &restate_settings.ingress_url(),
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                         } else {
                             use_legacy = false;

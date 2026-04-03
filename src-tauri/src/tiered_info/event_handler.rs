@@ -110,7 +110,10 @@ impl RunRecordingHandler {
         // config_statistics was a SQLite-only optimization; PG stores transition data
         // in task_run_automation.transitions_executed JSON, so we start with empty durations
         // and let anomaly detection rely on the per-run thresholds.
-        debug!("Config set for {}, expected durations will be populated from PG if available", config_id);
+        debug!(
+            "Config set for {}, expected durations will be populated from PG if available",
+            config_id
+        );
     }
 
     /// Handle a workflow started event.
@@ -179,12 +182,7 @@ impl RunRecordingHandler {
             // Create findings for failed critical tests
             if let Some(ref trid) = task_run_id {
                 let session_num = *self.session_number.lock().await;
-                create_findings_for_failures(
-                    trid,
-                    session_num,
-                    &tests_result,
-                    &config_id,
-                );
+                create_findings_for_failures(trid, session_num, &tests_result, &config_id);
             }
 
             // Store results for AI context

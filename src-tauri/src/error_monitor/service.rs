@@ -346,10 +346,8 @@ impl ErrorMonitorService {
         let current_task_run_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
         let current_workflow_name: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-        let sqlite_exporter = SqliteExporter::new(
-            current_task_run_id.clone(),
-            current_workflow_name.clone(),
-        );
+        let sqlite_exporter =
+            SqliteExporter::new(current_task_run_id.clone(), current_workflow_name.clone());
         let event_bus_exporter = EventBusExporter::new(event_tx.clone());
 
         let handle = ErrorMonitorHandle {
@@ -962,16 +960,16 @@ mod tests {
 
         // Send a mix of error-like and non-error lines
         let lines = vec![
-            "INFO: Starting up",                      // should be filtered out
-            "DEBUG: connecting to database",           // should be filtered out
-            "ERROR: connection refused",               // should be forwarded
-            "  File \"main.py\", line 42",            // should be filtered out (no error keyword)
-            "Traceback (most recent call last):",     // should be forwarded
-            "WARNING: deprecated API call",            // should be forwarded
-            "All systems nominal",                     // should be filtered out
-            "CRITICAL: disk full",                     // should be forwarded
-            "fatal: not a git repository",             // should be forwarded
-            "panic: runtime error",                    // should be forwarded
+            "INFO: Starting up",                  // should be filtered out
+            "DEBUG: connecting to database",      // should be filtered out
+            "ERROR: connection refused",          // should be forwarded
+            "  File \"main.py\", line 42",        // should be filtered out (no error keyword)
+            "Traceback (most recent call last):", // should be forwarded
+            "WARNING: deprecated API call",       // should be forwarded
+            "All systems nominal",                // should be filtered out
+            "CRITICAL: disk full",                // should be forwarded
+            "fatal: not a git repository",        // should be forwarded
+            "panic: runtime error",               // should be forwarded
         ];
 
         for line in &lines {
@@ -996,7 +994,7 @@ mod tests {
                     }
                 }
                 Ok(Some(ServiceCommand::Stop)) => break,
-                Ok(Some(_)) => {} // ignore other commands
+                Ok(Some(_)) => {}  // ignore other commands
                 Ok(None) => break, // channel closed
                 Err(_) => break,   // timeout
             }
@@ -1004,7 +1002,9 @@ mod tests {
 
         // Verify error-like lines were forwarded
         assert!(
-            ingested_messages.iter().any(|m| m.contains("connection refused")),
+            ingested_messages
+                .iter()
+                .any(|m| m.contains("connection refused")),
             "ERROR line should be forwarded"
         );
         assert!(
@@ -1012,7 +1012,9 @@ mod tests {
             "Traceback line should be forwarded"
         );
         assert!(
-            ingested_messages.iter().any(|m| m.contains("deprecated API")),
+            ingested_messages
+                .iter()
+                .any(|m| m.contains("deprecated API")),
             "WARNING line should be forwarded"
         );
         assert!(
@@ -1020,11 +1022,15 @@ mod tests {
             "CRITICAL line should be forwarded"
         );
         assert!(
-            ingested_messages.iter().any(|m| m.contains("fatal: not a git")),
+            ingested_messages
+                .iter()
+                .any(|m| m.contains("fatal: not a git")),
             "fatal line should be forwarded"
         );
         assert!(
-            ingested_messages.iter().any(|m| m.contains("panic: runtime")),
+            ingested_messages
+                .iter()
+                .any(|m| m.contains("panic: runtime")),
             "panic line should be forwarded"
         );
 
@@ -1034,11 +1040,15 @@ mod tests {
             "INFO line should be filtered out"
         );
         assert!(
-            !ingested_messages.iter().any(|m| m.contains("connecting to database")),
+            !ingested_messages
+                .iter()
+                .any(|m| m.contains("connecting to database")),
             "DEBUG line should be filtered out"
         );
         assert!(
-            !ingested_messages.iter().any(|m| m.contains("All systems nominal")),
+            !ingested_messages
+                .iter()
+                .any(|m| m.contains("All systems nominal")),
             "Normal line should be filtered out"
         );
 

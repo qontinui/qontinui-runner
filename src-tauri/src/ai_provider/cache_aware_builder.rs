@@ -67,8 +67,15 @@ impl StructuredPrompt {
 
     /// Estimate total character count across all blocks.
     pub fn total_chars(&self) -> usize {
-        self.cached_system_blocks.iter().map(|b| b.len()).sum::<usize>()
-            + self.dynamic_system_blocks.iter().map(|b| b.len()).sum::<usize>()
+        self.cached_system_blocks
+            .iter()
+            .map(|b| b.len())
+            .sum::<usize>()
+            + self
+                .dynamic_system_blocks
+                .iter()
+                .map(|b| b.len())
+                .sum::<usize>()
             + self.user_message.len()
     }
 
@@ -168,11 +175,7 @@ impl CacheAwareRequestBuilder {
     }
 
     /// Build from a StructuredPrompt.
-    pub fn from_structured_prompt(
-        prompt: &StructuredPrompt,
-        model: &str,
-        max_tokens: u32,
-    ) -> Self {
+    pub fn from_structured_prompt(prompt: &StructuredPrompt, model: &str, max_tokens: u32) -> Self {
         let mut builder = Self::new(model, max_tokens);
 
         // Merge small cached blocks together for more efficient caching.
@@ -234,8 +237,8 @@ impl CacheAwareRequestBuilder {
         });
 
         if !self.system_blocks.is_empty() {
-            body["system"] = serde_json::to_value(&self.system_blocks)
-                .unwrap_or_else(|_| serde_json::json!([]));
+            body["system"] =
+                serde_json::to_value(&self.system_blocks).unwrap_or_else(|_| serde_json::json!([]));
         }
 
         if let Some(temp) = self.temperature {
@@ -246,10 +249,7 @@ impl CacheAwareRequestBuilder {
     }
 
     /// Build for a multimodal user message (content blocks array).
-    pub fn build_multimodal(
-        &self,
-        user_content: &serde_json::Value,
-    ) -> serde_json::Value {
+    pub fn build_multimodal(&self, user_content: &serde_json::Value) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -260,8 +260,8 @@ impl CacheAwareRequestBuilder {
         });
 
         if !self.system_blocks.is_empty() {
-            body["system"] = serde_json::to_value(&self.system_blocks)
-                .unwrap_or_else(|_| serde_json::json!([]));
+            body["system"] =
+                serde_json::to_value(&self.system_blocks).unwrap_or_else(|_| serde_json::json!([]));
         }
 
         if let Some(temp) = self.temperature {
@@ -408,11 +408,7 @@ mod tests {
 
     #[test]
     fn test_merge_small_blocks() {
-        let blocks = vec![
-            "small1".to_string(),
-            "small2".to_string(),
-            "x".repeat(2000),
-        ];
+        let blocks = vec!["small1".to_string(), "small2".to_string(), "x".repeat(2000)];
         let merged = merge_small_blocks(&blocks);
         // First two should be merged, third stands alone
         assert_eq!(merged.len(), 2);
@@ -473,8 +469,8 @@ mod tests {
 
     #[test]
     fn test_temperature_override() {
-        let builder = CacheAwareRequestBuilder::new("claude-sonnet-4-20250514", 4096)
-            .temperature(0.5);
+        let builder =
+            CacheAwareRequestBuilder::new("claude-sonnet-4-20250514", 4096).temperature(0.5);
         let body = builder.build("Hello");
         assert_eq!(body["temperature"], 0.5);
     }

@@ -56,9 +56,8 @@ pub fn should_launch_follow_up(
     let pg = pg_db.clone();
     let src_id = source_task_run_id.to_string();
     tokio::task::block_in_place(move || {
-        tokio::runtime::Handle::current().block_on(async {
-            should_launch_follow_up_pg(&pg, &src_id).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { should_launch_follow_up_pg(&pg, &src_id).await })
     })
 }
 
@@ -78,32 +77,51 @@ async fn should_launch_follow_up_pg(
         pg_db.get_task_run_flags(source_task_run_id).await?;
 
     if is_follow_up {
-        debug!("Skipping follow-up for {} — source is already a follow-up run", source_task_run_id);
+        debug!(
+            "Skipping follow-up for {} — source is already a follow-up run",
+            source_task_run_id
+        );
         return Ok(false);
     }
     if is_reflection {
-        debug!("Skipping follow-up for {} — source is a reflection run", source_task_run_id);
+        debug!(
+            "Skipping follow-up for {} — source is a reflection run",
+            source_task_run_id
+        );
         return Ok(false);
     }
     if is_fixer {
-        debug!("Skipping follow-up for {} — source is a fixer run", source_task_run_id);
+        debug!(
+            "Skipping follow-up for {} — source is a fixer run",
+            source_task_run_id
+        );
         return Ok(false);
     }
 
     // Guard 3: Check follow_up_enabled setting
-    if !pg_db.get_dev_mode_setting_bool("follow_up_enabled", true).await? {
+    if !pg_db
+        .get_dev_mode_setting_bool("follow_up_enabled", true)
+        .await?
+    {
         debug!("Follow-up disabled in settings");
         return Ok(false);
     }
 
     // Guard 4: Check output threshold
     if !pg_db.has_sufficient_output(source_task_run_id).await? {
-        debug!("Skipping follow-up for {} — insufficient output to analyze", source_task_run_id);
+        debug!(
+            "Skipping follow-up for {} — insufficient output to analyze",
+            source_task_run_id
+        );
         return Ok(false);
     }
 
     // Guard 5: Check that source output contains unfixed-issue signals
-    let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+    let conn = pg_db
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool: {e}"))?;
     let chunks: Vec<String> = conn
         .query(
             r#"SELECT content FROM task_run_output_chunks
@@ -135,10 +153,15 @@ async fn should_launch_follow_up_pg(
     };
 
     let lower = tail_output.to_lowercase();
-    let has_signal = UNFIXED_SIGNAL_PATTERNS.iter().any(|pattern| lower.contains(pattern));
+    let has_signal = UNFIXED_SIGNAL_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern));
 
     if !has_signal {
-        debug!("Skipping follow-up for {} — no unfixed-issue signals found in output", source_task_run_id);
+        debug!(
+            "Skipping follow-up for {} — no unfixed-issue signals found in output",
+            source_task_run_id
+        );
         return Ok(false);
     }
 
@@ -172,9 +195,8 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
         let pg = pg_db.clone();
         let src_id = source_task_run_id.clone();
         tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async {
-                pg.get_task_run_workflow_name(&src_id).await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async { pg.get_task_run_workflow_name(&src_id).await })
         })?
     };
 
@@ -250,17 +272,21 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let restate_settings = crate::settings::load_settings().restate;
     let pg_db_restate = deps.app_state.pg_db.clone();
     let exec_id_restate = exec_id.clone();
-    let restate_workflow_input = crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
+    let restate_workflow_input =
+        crate::restate::launch::build_workflow_input_from_loop_config(&loop_config);
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
             if crate::restate::launch::should_use_restate(&restate_settings).await {
                 match restate_workflow_input {
                     Ok(input) => {
-                        if let Err(e) = pg_db_restate.save_restate_workflow_execution(
-                            &exec_id_restate,
-                            &exec_id_restate,
-                            None,
-                        ).await {
+                        if let Err(e) = pg_db_restate
+                            .save_restate_workflow_execution(
+                                &exec_id_restate,
+                                &exec_id_restate,
+                                None,
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to record Restate workflow: {}", e);
                         }
 
@@ -268,7 +294,9 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
                             &exec_id_restate,
                             &input,
                             &restate_settings.ingress_url(),
-                        ).await {
+                        )
+                        .await
+                        {
                             tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                         } else {
                             use_legacy = false;

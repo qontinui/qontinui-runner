@@ -298,9 +298,7 @@ impl DeterministicVerifier {
         let test_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        pg.get_verification_test(&sid).await
-                    })
+                    handle.block_on(async move { pg.get_verification_test(&sid).await })
                 })
             }))
             .unwrap_or_else(|_| Err("block_in_place panicked".to_string()))
@@ -987,12 +985,11 @@ impl AiVerifier {
         // Build a multimodal prompt with the screenshot as a proper image content block.
         // This sends the image in the provider's native format (Claude content blocks,
         // Gemini inline_data) rather than appending base64 as text.
-        let multimodal_prompt =
-            crate::ai_provider::MultimodalPrompt::with_system_and_screenshot(
-                &system_prompt,
-                &user_prompt,
-                screenshot_base64,
-            );
+        let multimodal_prompt = crate::ai_provider::MultimodalPrompt::with_system_and_screenshot(
+            &system_prompt,
+            &user_prompt,
+            screenshot_base64,
+        );
 
         debug!(
             "AI verification multimodal prompt built (blocks: {}, has_images: {})",

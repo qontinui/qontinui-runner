@@ -134,7 +134,10 @@ pub fn compliance_input_from_trace(
 pub fn compliance_inputs_from_traces(
     traces: &[crate::autoresearch::agentic_verification::PipelineAgentTrace],
 ) -> Vec<SchemaComplianceInput> {
-    traces.iter().filter_map(compliance_input_from_trace).collect()
+    traces
+        .iter()
+        .filter_map(compliance_input_from_trace)
+        .collect()
 }
 
 #[cfg(test)]

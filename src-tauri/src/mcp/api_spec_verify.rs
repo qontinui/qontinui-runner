@@ -113,10 +113,7 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 // =============================================================================
 
 /// Evaluate a single field assertion against a JSON response body.
-fn evaluate_field_assertion(
-    body: &serde_json::Value,
-    field: &FieldAssertion,
-) -> (bool, String) {
+fn evaluate_field_assertion(body: &serde_json::Value, field: &FieldAssertion) -> (bool, String) {
     let value = match json_path(body, &field.path) {
         Some(v) => v,
         None => {
@@ -124,7 +121,10 @@ fn evaluate_field_assertion(
                 // "exists" with no value at path = fail
                 return (false, format!("Path '{}' does not exist", field.path));
             }
-            return (false, format!("Path '{}' not found in response", field.path));
+            return (
+                false,
+                format!("Path '{}' not found in response", field.path),
+            );
         }
     };
 
@@ -134,27 +134,46 @@ fn evaluate_field_assertion(
         "equals" => {
             let expected = match &field.expected {
                 Some(e) => e,
-                None => return (false, "No expected value for 'equals' assertion".to_string()),
+                None => {
+                    return (
+                        false,
+                        "No expected value for 'equals' assertion".to_string(),
+                    )
+                }
             };
             let passed = value == expected;
             if passed {
                 (true, format!("'{}' equals {:?}", field.path, expected))
             } else {
-                (false, format!("'{}': expected {:?}, got {:?}", field.path, expected, value))
+                (
+                    false,
+                    format!("'{}': expected {:?}, got {:?}", field.path, expected, value),
+                )
             }
         }
 
         "type_is" => {
             let expected_type = match &field.expected {
                 Some(serde_json::Value::String(s)) => s.as_str(),
-                _ => return (false, "Expected a type name string for 'type_is'".to_string()),
+                _ => {
+                    return (
+                        false,
+                        "Expected a type name string for 'type_is'".to_string(),
+                    )
+                }
             };
             let actual_type = json_type_name(value);
             let passed = actual_type == expected_type;
             if passed {
                 (true, format!("'{}' is type {}", field.path, actual_type))
             } else {
-                (false, format!("'{}': expected type {}, got {}", field.path, expected_type, actual_type))
+                (
+                    false,
+                    format!(
+                        "'{}': expected type {}, got {}",
+                        field.path, expected_type, actual_type
+                    ),
+                )
             }
         }
 
@@ -169,9 +188,18 @@ fn evaluate_field_assertion(
             };
             let passed = actual_num >= expected_num;
             if passed {
-                (true, format!("'{}': {} >= {}", field.path, actual_num, expected_num))
+                (
+                    true,
+                    format!("'{}': {} >= {}", field.path, actual_num, expected_num),
+                )
             } else {
-                (false, format!("'{}': {} < {} (expected >=)", field.path, actual_num, expected_num))
+                (
+                    false,
+                    format!(
+                        "'{}': {} < {} (expected >=)",
+                        field.path, actual_num, expected_num
+                    ),
+                )
             }
         }
 
@@ -186,16 +214,30 @@ fn evaluate_field_assertion(
             };
             let passed = actual_num <= expected_num;
             if passed {
-                (true, format!("'{}': {} <= {}", field.path, actual_num, expected_num))
+                (
+                    true,
+                    format!("'{}': {} <= {}", field.path, actual_num, expected_num),
+                )
             } else {
-                (false, format!("'{}': {} > {} (expected <=)", field.path, actual_num, expected_num))
+                (
+                    false,
+                    format!(
+                        "'{}': {} > {} (expected <=)",
+                        field.path, actual_num, expected_num
+                    ),
+                )
             }
         }
 
         "contains" => {
             let needle = match &field.expected {
                 Some(serde_json::Value::String(s)) => s.as_str(),
-                _ => return (false, "'contains' requires a string expected value".to_string()),
+                _ => {
+                    return (
+                        false,
+                        "'contains' requires a string expected value".to_string(),
+                    )
+                }
             };
             let haystack = match value.as_str() {
                 Some(s) => s,
@@ -205,7 +247,13 @@ fn evaluate_field_assertion(
             if passed {
                 (true, format!("'{}' contains '{}'", field.path, needle))
             } else {
-                (false, format!("'{}': '{}' does not contain '{}'", field.path, haystack, needle))
+                (
+                    false,
+                    format!(
+                        "'{}': '{}' does not contain '{}'",
+                        field.path, haystack, needle
+                    ),
+                )
             }
         }
 
@@ -250,7 +298,10 @@ fn load_api_assertions(spec_id: &str) -> Result<Vec<ApiAssertion>, String> {
         }
     }
 
-    Err(format!("Spec file '{}.spec.uibridge.json' not found", spec_id))
+    Err(format!(
+        "Spec file '{}.spec.uibridge.json' not found",
+        spec_id
+    ))
 }
 
 // =============================================================================
@@ -269,18 +320,16 @@ pub async fn verify_api_spec(
     let assertions = match load_api_assertions(&request.spec_id) {
         Ok(a) => a,
         Err(e) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::error(e)),
-            ));
+            return Err((StatusCode::NOT_FOUND, Json(ApiResponse::error(e))));
         }
     };
 
     // Filter if specific assertion IDs requested
     let assertions: Vec<ApiAssertion> = match &request.assertion_ids {
-        Some(ids) if !ids.is_empty() => {
-            assertions.into_iter().filter(|a| ids.contains(&a.id)).collect()
-        }
+        Some(ids) if !ids.is_empty() => assertions
+            .into_iter()
+            .filter(|a| ids.contains(&a.id))
+            .collect(),
         _ => assertions,
     };
 
@@ -296,7 +345,10 @@ pub async fn verify_api_spec(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(format!("Failed to create HTTP client: {}", e))),
+                Json(ApiResponse::error(format!(
+                    "Failed to create HTTP client: {}",
+                    e
+                ))),
             )
         })?;
 
@@ -313,7 +365,10 @@ pub async fn verify_api_spec(
                     passed: false,
                     endpoint: assertion.endpoint.clone(),
                     actual_status: 0,
-                    detail: format!("Invalid endpoint format: '{}' (expected 'METHOD /path')", assertion.endpoint),
+                    detail: format!(
+                        "Invalid endpoint format: '{}' (expected 'METHOD /path')",
+                        assertion.endpoint
+                    ),
                     response_time_ms: 0,
                 });
                 continue;
@@ -451,9 +506,7 @@ pub async fn verify_api_spec(
 }
 
 /// List all specs that have apiAssertions.
-pub async fn list_api_specs(
-    State(_state): State<Arc<ApiState>>,
-) -> Json<ApiResponse<Vec<String>>> {
+pub async fn list_api_specs(State(_state): State<Arc<ApiState>>) -> Json<ApiResponse<Vec<String>>> {
     let spec_dirs = [
         std::path::PathBuf::from("src/specs"),
         std::path::PathBuf::from("../src/specs"),

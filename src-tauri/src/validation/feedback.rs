@@ -132,7 +132,11 @@ mod tests {
         let result = ValidationResult::invalid(
             serde_json::json!({}),
             vec![
-                make_error("/name", ErrorKind::MissingField, "Required property 'name' is missing"),
+                make_error(
+                    "/name",
+                    ErrorKind::MissingField,
+                    "Required property 'name' is missing",
+                ),
                 make_error(
                     "/confidence",
                     ErrorKind::WrongType,

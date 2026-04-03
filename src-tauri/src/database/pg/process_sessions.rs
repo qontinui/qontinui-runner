@@ -18,7 +18,11 @@ impl PgDb {
         config_id: &str,
         name: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -42,7 +46,11 @@ impl PgDb {
         exit_code: Option<i32>,
         error_count: u32,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
         let err_count = error_count as i32;
 
@@ -72,7 +80,11 @@ impl PgDb {
         config_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<ProcessSession>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
 
         let rows = if let Some(cid) = config_id {
@@ -133,7 +145,11 @@ impl PgDb {
             return Ok(());
         }
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         for (timestamp, stream, line) in lines {
             conn.execute(
@@ -154,7 +170,11 @@ impl PgDb {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<ProcessSessionOutputLine>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
         let offset_i64 = offset as i64;
 
@@ -190,7 +210,11 @@ impl PgDb {
         session_id: &str,
         max_lines: u32,
     ) -> Result<u32, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let max_i64 = max_lines as i64;
 
         let affected = conn

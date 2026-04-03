@@ -18,9 +18,6 @@ use std::collections::HashMap;
 use crate::ai_provider::cache_aware_builder::StructuredPrompt;
 use crate::database::pg::PgDb;
 use crate::doctor::DoctorHandle;
-use crate::workflow_generation::learning_orchestrator::{
-    LearningConfig, LearningOrchestrator, RunContext,
-};
 use crate::error_monitor::{CuratorConfig, DebugContextCurator};
 use crate::execution_context::AiSessionContext;
 use crate::orchestrator::{
@@ -53,6 +50,9 @@ use crate::orchestrator::{
         WorkerSignal, WorkerStatus,
     },
     verification::VerificationOrchestrator,
+};
+use crate::workflow_generation::learning_orchestrator::{
+    LearningConfig, LearningOrchestrator, RunContext,
 };
 
 use super::types::{CriterionType, VerificationMethod};
@@ -677,10 +677,7 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     /// Create a new orchestrator without output capabilities.
-    pub fn new(
-        config: OrchestratorConfig,
-        doctor_handle: Option<DoctorHandle>,
-    ) -> Self {
+    pub fn new(config: OrchestratorConfig, doctor_handle: Option<DoctorHandle>) -> Self {
         unreachable!("SQLite removed — use PG-based Orchestrator constructor instead")
     }
 
@@ -765,25 +762,28 @@ impl Orchestrator {
         // PG-primary: sync method context, use block_in_place
         let pg = crate::database::pg::PgDb::global();
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                match pg.build_error_monitor_context(task_run_id, 20).await {
-                    Ok(Some(formatted)) => {
-                        info!("Injecting error monitor context from PG");
-                        Ok::<_, String>(Some(format!(
-                            "## Application Error Context\n\n\
+            tokio::runtime::Handle::current()
+                .block_on(async {
+                    match pg.build_error_monitor_context(task_run_id, 20).await {
+                        Ok(Some(formatted)) => {
+                            info!("Injecting error monitor context from PG");
+                            Ok::<_, String>(Some(format!(
+                                "## Application Error Context\n\n\
                              The following errors have been detected in the application logs. \
                              Consider these when debugging or if your changes might be related.\n\n\
                              {}\n\n---\n",
-                            formatted
-                        )))
+                                formatted
+                            )))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => {
+                            warn!("Failed to build error monitor context: {}", e);
+                            Ok(None)
+                        }
                     }
-                    Ok(None) => Ok(None),
-                    Err(e) => {
-                        warn!("Failed to build error monitor context: {}", e);
-                        Ok(None)
-                    }
-                }
-            }).ok().flatten()
+                })
+                .ok()
+                .flatten()
         })
     }
 
@@ -815,11 +815,14 @@ impl Orchestrator {
                         state.task_run_id
                     );
 
-                    match pg.mark_resolved_by_task(
-                        *error_id,
-                        &state.task_run_id,
-                        Some(&resolution_note),
-                    ).await {
+                    match pg
+                        .mark_resolved_by_task(
+                            *error_id,
+                            &state.task_run_id,
+                            Some(&resolution_note),
+                        )
+                        .await
+                    {
                         Ok(_) => {
                             resolved_count += 1;
                             debug!("Resolved error {} via task {}", error_id, state.task_run_id);
@@ -1562,9 +1565,8 @@ impl Orchestrator {
             let mem = super::memory::MemorySystem::new();
             let pg = Arc::clone(pg);
             let task_desc = base_prompt.to_string();
-            let mem_ctx = tokio::runtime::Handle::current().block_on(async {
-                mem.build_context_unified(20, &task_desc, &pg).await
-            });
+            let mem_ctx = tokio::runtime::Handle::current()
+                .block_on(async { mem.build_context_unified(20, &task_desc, &pg).await });
             if !mem_ctx.trim().is_empty() {
                 info!(
                     "Injected unified memory context ({} chars) for task {}",
@@ -1692,9 +1694,8 @@ impl Orchestrator {
             let mem = super::memory::MemorySystem::new();
             let pg = Arc::clone(pg);
             let task_desc = base_prompt.to_string();
-            let mem_ctx = tokio::runtime::Handle::current().block_on(async {
-                mem.build_context_unified(20, &task_desc, &pg).await
-            });
+            let mem_ctx = tokio::runtime::Handle::current()
+                .block_on(async { mem.build_context_unified(20, &task_desc, &pg).await });
             if !mem_ctx.trim().is_empty() {
                 dynamic_blocks.push(mem_ctx);
             }
@@ -2294,11 +2295,7 @@ impl Orchestrator {
     ///
     /// This extracts lessons, curates few-shot examples, tracks template usage,
     /// and triggers GEPA/PRM retrain when thresholds are met.
-    fn run_adaptive_learning(
-        &self,
-        state: &OrchestratorState,
-        result: &TaskCompletionResult,
-    ) {
+    fn run_adaptive_learning(&self, state: &OrchestratorState, result: &TaskCompletionResult) {
         // SQLite removed - no-op
     }
 

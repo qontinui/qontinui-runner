@@ -19,8 +19,7 @@ use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
 use crate::memory::unified_query::{self, MemorySource, UnifiedMemoryQuery};
 use crate::reflection::{
-    fuzzy_matching, graph_engine::KnowledgeGraph,
-    graph_types::GraphSummary, unified_search,
+    fuzzy_matching, graph_engine::KnowledgeGraph, graph_types::GraphSummary, unified_search,
 };
 
 use crate::database::types::{Observation, ObservationSearchResult};
@@ -38,10 +37,7 @@ async fn fetch_observations_for_graph(
     let pg = pg_db;
 
     // Single batch query for full observations (replaces N+1 pattern)
-    let full = pg
-        .get_all_observations_full(500)
-        .await
-        .unwrap_or_default();
+    let full = pg.get_all_observations_full(500).await.unwrap_or_default();
 
     // Build preview versions for load_observations_from_pg (needs content_preview)
     let previews: Vec<ObservationSearchResult> = full
@@ -108,11 +104,7 @@ pub(crate) async fn get_or_build_graph(
         }
     }
 
-    let graph = KnowledgeGraph::build_from_pg(
-        &state.app_state.pg_db,
-        workflow_name,
-    )
-    .await?;
+    let graph = KnowledgeGraph::build_from_pg(&state.app_state.pg_db, workflow_name).await?;
 
     let graph = Arc::new(graph);
 
@@ -195,13 +187,22 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/graph/impact", get(impact_stub_handler))
         .route("/graph/effectiveness", get(effectiveness_stub_handler))
         .route("/graph/ui-failure-chain", get(ui_failure_chain_handler))
-        .route("/graph/ui-fix-effectiveness", get(ui_fix_effectiveness_handler))
+        .route(
+            "/graph/ui-fix-effectiveness",
+            get(ui_fix_effectiveness_handler),
+        )
         .route("/graph/skill-metrics", get(skill_metrics_handler))
         // Unified memory search (RRF fusion across all stores)
         .route("/memory/search", get(memory_search_handler))
         // Explicit cache invalidation endpoints
-        .route("/graph/invalidate-cache", post(invalidate_graph_cache_handler))
-        .route("/memory/invalidate-graph-cache", post(invalidate_graph_cache_handler))
+        .route(
+            "/graph/invalidate-cache",
+            post(invalidate_graph_cache_handler),
+        )
+        .route(
+            "/memory/invalidate-graph-cache",
+            post(invalidate_graph_cache_handler),
+        )
 }
 
 // ============================================================================
@@ -303,10 +304,7 @@ async fn summary_handler(
     let workflow_name = query.workflow_name;
 
     // Pre-fetch observations from PG (async) before the sync graph build
-    let (obs_previews, obs_full) = fetch_observations_for_graph(
-        &state.app_state.pg_db,
-    )
-    .await;
+    let (obs_previews, obs_full) = fetch_observations_for_graph(&state.app_state.pg_db).await;
 
     let has_observations = !obs_previews.is_empty();
 
@@ -315,17 +313,15 @@ async fn summary_handler(
     // version so other handlers benefit.
     // If no observations, use the cached graph directly.
     if has_observations || workflow_name.is_some() {
-        let mut graph = KnowledgeGraph::build_from_pg(
-            &state.app_state.pg_db,
-            workflow_name.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to build graph: {}", e))),
-            )
-        })?;
+        let mut graph =
+            KnowledgeGraph::build_from_pg(&state.app_state.pg_db, workflow_name.as_deref())
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to build graph: {}", e))),
+                    )
+                })?;
 
         if has_observations {
             graph.load_observations_from_pg(&obs_previews);
@@ -427,10 +423,8 @@ async fn cross_run_patterns_handler(
 async fn workflow_versions_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<WorkflowIdQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<graph_ops::WorkflowVersion>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<graph_ops::WorkflowVersion>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
     let versions = state
         .app_state
         .pg_db
@@ -439,10 +433,7 @@ async fn workflow_versions_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to get workflow versions: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to get workflow versions: {}", e))),
             )
         })?;
 
@@ -456,10 +447,8 @@ async fn workflow_versions_handler(
 async fn step_provenance_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<WorkflowIdQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<graph_ops::StepProvenance>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<graph_ops::StepProvenance>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
     let provenance = state
         .app_state
         .pg_db
@@ -468,10 +457,7 @@ async fn step_provenance_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to get step provenance: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to get step provenance: {}", e))),
             )
         })?;
 
@@ -485,10 +471,7 @@ async fn step_provenance_handler(
 async fn rule_influence_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<RuleIdQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<graph_ops::RuleInfluence>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<graph_ops::RuleInfluence>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let influences = state
         .app_state
         .pg_db
@@ -497,10 +480,7 @@ async fn rule_influence_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to get rule influences: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to get rule influences: {}", e))),
             )
         })?;
 
@@ -514,10 +494,8 @@ async fn rule_influence_handler(
 async fn ineffective_rules_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<IneffectiveRulesQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<graph_ops::IneffectiveRule>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<graph_ops::IneffectiveRule>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
     let threshold = query.threshold.unwrap_or(3);
     let rules = state
         .app_state
@@ -527,10 +505,7 @@ async fn ineffective_rules_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to get ineffective rules: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to get ineffective rules: {}", e))),
             )
         })?;
 
@@ -544,10 +519,7 @@ async fn ineffective_rules_handler(
 async fn pipeline_events_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<TaskRunIdQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<graph_ops::PipelineEvent>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<graph_ops::PipelineEvent>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let events = state
         .app_state
         .pg_db
@@ -556,10 +528,7 @@ async fn pipeline_events_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to get pipeline events: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to get pipeline events: {}", e))),
             )
         })?;
 
@@ -573,10 +542,7 @@ async fn pipeline_events_handler(
 async fn phase_stats_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<WorkflowIdQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<graph_ops::PhaseStats>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<graph_ops::PhaseStats>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let stats = state
         .app_state
         .pg_db
@@ -599,10 +565,7 @@ async fn phase_stats_handler(
 async fn detect_patterns_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DetectPatternsQuery>,
-) -> Result<
-    Json<ApiResponse<DetectPatternsResponse>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<DetectPatternsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let (patterns_detected, rules_disabled, fixes_auto_applied) = state
         .app_state
         .pg_db
@@ -611,10 +574,7 @@ async fn detect_patterns_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to detect patterns: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to detect patterns: {}", e))),
             )
         })?;
 
@@ -635,10 +595,8 @@ async fn detect_patterns_handler(
 async fn similar_errors_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SimilarErrorsQuery>,
-) -> Result<
-    Json<ApiResponse<Vec<fuzzy_matching::SimilarError>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+) -> Result<Json<ApiResponse<Vec<fuzzy_matching::SimilarError>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
     let min_similarity = query.min_similarity.unwrap_or(0.6);
     let limit = query.limit.unwrap_or(10);
     let results = state
@@ -649,10 +607,7 @@ async fn similar_errors_handler(
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to find similar errors: {}",
-                    e
-                ))),
+                Json(api_error(format!("Failed to find similar errors: {}", e))),
             )
         })?;
 
@@ -736,8 +691,10 @@ struct UiFailureChainQuery {
 async fn ui_failure_chain_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<UiFailureChainQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::reflection::graph_types::GraphPath>>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<
+    Json<ApiResponse<Vec<crate::reflection::graph_types::GraphPath>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let element_id = query.element_id;
 
     match get_or_build_graph(&state, None).await {
@@ -755,7 +712,9 @@ struct UiFixEffectivenessQuery {
     limit: i64,
 }
 
-fn default_effectiveness_limit() -> i64 { 20 }
+fn default_effectiveness_limit() -> i64 {
+    20
+}
 
 /// GET /graph/ui-fix-effectiveness — ranked fix effectiveness scores.
 async fn ui_fix_effectiveness_handler(

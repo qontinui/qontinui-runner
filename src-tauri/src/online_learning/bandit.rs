@@ -186,7 +186,11 @@ impl<C: ContextEncoder, P: SelectionPolicy> ContextualBandit<C, P> {
 
         debug!(
             "Bandit selected arm '{}' for context '{}' (q={:.4}, visits={}, explore={})",
-            selected_arm, context_key, selected_stats.q_value, selected_stats.visit_count, is_exploration
+            selected_arm,
+            context_key,
+            selected_stats.q_value,
+            selected_stats.visit_count,
+            is_exploration
         );
 
         Some(SelectionResult {
@@ -432,8 +436,7 @@ mod tests {
     #[test]
     fn test_bandit_update_and_exploitation() {
         let policy = EpsilonGreedy::new(0.0, 0.0, 1.0); // No exploration
-        let mut bandit = ContextualBandit::new(IdentityEncoder, policy, 0.1)
-            .with_min_visits(2);
+        let mut bandit = ContextualBandit::new(IdentityEncoder, policy, 0.1).with_min_visits(2);
 
         let arms = vec!["arm_a".to_string(), "arm_b".to_string()];
 
@@ -463,8 +466,7 @@ mod tests {
     #[test]
     fn test_bandit_load_from_rows() {
         let policy = EpsilonGreedy::new(0.0, 0.0, 1.0);
-        let mut bandit = ContextualBandit::new(IdentityEncoder, policy, 0.1)
-            .with_min_visits(1);
+        let mut bandit = ContextualBandit::new(IdentityEncoder, policy, 0.1).with_min_visits(1);
 
         bandit.load_from_rows(vec![
             ("ctx".to_string(), "arm_a".to_string(), 0.3, 5, 0.5),

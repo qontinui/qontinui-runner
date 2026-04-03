@@ -378,8 +378,7 @@ pub(super) fn run_claude_api_cached(
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
 
-    let mut builder =
-        CacheAwareRequestBuilder::from_structured_prompt(prompt, model, max_tokens);
+    let mut builder = CacheAwareRequestBuilder::from_structured_prompt(prompt, model, max_tokens);
     if let Some(temp) = temperature_override {
         builder = builder.temperature(temp);
     }
@@ -501,7 +500,13 @@ pub(super) fn run_claude_api_with_structured_output(
     // The tool name is derived from the schema name, sanitized for Claude's requirements.
     let tool_name = schema_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
 
     let tool_def = serde_json::json!({

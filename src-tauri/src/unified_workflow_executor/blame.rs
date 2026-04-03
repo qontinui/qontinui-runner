@@ -37,19 +37,16 @@ static RE_FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Rust compiler style: `--> path/to/file.rs:10:5`
-static RE_RUST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"-->\s+([\w./\-]+\.(?:rs|toml)):(\d+)"#).unwrap()
-});
+static RE_RUST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"-->\s+([\w./\-]+\.(?:rs|toml)):(\d+)"#).unwrap());
 
 /// TypeScript compiler style: `path/to/file.ts(10,5)`
-static RE_TS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"([\w./\-]+\.(?:tsx|jsx|ts|js))\((\d+),(\d+)\)"#).unwrap()
-});
+static RE_TS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"([\w./\-]+\.(?:tsx|jsx|ts|js))\((\d+),(\d+)\)"#).unwrap());
 
 /// Python traceback style: `File "path/to/file.py", line 10`
-static RE_PY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"File\s+"([\w./\-]+\.py)""#).unwrap()
-});
+static RE_PY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"File\s+"([\w./\-]+\.py)""#).unwrap());
 
 /// Webpack/Vite style: `ERROR in ./src/App.tsx`
 static RE_WEBPACK: LazyLock<Regex> = LazyLock::new(|| {
@@ -217,10 +214,8 @@ fn attribute_step_failure(
         if let Some((iteration, diff)) =
             find_most_recent_modifier(mentioned_file, accumulated_diffs)
         {
-            let change_summary = format!(
-                "Modified in iteration {} ({})",
-                iteration, diff.diff_stat
-            );
+            let change_summary =
+                format!("Modified in iteration {} ({})", iteration, diff.diff_stat);
             let lines_changed = extract_hunk_lines_for_file(mentioned_file, &diff.diff_summary);
             implicated.push(ImplicatedChange {
                 file_path: mentioned_file.clone(),
@@ -374,7 +369,10 @@ fn extract_hunk_lines_for_file(file_path: &str, diff_summary: &str) -> Option<(u
             let hunk_re = Regex::new(r#"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"#).unwrap();
             if let Some(caps) = hunk_re.captures(line) {
                 let start: usize = caps[1].parse().unwrap_or(0);
-                let count: usize = caps.get(2).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
+                let count: usize = caps
+                    .get(2)
+                    .map(|m| m.as_str().parse().unwrap_or(1))
+                    .unwrap_or(1);
                 return Some((start, start + count));
             }
         }
@@ -701,11 +699,7 @@ impl EscalationPolicy {
 ///
 /// This feeds into `cross_run_learning.rs` — if the same file is blamed across
 /// multiple runs, it's a systemic issue worth surfacing as a pattern.
-pub fn record_blame_as_causal_events(
-    task_run_id: &str,
-    workflow_name: &str,
-    report: &BlameReport,
-) {
+pub fn record_blame_as_causal_events(task_run_id: &str, workflow_name: &str, report: &BlameReport) {
     for attr in &report.attributions {
         let cause_id = format!("iter-{}-change", attr.blamed_iteration);
         let effect_id = format!("verification-{}", attr.failed_step);
@@ -779,9 +773,17 @@ pub fn record_blame_as_causal_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::step_executor::{StepExecutionConfig, StepExecutionResult, VerificationPhaseResult, VerificationStepDetails};
+    use crate::step_executor::{
+        StepExecutionConfig, StepExecutionResult, VerificationPhaseResult, VerificationStepDetails,
+    };
 
-    fn make_step_result(name: &str, success: bool, stdout: Option<&str>, stderr: Option<&str>, error: Option<&str>) -> StepExecutionResult {
+    fn make_step_result(
+        name: &str,
+        success: bool,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+        error: Option<&str>,
+    ) -> StepExecutionResult {
         StepExecutionResult {
             step_index: 0,
             step_type: "command".to_string(),
@@ -841,7 +843,11 @@ mod tests {
             None,
         );
         let paths = extract_file_paths(&step);
-        assert!(paths.contains("src/components/Card.tsx"), "paths: {:?}", paths);
+        assert!(
+            paths.contains("src/components/Card.tsx"),
+            "paths: {:?}",
+            paths
+        );
     }
 
     #[test]
@@ -893,8 +899,15 @@ mod tests {
             None,
         );
         let paths = extract_file_paths(&step);
-        assert!(!paths.is_empty(), "no paths extracted; expected src/components/Card.tsx");
-        assert!(paths.contains("src/components/Card.tsx"), "paths: {:?}", paths);
+        assert!(
+            !paths.is_empty(),
+            "no paths extracted; expected src/components/Card.tsx"
+        );
+        assert!(
+            paths.contains("src/components/Card.tsx"),
+            "paths: {:?}",
+            paths
+        );
     }
 
     #[test]
@@ -1050,10 +1063,10 @@ mod tests {
         assert!(!policy.should_warn(2));
         assert!(policy.should_warn(3));
         assert!(!policy.should_rethink(4));
-        assert!(policy.should_rethink(5));  // fires at threshold
+        assert!(policy.should_rethink(5)); // fires at threshold
         assert!(!policy.should_rethink(6)); // skipped (1 past threshold)
         assert!(!policy.should_rethink(7)); // skipped (2 past threshold)
-        assert!(policy.should_rethink(8));  // fires again (3 past threshold)
+        assert!(policy.should_rethink(8)); // fires again (3 past threshold)
     }
 
     #[test]
@@ -1145,21 +1158,45 @@ mod tests {
         let report = analyze_blame(&verification, &diffs, 3);
 
         // Should have exactly 1 attribution
-        assert_eq!(report.attributions.len(), 1, "Expected 1 attribution, got {:?}", report.attributions);
+        assert_eq!(
+            report.attributions.len(),
+            1,
+            "Expected 1 attribution, got {:?}",
+            report.attributions
+        );
 
         let attr = &report.attributions[0];
         assert_eq!(attr.failed_step, "CSS layout check");
-        assert_eq!(attr.blamed_iteration, 2, "Should blame iteration 2 (when Card.tsx was modified)");
-        assert!(attr.confidence >= 0.8, "Single file explicit match should be high confidence, got {}", attr.confidence);
+        assert_eq!(
+            attr.blamed_iteration, 2,
+            "Should blame iteration 2 (when Card.tsx was modified)"
+        );
+        assert!(
+            attr.confidence >= 0.8,
+            "Single file explicit match should be high confidence, got {}",
+            attr.confidence
+        );
         assert_eq!(attr.implicated_changes.len(), 1);
-        assert_eq!(attr.implicated_changes[0].file_path, "src/components/Card.tsx");
+        assert_eq!(
+            attr.implicated_changes[0].file_path,
+            "src/components/Card.tsx"
+        );
         assert_eq!(attr.implicated_changes[0].iteration_introduced, 2);
 
         // Format and verify the context contains actionable info
         let context = format_blame_context(&report);
-        assert!(context.contains("Iteration 2"), "Context should mention blamed iteration");
-        assert!(context.contains("Card.tsx"), "Context should mention the file");
-        assert!(context.contains("High"), "Context should show high confidence");
+        assert!(
+            context.contains("Iteration 2"),
+            "Context should mention blamed iteration"
+        );
+        assert!(
+            context.contains("Card.tsx"),
+            "Context should mention the file"
+        );
+        assert!(
+            context.contains("High"),
+            "Context should show high confidence"
+        );
     }
 
     /// Simulate multiple failures from the same iteration — both a TS compilation
@@ -1167,7 +1204,14 @@ mod tests {
     #[test]
     fn test_integration_multi_failure_single_blamed_iteration() {
         let diffs = vec![
-            make_diff(1, vec!["src/types/index.ts", "src/components/Card.tsx", "src/styles/main.css"]),
+            make_diff(
+                1,
+                vec![
+                    "src/types/index.ts",
+                    "src/components/Card.tsx",
+                    "src/styles/main.css",
+                ],
+            ),
             make_diff(2, vec!["src/utils/helpers.ts"]),
         ];
 
@@ -1208,13 +1252,19 @@ mod tests {
         // Both failures should be attributed to iteration 1
         assert_eq!(report.attributions.len(), 2);
         for attr in &report.attributions {
-            assert_eq!(attr.blamed_iteration, 1,
+            assert_eq!(
+                attr.blamed_iteration, 1,
                 "Step '{}' should blame iteration 1, got {}",
-                attr.failed_step, attr.blamed_iteration);
+                attr.failed_step, attr.blamed_iteration
+            );
         }
 
         // TS step has 2 files from iteration 1 → very high confidence
-        let ts_attr = report.attributions.iter().find(|a| a.failed_step == "TypeScript compilation").unwrap();
+        let ts_attr = report
+            .attributions
+            .iter()
+            .find(|a| a.failed_step == "TypeScript compilation")
+            .unwrap();
         assert!(ts_attr.confidence >= 0.9);
         assert!(ts_attr.implicated_changes.len() >= 2);
     }
@@ -1260,16 +1310,28 @@ mod tests {
         assert_eq!(report.attributions[0].blamed_iteration, 3);
 
         // Should detect oscillation on Card.tsx (modified in 3 consecutive iterations)
-        assert!(!report.oscillating_files.is_empty(), "Should detect oscillation");
+        assert!(
+            !report.oscillating_files.is_empty(),
+            "Should detect oscillation"
+        );
         let osc = &report.oscillating_files[0];
         assert_eq!(osc.file_path, "src/components/Card.tsx");
         assert_eq!(osc.consecutive_blames, 3);
 
         // The formatted context should include both blame and oscillation warnings
         let context = format_blame_context(&report);
-        assert!(context.contains("Failure Attribution"), "Should have attribution section");
-        assert!(context.contains("STOP: File Oscillation"), "Should have oscillation warning");
-        assert!(context.contains("Card.tsx"), "Should mention the oscillating file");
+        assert!(
+            context.contains("Failure Attribution"),
+            "Should have attribution section"
+        );
+        assert!(
+            context.contains("STOP: File Oscillation"),
+            "Should have oscillation warning"
+        );
+        assert!(
+            context.contains("Card.tsx"),
+            "Should mention the oscillating file"
+        );
     }
 
     /// Test escalation policy thresholds.
@@ -1344,8 +1406,14 @@ mod tests {
 
         // Should still produce a blame (low confidence, most recent iteration)
         assert_eq!(report.attributions.len(), 1);
-        assert_eq!(report.attributions[0].blamed_iteration, 2, "Should blame most recent iteration");
-        assert!(report.attributions[0].confidence <= 0.4, "No file match → low confidence");
+        assert_eq!(
+            report.attributions[0].blamed_iteration, 2,
+            "Should blame most recent iteration"
+        );
+        assert!(
+            report.attributions[0].confidence <= 0.4,
+            "No file match → low confidence"
+        );
         assert!(report.attributions[0].implicated_changes.is_empty());
     }
 }

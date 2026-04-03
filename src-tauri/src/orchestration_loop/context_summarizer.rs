@@ -72,8 +72,11 @@ impl ContextSummarizer {
 
     /// Estimate total tokens across all stored iteration contexts and summaries.
     pub fn total_token_estimate(&self) -> usize {
-        let iteration_tokens: usize =
-            self.iteration_contexts.iter().map(|c| c.token_estimate).sum();
+        let iteration_tokens: usize = self
+            .iteration_contexts
+            .iter()
+            .map(|c| c.token_estimate)
+            .sum();
         let summary_tokens: usize = self
             .prior_summaries
             .iter()
@@ -131,7 +134,10 @@ impl ContextSummarizer {
                 ));
             }
             if !ctx.fixes_applied.is_empty() {
-                context_text.push_str(&format!("Fixes applied: {}\n", ctx.fixes_applied.join("; ")));
+                context_text.push_str(&format!(
+                    "Fixes applied: {}\n",
+                    ctx.fixes_applied.join("; ")
+                ));
             }
             context_text.push_str(&format!("Exit reason: {}\n", ctx.exit_check_reason));
         }
@@ -173,7 +179,9 @@ impl ContextSummarizer {
 
         info!(
             "Context summarizer: compressing iterations {:?} ({} -> {} tokens)",
-            summary.iterations_summarized, summary.original_token_count, summary.summary_token_count
+            summary.iterations_summarized,
+            summary.original_token_count,
+            summary.summary_token_count
         );
 
         // Remove summarized iterations, keep the last N
@@ -334,7 +342,12 @@ pub fn estimate_tokens(text: &str) -> usize {
 mod tests {
     use super::*;
 
-    fn make_config(enabled: bool, threshold_pct: f32, budget: usize, preserve: u32) -> SummarizationConfig {
+    fn make_config(
+        enabled: bool,
+        threshold_pct: f32,
+        budget: usize,
+        preserve: u32,
+    ) -> SummarizationConfig {
         SummarizationConfig {
             enabled,
             token_threshold_pct: threshold_pct,

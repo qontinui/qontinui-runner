@@ -158,7 +158,10 @@ mod tests {
 
     #[test]
     fn test_truncate_smart_paragraph() {
-        let content = format!("First paragraph.\n\nSecond paragraph.\n\n{}", "x".repeat(3000));
+        let content = format!(
+            "First paragraph.\n\nSecond paragraph.\n\n{}",
+            "x".repeat(3000)
+        );
         let result = truncate_smart(&content, 80);
         assert!(result.contains("First paragraph."));
         assert!(result.contains("Second paragraph."));

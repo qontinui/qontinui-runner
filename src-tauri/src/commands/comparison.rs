@@ -132,7 +132,9 @@ pub async fn start_comparison(
         let ejs_pg = ejs.clone();
         let status_pg = new_status.to_string();
         tokio::spawn(async move {
-            let _ = pg_db.update_comparison_entries(&comp_id_pg, &ejs_pg, &status_pg).await;
+            let _ = pg_db
+                .update_comparison_entries(&comp_id_pg, &ejs_pg, &status_pg)
+                .await;
         });
     });
 
@@ -153,9 +155,15 @@ pub async fn get_comparison_status(
 
     let id = cmp_json["id"].as_str().unwrap_or("").to_string();
     let workflow_id = cmp_json["workflow_id"].as_str().unwrap_or("").to_string();
-    let variation_type = cmp_json["variation_type"].as_str().unwrap_or("").to_string();
+    let variation_type = cmp_json["variation_type"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let status = cmp_json["status"].as_str().unwrap_or("").to_string();
-    let entries_json_str = cmp_json["entries_json"].as_str().unwrap_or("[]").to_string();
+    let entries_json_str = cmp_json["entries_json"]
+        .as_str()
+        .unwrap_or("[]")
+        .to_string();
     let report: Option<String> = cmp_json["report"].as_str().map(|s| s.to_string());
     let created_at = cmp_json["created_at"].as_str().unwrap_or("").to_string();
     let completed_at: Option<String> = cmp_json["completed_at"].as_str().map(|s| s.to_string());
@@ -209,10 +217,7 @@ pub async fn get_comparison_status(
     // Auto-complete if all done
     let final_status = if all_done && status == "running" {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = app_state
-            .pg_db
-            .complete_comparison(&id, &entries_str)
-            .await;
+        let _ = app_state.pg_db.complete_comparison(&id, &entries_str).await;
         "completed".to_string()
     } else {
         status

@@ -193,10 +193,7 @@ fn insert_entry(entry: &PlaybookEntry) -> Result<(), String> {
 // row_to_entry removed (SQLite dead code)
 
 /// Query active entries, optionally filtered by domain.
-fn query_active_entries(
-    domain: Option<&str>,
-    limit: usize,
-) -> Result<Vec<PlaybookEntry>, String> {
+fn query_active_entries(domain: Option<&str>, limit: usize) -> Result<Vec<PlaybookEntry>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -206,17 +203,12 @@ fn query_non_retired_entries() -> Result<Vec<PlaybookEntry>, String> {
 }
 
 /// Merge a new entry into an existing one: bump `times_applied`, escalate severity if needed.
-fn merge_into_existing(
-    existing_id: &str,
-    new_severity: LessonSeverity,
-) -> Result<(), String> {
+fn merge_into_existing(existing_id: &str, new_severity: LessonSeverity) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Retire entries that have been applied 10+ times but helped less than the threshold ratio.
-fn retire_underperforming_entries(
-    threshold: f64,
-) -> Result<usize, String> {
+fn retire_underperforming_entries(threshold: f64) -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -349,18 +341,13 @@ impl PlaybookCurator {
     /// New entries that are textually similar to existing entries get merged
     /// (bumping `times_applied` and potentially escalating severity). Truly novel
     /// entries are inserted and promoted to `Active` status.
-    pub fn curate(
-        &self,
-        new_entries: Vec<PlaybookEntry>,
-    ) -> Result<CurationResult, String> {
+    pub fn curate(&self, new_entries: Vec<PlaybookEntry>) -> Result<CurationResult, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Retire entries that have been applied 10+ times but helped less than
     /// the `retirement_threshold` ratio.
-    pub fn retire_underperforming(
-        &self,
-    ) -> Result<usize, String> {
+    pub fn retire_underperforming(&self) -> Result<usize, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -399,12 +386,9 @@ fn find_similar_entry<'a>(
         }
 
         let new_lower = new_lesson.to_lowercase();
-        let new_words_set: std::collections::HashSet<&str> =
-            new_lower.split_whitespace().collect();
+        let new_words_set: std::collections::HashSet<&str> = new_lower.split_whitespace().collect();
 
-        let intersection = existing_words
-            .intersection(&new_words_set)
-            .count();
+        let intersection = existing_words.intersection(&new_words_set).count();
         let union = existing_words.union(&new_words_set).count();
 
         if union > 0 {

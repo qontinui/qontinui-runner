@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 use uuid::Uuid;
 
-
 // ============================================================================
 // Schedule Expression Types
 // ============================================================================
@@ -39,11 +38,15 @@ pub struct ConditionScheduleConfig {
 
 impl Default for ConditionScheduleConfig {
     fn default() -> Self {
-        Self { rearm_delay_minutes: default_rearm_delay() }
+        Self {
+            rearm_delay_minutes: default_rearm_delay(),
+        }
     }
 }
 
-fn default_rearm_delay() -> u32 { 60 }
+fn default_rearm_delay() -> u32 {
+    60
+}
 
 impl Default for ScheduleExpression {
     fn default() -> Self {
@@ -526,10 +529,7 @@ pub fn delete_task(id: &str) -> Result<(), String> {
 }
 
 /// Record an execution
-pub fn record_execution(
-    task_id: &str,
-    record: TaskExecutionRecord,
-) -> Result<(), String> {
+pub fn record_execution(task_id: &str, record: TaskExecutionRecord) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -539,10 +539,7 @@ pub fn get_task_history(task_id: &str) -> Vec<TaskExecutionRecord> {
 }
 
 /// Update the condition status for a task
-pub fn update_task_condition_status(
-    task_id: &str,
-    status: ConditionStatus,
-) -> Result<(), String> {
+pub fn update_task_condition_status(task_id: &str, status: ConditionStatus) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -563,9 +560,7 @@ pub fn get_scheduler_settings() -> SchedulerSettings {
 }
 
 /// Update scheduler settings
-pub fn update_scheduler_settings(
-    settings: SchedulerSettings,
-) -> Result<(), String> {
+pub fn update_scheduler_settings(settings: SchedulerSettings) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 
@@ -617,9 +612,7 @@ pub fn compute_next_run(
             // Next run is from + interval
             Some(from + chrono::Duration::seconds(*seconds as i64))
         }
-        ScheduleExpression::Condition(_) => {
-            Some(from)
-        }
+        ScheduleExpression::Condition(_) => Some(from),
     }
 }
 
@@ -651,7 +644,10 @@ mod tests {
         let schedule = ScheduleExpression::Cron("0 3 * * *".to_string());
         let now = chrono::Utc::now();
         let next = compute_next_run(&schedule, now);
-        assert!(next.is_some(), "5-field cron '0 3 * * *' should be normalized and parsed");
+        assert!(
+            next.is_some(),
+            "5-field cron '0 3 * * *' should be normalized and parsed"
+        );
     }
 
     #[test]

@@ -1,10 +1,16 @@
 //! PostgreSQL workflow execution state operations via Clorinde-generated queries.
 
 use super::PgDb;
-use crate::workflow_state::{StepCheckpoint, StepCheckpointStatus, StepProgressMarker, WorkflowExecutionStateRecord};
+use crate::workflow_state::{
+    StepCheckpoint, StepCheckpointStatus, StepProgressMarker, WorkflowExecutionStateRecord,
+};
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// Map a Clorinde step checkpoint row to the domain type.
@@ -16,9 +22,17 @@ macro_rules! row_to_step_checkpoint {
             execution_id: $r.execution_id,
             workflow_type: $r.workflow_type,
             phase: $r.phase,
-            iteration: if $r.iteration == 0 { None } else { Some($r.iteration as u32) },
+            iteration: if $r.iteration == 0 {
+                None
+            } else {
+                Some($r.iteration as u32)
+            },
             step_index: $r.step_index as usize,
-            stage_index: if $r.stage_index == 0 { None } else { Some($r.stage_index as u32) },
+            stage_index: if $r.stage_index == 0 {
+                None
+            } else {
+                Some($r.stage_index as u32)
+            },
             step_type: $r.step_type,
             step_name: non_empty($r.step_name),
             status,
@@ -26,7 +40,11 @@ macro_rules! row_to_step_checkpoint {
             step_config_json: non_empty($r.step_config_json),
             started_at: non_empty($r.started_at),
             completed_at: non_empty($r.completed_at),
-            duration_ms: if $r.duration_ms == 0 { None } else { Some($r.duration_ms as i64) },
+            duration_ms: if $r.duration_ms == 0 {
+                None
+            } else {
+                Some($r.duration_ms as i64)
+            },
             error: non_empty($r.error),
         }
     }};
@@ -43,7 +61,11 @@ impl PgDb {
         phase: Option<&str>,
         iteration: Option<u32>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32: Option<i32> = iteration.map(|i| i as i32);
 
         conn.execute(
@@ -77,7 +99,11 @@ impl PgDb {
         &self,
         execution_id: &str,
     ) -> Result<Option<WorkflowExecutionStateRecord>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::workflow_state::get_workflow_execution_state()
             .bind(&conn, &execution_id)
             .opt()
@@ -90,7 +116,11 @@ impl PgDb {
             state_name: r.state_name,
             state_data: non_empty(r.state_data),
             phase: non_empty(r.phase),
-            iteration: if r.iteration == 0 { None } else { Some(r.iteration as u32) },
+            iteration: if r.iteration == 0 {
+                None
+            } else {
+                Some(r.iteration as u32)
+            },
             updated_at: r.updated_at.to_rfc3339(),
         }))
     }
@@ -102,23 +132,33 @@ impl PgDb {
         cursor: Option<i64>,
         limit: usize,
     ) -> Result<(Vec<StepCheckpoint>, Option<i64>), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let fetch_limit = (limit + 1) as i64; // Fetch one extra to detect more results
 
         let checkpoints: Vec<StepCheckpoint> = if let Some(cursor_val) = cursor {
-            let rows = qontinui_db::queries::workflow_state::get_step_checkpoints_paginated_with_cursor()
-                .bind(&conn, &execution_id, &(cursor_val as i32), &fetch_limit)
-                .all()
-                .await
-                .map_err(|e| format!("PG get_step_checkpoints: {}", e))?;
-            rows.into_iter().map(|r| row_to_step_checkpoint!(r)).collect()
+            let rows =
+                qontinui_db::queries::workflow_state::get_step_checkpoints_paginated_with_cursor()
+                    .bind(&conn, &execution_id, &(cursor_val as i32), &fetch_limit)
+                    .all()
+                    .await
+                    .map_err(|e| format!("PG get_step_checkpoints: {}", e))?;
+            rows.into_iter()
+                .map(|r| row_to_step_checkpoint!(r))
+                .collect()
         } else {
-            let rows = qontinui_db::queries::workflow_state::get_step_checkpoints_paginated_no_cursor()
-                .bind(&conn, &execution_id, &fetch_limit)
-                .all()
-                .await
-                .map_err(|e| format!("PG get_step_checkpoints: {}", e))?;
-            rows.into_iter().map(|r| row_to_step_checkpoint!(r)).collect()
+            let rows =
+                qontinui_db::queries::workflow_state::get_step_checkpoints_paginated_no_cursor()
+                    .bind(&conn, &execution_id, &fetch_limit)
+                    .all()
+                    .await
+                    .map_err(|e| format!("PG get_step_checkpoints: {}", e))?;
+            rows.into_iter()
+                .map(|r| row_to_step_checkpoint!(r))
+                .collect()
         };
 
         // Determine next cursor
@@ -137,7 +177,11 @@ impl PgDb {
         &self,
         execution_id: &str,
     ) -> Result<Option<StepProgressMarker>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Find the running checkpoint
         let running_id = qontinui_db::queries::workflow_state::get_running_checkpoint_id()
@@ -149,18 +193,23 @@ impl PgDb {
         match running_id {
             Some(checkpoint_id) => {
                 let cp_opt: Option<&str> = Some(checkpoint_id.as_str());
-                let marker = qontinui_db::queries::workflow_state::get_latest_step_progress_marker()
-                    .bind(&conn, &cp_opt)
-                    .opt()
-                    .await
-                    .map_err(|e| format!("PG get_latest_progress: {}", e))?;
+                let marker =
+                    qontinui_db::queries::workflow_state::get_latest_step_progress_marker()
+                        .bind(&conn, &cp_opt)
+                        .opt()
+                        .await
+                        .map_err(|e| format!("PG get_latest_progress: {}", e))?;
 
                 Ok(marker.map(|r| StepProgressMarker {
                     id: r.id,
                     checkpoint_id: r.checkpoint_id,
                     marker_type: r.marker_type,
                     current_value: r.current_value as u64,
-                    total_value: if r.total_value == 0 { None } else { Some(r.total_value as u64) },
+                    total_value: if r.total_value == 0 {
+                        None
+                    } else {
+                        Some(r.total_value as u64)
+                    },
                     description: non_empty(r.description),
                     data_json: non_empty(r.data_json),
                     created_at: r.created_at.to_rfc3339(),
@@ -183,7 +232,11 @@ impl PgDb {
         description: Option<&str>,
         data_json: Option<&str>,
     ) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let current_i64 = current_value as i64;
         let total_i64: Option<i64> = total_value.map(|v| v as i64);
 
@@ -215,15 +268,40 @@ impl PgDb {
         iteration: u32,
         result: &serde_json::Value,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let all_passed = result.get("all_passed").and_then(|v| v.as_bool()).unwrap_or(false);
-        let total_steps = result.get("total_steps").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-        let passed_steps = result.get("passed_steps").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-        let failed_steps = result.get("failed_steps").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-        let skipped_steps = result.get("skipped_steps").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
-        let total_duration_ms = result.get("total_duration_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-        let critical_failure = result.get("critical_failure").and_then(|v| v.as_bool()).unwrap_or(false);
+        let all_passed = result
+            .get("all_passed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let total_steps = result
+            .get("total_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let passed_steps = result
+            .get("passed_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let failed_steps = result
+            .get("failed_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let skipped_steps = result
+            .get("skipped_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let total_duration_ms = result
+            .get("total_duration_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let critical_failure = result
+            .get("critical_failure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let result_json = serde_json::to_string(result)
             .map_err(|e| format!("Failed to serialize verification result: {}", e))?;
         let iter_i32 = iteration as i32;
@@ -261,9 +339,17 @@ impl PgDb {
                     failed_steps, skipped_steps, total_duration_ms, critical_failure, result_json)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
                 &[
-                    &new_id, &task_run_id, &iter_i32,
-                    &all_passed, &total_steps, &passed_steps, &failed_steps,
-                    &skipped_steps, &total_duration_ms, &critical_failure, &result_json,
+                    &new_id,
+                    &task_run_id,
+                    &iter_i32,
+                    &all_passed,
+                    &total_steps,
+                    &passed_steps,
+                    &failed_steps,
+                    &skipped_steps,
+                    &total_duration_ms,
+                    &critical_failure,
+                    &result_json,
                 ],
             )
             .await
@@ -273,7 +359,11 @@ impl PgDb {
 
         tracing::info!(
             "Stored verification phase result for task {} iteration {}: all_passed={}, {}/{} steps",
-            task_run_id, iteration, all_passed, passed_steps, total_steps
+            task_run_id,
+            iteration,
+            all_passed,
+            passed_steps,
+            total_steps
         );
         Ok(id)
     }
@@ -284,7 +374,11 @@ impl PgDb {
         task_run_id: &str,
         iteration: u32,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32 = iteration as i32;
 
         let row = conn
@@ -313,7 +407,11 @@ impl PgDb {
         iteration: u32,
         results: &[crate::constraint_engine::ConstraintResult],
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i64 = iteration as i64;
 
         // Delete existing results for this (task_run_id, iteration)
@@ -357,7 +455,10 @@ impl PgDb {
         let failed_count = results.iter().filter(|r| !r.passed).count();
         tracing::info!(
             "Stored {} constraint results for task {} iteration {} ({} failed)",
-            results.len(), task_run_id, iteration, failed_count
+            results.len(),
+            task_run_id,
+            iteration,
+            failed_count
         );
         Ok(())
     }
@@ -372,9 +473,8 @@ impl PgDb {
         checkpoint: &StepCheckpoint,
     ) -> Result<(), String> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                self.save_workflow_step_checkpoint_async(checkpoint),
-            )
+            tokio::runtime::Handle::current()
+                .block_on(self.save_workflow_step_checkpoint_async(checkpoint))
         })
     }
 
@@ -383,7 +483,11 @@ impl PgDb {
         &self,
         checkpoint: &StepCheckpoint,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32: Option<i32> = checkpoint.iteration.map(|i| i as i32);
         let step_index_i32 = checkpoint.step_index as i32;
         let stage_index_i32: Option<i32> = checkpoint.stage_index.map(|i| i as i32);
@@ -437,9 +541,11 @@ impl PgDb {
         iteration: Option<u32>,
     ) -> Result<Vec<StepCheckpoint>, String> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                self.get_workflow_step_checkpoints_by_phase(execution_id, phase, iteration),
-            )
+            tokio::runtime::Handle::current().block_on(self.get_workflow_step_checkpoints_by_phase(
+                execution_id,
+                phase,
+                iteration,
+            ))
         })
     }
 
@@ -450,7 +556,11 @@ impl PgDb {
         phase: &str,
         iteration: Option<u32>,
     ) -> Result<Vec<StepCheckpoint>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32: Option<i32> = iteration.map(|i| i as i32);
 
         let rows = if let Some(iter_val) = iter_i32 {
@@ -462,7 +572,8 @@ impl PgDb {
                    WHERE execution_id = $1 AND phase = $2 AND iteration = $3
                    ORDER BY step_index ASC"#,
                 &[&execution_id, &phase, &iter_val],
-            ).await
+            )
+            .await
         } else {
             conn.query(
                 r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
@@ -472,36 +583,41 @@ impl PgDb {
                    WHERE execution_id = $1 AND phase = $2 AND iteration IS NULL
                    ORDER BY step_index ASC"#,
                 &[&execution_id, &phase],
-            ).await
-        }.map_err(|e| format!("PG get_workflow_step_checkpoints_by_phase: {}", e))?;
+            )
+            .await
+        }
+        .map_err(|e| format!("PG get_workflow_step_checkpoints_by_phase: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| {
-            let status_str: String = r.get(9);
-            let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
-            let iter_raw: Option<i32> = r.get(4);
-            let step_idx: i32 = r.get(5);
-            let stage_idx: Option<i32> = r.get(6);
-            let dur: Option<i64> = r.get(14);
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let status_str: String = r.get(9);
+                let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
+                let iter_raw: Option<i32> = r.get(4);
+                let step_idx: i32 = r.get(5);
+                let stage_idx: Option<i32> = r.get(6);
+                let dur: Option<i64> = r.get(14);
 
-            StepCheckpoint {
-                id: r.get(0),
-                execution_id: r.get(1),
-                workflow_type: r.get(2),
-                phase: r.get(3),
-                iteration: iter_raw.map(|i| i as u32),
-                step_index: step_idx as usize,
-                stage_index: stage_idx.map(|i| i as u32),
-                step_type: r.get(7),
-                step_name: r.get(8),
-                status,
-                result_json: r.get(10),
-                step_config_json: r.get(11),
-                started_at: r.get(12),
-                completed_at: r.get(13),
-                duration_ms: dur,
-                error: r.get(15),
-            }
-        }).collect())
+                StepCheckpoint {
+                    id: r.get(0),
+                    execution_id: r.get(1),
+                    workflow_type: r.get(2),
+                    phase: r.get(3),
+                    iteration: iter_raw.map(|i| i as u32),
+                    step_index: step_idx as usize,
+                    stage_index: stage_idx.map(|i| i as u32),
+                    step_type: r.get(7),
+                    step_name: r.get(8),
+                    status,
+                    result_json: r.get(10),
+                    step_config_json: r.get(11),
+                    started_at: r.get(12),
+                    completed_at: r.get(13),
+                    duration_ms: dur,
+                    error: r.get(15),
+                }
+            })
+            .collect())
     }
 
     /// Get all workflow step checkpoints for an execution (async).
@@ -509,44 +625,54 @@ impl PgDb {
         &self,
         execution_id: &str,
     ) -> Result<Vec<StepCheckpoint>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, execution_id, workflow_type, phase, iteration, step_index,
                       stage_index, step_type, step_name, status, result_json, step_config_json,
                       started_at, completed_at, duration_ms, error
                FROM workflow_step_checkpoints
                WHERE execution_id = $1
                ORDER BY step_index ASC"#,
-            &[&execution_id],
-        ).await.map_err(|e| format!("PG get_all_workflow_step_checkpoints: {}", e))?;
+                &[&execution_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_all_workflow_step_checkpoints: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| {
-            let status_str: String = r.get(9);
-            let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
-            let iter_raw: Option<i32> = r.get(4);
-            let step_idx: i32 = r.get(5);
-            let stage_idx: Option<i32> = r.get(6);
-            let dur: Option<i64> = r.get(14);
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let status_str: String = r.get(9);
+                let status = status_str.parse().unwrap_or(StepCheckpointStatus::Pending);
+                let iter_raw: Option<i32> = r.get(4);
+                let step_idx: i32 = r.get(5);
+                let stage_idx: Option<i32> = r.get(6);
+                let dur: Option<i64> = r.get(14);
 
-            StepCheckpoint {
-                id: r.get(0),
-                execution_id: r.get(1),
-                workflow_type: r.get(2),
-                phase: r.get(3),
-                iteration: iter_raw.map(|i| i as u32),
-                step_index: step_idx as usize,
-                stage_index: stage_idx.map(|i| i as u32),
-                step_type: r.get(7),
-                step_name: r.get(8),
-                status,
-                result_json: r.get(10),
-                step_config_json: r.get(11),
-                started_at: r.get(12),
-                completed_at: r.get(13),
-                duration_ms: dur,
-                error: r.get(15),
-            }
-        }).collect())
+                StepCheckpoint {
+                    id: r.get(0),
+                    execution_id: r.get(1),
+                    workflow_type: r.get(2),
+                    phase: r.get(3),
+                    iteration: iter_raw.map(|i| i as u32),
+                    step_index: step_idx as usize,
+                    stage_index: stage_idx.map(|i| i as u32),
+                    step_type: r.get(7),
+                    step_name: r.get(8),
+                    status,
+                    result_json: r.get(10),
+                    step_config_json: r.get(11),
+                    started_at: r.get(12),
+                    completed_at: r.get(13),
+                    duration_ms: dur,
+                    error: r.get(15),
+                }
+            })
+            .collect())
     }
 
     /// Delete workflow step checkpoints (sync wrapper).
@@ -557,9 +683,11 @@ impl PgDb {
         iteration: Option<u32>,
     ) -> Result<(), String> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                self.delete_workflow_step_checkpoints_async(execution_id, phase, iteration),
-            )
+            tokio::runtime::Handle::current().block_on(self.delete_workflow_step_checkpoints_async(
+                execution_id,
+                phase,
+                iteration,
+            ))
         })
     }
 
@@ -570,7 +698,11 @@ impl PgDb {
         phase: Option<&str>,
         iteration: Option<u32>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iter_i32: Option<i32> = iteration.map(|i| i as i32);
 
         match (phase, iter_i32) {

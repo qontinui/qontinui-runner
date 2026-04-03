@@ -826,7 +826,9 @@ impl MemorySystem {
         items.sort_by(|a, b| {
             let score_a = importance_recency_score(a, &now);
             let score_b = importance_recency_score(b, &now);
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let selected: Vec<&MemoryItem> = items.into_iter().take(max_items).collect();

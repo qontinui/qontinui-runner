@@ -6,16 +6,17 @@
 
 use tracing::debug;
 
-use crate::autoresearch::agentic_verification::{
-    PipelineAgentTrace, PipelineCheckpoint,
-};
+use crate::autoresearch::agentic_verification::{PipelineAgentTrace, PipelineCheckpoint};
 
 /// Save a batch of pipeline agent traces from a completed pipeline run.
 pub fn save_pipeline_agent_traces(
     _task_run_id: &str,
     traces: &[PipelineAgentTrace],
 ) -> Result<usize, String> {
-    debug!("save_pipeline_agent_traces stub: {} traces (no-op, use PG)", traces.len());
+    debug!(
+        "save_pipeline_agent_traces stub: {} traces (no-op, use PG)",
+        traces.len()
+    );
     Ok(traces.len())
 }
 
@@ -29,10 +30,7 @@ pub fn save_pipeline_agent_trace(
 }
 
 /// Backfill `downstream_success` on all traces for a completed execution.
-pub fn backfill_downstream_success(
-    _task_run_id: &str,
-    _success: bool,
-) -> Result<usize, String> {
+pub fn backfill_downstream_success(_task_run_id: &str, _success: bool) -> Result<usize, String> {
     debug!("backfill_downstream_success stub (no-op, use PG)");
     Ok(0)
 }
@@ -55,25 +53,19 @@ pub fn get_trace_details_l1(
 }
 
 /// Get aggregate metrics for pipeline agent traces, grouped by agent type.
-pub fn get_agent_trace_aggregates(
-    _limit: u32,
-) -> Result<Vec<AgentTraceAggregate>, String> {
+pub fn get_agent_trace_aggregates(_limit: u32) -> Result<Vec<AgentTraceAggregate>, String> {
     debug!("get_agent_trace_aggregates stub (no-op, use PG)");
     Ok(vec![])
 }
 
 /// L2: Retrieve a single pipeline agent trace by its ID with all fields.
-pub fn get_trace_full_l2(
-    _trace_id: &str,
-) -> Result<Option<PipelineAgentTrace>, String> {
+pub fn get_trace_full_l2(_trace_id: &str) -> Result<Option<PipelineAgentTrace>, String> {
     debug!("get_trace_full_l2 stub (no-op, use PG)");
     Ok(None)
 }
 
 /// Retrieve all pipeline agent traces for a given task run ID.
-pub fn get_traces_for_task_run(
-    _task_run_id: &str,
-) -> Result<Vec<PipelineAgentTrace>, String> {
+pub fn get_traces_for_task_run(_task_run_id: &str) -> Result<Vec<PipelineAgentTrace>, String> {
     debug!("get_traces_for_task_run stub (no-op, use PG)");
     Ok(vec![])
 }
@@ -129,9 +121,7 @@ pub struct AgentInteraction {
 }
 
 /// Get the interaction matrix showing correlations between agent pairs.
-pub fn get_agent_interaction_matrix(
-    _days: i64,
-) -> Result<Vec<AgentInteraction>, String> {
+pub fn get_agent_interaction_matrix(_days: i64) -> Result<Vec<AgentInteraction>, String> {
     debug!("get_agent_interaction_matrix stub (no-op, use PG)");
     Ok(vec![])
 }
@@ -148,9 +138,7 @@ pub struct CascadeEffect {
 }
 
 /// Get cascade effects: how an applied recommendation on one agent affected others.
-pub fn get_agent_cascade_effect(
-    _recommendation_id: &str,
-) -> Result<Vec<CascadeEffect>, String> {
+pub fn get_agent_cascade_effect(_recommendation_id: &str) -> Result<Vec<CascadeEffect>, String> {
     debug!("get_agent_cascade_effect stub (no-op, use PG)");
     Ok(vec![])
 }
@@ -165,9 +153,7 @@ pub fn save_pipeline_checkpoint(
 }
 
 /// Load a pipeline checkpoint for a task run, if one exists.
-pub fn get_pipeline_checkpoint(
-    _task_run_id: &str,
-) -> Result<Option<PipelineCheckpoint>, String> {
+pub fn get_pipeline_checkpoint(_task_run_id: &str) -> Result<Option<PipelineCheckpoint>, String> {
     debug!("get_pipeline_checkpoint stub (no-op, use PG)");
     Ok(None)
 }

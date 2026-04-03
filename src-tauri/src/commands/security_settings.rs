@@ -47,8 +47,7 @@ pub async fn update_security_settings(config: SecuritySettings) -> Result<Comman
             config.default_profile
         )),
         data: Some(
-            serde_json::to_value(&config)
-                .map_err(|e| format!("Failed to serialize: {}", e))?,
+            serde_json::to_value(&config).map_err(|e| format!("Failed to serialize: {}", e))?,
         ),
     })
 }

@@ -249,7 +249,10 @@ pub async fn transcript_find_external_processes(
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Found {} external Claude processes", external.len())),
+        message: Some(format!(
+            "Found {} external Claude processes",
+            external.len()
+        )),
         data: Some(serde_json::to_value(&external).unwrap_or_default()),
     })
 }

@@ -40,9 +40,7 @@ impl CompensationManager {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        pg.append_iteration_commit(&eid, &commit).await
-                    })
+                    handle.block_on(async move { pg.append_iteration_commit(&eid, &commit).await })
                 })
             }));
             match result {
@@ -64,9 +62,7 @@ impl CompensationManager {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        pg.get_iteration_commits(&eid).await
-                    })
+                    handle.block_on(async move { pg.get_iteration_commits(&eid).await })
                 })
             }));
             match result {

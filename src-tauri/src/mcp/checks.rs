@@ -13,8 +13,8 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::database::{
-    Check, CheckGroup, CreateCheckGroupInput, CreateCheckInput,
-    UpdateCheckGroupInput, UpdateCheckInput,
+    Check, CheckGroup, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput,
+    UpdateCheckInput,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
@@ -111,7 +111,12 @@ pub async fn repair_check_associations_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("Repairing check-group associations via MCP API");
 
-    match state.app_state.pg_db.repair_check_group_associations().await {
+    match state
+        .app_state
+        .pg_db
+        .repair_check_group_associations()
+        .await
+    {
         Ok(count) => {
             let message = if count > 0 {
                 format!("Repaired {} check-group associations", count)
@@ -478,20 +483,25 @@ pub async fn run_check_handler(
             .as_ref()
             .map(|o| serde_json::to_string(o).unwrap_or_default());
 
-        if let Err(e) = state.app_state.pg_db.save_check_result(
-            &result.check_id,
-            &status_str,
-            Some(result.started_at.as_str()),
-            Some(result.completed_at.as_str()),
-            Some(result.duration_ms as i64),
-            Some(result.output.as_str()),
-            result.error.as_deref(),
-            result.issues_found as i32,
-            result.issues_fixed as i32,
-            result.files_checked as i32,
-            structured.as_deref(),
-            Some(run_id.as_str()),
-        ).await {
+        if let Err(e) = state
+            .app_state
+            .pg_db
+            .save_check_result(
+                &result.check_id,
+                &status_str,
+                Some(result.started_at.as_str()),
+                Some(result.completed_at.as_str()),
+                Some(result.duration_ms as i64),
+                Some(result.output.as_str()),
+                result.error.as_deref(),
+                result.issues_found as i32,
+                result.issues_fixed as i32,
+                result.files_checked as i32,
+                structured.as_deref(),
+                Some(run_id.as_str()),
+            )
+            .await
+        {
             tracing::error!("Failed to store check result in PG: {}", e);
         }
     }

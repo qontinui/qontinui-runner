@@ -2,7 +2,6 @@
 //!
 //! Provides CRUD operations and queries for the reflection_fixes table.
 
-
 use super::types::{CreateReflectionFixInput, EffectivenessReport, ReflectionFix};
 
 // row_to_fix removed (SQLite dead code)
@@ -70,9 +69,7 @@ fn compute_content_hash(
 /// Insert a new reflection fix into the database.
 /// Deduplicates by content hash — if an identical fix already exists with status 'applied',
 /// the existing fix is returned instead of creating a duplicate.
-pub fn insert_fix(
-    input: &CreateReflectionFixInput,
-) -> Result<ReflectionFix, String> {
+pub fn insert_fix(input: &CreateReflectionFixInput) -> Result<ReflectionFix, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -82,9 +79,7 @@ pub fn get_fix(id: &str) -> Result<Option<ReflectionFix>, String> {
 }
 
 /// Get all fixes created by analyzing a specific source run.
-pub fn get_fixes_for_source_run(
-    source_task_run_id: &str,
-) -> Result<Vec<ReflectionFix>, String> {
+pub fn get_fixes_for_source_run(source_task_run_id: &str) -> Result<Vec<ReflectionFix>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -133,16 +128,12 @@ pub fn update_fix_effectiveness(
 }
 
 /// Generate an aggregated effectiveness report for a workflow.
-pub fn get_effectiveness_report(
-    workflow_name: &str,
-) -> Result<EffectivenessReport, String> {
+pub fn get_effectiveness_report(workflow_name: &str) -> Result<EffectivenessReport, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get all reflection task runs for a workflow (history).
-pub fn get_reflection_history(
-    workflow_name: &str,
-) -> Result<Vec<ReflectionRunSummary>, String> {
+pub fn get_reflection_history(workflow_name: &str) -> Result<Vec<ReflectionRunSummary>, String> {
     Err("SQLite removed".to_string())
 }
 

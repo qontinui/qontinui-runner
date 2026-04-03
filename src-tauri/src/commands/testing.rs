@@ -10,10 +10,7 @@
 //! Also provides CRUD operations for managing tests in the database.
 
 use super::CommandResponse;
-use crate::database::{
-    CreateVerificationTestInput, TriggerPoint,
-    VerificationTest,
-};
+use crate::database::{CreateVerificationTestInput, TriggerPoint, VerificationTest};
 use crate::executor::{is_default_bridge_running, with_default_bridge};
 use crate::test_executor::{
     execute_test, execute_test_suite, RepoTestConfig, TestCategory, TestDefinition,
@@ -358,23 +355,32 @@ pub async fn list_verification_tests(
 
 /// Get a single verification test by ID
 #[tauri::command]
-pub async fn get_verification_test(id: String, state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_verification_test(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     match state.pg_db.get_verification_test(&id).await {
-        Ok(Some(test)) => return Ok(CommandResponse {
-            success: true,
-            message: Some("Test found".to_string()),
-            data: Some(serde_json::to_value(test).unwrap_or_default()),
-        }),
-        Ok(None) => return Ok(CommandResponse {
-            success: false,
-            message: Some(format!("Test not found: {}", id)),
-            data: None,
-        }),
-        Err(e) => return Ok(CommandResponse {
-            success: false,
-            message: Some(format!("Failed to get test: {}", e)),
-            data: None,
-        }),
+        Ok(Some(test)) => {
+            return Ok(CommandResponse {
+                success: true,
+                message: Some("Test found".to_string()),
+                data: Some(serde_json::to_value(test).unwrap_or_default()),
+            })
+        }
+        Ok(None) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Test not found: {}", id)),
+                data: None,
+            })
+        }
+        Err(e) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Failed to get test: {}", e)),
+                data: None,
+            })
+        }
     }
 }
 
@@ -420,7 +426,10 @@ pub async fn update_verification_test(
 
 /// Delete a verification test
 #[tauri::command]
-pub async fn delete_verification_test(id: String, state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn delete_verification_test(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     let _db = &state.pg_db;
 
     info!("Deleting verification test: {}", id);
@@ -668,7 +677,10 @@ pub async fn get_config_test_associations(
 
 /// Delete a test association
 #[tauri::command]
-pub async fn delete_test_association(id: String, state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn delete_test_association(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     let _db = &state.pg_db;
     let _id = id;
 
@@ -832,7 +844,10 @@ pub async fn export_all_tests_to_file(
     // list_verification_tests not yet implemented on PgDb — return empty
     Ok(CommandResponse {
         success: false,
-        message: Some("export_all_tests_to_file: list_verification_tests not yet implemented on PgDb".to_string()),
+        message: Some(
+            "export_all_tests_to_file: list_verification_tests not yet implemented on PgDb"
+                .to_string(),
+        ),
         data: None,
     })
 }
@@ -855,7 +870,10 @@ pub async fn import_tests_from_file(
     // import_tests_from_file: create/update_verification_test not yet on PgDb — stub
     Ok(CommandResponse {
         success: false,
-        message: Some("import_tests_from_file: create/update_verification_test not yet implemented on PgDb".to_string()),
+        message: Some(
+            "import_tests_from_file: create/update_verification_test not yet implemented on PgDb"
+                .to_string(),
+        ),
         data: None,
     })
 }

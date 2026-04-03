@@ -112,7 +112,10 @@ impl PgDb {
     }
 
     /// Update a watcher's fields. Returns the ID if found.
-    pub async fn update_watcher(&self, input: &UpdateWatcherInput) -> Result<Option<String>, String> {
+    pub async fn update_watcher(
+        &self,
+        input: &UpdateWatcherInput,
+    ) -> Result<Option<String>, String> {
         let conn = self
             .pool
             .get()

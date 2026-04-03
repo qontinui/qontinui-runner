@@ -155,12 +155,10 @@ pub fn schema_to_gbnf(schema: &Value) -> String {
         .push(r#"boolean ::= ("true" | "false")"#.to_string());
     ctx.rules.push(r#"null ::= "null""#.to_string());
     ctx.rules.push(
-        r#"json-value ::= string | number | boolean | null | json-array | json-object"#
-            .to_string(),
+        r#"json-value ::= string | number | boolean | null | json-array | json-object"#.to_string(),
     );
-    ctx.rules.push(
-        r#"json-array ::= "[" ws (json-value ("," ws json-value)*)? ws "]""#.to_string(),
-    );
+    ctx.rules
+        .push(r#"json-array ::= "[" ws (json-value ("," ws json-value)*)? ws "]""#.to_string());
     ctx.rules.push(
         r#"json-object ::= "{" ws (string ws ":" ws json-value ("," ws string ws ":" ws json-value)*)? ws "}""#
             .to_string(),
@@ -184,7 +182,13 @@ impl GbnfContext {
         self.counter += 1;
         let sanitized: String = hint
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
         format!("r-{}-{}", sanitized, self.counter)
     }
@@ -211,8 +215,7 @@ fn emit_schema_rule(ctx: &mut GbnfContext, node: &Value, root: &Value) -> String
             return alts.into_iter().next().unwrap();
         }
         let name = ctx.next_name("oneof");
-        ctx.rules
-            .push(format!("{} ::= {}", name, alts.join(" | ")));
+        ctx.rules.push(format!("{} ::= {}", name, alts.join(" | ")));
         return name;
     }
 
@@ -226,8 +229,7 @@ fn emit_schema_rule(ctx: &mut GbnfContext, node: &Value, root: &Value) -> String
             return alts.into_iter().next().unwrap();
         }
         let name = ctx.next_name("anyof");
-        ctx.rules
-            .push(format!("{} ::= {}", name, alts.join(" | ")));
+        ctx.rules.push(format!("{} ::= {}", name, alts.join(" | ")));
         return name;
     }
 
@@ -247,8 +249,7 @@ fn emit_schema_rule(ctx: &mut GbnfContext, node: &Value, root: &Value) -> String
                     .collect();
                 if !alts.is_empty() {
                     let name = ctx.next_name("enum");
-                    ctx.rules
-                        .push(format!("{} ::= {}", name, alts.join(" | ")));
+                    ctx.rules.push(format!("{} ::= {}", name, alts.join(" | ")));
                     return name;
                 }
             }

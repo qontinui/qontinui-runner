@@ -104,7 +104,10 @@ mod tests {
 
     #[test]
     fn test_allowed_tool_passes() {
-        let guard = ToolGuard::new("analyzer", &["get_state".to_string(), "query_rag".to_string()]);
+        let guard = ToolGuard::new(
+            "analyzer",
+            &["get_state".to_string(), "query_rag".to_string()],
+        );
         assert!(!guard.is_unrestricted());
         assert!(guard.check_tool("get_state").is_ok());
         assert!(guard.check_tool("query_rag").is_ok());

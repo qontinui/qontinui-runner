@@ -127,10 +127,8 @@ async fn retrieve_observations(pg: &PgDb, query: &str, limit: i64) -> Vec<Memory
     // We use these to: (1) filter out raw observations that were consolidated,
     // (2) inject relevant mental models with a score boost.
     let mental_models = pg.get_mental_models(limit).await.unwrap_or_default();
-    let mental_model_ids: std::collections::HashSet<i64> = mental_models
-        .iter()
-        .map(|m| m.id)
-        .collect();
+    let mental_model_ids: std::collections::HashSet<i64> =
+        mental_models.iter().map(|m| m.id).collect();
     let mental_model_source_ids: std::collections::HashSet<i64> = mental_models
         .iter()
         .flat_map(|m| m.consolidated_from.as_deref().unwrap_or(&[]))
@@ -156,12 +154,20 @@ async fn retrieve_observations(pg: &PgDb, query: &str, limit: i64) -> Vec<Memory
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc));
             // Apply temporal relevance: weight FTS score by recency/currency/supersession
-            let temporal = ts.map(|vf| {
-                let vu = r.valid_until.as_deref()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-                crate::database::pg::observations::temporal_score(&vf, vu.as_ref(), r.superseded_by)
-            }).unwrap_or(1.0);
+            let temporal = ts
+                .map(|vf| {
+                    let vu = r
+                        .valid_until
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&Utc));
+                    crate::database::pg::observations::temporal_score(
+                        &vf,
+                        vu.as_ref(),
+                        r.superseded_by,
+                    )
+                })
+                .unwrap_or(1.0);
             let score = (fts_score as f64) * temporal;
             MemoryResult {
                 id: r.id.to_string(),
@@ -187,7 +193,10 @@ async fn retrieve_observations(pg: &PgDb, query: &str, limit: i64) -> Vec<Memory
         .collect();
     for model in &mental_models {
         let text_lower = format!("{} {}", model.title, model.content).to_lowercase();
-        let matching_words = query_words.iter().filter(|w| text_lower.contains(w.as_str())).count();
+        let matching_words = query_words
+            .iter()
+            .filter(|w| text_lower.contains(w.as_str()))
+            .count();
         // Require at least half the query words to match (minimum 1)
         let threshold = (query_words.len() / 2).max(1);
         if matching_words >= threshold {
@@ -339,11 +348,7 @@ async fn retrieve_pg_unified(
 /// Searches knowledge (PG hybrid search with embeddings), findings (text fallback),
 /// and error events (text fallback) in PostgreSQL.
 /// Requires the local embedding service to be available.
-async fn retrieve_embeddings(
-    pg: &PgDb,
-    query: &str,
-    limit: usize,
-) -> Vec<MemoryResult> {
+async fn retrieve_embeddings(pg: &PgDb, query: &str, limit: usize) -> Vec<MemoryResult> {
     use crate::database::embedding_client::EmbeddingClient;
     use crate::database::hybrid_search::HybridSearchConfig;
 
@@ -393,37 +398,34 @@ async fn retrieve_embeddings(
     }
 
     // Search error events via PG query (returns JSON values)
-    match pg.query_error_events(None, None, None, None, None, Some(limit as u32)).await {
+    match pg
+        .query_error_events(None, None, None, None, None, Some(limit as u32))
+        .await
+    {
         Ok(errors) => {
             let query_lower = query.to_lowercase();
             let total = errors.len().max(1) as f64;
             for (i, e) in errors.into_iter().enumerate() {
                 // Filter by query text client-side
-                let message = e.get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let message = e.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 if !query_lower.is_empty() && !message.to_lowercase().contains(&query_lower) {
                     continue;
                 }
                 let score = 1.0 - (i as f64 / total);
-                let severity = e.get("severity")
+                let severity = e
+                    .get("severity")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let last_seen = e.get("last_seen_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let id = e.get("id")
+                let last_seen = e.get("last_seen_at").and_then(|v| v.as_str()).unwrap_or("");
+                let id = e
+                    .get("id")
                     .and_then(|v| v.as_i64())
                     .map(|v| v.to_string())
                     .unwrap_or_default();
                 all_results.push(MemoryResult {
                     id,
                     source: MemorySource::Error,
-                    title: format!(
-                        "[{}] {}",
-                        severity,
-                        truncate_str(message, 80)
-                    ),
+                    title: format!("[{}] {}", severity, truncate_str(message, 80)),
                     snippet: truncate_str(message, 500),
                     source_score: score * 0.7, // Discount text-only results vs embedding
                     fused_score: 0.0,
@@ -463,14 +465,7 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
                 id: node.entity_id.clone(),
                 source: MemorySource::GraphNode,
                 title: node.label.clone(),
-                snippet: truncate_str(
-                    &format!(
-                        "[{}] {}",
-                        node.kind.as_str(),
-                        node.label
-                    ),
-                    500,
-                ),
+                snippet: truncate_str(&format!("[{}] {}", node.kind.as_str(), node.label), 500),
                 source_score: score,
                 fused_score: 0.0,
                 timestamp: node
@@ -496,10 +491,7 @@ fn retrieve_graph(graph: &KnowledgeGraph, query: &str, limit: usize) -> Vec<Memo
 ///
 /// where k is a smoothing constant (typically 60) and rank_s(d) is the
 /// 1-based rank of d in strategy s's result list.
-pub fn reciprocal_rank_fusion(
-    result_sets: Vec<Vec<MemoryResult>>,
-    k: f64,
-) -> Vec<MemoryResult> {
+pub fn reciprocal_rank_fusion(result_sets: Vec<Vec<MemoryResult>>, k: f64) -> Vec<MemoryResult> {
     // Map: (source, id) -> (merged result, cumulative rrf score)
     let mut merged: HashMap<(MemorySource, String), MemoryResult> = HashMap::new();
     let mut scores: HashMap<(MemorySource, String), f64> = HashMap::new();
@@ -659,8 +651,12 @@ mod tests {
 
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].found_by.len(), 2);
-        assert!(fused[0].found_by.contains(&RetrievalStrategy::FullTextSearch));
-        assert!(fused[0].found_by.contains(&RetrievalStrategy::GraphTraversal));
+        assert!(fused[0]
+            .found_by
+            .contains(&RetrievalStrategy::FullTextSearch));
+        assert!(fused[0]
+            .found_by
+            .contains(&RetrievalStrategy::GraphTraversal));
     }
 
     #[test]
@@ -739,9 +735,18 @@ mod tests {
         let t3 = Utc.with_ymd_and_hms(2025, 12, 1, 0, 0, 0).unwrap();
 
         let set = vec![
-            MemoryResult { timestamp: Some(t1), ..make_result("old", MemorySource::Observation, 1.0) },
-            MemoryResult { timestamp: Some(t2), ..make_result("mid", MemorySource::Observation, 0.8) },
-            MemoryResult { timestamp: Some(t3), ..make_result("new", MemorySource::Observation, 0.5) },
+            MemoryResult {
+                timestamp: Some(t1),
+                ..make_result("old", MemorySource::Observation, 1.0)
+            },
+            MemoryResult {
+                timestamp: Some(t2),
+                ..make_result("mid", MemorySource::Observation, 0.8)
+            },
+            MemoryResult {
+                timestamp: Some(t3),
+                ..make_result("new", MemorySource::Observation, 0.5)
+            },
             // No timestamp — should be retained (map_or(true, ...))
             make_result("none", MemorySource::Finding, 0.3),
         ];
@@ -753,10 +758,22 @@ mod tests {
         fused.retain(|r| r.timestamp.map_or(true, |t| t >= from));
 
         let ids: Vec<&str> = fused.iter().map(|r| r.id.as_str()).collect();
-        assert!(!ids.contains(&"old"), "result before `from` should be excluded");
-        assert!(ids.contains(&"mid"), "result after `from` should be included");
-        assert!(ids.contains(&"new"), "result after `from` should be included");
-        assert!(ids.contains(&"none"), "result with no timestamp should be retained");
+        assert!(
+            !ids.contains(&"old"),
+            "result before `from` should be excluded"
+        );
+        assert!(
+            ids.contains(&"mid"),
+            "result after `from` should be included"
+        );
+        assert!(
+            ids.contains(&"new"),
+            "result after `from` should be included"
+        );
+        assert!(
+            ids.contains(&"none"),
+            "result with no timestamp should be retained"
+        );
     }
 
     #[test]
@@ -768,9 +785,18 @@ mod tests {
         let t3 = Utc.with_ymd_and_hms(2025, 12, 1, 0, 0, 0).unwrap();
 
         let set = vec![
-            MemoryResult { timestamp: Some(t1), ..make_result("old", MemorySource::Observation, 1.0) },
-            MemoryResult { timestamp: Some(t2), ..make_result("mid", MemorySource::Observation, 0.8) },
-            MemoryResult { timestamp: Some(t3), ..make_result("new", MemorySource::Observation, 0.5) },
+            MemoryResult {
+                timestamp: Some(t1),
+                ..make_result("old", MemorySource::Observation, 1.0)
+            },
+            MemoryResult {
+                timestamp: Some(t2),
+                ..make_result("mid", MemorySource::Observation, 0.8)
+            },
+            MemoryResult {
+                timestamp: Some(t3),
+                ..make_result("new", MemorySource::Observation, 0.5)
+            },
             make_result("none", MemorySource::Finding, 0.3),
         ];
 
@@ -781,10 +807,22 @@ mod tests {
         fused.retain(|r| r.timestamp.map_or(true, |t| t <= to));
 
         let ids: Vec<&str> = fused.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"old"), "result before `to` should be included");
-        assert!(ids.contains(&"mid"), "result before `to` should be included");
-        assert!(!ids.contains(&"new"), "result after `to` should be excluded");
-        assert!(ids.contains(&"none"), "result with no timestamp should be retained");
+        assert!(
+            ids.contains(&"old"),
+            "result before `to` should be included"
+        );
+        assert!(
+            ids.contains(&"mid"),
+            "result before `to` should be included"
+        );
+        assert!(
+            !ids.contains(&"new"),
+            "result after `to` should be excluded"
+        );
+        assert!(
+            ids.contains(&"none"),
+            "result with no timestamp should be retained"
+        );
     }
 
     #[test]
@@ -804,9 +842,21 @@ mod tests {
         let filter = Some(vec![MemorySource::Observation, MemorySource::Fix]);
         assert!(source_enabled(&filter, MemorySource::Observation));
         assert!(source_enabled(&filter, MemorySource::Fix));
-        assert!(!source_enabled(&filter, MemorySource::Finding), "unlisted source should be disabled");
-        assert!(!source_enabled(&filter, MemorySource::GraphNode), "unlisted source should be disabled");
-        assert!(!source_enabled(&filter, MemorySource::ActivityTimeline), "unlisted source should be disabled");
-        assert!(!source_enabled(&filter, MemorySource::Error), "unlisted source should be disabled");
+        assert!(
+            !source_enabled(&filter, MemorySource::Finding),
+            "unlisted source should be disabled"
+        );
+        assert!(
+            !source_enabled(&filter, MemorySource::GraphNode),
+            "unlisted source should be disabled"
+        );
+        assert!(
+            !source_enabled(&filter, MemorySource::ActivityTimeline),
+            "unlisted source should be disabled"
+        );
+        assert!(
+            !source_enabled(&filter, MemorySource::Error),
+            "unlisted source should be disabled"
+        );
     }
 }

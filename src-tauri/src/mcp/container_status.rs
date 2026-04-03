@@ -12,9 +12,7 @@ pub struct ContainerStatus {
     pub executor_ready: bool,
 }
 
-pub async fn get_container_status(
-    AxumState(state): AxumState<Arc<ApiState>>,
-) -> impl IntoResponse {
+pub async fn get_container_status(AxumState(state): AxumState<Arc<ApiState>>) -> impl IntoResponse {
     let config = crate::settings::get_container_settings();
 
     // Check if the executor is initialized and available

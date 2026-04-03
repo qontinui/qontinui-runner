@@ -66,10 +66,15 @@ pub async fn update_container_settings(
         let docker = Arc::new(DockerManager::new().await);
         if docker.is_available() {
             *executor_guard = Some(IsolatedExecutor::new(docker, config.clone()));
-            info!("Container executor initialized with image: {}", config.base_image);
+            info!(
+                "Container executor initialized with image: {}",
+                config.base_image
+            );
         } else {
             *executor_guard = None;
-            info!("Container isolation enabled but Docker is not available; executor not initialized");
+            info!(
+                "Container isolation enabled but Docker is not available; executor not initialized"
+            );
         }
     } else {
         *executor_guard = None;

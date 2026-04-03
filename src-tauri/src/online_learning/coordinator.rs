@@ -99,10 +99,7 @@ pub async fn enrich_from_pipeline_traces(
     pg: &std::sync::Arc<crate::database::pg::PgDb>,
     outcome: &mut OnlineLearningOutcome,
 ) {
-    let traces = match pg
-        .get_pipeline_traces_for_task(&outcome.task_run_id)
-        .await
-    {
+    let traces = match pg.get_pipeline_traces_for_task(&outcome.task_run_id).await {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => return, // No traces for this run (non-pipeline architecture)
         Err(e) => {

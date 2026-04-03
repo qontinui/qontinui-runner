@@ -80,9 +80,7 @@ pub fn save_template(template: &StepTemplate) -> Result<(), String> {
 // row_to_template removed (SQLite dead code)
 
 /// Load all templates for a domain.
-pub fn load_templates_for_domain(
-    domain: VerificationDomain,
-) -> Result<Vec<StepTemplate>, String> {
+pub fn load_templates_for_domain(domain: VerificationDomain) -> Result<Vec<StepTemplate>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -122,13 +120,13 @@ pub fn record_failure(template_id: &str) -> Result<(), String> {
 /// Extract lowercase keywords from a text string, filtering out stop words.
 fn extract_keywords(text: &str) -> HashSet<String> {
     static STOP_WORDS: &[&str] = &[
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has",
-        "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can",
-        "shall", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into",
-        "through", "during", "before", "after", "above", "below", "between", "and", "but", "or",
-        "nor", "not", "no", "so", "if", "then", "than", "that", "this", "it", "its", "all",
-        "each", "every", "any", "both", "few", "more", "most", "other", "some", "such", "only",
-        "same", "when", "where", "which", "while", "who", "whom", "how", "what", "why",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "shall",
+        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "and", "but", "or", "nor", "not",
+        "no", "so", "if", "then", "than", "that", "this", "it", "its", "all", "each", "every",
+        "any", "both", "few", "more", "most", "other", "some", "such", "only", "same", "when",
+        "where", "which", "while", "who", "whom", "how", "what", "why",
     ];
     let stop: HashSet<&str> = STOP_WORDS.iter().copied().collect();
 
@@ -165,9 +163,7 @@ pub fn find_matching_templates(
                 return None;
             }
             // Jaccard-like: intersection / union
-            let intersection = criterion_keywords
-                .intersection(&template_keywords)
-                .count() as f64;
+            let intersection = criterion_keywords.intersection(&template_keywords).count() as f64;
             let union = criterion_keywords.union(&template_keywords).count() as f64;
             let score = intersection / union;
             if score >= 0.3 {
@@ -276,8 +272,15 @@ pub fn build_template_injection(matches: &[(StepTemplate, f64)]) -> String {
         if !template.parameters.is_empty() {
             block.push_str("\nParameters to fill:\n");
             for param in &template.parameters {
-                let req = if param.required { "required" } else { "optional" };
-                block.push_str(&format!("- `{{{{{}}}}}`: {} ({})\n", param.name, param.description, req));
+                let req = if param.required {
+                    "required"
+                } else {
+                    "optional"
+                };
+                block.push_str(&format!(
+                    "- `{{{{{}}}}}`: {} ({})\n",
+                    param.name, param.description, req
+                ));
             }
         }
 

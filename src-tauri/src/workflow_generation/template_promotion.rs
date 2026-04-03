@@ -78,9 +78,7 @@ pub fn evaluate_and_promote() -> Result<PromotionResult, String> {
 }
 
 /// Find promoted templates relevant to a description.
-pub fn find_relevant_templates(
-    description: &str,
-) -> Result<Vec<PromotedTemplate>, String> {
+pub fn find_relevant_templates(description: &str) -> Result<Vec<PromotedTemplate>, String> {
     Err("SQLite removed".to_string())
 }
 

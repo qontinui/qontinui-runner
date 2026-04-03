@@ -5,19 +5,16 @@
 //! by the Python `RustBackendCapture` bridge and by external MCP clients.
 
 use axum::{
-    extract::State as AxumState,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-    Json, Router,
+    extract::State as AxumState, http::StatusCode, response::IntoResponse, routing::post, Json,
+    Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::mcp::types::ApiState;
 use qontinui_runner_lib::accessibility::model::UnifiedRole;
 use qontinui_runner_lib::accessibility::traits::ConnectionTarget;
-use crate::mcp::types::ApiState;
 
 // ============================================================================
 // Request / Response types
@@ -77,7 +74,10 @@ async fn handle_connect(
     AxumState(state): AxumState<Arc<ApiState>>,
     Json(req): Json<ConnectRequest>,
 ) -> impl IntoResponse {
-    info!("POST /a11y/connect target={} backend={}", req.target, req.backend);
+    info!(
+        "POST /a11y/connect target={} backend={}",
+        req.target, req.backend
+    );
 
     let connection_target = match parse_connection_target(&req.target) {
         Ok(t) => t,
@@ -180,7 +180,9 @@ async fn handle_query(
     }
 
     if let Some(ref substr) = req.label_contains {
-        builder = builder.by_label_contains(substr.as_str()).case_insensitive();
+        builder = builder
+            .by_label_contains(substr.as_str())
+            .case_insensitive();
     }
 
     if req.interactive_only {
@@ -291,9 +293,7 @@ async fn handle_focus(
 }
 
 /// POST /a11y/disconnect
-async fn handle_disconnect(
-    AxumState(state): AxumState<Arc<ApiState>>,
-) -> impl IntoResponse {
+async fn handle_disconnect(AxumState(state): AxumState<Arc<ApiState>>) -> impl IntoResponse {
     info!("POST /a11y/disconnect");
     let mut mgr = state.accessibility_manager.lock().await;
 

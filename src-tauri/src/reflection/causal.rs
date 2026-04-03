@@ -85,10 +85,7 @@ pub fn insert_causal_event(
 /// 4. error_occurred → finding_detected (via signature_hash matching)
 ///
 /// Returns the count of new links created.
-pub fn build_automated_causal_links(
-    task_run_id: &str,
-    workflow_name: &str,
-) -> Result<u32, String> {
+pub fn build_automated_causal_links(task_run_id: &str, workflow_name: &str) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 

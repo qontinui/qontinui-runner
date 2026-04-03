@@ -190,24 +190,17 @@ impl TemplateLifecycleManager {
     /// - Extracted + confidence >= promotion_threshold → Promoted
     /// - Promoted + confidence <= demotion_threshold → Demoted
     /// - Any source + failure_count >= retirement_after_failures + zero successes → Retired
-    pub fn check_lifecycle_transitions(
-        &self,
-    ) -> Result<LifecycleResult, String> {
+    pub fn check_lifecycle_transitions(&self) -> Result<LifecycleResult, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Get performance data for all tracked templates.
-    pub fn get_all_performance(
-        &self,
-    ) -> Result<Vec<TemplatePerformance>, String> {
+    pub fn get_all_performance(&self) -> Result<Vec<TemplatePerformance>, String> {
         Err("SQLite removed".to_string())
     }
 
     /// Get lifecycle history for a specific template.
-    pub fn get_template_history(
-        &self,
-        template_id: &str,
-    ) -> Result<Vec<LifecycleEvent>, String> {
+    pub fn get_template_history(&self, template_id: &str) -> Result<Vec<LifecycleEvent>, String> {
         Err("SQLite removed".to_string())
     }
 

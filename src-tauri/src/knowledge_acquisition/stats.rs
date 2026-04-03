@@ -19,7 +19,8 @@ impl ProviderCounters {
     pub fn record_success(&self, result_count: u64, bytes: u64) {
         self.queries.fetch_add(1, Ordering::Relaxed);
         self.successes.fetch_add(1, Ordering::Relaxed);
-        self.results_returned.fetch_add(result_count, Ordering::Relaxed);
+        self.results_returned
+            .fetch_add(result_count, Ordering::Relaxed);
         self.bytes_fetched.fetch_add(bytes, Ordering::Relaxed);
     }
 

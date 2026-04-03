@@ -75,7 +75,11 @@ impl PgDb {
         &self,
         input: &CreateReflectionFixInput,
     ) -> Result<ReflectionFix, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let content_hash = compute_content_hash(
             &input.fix_type,
@@ -95,8 +99,13 @@ impl PgDb {
 
         if let Some(row) = existing {
             let existing_id: String = row.get(0);
-            warn!("Skipping duplicate PG reflection fix (hash: {}, existing: {})", content_hash, existing_id);
-            return self.get_reflection_fix(&existing_id).await?
+            warn!(
+                "Skipping duplicate PG reflection fix (hash: {}, existing: {})",
+                content_hash, existing_id
+            );
+            return self
+                .get_reflection_fix(&existing_id)
+                .await?
                 .ok_or_else(|| "Existing fix not found after dedup check".to_string());
         }
 
@@ -134,17 +143,28 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG save_reflection_fix: {}", e))?;
 
-        info!("Inserted PG reflection fix {} (type: {})", id, input.fix_type);
+        info!(
+            "Inserted PG reflection fix {} (type: {})",
+            id, input.fix_type
+        );
 
-        self.get_reflection_fix(&id).await?
+        self.get_reflection_fix(&id)
+            .await?
             .ok_or_else(|| "Fix not found after PG insert".to_string())
     }
 
     /// Get a single reflection fix by ID.
     pub async fn get_reflection_fix(&self, id: &str) -> Result<Option<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let sql = format!("SELECT {} FROM reflection_fixes WHERE id = $1", SELECT_ALL_COLUMNS);
+        let sql = format!(
+            "SELECT {} FROM reflection_fixes WHERE id = $1",
+            SELECT_ALL_COLUMNS
+        );
         let rows = conn
             .query(&sql, &[&id])
             .await
@@ -158,7 +178,11 @@ impl PgDb {
         &self,
         source_task_run_id: &str,
     ) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let sql = format!(
             "SELECT {} FROM reflection_fixes WHERE source_task_run_id = $1 ORDER BY created_at",
@@ -174,7 +198,11 @@ impl PgDb {
 
     /// Get unresolved reflection fixes (status != 'resolved' and != 'superseded').
     pub async fn get_unresolved_fixes(&self) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let sql = format!(
             "SELECT {} FROM reflection_fixes WHERE status NOT IN ('resolved', 'superseded') ORDER BY created_at DESC",
@@ -190,7 +218,11 @@ impl PgDb {
 
     /// Update the status of a reflection fix.
     pub async fn update_fix_status(&self, id: &str, status: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute(
@@ -215,7 +247,11 @@ impl PgDb {
         effectiveness: &str,
         evidence: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -238,7 +274,10 @@ impl PgDb {
             return Err(format!("PG reflection fix {} not found", id));
         }
 
-        info!("Updated PG reflection fix {} effectiveness to {}", id, effectiveness);
+        info!(
+            "Updated PG reflection fix {} effectiveness to {}",
+            id, effectiveness
+        );
         Ok(())
     }
 
@@ -248,13 +287,21 @@ impl PgDb {
         workflow_name: &str,
         status_filter: Option<&str>,
     ) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let prefixed = SELECT_ALL_COLUMNS
             .split(',')
             .map(|col| {
                 let col = col.trim();
-                if col.is_empty() { String::new() } else { format!("rf.{}", col) }
+                if col.is_empty() {
+                    String::new()
+                } else {
+                    format!("rf.{}", col)
+                }
             })
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -288,7 +335,11 @@ impl PgDb {
         project_path: &str,
         status_filter: Option<&str>,
     ) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = format!(
             "SELECT {} FROM reflection_fixes WHERE project_path = $1 AND reflection_scope = 'project'",
@@ -312,7 +363,11 @@ impl PgDb {
 
     /// Get universal-scoped fixes ordered by reuse_count.
     pub async fn get_universal_fixes(&self, limit: i64) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let sql = format!(
             "SELECT {} FROM reflection_fixes WHERE reflection_scope = 'universal' AND status = 'applied' ORDER BY reuse_count DESC, created_at DESC LIMIT $1",
@@ -339,7 +394,11 @@ impl PgDb {
         error_signature_hash: Option<&str>,
         outcome: &str,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -379,13 +438,21 @@ impl PgDb {
         status_filter: Option<&str>,
         effectiveness_filter: Option<&str>,
     ) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let prefixed = SELECT_ALL_COLUMNS
             .split(',')
             .map(|col| {
                 let col = col.trim();
-                if col.is_empty() { String::new() } else { format!("rf.{}", col) }
+                if col.is_empty() {
+                    String::new()
+                } else {
+                    format!("rf.{}", col)
+                }
             })
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -415,8 +482,10 @@ impl PgDb {
         }
         sql.push_str(" ORDER BY rf.created_at DESC");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &param_refs)
@@ -431,7 +500,11 @@ impl PgDb {
         &self,
         workflow_name: &str,
     ) -> Result<Vec<crate::reflection::storage::ReflectionRunSummary>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -521,7 +594,11 @@ impl PgDb {
         &self,
         fix_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -559,7 +636,11 @@ impl PgDb {
         &self,
         error_signature_hash: &str,
     ) -> Result<Option<crate::reflection::prediction::PredictedFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let rows = conn
             .query(
@@ -632,7 +713,11 @@ impl PgDb {
         workflow_name: &str,
         scope: &str,
     ) -> Result<crate::reflection::prediction::ConvergenceMetrics, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // 1. Count consecutive clean runs
         let rows = conn
@@ -700,7 +785,11 @@ impl PgDb {
                 .map(|r| r.get(0))
                 .unwrap_or(0);
 
-            if total_unique == 0 { 0.0 } else { recent_unique as f64 / total_unique as f64 }
+            if total_unique == 0 {
+                0.0
+            } else {
+                recent_unique as f64 / total_unique as f64
+            }
         };
 
         // 3. Effective fix rate
@@ -728,7 +817,11 @@ impl PgDb {
                 let ineffective: i64 = r.get(2);
                 let regression: i64 = r.get(3);
                 let denom = effective + ineffective + regression;
-                let rate = if denom > 0 { effective as f64 / denom as f64 } else { 1.0 };
+                let rate = if denom > 0 {
+                    effective as f64 / denom as f64
+                } else {
+                    1.0
+                };
                 (total as u32, effective as u32, rate)
             }
             None => (0, 0, 1.0),
@@ -779,7 +872,11 @@ impl PgDb {
         component_path: &str,
         window_size: u32,
     ) -> Result<f64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let window_i64 = window_size as i64;
 
         let fix_count: i64 = conn
@@ -811,7 +908,11 @@ impl PgDb {
         workflow_name: &str,
         limit: u32,
     ) -> Result<Vec<crate::reflection::prediction::ScoredKnowledge>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let rows = conn
             .query(
@@ -919,7 +1020,11 @@ impl PgDb {
         &self,
         workflow_name: &str,
     ) -> Result<Vec<ReflectionFix>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Get applied fixes that haven't been evaluated yet
         let rows = conn
@@ -987,7 +1092,11 @@ impl PgDb {
         workflow_name: &str,
         _task_run_id: &str,
     ) -> Result<(u32, u32, u32), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Detect recurring findings (simplified: count finding signatures with 3+ occurrences)
         let patterns: i64 = conn
@@ -1025,10 +1134,17 @@ impl PgDb {
         min_similarity: f64,
         limit: usize,
     ) -> Result<Vec<crate::reflection::fuzzy_matching::SimilarError>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Use ILIKE for basic text matching since PG trigram extension may not be installed
-        let search_term = format!("%{}%", &error_description[..error_description.len().min(50)]);
+        let search_term = format!(
+            "%{}%",
+            &error_description[..error_description.len().min(50)]
+        );
         let limit_i64 = (limit * 2) as i64; // fetch more, then filter by similarity
 
         let rows = conn
@@ -1049,7 +1165,8 @@ impl PgDb {
             let id: String = row.get(0);
             let sig: String = row.get(1);
             let msg: String = row.get(2);
-            let sim = crate::reflection::fuzzy_matching::trigram_similarity(error_description, &msg);
+            let sim =
+                crate::reflection::fuzzy_matching::trigram_similarity(error_description, &msg);
             if sim >= min_similarity {
                 results.push(crate::reflection::fuzzy_matching::SimilarError {
                     error_id: id,
@@ -1075,11 +1192,12 @@ impl PgDb {
 
     /// PG equivalent of trigger::should_launch_reflection.
     /// Returns false if reflection should be skipped.
-    pub async fn should_launch_reflection(
-        &self,
-        source_task_run_id: &str,
-    ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+    pub async fn should_launch_reflection(&self, source_task_run_id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Guard 0: Check if a reflection for the SAME workflow is already running
         let has_running: bool = conn
@@ -1136,7 +1254,11 @@ impl PgDb {
         &self,
         source_task_run_id: &str,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Guard 0: Block if a project reflection for the SAME workflow is already running
         let has_running: bool = conn
@@ -1217,7 +1339,11 @@ impl PgDb {
         &self,
         source_task_run_id: &str,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         // Guard 0: Block if a UI Bridge reflection for the SAME workflow is already running
         let has_running: bool = conn
@@ -1277,7 +1403,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         conn.query_one(
             "SELECT COALESCE(workflow_name, task_name) FROM task_runs WHERE id = $1",
@@ -1285,7 +1415,12 @@ impl PgDb {
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| format!("Failed to get workflow name for task run {}: {}", task_run_id, e))
+        .map_err(|e| {
+            format!(
+                "Failed to get workflow name for task run {}: {}",
+                task_run_id, e
+            )
+        })
     }
 
     /// Get workflow name and project path for a task run (used by project reflection).
@@ -1293,7 +1428,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<(String, Option<String>), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let wf_name: String = conn
             .query_one(
@@ -1335,7 +1474,11 @@ impl PgDb {
         &self,
         reflection_task_run_id: &str,
     ) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -1356,7 +1499,11 @@ impl PgDb {
         project_path: Option<&str>,
         applicability_context: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         conn.execute(
             r#"UPDATE reflection_fixes
@@ -1383,7 +1530,11 @@ impl PgDb {
         fix_id: &str,
         finding_id: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         conn.execute(
             r#"UPDATE error_events SET resolved_by_fix_id = $1
@@ -1406,7 +1557,11 @@ impl PgDb {
         scope: &str,
         metrics: &crate::reflection::prediction::ConvergenceMetrics,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -1423,7 +1578,8 @@ impl PgDb {
                 &project_path as &(dyn tokio_postgres::types::ToSql + Sync),
                 &scope as &(dyn tokio_postgres::types::ToSql + Sync),
                 &metrics.score as &(dyn tokio_postgres::types::ToSql + Sync),
-                &(metrics.consecutive_clean_runs as i32) as &(dyn tokio_postgres::types::ToSql + Sync),
+                &(metrics.consecutive_clean_runs as i32)
+                    as &(dyn tokio_postgres::types::ToSql + Sync),
                 &metrics.novelty_score as &(dyn tokio_postgres::types::ToSql + Sync),
                 &metrics.effective_fix_rate as &(dyn tokio_postgres::types::ToSql + Sync),
                 &metrics.change_velocity as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -1484,7 +1640,8 @@ impl PgDb {
                 "stalled".to_string(),
                 format!(
                     "Convergence score {:.2}. Progress has stalled with {:.0}% fix effectiveness.",
-                    metrics.score, metrics.effective_fix_rate * 100.0
+                    metrics.score,
+                    metrics.effective_fix_rate * 100.0
                 ),
                 "Consider reviewing ineffective fixes or changing the approach.".to_string(),
             )
@@ -1511,7 +1668,11 @@ impl PgDb {
         event_id: &str,
         max_depth: u32,
     ) -> Result<crate::reflection::causal::CausalChain, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let mut events = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
@@ -1538,27 +1699,42 @@ impl PgDb {
                 .map_err(|e| format!("PG trace_causal_chain_forward: {}", e))?;
             for row in &rows {
                 let event = crate::reflection::causal::CausalEvent {
-                    id: row.get(0), cause_event_type: row.get(1), cause_event_id: row.get(2),
-                    effect_event_type: row.get(3), effect_event_id: row.get(4),
-                    relationship: row.get(5), confidence: row.get(6), source: row.get(7),
-                    task_run_id: row.get(8), workflow_name: row.get(9),
-                    description: row.get(10), created_at: row.get(11),
+                    id: row.get(0),
+                    cause_event_type: row.get(1),
+                    cause_event_id: row.get(2),
+                    effect_event_type: row.get(3),
+                    effect_event_id: row.get(4),
+                    relationship: row.get(5),
+                    confidence: row.get(6),
+                    source: row.get(7),
+                    task_run_id: row.get(8),
+                    workflow_name: row.get(9),
+                    description: row.get(10),
+                    created_at: row.get(11),
                 };
                 let key = format!("{}:{}", event.effect_event_type, event.effect_event_id);
                 if !visited.contains(&key) {
                     visited.insert(key);
-                    queue.push_back((event.effect_event_type.clone(), event.effect_event_id.clone(), depth + 1));
+                    queue.push_back((
+                        event.effect_event_type.clone(),
+                        event.effect_event_id.clone(),
+                        depth + 1,
+                    ));
                 }
                 events.push(event);
             }
         }
-        let (terminal_type, terminal_id) = events.last()
+        let (terminal_type, terminal_id) = events
+            .last()
             .map(|e| (e.effect_event_type.clone(), e.effect_event_id.clone()))
             .unwrap_or_else(|| (event_type.to_string(), event_id.to_string()));
         Ok(crate::reflection::causal::CausalChain {
-            chain_length: events.len(), events,
-            root_cause_type: event_type.to_string(), root_cause_id: event_id.to_string(),
-            terminal_type, terminal_id,
+            chain_length: events.len(),
+            events,
+            root_cause_type: event_type.to_string(),
+            root_cause_id: event_id.to_string(),
+            terminal_type,
+            terminal_id,
         })
     }
 
@@ -1569,7 +1745,11 @@ impl PgDb {
         event_id: &str,
         max_depth: u32,
     ) -> Result<crate::reflection::causal::CausalChain, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let mut events = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
@@ -1578,7 +1758,9 @@ impl PgDb {
         visited.insert(format!("{}:{}", event_type, event_id));
 
         while let Some((etype, eid, depth)) = queue.pop_front() {
-            if depth >= max_depth { continue; }
+            if depth >= max_depth {
+                continue;
+            }
             let rows = conn
                 .query(
                     r#"SELECT id, cause_event_type, cause_event_id,
@@ -1594,35 +1776,56 @@ impl PgDb {
                 .map_err(|e| format!("PG trace_causal_chain_backward: {}", e))?;
             for row in &rows {
                 let event = crate::reflection::causal::CausalEvent {
-                    id: row.get(0), cause_event_type: row.get(1), cause_event_id: row.get(2),
-                    effect_event_type: row.get(3), effect_event_id: row.get(4),
-                    relationship: row.get(5), confidence: row.get(6), source: row.get(7),
-                    task_run_id: row.get(8), workflow_name: row.get(9),
-                    description: row.get(10), created_at: row.get(11),
+                    id: row.get(0),
+                    cause_event_type: row.get(1),
+                    cause_event_id: row.get(2),
+                    effect_event_type: row.get(3),
+                    effect_event_id: row.get(4),
+                    relationship: row.get(5),
+                    confidence: row.get(6),
+                    source: row.get(7),
+                    task_run_id: row.get(8),
+                    workflow_name: row.get(9),
+                    description: row.get(10),
+                    created_at: row.get(11),
                 };
                 let key = format!("{}:{}", event.cause_event_type, event.cause_event_id);
                 if !visited.contains(&key) {
                     visited.insert(key);
-                    queue.push_back((event.cause_event_type.clone(), event.cause_event_id.clone(), depth + 1));
+                    queue.push_back((
+                        event.cause_event_type.clone(),
+                        event.cause_event_id.clone(),
+                        depth + 1,
+                    ));
                 }
                 events.push(event);
             }
         }
-        let (root_type, root_id) = events.last()
+        let (root_type, root_id) = events
+            .last()
             .map(|e| (e.cause_event_type.clone(), e.cause_event_id.clone()))
             .unwrap_or_else(|| (event_type.to_string(), event_id.to_string()));
         Ok(crate::reflection::causal::CausalChain {
-            chain_length: events.len(), events,
-            root_cause_type: root_type, root_cause_id: root_id,
-            terminal_type: event_type.to_string(), terminal_id: event_id.to_string(),
+            chain_length: events.len(),
+            events,
+            root_cause_type: root_type,
+            root_cause_id: root_id,
+            terminal_type: event_type.to_string(),
+            terminal_id: event_id.to_string(),
         })
     }
 
     /// Get causal events for a workflow (reflection module version with typed return).
     pub async fn get_causal_events_typed(
-        &self, workflow_name: &str, limit: u32,
+        &self,
+        workflow_name: &str,
+        limit: u32,
     ) -> Result<Vec<crate::reflection::causal::CausalEvent>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let limit_i64 = limit as i64;
         let rows = conn.query(
             r#"SELECT id, cause_event_type, cause_event_id, effect_event_type, effect_event_id,
@@ -1630,20 +1833,36 @@ impl PgDb {
                FROM causal_events WHERE workflow_name = $1 ORDER BY created_at DESC LIMIT $2"#,
             &[&workflow_name, &limit_i64],
         ).await.map_err(|e| format!("PG get_causal_events: {}", e))?;
-        Ok(rows.iter().map(|row| crate::reflection::causal::CausalEvent {
-            id: row.get(0), cause_event_type: row.get(1), cause_event_id: row.get(2),
-            effect_event_type: row.get(3), effect_event_id: row.get(4),
-            relationship: row.get(5), confidence: row.get(6), source: row.get(7),
-            task_run_id: row.get(8), workflow_name: row.get(9),
-            description: row.get(10), created_at: row.get(11),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| crate::reflection::causal::CausalEvent {
+                id: row.get(0),
+                cause_event_type: row.get(1),
+                cause_event_id: row.get(2),
+                effect_event_type: row.get(3),
+                effect_event_id: row.get(4),
+                relationship: row.get(5),
+                confidence: row.get(6),
+                source: row.get(7),
+                task_run_id: row.get(8),
+                workflow_name: row.get(9),
+                description: row.get(10),
+                created_at: row.get(11),
+            })
+            .collect())
     }
 
     /// Build automated causal links for a task run.
     pub async fn build_automated_causal_links(
-        &self, task_run_id: &str, workflow_name: &str,
+        &self,
+        task_run_id: &str,
+        workflow_name: &str,
     ) -> Result<u32, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let mut count = 0u32;
         let fix_rows = conn.query(
             "SELECT id, source_finding_id FROM reflection_fixes WHERE source_task_run_id = $1 AND source_finding_id IS NOT NULL",
@@ -1662,18 +1881,31 @@ impl PgDb {
             ).await.unwrap_or(0);
             count += affected as u32;
         }
-        info!("PG: Built {} automated causal links for task_run={}, workflow={}", count, task_run_id, workflow_name);
+        info!(
+            "PG: Built {} automated causal links for task_run={}, workflow={}",
+            count, task_run_id, workflow_name
+        );
         Ok(count)
     }
 
     /// Get causal summary for a workflow.
     pub async fn get_causal_summary(
-        &self, workflow_name: &str,
+        &self,
+        workflow_name: &str,
     ) -> Result<crate::reflection::causal::CausalSummary, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let total_links: i64 = conn.query_one(
-            "SELECT COUNT(*) FROM causal_events WHERE workflow_name = $1", &[&workflow_name],
-        ).await.map(|r| r.get(0)).map_err(|e| format!("PG causal count: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let total_links: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM causal_events WHERE workflow_name = $1",
+                &[&workflow_name],
+            )
+            .await
+            .map(|r| r.get(0))
+            .map_err(|e| format!("PG causal count: {}", e))?;
 
         let mut by_relationship = std::collections::HashMap::new();
         for row in conn.query(
@@ -1698,10 +1930,21 @@ impl PgDb {
                        SELECT effect_event_type || ':' || effect_event_id FROM causal_events WHERE workflow_name = $1)"#,
                 &[&workflow_name],
             ).await.map(|r| r.get(0)).unwrap_or(1);
-            if root_count > 0 { total_links as f64 / root_count as f64 } else { total_links as f64 }
-        } else { 0.0 };
+            if root_count > 0 {
+                total_links as f64 / root_count as f64
+            } else {
+                total_links as f64
+            }
+        } else {
+            0.0
+        };
 
-        Ok(crate::reflection::causal::CausalSummary { total_links: total_links as u32, by_relationship, by_cause_type, avg_chain_length })
+        Ok(crate::reflection::causal::CausalSummary {
+            total_links: total_links as u32,
+            by_relationship,
+            by_cause_type,
+            avg_chain_length,
+        })
     }
 
     // ========================================================================
@@ -1710,59 +1953,109 @@ impl PgDb {
 
     /// Get the component graph for a workflow.
     pub async fn get_component_graph(
-        &self, workflow_name: &str,
+        &self,
+        workflow_name: &str,
     ) -> Result<crate::reflection::architecture::ComponentGraph, String> {
         use crate::reflection::architecture::*;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let node_rows = conn.query(
-            r#"SELECT id, component_path, component_type, fix_count, error_count,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let node_rows = conn
+            .query(
+                r#"SELECT id, component_path, component_type, fix_count, error_count,
                       causal_involvement_count, effective_fix_count, ineffective_fix_count,
                       health_score, change_velocity, last_activity_at
                FROM architecture_components WHERE workflow_name = $1 ORDER BY component_path"#,
-            &[&workflow_name],
-        ).await.map_err(|e| format!("PG get_component_graph: {}", e))?;
+                &[&workflow_name],
+            )
+            .await
+            .map_err(|e| format!("PG get_component_graph: {}", e))?;
 
-        let nodes: Vec<ComponentNode> = node_rows.iter().map(|r| ComponentNode {
-            id: r.get(0), component_path: r.get(1), component_type: r.get(2),
-            fix_count: r.get::<_, i32>(3) as u32, error_count: r.get::<_, i32>(4) as u32,
-            causal_involvement_count: r.get::<_, i32>(5) as u32,
-            effective_fix_count: r.get::<_, i32>(6) as u32, ineffective_fix_count: r.get::<_, i32>(7) as u32,
-            health_score: r.get(8), change_velocity: r.get(9), last_activity_at: r.get(10),
-        }).collect();
+        let nodes: Vec<ComponentNode> = node_rows
+            .iter()
+            .map(|r| ComponentNode {
+                id: r.get(0),
+                component_path: r.get(1),
+                component_type: r.get(2),
+                fix_count: r.get::<_, i32>(3) as u32,
+                error_count: r.get::<_, i32>(4) as u32,
+                causal_involvement_count: r.get::<_, i32>(5) as u32,
+                effective_fix_count: r.get::<_, i32>(6) as u32,
+                ineffective_fix_count: r.get::<_, i32>(7) as u32,
+                health_score: r.get(8),
+                change_velocity: r.get(9),
+                last_activity_at: r.get(10),
+            })
+            .collect();
 
         let edge_rows = conn.query(
             "SELECT source_component, target_component, relationship_type, strength FROM architecture_relationships WHERE workflow_name = $1",
             &[&workflow_name],
         ).await.map_err(|e| format!("PG get_component_graph edges: {}", e))?;
 
-        let edges: Vec<ComponentEdge> = edge_rows.iter().map(|r| ComponentEdge {
-            source: r.get(0), target: r.get(1), relationship_type: r.get(2), strength: r.get::<_, i32>(3) as u32,
-        }).collect();
+        let edges: Vec<ComponentEdge> = edge_rows
+            .iter()
+            .map(|r| ComponentEdge {
+                source: r.get(0),
+                target: r.get(1),
+                relationship_type: r.get(2),
+                strength: r.get::<_, i32>(3) as u32,
+            })
+            .collect();
 
-        let avg_health = if !nodes.is_empty() { nodes.iter().map(|n| n.health_score).sum::<f64>() / nodes.len() as f64 } else { 0.0 };
-        let mut volatile: Vec<_> = nodes.iter().map(|n| (n.component_path.clone(), n.change_velocity)).collect();
+        let avg_health = if !nodes.is_empty() {
+            nodes.iter().map(|n| n.health_score).sum::<f64>() / nodes.len() as f64
+        } else {
+            0.0
+        };
+        let mut volatile: Vec<_> = nodes
+            .iter()
+            .map(|n| (n.component_path.clone(), n.change_velocity))
+            .collect();
         volatile.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let most_volatile: Vec<String> = volatile.into_iter().take(5).map(|(p, _)| p).collect();
 
         Ok(ComponentGraph {
-            nodes, edges,
-            stats: GraphStats { total_components: node_rows.len() as u32, total_relationships: edge_rows.len() as u32, avg_health_score: avg_health, most_volatile },
+            nodes,
+            edges,
+            stats: GraphStats {
+                total_components: node_rows.len() as u32,
+                total_relationships: edge_rows.len() as u32,
+                avg_health_score: avg_health,
+                most_volatile,
+            },
         })
     }
 
     /// Rebuild the architecture model for a workflow.
     pub async fn rebuild_architecture_model(
-        &self, workflow_name: &str,
+        &self,
+        workflow_name: &str,
     ) -> Result<crate::reflection::architecture::RebuildResult, String> {
         use crate::reflection::architecture::*;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
-        conn.execute("DELETE FROM architecture_components WHERE workflow_name = $1", &[&workflow_name]).await
-            .map_err(|e| format!("PG rebuild_arch delete: {}", e))?;
-        conn.execute("DELETE FROM architecture_relationships WHERE workflow_name = $1", &[&workflow_name]).await
-            .map_err(|e| format!("PG rebuild_arch delete rels: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        conn.execute(
+            "DELETE FROM architecture_components WHERE workflow_name = $1",
+            &[&workflow_name],
+        )
+        .await
+        .map_err(|e| format!("PG rebuild_arch delete: {}", e))?;
+        conn.execute(
+            "DELETE FROM architecture_relationships WHERE workflow_name = $1",
+            &[&workflow_name],
+        )
+        .await
+        .map_err(|e| format!("PG rebuild_arch delete rels: {}", e))?;
 
-        let fix_rows = conn.query(
-            r#"SELECT file_changed, COUNT(*) as fix_count,
+        let fix_rows = conn
+            .query(
+                r#"SELECT file_changed, COUNT(*) as fix_count,
                       SUM(CASE WHEN effectiveness = 'effective' THEN 1 ELSE 0 END) as effective,
                       SUM(CASE WHEN effectiveness = 'ineffective' THEN 1 ELSE 0 END) as ineffective,
                       MAX(created_at) as last_activity
@@ -1770,8 +2063,10 @@ impl PgDb {
                WHERE file_changed IS NOT NULL
                  AND source_task_run_id IN (SELECT id FROM task_runs WHERE workflow_name = $1)
                GROUP BY file_changed"#,
-            &[&workflow_name],
-        ).await.map_err(|e| format!("PG rebuild_arch scan: {}", e))?;
+                &[&workflow_name],
+            )
+            .await
+            .map_err(|e| format!("PG rebuild_arch scan: {}", e))?;
 
         let mut components_count = 0u32;
         for row in &fix_rows {
@@ -1782,7 +2077,11 @@ impl PgDb {
             let effective: i64 = row.get(2);
             let ineffective: i64 = row.get(3);
             let last_activity: Option<String> = row.get(4);
-            let health = if fix_count > 0 { effective as f64 / fix_count as f64 } else { 1.0 };
+            let health = if fix_count > 0 {
+                effective as f64 / fix_count as f64
+            } else {
+                1.0
+            };
             let id = uuid::Uuid::new_v4().to_string();
             conn.execute(
                 r#"INSERT INTO architecture_components
@@ -1796,34 +2095,58 @@ impl PgDb {
             components_count += 1;
         }
 
-        let rel_count: i64 = conn.query_one(
-            "SELECT COUNT(*) FROM architecture_relationships WHERE workflow_name = $1", &[&workflow_name],
-        ).await.map(|r| r.get(0)).unwrap_or(0);
+        let rel_count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM architecture_relationships WHERE workflow_name = $1",
+                &[&workflow_name],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
 
-        Ok(RebuildResult { components_count, relationships_count: rel_count as u32, workflow_name: workflow_name.to_string() })
+        Ok(RebuildResult {
+            components_count,
+            relationships_count: rel_count as u32,
+            workflow_name: workflow_name.to_string(),
+        })
     }
 
     /// Get component details for a specific path.
     pub async fn get_component_details(
-        &self, workflow_name: &str, path: &str,
+        &self,
+        workflow_name: &str,
+        path: &str,
     ) -> Result<crate::reflection::architecture::ComponentDetails, String> {
         use crate::reflection::architecture::*;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let norm_path = normalize_component_path(path);
-        let node_row = conn.query_opt(
-            r#"SELECT id, component_path, component_type, fix_count, error_count,
+        let node_row = conn
+            .query_opt(
+                r#"SELECT id, component_path, component_type, fix_count, error_count,
                       causal_involvement_count, effective_fix_count, ineffective_fix_count,
                       health_score, change_velocity, last_activity_at
                FROM architecture_components WHERE workflow_name = $1 AND component_path = $2"#,
-            &[&workflow_name, &norm_path],
-        ).await.map_err(|e| format!("PG get_component_details: {}", e))?;
+                &[&workflow_name, &norm_path],
+            )
+            .await
+            .map_err(|e| format!("PG get_component_details: {}", e))?;
         let node = match node_row {
             Some(r) => ComponentNode {
-                id: r.get(0), component_path: r.get(1), component_type: r.get(2),
-                fix_count: r.get::<_, i32>(3) as u32, error_count: r.get::<_, i32>(4) as u32,
+                id: r.get(0),
+                component_path: r.get(1),
+                component_type: r.get(2),
+                fix_count: r.get::<_, i32>(3) as u32,
+                error_count: r.get::<_, i32>(4) as u32,
                 causal_involvement_count: r.get::<_, i32>(5) as u32,
-                effective_fix_count: r.get::<_, i32>(6) as u32, ineffective_fix_count: r.get::<_, i32>(7) as u32,
-                health_score: r.get(8), change_velocity: r.get(9), last_activity_at: r.get(10),
+                effective_fix_count: r.get::<_, i32>(6) as u32,
+                ineffective_fix_count: r.get::<_, i32>(7) as u32,
+                health_score: r.get(8),
+                change_velocity: r.get(9),
+                last_activity_at: r.get(10),
             },
             None => return Err(format!("Component not found: {}", path)),
         };
@@ -1845,31 +2168,52 @@ impl PgDb {
         ).await.unwrap_or_default().iter().map(|r| ImpactEntry {
             component_path: r.get(0), relationship_type: r.get(1), strength: r.get::<_, i32>(2) as u32,
         }).collect();
-        Ok(ComponentDetails { node, recent_fixes, impacted_by, impacts })
+        Ok(ComponentDetails {
+            node,
+            recent_fixes,
+            impacted_by,
+            impacts,
+        })
     }
 
     /// Get architecture impact analysis for a component (BFS, max 3 hops).
     pub async fn get_architecture_impact_analysis(
-        &self, workflow_name: &str, component: &str,
+        &self,
+        workflow_name: &str,
+        component: &str,
     ) -> Result<crate::reflection::architecture::ImpactAnalysis, String> {
         use crate::reflection::architecture::*;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let norm = normalize_component_path(component);
         let direct_rows = conn.query(
             "SELECT target_component, relationship_type, strength FROM architecture_relationships WHERE workflow_name = $1 AND source_component = $2",
             &[&workflow_name, &norm],
         ).await.unwrap_or_default();
-        let direct_impacts: Vec<ImpactEntry> = direct_rows.iter().map(|r| ImpactEntry {
-            component_path: r.get(0), relationship_type: r.get(1), strength: r.get::<_, i32>(2) as u32,
-        }).collect();
+        let direct_impacts: Vec<ImpactEntry> = direct_rows
+            .iter()
+            .map(|r| ImpactEntry {
+                component_path: r.get(0),
+                relationship_type: r.get(1),
+                strength: r.get::<_, i32>(2) as u32,
+            })
+            .collect();
         let mut transitive = Vec::new();
         let mut visited = std::collections::HashSet::new();
         visited.insert(norm.clone());
-        let mut frontier: Vec<String> = direct_impacts.iter().map(|d| d.component_path.clone()).collect();
+        let mut frontier: Vec<String> = direct_impacts
+            .iter()
+            .map(|d| d.component_path.clone())
+            .collect();
         for _ in 0..2 {
             let mut next = Vec::new();
             for f in &frontier {
-                if visited.contains(f) { continue; }
+                if visited.contains(f) {
+                    continue;
+                }
                 visited.insert(f.clone());
                 for r in conn.query(
                     "SELECT target_component, relationship_type, strength FROM architecture_relationships WHERE workflow_name = $1 AND source_component = $2",
@@ -1883,17 +2227,28 @@ impl PgDb {
                 }
             }
             frontier = next;
-            if frontier.is_empty() { break; }
+            if frontier.is_empty() {
+                break;
+            }
         }
         let total = direct_impacts.len() + transitive.len();
-        Ok(ImpactAnalysis { component: component.to_string(), direct_impacts, transitive_impacts: transitive, total_impact_radius: total as u32, highest_risk_path: vec![component.to_string()] })
+        Ok(ImpactAnalysis {
+            component: component.to_string(),
+            direct_impacts,
+            transitive_impacts: transitive,
+            total_impact_radius: total as u32,
+            highest_risk_path: vec![component.to_string()],
+        })
     }
 
     /// Get impact analysis with graph enrichment.
     pub async fn get_impact_analysis_with_graph(
-        &self, workflow_name: &str, component: &str,
+        &self,
+        workflow_name: &str,
+        component: &str,
     ) -> Result<crate::reflection::architecture::ImpactAnalysis, String> {
-        self.get_architecture_impact_analysis(workflow_name, component).await
+        self.get_architecture_impact_analysis(workflow_name, component)
+            .await
     }
 
     // ========================================================================
@@ -1902,10 +2257,16 @@ impl PgDb {
 
     /// Get workflow-level convergence trends.
     pub async fn get_workflow_trends(
-        &self, workflow_name: &str, time_range: Option<&str>,
+        &self,
+        workflow_name: &str,
+        time_range: Option<&str>,
     ) -> Result<crate::reflection::trends::WorkflowTrends, String> {
         use crate::reflection::trends::{TrendPoint, WorkflowTrends};
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let cutoff = parse_time_cutoff_static(time_range);
         let rows = if let Some(ref c) = cutoff {
             conn.query(
@@ -1924,20 +2285,50 @@ impl PgDb {
         let mut total_fixes = Vec::new();
         for row in &rows {
             let ts: String = row.get(0);
-            convergence.push(TrendPoint { timestamp: ts.clone(), value: row.get(1), count: None });
-            fix_rate.push(TrendPoint { timestamp: ts.clone(), value: row.get(2), count: None });
-            velocity.push(TrendPoint { timestamp: ts.clone(), value: row.get(3), count: None });
-            total_fixes.push(TrendPoint { timestamp: ts.clone(), value: row.get::<_, i32>(4) as f64, count: Some(row.get::<_, i32>(4) as u32) });
+            convergence.push(TrendPoint {
+                timestamp: ts.clone(),
+                value: row.get(1),
+                count: None,
+            });
+            fix_rate.push(TrendPoint {
+                timestamp: ts.clone(),
+                value: row.get(2),
+                count: None,
+            });
+            velocity.push(TrendPoint {
+                timestamp: ts.clone(),
+                value: row.get(3),
+                count: None,
+            });
+            total_fixes.push(TrendPoint {
+                timestamp: ts.clone(),
+                value: row.get::<_, i32>(4) as f64,
+                count: Some(row.get::<_, i32>(4) as u32),
+            });
         }
-        Ok(WorkflowTrends { workflow_name: workflow_name.to_string(), convergence, fix_rate, velocity, total_fixes, snapshot_count: rows.len() })
+        Ok(WorkflowTrends {
+            workflow_name: workflow_name.to_string(),
+            convergence,
+            fix_rate,
+            velocity,
+            total_fixes,
+            snapshot_count: rows.len(),
+        })
     }
 
     /// Get component-level health trends.
     pub async fn get_component_trend(
-        &self, workflow_name: &str, path: &str, time_range: Option<&str>,
+        &self,
+        workflow_name: &str,
+        path: &str,
+        time_range: Option<&str>,
     ) -> Result<crate::reflection::trends::ComponentTrend, String> {
         use crate::reflection::trends::{ComponentTrend, TrendPoint};
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let norm_path = crate::reflection::architecture::normalize_component_path(path);
         let cutoff = parse_time_cutoff_static(time_range);
         let rows = if let Some(ref c) = cutoff {
@@ -1955,19 +2346,42 @@ impl PgDb {
         let mut fix_counts = Vec::new();
         for row in &rows {
             let ts: String = row.get(0);
-            health_scores.push(TrendPoint { timestamp: ts.clone(), value: row.get(1), count: None });
-            fix_counts.push(TrendPoint { timestamp: ts.clone(), value: row.get::<_, i32>(2) as f64, count: Some(row.get::<_, i32>(2) as u32) });
+            health_scores.push(TrendPoint {
+                timestamp: ts.clone(),
+                value: row.get(1),
+                count: None,
+            });
+            fix_counts.push(TrendPoint {
+                timestamp: ts.clone(),
+                value: row.get::<_, i32>(2) as f64,
+                count: Some(row.get::<_, i32>(2) as u32),
+            });
         }
-        Ok(ComponentTrend { component_path: norm_path, health_scores, fix_counts })
+        Ok(ComponentTrend {
+            component_path: norm_path,
+            health_scores,
+            fix_counts,
+        })
     }
 
     /// Get time-bucketed effectiveness rate from reflection_fixes.
     pub async fn get_effectiveness_over_time(
-        &self, workflow_name: &str, bucket_type: &str, time_range: Option<&str>,
+        &self,
+        workflow_name: &str,
+        bucket_type: &str,
+        time_range: Option<&str>,
     ) -> Result<crate::reflection::trends::EffectivenessOverTime, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let cutoff = parse_time_cutoff_static(time_range);
-        let date_trunc = match bucket_type { "day" => "day", "month" => "month", _ => "week" };
+        let date_trunc = match bucket_type {
+            "day" => "day",
+            "month" => "month",
+            _ => "week",
+        };
         let base_query = format!(
             r#"SELECT DATE_TRUNC('{}', created_at::timestamp)::TEXT as bucket,
                       COUNT(*) as total,
@@ -1976,20 +2390,29 @@ impl PgDb {
                WHERE source_task_run_id IN (SELECT id FROM task_runs WHERE workflow_name = $1)
                {} GROUP BY bucket ORDER BY bucket ASC"#,
             date_trunc,
-            if cutoff.is_some() { "AND created_at > $2" } else { "" }
+            if cutoff.is_some() {
+                "AND created_at > $2"
+            } else {
+                ""
+            }
         );
         let rows = if let Some(ref c) = cutoff {
             conn.query(&base_query, &[&workflow_name, c]).await
         } else {
             conn.query(&base_query, &[&workflow_name]).await
-        }.map_err(|e| format!("PG get_effectiveness_over_time: {}", e))?;
+        }
+        .map_err(|e| format!("PG get_effectiveness_over_time: {}", e))?;
         let mut eb = Vec::new();
         for row in &rows {
             let bucket_label: String = row.get(0);
             let total: i64 = row.get(1);
             let effective: i64 = row.get(2);
             let ineffective = total - effective;
-            let rate = if total > 0 { effective as f64 / total as f64 } else { 0.0 };
+            let rate = if total > 0 {
+                effective as f64 / total as f64
+            } else {
+                0.0
+            };
             eb.push(crate::reflection::trends::EffectivenessBucket {
                 bucket: bucket_label,
                 total: total as u32,
@@ -2005,18 +2428,21 @@ impl PgDb {
             buckets: eb,
         })
     }
-
 }
 
 /// Parse time range to cutoff (standalone function for use by PgDb).
 fn parse_time_cutoff_static(time_range: Option<&str>) -> Option<String> {
     let range = time_range?;
-    if range == "all" { return None; }
+    if range == "all" {
+        return None;
+    }
     let now = chrono::Utc::now();
     let duration = if range.ends_with('d') {
         chrono::Duration::days(range.trim_end_matches('d').parse().ok()?)
     } else if range.ends_with('h') {
         chrono::Duration::hours(range.trim_end_matches('h').parse().ok()?)
-    } else { return None; };
+    } else {
+        return None;
+    };
     Some((now - duration).format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }

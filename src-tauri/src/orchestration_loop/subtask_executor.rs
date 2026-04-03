@@ -100,19 +100,13 @@ pub fn build_subtask_context(
         }
     }
 
-    context.push_str(&format!(
-        "\n## Overall goal\n{}\n",
-        plan.original_goal
-    ));
+    context.push_str(&format!("\n## Overall goal\n{}\n", plan.original_goal));
 
     context
 }
 
 /// Check if a subtask should be skipped due to failed dependencies.
-pub fn should_skip_subtask(
-    subtask: &SubTask,
-    failed_ids: &[String],
-) -> Option<String> {
+pub fn should_skip_subtask(subtask: &SubTask, failed_ids: &[String]) -> Option<String> {
     for dep_id in &subtask.depends_on {
         if failed_ids.contains(dep_id) {
             return Some(format!(
@@ -198,17 +192,15 @@ mod tests {
     #[test]
     fn build_subtask_context_with_completed_results() {
         let plan = make_plan(vec![make_subtask("a", "A", vec![])]);
-        let results = vec![
-            SubTaskExecutionResult {
-                subtask_id: "a".to_string(),
-                subtask_title: "Task A".to_string(),
-                success: true,
-                output_summary: "Did something useful".to_string(),
-                error: None,
-                task_run_id: Some("run1".to_string()),
-                duration_ms: 1000,
-            },
-        ];
+        let results = vec![SubTaskExecutionResult {
+            subtask_id: "a".to_string(),
+            subtask_title: "Task A".to_string(),
+            success: true,
+            output_summary: "Did something useful".to_string(),
+            error: None,
+            task_run_id: Some("run1".to_string()),
+            duration_ms: 1000,
+        }];
         let context = build_subtask_context(&plan, &results);
         assert!(context.contains("Task A (completed)"));
         assert!(context.contains("Did something useful"));

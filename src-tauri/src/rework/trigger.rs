@@ -44,19 +44,13 @@ pub async fn trigger_rework(
         .workflow_id
         .as_deref()
         .ok_or("Source task run has no workflow_id")?;
-    let workflow_name = source_run
-        .workflow_name
-        .as_deref()
-        .unwrap_or("Unknown");
+    let workflow_name = source_run.workflow_name.as_deref().unwrap_or("Unknown");
     let project_path = crate::mcp::shared::current_project_path();
 
     // 2. Git rollback if checkpoint available
     if let (Some(checkpoint), Some(ref proj_path)) = (git_checkpoint, &project_path) {
         if !checkpoint.is_empty() {
-            info!(
-                "Rolling back to git checkpoint {} for rework",
-                checkpoint
-            );
+            info!("Rolling back to git checkpoint {} for rework", checkpoint);
             let output = crate::process_helpers::tokio_no_window("git")
                 .args(["reset", "--hard", checkpoint])
                 .current_dir(proj_path)

@@ -2,8 +2,8 @@
 //!
 //! Allows testing a recommendation on a percentage of runs before full rollout.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::{debug, info, warn};
 
@@ -76,16 +76,16 @@ pub fn start_canary(
     let percentage = percentage.clamp(1, 100);
     tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
-            pg_db.start_canary(recommendation_id, percentage as f64).await
+            pg_db
+                .start_canary(recommendation_id, percentage as f64)
+                .await
         })
     })
 }
 
 /// Get all active canary rollouts.
 pub fn get_active_canaries(pg_db: &Arc<PgDb>) -> Result<Vec<CanaryRollout>, String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.get_active_canaries())
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_active_canaries()))
 }
 
 /// Update the traffic percentage for an active canary rollout.
@@ -107,9 +107,7 @@ pub fn update_canary_percentage(
 /// Get completed canary rollouts (promoted or rolled back) for history display.
 pub fn get_canary_history(pg_db: &Arc<PgDb>, limit: u32) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.min(100) as i64;
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.get_canary_history(limit))
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_canary_history(limit)))
 }
 
 /// Get the canary prompt overrides for a recommendation.
@@ -156,18 +154,40 @@ pub fn record_canary_run(
     let pg_result = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
             let (baseline_json, canary_json) = pg_db.get_canary_metrics(canary_id).await?;
-            let mut baseline: CanaryMetrics = serde_json::from_str(&baseline_json).unwrap_or_default();
-            let mut canary_m: CanaryMetrics = serde_json::from_str(&canary_json).unwrap_or_default();
-            let metrics = if is_canary { &mut canary_m } else { &mut baseline };
-            if success { metrics.success_count += 1; } else { metrics.failure_count += 1; }
+            let mut baseline: CanaryMetrics =
+                serde_json::from_str(&baseline_json).unwrap_or_default();
+            let mut canary_m: CanaryMetrics =
+                serde_json::from_str(&canary_json).unwrap_or_default();
+            let metrics = if is_canary {
+                &mut canary_m
+            } else {
+                &mut baseline
+            };
+            if success {
+                metrics.success_count += 1;
+            } else {
+                metrics.failure_count += 1;
+            }
             metrics.total_cost_usd += cost;
             metrics.total_duration_ms += duration_ms;
             let new_baseline = serde_json::to_string(&baseline).unwrap_or_default();
             let new_canary = serde_json::to_string(&canary_m).unwrap_or_default();
             let run_type = if is_canary { "canary" } else { "baseline" };
-            pg_db.record_canary_run(canary_id, run_type, if is_canary { &new_canary } else { &new_baseline }).await?;
+            pg_db
+                .record_canary_run(
+                    canary_id,
+                    run_type,
+                    if is_canary {
+                        &new_canary
+                    } else {
+                        &new_baseline
+                    },
+                )
+                .await?;
             // Also update full metrics
-            pg_db.update_canary_metrics(canary_id, &new_baseline, &new_canary).await?;
+            pg_db
+                .update_canary_metrics(canary_id, &new_baseline, &new_canary)
+                .await?;
             Ok::<(), String>(())
         })
     });
@@ -180,9 +200,7 @@ pub fn record_canary_run(
 /// Uses statistical tests (proportion z-test, confidence intervals, effect size)
 /// instead of simple threshold-based verdicts.
 pub fn evaluate_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<CanaryEvaluation, String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.evaluate_canary(canary_id))
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.evaluate_canary(canary_id)))
 }
 
 /// Promote a canary: apply the recommendation globally.
@@ -192,11 +210,18 @@ pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> 
     // Get recommendation_id from PG
     let rec_id: String = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
-            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
-            let row = conn.query_one(
-                "SELECT recommendation_id FROM canary_rollouts WHERE id = $1",
-                &[&canary_id_str],
-            ).await.map_err(|e| format!("PG canary lookup: {e}"))?;
+            let conn = pg_db
+                .pool()
+                .get()
+                .await
+                .map_err(|e| format!("PG pool: {e}"))?;
+            let row = conn
+                .query_one(
+                    "SELECT recommendation_id FROM canary_rollouts WHERE id = $1",
+                    &[&canary_id_str],
+                )
+                .await
+                .map_err(|e| format!("PG canary lookup: {e}"))?;
             Ok::<String, String>(row.get(0))
         })
     })?;
@@ -211,7 +236,10 @@ pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> 
 
     // Update prompt evolution verdict if this was a meta-prompt rewrite canary
     if let Err(e) = update_evolution_for_recommendation(pg_db, &rec_id, "adopt", None) {
-        debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
+        debug!(
+            "No prompt evolution entry for recommendation {}: {}",
+            rec_id, e
+        );
     }
 
     info!("Promoted canary {} (recommendation {})", canary_id, rec_id);
@@ -237,11 +265,18 @@ pub fn rollback_canary_with_eval(
     // Get rec_id from PG
     let rec_id: String = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
-            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
-            let row = conn.query_one(
-                "SELECT recommendation_id FROM canary_rollouts WHERE id = $1",
-                &[&canary_id_str],
-            ).await.map_err(|e| format!("PG canary lookup: {e}"))?;
+            let conn = pg_db
+                .pool()
+                .get()
+                .await
+                .map_err(|e| format!("PG pool: {e}"))?;
+            let row = conn
+                .query_one(
+                    "SELECT recommendation_id FROM canary_rollouts WHERE id = $1",
+                    &[&canary_id_str],
+                )
+                .await
+                .map_err(|e| format!("PG canary lookup: {e}"))?;
             Ok::<String, String>(row.get(0))
         })
     })?;
@@ -251,7 +286,9 @@ pub fn rollback_canary_with_eval(
         Handle::current().block_on(async {
             pg_db.rollback_canary(&canary_id_str).await?;
             // Also update recommendation outcome
-            pg_db.update_recommendation_outcome(&rec_id, &eval_json).await?;
+            pg_db
+                .update_recommendation_outcome(&rec_id, &eval_json)
+                .await?;
             Ok::<(), String>(())
         })
     })?;
@@ -266,7 +303,10 @@ pub fn rollback_canary_with_eval(
 
     // Update prompt evolution verdict if this was a meta-prompt rewrite canary
     if let Err(e) = update_evolution_for_recommendation(pg_db, &rec_id, "reject", score_after) {
-        debug!("No prompt evolution entry for recommendation {}: {}", rec_id, e);
+        debug!(
+            "No prompt evolution entry for recommendation {}: {}",
+            rec_id, e
+        );
     }
 
     Ok(())
@@ -450,12 +490,11 @@ pub fn evaluate_prompt_canary(canary: &PromptTemplateCanary) -> CanaryEvaluation
         None
     };
 
-    let duration_delta_pct =
-        if baseline_total > 0 && candidate_total > 0 && b.avg_latency() > 0.0 {
-            Some((c.avg_latency() - b.avg_latency()) / b.avg_latency() * 100.0)
-        } else {
-            None
-        };
+    let duration_delta_pct = if baseline_total > 0 && candidate_total > 0 && b.avg_latency() > 0.0 {
+        Some((c.avg_latency() - b.avg_latency()) / b.avg_latency() * 100.0)
+    } else {
+        None
+    };
 
     let verdict_enum = if !min_runs_met {
         crate::stats::Verdict::Neutral
@@ -493,7 +532,12 @@ pub fn create_prompt_template_canary(
     traffic_pct: f64,
 ) -> Result<String, String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.create_template_canary(template_id, baseline_version, candidate_version, traffic_pct))
+        Handle::current().block_on(pg_db.create_template_canary(
+            template_id,
+            baseline_version,
+            candidate_version,
+            traffic_pct,
+        ))
     })
 }
 
@@ -521,19 +565,31 @@ pub fn record_prompt_canary_run(
     // PG-primary: load metrics, update, write back
     let pg_result = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
-            let canary = pg_db.get_template_canary(canary_id).await?
+            let canary = pg_db
+                .get_template_canary(canary_id)
+                .await?
                 .ok_or_else(|| format!("Prompt template canary not found: {}", canary_id))?;
             let mut baseline = canary.baseline_metrics;
             let mut candidate = canary.candidate_metrics;
-            let metrics = if used_candidate { &mut candidate } else { &mut baseline };
+            let metrics = if used_candidate {
+                &mut candidate
+            } else {
+                &mut baseline
+            };
             metrics.run_count += 1;
-            if success { metrics.success_count += 1; } else { metrics.failure_count += 1; }
+            if success {
+                metrics.success_count += 1;
+            } else {
+                metrics.failure_count += 1;
+            }
             metrics.total_cost_usd += cost;
             metrics.total_latency_ms += latency_ms;
             metrics.total_tokens += tokens;
             let b_json = serde_json::to_string(&baseline).unwrap_or_default();
             let c_json = serde_json::to_string(&candidate).unwrap_or_default();
-            pg_db.update_template_canary_metrics(canary_id, &b_json, &c_json).await
+            pg_db
+                .update_template_canary_metrics(canary_id, &b_json, &c_json)
+                .await
         })
     });
     pg_result
@@ -604,7 +660,11 @@ pub fn resolve_prompt_with_canary(
             info!(
                 "Canary {}: using {} version v{} for template '{}'",
                 canary.id,
-                if use_candidate { "candidate" } else { "baseline" },
+                if use_candidate {
+                    "candidate"
+                } else {
+                    "baseline"
+                },
                 version,
                 canary.template_id,
             );
@@ -671,15 +731,16 @@ pub async fn resolve_prompt_with_canary_pg(
     };
 
     // Load the prompt content for the selected version from the PG prompt registry
-    let content = match pg
-        .get_prompt_by_version(&canary.template_id, version)
-        .await
-    {
+    let content = match pg.get_prompt_by_version(&canary.template_id, version).await {
         Ok(Some(variant)) => {
             info!(
                 "Canary {}: using {} version v{} for template '{}' [PG]",
                 canary.id,
-                if use_candidate { "candidate" } else { "baseline" },
+                if use_candidate {
+                    "candidate"
+                } else {
+                    "baseline"
+                },
                 version,
                 canary.template_id,
             );
@@ -729,9 +790,6 @@ pub fn record_canary_outcome(
         latency_ms,
         tokens,
     ) {
-        warn!(
-            "Failed to record canary outcome for {}: {}",
-            canary_id, e
-        );
+        warn!("Failed to record canary outcome for {}: {}", canary_id, e);
     }
 }

@@ -5,8 +5,7 @@ use std::sync::LazyLock;
 use crate::knowledge_acquisition::types::KnowledgeResult;
 use crate::knowledge_acquisition::KnowledgeAcquisition;
 
-static CVE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
+static CVE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"CVE-\d{4}-\d{4,}").unwrap());
 
 /// Enrichment data for a security finding
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,10 +24,7 @@ impl EnrichmentData {
         let mut md = String::new();
 
         if !self.cve_ids.is_empty() {
-            md.push_str(&format!(
-                "**CVEs**: {}\n",
-                self.cve_ids.join(", ")
-            ));
+            md.push_str(&format!("**CVEs**: {}\n", self.cve_ids.join(", ")));
         }
 
         if let Some(score) = self.max_cvss_score {
@@ -90,10 +86,7 @@ pub async fn enrich_from_description(
 
     // Query Sploitus with the first CVE ID
     let query = cve_ids.first().unwrap();
-    let exploit_results = ka
-        .search_vulnerabilities(query)
-        .await
-        .unwrap_or_default();
+    let exploit_results = ka.search_vulnerabilities(query).await.unwrap_or_default();
 
     build_enrichment(&cve_ids, &exploit_results)
 }
@@ -123,18 +116,16 @@ fn build_enrichment(
         .collect();
 
     // Extract fixed version from exploit results if available
-    let remediation = exploit_results
-        .iter()
-        .find_map(|r| {
-            if r.content.contains("Fixed in") {
-                r.content
-                    .lines()
-                    .find(|l| l.contains("Fixed in"))
-                    .map(|l| l.trim().to_string())
-            } else {
-                None
-            }
-        });
+    let remediation = exploit_results.iter().find_map(|r| {
+        if r.content.contains("Fixed in") {
+            r.content
+                .lines()
+                .find(|l| l.contains("Fixed in"))
+                .map(|l| l.trim().to_string())
+        } else {
+            None
+        }
+    });
 
     Some(EnrichmentData {
         cve_ids: cve_ids.to_vec(),
@@ -152,7 +143,8 @@ mod tests {
 
     #[test]
     fn test_extract_cve_ids() {
-        let text = "Found CVE-2021-44228 and CVE-2024-12345 in the report. Also CVE-2021-44228 again.";
+        let text =
+            "Found CVE-2021-44228 and CVE-2024-12345 in the report. Also CVE-2021-44228 again.";
         let cves = extract_cve_ids(text);
         assert_eq!(cves, vec!["CVE-2021-44228", "CVE-2024-12345"]);
     }

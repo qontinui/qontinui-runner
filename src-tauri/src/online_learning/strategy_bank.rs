@@ -67,8 +67,7 @@ impl Default for StrategyApplicability {
 }
 
 /// What the strategy configures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StrategyComponents {
     /// Preferred workflow architecture (Traditional, AgenticVerification, MultiAgentPipeline).
     pub preferred_architecture: Option<String>,
@@ -83,7 +82,6 @@ pub struct StrategyComponents {
     /// Arbitrary parameter overrides.
     pub parameter_overrides: HashMap<String, serde_json::Value>,
 }
-
 
 /// Performance statistics for a strategy.
 #[derive(Debug, Clone, Serialize, Deserialize)]

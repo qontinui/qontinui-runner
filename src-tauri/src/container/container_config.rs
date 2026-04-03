@@ -18,7 +18,6 @@ pub struct ContainerConfig {
     pub network_enabled: bool,
 
     // === Security hardening fields (Phase 2) ===
-
     /// Linux capabilities to drop (e.g., ["ALL"]).
     /// Dropping ALL capabilities and adding back only what's needed is the recommended pattern.
     #[serde(default)]

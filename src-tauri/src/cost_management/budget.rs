@@ -143,8 +143,8 @@ impl BudgetTracker {
         // Calculate remaining fraction
         let cost_remaining =
             1.0 - (state.total_cost_usd / self.budget.max_cost_per_run_usd).min(1.0);
-        let token_remaining = 1.0
-            - (state.total_tokens as f64 / self.budget.max_tokens_per_run as f64).min(1.0);
+        let token_remaining =
+            1.0 - (state.total_tokens as f64 / self.budget.max_tokens_per_run as f64).min(1.0);
         let remaining_fraction = cost_remaining.min(token_remaining);
 
         if remaining_fraction < 0.2 {
@@ -176,8 +176,8 @@ impl BudgetTracker {
         let state = self.state.lock().unwrap();
         let cost_remaining =
             1.0 - (state.total_cost_usd / self.budget.max_cost_per_run_usd).min(1.0);
-        let token_remaining = 1.0
-            - (state.total_tokens as f64 / self.budget.max_tokens_per_run as f64).min(1.0);
+        let token_remaining =
+            1.0 - (state.total_tokens as f64 / self.budget.max_tokens_per_run as f64).min(1.0);
         cost_remaining.min(token_remaining).max(0.0)
     }
 
@@ -186,15 +186,9 @@ impl BudgetTracker {
         let state = self.state.lock().unwrap();
         let consumed = state.per_phase.get(phase).copied().unwrap_or((0, 0.0));
 
-        let phase_fraction = self
-            .budget
-            .phase_budgets
-            .get(phase)
-            .copied()
-            .unwrap_or(1.0);
+        let phase_fraction = self.budget.phase_budgets.get(phase).copied().unwrap_or(1.0);
 
-        let phase_token_limit =
-            (self.budget.max_tokens_per_run as f64 * phase_fraction) as u64;
+        let phase_token_limit = (self.budget.max_tokens_per_run as f64 * phase_fraction) as u64;
         let phase_cost_limit = self.budget.max_cost_per_run_usd * phase_fraction;
 
         let remaining_tokens = phase_token_limit.saturating_sub(consumed.0);
@@ -287,7 +281,9 @@ impl AiMiddleware for BudgetEnforcementMiddleware {
             // Estimate cost (simple approximation — callers can provide exact cost)
             let estimated_cost = total_tokens as f64 * 0.000003; // ~$3/M tokens average
 
-            let result = self.tracker.record(&ctx.phase, total_tokens, estimated_cost);
+            let result = self
+                .tracker
+                .record(&ctx.phase, total_tokens, estimated_cost);
             match result {
                 BudgetResult::Warning { message, .. } => {
                     info!("Budget warning: {}", message);

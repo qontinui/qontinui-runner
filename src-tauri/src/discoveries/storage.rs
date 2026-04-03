@@ -3,7 +3,6 @@
 //! Provides persistent queue storage for discoveries that need to be synced
 //! to qontinui-web. Supports offline operation with retry capability.
 
-
 use super::types::{DiscoveryPayload, PendingDiscovery};
 
 /// Queue a discovery for sync to qontinui-web.
@@ -34,9 +33,7 @@ pub fn get_discoveries_for_retry() -> Result<Vec<PendingDiscovery>, String> {
 }
 
 /// Get a specific pending discovery by ID.
-pub fn get_pending_discovery(
-    id: &str,
-) -> Result<Option<PendingDiscovery>, String> {
+pub fn get_pending_discovery(id: &str) -> Result<Option<PendingDiscovery>, String> {
     Err("SQLite removed".to_string())
 }
 

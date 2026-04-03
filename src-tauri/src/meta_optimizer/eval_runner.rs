@@ -467,9 +467,7 @@ pub fn evaluate_assertion_with_io(
             let result = evaluate_factuality(&judge_input, *min_factuality);
             judge_result_to_assertion(&result, "factuality")
         }
-        EvalAssertion::ContentSafety {
-            blocked_categories,
-        } => {
+        EvalAssertion::ContentSafety { blocked_categories } => {
             let result = evaluate_content_safety(&judge_input, blocked_categories);
             judge_result_to_assertion(&result, "content_safety")
         }

@@ -269,7 +269,8 @@ impl FileRegistryManager {
         // First pass: identify stale task_run_ids under a read lock
         let stale_task_ids: Vec<String> = {
             let state = self.state.read().await;
-            let mut unique_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut unique_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for entries in state.values() {
                 for entry in entries {
                     unique_ids.insert(entry.holder_task_run_id.clone());
@@ -405,7 +406,11 @@ mod tests {
             .await;
 
         let info = mgr.info().await;
-        assert_eq!(info.len(), 1, "Same session registering twice should not duplicate");
+        assert_eq!(
+            info.len(),
+            1,
+            "Same session registering twice should not duplicate"
+        );
     }
 
     #[tokio::test]

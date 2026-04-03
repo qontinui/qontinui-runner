@@ -13,7 +13,11 @@ impl PgDb {
 
     /// List all saved configs, favorites first then by updated_at desc.
     pub async fn list_ol_configs(&self) -> Result<Vec<OlConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -32,7 +36,11 @@ impl PgDb {
 
     /// Get a single config by ID.
     pub async fn get_ol_config(&self, id: &str) -> Result<Option<OlConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -51,7 +59,11 @@ impl PgDb {
 
     /// Insert a new orchestration loop config. Returns the created config.
     pub async fn insert_ol_config(&self, req: &CreateOlConfigRequest) -> Result<OlConfig, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -79,7 +91,11 @@ impl PgDb {
         id: &str,
         req: &UpdateOlConfigRequest,
     ) -> Result<OlConfig, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         // Build dynamic SET clause
@@ -104,7 +120,8 @@ impl PgDb {
             param_idx += 1;
         }
         if let Some(ref config) = req.config_json {
-            let s = serde_json::to_string(config).map_err(|e| format!("Failed to serialize: {}", e))?;
+            let s =
+                serde_json::to_string(config).map_err(|e| format!("Failed to serialize: {}", e))?;
             sets.push(format!("config_json = ${}", param_idx));
             param_values.push(Box::new(s));
             param_idx += 1;
@@ -112,7 +129,7 @@ impl PgDb {
 
         let id_owned = id.to_string();
         sets.push(String::new()); // placeholder — we use WHERE instead
-        // Remove empty placeholder
+                                  // Remove empty placeholder
         sets.pop();
 
         let sql = format!(
@@ -122,8 +139,10 @@ impl PgDb {
         );
         param_values.push(Box::new(id_owned));
 
-        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            param_values.iter().map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
+            .iter()
+            .map(|v| v.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         conn.execute(&sql, &params)
             .await
@@ -136,7 +155,11 @@ impl PgDb {
 
     /// Delete a config by ID.
     pub async fn delete_ol_config(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute(

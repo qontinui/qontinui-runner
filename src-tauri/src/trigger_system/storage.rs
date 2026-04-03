@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use tracing::info;
 
-
 use super::types::{TriggerCondition, TriggerConfig, TriggerHistoryEntry, WorkflowTrigger};
 
 // ============================================================================
@@ -46,10 +45,7 @@ pub fn set_trigger_enabled(id: &str, enabled: bool) -> Result<(), String> {
 }
 
 /// Record that a trigger was fired.
-pub fn record_trigger_fired(
-    id: &str,
-    execution_id: Option<&str>,
-) -> Result<(), String> {
+pub fn record_trigger_fired(id: &str, execution_id: Option<&str>) -> Result<(), String> {
     Err("SQLite removed".to_string())
 }
 

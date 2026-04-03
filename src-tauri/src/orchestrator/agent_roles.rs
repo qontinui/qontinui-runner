@@ -717,9 +717,12 @@ impl AgentRole {
                 .mutating()
                 .with_risk(ToolRiskLevel::Low),
             ToolSpec::new("wait", "Wait for a condition before proceeding"),
-            ToolSpec::new("record_info", "Save intermediate information for later retrieval")
-                .mutating()
-                .with_risk(ToolRiskLevel::Low),
+            ToolSpec::new(
+                "record_info",
+                "Save intermediate information for later retrieval",
+            )
+            .mutating()
+            .with_risk(ToolRiskLevel::Low),
         ])
         .with_constraints(vec![
             "Follow the Brain's action plan in order".to_string(),

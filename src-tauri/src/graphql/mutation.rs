@@ -212,9 +212,8 @@ impl MutationRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
         let id = uuid::Uuid::new_v4().to_string();
 
-        let mut db_input =
-            crate::database::CreateTaskRunInput::new(&id, &input.task_name)
-                .with_task_type(&input.task_type);
+        let mut db_input = crate::database::CreateTaskRunInput::new(&id, &input.task_name)
+            .with_task_type(&input.task_type);
         if let Some(ref p) = input.prompt {
             db_input = db_input.with_prompt(p);
         }
@@ -241,28 +240,29 @@ impl MutationRoot {
         let run = 'pg: {
             match state.app_state.pg_db.create_task_run(&db_input).await {
                 Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for create_task_run, falling back to SQLite: {}", e),
+                Err(e) => tracing::warn!(
+                    "PG failed for create_task_run, falling back to SQLite: {}",
+                    e
+                ),
             }
-            return Err(Error::new("PG create_task_run failed (no SQLite fallback)"))
+            return Err(Error::new("PG create_task_run failed (no SQLite fallback)"));
         };
 
         Ok(GqlTaskRun::from_db(run))
     }
 
     /// Stop a running task run (kills AI processes and marks as stopped).
-    async fn stop_task_run(
-        &self,
-        ctx: &Context<'_>,
-        id: String,
-    ) -> Result<bool> {
+    async fn stop_task_run(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
         let task_run = 'pg: {
             match state.app_state.pg_db.get_task_run(&id).await {
                 Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for get_task_run, falling back to SQLite: {}", e),
+                Err(e) => {
+                    tracing::warn!("PG failed for get_task_run, falling back to SQLite: {}", e)
+                }
             }
-            return Err(Error::new(format!("PG get_task_run failed for {}", id)))
+            return Err(Error::new(format!("PG get_task_run failed for {}", id)));
         }
         .ok_or_else(|| Error::new(format!("Task run not found: {}", id)))?;
 
@@ -275,10 +275,8 @@ impl MutationRoot {
 
         // Kill tracked AI processes
         let pids_to_kill: Vec<u32> = {
-            let mut pids = crate::safe_lock::safe_lock_or_recover(
-                &state.current_ai_pids,
-                "current_ai_pids",
-            );
+            let mut pids =
+                crate::safe_lock::safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
             let copy = pids.clone();
             pids.clear();
             copy
@@ -301,12 +299,24 @@ impl MutationRoot {
 
         {
             let mut stopped = false;
-            match state.app_state.pg_db.stop_task_run(&id, "User stopped").await {
+            match state
+                .app_state
+                .pg_db
+                .stop_task_run(&id, "User stopped")
+                .await
+            {
                 Ok(_) => stopped = true,
-                Err(e) => tracing::warn!("PG failed for stop_task_run, falling back to SQLite: {}", e),
+                Err(e) => {
+                    tracing::warn!("PG failed for stop_task_run, falling back to SQLite: {}", e)
+                }
             }
             if !stopped {
-                state.app_state.pg_db.stop_task_run(&id, "User stopped").await.map_err(|e| Error::new(e))?;
+                state
+                    .app_state
+                    .pg_db
+                    .stop_task_run(&id, "User stopped")
+                    .await
+                    .map_err(|e| Error::new(e))?;
             }
         }
 
@@ -317,19 +327,14 @@ impl MutationRoot {
         state.app_state.file_registry_manager.release_all(&id).await;
 
         // Broadcast update
-        let broadcaster =
-            crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+        let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
         broadcaster.task_run_update(&id, "stopped", None, None);
 
         Ok(true)
     }
 
     /// Pause a running task run.
-    async fn pause_task_run(
-        &self,
-        ctx: &Context<'_>,
-        id: String,
-    ) -> Result<bool> {
+    async fn pause_task_run(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
         state
             .app_state
@@ -340,11 +345,7 @@ impl MutationRoot {
     }
 
     /// Unpause a paused task run.
-    async fn unpause_task_run(
-        &self,
-        ctx: &Context<'_>,
-        id: String,
-    ) -> Result<bool> {
+    async fn unpause_task_run(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
         state
             .app_state
@@ -355,13 +356,12 @@ impl MutationRoot {
     }
 
     /// Delete a task run by ID.
-    async fn delete_task_run(
-        &self,
-        ctx: &Context<'_>,
-        id: String,
-    ) -> Result<bool> {
+    async fn delete_task_run(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        state.app_state.pg_db.delete_task_run(&id)
+        state
+            .app_state
+            .pg_db
+            .delete_task_run(&id)
             .await
             .map_err(|e| Error::new(e))
     }
@@ -383,7 +383,15 @@ impl MutationRoot {
         let finding_id = input.finding_id;
 
         // PG-primary, SQLite fallback
-        state.app_state.pg_db.update_finding_status(&finding_id, domain_status.as_str(), resolution.as_deref(), None)
+        state
+            .app_state
+            .pg_db
+            .update_finding_status(
+                &finding_id,
+                domain_status.as_str(),
+                resolution.as_deref(),
+                None,
+            )
             .await
             .map_err(|e| Error::new(e))?;
 
@@ -398,7 +406,10 @@ impl MutationRoot {
         response: String,
     ) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        state.app_state.pg_db.set_finding_user_response(&finding_id, &response)
+        state
+            .app_state
+            .pg_db
+            .set_finding_user_response(&finding_id, &response)
             .await
             .map_err(|e| Error::new(e))?;
 
@@ -422,11 +433,22 @@ impl MutationRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
         // Fetch workflow to get its name
         let workflow = 'pg: {
-            match state.app_state.pg_db.get_unified_workflow(&workflow_id).await {
+            match state
+                .app_state
+                .pg_db
+                .get_unified_workflow(&workflow_id)
+                .await
+            {
                 Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for get_unified_workflow, falling back to SQLite: {}", e),
+                Err(e) => tracing::warn!(
+                    "PG failed for get_unified_workflow, falling back to SQLite: {}",
+                    e
+                ),
             }
-            return Err(Error::new(format!("PG get_unified_workflow failed for {}", workflow_id)))
+            return Err(Error::new(format!(
+                "PG get_unified_workflow failed for {}",
+                workflow_id
+            )));
         }
         .ok_or_else(|| Error::new(format!("Workflow not found: {}", workflow_id)))?;
 
@@ -451,33 +473,38 @@ impl MutationRoot {
         let run = 'pg: {
             match state.app_state.pg_db.create_task_run(&input).await {
                 Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!("PG failed for create_task_run in run_workflow, falling back to SQLite: {}", e),
+                Err(e) => tracing::warn!(
+                    "PG failed for create_task_run in run_workflow, falling back to SQLite: {}",
+                    e
+                ),
             }
-            return Err(Error::new("PG create_task_run failed in run_workflow (no SQLite fallback)"))
+            return Err(Error::new(
+                "PG create_task_run failed in run_workflow (no SQLite fallback)",
+            ));
         };
 
         // Broadcast task creation (not "running" — actual execution is
         // triggered via POST /unified-workflows/{id}/run)
-        let broadcaster =
-            crate::event_system::EventBroadcaster::new(state.app_handle.clone());
+        let broadcaster = crate::event_system::EventBroadcaster::new(state.app_handle.clone());
         broadcaster.task_run_update(&task_id, &run.status, None, None);
 
         Ok(GqlTaskRun::from_db(run))
     }
 
     /// Delete a unified workflow by ID.
-    async fn delete_workflow(
-        &self,
-        ctx: &Context<'_>,
-        id: String,
-    ) -> Result<bool> {
+    async fn delete_workflow(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let state = ctx.data::<Arc<ApiState>>()?;
         'pg: {
             match state.app_state.pg_db.delete_unified_workflow(&id).await {
                 Ok(r) => break 'pg Ok(r),
-                Err(e) => tracing::warn!("PG failed for delete_workflow, falling back to SQLite: {}", e),
+                Err(e) => tracing::warn!(
+                    "PG failed for delete_workflow, falling back to SQLite: {}",
+                    e
+                ),
             }
-            return Err(Error::new("PG delete_unified_workflow failed (no SQLite fallback)"))
+            return Err(Error::new(
+                "PG delete_unified_workflow failed (no SQLite fallback)",
+            ));
         }
     }
 }
@@ -518,9 +545,7 @@ async fn bridge_mutation(
 }
 
 /// Convert GraphQL finding status enum to domain enum.
-fn gql_status_to_domain(
-    status: GqlFindingStatus,
-) -> crate::findings::types::FindingStatus {
+fn gql_status_to_domain(status: GqlFindingStatus) -> crate::findings::types::FindingStatus {
     use crate::findings::types::FindingStatus;
     match status {
         GqlFindingStatus::Detected => FindingStatus::Detected,

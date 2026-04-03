@@ -356,11 +356,7 @@ pub async fn fetch_verifier_ui_context(
         for el in &elements {
             sections.push_str(&format!(
                 "[{}] \"{}\" {} at ({:.3}, {:.3})\n",
-                el.index,
-                el.label,
-                el.element_type,
-                el.normalized_rect.x,
-                el.normalized_rect.y,
+                el.index, el.label, el.element_type, el.normalized_rect.x, el.normalized_rect.y,
             ));
         }
     }
@@ -540,7 +536,9 @@ pub fn detect_regression(
             let pg = pg_db.clone();
             let id = execution_id.to_string();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle.block_on(async move { pg_db.get_verification_phase_result(&id, prev_iter).await })
+                handle.block_on(
+                    async move { pg_db.get_verification_phase_result(&id, prev_iter).await },
+                )
             }))
             .ok()
             .and_then(|r| r.ok())
@@ -657,7 +655,8 @@ pub fn build_resume_agentic_context(
         let pg = pg_db.clone();
         let id = execution_id.to_string();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle.block_on(async move { pg_db.get_verification_phase_result(&id, iteration).await })
+            handle
+                .block_on(async move { pg_db.get_verification_phase_result(&id, iteration).await })
         }))
         .ok()
         .and_then(|r| r.ok())
@@ -682,8 +681,7 @@ pub fn build_resume_agentic_context(
     }
 
     // Strategy 2: Build context from step checkpoints (which remap to parent ID).
-    let checkpoint_mgr =
-        crate::workflow_state::CheckpointManager::new("unified");
+    let checkpoint_mgr = crate::workflow_state::CheckpointManager::new("unified");
     if let Ok(checkpoints) =
         checkpoint_mgr.get_completed_steps(execution_id, "verification", Some(iteration))
     {

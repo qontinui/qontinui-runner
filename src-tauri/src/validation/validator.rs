@@ -78,7 +78,11 @@ pub struct ValidationError {
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {} (expected {}, got {})", self.path, self.message, self.expected, self.actual)
+        write!(
+            f,
+            "{}: {} (expected {}, got {})",
+            self.path, self.message, self.expected, self.actual
+        )
     }
 }
 
@@ -123,8 +127,8 @@ impl SchemaValidator {
     /// and compiled once.
     pub fn for_type<T: JsonSchema>() -> Result<Self, String> {
         let schema = schema_for!(T);
-        let schema_value =
-            serde_json::to_value(&schema).map_err(|e| format!("Schema serialization error: {}", e))?;
+        let schema_value = serde_json::to_value(&schema)
+            .map_err(|e| format!("Schema serialization error: {}", e))?;
         let compiled = Validator::new(&schema_value)
             .map_err(|e| format!("Schema compilation error: {}", e))?;
 
@@ -180,10 +184,7 @@ impl SchemaValidator {
             .collect();
 
         if errors.is_empty() {
-            debug!(
-                "Schema validation passed for {}",
-                self.schema_name
-            );
+            debug!("Schema validation passed for {}", self.schema_name);
             ValidationResult::valid(value.clone())
         } else {
             debug!(

@@ -313,8 +313,7 @@ pub(super) fn run_gemini_api_multimodal(
                             .to_string();
 
                         let input_tokens = json["usageMetadata"]["promptTokenCount"].as_u64();
-                        let output_tokens =
-                            json["usageMetadata"]["candidatesTokenCount"].as_u64();
+                        let output_tokens = json["usageMetadata"]["candidatesTokenCount"].as_u64();
 
                         if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
                             debug!(
@@ -431,8 +430,7 @@ pub(super) fn run_gemini_api_with_structured_output(
                             .to_string();
 
                         let input_tokens = json["usageMetadata"]["promptTokenCount"].as_u64();
-                        let output_tokens =
-                            json["usageMetadata"]["candidatesTokenCount"].as_u64();
+                        let output_tokens = json["usageMetadata"]["candidatesTokenCount"].as_u64();
 
                         if let (Some(input), Some(output)) = (input_tokens, output_tokens) {
                             debug!(
@@ -464,7 +462,10 @@ pub(super) fn run_gemini_api_with_structured_output(
 /// `title`, or `description` at the property level. This function inlines
 /// `$ref` references and removes unsupported fields.
 fn strip_schemars_metadata(schema: &Value) -> Value {
-    let defs = schema.get("$defs").cloned().or_else(|| schema.get("definitions").cloned());
+    let defs = schema
+        .get("$defs")
+        .cloned()
+        .or_else(|| schema.get("definitions").cloned());
     clean_schema_node(schema, &defs)
 }
 
@@ -488,8 +489,7 @@ fn clean_schema_node(node: &Value, defs: &Option<Value>) -> Value {
                         if let Value::Object(props) = value {
                             let mut clean_props = serde_json::Map::new();
                             for (pk, pv) in props {
-                                clean_props
-                                    .insert(pk.clone(), clean_schema_node(pv, defs));
+                                clean_props.insert(pk.clone(), clean_schema_node(pv, defs));
                             }
                             cleaned.insert(key.clone(), Value::Object(clean_props));
                         }
@@ -499,10 +499,8 @@ fn clean_schema_node(node: &Value, defs: &Option<Value>) -> Value {
                     }
                     "oneOf" | "anyOf" | "allOf" => {
                         if let Value::Array(arr) = value {
-                            let clean_arr: Vec<Value> = arr
-                                .iter()
-                                .map(|v| clean_schema_node(v, defs))
-                                .collect();
+                            let clean_arr: Vec<Value> =
+                                arr.iter().map(|v| clean_schema_node(v, defs)).collect();
                             cleaned.insert(key.clone(), Value::Array(clean_arr));
                         }
                     }

@@ -7,19 +7,16 @@
 //! All timestamps use `::TEXT` casts since tokio-postgres does not have
 //! the `with-chrono-0_4` feature enabled in this workspace.
 
-use crate::database::pg::PgDb;
 use super::graph_engine::KnowledgeGraph;
 use super::graph_types::*;
+use crate::database::pg::PgDb;
 
 impl KnowledgeGraph {
     /// Build the full knowledge graph from PostgreSQL data.
     ///
     /// Async equivalent of `build_from_db`. Queries 16+ tables, creates nodes
     /// for each entity type, then wires up directed edges.
-    pub async fn build_from_pg(
-        pg: &PgDb,
-        workflow_name: Option<&str>,
-    ) -> Result<Self, String> {
+    pub async fn build_from_pg(pg: &PgDb, workflow_name: Option<&str>) -> Result<Self, String> {
         let mut kg = Self::new(workflow_name.map(|s| s.to_string()));
 
         // --- Nodes ---
@@ -46,7 +43,8 @@ impl KnowledgeGraph {
         kg.pg_link_step_provenance(pg, workflow_name).await?;
         kg.pg_link_step_finding_links(pg, workflow_name).await?;
         kg.pg_link_rule_influence(pg, workflow_name).await?;
-        kg.pg_link_component_relationships(pg, workflow_name).await?;
+        kg.pg_link_component_relationships(pg, workflow_name)
+            .await?;
         kg.pg_link_fix_applications(pg, workflow_name).await?;
         kg.pg_link_ui_interactions(pg).await?;
         kg.pg_link_skills(pg).await?;
@@ -63,7 +61,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT id, name, description, category, created_at::TEXT
@@ -108,7 +110,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT wv.id, wv.workflow_id, wv.version_number, wv.parent_version_id,
@@ -151,7 +157,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT id, task_name, workflow_name, status, created_at::TEXT
@@ -188,7 +198,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT f.id, f.title, f.category, f.severity, f.status, f.detected_at::TEXT
@@ -241,7 +255,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT rf.id, rf.fix_type, rf.fix_description, rf.effectiveness,
@@ -303,7 +321,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT MIN(e.id), e.signature_hash, e.error_type, e.message,
@@ -368,7 +390,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT id, component_path, component_type, health_score, created_at::TEXT
@@ -404,7 +430,11 @@ impl KnowledgeGraph {
     }
 
     async fn pg_load_rules(&mut self, pg: &PgDb) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT id, agent, section, title, severity, created_at::TEXT
@@ -445,7 +475,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT id, pattern_type, signature_hash, occurrence_count, status, created_at::TEXT
@@ -488,7 +522,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT tk.id, tk.category, tk.content, tk.confidence, tk.created_at::TEXT
@@ -537,7 +575,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT DISTINCT sp.step_name, sp.phase, sp.generating_agent
@@ -576,7 +618,11 @@ impl KnowledgeGraph {
     }
 
     async fn pg_load_ui_elements(&mut self, pg: &PgDb) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT element_id, COUNT(*) as interaction_count,
@@ -607,7 +653,11 @@ impl KnowledgeGraph {
     }
 
     async fn pg_load_skills(&mut self, pg: &PgDb) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT id, name, slug, category, source, usage_count,
@@ -661,8 +711,7 @@ impl KnowledgeGraph {
                 self.add_edge_by_key(
                     &child_key,
                     &parent_key,
-                    GraphEdge::new(GraphEdgeKind::Supersedes)
-                        .with_label("forked and improved"),
+                    GraphEdge::new(GraphEdgeKind::Supersedes).with_label("forked and improved"),
                 );
             }
         }
@@ -678,7 +727,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT tr.id, uw.id
@@ -715,7 +768,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT f.id, f.task_run_id
@@ -742,7 +799,11 @@ impl KnowledgeGraph {
             let run_id: String = row.get(1);
             let from_key = format!("finding:{}", finding_id);
             let to_key = format!("task_run:{}", run_id);
-            self.add_edge_by_key(&from_key, &to_key, GraphEdge::new(GraphEdgeKind::DetectedDuring));
+            self.add_edge_by_key(
+                &from_key,
+                &to_key,
+                GraphEdge::new(GraphEdgeKind::DetectedDuring),
+            );
         }
         Ok(())
     }
@@ -752,7 +813,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT rf.id, rf.source_finding_id, rf.effectiveness
@@ -806,7 +871,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT cause_event_type, cause_event_id, effect_event_type, effect_event_id,
@@ -865,7 +934,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT wv.id, wv.parent_version_id, wv.generation_task_run_id
@@ -918,7 +991,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT DISTINCT sp.step_name, sp.phase, sp.generating_agent
@@ -959,7 +1036,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT sfl.step_name, sfl.finding_id
@@ -1006,7 +1087,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT ril.rule_id, ril.workflow_id
@@ -1048,7 +1133,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT source_component, target_component, relationship_type, strength
@@ -1092,7 +1181,11 @@ impl KnowledgeGraph {
         pg: &PgDb,
         workflow_name: Option<&str>,
     ) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(wn) = workflow_name {
             conn.query(
                 "SELECT fa.fix_id, fa.task_run_id, fa.outcome
@@ -1137,7 +1230,11 @@ impl KnowledgeGraph {
     }
 
     async fn pg_link_ui_interactions(&mut self, pg: &PgDb) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT DISTINCT
@@ -1173,7 +1270,11 @@ impl KnowledgeGraph {
     }
 
     async fn pg_link_skills(&mut self, pg: &PgDb) -> Result<(), String> {
-        let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Link skills to workflows via step_provenance
         let rows = conn
@@ -1197,8 +1298,7 @@ impl KnowledgeGraph {
             self.add_edge_by_key(
                 &skill_key,
                 &wf_key,
-                GraphEdge::new(GraphEdgeKind::UsedIn)
-                    .with_label("skill template used in workflow"),
+                GraphEdge::new(GraphEdgeKind::UsedIn).with_label("skill template used in workflow"),
             );
         }
 

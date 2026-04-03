@@ -24,10 +24,16 @@ fn get_str(step: &Value, key: &str) -> String {
 
 /// Concatenate name, command, prompt, expected_output, description - all lowercased.
 fn get_step_text(step: &Value) -> String {
-    let parts: Vec<String> = ["name", "command", "prompt", "expected_output", "description"]
-        .iter()
-        .map(|k| get_str(step, k))
-        .collect();
+    let parts: Vec<String> = [
+        "name",
+        "command",
+        "prompt",
+        "expected_output",
+        "description",
+    ]
+    .iter()
+    .map(|k| get_str(step, k))
+    .collect();
     parts.join(" ").to_lowercase()
 }
 
@@ -79,12 +85,12 @@ fn score_determinism(step: &Value) -> DimensionScore {
 
             if (command.contains("grep") || command.contains("curl")) && has_output_check {
                 explanation =
-                    "Command checks specific content via grep/curl with output validation".to_string();
+                    "Command checks specific content via grep/curl with output validation"
+                        .to_string();
                 evidence.push("command uses grep/curl with output check".to_string());
                 0.8
             } else if command.is_empty() || !has_output_check {
-                explanation =
-                    "Command runs without output check".to_string();
+                explanation = "Command runs without output check".to_string();
                 evidence.push("no output validation in command".to_string());
                 0.5
             } else {
@@ -113,8 +119,18 @@ fn score_determinism(step: &Value) -> DimensionScore {
     };
 
     // Environment-dependent paths penalty
-    let env_patterns = ["$HOME", "$USER", "$TMPDIR", "${HOME}", "${USER}", "${TMPDIR}"];
-    if env_patterns.iter().any(|p| text.contains(&p.to_lowercase())) {
+    let env_patterns = [
+        "$HOME",
+        "$USER",
+        "$TMPDIR",
+        "${HOME}",
+        "${USER}",
+        "${TMPDIR}",
+    ];
+    if env_patterns
+        .iter()
+        .any(|p| text.contains(&p.to_lowercase()))
+    {
         score -= 0.2;
         evidence.push("environment-dependent path detected".to_string());
         explanation = format!("{} (penalized: env-dependent path)", explanation);
@@ -213,10 +229,7 @@ fn score_executability(step: &Value) -> DimensionScore {
                 score: 0.0,
                 confidence: 0.8,
                 tier: ScoringTier::Deterministic,
-                explanation: Some(format!(
-                    "Step contains placeholder value: {}",
-                    pattern
-                )),
+                explanation: Some(format!("Step contains placeholder value: {}", pattern)),
                 evidence,
             };
         }
@@ -248,7 +261,10 @@ fn score_executability(step: &Value) -> DimensionScore {
 
     // URL validation for curl/wget steps
     let command_lower = command.to_lowercase();
-    if command_lower.contains("curl") || command_lower.contains("wget") || step_type == "http_status" {
+    if command_lower.contains("curl")
+        || command_lower.contains("wget")
+        || step_type == "http_status"
+    {
         let check_url = if !url.is_empty() {
             url.clone()
         } else {
@@ -291,7 +307,6 @@ fn score_specificity(step: &Value) -> DimensionScore {
     let expected_output = get_str(step, "expected_output");
 
     let mut evidence: Vec<String> = Vec::new();
-    
 
     // Prompt steps are inherently imprecise
     if step_type == "prompt" {
@@ -357,9 +372,7 @@ fn score_specificity(step: &Value) -> DimensionScore {
             score: 0.5,
             confidence: 0.8,
             tier: ScoringTier::Deterministic,
-            explanation: Some(
-                "File existence check without content verification".to_string(),
-            ),
+            explanation: Some("File existence check without content verification".to_string()),
             evidence,
         };
     }
@@ -386,10 +399,7 @@ fn score_specificity(step: &Value) -> DimensionScore {
     // Anti-pattern: UI Bridge assert with very short expected text
     if step_type == "ui_bridge" && action.contains("assert") {
         if expected_output.len() < 3 && !expected_output.is_empty() {
-            evidence.push(format!(
-                "very short expected text: '{}'",
-                expected_output
-            ));
+            evidence.push(format!("very short expected text: '{}'", expected_output));
             return DimensionScore {
                 dimension: EvaluationDimension::Specificity,
                 score: 0.5,
@@ -540,9 +550,7 @@ fn score_coverage_structural(
                 score: 0.5,
                 confidence: 0.5,
                 tier: ScoringTier::Deterministic,
-                explanation: Some(
-                    "Criterion ID present but no criteria list provided".to_string(),
-                ),
+                explanation: Some("Criterion ID present but no criteria list provided".to_string()),
                 evidence,
             };
         }
@@ -552,7 +560,10 @@ fn score_coverage_structural(
     let criterion = match criterion {
         Some(c) => c,
         None => {
-            evidence.push(format!("criterion_id: {} (not found in criteria list)", criterion_id));
+            evidence.push(format!(
+                "criterion_id: {} (not found in criteria list)",
+                criterion_id
+            ));
             return DimensionScore {
                 dimension: EvaluationDimension::Coverage,
                 score: 0.5,
@@ -852,7 +863,8 @@ mod tests {
         // The URL extraction only looks for http:// or https:// prefixed tokens,
         // so ftp://invalid won't be extracted from the command string.
         // But if passed via the url field, it will be checked.
-        let step = json!({"type": "command", "command": "curl ftp://invalid", "url": "ftp://invalid"});
+        let step =
+            json!({"type": "command", "command": "curl ftp://invalid", "url": "ftp://invalid"});
         let scores = score_step(&step, None);
         let exec = get_score(&scores, EvaluationDimension::Executability);
         assert!(
@@ -919,7 +931,8 @@ mod tests {
 
     #[test]
     fn specificity_curl_with_grep() {
-        let step = json!({"type": "command", "command": "curl -s http://localhost:3000 | grep 'OK'"});
+        let step =
+            json!({"type": "command", "command": "curl -s http://localhost:3000 | grep 'OK'"});
         let scores = score_step(&step, None);
         assert_eq!(
             get_score(&scores, EvaluationDimension::Specificity),
@@ -941,7 +954,8 @@ mod tests {
 
     #[test]
     fn specificity_file_with_content_check() {
-        let step = json!({"type": "command", "command": "test -f config.json && grep 'port' config.json"});
+        let step =
+            json!({"type": "command", "command": "test -f config.json && grep 'port' config.json"});
         let scores = score_step(&step, None);
         assert_eq!(
             get_score(&scores, EvaluationDimension::Specificity),
@@ -1147,11 +1161,21 @@ mod tests {
         let step = json!({"type": "command", "command": "npm test"});
         let scores = score_step(&step, None);
         assert_eq!(scores.len(), 5);
-        assert!(scores.iter().any(|s| s.dimension == EvaluationDimension::Determinism));
-        assert!(scores.iter().any(|s| s.dimension == EvaluationDimension::Executability));
-        assert!(scores.iter().any(|s| s.dimension == EvaluationDimension::Specificity));
-        assert!(scores.iter().any(|s| s.dimension == EvaluationDimension::Robustness));
-        assert!(scores.iter().any(|s| s.dimension == EvaluationDimension::Coverage));
+        assert!(scores
+            .iter()
+            .any(|s| s.dimension == EvaluationDimension::Determinism));
+        assert!(scores
+            .iter()
+            .any(|s| s.dimension == EvaluationDimension::Executability));
+        assert!(scores
+            .iter()
+            .any(|s| s.dimension == EvaluationDimension::Specificity));
+        assert!(scores
+            .iter()
+            .any(|s| s.dimension == EvaluationDimension::Robustness));
+        assert!(scores
+            .iter()
+            .any(|s| s.dimension == EvaluationDimension::Coverage));
     }
 
     #[test]

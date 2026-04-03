@@ -32,18 +32,14 @@ pub enum CompensationType {
         repo_path: String,
     },
     /// Remove specific files created during execution
-    FileCleanup {
-        paths: Vec<String>,
-    },
+    FileCleanup { paths: Vec<String> },
     /// Remove a git worktree
     WorktreeRemove {
         worktree_path: String,
         branch_name: Option<String>,
     },
     /// Kill a spawned process
-    ProcessKill {
-        pid: u32,
-    },
+    ProcessKill { pid: u32 },
     /// Run a custom shell command for cleanup
     CustomCommand {
         command: String,
@@ -111,9 +107,7 @@ pub async fn execute_compensation(action: &CompensationAction) -> CompensationRe
 
 /// Execute all compensation actions in LIFO (reverse) order.
 /// Continues executing even if individual compensations fail.
-pub async fn execute_all_compensations(
-    actions: &[CompensationAction],
-) -> Vec<CompensationResult> {
+pub async fn execute_all_compensations(actions: &[CompensationAction]) -> Vec<CompensationResult> {
     let mut results = Vec::with_capacity(actions.len());
 
     // Execute in reverse order (LIFO)
@@ -223,11 +217,7 @@ async fn execute_process_kill(pid: u32) -> Result<(), String> {
     }
 }
 
-async fn execute_custom_command(
-    command: &str,
-    args: &[String],
-    cwd: &str,
-) -> Result<(), String> {
+async fn execute_custom_command(command: &str, args: &[String], cwd: &str) -> Result<(), String> {
     let output = tokio::process::Command::new(command)
         .args(args)
         .current_dir(cwd)

@@ -142,10 +142,7 @@ impl CodeGraph {
                 .to_string_lossy()
                 .replace('\\', "/");
 
-            let ext = file_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
             let content = match std::fs::read_to_string(file_path) {
                 Ok(c) => c,
@@ -445,14 +442,17 @@ impl CodeGraph {
             return None;
         }
 
-        let mut output = String::from("## Blast Radius Analysis (auto-generated regression hints)\n\n");
+        let mut output =
+            String::from("## Blast Radius Analysis (auto-generated regression hints)\n\n");
         output.push_str(&format!(
             "**Risk Level:** {:?} ({} files potentially affected)\n\n",
             br.risk_level, br.total_impact_count
         ));
 
         if !br.affected_exports.is_empty() {
-            output.push_str("**Exported symbols in changed files** (callers may need regression checks):\n");
+            output.push_str(
+                "**Exported symbols in changed files** (callers may need regression checks):\n",
+            );
             for exp in &br.affected_exports {
                 output.push_str(&format!("- {}\n", exp));
             }
@@ -552,9 +552,18 @@ impl CachedCodeGraph {
 
         // Also check for new source files not in the cache
         let skip_dirs = [
-            "node_modules", "target", ".git", "dist", "build",
-            "__pycache__", ".venv", "venv", ".next", ".turbo",
-            "coverage", ".worktrees",
+            "node_modules",
+            "target",
+            ".git",
+            "dist",
+            "build",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".next",
+            ".turbo",
+            "coverage",
+            ".worktrees",
         ];
         let current_files = collect_source_files(&self.project_path, &skip_dirs);
         for file_path in &current_files {
@@ -596,9 +605,18 @@ impl CachedCodeGraph {
 
         // Detect new files
         let skip_dirs = [
-            "node_modules", "target", ".git", "dist", "build",
-            "__pycache__", ".venv", "venv", ".next", ".turbo",
-            "coverage", ".worktrees",
+            "node_modules",
+            "target",
+            ".git",
+            "dist",
+            "build",
+            "__pycache__",
+            ".venv",
+            "venv",
+            ".next",
+            ".turbo",
+            "coverage",
+            ".worktrees",
         ];
         let current_files = collect_source_files(&self.project_path, &skip_dirs);
         let mut new_files = Vec::new();
@@ -631,11 +649,21 @@ impl CachedCodeGraph {
             .map(|s| s.as_str())
             .collect();
 
-        self.graph.files.retain(|f| !remove_set.contains(f.path.as_str()));
-        self.graph.functions.retain(|f| !remove_set.contains(f.file_path.as_str()));
-        self.graph.classes.retain(|c| !remove_set.contains(c.file_path.as_str()));
-        self.graph.imports.retain(|i| !remove_set.contains(i.from_file.as_str()));
-        self.graph.exports.retain(|e| !remove_set.contains(e.file_path.as_str()));
+        self.graph
+            .files
+            .retain(|f| !remove_set.contains(f.path.as_str()));
+        self.graph
+            .functions
+            .retain(|f| !remove_set.contains(f.file_path.as_str()));
+        self.graph
+            .classes
+            .retain(|c| !remove_set.contains(c.file_path.as_str()));
+        self.graph
+            .imports
+            .retain(|i| !remove_set.contains(i.from_file.as_str()));
+        self.graph
+            .exports
+            .retain(|e| !remove_set.contains(e.file_path.as_str()));
 
         for path in &deleted_files {
             self.file_mtimes.remove(path);
@@ -647,10 +675,7 @@ impl CachedCodeGraph {
 
         for rel_path in &files_to_parse {
             let full_path = self.project_path.join(rel_path);
-            let ext = full_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
             let content = match std::fs::read_to_string(&full_path) {
                 Ok(c) => c,
@@ -730,12 +755,7 @@ fn collect_source_files(root: &Path, skip_dirs: &[&str]) -> Vec<PathBuf> {
     files
 }
 
-fn collect_files_recursive(
-    dir: &Path,
-    skip_dirs: &[&str],
-    files: &mut Vec<PathBuf>,
-    depth: usize,
-) {
+fn collect_files_recursive(dir: &Path, skip_dirs: &[&str], files: &mut Vec<PathBuf>, depth: usize) {
     if depth > 10 {
         return;
     } // Prevent infinite recursion
@@ -801,10 +821,7 @@ fn parse_typescript(content: &str, file_path: &str, graph: &mut CodeGraph, is_ts
             "function_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = name_node.utf8_text(bytes).unwrap_or("").to_string();
-                    let is_async = node
-                        .child(0)
-                        .map(|c| c.kind() == "async")
-                        .unwrap_or(false);
+                    let is_async = node.child(0).map(|c| c.kind() == "async").unwrap_or(false);
                     graph.functions.push(FunctionNode {
                         name,
                         file_path: file_path.to_string(),
@@ -822,8 +839,7 @@ fn parse_typescript(content: &str, file_path: &str, graph: &mut CodeGraph, is_ts
                     match declaration.kind() {
                         "function_declaration" => {
                             if let Some(name_node) = declaration.child_by_field_name("name") {
-                                let name =
-                                    name_node.utf8_text(bytes).unwrap_or("").to_string();
+                                let name = name_node.utf8_text(bytes).unwrap_or("").to_string();
                                 let is_async = declaration
                                     .child(0)
                                     .map(|c| c.kind() == "async")
@@ -846,8 +862,7 @@ fn parse_typescript(content: &str, file_path: &str, graph: &mut CodeGraph, is_ts
                         }
                         "class_declaration" => {
                             if let Some(name_node) = declaration.child_by_field_name("name") {
-                                let name =
-                                    name_node.utf8_text(bytes).unwrap_or("").to_string();
+                                let name = name_node.utf8_text(bytes).unwrap_or("").to_string();
                                 let methods = extract_ts_class_methods(&declaration, bytes);
                                 graph.classes.push(ClassNode {
                                     name: name.clone(),
@@ -871,10 +886,8 @@ fn parse_typescript(content: &str, file_path: &str, graph: &mut CodeGraph, is_ts
                             for child in declaration.children(&mut decl_cursor) {
                                 if child.kind() == "variable_declarator" {
                                     if let Some(name_node) = child.child_by_field_name("name") {
-                                        let name = name_node
-                                            .utf8_text(bytes)
-                                            .unwrap_or("")
-                                            .to_string();
+                                        let name =
+                                            name_node.utf8_text(bytes).unwrap_or("").to_string();
                                         graph.exports.push(ExportNode {
                                             name,
                                             file_path: file_path.to_string(),
@@ -907,9 +920,7 @@ fn parse_typescript(content: &str, file_path: &str, graph: &mut CodeGraph, is_ts
                                 let mut named_cursor = clause_child.walk();
                                 for spec in clause_child.children(&mut named_cursor) {
                                     if spec.kind() == "import_specifier" {
-                                        if let Some(name_node) =
-                                            spec.child_by_field_name("name")
-                                        {
+                                        if let Some(name_node) = spec.child_by_field_name("name") {
                                             if let Ok(name) = name_node.utf8_text(bytes) {
                                                 imported_names.push(name.to_string());
                                             }
@@ -1208,9 +1219,11 @@ fn parse_rust(content: &str, file_path: &str, graph: &mut CodeGraph) {
                                     let method_name =
                                         name_node.utf8_text(bytes).unwrap_or("").to_string();
                                     // Add method to existing class if found
-                                    if let Some(cls) = graph.classes.iter_mut().find(|c| {
-                                        c.name == type_name && c.file_path == file_path
-                                    }) {
+                                    if let Some(cls) = graph
+                                        .classes
+                                        .iter_mut()
+                                        .find(|c| c.name == type_name && c.file_path == file_path)
+                                    {
                                         cls.methods.push(method_name);
                                     }
                                 }
@@ -1255,10 +1268,7 @@ function helperFn() {}
         };
         parse_typescript(content, "src/data.ts", &mut graph, false);
 
-        assert!(
-            graph.functions.len() >= 1,
-            "Should find fetchData function"
-        );
+        assert!(graph.functions.len() >= 1, "Should find fetchData function");
         assert!(graph.classes.len() >= 1, "Should find DataService class");
         assert!(
             graph.imports.len() >= 2,
@@ -1302,14 +1312,8 @@ def _private_helper():
             graph.functions.len() >= 2,
             "Should find process_data and _private_helper"
         );
-        assert!(
-            graph.classes.len() >= 1,
-            "Should find DataProcessor class"
-        );
-        assert!(
-            graph.imports.len() >= 2,
-            "Should find os and json imports"
-        );
+        assert!(graph.classes.len() >= 1, "Should find DataProcessor class");
+        assert!(graph.imports.len() >= 2, "Should find os and json imports");
 
         // _private_helper should not be exported
         let private = graph.functions.iter().find(|f| f.name == "_private_helper");
@@ -1390,14 +1394,8 @@ export class App extends React.Component {
             graph.functions.len() >= 1,
             "Should find MyComponent function in TSX"
         );
-        assert!(
-            graph.classes.len() >= 1,
-            "Should find App class in TSX"
-        );
-        assert!(
-            graph.imports.len() >= 1,
-            "Should find React import in TSX"
-        );
+        assert!(graph.classes.len() >= 1, "Should find App class in TSX");
+        assert!(graph.imports.len() >= 1, "Should find React import in TSX");
     }
 
     #[test]
@@ -1408,9 +1406,21 @@ export class App extends React.Component {
         // resolution pattern where module paths mirror file paths.
         let graph = CodeGraph {
             files: vec![
-                FileNode { path: "src/auth.ts".into(), language: "typescript".into(), line_count: 50 },
-                FileNode { path: "src/routes.ts".into(), language: "typescript".into(), line_count: 80 },
-                FileNode { path: "src/app.ts".into(), language: "typescript".into(), line_count: 120 },
+                FileNode {
+                    path: "src/auth.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 50,
+                },
+                FileNode {
+                    path: "src/routes.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 80,
+                },
+                FileNode {
+                    path: "src/app.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 120,
+                },
             ],
             functions: vec![],
             classes: vec![],
@@ -1438,19 +1448,36 @@ export class App extends React.Component {
         };
 
         let br = graph.blast_radius(&["src/auth.ts".to_string()]);
-        assert!(!br.directly_affected.is_empty(), "routes.ts should be directly affected");
-        assert!(!br.affected_exports.is_empty(), "authenticate should be an affected export");
+        assert!(
+            !br.directly_affected.is_empty(),
+            "routes.ts should be directly affected"
+        );
+        assert!(
+            !br.affected_exports.is_empty(),
+            "authenticate should be an affected export"
+        );
         assert!(br.total_impact_count >= 1);
         // 2-hop: app.ts imports routes.ts which imports auth.ts
-        assert!(!br.transitively_affected.is_empty(), "app.ts should be transitively affected");
+        assert!(
+            !br.transitively_affected.is_empty(),
+            "app.ts should be transitively affected"
+        );
     }
 
     #[test]
     fn test_blast_radius_for_specification() {
         let graph = CodeGraph {
             files: vec![
-                FileNode { path: "src/auth.ts".into(), language: "typescript".into(), line_count: 50 },
-                FileNode { path: "src/routes.ts".into(), language: "typescript".into(), line_count: 80 },
+                FileNode {
+                    path: "src/auth.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 50,
+                },
+                FileNode {
+                    path: "src/routes.ts".into(),
+                    language: "typescript".into(),
+                    line_count: 80,
+                },
             ],
             functions: vec![],
             classes: vec![],
@@ -1471,9 +1498,15 @@ export class App extends React.Component {
 
         // Description mentioning "auth" should match "auth.ts"
         let result = graph.format_blast_radius_for_specification("fix the auth module login flow");
-        assert!(result.is_some(), "Should produce blast radius context for auth");
+        assert!(
+            result.is_some(),
+            "Should produce blast radius context for auth"
+        );
         let text = result.unwrap();
-        assert!(text.contains("Blast Radius"), "Should contain blast radius header");
+        assert!(
+            text.contains("Blast Radius"),
+            "Should contain blast radius header"
+        );
         assert!(text.contains("regression"), "Should mention regression");
     }
 
@@ -1508,7 +1541,13 @@ impl MyService {
         let cls = graph.classes.iter().find(|c| c.name == "MyService");
         assert!(cls.is_some());
         let methods = &cls.unwrap().methods;
-        assert!(methods.contains(&"new".to_string()), "Should find new method");
-        assert!(methods.contains(&"get_name".to_string()), "Should find get_name method");
+        assert!(
+            methods.contains(&"new".to_string()),
+            "Should find new method"
+        );
+        assert!(
+            methods.contains(&"get_name".to_string()),
+            "Should find get_name method"
+        );
     }
 }

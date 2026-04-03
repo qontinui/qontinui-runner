@@ -129,7 +129,11 @@ impl ModelRouterBandit {
 
                 info!(
                     "Model router: {} → {} (source={:?}, context={}, explore={})",
-                    context.complexity_tier, model, source, result.context_key, result.is_exploration
+                    context.complexity_tier,
+                    model,
+                    source,
+                    result.context_key,
+                    result.is_exploration
                 );
 
                 ModelRoutingDecision {
@@ -288,7 +292,10 @@ mod tests {
         let ctx = make_context("simple", "frontend");
 
         // make_context uses prompt_length=1000 (medium) and file_count=5 (moderate)
-        router.set_override("medium:moderate:simple:frontend:no_ui", DEFAULT_COMPLEX_MODEL);
+        router.set_override(
+            "medium:moderate:simple:frontend:no_ui",
+            DEFAULT_COMPLEX_MODEL,
+        );
 
         let decision = router.route(&ctx, DEFAULT_SIMPLE_MODEL);
         assert_eq!(decision.source, RoutingSource::Override);

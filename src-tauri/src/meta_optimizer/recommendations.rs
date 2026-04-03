@@ -2,9 +2,9 @@
 //!
 //! All optimizer outputs go here with status `pending`. Human reviews from UI.
 
-use std::sync::Arc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
@@ -121,9 +121,18 @@ pub fn create_recommendation(
 
     tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.create_recommendation(
-            &rec.id, optimizer_type, recommendation_type, target_agent,
-            title, description, current_value, recommended_value,
-            evidence, confidence, optimizer_run_id, &content_hash,
+            &rec.id,
+            optimizer_type,
+            recommendation_type,
+            target_agent,
+            title,
+            description,
+            current_value,
+            recommended_value,
+            evidence,
+            confidence,
+            optimizer_run_id,
+            &content_hash,
         ))
     })?;
     info!("Created recommendation {} ({})", rec.id, rec.title);
@@ -170,10 +179,9 @@ pub fn apply_recommendation_with_side_effects(
     recommendation_id: &str,
 ) -> Result<(), String> {
     let id = recommendation_id.to_string();
-    let rec = tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.get_recommendation(&id))
-    })?
-    .ok_or_else(|| format!("Recommendation not found: {}", id))?;
+    let rec =
+        tokio::task::block_in_place(|| Handle::current().block_on(pg_db.get_recommendation(&id)))?
+            .ok_or_else(|| format!("Recommendation not found: {}", id))?;
 
     if rec.status != "pending" && rec.status != "canary" {
         return Err(format!(
@@ -295,9 +303,8 @@ fn apply_rule_create(
         examples_json: payload.examples_json.clone(),
     };
 
-    let rule = tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.insert_rule(&input))
-    })?;
+    let rule =
+        tokio::task::block_in_place(|| Handle::current().block_on(pg_db.insert_rule(&input)))?;
     info!(
         "Applied rule_create recommendation {}: created rule {}",
         rec_id, rule.id
@@ -336,7 +343,8 @@ fn apply_rule_update(pg_db: &Arc<PgDb>, recommended_value: &str) -> Result<(), S
 /// Reject a recommendation.
 pub fn reject_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Result<(), String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "rejected"))
+        Handle::current()
+            .block_on(pg_db.update_recommendation_status(recommendation_id, "rejected"))
     })?;
     info!("Rejected recommendation {}", recommendation_id);
     Ok(())
@@ -351,7 +359,11 @@ pub fn reject_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Resu
 pub fn dedup_pending_recommendations(pg_db: &Arc<PgDb>) -> usize {
     let superseded = tokio::task::block_in_place(|| {
         Handle::current().block_on(async {
-            let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+            let conn = pg_db
+                .pool()
+                .get()
+                .await
+                .map_err(|e| format!("PG pool: {e}"))?;
             let affected = conn
                 .execute(
                     r#"UPDATE meta_optimizer_recommendations SET status = 'superseded'
@@ -374,7 +386,10 @@ pub fn dedup_pending_recommendations(pg_db: &Arc<PgDb>) -> usize {
     .unwrap_or(0) as usize;
 
     if superseded > 0 {
-        info!("Dedup: superseded {} duplicate pending recommendation(s)", superseded);
+        info!(
+            "Dedup: superseded {} duplicate pending recommendation(s)",
+            superseded
+        );
     }
     superseded
 }
@@ -432,7 +447,8 @@ pub fn rollback_recommendation(pg_db: &Arc<PgDb>, recommendation_id: &str) -> Re
 
     // Flip the status to rolled_back
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.update_recommendation_status(recommendation_id, "rolled_back"))
+        Handle::current()
+            .block_on(pg_db.update_recommendation_status(recommendation_id, "rolled_back"))
     })?;
     info!("Rolled back recommendation {}", recommendation_id);
     Ok(())
@@ -507,7 +523,11 @@ pub fn create_optimizer_run(
     task_run_id: Option<&str>,
 ) -> Result<String, String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.create_optimizer_run(optimizer_type, trigger_type, task_run_id))
+        Handle::current().block_on(pg_db.create_optimizer_run(
+            optimizer_type,
+            trigger_type,
+            task_run_id,
+        ))
     })
 }
 
@@ -519,15 +539,17 @@ pub fn complete_optimizer_run(
     recommendations_produced: i64,
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.complete_optimizer_run(run_id, runs_analyzed, recommendations_produced))
+        Handle::current().block_on(pg_db.complete_optimizer_run(
+            run_id,
+            runs_analyzed,
+            recommendations_produced,
+        ))
     })
 }
 
 /// List optimizer runs.
 pub fn list_optimizer_runs(pg_db: &Arc<PgDb>) -> Result<Vec<MetaOptimizerRun>, String> {
-    tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.list_optimizer_runs())
-    })
+    tokio::task::block_in_place(|| Handle::current().block_on(pg_db.list_optimizer_runs()))
 }
 
 /// Evaluate applied recommendations using composite agentic scores.

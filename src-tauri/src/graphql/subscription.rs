@@ -354,7 +354,10 @@ fn convert_raw_event_to_runner_event(raw: &serde_json::Value) -> Option<RunnerEv
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
+                    iteration: data
+                        .get("iteration")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32),
                     phase: data
                         .get("phase")
                         .and_then(|v| v.as_str())
@@ -396,7 +399,10 @@ fn convert_raw_event_to_runner_event(raw: &serde_json::Value) -> Option<RunnerEv
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
+                iteration: data
+                    .get("iteration")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32),
                 details: data.get("details").map(|v| Json(v.clone())),
                 timestamp: data
                     .get("timestamp")
@@ -441,7 +447,10 @@ fn convert_raw_event_to_runner_event(raw: &serde_json::Value) -> Option<RunnerEv
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
+                iteration: data
+                    .get("iteration")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32),
                 input_tokens: data
                     .get("input_tokens")
                     .and_then(|v| v.as_u64())
@@ -573,7 +582,10 @@ fn convert_raw_event_to_cost_event(raw: &serde_json::Value) -> Option<CostEvent>
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                iteration: data.get("iteration").and_then(|v| v.as_i64()).map(|v| v as i32),
+                iteration: data
+                    .get("iteration")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32),
                 input_tokens: data
                     .get("input_tokens")
                     .and_then(|v| v.as_u64())

@@ -305,7 +305,8 @@ where
             let end_time = Utc::now();
             let duration = end_time
                 .signed_duration_since(data.start_time)
-                .num_milliseconds().max(0) as u64;
+                .num_milliseconds()
+                .max(0) as u64;
 
             let entry = SpanEntry {
                 trace_id: data.trace_id,
@@ -347,7 +348,6 @@ impl SqliteSpanLayer {
             active_spans: Arc::new(RwLock::new(HashMap::new())),
         }
     }
-
 }
 
 // No-op Layer implementation for SqliteSpanLayer (SQLite removed)

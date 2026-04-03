@@ -109,7 +109,11 @@ pub fn compute_step_credits(
 
     let n = steps.len() as f64;
     let total_cost: f64 = steps.iter().map(|s| s.cost_usd).sum();
-    let avg_cost = if total_cost > 0.0 { total_cost / n } else { 0.01 };
+    let avg_cost = if total_cost > 0.0 {
+        total_cost / n
+    } else {
+        0.01
+    };
 
     let mut credits: Vec<StepCredit> = steps
         .iter()
@@ -265,9 +269,7 @@ pub fn aggregate_by_step_type(credits: &[StepCredit]) -> Vec<StepTypeScorecard> 
         std::collections::HashMap::new();
 
     for credit in credits {
-        let entry = map
-            .entry(credit.step_type.clone())
-            .or_insert((0.0, 0, 0.0));
+        let entry = map.entry(credit.step_type.clone()).or_insert((0.0, 0, 0.0));
         entry.0 += credit.normalized_credit;
         entry.1 += 1;
         entry.2 += credit.raw_credit;
@@ -275,12 +277,14 @@ pub fn aggregate_by_step_type(credits: &[StepCredit]) -> Vec<StepTypeScorecard> 
 
     let mut result: Vec<StepTypeScorecard> = map
         .into_iter()
-        .map(|(step_type, (total_credit, count, total_raw))| StepTypeScorecard {
-            step_type,
-            avg_normalized_credit: total_credit / count as f64,
-            total_count: count,
-            avg_raw_credit: total_raw / count as f64,
-        })
+        .map(
+            |(step_type, (total_credit, count, total_raw))| StepTypeScorecard {
+                step_type,
+                avg_normalized_credit: total_credit / count as f64,
+                total_count: count,
+                avg_raw_credit: total_raw / count as f64,
+            },
+        )
         .collect();
 
     result.sort_by(|a, b| {

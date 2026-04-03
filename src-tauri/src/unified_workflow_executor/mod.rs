@@ -63,9 +63,9 @@ pub(crate) mod auto_run;
 pub mod blame;
 mod canvas_panels;
 pub mod compensation;
-pub mod deferred_feedback;
 pub mod conditional_routing;
 pub mod convergence;
+pub mod deferred_feedback;
 mod health_monitor;
 mod loop_controller;
 mod loop_handlers;
@@ -295,7 +295,10 @@ pub fn spawn_workflow_with_panic_guard<F>(
 
                 // Mark the task as failed so Continue button appears
                 let error_message = format!("Workflow panicked: {}", panic_msg);
-                let fail_err = pg_db.fail_task_run(&execution_id, &error_message).await.err();
+                let fail_err = pg_db
+                    .fail_task_run(&execution_id, &error_message)
+                    .await
+                    .err();
                 if let Some(e) = fail_err {
                     error!(
                         "Failed to mark panicked workflow {} as failed: {}",
@@ -385,7 +388,10 @@ pub fn spawn_sequence_with_panic_guard<F>(
 
                 // Mark the task as failed so Continue button appears
                 let error_message = format!("Workflow sequence panicked: {}", panic_msg);
-                let fail_err = pg_db.fail_task_run(&execution_id, &error_message).await.err();
+                let fail_err = pg_db
+                    .fail_task_run(&execution_id, &error_message)
+                    .await
+                    .err();
                 if let Some(e) = fail_err {
                     error!(
                         "Failed to mark panicked sequence {} as failed: {}",

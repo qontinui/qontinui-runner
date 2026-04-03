@@ -158,7 +158,10 @@ async fn db_assert(
     // db_assert: SQLite-based assertions removed. Return an error indicating
     // this feature needs PG migration.
     let _ = (state, expected_rows, expected_values);
-    Err(format!("db_assert not supported: SQLite checkpoint DB removed. Query: {}", query))
+    Err(format!(
+        "db_assert not supported: SQLite checkpoint DB removed. Query: {}",
+        query
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +179,11 @@ async fn save_artifact(
         "ui-bridge plugin: save_artifact id={}",
         artifact.artifact_id
     );
-    state.pg_db.save_artifact(&artifact).await.map_err(|e| format!("Failed to save artifact: {e}"))?;
+    state
+        .pg_db
+        .save_artifact(&artifact)
+        .await
+        .map_err(|e| format!("Failed to save artifact: {e}"))?;
     Ok(serde_json::json!({ "saved": true }))
 }
 
@@ -187,9 +194,15 @@ async fn get_artifact(
     artifact_id: String,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: get_artifact id={artifact_id}");
-    let artifact = state.pg_db.get_artifact(&artifact_id).await.map_err(|e| format!("Failed to get artifact: {e}"))?;
+    let artifact = state
+        .pg_db
+        .get_artifact(&artifact_id)
+        .await
+        .map_err(|e| format!("Failed to get artifact: {e}"))?;
     match artifact {
-        Some(a) => serde_json::to_value(&a).map_err(|e| format!("Failed to serialize artifact: {e}")),
+        Some(a) => {
+            serde_json::to_value(&a).map_err(|e| format!("Failed to serialize artifact: {e}"))
+        }
         None => Err(format!("Artifact '{artifact_id}' not found")),
     }
 }
@@ -202,7 +215,11 @@ async fn query_artifacts(
     query: ArtifactQuery,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: query_artifacts");
-    let artifacts = state.pg_db.query_artifacts(&query).await.map_err(|e| format!("Failed to query artifacts: {e}"))?;
+    let artifacts = state
+        .pg_db
+        .query_artifacts(&query)
+        .await
+        .map_err(|e| format!("Failed to query artifacts: {e}"))?;
     serde_json::to_value(&artifacts).map_err(|e| format!("Failed to serialize artifacts: {e}"))
 }
 
@@ -214,7 +231,11 @@ async fn verify_artifact(
     artifact_id: String,
 ) -> Result<serde_json::Value, String> {
     info!("ui-bridge plugin: verify_artifact id={artifact_id}");
-    let artifact = state.pg_db.get_artifact(&artifact_id).await.map_err(|e| format!("Failed to get artifact: {e}"))?;
+    let artifact = state
+        .pg_db
+        .get_artifact(&artifact_id)
+        .await
+        .map_err(|e| format!("Failed to get artifact: {e}"))?;
     match artifact {
         Some(a) => {
             let canonical = serde_json::json!({
@@ -259,7 +280,11 @@ async fn count_artifacts(
         passed_only: None,
         failed_only: None,
     });
-    let count = state.pg_db.count_artifacts(&q).await.map_err(|e| format!("Failed to count artifacts: {e}"))?;
+    let count = state
+        .pg_db
+        .count_artifacts(&q)
+        .await
+        .map_err(|e| format!("Failed to count artifacts: {e}"))?;
     Ok(serde_json::json!({ "count": count }))
 }
 

@@ -270,16 +270,16 @@ impl PgDb {
                 source_type: r.source_type,
                 capture_mode: r.capture_mode,
                 count: r.count,
-                latest_capture: r.latest_capture.map(|dt| dt.to_rfc3339()).unwrap_or_default(),
+                latest_capture: r
+                    .latest_capture
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_default(),
             })
             .collect())
     }
 
     /// Permanently delete soft-deleted entries older than retention_days.
-    pub async fn cleanup_old_timeline_entries(
-        &self,
-        retention_days: i32,
-    ) -> Result<u64, String> {
+    pub async fn cleanup_old_timeline_entries(&self, retention_days: i32) -> Result<u64, String> {
         let conn = self
             .pool
             .get()

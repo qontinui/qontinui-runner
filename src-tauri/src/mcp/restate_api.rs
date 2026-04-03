@@ -95,10 +95,7 @@ async fn resolve_awakeable(
         }
         Err(e) => {
             error!("Failed to resolve awakeable {}: {}", awakeable_id, e);
-            Err((
-                StatusCode::BAD_GATEWAY,
-                Json(api_error(e)),
-            ))
+            Err((StatusCode::BAD_GATEWAY, Json(api_error(e))))
         }
     }
 }
@@ -153,10 +150,7 @@ async fn stop_restate_workflow(
         })))),
         Err(e) => {
             error!("Failed to stop Restate workflow {}: {}", execution_id, e);
-            Err((
-                StatusCode::BAD_GATEWAY,
-                Json(api_error(e)),
-            ))
+            Err((StatusCode::BAD_GATEWAY, Json(api_error(e))))
         }
     }
 }

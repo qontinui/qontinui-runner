@@ -4,8 +4,7 @@
 
 use crate::commands::AppState;
 use crate::discoveries::{
-    self, sync_discoveries_batch, PendingDiscovery, SyncStatus,
-    DiscoveryPayload, DiscoveryToSync,
+    self, sync_discoveries_batch, DiscoveryPayload, DiscoveryToSync, PendingDiscovery, SyncStatus,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -89,8 +88,10 @@ pub async fn get_pending_discoveries_cmd(
 ) -> Result<DiscoveryResponse<Vec<PendingDiscovery>>, String> {
     match state.pg_db.get_pending_discoveries().await {
         Ok(vals) => {
-            let discoveries: Vec<PendingDiscovery> = vals.into_iter()
-                .filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let discoveries: Vec<PendingDiscovery> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(DiscoveryResponse::ok(discoveries))
         }
         Err(e) => Ok(DiscoveryResponse::err(e)),
@@ -141,10 +142,14 @@ pub async fn sync_discoveries(
 ) -> Result<DiscoveryResponse<SyncResultResponse>, String> {
     info!("Manual sync of pending discoveries triggered");
 
-    let to_sync_pairs = state.pg_db.extract_discoveries_for_sync().await
+    let to_sync_pairs = state
+        .pg_db
+        .extract_discoveries_for_sync()
+        .await
         .map_err(|e| format!("Failed to extract discoveries: {}", e))?;
     // Convert to DiscoveryToSync format for sync_discoveries_batch
-    let to_sync: Vec<DiscoveryToSync> = to_sync_pairs.into_iter()
+    let to_sync: Vec<DiscoveryToSync> = to_sync_pairs
+        .into_iter()
         .filter_map(|(id, payload_str)| {
             serde_json::from_str::<DiscoveryPayload>(&payload_str)
                 .ok()

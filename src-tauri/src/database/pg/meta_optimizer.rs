@@ -19,7 +19,11 @@ impl PgDb {
         trigger_type: &str,
         task_run_id: Option<&str>,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = format!("morun-{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now().to_rfc3339();
@@ -40,7 +44,10 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG create_optimizer_run: {}", e))?;
 
-        info!("Created PG meta-optimizer run {} (type={})", id, optimizer_type);
+        info!(
+            "Created PG meta-optimizer run {} (type={})",
+            id, optimizer_type
+        );
         Ok(id)
     }
 
@@ -51,7 +58,11 @@ impl PgDb {
         runs_analyzed: i64,
         recommendations_produced: i64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -77,7 +88,11 @@ impl PgDb {
         &self,
         limit: i64,
     ) -> Result<Vec<MetaOptimizerRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -123,7 +138,11 @@ impl PgDb {
         recommendation_id: Option<&str>,
         runs_included: i64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let bd = breakdown_json.unwrap_or("{}");
 
@@ -147,7 +166,10 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG save_optimizer_snapshot: {}", e))?;
 
-        info!("Saved PG meta-optimizer snapshot {} (type={})", id, snapshot_type);
+        info!(
+            "Saved PG meta-optimizer snapshot {} (type={})",
+            id, snapshot_type
+        );
         Ok(())
     }
 
@@ -155,7 +177,11 @@ impl PgDb {
     pub async fn get_latest_optimizer_snapshot(
         &self,
     ) -> Result<Option<MetaOptimizerSnapshot>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -183,15 +209,46 @@ impl PgDb {
     }
 
     /// Update outcome_after_apply on a recommendation.
-    pub async fn update_recommendation_outcome(&self, recommendation_id: &str, outcome_json: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute("UPDATE meta_optimizer_recommendations SET outcome_after_apply = $1 WHERE id = $2", &[&outcome_json, &recommendation_id]).await.map_err(|e| format!("PG update_recommendation_outcome: {}", e))?;
+    pub async fn update_recommendation_outcome(
+        &self,
+        recommendation_id: &str,
+        outcome_json: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE meta_optimizer_recommendations SET outcome_after_apply = $1 WHERE id = $2",
+            &[&outcome_json, &recommendation_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_recommendation_outcome: {}", e))?;
         Ok(())
     }
 
     /// Create a recommendation in PG.
-    pub async fn create_recommendation(&self, id: &str, optimizer_type: &str, recommendation_type: &str, target_agent: Option<&str>, title: &str, description: &str, current_value: Option<&str>, recommended_value: Option<&str>, evidence: Option<&str>, confidence: f64, optimizer_run_id: Option<&str>, content_hash: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn create_recommendation(
+        &self,
+        id: &str,
+        optimizer_type: &str,
+        recommendation_type: &str,
+        target_agent: Option<&str>,
+        title: &str,
+        description: &str,
+        current_value: Option<&str>,
+        recommended_value: Option<&str>,
+        evidence: Option<&str>,
+        confidence: f64,
+        optimizer_run_id: Option<&str>,
+        content_hash: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             r#"INSERT INTO meta_optimizer_recommendations (id, optimizer_type, recommendation_type, target_agent, title, description, current_value, recommended_value, evidence, confidence, status, optimizer_run_id, created_at, content_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13) ON CONFLICT (id) DO NOTHING"#,
@@ -201,16 +258,34 @@ impl PgDb {
     }
 
     /// Update recommendation status in PG.
-    pub async fn update_recommendation_status(&self, recommendation_id: &str, status: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn update_recommendation_status(
+        &self,
+        recommendation_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute("UPDATE meta_optimizer_recommendations SET status = $1, applied_at = CASE WHEN $1 = 'applied' THEN $2 ELSE applied_at END WHERE id = $3", &[&status, &now, &recommendation_id]).await.map_err(|e| format!("PG update_recommendation_status: {}", e))?;
         Ok(())
     }
 
     /// Save an eval spec in PG.
-    pub async fn save_eval_spec(&self, id: &str, name: &str, target_agent: &str, spec_json: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn save_eval_spec(
+        &self,
+        id: &str,
+        name: &str,
+        target_agent: &str,
+        spec_json: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(r#"INSERT INTO eval_specs (id, name, target_agent, spec_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, target_agent = EXCLUDED.target_agent, spec_json = EXCLUDED.spec_json, updated_at = EXCLUDED.updated_at"#, &[&id, &name, &target_agent, &spec_json, &now]).await.map_err(|e| format!("PG save_eval_spec: {}", e))?;
         Ok(())
@@ -218,14 +293,33 @@ impl PgDb {
 
     /// Delete an eval spec in PG.
     pub async fn delete_eval_spec(&self, spec_id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute("DELETE FROM eval_specs WHERE id = $1", &[&spec_id]).await.map_err(|e| format!("PG delete_eval_spec: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute("DELETE FROM eval_specs WHERE id = $1", &[&spec_id])
+            .await
+            .map_err(|e| format!("PG delete_eval_spec: {}", e))?;
         Ok(())
     }
 
     /// Save an eval result in PG.
-    pub async fn save_eval_result(&self, id: &str, spec_id: &str, recommendation_id: Option<&str>, status: &str, result_json: &str, p_value: Option<f64>, trials_run: i64) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn save_eval_result(
+        &self,
+        id: &str,
+        spec_id: &str,
+        recommendation_id: Option<&str>,
+        status: &str,
+        result_json: &str,
+        p_value: Option<f64>,
+        trials_run: i64,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             r#"INSERT INTO eval_results (id, spec_id, recommendation_id, status, result_json, p_value, trials_run, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(id) DO UPDATE SET status = EXCLUDED.status, result_json = EXCLUDED.result_json, p_value = EXCLUDED.p_value, trials_run = EXCLUDED.trials_run"#,
@@ -235,15 +329,35 @@ impl PgDb {
     }
 
     /// Attach eval result to a recommendation in PG.
-    pub async fn attach_eval_result(&self, recommendation_id: &str, eval_result_id: &str, eval_status: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn attach_eval_result(
+        &self,
+        recommendation_id: &str,
+        eval_result_id: &str,
+        eval_status: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("UPDATE meta_optimizer_recommendations SET eval_result_id = $1, eval_status = $2 WHERE id = $3", &[&eval_result_id, &eval_status, &recommendation_id]).await.map_err(|e| format!("PG attach_eval_result: {}", e))?;
         Ok(())
     }
 
     /// Save a golden dataset in PG.
-    pub async fn save_golden_dataset(&self, id: &str, agent_type: &str, name: &str, entries_json: &str, entry_count: i64) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn save_golden_dataset(
+        &self,
+        id: &str,
+        agent_type: &str,
+        name: &str,
+        entries_json: &str,
+        entry_count: i64,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(r#"INSERT INTO golden_datasets (id, agent_type, name, entries_json, entry_count, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, entries_json = EXCLUDED.entries_json, entry_count = EXCLUDED.entry_count, updated_at = EXCLUDED.updated_at"#,
             &[&id as &(dyn tokio_postgres::types::ToSql + Sync), &agent_type, &name, &entries_json, &entry_count, &now]).await.map_err(|e| format!("PG save_golden_dataset: {}", e))?;
@@ -252,14 +366,33 @@ impl PgDb {
 
     /// Delete a golden dataset in PG.
     pub async fn delete_golden_dataset(&self, dataset_id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute("DELETE FROM golden_datasets WHERE id = $1", &[&dataset_id]).await.map_err(|e| format!("PG delete_golden_dataset: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute("DELETE FROM golden_datasets WHERE id = $1", &[&dataset_id])
+            .await
+            .map_err(|e| format!("PG delete_golden_dataset: {}", e))?;
         Ok(())
     }
 
     /// Save a robustness report in PG.
-    pub async fn save_robustness_report(&self, id: &str, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>, total_tests: i64, passed: i64, failed: i64, report_json: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn save_robustness_report(
+        &self,
+        id: &str,
+        prompt_variant_id: Option<&str>,
+        recommendation_id: Option<&str>,
+        total_tests: i64,
+        passed: i64,
+        failed: i64,
+        report_json: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             r#"INSERT INTO robustness_reports (id, prompt_variant_id, recommendation_id, total_tests, passed, failed, report_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
@@ -269,9 +402,22 @@ impl PgDb {
     }
 
     /// Update canary percentage in PG.
-    pub async fn update_canary_percentage(&self, canary_id: &str, new_percentage: i64) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute("UPDATE canary_rollouts SET percentage = $1 WHERE id = $2 AND status = 'active'", &[&new_percentage, &canary_id]).await.map_err(|e| format!("PG update_canary_percentage: {}", e))?;
+    pub async fn update_canary_percentage(
+        &self,
+        canary_id: &str,
+        new_percentage: i64,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE canary_rollouts SET percentage = $1 WHERE id = $2 AND status = 'active'",
+            &[&new_percentage, &canary_id],
+        )
+        .await
+        .map_err(|e| format!("PG update_canary_percentage: {}", e))?;
         Ok(())
     }
 
@@ -280,7 +426,11 @@ impl PgDb {
         &self,
         recommendation_id: &str,
     ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -317,7 +467,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Option<(String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -335,29 +489,58 @@ impl PgDb {
     // ========================================================================
 
     /// Get a single recommendation by ID.
-    pub async fn get_recommendation(&self, recommendation_id: &str) -> Result<Option<crate::meta_optimizer::types::Recommendation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
+    pub async fn get_recommendation(
+        &self,
+        recommendation_id: &str,
+    ) -> Result<Option<crate::meta_optimizer::types::Recommendation>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
                       current_value, recommended_value, evidence, confidence, status,
                       applied_at::TEXT, outcome_after_apply, optimizer_run_id, created_at::TEXT,
                       eval_result_id, eval_status
                FROM meta_optimizer_recommendations WHERE id = $1"#,
-            &[&recommendation_id],
-        ).await.map_err(|e| format!("PG get_recommendation: {}", e))?;
+                &[&recommendation_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_recommendation: {}", e))?;
         Ok(row.map(|r| crate::meta_optimizer::types::Recommendation {
-            id: r.get(0), optimizer_type: r.get(1), recommendation_type: r.get(2),
-            target_agent: r.get(3), title: r.get(4), description: r.get(5),
-            current_value: r.get(6), recommended_value: r.get(7), evidence: r.get(8),
-            confidence: r.get(9), status: r.get(10), applied_at: r.get(11),
-            outcome_after_apply: r.get(12), optimizer_run_id: r.get(13), created_at: r.get(14),
-            eval_result_id: r.get(15), eval_status: r.get(16),
+            id: r.get(0),
+            optimizer_type: r.get(1),
+            recommendation_type: r.get(2),
+            target_agent: r.get(3),
+            title: r.get(4),
+            description: r.get(5),
+            current_value: r.get(6),
+            recommended_value: r.get(7),
+            evidence: r.get(8),
+            confidence: r.get(9),
+            status: r.get(10),
+            applied_at: r.get(11),
+            outcome_after_apply: r.get(12),
+            optimizer_run_id: r.get(13),
+            created_at: r.get(14),
+            eval_result_id: r.get(15),
+            eval_status: r.get(16),
         }))
     }
 
     /// List recommendations with optional filters.
-    pub async fn list_recommendations(&self, optimizer_type: Option<&str>, status: Option<&str>) -> Result<Vec<crate::meta_optimizer::types::Recommendation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_recommendations(
+        &self,
+        optimizer_type: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Vec<crate::meta_optimizer::types::Recommendation>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut sql = String::from(
             r#"SELECT id, optimizer_type, recommendation_type, target_agent, title, description,
                       current_value, recommended_value, evidence, confidence, status,
@@ -377,21 +560,45 @@ impl PgDb {
             params.push(Box::new(st.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC");
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await.map_err(|e| format!("PG list_recommendations: {}", e))?;
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::Recommendation {
-            id: r.get(0), optimizer_type: r.get(1), recommendation_type: r.get(2),
-            target_agent: r.get(3), title: r.get(4), description: r.get(5),
-            current_value: r.get(6), recommended_value: r.get(7), evidence: r.get(8),
-            confidence: r.get(9), status: r.get(10), applied_at: r.get(11),
-            outcome_after_apply: r.get(12), optimizer_run_id: r.get(13), created_at: r.get(14),
-            eval_result_id: r.get(15), eval_status: r.get(16),
-        }).collect())
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG list_recommendations: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::meta_optimizer::types::Recommendation {
+                id: r.get(0),
+                optimizer_type: r.get(1),
+                recommendation_type: r.get(2),
+                target_agent: r.get(3),
+                title: r.get(4),
+                description: r.get(5),
+                current_value: r.get(6),
+                recommended_value: r.get(7),
+                evidence: r.get(8),
+                confidence: r.get(9),
+                status: r.get(10),
+                applied_at: r.get(11),
+                outcome_after_apply: r.get(12),
+                optimizer_run_id: r.get(13),
+                created_at: r.get(14),
+                eval_result_id: r.get(15),
+                eval_status: r.get(16),
+            })
+            .collect())
     }
 
     /// Check if a recommendation with the given content hash already exists in a non-terminal state.
     pub async fn is_content_duplicate(&self, content_hash: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_one(
             "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE content_hash = $1 AND status IN ('pending', 'canary', 'applied')",
             &[&content_hash],
@@ -402,23 +609,46 @@ impl PgDb {
 
     /// List all optimizer runs (most recent first, limit 100).
     pub async fn list_optimizer_runs(&self) -> Result<Vec<MetaOptimizerRun>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
                       task_run_id, status, created_at::TEXT, completed_at::TEXT
                FROM meta_optimizer_runs ORDER BY created_at DESC LIMIT 100"#,
-            &[],
-        ).await.map_err(|e| format!("PG list_optimizer_runs: {}", e))?;
-        Ok(rows.iter().map(|r| MetaOptimizerRun {
-            id: r.get(0), optimizer_type: r.get(1), trigger_type: r.get(2),
-            runs_analyzed: r.get(3), recommendations_produced: r.get(4),
-            task_run_id: r.get(5), status: r.get(6), created_at: r.get(7), completed_at: r.get(8),
-        }).collect())
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG list_optimizer_runs: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| MetaOptimizerRun {
+                id: r.get(0),
+                optimizer_type: r.get(1),
+                trigger_type: r.get(2),
+                runs_analyzed: r.get(3),
+                recommendations_produced: r.get(4),
+                task_run_id: r.get(5),
+                status: r.get(6),
+                created_at: r.get(7),
+                completed_at: r.get(8),
+            })
+            .collect())
     }
 
     /// List snapshots with optional type filter.
-    pub async fn list_snapshots(&self, snapshot_type: Option<&str>) -> Result<Vec<MetaOptimizerSnapshot>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_snapshots(
+        &self,
+        snapshot_type: Option<&str>,
+    ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(st) = snapshot_type {
             conn.query(
                 r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
@@ -426,46 +656,81 @@ impl PgDb {
                    FROM meta_optimizer_snapshots WHERE snapshot_type = $1
                    ORDER BY created_at DESC LIMIT 100"#,
                 &[&st],
-            ).await
+            )
+            .await
         } else {
             conn.query(
                 r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
                           breakdown_json, recommendation_id, runs_included, created_at::TEXT
                    FROM meta_optimizer_snapshots ORDER BY created_at DESC LIMIT 100"#,
                 &[],
-            ).await
-        }.map_err(|e| format!("PG list_snapshots: {}", e))?;
-        Ok(rows.iter().map(|r| MetaOptimizerSnapshot {
-            id: r.get(0), snapshot_type: r.get(1), period_start: r.get(2),
-            period_end: r.get(3), metrics_json: r.get(4), breakdown_json: r.get(5),
-            recommendation_id: r.get(6), runs_included: r.get(7), created_at: r.get(8),
-        }).collect())
+            )
+            .await
+        }
+        .map_err(|e| format!("PG list_snapshots: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| MetaOptimizerSnapshot {
+                id: r.get(0),
+                snapshot_type: r.get(1),
+                period_start: r.get(2),
+                period_end: r.get(3),
+                metrics_json: r.get(4),
+                breakdown_json: r.get(5),
+                recommendation_id: r.get(6),
+                runs_included: r.get(7),
+                created_at: r.get(8),
+            })
+            .collect())
     }
 
     /// Get the latest baseline snapshot for a given type.
-    pub async fn get_latest_baseline_snapshot(&self, snapshot_type: &str) -> Result<Option<MetaOptimizerSnapshot>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
+    pub async fn get_latest_baseline_snapshot(
+        &self,
+        snapshot_type: &str,
+    ) -> Result<Option<MetaOptimizerSnapshot>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
                       breakdown_json, recommendation_id, runs_included, created_at::TEXT
                FROM meta_optimizer_snapshots WHERE snapshot_type = $1
                ORDER BY created_at DESC LIMIT 1"#,
-            &[&snapshot_type],
-        ).await.map_err(|e| format!("PG get_latest_baseline_snapshot: {}", e))?;
+                &[&snapshot_type],
+            )
+            .await
+            .map_err(|e| format!("PG get_latest_baseline_snapshot: {}", e))?;
         Ok(row.map(|r| MetaOptimizerSnapshot {
-            id: r.get(0), snapshot_type: r.get(1), period_start: r.get(2),
-            period_end: r.get(3), metrics_json: r.get(4), breakdown_json: r.get(5),
-            recommendation_id: r.get(6), runs_included: r.get(7), created_at: r.get(8),
+            id: r.get(0),
+            snapshot_type: r.get(1),
+            period_start: r.get(2),
+            period_end: r.get(3),
+            metrics_json: r.get(4),
+            breakdown_json: r.get(5),
+            recommendation_id: r.get(6),
+            runs_included: r.get(7),
+            created_at: r.get(8),
         }))
     }
 
     /// Count applied recommendations.
     pub async fn count_applied_recommendations(&self) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_one(
-            "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
-            &[],
-        ).await.map_err(|e| format!("PG count_applied_recommendations: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE status = 'applied'",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG count_applied_recommendations: {}", e))?;
         Ok(row.get(0))
     }
 
@@ -475,26 +740,56 @@ impl PgDb {
 
     /// List eval specs, optionally filtered by target agent.
     pub async fn list_eval_specs(&self, target_agent: Option<&str>) -> Result<Vec<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(ta) = target_agent {
-            conn.query("SELECT spec_json FROM eval_specs WHERE target_agent = $1 ORDER BY updated_at DESC", &[&ta]).await
+            conn.query(
+                "SELECT spec_json FROM eval_specs WHERE target_agent = $1 ORDER BY updated_at DESC",
+                &[&ta],
+            )
+            .await
         } else {
-            conn.query("SELECT spec_json FROM eval_specs ORDER BY updated_at DESC", &[]).await
-        }.map_err(|e| format!("PG list_eval_specs: {}", e))?;
+            conn.query(
+                "SELECT spec_json FROM eval_specs ORDER BY updated_at DESC",
+                &[],
+            )
+            .await
+        }
+        .map_err(|e| format!("PG list_eval_specs: {}", e))?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
     /// Get a single eval spec by ID (returns the spec_json).
     pub async fn get_eval_spec(&self, spec_id: &str) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt("SELECT spec_json FROM eval_specs WHERE id = $1", &[&spec_id])
-            .await.map_err(|e| format!("PG get_eval_spec: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                "SELECT spec_json FROM eval_specs WHERE id = $1",
+                &[&spec_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_eval_spec: {}", e))?;
         Ok(row.map(|r| r.get::<_, String>(0)))
     }
 
     /// List eval results, optionally filtered by spec or recommendation.
-    pub async fn list_eval_results(&self, spec_id: Option<&str>, recommendation_id: Option<&str>) -> Result<Vec<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_eval_results(
+        &self,
+        spec_id: Option<&str>,
+        recommendation_id: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut sql = String::from("SELECT result_json FROM eval_results WHERE 1=1");
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         let mut idx = 1u32;
@@ -508,8 +803,14 @@ impl PgDb {
             params.push(Box::new(r.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC LIMIT 50");
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await.map_err(|e| format!("PG list_eval_results: {}", e))?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG list_eval_results: {}", e))?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -518,8 +819,15 @@ impl PgDb {
     // ========================================================================
 
     /// List golden datasets, optionally filtered by agent type.
-    pub async fn list_golden_datasets(&self, agent_type: Option<&str>) -> Result<Vec<(String, String, String, String, String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_golden_datasets(
+        &self,
+        agent_type: Option<&str>,
+    ) -> Result<Vec<(String, String, String, String, String, String)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(at) = agent_type {
             conn.query(
                 "SELECT id, agent_type, name, entries_json, created_at, updated_at FROM golden_datasets WHERE agent_type = $1 ORDER BY updated_at DESC",
@@ -531,7 +839,10 @@ impl PgDb {
                 &[],
             ).await
         }.map_err(|e| format!("PG list_golden_datasets: {}", e))?;
-        Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+            .collect())
     }
 
     // ========================================================================
@@ -539,8 +850,16 @@ impl PgDb {
     // ========================================================================
 
     /// List robustness reports, optionally filtered.
-    pub async fn list_robustness_reports(&self, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>) -> Result<Vec<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_robustness_reports(
+        &self,
+        prompt_variant_id: Option<&str>,
+        recommendation_id: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut sql = String::from("SELECT report_json FROM robustness_reports WHERE 1=1");
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         let mut idx = 1u32;
@@ -554,8 +873,14 @@ impl PgDb {
             params.push(Box::new(r.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC LIMIT 50");
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await.map_err(|e| format!("PG list_robustness_reports: {}", e))?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG list_robustness_reports: {}", e))?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -565,7 +890,11 @@ impl PgDb {
 
     /// Check whether there is an active (no verdict yet) evolution entry for an agent type.
     pub async fn has_active_evolution(&self, agent_type: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_one(
             "SELECT COUNT(*) FROM prompt_evolution WHERE agent_type = $1 AND canary_verdict IS NULL",
             &[&agent_type],
@@ -575,78 +904,143 @@ impl PgDb {
     }
 
     /// Get the most recent rejected evolution entry for an agent type.
-    pub async fn get_latest_rejected_evolution(&self, agent_type: &str) -> Result<Option<crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
+    pub async fn get_latest_rejected_evolution(
+        &self,
+        agent_type: &str,
+    ) -> Result<Option<crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT id, agent_type, parent_variant_id, variant_id, recommendation_id,
                       critique, changes_summary, canary_verdict, score_before, score_after,
                       baseline_prompt_hash, COALESCE(consecutive_rejections, 0), created_at::text
                FROM prompt_evolution
                WHERE agent_type = $1 AND canary_verdict = 'reject'
                ORDER BY created_at DESC LIMIT 1"#,
-            &[&agent_type],
-        ).await.map_err(|e| format!("PG get_latest_rejected_evolution: {}", e))?;
-        Ok(row.map(|r| crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry {
-            id: r.get(0), agent_type: r.get(1), parent_variant_id: r.get(2),
-            variant_id: r.get(3), recommendation_id: r.get(4), critique: r.get(5),
-            changes_summary: r.get(6), canary_verdict: r.get(7), score_before: r.get(8),
-            score_after: r.get(9), baseline_prompt_hash: r.get(10),
-            consecutive_rejections: r.get::<_, Option<i32>>(11).unwrap_or(0),
-            created_at: r.get(12),
-        }))
+                &[&agent_type],
+            )
+            .await
+            .map_err(|e| format!("PG get_latest_rejected_evolution: {}", e))?;
+        Ok(row.map(
+            |r| crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry {
+                id: r.get(0),
+                agent_type: r.get(1),
+                parent_variant_id: r.get(2),
+                variant_id: r.get(3),
+                recommendation_id: r.get(4),
+                critique: r.get(5),
+                changes_summary: r.get(6),
+                canary_verdict: r.get(7),
+                score_before: r.get(8),
+                score_after: r.get(9),
+                baseline_prompt_hash: r.get(10),
+                consecutive_rejections: r.get::<_, Option<i32>>(11).unwrap_or(0),
+                created_at: r.get(12),
+            },
+        ))
     }
 
     /// Check cooldown: returns true if an evolution entry exists within cutoff.
-    pub async fn is_in_evolution_cooldown(&self, agent_type: &str, cutoff: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_one(
-            "SELECT COUNT(*) FROM prompt_evolution WHERE agent_type = $1 AND created_at > $2",
-            &[&agent_type, &cutoff],
-        ).await.map_err(|e| format!("PG is_in_evolution_cooldown: {}", e))?;
+    pub async fn is_in_evolution_cooldown(
+        &self,
+        agent_type: &str,
+        cutoff: &str,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*) FROM prompt_evolution WHERE agent_type = $1 AND created_at > $2",
+                &[&agent_type, &cutoff],
+            )
+            .await
+            .map_err(|e| format!("PG is_in_evolution_cooldown: {}", e))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
 
     /// Count consecutive recent rejections for an agent type.
     pub async fn count_consecutive_rejections(&self, agent_type: &str) -> Result<i32, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT canary_verdict FROM prompt_evolution
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT canary_verdict FROM prompt_evolution
                WHERE agent_type = $1 AND canary_verdict IS NOT NULL
                ORDER BY created_at DESC LIMIT 10"#,
-            &[&agent_type],
-        ).await.map_err(|e| format!("PG count_consecutive_rejections: {}", e))?;
+                &[&agent_type],
+            )
+            .await
+            .map_err(|e| format!("PG count_consecutive_rejections: {}", e))?;
         let mut count = 0i32;
         for r in &rows {
             let v: String = r.get(0);
-            if v == "reject" { count += 1; } else { break; }
+            if v == "reject" {
+                count += 1;
+            } else {
+                break;
+            }
         }
         Ok(count)
     }
 
     /// Get rejected prompt contents for an agent type (for similarity comparison).
-    pub async fn get_rejected_prompt_contents(&self, agent_type: &str) -> Result<Vec<(String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT pe.variant_id, pr.prompt_content
+    pub async fn get_rejected_prompt_contents(
+        &self,
+        agent_type: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT pe.variant_id, pr.prompt_content
                FROM prompt_evolution pe
                INNER JOIN prompt_registry pr ON pr.id = pe.variant_id
                WHERE pe.agent_type = $1 AND pe.canary_verdict = 'reject'
                ORDER BY pe.created_at DESC LIMIT 10"#,
-            &[&agent_type],
-        ).await.map_err(|e| format!("PG get_rejected_prompt_contents: {}", e))?;
-        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect())
+                &[&agent_type],
+            )
+            .await
+            .map_err(|e| format!("PG get_rejected_prompt_contents: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
     }
 
     /// Check if baseline prompt has drifted.
-    pub async fn has_baseline_drifted(&self, agent_type: &str, current_hash: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            r#"SELECT baseline_prompt_hash FROM prompt_evolution
+    pub async fn has_baseline_drifted(
+        &self,
+        agent_type: &str,
+        current_hash: &str,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT baseline_prompt_hash FROM prompt_evolution
                WHERE agent_type = $1 AND canary_verdict IS NULL
                ORDER BY created_at DESC LIMIT 1"#,
-            &[&agent_type],
-        ).await.map_err(|e| format!("PG has_baseline_drifted: {}", e))?;
+                &[&agent_type],
+            )
+            .await
+            .map_err(|e| format!("PG has_baseline_drifted: {}", e))?;
         match row {
             Some(r) => {
                 let h: Option<String> = r.get(0);
@@ -665,9 +1059,14 @@ impl PgDb {
 
     /// Get completed canary rollouts for history display.
     pub async fn get_canary_history(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT c.id, c.recommendation_id, c.percentage, c.status,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT c.id, c.recommendation_id, c.percentage, c.status,
                       c.start_date::text, c.end_date::text,
                       c.baseline_run_count, c.canary_run_count,
                       c.baseline_metrics_json, c.canary_metrics_json, c.created_at::text,
@@ -677,31 +1076,40 @@ impl PgDb {
                WHERE c.status IN ('promoted', 'rolled_back')
                ORDER BY c.end_date DESC
                LIMIT $1"#,
-            &[&limit],
-        ).await.map_err(|e| format!("PG get_canary_history: {}", e))?;
-        Ok(rows.iter().map(|row| {
-            serde_json::json!({
-                "id": row.get::<_, String>(0),
-                "recommendation_id": row.get::<_, String>(1),
-                "percentage": row.get::<_, i64>(2),
-                "status": row.get::<_, String>(3),
-                "start_date": row.get::<_, Option<String>>(4),
-                "end_date": row.get::<_, Option<String>>(5),
-                "baseline_run_count": row.get::<_, i64>(6),
-                "canary_run_count": row.get::<_, i64>(7),
-                "baseline_metrics_json": row.get::<_, String>(8),
-                "canary_metrics_json": row.get::<_, String>(9),
-                "created_at": row.get::<_, Option<String>>(10),
-                "recommendation_title": row.get::<_, Option<String>>(11),
-                "target_agent": row.get::<_, Option<String>>(12),
-                "recommendation_type": row.get::<_, Option<String>>(13),
+                &[&limit],
+            )
+            .await
+            .map_err(|e| format!("PG get_canary_history: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<_, String>(0),
+                    "recommendation_id": row.get::<_, String>(1),
+                    "percentage": row.get::<_, i64>(2),
+                    "status": row.get::<_, String>(3),
+                    "start_date": row.get::<_, Option<String>>(4),
+                    "end_date": row.get::<_, Option<String>>(5),
+                    "baseline_run_count": row.get::<_, i64>(6),
+                    "canary_run_count": row.get::<_, i64>(7),
+                    "baseline_metrics_json": row.get::<_, String>(8),
+                    "canary_metrics_json": row.get::<_, String>(9),
+                    "created_at": row.get::<_, Option<String>>(10),
+                    "recommendation_title": row.get::<_, Option<String>>(11),
+                    "target_agent": row.get::<_, Option<String>>(12),
+                    "recommendation_type": row.get::<_, Option<String>>(13),
+                })
             })
-        }).collect())
+            .collect())
     }
 
     /// Probabilistic check: should this run use the canary config?
     pub async fn should_apply_canary(&self, recommendation_id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             "SELECT percentage FROM canary_rollouts WHERE recommendation_id = $1 AND status = 'active' LIMIT 1",
             &[&recommendation_id],
@@ -709,7 +1117,9 @@ impl PgDb {
         match row {
             Some(r) => {
                 let percentage: i64 = r.get(0);
-                if percentage <= 0 { return Ok(false); }
+                if percentage <= 0 {
+                    return Ok(false);
+                }
                 let roll: f64 = rand::random::<f64>() * 100.0;
                 Ok(roll < percentage as f64)
             }
@@ -727,7 +1137,11 @@ impl PgDb {
         status: Option<&str>,
         workflow_architecture: Option<&str>,
     ) -> Result<Vec<crate::meta_optimizer::types::LearningOutcomeSummaryL0>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT status,
@@ -748,16 +1162,24 @@ impl PgDb {
         }
         sql.push_str(" GROUP BY status ORDER BY run_count DESC");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_learning_outcomes_l0: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::LearningOutcomeSummaryL0 {
-            status: r.get(0),
-            run_count: r.get(1),
-            avg_duration_secs: r.get(2),
-            avg_iterations: r.get(3),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| crate::meta_optimizer::types::LearningOutcomeSummaryL0 {
+                status: r.get(0),
+                run_count: r.get(1),
+                avg_duration_secs: r.get(2),
+                avg_iterations: r.get(3),
+            })
+            .collect())
     }
 
     /// Learning outcomes L1 details.
@@ -767,7 +1189,11 @@ impl PgDb {
         workflow_architecture: Option<&str>,
         limit: u32,
     ) -> Result<Vec<crate::meta_optimizer::types::LearningOutcomeDetailL1>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, task_id, status, duration_secs, iterations,
@@ -785,20 +1211,28 @@ impl PgDb {
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_learning_outcomes_l1: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::LearningOutcomeDetailL1 {
-            id: r.get(0),
-            task_id: r.get(1),
-            status: r.get(2),
-            duration_secs: r.get(3),
-            iterations: r.get(4),
-            workflow_architecture: r.get(5),
-            error_type: r.get(6),
-            created_at: r.get(7),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| crate::meta_optimizer::types::LearningOutcomeDetailL1 {
+                id: r.get(0),
+                task_id: r.get(1),
+                status: r.get(2),
+                duration_secs: r.get(3),
+                iterations: r.get(4),
+                workflow_architecture: r.get(5),
+                error_type: r.get(6),
+                created_at: r.get(7),
+            })
+            .collect())
     }
 
     /// Learning outcomes L2 full records.
@@ -808,7 +1242,11 @@ impl PgDb {
         workflow_architecture: Option<&str>,
         limit: u32,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
@@ -829,8 +1267,13 @@ impl PgDb {
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_learning_outcomes_l2: {}", e))?;
 
         Ok(rows.iter().map(|r| {
@@ -865,7 +1308,11 @@ impl PgDb {
         &self,
         feedback_type: Option<&str>,
     ) -> Result<Vec<crate::meta_optimizer::types::GenerationFeedbackSummaryL0>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT feedback_type,
@@ -880,15 +1327,25 @@ impl PgDb {
         }
         sql.push_str(" GROUP BY feedback_type ORDER BY total_count DESC");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_generation_feedback_l0: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::GenerationFeedbackSummaryL0 {
-            feedback_type: r.get(0),
-            total_count: r.get(1),
-            avg_rating: r.get(2),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(
+                |r| crate::meta_optimizer::types::GenerationFeedbackSummaryL0 {
+                    feedback_type: r.get(0),
+                    total_count: r.get(1),
+                    avg_rating: r.get(2),
+                },
+            )
+            .collect())
     }
 
     /// Generation feedback L1 details.
@@ -897,7 +1354,11 @@ impl PgDb {
         feedback_type: Option<&str>,
         limit: u32,
     ) -> Result<Vec<crate::meta_optimizer::types::GenerationFeedbackDetailL1>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, feedback_type, edited_field, rating,
@@ -911,18 +1372,28 @@ impl PgDb {
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_generation_feedback_l1: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::GenerationFeedbackDetailL1 {
-            id: r.get(0),
-            feedback_type: r.get(1),
-            edited_field: r.get(2),
-            rating: r.get(3),
-            workflow_category: r.get(4),
-            created_at: r.get(5),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(
+                |r| crate::meta_optimizer::types::GenerationFeedbackDetailL1 {
+                    id: r.get(0),
+                    feedback_type: r.get(1),
+                    edited_field: r.get(2),
+                    rating: r.get(3),
+                    workflow_category: r.get(4),
+                    created_at: r.get(5),
+                },
+            )
+            .collect())
     }
 
     /// Generation feedback L2 full records.
@@ -931,7 +1402,11 @@ impl PgDb {
         feedback_type: Option<&str>,
         limit: u32,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, workflow_id, task_run_id, feedback_type, edited_field,
@@ -946,25 +1421,35 @@ impl PgDb {
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_generation_feedback_l2: {}", e))?;
 
-        Ok(rows.iter().map(|r| serde_json::json!({
-            "id": r.get::<_, String>(0),
-            "workflow_id": r.get::<_, String>(1),
-            "task_run_id": r.get::<_, Option<String>>(2),
-            "feedback_type": r.get::<_, String>(3),
-            "edited_field": r.get::<_, Option<String>>(4),
-            "old_value": r.get::<_, Option<String>>(5),
-            "new_value": r.get::<_, Option<String>>(6),
-            "delete_reason": r.get::<_, Option<String>>(7),
-            "rating": r.get::<_, Option<i32>>(8),
-            "rating_comment": r.get::<_, Option<String>>(9),
-            "workflow_category": r.get::<_, Option<String>>(10),
-            "workflow_description": r.get::<_, Option<String>>(11),
-            "created_at": r.get::<_, String>(12),
-        })).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "workflow_id": r.get::<_, String>(1),
+                    "task_run_id": r.get::<_, Option<String>>(2),
+                    "feedback_type": r.get::<_, String>(3),
+                    "edited_field": r.get::<_, Option<String>>(4),
+                    "old_value": r.get::<_, Option<String>>(5),
+                    "new_value": r.get::<_, Option<String>>(6),
+                    "delete_reason": r.get::<_, Option<String>>(7),
+                    "rating": r.get::<_, Option<i32>>(8),
+                    "rating_comment": r.get::<_, Option<String>>(9),
+                    "workflow_category": r.get::<_, Option<String>>(10),
+                    "workflow_description": r.get::<_, Option<String>>(11),
+                    "created_at": r.get::<_, String>(12),
+                })
+            })
+            .collect())
     }
 
     /// Reflection fixes L0 summary (for cross-workflow view).
@@ -972,7 +1457,11 @@ impl PgDb {
         &self,
         source_agent: Option<&str>,
     ) -> Result<Vec<crate::meta_optimizer::types::ReflectionFixSummaryL0>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT fix_type,
@@ -987,15 +1476,23 @@ impl PgDb {
         }
         sql.push_str(" GROUP BY fix_type ORDER BY total_count DESC");
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_reflection_fixes_l0: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::ReflectionFixSummaryL0 {
-            fix_type: r.get(0),
-            total_count: r.get(1),
-            effective_count: r.get(2),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| crate::meta_optimizer::types::ReflectionFixSummaryL0 {
+                fix_type: r.get(0),
+                total_count: r.get(1),
+                effective_count: r.get(2),
+            })
+            .collect())
     }
 
     /// Reflection fixes L1 details.
@@ -1004,7 +1501,11 @@ impl PgDb {
         source_agent: Option<&str>,
         limit: i64,
     ) -> Result<Vec<crate::meta_optimizer::types::ReflectionFixDetailL1>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, fix_type, fix_description, confidence,
@@ -1018,19 +1519,27 @@ impl PgDb {
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_reflection_fixes_l1: {}", e))?;
 
-        Ok(rows.iter().map(|r| crate::meta_optimizer::types::ReflectionFixDetailL1 {
-            id: r.get(0),
-            fix_type: r.get(1),
-            fix_description: r.get(2),
-            confidence: r.get(3),
-            effectiveness: r.get(4),
-            source_agent: r.get(5),
-            created_at: r.get(6),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| crate::meta_optimizer::types::ReflectionFixDetailL1 {
+                id: r.get(0),
+                fix_type: r.get(1),
+                fix_description: r.get(2),
+                confidence: r.get(3),
+                effectiveness: r.get(4),
+                source_agent: r.get(5),
+                created_at: r.get(6),
+            })
+            .collect())
     }
 
     /// Reflection fixes L2 full records.
@@ -1039,7 +1548,11 @@ impl PgDb {
         source_agent: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
             r#"SELECT id, source_task_run_id, reflection_task_run_id,
@@ -1061,38 +1574,48 @@ impl PgDb {
         }
         sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG get_reflection_fixes_l2: {}", e))?;
 
-        Ok(rows.iter().map(|r| serde_json::json!({
-            "id": r.get::<_, String>(0),
-            "source_task_run_id": r.get::<_, String>(1),
-            "reflection_task_run_id": r.get::<_, String>(2),
-            "source_finding_id": r.get::<_, Option<String>>(3),
-            "source_knowledge_id": r.get::<_, Option<String>>(4),
-            "fix_type": r.get::<_, String>(5),
-            "fix_description": r.get::<_, String>(6),
-            "file_changed": r.get::<_, Option<String>>(7),
-            "old_value": r.get::<_, Option<String>>(8),
-            "new_value": r.get::<_, Option<String>>(9),
-            "confidence": r.get::<_, String>(10),
-            "status": r.get::<_, String>(11),
-            "effectiveness": r.get::<_, Option<String>>(12),
-            "effectiveness_evidence": r.get::<_, Option<String>>(13),
-            "applied_at": r.get::<_, String>(14),
-            "evaluated_at": r.get::<_, Option<String>>(15),
-            "created_at": r.get::<_, String>(16),
-            "content_hash": r.get::<_, Option<String>>(17),
-            "source_agent": r.get::<_, Option<String>>(18),
-            "reflection_scope": r.get::<_, Option<String>>(19),
-            "project_path": r.get::<_, Option<String>>(20),
-            "target_component": r.get::<_, Option<String>>(21),
-            "reuse_count": r.get::<_, Option<i32>>(22),
-            "reasoning": r.get::<_, Option<String>>(23),
-            "alternatives_considered": r.get::<_, Option<String>>(24),
-            "applicability_context": r.get::<_, Option<String>>(25),
-        })).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "source_task_run_id": r.get::<_, String>(1),
+                    "reflection_task_run_id": r.get::<_, String>(2),
+                    "source_finding_id": r.get::<_, Option<String>>(3),
+                    "source_knowledge_id": r.get::<_, Option<String>>(4),
+                    "fix_type": r.get::<_, String>(5),
+                    "fix_description": r.get::<_, String>(6),
+                    "file_changed": r.get::<_, Option<String>>(7),
+                    "old_value": r.get::<_, Option<String>>(8),
+                    "new_value": r.get::<_, Option<String>>(9),
+                    "confidence": r.get::<_, String>(10),
+                    "status": r.get::<_, String>(11),
+                    "effectiveness": r.get::<_, Option<String>>(12),
+                    "effectiveness_evidence": r.get::<_, Option<String>>(13),
+                    "applied_at": r.get::<_, String>(14),
+                    "evaluated_at": r.get::<_, Option<String>>(15),
+                    "created_at": r.get::<_, String>(16),
+                    "content_hash": r.get::<_, Option<String>>(17),
+                    "source_agent": r.get::<_, Option<String>>(18),
+                    "reflection_scope": r.get::<_, Option<String>>(19),
+                    "project_path": r.get::<_, Option<String>>(20),
+                    "target_component": r.get::<_, Option<String>>(21),
+                    "reuse_count": r.get::<_, Option<i32>>(22),
+                    "reasoning": r.get::<_, Option<String>>(23),
+                    "alternatives_considered": r.get::<_, Option<String>>(24),
+                    "applicability_context": r.get::<_, Option<String>>(25),
+                })
+            })
+            .collect())
     }
 
     /// Get recommendation metadata (title, target_agent, type) for a recommendation ID.
@@ -1100,7 +1623,11 @@ impl PgDb {
         &self,
         rec_id: &str,
     ) -> Result<Option<(Option<String>, Option<String>, Option<String>)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             "SELECT title, target_agent, recommendation_type FROM meta_optimizer_recommendations WHERE id = $1",
             &[&rec_id],
@@ -1110,8 +1637,17 @@ impl PgDb {
     }
 
     /// Update evolution verdict by variant_id.
-    pub async fn update_evolution_verdict_by_variant(&self, variant_id: &str, verdict: &str, score_after: Option<f64>) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn update_evolution_verdict_by_variant(
+        &self,
+        variant_id: &str,
+        verdict: &str,
+        score_after: Option<f64>,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE prompt_evolution SET canary_verdict = $1, score_after = $2 WHERE variant_id = $3 AND canary_verdict IS NULL",
             &[&verdict, &score_after as &(dyn tokio_postgres::types::ToSql + Sync), &variant_id],
@@ -1127,7 +1663,11 @@ impl PgDb {
     /// Returns a markdown-formatted context string for AI consumption.
     pub async fn get_optimizer_context(&self, is_pipeline: bool) -> Result<String, String> {
         use std::fmt::Write;
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         let mut out = String::new();
 
@@ -1224,8 +1764,15 @@ impl PgDb {
     }
 
     /// PG equivalent of the autoresearch campaigns query.
-    pub async fn get_autoresearch_campaigns_with_experiments(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+    pub async fn get_autoresearch_campaigns_with_experiments(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let campaigns = conn
             .query(
@@ -1302,7 +1849,11 @@ impl PgDb {
         limit: i64,
         status_filter: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let rows = if let Some(status) = status_filter {
             conn.query(
@@ -1313,7 +1864,8 @@ impl PgDb {
                      AND status = $1
                    ORDER BY created_at DESC LIMIT $2"#,
                 &[&status, &limit],
-            ).await
+            )
+            .await
         } else {
             conn.query(
                 r#"SELECT status, iteration_history
@@ -1322,8 +1874,10 @@ impl PgDb {
                      AND iteration_history != '[]'
                    ORDER BY created_at DESC LIMIT $1"#,
                 &[&limit],
-            ).await
-        }.map_err(|e| format!("PG iteration_history_l0: {}", e))?;
+            )
+            .await
+        }
+        .map_err(|e| format!("PG iteration_history_l0: {}", e))?;
 
         // Group by status and compute aggregates
         let mut groups: std::collections::HashMap<String, Vec<Vec<serde_json::Value>>> =
@@ -1341,7 +1895,8 @@ impl PgDb {
             let run_count = runs.len() as i64;
             let mut total_iterations: usize = 0;
             let mut total_confidence_delta: f64 = 0.0;
-            let mut approach_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut approach_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for entries in runs {
                 total_iterations += entries.len();
                 for e in entries {
@@ -1354,8 +1909,16 @@ impl PgDb {
                 }
             }
 
-            let avg_iterations = if run_count > 0 { total_iterations as f64 / run_count as f64 } else { 0.0 };
-            let avg_confidence_delta = if total_iterations > 0 { total_confidence_delta / total_iterations as f64 } else { 0.0 };
+            let avg_iterations = if run_count > 0 {
+                total_iterations as f64 / run_count as f64
+            } else {
+                0.0
+            };
+            let avg_confidence_delta = if total_iterations > 0 {
+                total_confidence_delta / total_iterations as f64
+            } else {
+                0.0
+            };
 
             summaries.push(serde_json::json!({
                 "status": status,
@@ -1375,7 +1938,11 @@ impl PgDb {
         limit: i64,
         status_filter: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let rows = if let Some(status) = status_filter {
             conn.query(
@@ -1386,7 +1953,8 @@ impl PgDb {
                      AND status = $1
                    ORDER BY created_at DESC LIMIT $2"#,
                 &[&status, &limit],
-            ).await
+            )
+            .await
         } else {
             conn.query(
                 r#"SELECT id, task_name, status, iteration_history, created_at
@@ -1395,8 +1963,10 @@ impl PgDb {
                      AND iteration_history != '[]'
                    ORDER BY created_at DESC LIMIT $1"#,
                 &[&limit],
-            ).await
-        }.map_err(|e| format!("PG iteration_history_l1: {}", e))?;
+            )
+            .await
+        }
+        .map_err(|e| format!("PG iteration_history_l1: {}", e))?;
 
         let details: Vec<serde_json::Value> = rows
             .iter()
@@ -1440,7 +2010,11 @@ impl PgDb {
         limit: i64,
         status_filter: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
 
         let rows = if let Some(status) = status_filter {
             conn.query(
@@ -1451,7 +2025,8 @@ impl PgDb {
                      AND status = $1
                    ORDER BY created_at DESC LIMIT $2"#,
                 &[&status, &limit],
-            ).await
+            )
+            .await
         } else {
             conn.query(
                 r#"SELECT id, task_name, status, iteration_history, created_at
@@ -1460,8 +2035,10 @@ impl PgDb {
                      AND iteration_history != '[]'
                    ORDER BY created_at DESC LIMIT $1"#,
                 &[&limit],
-            ).await
-        }.map_err(|e| format!("PG iteration_history_l2: {}", e))?;
+            )
+            .await
+        }
+        .map_err(|e| format!("PG iteration_history_l2: {}", e))?;
 
         let full: Vec<serde_json::Value> = rows
             .iter()
@@ -1496,7 +2073,11 @@ impl PgDb {
         &self,
         since: &str,
     ) -> Result<Vec<(String, i64, f64, f64, f64, f64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT
@@ -1531,11 +2112,12 @@ impl PgDb {
     }
 
     /// Query agents that have traces but zero tokens (instrumentation gap).
-    pub async fn query_zero_token_agents(
-        &self,
-        since: &str,
-    ) -> Result<Vec<(String, i64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn query_zero_token_agents(&self, since: &str) -> Result<Vec<(String, i64)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT agent_type, COUNT(*)::bigint as run_count
@@ -1549,7 +2131,10 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG query_zero_token_agents: {}", e))?;
-        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect())
     }
 
     /// Query agents that primarily use CLI sessions (expensive) vs API.
@@ -1560,7 +2145,11 @@ impl PgDb {
         &self,
         since: &str,
     ) -> Result<Vec<(String, i64, i64, f64, f64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Check if iteration_logs table exists (graceful if not yet migrated)
         let exists: bool = conn
@@ -1610,12 +2199,12 @@ impl PgDb {
     }
 
     /// Compare cost over recent vs previous 15-day window.
-    pub async fn compute_cost_trend(
-        &self,
-        mid: &str,
-        start: &str,
-    ) -> Result<(f64, f64), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn compute_cost_trend(&self, mid: &str, start: &str) -> Result<(f64, f64), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let recent_row = conn
             .query_one(
                 "SELECT COALESCE(SUM(cost_usd), 0)::double precision FROM pipeline_agent_traces WHERE created_at > $1",
@@ -1644,8 +2233,23 @@ impl PgDb {
     pub async fn get_comparison_run_for_bridge(
         &self,
         comparison_id: &str,
-    ) -> Result<Option<(String, Option<String>, Option<String>, String, String, String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    ) -> Result<
+        Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+        )>,
+        String,
+    > {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 r#"SELECT entries_json, comparison_report, recommendation_json,
@@ -1674,7 +2278,11 @@ impl PgDb {
         recommendation_id: &str,
         comparison_id: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE comparison_runs SET recommendation_id = $1, source = 'meta_optimizer' WHERE id = $2",
             &[&recommendation_id, &comparison_id],
@@ -1693,7 +2301,11 @@ impl PgDb {
         &self,
         optimizer_run_id: Option<&str>,
     ) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let affected = conn
             .execute(
                 r#"UPDATE meta_optimizer_recommendations
@@ -1716,10 +2328,16 @@ impl PgDb {
         min_confidence: f64,
         optimizer_run_id: Option<&str>,
     ) -> Result<Vec<(String, f64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let types_str: Vec<String> = recommendation_types.iter().map(|s| s.to_string()).collect();
         // Build IN clause dynamically
-        let placeholders: Vec<String> = (0..types_str.len()).map(|i| format!("${}", i + 3)).collect();
+        let placeholders: Vec<String> = (0..types_str.len())
+            .map(|i| format!("${}", i + 3))
+            .collect();
         let in_clause = placeholders.join(", ");
         let sql = format!(
             r#"SELECT id, confidence FROM meta_optimizer_recommendations
@@ -1733,20 +2351,33 @@ impl PgDb {
 
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         params.push(Box::new(min_confidence));
-        params.push(Box::new(optimizer_run_id.map(|s| s.to_string()) as Option<String>));
+        params.push(Box::new(
+            optimizer_run_id.map(|s| s.to_string()) as Option<String>
+        ));
         for t in &types_str {
             params.push(Box::new(t.clone()));
         }
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
             .map_err(|e| format!("PG query_pending_recommendations_by_type: {}", e))?;
-        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1)))
+            .collect())
     }
 
     /// Count rejected recommendations with a given title.
     pub async fn count_rejected_by_title(&self, title: &str) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_one(
                 "SELECT COUNT(*)::bigint FROM meta_optimizer_recommendations WHERE title = $1 AND status = 'rejected'",
@@ -1768,7 +2399,11 @@ impl PgDb {
         since: &str,
         limit: i64,
     ) -> Result<Vec<(String, String, i64, bool)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT pat.task_run_id, tr.name, pat.duration_ms, pat.success
@@ -1783,14 +2418,17 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG query_golden_entries_from_traces: {}", e))?;
-        Ok(rows.iter().map(|r| {
-            (
-                r.get::<_, String>(0),
-                r.get::<_, String>(1),
-                r.get::<_, i64>(2),
-                r.get::<_, bool>(3),
-            )
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, i64>(2),
+                    r.get::<_, bool>(3),
+                )
+            })
+            .collect())
     }
 
     /// List golden datasets for a specific agent type (for robustness regression cases).
@@ -1798,7 +2436,11 @@ impl PgDb {
         &self,
         agent_type: &str,
     ) -> Result<Vec<(String, String, String, String, String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, agent_type, name, entries_json, created_at, updated_at
@@ -1807,9 +2449,10 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG query_golden_datasets_by_agent: {}", e))?;
-        Ok(rows.iter().map(|r| {
-            (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5))
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+            .collect())
     }
 
     // ========================================================================
@@ -1818,7 +2461,11 @@ impl PgDb {
 
     /// Count optimizer runs for a given type (for style rotation).
     pub async fn count_optimizer_runs_by_type(&self, optimizer_type: &str) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_one(
                 "SELECT COUNT(*)::bigint FROM meta_optimizer_runs WHERE optimizer_type = $1",
@@ -1838,7 +2485,11 @@ impl PgDb {
         &self,
         applied_at: &str,
     ) -> Result<Option<(f64, f64, i64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Count post-apply runs
         let post_count_row = conn
@@ -1892,7 +2543,11 @@ impl PgDb {
         recommendation_id: &str,
         outcome_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE meta_optimizer_recommendations SET outcome_after_apply = $1 WHERE id = $2",
             &[&outcome_json, &recommendation_id],
@@ -1907,7 +2562,11 @@ impl PgDb {
         &self,
         recommendation_id: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE meta_optimizer_recommendations SET status = 'applied', applied_at = $1 WHERE id = $2 AND status IN ('pending', 'canary')",
@@ -1930,7 +2589,11 @@ impl PgDb {
         lookback_days: i64,
         category_filter: &str,
     ) -> Result<MetaOptimizerSnapshot, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("mos-{}", uuid::Uuid::new_v4());
         let now = chrono::Utc::now();
         let period_end = now.to_rfc3339();
@@ -1951,8 +2614,10 @@ impl PgDb {
                  AND (lo.iterations IS NULL OR lo.iterations > 0){}"#,
             category_filter
         );
-        let agg_row = conn.query_one(&agg_sql, &[&period_start])
-            .await.map_err(|e| format!("PG capture_snapshot agg: {}", e))?;
+        let agg_row = conn
+            .query_one(&agg_sql, &[&period_start])
+            .await
+            .map_err(|e| format!("PG capture_snapshot agg: {}", e))?;
         let total_runs: i64 = agg_row.get(0);
         let successful_runs: i64 = agg_row.get(1);
         let failed_runs: i64 = agg_row.get(2);
@@ -1978,15 +2643,20 @@ impl PgDb {
                ) sub"#,
             category_filter
         );
-        let cost_row = conn.query_one(&cost_sql, &[&period_start])
-            .await.map_err(|e| format!("PG capture_snapshot cost: {}", e))?;
+        let cost_row = conn
+            .query_one(&cost_sql, &[&period_start])
+            .await
+            .map_err(|e| format!("PG capture_snapshot cost: {}", e))?;
         let avg_cost_cents: f64 = cost_row.get(0);
 
         // Spec compliance average
-        let sc_row = conn.query_one(
-            "SELECT AVG(overall_score) FROM spec_compliance_results WHERE created_at > $1",
-            &[&period_start],
-        ).await.ok();
+        let sc_row = conn
+            .query_one(
+                "SELECT AVG(overall_score) FROM spec_compliance_results WHERE created_at > $1",
+                &[&period_start],
+            )
+            .await
+            .ok();
         let avg_spec_compliance: Option<f64> = sc_row.and_then(|r| r.get(0));
 
         // Composite agentic score average
@@ -2024,22 +2694,29 @@ impl PgDb {
                GROUP BY lo.workflow_architecture"#,
             category_filter
         );
-        let breakdown_rows = conn.query(&breakdown_sql, &[&period_start])
-            .await.map_err(|e| format!("PG capture_snapshot breakdown: {}", e))?;
+        let breakdown_rows = conn
+            .query(&breakdown_sql, &[&period_start])
+            .await
+            .map_err(|e| format!("PG capture_snapshot breakdown: {}", e))?;
         let breakdown_json: Option<String> = if breakdown_rows.is_empty() {
             None
         } else {
-            let entries: Vec<serde_json::Value> = breakdown_rows.iter().map(|row| {
-                serde_json::json!({
-                    "architecture": row.get::<_, String>(0),
-                    "count": row.get::<_, i64>(1),
-                    "success_rate": row.get::<_, f64>(2),
-                    "avg_duration_secs": row.get::<_, f64>(3),
-                    "avg_iterations": row.get::<_, f64>(4),
+            let entries: Vec<serde_json::Value> = breakdown_rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "architecture": row.get::<_, String>(0),
+                        "count": row.get::<_, i64>(1),
+                        "success_rate": row.get::<_, f64>(2),
+                        "avg_duration_secs": row.get::<_, f64>(3),
+                        "avg_iterations": row.get::<_, f64>(4),
+                    })
                 })
-            }).collect();
-            Some(serde_json::to_string(&entries)
-                .map_err(|e| format!("Failed to serialize breakdown: {}", e))?)
+                .collect();
+            Some(
+                serde_json::to_string(&entries)
+                    .map_err(|e| format!("Failed to serialize breakdown: {}", e))?,
+            )
         };
 
         // Insert snapshot row
@@ -2059,11 +2736,16 @@ impl PgDb {
                 &total_runs,
                 &period_end,
             ],
-        ).await.map_err(|e| format!("PG capture_snapshot insert: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG capture_snapshot insert: {}", e))?;
 
         info!(
             "PG: Captured {} snapshot {} ({} runs, success_rate={:.1}%)",
-            snapshot_type, id, total_runs, success_rate * 100.0
+            snapshot_type,
+            id,
+            total_runs,
+            success_rate * 100.0
         );
 
         Ok(MetaOptimizerSnapshot {
@@ -2084,7 +2766,11 @@ impl PgDb {
         &self,
         recommendation_id: &str,
     ) -> Result<(Option<String>, Option<String>), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_one(
             "SELECT target_agent, applied_at::TEXT FROM meta_optimizer_recommendations WHERE id = $1",
             &[&recommendation_id],
@@ -2097,19 +2783,32 @@ impl PgDb {
         &self,
         recommendation_id: &str,
     ) -> Result<Option<MetaOptimizerSnapshot>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_opt(
-            r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT id, snapshot_type, period_start, period_end, metrics_json,
                       breakdown_json, recommendation_id, runs_included, created_at::TEXT
                FROM meta_optimizer_snapshots
                WHERE recommendation_id = $1 AND snapshot_type = 'post_apply'
                ORDER BY created_at DESC LIMIT 1"#,
-            &[&recommendation_id],
-        ).await.map_err(|e| format!("PG get_post_apply_snapshot: {}", e))?;
+                &[&recommendation_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_post_apply_snapshot: {}", e))?;
         Ok(row.map(|r| MetaOptimizerSnapshot {
-            id: r.get(0), snapshot_type: r.get(1), period_start: r.get(2),
-            period_end: r.get(3), metrics_json: r.get(4), breakdown_json: r.get(5),
-            recommendation_id: r.get(6), runs_included: r.get(7), created_at: r.get(8),
+            id: r.get(0),
+            snapshot_type: r.get(1),
+            period_start: r.get(2),
+            period_end: r.get(3),
+            metrics_json: r.get(4),
+            breakdown_json: r.get(5),
+            recommendation_id: r.get(6),
+            runs_included: r.get(7),
+            created_at: r.get(8),
         }))
     }
 
@@ -2120,9 +2819,14 @@ impl PgDb {
         start: &str,
         end: &str,
     ) -> Result<Option<crate::database::pipeline_traces::AgentTraceAggregate>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn.query_one(
-            r#"SELECT
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                r#"SELECT
                 agent_type,
                 COUNT(*) as run_count,
                 AVG(duration_ms) as avg_duration_ms,
@@ -2133,22 +2837,26 @@ impl PgDb {
                 AVG(tokens_out::double precision) as avg_tokens_out
             FROM pipeline_agent_traces
             WHERE agent_type = $1 AND created_at >= $2 AND created_at <= $3"#,
-            &[&agent_type, &start, &end],
-        ).await.map_err(|e| format!("PG get_agent_aggregates_for_period: {}", e))?;
+                &[&agent_type, &start, &end],
+            )
+            .await
+            .map_err(|e| format!("PG get_agent_aggregates_for_period: {}", e))?;
         let run_count: i64 = row.get(1);
         if run_count == 0 {
             return Ok(None);
         }
-        Ok(Some(crate::database::pipeline_traces::AgentTraceAggregate {
-            agent_type: row.get(0),
-            run_count,
-            avg_duration_ms: row.get(2),
-            avg_cost_usd: row.get(3),
-            success_count: row.get(4),
-            failure_count: row.get(5),
-            avg_tokens_in: row.get(6),
-            avg_tokens_out: row.get(7),
-        }))
+        Ok(Some(
+            crate::database::pipeline_traces::AgentTraceAggregate {
+                agent_type: row.get(0),
+                run_count,
+                avg_duration_ms: row.get(2),
+                avg_cost_usd: row.get(3),
+                success_count: row.get(4),
+                failure_count: row.get(5),
+                avg_tokens_in: row.get(6),
+                avg_tokens_out: row.get(7),
+            },
+        ))
     }
 
     /// Record prompt evolution with full parameters (including baseline_prompt_hash and consecutive_rejections).
@@ -2165,7 +2873,11 @@ impl PgDb {
         baseline_prompt_hash: Option<&str>,
         consecutive_rejections: i32,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             r#"INSERT INTO prompt_evolution
@@ -2187,8 +2899,13 @@ impl PgDb {
                 &consecutive_rejections,
                 &now,
             ],
-        ).await.map_err(|e| format!("PG record_prompt_evolution_full: {}", e))?;
-        info!("PG: Recorded prompt evolution {} for agent {} (consecutive_rejections={})", id, agent_type, consecutive_rejections);
+        )
+        .await
+        .map_err(|e| format!("PG record_prompt_evolution_full: {}", e))?;
+        info!(
+            "PG: Recorded prompt evolution {} for agent {} (consecutive_rejections={})",
+            id, agent_type, consecutive_rejections
+        );
         Ok(())
     }
 
@@ -2198,7 +2915,11 @@ impl PgDb {
         variant_id: &str,
         verdict: &str,
     ) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             "SELECT recommendation_id FROM prompt_evolution WHERE variant_id = $1 AND canary_verdict = $2 ORDER BY created_at DESC LIMIT 1",
             &[&variant_id, &verdict],
@@ -2222,7 +2943,11 @@ impl PgDb {
         optimizer_type: &str,
         source_task_run_id: &str,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Guard 0: Check if any meta-optimizer is already running
         let row = conn.query_one(
@@ -2235,34 +2960,42 @@ impl PgDb {
         }
 
         // Guard 1: Source must not be a meta-optimizer, fixer, reflection, or follow-up run
-        let row = conn.query_opt(
-            r#"SELECT (COALESCE(is_meta_optimizer, false)
+        let row = conn
+            .query_opt(
+                r#"SELECT (COALESCE(is_meta_optimizer, false)
                     OR COALESCE(is_fixer, false)
                     OR COALESCE(is_reflection, false)
                     OR COALESCE(is_follow_up, false))
                FROM task_runs WHERE id = $1"#,
-            &[&source_task_run_id],
-        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+                &[&source_task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG should_launch: {}", e))?;
         let is_excluded: bool = row.map(|r| r.get(0)).unwrap_or(true);
         if is_excluded {
             return Ok(false);
         }
 
         // Guard 2: Meta-optimizer must be enabled in settings
-        let dev_mode_row = conn.query_opt(
-            "SELECT value FROM settings WHERE key = 'dev_mode'",
-            &[],
-        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+        let dev_mode_row = conn
+            .query_opt("SELECT value FROM settings WHERE key = 'dev_mode'", &[])
+            .await
+            .map_err(|e| format!("PG should_launch: {}", e))?;
 
         let (enabled, threshold) = match dev_mode_row {
             Some(r) => {
                 let val: String = r.get(0);
                 let parsed = serde_json::from_str::<serde_json::Value>(&val).ok();
-                let en = parsed.as_ref()
+                let en = parsed
+                    .as_ref()
                     .and_then(|v| v.get("meta_optimizer_enabled"))
-                    .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true" || s == "1")))
+                    .and_then(|v| {
+                        v.as_bool()
+                            .or_else(|| v.as_str().map(|s| s == "true" || s == "1"))
+                    })
                     .unwrap_or(true);
-                let th = parsed.as_ref()
+                let th = parsed
+                    .as_ref()
                     .and_then(|v| v.get("meta_optimizer_threshold"))
                     .and_then(|v| v.as_i64())
                     .unwrap_or(2);
@@ -2282,8 +3015,9 @@ impl PgDb {
         let last_optimizer_run_at: Option<String> = last_run_row.and_then(|r| r.get(0));
 
         let completed_since: i64 = if let Some(ref since) = last_optimizer_run_at {
-            let row = conn.query_one(
-                r#"SELECT COUNT(*) FROM task_runs
+            let row = conn
+                .query_one(
+                    r#"SELECT COUNT(*) FROM task_runs
                    WHERE status IN ('complete', 'failed')
                      AND COALESCE(is_meta_optimizer, false) = false
                      AND COALESCE(is_fixer, false) = false
@@ -2291,20 +3025,25 @@ impl PgDb {
                      AND COALESCE(is_follow_up, false) = false
                      AND workflow_type = 'unified'
                      AND created_at > $1"#,
-                &[since],
-            ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+                    &[since],
+                )
+                .await
+                .map_err(|e| format!("PG should_launch: {}", e))?;
             row.get(0)
         } else {
-            let row = conn.query_one(
-                r#"SELECT COUNT(*) FROM task_runs
+            let row = conn
+                .query_one(
+                    r#"SELECT COUNT(*) FROM task_runs
                    WHERE status IN ('complete', 'failed')
                      AND COALESCE(is_meta_optimizer, false) = false
                      AND COALESCE(is_fixer, false) = false
                      AND COALESCE(is_reflection, false) = false
                      AND COALESCE(is_follow_up, false) = false
                      AND workflow_type = 'unified'"#,
-                &[],
-            ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("PG should_launch: {}", e))?;
             row.get(0)
         };
 
@@ -2321,11 +3060,16 @@ impl PgDb {
         agent_type: &str,
         max_entries: i64,
     ) -> Result<Vec<(String, String, i64, bool)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let period_start = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
 
-        let rows = conn.query(
-            r#"SELECT pat.task_run_id, tr.task_name, pat.duration_ms, pat.downstream_success
+        let rows = conn
+            .query(
+                r#"SELECT pat.task_run_id, tr.task_name, pat.duration_ms, pat.downstream_success
                FROM pipeline_agent_traces pat
                JOIN task_runs tr ON pat.task_run_id = tr.id
                WHERE pat.agent_type = $1
@@ -2333,16 +3077,21 @@ impl PgDb {
                  AND pat.created_at > $2
                ORDER BY pat.created_at DESC
                LIMIT $3"#,
-            &[&agent_type, &period_start, &max_entries],
-        ).await.map_err(|e| format!("PG build_golden_entries: {}", e))?;
+                &[&agent_type, &period_start, &max_entries],
+            )
+            .await
+            .map_err(|e| format!("PG build_golden_entries: {}", e))?;
 
-        Ok(rows.iter().map(|r| {
-            let task_run_id: String = r.get(0);
-            let task_name: String = r.get(1);
-            let duration_ms: i64 = r.get(2);
-            let success: bool = r.get::<_, Option<bool>>(3).unwrap_or(false);
-            (task_run_id, task_name, duration_ms, success)
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let task_run_id: String = r.get(0);
+                let task_name: String = r.get(1);
+                let duration_ms: i64 = r.get(2);
+                let success: bool = r.get::<_, Option<bool>>(3).unwrap_or(false);
+                (task_run_id, task_name, duration_ms, success)
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -2354,10 +3103,15 @@ impl PgDb {
         &self,
         limit: i64,
     ) -> Result<Vec<(String, String, String, f64, String, i64, f64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let rows = conn.query(
-            r#"SELECT
+        let rows = conn
+            .query(
+                r#"SELECT
                    ptu.task_run_id,
                    ptu.phase,
                    COALESCE(tr.workflow_name, ptu.phase) AS agent_type,
@@ -2376,20 +3130,25 @@ impl PgDb {
                  AND ptu.phase IN ('generation', 'verification', 'agentic')
                ORDER BY outcome_score ASC
                LIMIT $1"#,
-            &[&limit],
-        ).await.map_err(|e| format!("PG extract_prompt_samples: {}", e))?;
-
-        Ok(rows.iter().map(|r| {
-            (
-                r.get::<_, String>(0),
-                r.get::<_, String>(1),
-                r.get::<_, String>(2),
-                r.get::<_, f64>(3),
-                r.get::<_, String>(4),
-                r.get::<_, i64>(5),
-                r.get::<_, f64>(6),
+                &[&limit],
             )
-        }).collect())
+            .await
+            .map_err(|e| format!("PG extract_prompt_samples: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, f64>(3),
+                    r.get::<_, String>(4),
+                    r.get::<_, i64>(5),
+                    r.get::<_, f64>(6),
+                )
+            })
+            .collect())
     }
 
     /// Collect failure and success evidence samples for a specific prompt group (PG version).
@@ -2399,8 +3158,18 @@ impl PgDb {
         agent_type: &str,
         max_failures: i64,
         max_successes: i64,
-    ) -> Result<(Vec<(String, String, String, f64, String, i64, f64)>, Vec<(String, String, String, f64, String, i64, f64)>), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    ) -> Result<
+        (
+            Vec<(String, String, String, f64, String, i64, f64)>,
+            Vec<(String, String, String, f64, String, i64, f64)>,
+        ),
+        String,
+    > {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let agent_filter = if agent_type.is_empty() {
             String::new()
@@ -2432,15 +3201,44 @@ impl PgDb {
             agent_filter
         );
 
-        let failures: Vec<(String, String, String, f64, String, i64, f64)> = if agent_type.is_empty() {
-            let rows = conn.query(&fail_sql, &[&phase, &max_failures])
-                .await.map_err(|e| format!("PG failures query: {}", e))?;
-            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
-        } else {
-            let rows = conn.query(&fail_sql, &[&phase, &max_failures, &agent_type])
-                .await.map_err(|e| format!("PG failures query: {}", e))?;
-            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
-        };
+        let failures: Vec<(String, String, String, f64, String, i64, f64)> =
+            if agent_type.is_empty() {
+                let rows = conn
+                    .query(&fail_sql, &[&phase, &max_failures])
+                    .await
+                    .map_err(|e| format!("PG failures query: {}", e))?;
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r.get(0),
+                            r.get(1),
+                            r.get(2),
+                            r.get(3),
+                            r.get(4),
+                            r.get(5),
+                            r.get(6),
+                        )
+                    })
+                    .collect()
+            } else {
+                let rows = conn
+                    .query(&fail_sql, &[&phase, &max_failures, &agent_type])
+                    .await
+                    .map_err(|e| format!("PG failures query: {}", e))?;
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r.get(0),
+                            r.get(1),
+                            r.get(2),
+                            r.get(3),
+                            r.get(4),
+                            r.get(5),
+                            r.get(6),
+                        )
+                    })
+                    .collect()
+            };
 
         // Successes (score > 0.8)
         let success_sql = format!(
@@ -2466,15 +3264,44 @@ impl PgDb {
             agent_filter
         );
 
-        let successes: Vec<(String, String, String, f64, String, i64, f64)> = if agent_type.is_empty() {
-            let rows = conn.query(&success_sql, &[&phase, &max_successes])
-                .await.map_err(|e| format!("PG successes query: {}", e))?;
-            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
-        } else {
-            let rows = conn.query(&success_sql, &[&phase, &max_successes, &agent_type])
-                .await.map_err(|e| format!("PG successes query: {}", e))?;
-            rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))).collect()
-        };
+        let successes: Vec<(String, String, String, f64, String, i64, f64)> =
+            if agent_type.is_empty() {
+                let rows = conn
+                    .query(&success_sql, &[&phase, &max_successes])
+                    .await
+                    .map_err(|e| format!("PG successes query: {}", e))?;
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r.get(0),
+                            r.get(1),
+                            r.get(2),
+                            r.get(3),
+                            r.get(4),
+                            r.get(5),
+                            r.get(6),
+                        )
+                    })
+                    .collect()
+            } else {
+                let rows = conn
+                    .query(&success_sql, &[&phase, &max_successes, &agent_type])
+                    .await
+                    .map_err(|e| format!("PG successes query: {}", e))?;
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r.get(0),
+                            r.get(1),
+                            r.get(2),
+                            r.get(3),
+                            r.get(4),
+                            r.get(5),
+                            r.get(6),
+                        )
+                    })
+                    .collect()
+            };
 
         Ok((failures, successes))
     }
@@ -2485,7 +3312,11 @@ impl PgDb {
 
     /// Get the most recent active (non-deleted) workflow ID.
     pub async fn get_most_recent_workflow_id(&self) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             "SELECT id FROM unified_workflows WHERE is_deleted = false ORDER BY updated_at DESC LIMIT 1",
             &[],
@@ -2503,28 +3334,45 @@ impl PgDb {
         since: &str,
         category: &crate::meta_optimizer::types::WorkflowCategory,
     ) -> Result<crate::meta_optimizer::failure_analysis::FailureAnalysis, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let filter = category.pg_sql_filter("tr");
         let task_runs_filter = category.pg_sql_filter("task_runs");
 
         // Run totals
-        let total_runs: i64 = conn.query_one(
-            &format!("SELECT COUNT(*) FROM task_runs WHERE created_at > $1{}", task_runs_filter.replace("task_runs.", "")),
-            &[&since],
-        ).await.map(|r| r.get(0)).unwrap_or(0);
+        let total_runs: i64 = conn
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM task_runs WHERE created_at > $1{}",
+                    task_runs_filter.replace("task_runs.", "")
+                ),
+                &[&since],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
 
         let failed_runs: i64 = conn.query_one(
             &format!("SELECT COUNT(*) FROM task_runs WHERE status IN ('failed', 'stopped') AND created_at > $1{}", task_runs_filter.replace("task_runs.", "")),
             &[&since],
         ).await.map(|r| r.get(0)).unwrap_or(0);
 
-        let failure_rate = if total_runs > 0 { 100.0 * failed_runs as f64 / total_runs as f64 } else { 0.0 };
+        let failure_rate = if total_runs > 0 {
+            100.0 * failed_runs as f64 / total_runs as f64
+        } else {
+            0.0
+        };
 
         // Abort reasons from learning_outcomes
-        let mut abort_reasons: Vec<crate::meta_optimizer::failure_analysis::AbortReason> = Vec::new();
-        if let Ok(rows) = conn.query(
-            &format!(
-                r#"SELECT
+        let mut abort_reasons: Vec<crate::meta_optimizer::failure_analysis::AbortReason> =
+            Vec::new();
+        if let Ok(rows) = conn
+            .query(
+                &format!(
+                    r#"SELECT
                      CASE
                          WHEN lo.status = 'partial' THEN 'stopped_by_user'
                          WHEN lo.error_type IS NOT NULL THEN lo.error_type
@@ -2536,13 +3384,17 @@ impl PgDb {
                  WHERE lo.status != 'success' AND lo.created_at > $1{}
                  GROUP BY reason
                  ORDER BY count DESC"#,
-                filter
-            ),
-            &[&since],
-        ).await {
+                    filter
+                ),
+                &[&since],
+            )
+            .await
+        {
             for r in &rows {
                 abort_reasons.push(crate::meta_optimizer::failure_analysis::AbortReason {
-                    reason: r.get(0), count: r.get(1), percentage: 0.0,
+                    reason: r.get(0),
+                    count: r.get(1),
+                    percentage: 0.0,
                 });
             }
         }
@@ -2587,7 +3439,9 @@ impl PgDb {
         }
         let total_abort: i64 = abort_reasons.iter().map(|r| r.count).sum();
         if total_abort > 0 {
-            for r in &mut abort_reasons { r.percentage = 100.0 * r.count as f64 / total_abort as f64; }
+            for r in &mut abort_reasons {
+                r.percentage = 100.0 * r.count as f64 / total_abort as f64;
+            }
         }
         abort_reasons.sort_by(|a, b| b.count.cmp(&a.count));
 
@@ -2621,29 +3475,34 @@ impl PgDb {
 
         // Finding distribution
         let mut finding_distribution = Vec::new();
-        if let Ok(rows) = conn.query(
-            &format!(
-                r#"SELECT trf.category, COUNT(*) as count
+        if let Ok(rows) = conn
+            .query(
+                &format!(
+                    r#"SELECT trf.category, COUNT(*) as count
                  FROM task_run_findings trf
                  JOIN task_runs tr ON trf.task_run_id = tr.id
                  WHERE trf.detected_at > $1{}
                  GROUP BY trf.category ORDER BY count DESC"#,
-                filter
-            ),
-            &[&since],
-        ).await {
+                    filter
+                ),
+                &[&since],
+            )
+            .await
+        {
             for r in &rows {
                 finding_distribution.push(crate::meta_optimizer::failure_analysis::CategoryCount {
-                    category: r.get(0), count: r.get(1),
+                    category: r.get(0),
+                    count: r.get(1),
                 });
             }
         }
 
         // Severity distribution
         let mut severity_distribution = Vec::new();
-        if let Ok(rows) = conn.query(
-            &format!(
-                r#"SELECT trf.severity, COUNT(*) as count
+        if let Ok(rows) = conn
+            .query(
+                &format!(
+                    r#"SELECT trf.severity, COUNT(*) as count
                  FROM task_run_findings trf
                  JOIN task_runs tr ON trf.task_run_id = tr.id
                  WHERE trf.detected_at > $1{}
@@ -2651,14 +3510,19 @@ impl PgDb {
                  ORDER BY CASE trf.severity
                      WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3
                      WHEN 'low' THEN 4 WHEN 'info' THEN 5 END"#,
-                filter
-            ),
-            &[&since],
-        ).await {
+                    filter
+                ),
+                &[&since],
+            )
+            .await
+        {
             for r in &rows {
-                severity_distribution.push(crate::meta_optimizer::failure_analysis::CategoryCount {
-                    category: r.get(0), count: r.get(1),
-                });
+                severity_distribution.push(
+                    crate::meta_optimizer::failure_analysis::CategoryCount {
+                        category: r.get(0),
+                        count: r.get(1),
+                    },
+                );
             }
         }
 
@@ -2691,31 +3555,46 @@ impl PgDb {
         }
 
         // Generation quality
-        let mut generation_quality = crate::meta_optimizer::failure_analysis::GenerationQualityMetrics {
-            total_feedback: 0, edits: 0, deletes: 0, avg_rating: None,
-            most_edited_fields: Vec::new(), delete_reasons: Vec::new(),
-        };
-        if let Ok(r) = conn.query_one(
-            r#"SELECT COUNT(*), SUM(CASE WHEN feedback_type = 'edit' THEN 1 ELSE 0 END),
+        let mut generation_quality =
+            crate::meta_optimizer::failure_analysis::GenerationQualityMetrics {
+                total_feedback: 0,
+                edits: 0,
+                deletes: 0,
+                avg_rating: None,
+                most_edited_fields: Vec::new(),
+                delete_reasons: Vec::new(),
+            };
+        if let Ok(r) = conn
+            .query_one(
+                r#"SELECT COUNT(*), SUM(CASE WHEN feedback_type = 'edit' THEN 1 ELSE 0 END),
                  SUM(CASE WHEN feedback_type = 'delete' THEN 1 ELSE 0 END),
                  AVG(CASE WHEN feedback_type = 'rating' THEN rating END)
              FROM workflow_generation_feedback WHERE created_at > $1"#,
-            &[&since],
-        ).await {
+                &[&since],
+            )
+            .await
+        {
             generation_quality.total_feedback = r.get(0);
             generation_quality.edits = r.get(1);
             generation_quality.deletes = r.get(2);
             generation_quality.avg_rating = r.get(3);
         }
-        if let Ok(rows) = conn.query(
-            r#"SELECT edited_field, COUNT(*) FROM workflow_generation_feedback
+        if let Ok(rows) = conn
+            .query(
+                r#"SELECT edited_field, COUNT(*) FROM workflow_generation_feedback
              WHERE feedback_type = 'edit' AND edited_field IS NOT NULL AND created_at > $1
              GROUP BY edited_field ORDER BY COUNT(*) DESC LIMIT 10"#,
-            &[&since],
-        ).await {
-            generation_quality.most_edited_fields = rows.iter().map(|r| crate::meta_optimizer::failure_analysis::CategoryCount {
-                category: r.get(0), count: r.get(1),
-            }).collect();
+                &[&since],
+            )
+            .await
+        {
+            generation_quality.most_edited_fields = rows
+                .iter()
+                .map(|r| crate::meta_optimizer::failure_analysis::CategoryCount {
+                    category: r.get(0),
+                    count: r.get(1),
+                })
+                .collect();
         }
         if let Ok(rows) = conn.query(
             r#"SELECT COALESCE(delete_reason, 'unspecified'), COUNT(*) FROM workflow_generation_feedback
@@ -2730,9 +3609,10 @@ impl PgDb {
 
         // Pipeline agent failures
         let mut pipeline_agent_failures = Vec::new();
-        if let Ok(rows) = conn.query(
-            &format!(
-                r#"SELECT pat.agent_type,
+        if let Ok(rows) = conn
+            .query(
+                &format!(
+                    r#"SELECT pat.agent_type,
                      COUNT(*) as total_runs,
                      SUM(CASE WHEN pat.downstream_success = false THEN 1 ELSE 0 END) as failures,
                      AVG(pat.duration_ms) as avg_duration_ms,
@@ -2741,43 +3621,58 @@ impl PgDb {
                  JOIN task_runs tr ON pat.task_run_id = tr.id
                  WHERE pat.created_at > $1 AND pat.downstream_success IS NOT NULL{}
                  GROUP BY pat.agent_type ORDER BY pat.agent_type"#,
-                filter
-            ),
-            &[&since],
-        ).await {
+                    filter
+                ),
+                &[&since],
+            )
+            .await
+        {
             for r in &rows {
                 let total_runs: i64 = r.get(1);
                 let failures: i64 = r.get(2);
-                pipeline_agent_failures.push(crate::meta_optimizer::failure_analysis::PipelineAgentFailureRecord {
-                    agent_type: r.get(0),
-                    total_runs,
-                    failures,
-                    failure_rate: if total_runs > 0 { 100.0 * failures as f64 / total_runs as f64 } else { 0.0 },
-                    avg_duration_ms: r.get::<_, Option<f64>>(3).unwrap_or(0.0),
-                    avg_cost_usd: r.get::<_, Option<f64>>(4).unwrap_or(0.0),
-                });
+                pipeline_agent_failures.push(
+                    crate::meta_optimizer::failure_analysis::PipelineAgentFailureRecord {
+                        agent_type: r.get(0),
+                        total_runs,
+                        failures,
+                        failure_rate: if total_runs > 0 {
+                            100.0 * failures as f64 / total_runs as f64
+                        } else {
+                            0.0
+                        },
+                        avg_duration_ms: r.get::<_, Option<f64>>(3).unwrap_or(0.0),
+                        avg_cost_usd: r.get::<_, Option<f64>>(4).unwrap_or(0.0),
+                    },
+                );
             }
         }
 
         // Recurring issues
         let mut recurring_issues = Vec::new();
-        if let Ok(rows) = conn.query(
-            &format!(
-                r#"SELECT trf.signature_hash, trf.title, trf.category, trf.severity,
+        if let Ok(rows) = conn
+            .query(
+                &format!(
+                    r#"SELECT trf.signature_hash, trf.title, trf.category, trf.severity,
                      COUNT(*) as occurrence_count, MAX(trf.detected_at) as last_seen
                  FROM task_run_findings trf
                  JOIN task_runs tr ON trf.task_run_id = tr.id
                  WHERE trf.detected_at > $1 AND trf.signature_hash IS NOT NULL{}
                  GROUP BY trf.signature_hash, trf.title, trf.category, trf.severity
                  HAVING COUNT(*) >= 2 ORDER BY occurrence_count DESC LIMIT 20"#,
-                filter
-            ),
-            &[&since],
-        ).await {
+                    filter
+                ),
+                &[&since],
+            )
+            .await
+        {
             for r in &rows {
                 recurring_issues.push(crate::meta_optimizer::failure_analysis::RecurringIssue {
-                    signature_hash: r.get(0), title: r.get(1), category: r.get(2),
-                    severity: r.get(3), occurrence_count: r.get(4), last_seen: r.get(5),
+                    signature_hash: r.get(0),
+                    title: r.get(1),
+                    category: r.get(2),
+                    severity: r.get(3),
+                    occurrence_count: r.get(4),
+                    last_seen: r.get(5),
                 });
             }
         }

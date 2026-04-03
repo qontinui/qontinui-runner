@@ -136,7 +136,9 @@ pub struct ImportPreview {
 
 /// Get a summary of all exportable data counts.
 #[tauri::command]
-pub async fn get_export_summary(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+pub async fn get_export_summary(
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
     info!("Getting export summary");
     state.pg_db.get_export_summary().await
 }
@@ -322,11 +324,14 @@ pub async fn import_all_data(
         match state.pg_db.import_flows(&data.flows).await {
             Ok(count) => {
                 total_imported += count as usize;
-                results.insert("flows".to_string(), ImportResult {
-                    imported: count as usize,
-                    skipped: 0,
-                    errors: vec![],
-                });
+                results.insert(
+                    "flows".to_string(),
+                    ImportResult {
+                        imported: count as usize,
+                        skipped: 0,
+                        errors: vec![],
+                    },
+                );
             }
             Err(e) => {
                 error!("Failed to import flows: {}", e);
@@ -352,10 +357,22 @@ pub async fn import_all_data(
 
         for item in &data.prompts {
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-            let category = item.get("category").and_then(|v| v.as_str()).unwrap_or("general");
-            let content = item.get("content").and_then(|v| v.as_str()).unwrap_or_default();
-            let variables = item.get("variables").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let category = item
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let content = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let variables = item
+                .get("variables")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
 
             if id.is_empty() || name.is_empty() {
                 skipped += 1;
@@ -373,8 +390,17 @@ pub async fn import_all_data(
             };
 
             match state.pg_db.pool().get().await {
-                Ok(conn) => match conn.execute(sql, &[&id, &name, &category, &content, &variables]).await {
-                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                Ok(conn) => match conn
+                    .execute(sql, &[&id, &name, &category, &content, &variables])
+                    .await
+                {
+                    Ok(n) => {
+                        if n > 0 {
+                            imported += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
                     Err(e) => errors.push(format!("Prompt {}: {}", id, e)),
                 },
                 Err(e) => errors.push(format!("PG pool: {}", e)),
@@ -383,7 +409,14 @@ pub async fn import_all_data(
         total_imported += imported;
         total_skipped += skipped;
         total_errors += errors.len();
-        results.insert("prompts".to_string(), ImportResult { imported, skipped, errors });
+        results.insert(
+            "prompts".to_string(),
+            ImportResult {
+                imported,
+                skipped,
+                errors,
+            },
+        );
     }
 
     // Import settings via PG upsert
@@ -394,9 +427,16 @@ pub async fn import_all_data(
 
         for item in &data.settings {
             let key = item.get("key").and_then(|v| v.as_str()).unwrap_or_default();
-            let value = item.get("value").map(|v| {
-                if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() }
-            }).unwrap_or_default();
+            let value = item
+                .get("value")
+                .map(|v| {
+                    if let Some(s) = v.as_str() {
+                        s.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .unwrap_or_default();
 
             if key.is_empty() {
                 skipped += 1;
@@ -411,7 +451,13 @@ pub async fn import_all_data(
 
             match state.pg_db.pool().get().await {
                 Ok(conn) => match conn.execute(sql, &[&key, &value]).await {
-                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                    Ok(n) => {
+                        if n > 0 {
+                            imported += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
                     Err(e) => errors.push(format!("Setting {}: {}", key, e)),
                 },
                 Err(e) => errors.push(format!("PG pool: {}", e)),
@@ -420,7 +466,14 @@ pub async fn import_all_data(
         total_imported += imported;
         total_skipped += skipped;
         total_errors += errors.len();
-        results.insert("settings".to_string(), ImportResult { imported, skipped, errors });
+        results.insert(
+            "settings".to_string(),
+            ImportResult {
+                imported,
+                skipped,
+                errors,
+            },
+        );
     }
 
     // Import unified_workflows via PG upsert
@@ -431,21 +484,48 @@ pub async fn import_all_data(
 
         for item in &data.unified_workflows {
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
 
             if id.is_empty() || name.is_empty() {
                 skipped += 1;
                 continue;
             }
 
-            let desc = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let category = item.get("category").and_then(|v| v.as_str()).unwrap_or("general");
-            let tags = item.get("tags").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let setup = item.get("setup_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let verif = item.get("verification_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let agentic = item.get("agentic_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let completion = item.get("completion_steps").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string());
-            let max_iters = item.get("max_iterations").and_then(|v| v.as_i64()).unwrap_or(10);
+            let desc = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let category = item
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let tags = item
+                .get("tags")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let setup = item
+                .get("setup_steps")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let verif = item
+                .get("verification_steps")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let agentic = item
+                .get("agentic_steps")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let completion = item
+                .get("completion_steps")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".to_string());
+            let max_iters = item
+                .get("max_iterations")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10);
 
             let sql = if is_overwrite {
                 r#"INSERT INTO unified_workflows (id, name, description, category, tags, setup_steps, verification_steps, agentic_steps, completion_steps, max_iterations)
@@ -461,8 +541,31 @@ pub async fn import_all_data(
             };
 
             match state.pg_db.pool().get().await {
-                Ok(conn) => match conn.execute(sql, &[&id, &name, &desc, &category, &tags, &setup, &verif, &agentic, &completion, &max_iters]).await {
-                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                Ok(conn) => match conn
+                    .execute(
+                        sql,
+                        &[
+                            &id,
+                            &name,
+                            &desc,
+                            &category,
+                            &tags,
+                            &setup,
+                            &verif,
+                            &agentic,
+                            &completion,
+                            &max_iters,
+                        ],
+                    )
+                    .await
+                {
+                    Ok(n) => {
+                        if n > 0 {
+                            imported += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
                     Err(e) => errors.push(format!("Workflow {}: {}", id, e)),
                 },
                 Err(e) => errors.push(format!("PG pool: {}", e)),
@@ -471,7 +574,14 @@ pub async fn import_all_data(
         total_imported += imported;
         total_skipped += skipped;
         total_errors += errors.len();
-        results.insert("unified_workflows".to_string(), ImportResult { imported, skipped, errors });
+        results.insert(
+            "unified_workflows".to_string(),
+            ImportResult {
+                imported,
+                skipped,
+                errors,
+            },
+        );
     }
 
     // Import learning_outcomes via PG upsert
@@ -482,8 +592,14 @@ pub async fn import_all_data(
 
         for item in &data.learning_outcomes {
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let task_id = item.get("task_id").and_then(|v| v.as_str()).unwrap_or_default();
-            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or_default();
+            let task_id = item
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let status = item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
 
             if id.is_empty() || task_id.is_empty() {
                 skipped += 1;
@@ -491,8 +607,14 @@ pub async fn import_all_data(
             }
 
             let duration_secs: Option<f64> = item.get("duration_secs").and_then(|v| v.as_f64());
-            let iterations: Option<i32> = item.get("iterations").and_then(|v| v.as_i64()).map(|n| n as i32);
-            let strategy = item.get("strategy").and_then(|v| v.as_str()).unwrap_or_default();
+            let iterations: Option<i32> = item
+                .get("iterations")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32);
+            let strategy = item
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
 
             let sql = if is_overwrite {
                 r#"INSERT INTO learning_outcomes (id, task_id, status, duration_secs, iterations, strategy)
@@ -505,8 +627,27 @@ pub async fn import_all_data(
             };
 
             match state.pg_db.pool().get().await {
-                Ok(conn) => match conn.execute(sql, &[&id, &task_id, &status, &duration_secs, &iterations, &strategy]).await {
-                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                Ok(conn) => match conn
+                    .execute(
+                        sql,
+                        &[
+                            &id,
+                            &task_id,
+                            &status,
+                            &duration_secs,
+                            &iterations,
+                            &strategy,
+                        ],
+                    )
+                    .await
+                {
+                    Ok(n) => {
+                        if n > 0 {
+                            imported += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
                     Err(e) => errors.push(format!("LO {}: {}", id, e)),
                 },
                 Err(e) => errors.push(format!("PG pool: {}", e)),
@@ -515,7 +656,14 @@ pub async fn import_all_data(
         total_imported += imported;
         total_skipped += skipped;
         total_errors += errors.len();
-        results.insert("learning_outcomes".to_string(), ImportResult { imported, skipped, errors });
+        results.insert(
+            "learning_outcomes".to_string(),
+            ImportResult {
+                imported,
+                skipped,
+                errors,
+            },
+        );
     }
 
     // Import learning_patterns via PG upsert
@@ -526,11 +674,26 @@ pub async fn import_all_data(
 
         for item in &data.learning_patterns {
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let pattern_type = item.get("pattern_type").and_then(|v| v.as_str()).unwrap_or_default();
-            let description = item.get("description").and_then(|v| v.as_str()).unwrap_or_default();
-            let confidence = item.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let occurrences = item.get("occurrences").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-            let context = item.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let pattern_type = item
+                .get("pattern_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let confidence = item
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let occurrences = item
+                .get("occurrences")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1) as i32;
+            let context = item
+                .get("context")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             if id.is_empty() || pattern_type.is_empty() {
                 skipped += 1;
@@ -549,8 +712,27 @@ pub async fn import_all_data(
             };
 
             match state.pg_db.pool().get().await {
-                Ok(conn) => match conn.execute(sql, &[&id, &pattern_type, &description, &confidence, &occurrences, &context.as_deref()]).await {
-                    Ok(n) => if n > 0 { imported += 1; } else { skipped += 1; },
+                Ok(conn) => match conn
+                    .execute(
+                        sql,
+                        &[
+                            &id,
+                            &pattern_type,
+                            &description,
+                            &confidence,
+                            &occurrences,
+                            &context.as_deref(),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(n) => {
+                        if n > 0 {
+                            imported += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
                     Err(e) => errors.push(format!("LP {}: {}", id, e)),
                 },
                 Err(e) => errors.push(format!("PG pool: {}", e)),
@@ -559,7 +741,14 @@ pub async fn import_all_data(
         total_imported += imported;
         total_skipped += skipped;
         total_errors += errors.len();
-        results.insert("learning_patterns".to_string(), ImportResult { imported, skipped, errors });
+        results.insert(
+            "learning_patterns".to_string(),
+            ImportResult {
+                imported,
+                skipped,
+                errors,
+            },
+        );
     }
 
     let success = total_errors == 0;

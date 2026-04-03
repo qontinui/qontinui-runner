@@ -114,12 +114,17 @@ pub trait DomainGenerator: Send + Sync {
                  Replace `{{placeholders}}` with concrete values.\n\n",
             );
             for t in templates {
-                let cmd_summary = t.template_steps.first()
+                let cmd_summary = t
+                    .template_steps
+                    .first()
                     .and_then(|s| s.command_template.as_deref())
                     .unwrap_or("(no command)");
                 prompt.push_str(&format!(
                     "- **{}** — {} (confidence: {:.0}%) — `{}`\n",
-                    t.id, t.pattern_description, t.confidence * 100.0, cmd_summary
+                    t.id,
+                    t.pattern_description,
+                    t.confidence * 100.0,
+                    cmd_summary
                 ));
             }
             prompt.push('\n');
@@ -229,8 +234,7 @@ pub trait DomainGenerator: Send + Sync {
         );
 
         let prompt = self.build_prompt(criteria, context, templates);
-        let task_context = TaskContext::from_prompt(&prompt)
-            .with_criteria_count(criteria.len());
+        let task_context = TaskContext::from_prompt(&prompt).with_criteria_count(criteria.len());
 
         let ai_result: AiResponse = crate::ai_provider::run_prompt_with_model_override(
             &prompt,
@@ -599,8 +603,8 @@ impl DomainGenerator for GeneralGenerator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::specification::{CriterionPriority, VerificationMethod};
+    use super::*;
 
     #[test]
     fn test_get_domain_generator_returns_correct_domain() {
@@ -660,7 +664,9 @@ mod tests {
             pattern_description: "Check HTTP status code".to_string(),
             template_steps: vec![crate::workflow_generation::template_library::TemplateStep {
                 step_type: "command".to_string(),
-                command_template: Some("curl -s -o /dev/null -w '%{http_code}' {{url}}".to_string()),
+                command_template: Some(
+                    "curl -s -o /dev/null -w '%{http_code}' {{url}}".to_string(),
+                ),
                 check_type: Some("exit_code".to_string()),
                 expected_template: Some("0".to_string()),
                 description: "Check HTTP status code".to_string(),

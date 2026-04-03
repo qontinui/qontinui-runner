@@ -159,10 +159,7 @@ mod tests {
 
         let response: PerplexityApiResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.choices.len(), 1);
-        assert!(response.choices[0]
-            .message
-            .content
-            .contains("ownership"));
+        assert!(response.choices[0].message.content.contains("ownership"));
         assert_eq!(response.citations.len(), 2);
     }
 

@@ -30,7 +30,11 @@ impl PgDb {
         post_drift_mean: f64,
         window_size: i64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO performance_drift_signals
              (id, detector_type, metric_name, context_key, drift_level,
@@ -54,10 +58,12 @@ impl PgDb {
     }
 
     /// Get unacknowledged drift signals.
-    pub async fn get_unacknowledged_drift_signals(
-        &self,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_unacknowledged_drift_signals(&self) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT id, detector_type, metric_name, context_key, drift_level,
@@ -90,7 +96,11 @@ impl PgDb {
 
     /// Acknowledge a drift signal.
     pub async fn acknowledge_drift_signal(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE performance_drift_signals SET acknowledged = true WHERE id = $1",
             &[&id],
@@ -107,7 +117,11 @@ impl PgDb {
         detector_type: &str,
         state_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO drift_detector_state (detector_id, detector_type, state_json, last_updated)
              VALUES ($1, $2, $3, NOW())
@@ -125,7 +139,11 @@ impl PgDb {
         &self,
         detector_id: &str,
     ) -> Result<Option<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 "SELECT state_json FROM drift_detector_state WHERE detector_id = $1",
@@ -149,14 +167,24 @@ impl PgDb {
         visit_count: i32,
         sum_of_squares: f64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO model_routing_table
              (context_key, model_id, q_value, visit_count, sum_of_squares, last_updated)
              VALUES ($1, $2, $3, $4, $5, NOW())
              ON CONFLICT (context_key, model_id) DO UPDATE
              SET q_value = $3, visit_count = $4, sum_of_squares = $5, last_updated = NOW()",
-            &[&context_key, &model_id, &q_value, &visit_count, &sum_of_squares],
+            &[
+                &context_key,
+                &model_id,
+                &q_value,
+                &visit_count,
+                &sum_of_squares,
+            ],
         )
         .await
         .map_err(|e| format!("PG upsert_model_routing_entry: {}", e))?;
@@ -167,7 +195,11 @@ impl PgDb {
     pub async fn load_model_routing_table(
         &self,
     ) -> Result<Vec<(String, String, f64, u32, f64)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT context_key, model_id, q_value, visit_count, sum_of_squares
@@ -192,10 +224,12 @@ impl PgDb {
     }
 
     /// Load model routing overrides.
-    pub async fn load_model_routing_overrides(
-        &self,
-    ) -> Result<Vec<(String, String)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn load_model_routing_overrides(&self) -> Result<Vec<(String, String)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT context_key, forced_model FROM model_routing_overrides",
@@ -220,13 +254,24 @@ impl PgDb {
         source: &str,
         exploration: bool,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO model_routing_decisions
              (id, task_run_id, context_key, model_selected, source, exploration)
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO NOTHING",
-            &[&id, &task_run_id, &context_key, &model_selected, &source, &exploration],
+            &[
+                &id,
+                &task_run_id,
+                &context_key,
+                &model_selected,
+                &source,
+                &exploration,
+            ],
         )
         .await
         .map_err(|e| format!("PG record_model_routing_decision: {}", e))?;
@@ -239,7 +284,11 @@ impl PgDb {
         task_run_id: &str,
         reward: f64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE model_routing_decisions SET reward = $2 WHERE task_run_id = $1",
             &[&task_run_id, &reward],
@@ -265,7 +314,11 @@ impl PgDb {
         failure_points_json: &str,
         effective_patterns_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO experience_summaries
              (id, task_run_id, domain, complexity_tier, outcome,
@@ -273,8 +326,14 @@ impl PgDb {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO NOTHING",
             &[
-                &id, &task_run_id, &domain, &complexity_tier, &outcome,
-                &key_decisions_json, &failure_points_json, &effective_patterns_json,
+                &id,
+                &task_run_id,
+                &domain,
+                &complexity_tier,
+                &outcome,
+                &key_decisions_json,
+                &failure_points_json,
+                &effective_patterns_json,
             ],
         )
         .await
@@ -288,7 +347,11 @@ impl PgDb {
         domain: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = if let Some(d) = domain {
             conn.query(
                 "SELECT id, task_run_id, domain, complexity_tier, outcome,
@@ -346,7 +409,11 @@ impl PgDb {
             return Ok(0);
         }
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut count = 0;
 
         for credit in credits {
@@ -393,7 +460,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT step_index, step_type, agent_type, raw_credit, normalized_credit,
@@ -430,7 +501,11 @@ impl PgDb {
         &self,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT step_type,
@@ -475,7 +550,11 @@ impl PgDb {
         status: &str,
         parent_strategy_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO strategy_bank
              (id, name, description, applicability_json, components_json,
@@ -483,8 +562,14 @@ impl PgDb {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO NOTHING",
             &[
-                &id, &name, &description, &applicability_json,
-                &components_json, &provenance_json, &status, &parent_strategy_id,
+                &id,
+                &name,
+                &description,
+                &applicability_json,
+                &components_json,
+                &provenance_json,
+                &status,
+                &parent_strategy_id,
             ],
         )
         .await
@@ -498,7 +583,11 @@ impl PgDb {
         strategy_id: &str,
         stats_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE strategy_bank SET stats_json = $2, updated_at = NOW() WHERE id = $1",
             &[&strategy_id, &stats_json],
@@ -514,7 +603,11 @@ impl PgDb {
         strategy_id: &str,
         status: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE strategy_bank SET status = $2, updated_at = NOW() WHERE id = $1",
             &[&strategy_id, &status],
@@ -525,10 +618,12 @@ impl PgDb {
     }
 
     /// Get active strategies for a given context.
-    pub async fn get_active_strategies(
-        &self,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_active_strategies(&self) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT id, name, description, applicability_json, components_json,
@@ -570,7 +665,11 @@ impl PgDb {
         &self,
         task_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 "SELECT status, duration_secs, iterations, tools_used, files_modified,
@@ -618,7 +717,11 @@ impl PgDb {
         context_key: &str,
         percentile: i32,
     ) -> Result<f64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Parse context_key (domain:complexity:has_ui) to filter
         let parts: Vec<&str> = context_key.split(':').collect();

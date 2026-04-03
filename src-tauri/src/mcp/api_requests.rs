@@ -188,7 +188,9 @@ pub async fn import_curl_to_library(
     let _ = name;
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Saved API requests: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Saved API requests: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 

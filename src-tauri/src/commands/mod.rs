@@ -90,16 +90,16 @@ pub mod mcp; // MCP client management and tool calling
 pub mod meta_optimizer; // Meta-optimizer recommendations and prompt registry
 pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
-pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
 pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
+pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
 pub mod performance_metrics; // Performance metrics dashboard
 pub mod playwright_settings;
 pub mod project_logs;
 pub mod rag;
 pub mod recap; // Session recap overview
 pub mod screenshot;
-pub mod security_settings;
 pub mod screenshots;
+pub mod security_settings;
 pub mod self_healing_settings;
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
@@ -212,7 +212,8 @@ pub struct AppState {
     pub container_executor: TokioMutex<Option<IsolatedExecutor>>,
     /// Per-run cost management trackers.
     /// Keyed by execution_id. Created at run start, removed on completion.
-    pub run_cost_trackers: TokioMutex<HashMap<String, Arc<crate::cost_management::RunCostTrackers>>>,
+    pub run_cost_trackers:
+        TokioMutex<HashMap<String, Arc<crate::cost_management::RunCostTrackers>>>,
 }
 
 impl AppState {

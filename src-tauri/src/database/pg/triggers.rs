@@ -3,7 +3,9 @@
 //! Mirrors the SQLite trigger_system/storage.rs operations.
 
 use super::PgDb;
-use crate::trigger_system::types::{TriggerCondition, TriggerConfig, TriggerHistoryEntry, WorkflowTrigger};
+use crate::trigger_system::types::{
+    TriggerCondition, TriggerConfig, TriggerHistoryEntry, WorkflowTrigger,
+};
 
 impl PgDb {
     // ========================================================================
@@ -12,7 +14,11 @@ impl PgDb {
 
     /// Get all triggers.
     pub async fn get_all_triggers(&self) -> Result<Vec<WorkflowTrigger>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -31,12 +37,19 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_all_triggers: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::trigger_row_to_workflow_trigger(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::trigger_row_to_workflow_trigger(r))
+            .collect())
     }
 
     /// Get a single trigger by ID.
     pub async fn get_trigger(&self, id: &str) -> Result<Option<WorkflowTrigger>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -59,7 +72,11 @@ impl PgDb {
 
     /// Get all enabled triggers.
     pub async fn get_enabled_triggers(&self) -> Result<Vec<WorkflowTrigger>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -77,15 +94,24 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_enabled_triggers: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::trigger_row_to_workflow_trigger(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::trigger_row_to_workflow_trigger(r))
+            .collect())
     }
 
     /// Create a new trigger.
     pub async fn create_trigger(&self, trigger: &WorkflowTrigger) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let config_json = serde_json::to_string(&trigger.trigger_config).map_err(|e| e.to_string())?;
-        let conditions_json = serde_json::to_string(&trigger.conditions).map_err(|e| e.to_string())?;
+        let config_json =
+            serde_json::to_string(&trigger.trigger_config).map_err(|e| e.to_string())?;
+        let conditions_json =
+            serde_json::to_string(&trigger.conditions).map_err(|e| e.to_string())?;
         let overrides_json = trigger
             .workflow_overrides
             .as_ref()
@@ -140,10 +166,16 @@ impl PgDb {
 
     /// Update an existing trigger.
     pub async fn update_trigger(&self, trigger: &WorkflowTrigger) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let config_json = serde_json::to_string(&trigger.trigger_config).map_err(|e| e.to_string())?;
-        let conditions_json = serde_json::to_string(&trigger.conditions).map_err(|e| e.to_string())?;
+        let config_json =
+            serde_json::to_string(&trigger.trigger_config).map_err(|e| e.to_string())?;
+        let conditions_json =
+            serde_json::to_string(&trigger.conditions).map_err(|e| e.to_string())?;
         let overrides_json = trigger
             .workflow_overrides
             .as_ref()
@@ -190,7 +222,11 @@ impl PgDb {
 
     /// Delete a trigger.
     pub async fn delete_trigger(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         conn.execute("DELETE FROM workflow_triggers WHERE id = $1", &[&id])
             .await
@@ -202,7 +238,11 @@ impl PgDb {
 
     /// Set trigger enabled status.
     pub async fn set_trigger_enabled(&self, id: &str, enabled: bool) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
 
         conn.execute(
@@ -225,7 +265,11 @@ impl PgDb {
         id: &str,
         execution_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
 
         conn.execute(
@@ -251,9 +295,14 @@ impl PgDb {
 
     /// Record a trigger history entry.
     pub async fn record_trigger_history(&self, entry: &TriggerHistoryEntry) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let event_data_json = serde_json::to_string(&entry.event_data).map_err(|e| e.to_string())?;
+        let event_data_json =
+            serde_json::to_string(&entry.event_data).map_err(|e| e.to_string())?;
 
         conn.execute(
             r#"INSERT INTO trigger_history
@@ -285,7 +334,11 @@ impl PgDb {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<TriggerHistoryEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Build dynamic WHERE clause with $N params
         let mut conditions = vec!["trigger_id = $1".to_string()];
@@ -353,7 +406,11 @@ impl PgDb {
 
     /// Get trigger counts (total, enabled).
     pub async fn get_trigger_stats(&self) -> Result<(u64, u64), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let total: i64 = conn
             .query_one("SELECT COUNT(*) FROM workflow_triggers", &[])

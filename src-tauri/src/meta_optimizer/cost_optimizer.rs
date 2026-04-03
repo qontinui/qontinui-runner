@@ -119,7 +119,6 @@ pub fn generate_cost_recommendations(
                 .to_string();
 
                 match recommendations::create_recommendation(
-                    
                     pg_db,
                     "pipeline_prompt",
                     "cost_optimization",
@@ -180,7 +179,6 @@ pub fn generate_cost_recommendations(
                 .to_string();
 
                 match recommendations::create_recommendation(
-                    
                     pg_db,
                     "pipeline_prompt",
                     "cost_optimization",
@@ -234,7 +232,6 @@ pub fn generate_cost_recommendations(
             .to_string();
 
             match recommendations::create_recommendation(
-                
                 pg_db,
                 "pipeline_prompt",
                 "cost_optimization",
@@ -311,7 +308,6 @@ pub fn generate_cost_recommendations(
             .to_string();
 
             match recommendations::create_recommendation(
-                
                 pg_db,
                 "pipeline_prompt",
                 "cost_optimization",
@@ -433,16 +429,18 @@ fn query_agent_cost_stats(pg_db: &Arc<PgDb>) -> Result<Vec<AgentCostStats>, Stri
     })?;
     Ok(tuples
         .into_iter()
-        .map(|(agent_type, run_count, avg_tokens_in, avg_tokens_out, avg_cost, total_cost)| {
-            AgentCostStats {
-                agent_type,
-                run_count,
-                avg_tokens_in,
-                avg_tokens_out,
-                avg_cost,
-                total_cost,
-            }
-        })
+        .map(
+            |(agent_type, run_count, avg_tokens_in, avg_tokens_out, avg_cost, total_cost)| {
+                AgentCostStats {
+                    agent_type,
+                    run_count,
+                    avg_tokens_in,
+                    avg_tokens_out,
+                    avg_cost,
+                    total_cost,
+                }
+            },
+        )
         .collect())
 }
 
@@ -493,13 +491,12 @@ fn compute_cost_trend(pg_db: &Arc<PgDb>) -> Result<String, String> {
 
 /// Fetch active (pending) cost_optimization recommendations.
 fn query_active_cost_recommendations(pg_db: &Arc<PgDb>) -> Result<Vec<Recommendation>, String> {
-    super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), Some("pending")).map(
-        |recs| {
+    super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), Some("pending"))
+        .map(|recs| {
             recs.into_iter()
                 .filter(|r| r.recommendation_type == "cost_optimization")
                 .collect()
-        },
-    )
+        })
 }
 
 /// Compute confidence based on sample size. Linearly scales from 0.5 at
@@ -589,7 +586,8 @@ pub fn generate_cache_efficiency_recommendations(
             continue;
         }
 
-        let total_input_plus_cache = stat.total_input + stat.total_cache_creation + stat.total_cache_read;
+        let total_input_plus_cache =
+            stat.total_input + stat.total_cache_creation + stat.total_cache_read;
         let cache_hit_rate = if total_input_plus_cache > 0 {
             stat.total_cache_read as f64 / total_input_plus_cache as f64
         } else {
@@ -648,9 +646,7 @@ pub fn generate_cache_efficiency_recommendations(
         }
 
         // Check 2: Cache creation >> cache read (prompts being recreated without reuse)
-        if stat.total_cache_creation > 0
-            && stat.total_cache_creation > stat.total_cache_read * 3
-        {
+        if stat.total_cache_creation > 0 && stat.total_cache_creation > stat.total_cache_read * 3 {
             let title = format!("Excessive cache recreation in {} phase", stat.phase);
             if !has_recent(&title) {
                 let ratio = if stat.total_cache_read > 0 {
@@ -712,14 +708,13 @@ pub fn generate_cache_efficiency_recommendations(
 /// Queries `phase_token_usage` to find phases that run with identical
 /// (phase, model_used) pairs many times with high token counts, suggesting
 /// repeated identical prompts that could benefit from caching or dedup.
-pub fn detect_duplicate_prompts(
-    pg_db: &Arc<PgDb>,
-) -> Vec<Recommendation> {
+pub fn detect_duplicate_prompts(pg_db: &Arc<PgDb>) -> Vec<Recommendation> {
     let mut results: Vec<Recommendation> = Vec::new();
 
     // Load existing recommendations for deduplication
-    let existing = super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), None)
-        .unwrap_or_default();
+    let existing =
+        super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), None)
+            .unwrap_or_default();
     let recent_titles: Vec<String> = existing
         .iter()
         .filter(|r| {
@@ -777,11 +772,7 @@ pub fn detect_duplicate_prompts(
                  - Enabling prompt caching to avoid redundant processing\n\
                  - Caching the AI response if the input is truly identical\n\
                  - Deduplicating calls at the orchestration layer",
-                stat.phase,
-                model_display,
-                stat.run_count,
-                mean,
-                cv,
+                stat.phase, model_display, stat.run_count, mean, cv,
             );
             let evidence = serde_json::json!({
                 "phase": stat.phase,
@@ -827,14 +818,13 @@ pub fn detect_duplicate_prompts(
 /// Queries `phase_model_routing` Q-values to find phases where an expensive
 /// model tier (opus) is dominant but a cheaper tier (sonnet) has comparable
 /// Q-values, suggesting the cheaper model would work just as well.
-pub fn detect_model_downgrade_opportunities(
-    pg_db: &Arc<PgDb>,
-) -> Vec<Recommendation> {
+pub fn detect_model_downgrade_opportunities(pg_db: &Arc<PgDb>) -> Vec<Recommendation> {
     let mut results: Vec<Recommendation> = Vec::new();
 
     // Load existing recommendations for deduplication
-    let existing = super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), None)
-        .unwrap_or_default();
+    let existing =
+        super::recommendations::list_recommendations(pg_db, Some("pipeline_prompt"), None)
+            .unwrap_or_default();
     let recent_titles: Vec<String> = existing
         .iter()
         .filter(|r| {
@@ -881,8 +871,11 @@ pub fn detect_model_downgrade_opportunities(
     };
     let is_cheap = |action: &str| -> bool {
         let lower = action.to_lowercase();
-        lower.contains("sonnet") || lower.contains("haiku") || lower.contains("gpt-4o-mini")
-            || lower.contains("gpt-3.5") || lower.contains("flash")
+        lower.contains("sonnet")
+            || lower.contains("haiku")
+            || lower.contains("gpt-4o-mini")
+            || lower.contains("gpt-3.5")
+            || lower.contains("flash")
     };
 
     for (state_key, actions) in &by_state {

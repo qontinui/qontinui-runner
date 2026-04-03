@@ -130,9 +130,7 @@ pub fn infer_component_type(path: &str) -> &str {
 ///
 /// Deletes existing data and re-extracts from reflection_fixes, causal_events,
 /// and task_knowledge tables.
-pub fn rebuild_architecture_model(
-    workflow_name: &str,
-) -> Result<RebuildResult, String> {
+pub fn rebuild_architecture_model(workflow_name: &str) -> Result<RebuildResult, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -152,9 +150,7 @@ struct ComponentData {
 // =============================================================================
 
 /// Get the full component graph for a workflow.
-pub fn get_component_graph(
-    workflow_name: &str,
-) -> Result<ComponentGraph, String> {
+pub fn get_component_graph(workflow_name: &str) -> Result<ComponentGraph, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -180,9 +176,7 @@ pub fn get_impact_analysis(
 
 /// Extended impact analysis that supplements the BFS-on-component_relationships approach
 /// with additional relationship data from step_finding_links and step_provenance tables.
-pub fn rebuild_architecture_with_graph(
-    workflow_name: &str,
-) -> Result<RebuildResult, String> {
+pub fn rebuild_architecture_with_graph(workflow_name: &str) -> Result<RebuildResult, String> {
     Err("SQLite removed".to_string())
 }
 

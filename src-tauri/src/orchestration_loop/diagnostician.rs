@@ -310,7 +310,10 @@ pub fn build_diagnostic_context(
             ctx.push_str(&format!("- **Diagnosis:** {}\n", diag));
         }
         if let Some(ref suggestion) = result.prompt_rewrite_suggestion {
-            ctx.push_str(&format!("- **Suggestion for next attempt:** {}\n", suggestion));
+            ctx.push_str(&format!(
+                "- **Suggestion for next attempt:** {}\n",
+                suggestion
+            ));
         }
         ctx.push('\n');
     }
@@ -354,8 +357,7 @@ mod tests {
 
     #[test]
     fn test_parse_triage_response_raw_json() {
-        let response =
-            r#"{"root_cause": "infrastructure_issue", "diagnosis": "App crashed.", "prompt_rewrite_suggestion": null}"#;
+        let response = r#"{"root_cause": "infrastructure_issue", "diagnosis": "App crashed.", "prompt_rewrite_suggestion": null}"#;
 
         let (cause, diag, suggestion) = parse_triage_response(response);
         assert_eq!(cause, RootCauseCategory::InfrastructureIssue);

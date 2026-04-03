@@ -185,7 +185,11 @@ pub async fn import_rag(
     // Auto-add to ConfigStorage (database)
     let config_name = request.config.metadata.name.clone();
     if let Ok(config_json) = serde_json::to_value(&request.config) {
-        let save_result = state.app_state.pg_db.save_config_with_id(&project_id, config_json, &config_name, "web", None).await;
+        let save_result = state
+            .app_state
+            .pg_db
+            .save_config_with_id(&project_id, config_json, &config_name, "web", None)
+            .await;
         if let Err(e) = save_result {
             warn!(
                 "MCP API: Failed to auto-store config in ConfigStorage: {}",

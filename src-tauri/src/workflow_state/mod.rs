@@ -263,9 +263,7 @@ impl<S: WorkflowState> StateMachine<S> {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     tokio::task::block_in_place(|| {
-                        handle.block_on(async move {
-                            pg.get_workflow_execution_state(&eid).await
-                        })
+                        handle.block_on(async move { pg.get_workflow_execution_state(&eid).await })
                     })
                 }));
                 match result {

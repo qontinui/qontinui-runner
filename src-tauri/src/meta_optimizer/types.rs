@@ -65,7 +65,9 @@ impl WorkflowCategory {
             Self::Reflections => format!(" AND COALESCE({}.is_reflection, false) = true", alias),
             Self::Fixers => format!(" AND COALESCE({}.is_fixer, false) = true", alias),
             Self::FollowUps => format!(" AND COALESCE({}.is_follow_up, false) = true", alias),
-            Self::MetaOptimizer => format!(" AND COALESCE({}.is_meta_optimizer, false) = true", alias),
+            Self::MetaOptimizer => {
+                format!(" AND COALESCE({}.is_meta_optimizer, false) = true", alias)
+            }
         }
     }
 

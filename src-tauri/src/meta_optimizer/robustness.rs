@@ -3,8 +3,8 @@
 //! Generates adversarial/edge-case inputs for prompt variants and tests them
 //! before deployment. Integrates with the eval spec system from Phase 3.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::info;
 
@@ -286,11 +286,20 @@ fn generate_regression_cases(
     })?;
     let datasets: Vec<super::golden_dataset::GoldenDataset> = tuples
         .into_iter()
-        .map(|(id, agent_type, name, entries_json, created_at, updated_at)| {
-            let entries: Vec<super::golden_dataset::GoldenEntry> =
-                serde_json::from_str(&entries_json).unwrap_or_default();
-            super::golden_dataset::GoldenDataset { id, agent_type, name, entries, created_at, updated_at }
-        })
+        .map(
+            |(id, agent_type, name, entries_json, created_at, updated_at)| {
+                let entries: Vec<super::golden_dataset::GoldenEntry> =
+                    serde_json::from_str(&entries_json).unwrap_or_default();
+                super::golden_dataset::GoldenDataset {
+                    id,
+                    agent_type,
+                    name,
+                    entries,
+                    created_at,
+                    updated_at,
+                }
+            },
+        )
         .collect();
 
     let mut cases = Vec::new();
@@ -407,7 +416,10 @@ pub fn save_robustness_report(pg_db: &Arc<PgDb>, report: &RobustnessReport) -> R
         ))
     });
     pg_result?;
-    info!("Saved robustness report {} ({}/{} passed)", id, passed, total);
+    info!(
+        "Saved robustness report {} ({}/{} passed)",
+        id, passed, total
+    );
     Ok(())
 }
 
@@ -418,9 +430,13 @@ pub fn list_robustness_reports(
     recommendation_id: Option<&str>,
 ) -> Result<Vec<RobustnessReport>, String> {
     let jsons = tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.list_robustness_reports(prompt_variant_id, recommendation_id))
+        Handle::current()
+            .block_on(pg_db.list_robustness_reports(prompt_variant_id, recommendation_id))
     })?;
-    let reports: Vec<RobustnessReport> = jsons.iter().filter_map(|j| serde_json::from_str(j).ok()).collect();
+    let reports: Vec<RobustnessReport> = jsons
+        .iter()
+        .filter_map(|j| serde_json::from_str(j).ok())
+        .collect();
     Ok(reports)
 }
 
@@ -458,14 +474,22 @@ pub fn run_robustness_test(
 /// Save a robustness report with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use save_robustness_report directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn save_robustness_report_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, report: &RobustnessReport) -> Result<(), String> {
+pub fn save_robustness_report_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    report: &RobustnessReport,
+) -> Result<(), String> {
     save_robustness_report(pg_db, report)
 }
 
 /// Run a full robustness test with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use run_robustness_test directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn run_robustness_test_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, prompt_variant_id: Option<&str>, recommendation_id: Option<&str>) -> Result<RobustnessReport, String> {
+pub fn run_robustness_test_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    prompt_variant_id: Option<&str>,
+    recommendation_id: Option<&str>,
+) -> Result<RobustnessReport, String> {
     run_robustness_test(pg_db, agent_type, prompt_variant_id, recommendation_id)
 }
 

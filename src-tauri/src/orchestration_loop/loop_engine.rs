@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tracing::{debug, error, info, warn};
 
-use super::context_summarizer::{ContextSummarizer, IterationContext, estimate_tokens};
+use super::context_summarizer::{estimate_tokens, ContextSummarizer, IterationContext};
 use super::diagnostician;
 use super::fix_agent;
 use super::intervention;
@@ -329,7 +329,10 @@ pub async fn start_multi_loop(
                 );
                 for started_id in &started_ids {
                     if let Err(stop_err) = stop_loop_by_id(states.clone(), started_id).await {
-                        error!("Failed to stop loop '{}' during rollback: {}", started_id, stop_err);
+                        error!(
+                            "Failed to stop loop '{}' during rollback: {}",
+                            started_id, stop_err
+                        );
                     }
                 }
                 // Remove the failed loop's state
@@ -343,8 +346,7 @@ pub async fn start_multi_loop(
 
     info!(
         "Multi-loop started: {} loops, stop_all_on_error={}",
-        loop_count,
-        stop_all_on_error
+        loop_count, stop_all_on_error
     );
 
     Ok(())
@@ -459,10 +461,7 @@ pub async fn get_multi_status(states: SharedLoopStates) -> MultiLoopStatus {
 }
 
 /// Signal restart on a specific loop by ID.
-pub async fn signal_restart_by_id(
-    states: SharedLoopStates,
-    loop_id: &str,
-) -> Result<(), String> {
+pub async fn signal_restart_by_id(states: SharedLoopStates, loop_id: &str) -> Result<(), String> {
     let mgr = states.lock().await;
     let loop_state = mgr
         .loops
@@ -566,8 +565,14 @@ async fn run_loop(
     }
 
     // Initialize stall detector and context summarizer from config
-    let mut stall_detector = config.stall_detection.as_ref().map(|c| StallDetector::new(c.clone()));
-    let mut context_summarizer_opt = config.summarization.as_ref().map(|c| ContextSummarizer::new(c.clone()));
+    let mut stall_detector = config
+        .stall_detection
+        .as_ref()
+        .map(|c| StallDetector::new(c.clone()));
+    let mut context_summarizer_opt = config
+        .summarization
+        .as_ref()
+        .map(|c| ContextSummarizer::new(c.clone()));
 
     // Task decomposition / planning phase
     if let Some(ref decomp_config) = config.decomposition {
@@ -582,21 +587,32 @@ async fn run_loop(
             let decomp_config_clone = decomp_config.clone();
             let goal_clone = goal.clone();
             let prompt_owned = prompt.clone();
-            match tokio::task::spawn_blocking(move || {
-                run_prompt_sync(&prompt_owned, None)
-            }).await {
+            match tokio::task::spawn_blocking(move || run_prompt_sync(&prompt_owned, None)).await {
                 Ok(response) if response.success => {
-                    match task_decomposer::parse_decomposition_response(&goal_clone, &response.output, &decomp_config_clone) {
+                    match task_decomposer::parse_decomposition_response(
+                        &goal_clone,
+                        &response.output,
+                        &decomp_config_clone,
+                    ) {
                         Ok(plan) => {
-                            info!("Decomposed into {} subtasks: {}",
+                            info!(
+                                "Decomposed into {} subtasks: {}",
                                 plan.subtasks.len(),
-                                plan.subtasks.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(", "));
+                                plan.subtasks
+                                    .iter()
+                                    .map(|s| s.title.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
                             execute_subtasks(&plan, &runner, &stop_rx).await;
                         }
                         Err(e) => warn!("Failed to parse decomposition: {}", e),
                     }
                 }
-                Ok(response) => warn!("Decomposition AI call failed: {}", response.error.unwrap_or_default()),
+                Ok(response) => warn!(
+                    "Decomposition AI call failed: {}",
+                    response.error.unwrap_or_default()
+                ),
                 Err(e) => warn!("Decomposition task panicked: {}", e),
             }
             info!("Task decomposition: planning phase complete");
@@ -676,10 +692,8 @@ async fn run_loop(
             // Check UI Bridge health signals for stuck page detection
             let ui_stall = {
                 let port = config.target_runner_port.unwrap_or(9876);
-                let health_url = format!(
-                    "http://127.0.0.1:{}/ui-bridge/control/health-signals",
-                    port
-                );
+                let health_url =
+                    format!("http://127.0.0.1:{}/ui-bridge/control/health-signals", port);
                 match reqwest::Client::new()
                     .get(&health_url)
                     .timeout(std::time::Duration::from_secs(3))
@@ -692,13 +706,33 @@ async fn run_loop(
                             let idle = data.get("idle").cloned().unwrap_or_default();
                             let stuck = data.get("stuck_screen").cloned().unwrap_or_default();
                             let signals = super::stall_detector::UiHealthSignals {
-                                idle_score: idle.get("score").and_then(|v| v.as_f64()).unwrap_or(1.0),
-                                network_idle: idle.get("network").and_then(|v| v.as_bool()).unwrap_or(true),
+                                idle_score: idle
+                                    .get("score")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(1.0),
+                                network_idle: idle
+                                    .get("network")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true),
                                 dom_idle: idle.get("dom").and_then(|v| v.as_bool()).unwrap_or(true),
-                                loading: idle.get("loading").and_then(|v| v.as_bool()).unwrap_or(false),
-                                stuck_verdict: stuck.get("verdict").and_then(|v| v.as_str()).unwrap_or("ok").to_string(),
-                                loading_indicator_count: stuck.get("loadingIndicators").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                                dom_changed: stuck.get("domChanged").and_then(|v| v.as_bool()).unwrap_or(true),
+                                loading: idle
+                                    .get("loading")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false),
+                                stuck_verdict: stuck
+                                    .get("verdict")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("ok")
+                                    .to_string(),
+                                loading_indicator_count: stuck
+                                    .get("loadingIndicators")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as u32,
+                                dom_changed: stuck
+                                    .get("domChanged")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true),
                                 observation_window_ms: 2000,
                             };
                             detector.check_ui_health(&signals)
@@ -719,17 +753,24 @@ async fn run_loop(
                     state.phase = LoopPhase::StallDetecting;
                 }
                 // Build intervention prompt for AI (prompt + parser ready)
-                let recent_actions: Vec<String> = detector.recent_actions(5)
+                let recent_actions: Vec<String> = detector
+                    .recent_actions(5)
                     .iter()
                     .map(|a| a.signature.clone())
                     .collect();
-                let intervention_prompt = intervention::build_intervention_prompt(&pattern, &recent_actions);
+                let intervention_prompt =
+                    intervention::build_intervention_prompt(&pattern, &recent_actions);
                 let pattern_clone = pattern.clone();
                 let _intervention_result = match tokio::task::spawn_blocking(move || {
                     run_prompt_sync(&intervention_prompt, None)
-                }).await {
+                })
+                .await
+                {
                     Ok(response) if response.success => {
-                        let interv = intervention::parse_intervention_response(&pattern_clone, &response.output);
+                        let interv = intervention::parse_intervention_response(
+                            &pattern_clone,
+                            &response.output,
+                        );
                         info!("Stall intervention: {}", interv.alternative_strategy);
                         Some(interv)
                     }
@@ -922,7 +963,9 @@ async fn run_loop(
                 Ok((
                     ExitCheckResult {
                         should_exit: true,
-                        reason: "DiagnosticEvaluation in simple mode — treated as WorkflowVerification".to_string(),
+                        reason:
+                            "DiagnosticEvaluation in simple mode — treated as WorkflowVerification"
+                                .to_string(),
                     },
                     None,
                     None,
@@ -954,7 +997,10 @@ async fn run_loop(
         if let Some(ref mut summarizer) = context_summarizer_opt {
             let ctx = IterationContext {
                 iteration,
-                workflow_output: format!("Iteration {} completed with status: {}", iteration, workflow_status),
+                workflow_output: format!(
+                    "Iteration {} completed with status: {}",
+                    iteration, workflow_status
+                ),
                 reflection_findings: vec![],
                 fixes_applied: vec![],
                 exit_check_reason: exit_check.reason.clone(),
@@ -966,12 +1012,16 @@ async fn run_loop(
                 if let Some(prompt) = summarizer.build_summarization_prompt() {
                     let original_tokens = summarizer.total_token_estimate();
                     let prompt_owned = prompt.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        run_prompt_sync(&prompt_owned, None)
-                    }).await {
+                    match tokio::task::spawn_blocking(move || run_prompt_sync(&prompt_owned, None))
+                        .await
+                    {
                         Ok(response) if response.success => {
-                            let summary = summarizer.parse_summary_response(&response.output, original_tokens);
-                            info!("Context summarized: {} iterations compressed", summary.iterations_summarized.len());
+                            let summary = summarizer
+                                .parse_summary_response(&response.output, original_tokens);
+                            info!(
+                                "Context summarized: {} iterations compressed",
+                                summary.iterations_summarized.len()
+                            );
                             summarizer.apply_summary(summary);
                             context_summarized_this_iteration = Some(true);
                         }
@@ -1252,48 +1302,59 @@ async fn execute_subtasks(
         // If the subtask has a workflow_id, run it directly; otherwise generate from description
         let exec_result = if let Some(ref wf_id) = subtask.workflow_id {
             match runner.start_workflow(wf_id).await {
-                Ok(task_run_id) => {
-                    match runner.poll_until_complete(&task_run_id, stop_rx).await {
-                        Ok(_state) => {
-                            let status = runner
-                                .get_task_run_status_pub(&task_run_id)
-                                .await
-                                .unwrap_or_else(|_| "unknown".to_string());
-                            let success = matches!(status.as_str(), "completed" | "complete");
-                            Ok((success, format!("Workflow {} finished with status: {}", wf_id, status), Some(task_run_id)))
-                        }
-                        Err(e) if e == "Loop stopped" => return,
-                        Err(e) => Err(e),
+                Ok(task_run_id) => match runner.poll_until_complete(&task_run_id, stop_rx).await {
+                    Ok(_state) => {
+                        let status = runner
+                            .get_task_run_status_pub(&task_run_id)
+                            .await
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        let success = matches!(status.as_str(), "completed" | "complete");
+                        Ok((
+                            success,
+                            format!("Workflow {} finished with status: {}", wf_id, status),
+                            Some(task_run_id),
+                        ))
                     }
-                }
+                    Err(e) if e == "Loop stopped" => return,
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             }
         } else {
             // No workflow_id — use description to generate + run a workflow
-            let ctx = if context.is_empty() { None } else { Some(context.as_str()) };
+            let ctx = if context.is_empty() {
+                None
+            } else {
+                Some(context.as_str())
+            };
             match runner
                 .generate_workflow(&subtask.description, ctx, None)
                 .await
             {
-                Ok((wf_id, _gen_task_run_id)) => {
-                    match runner.start_workflow(&wf_id).await {
-                        Ok(task_run_id) => {
-                            match runner.poll_until_complete(&task_run_id, stop_rx).await {
-                                Ok(_state) => {
-                                    let status = runner
-                                        .get_task_run_status_pub(&task_run_id)
-                                        .await
-                                        .unwrap_or_else(|_| "unknown".to_string());
-                                    let success = matches!(status.as_str(), "completed" | "complete");
-                                    Ok((success, format!("Generated workflow {} finished with status: {}", wf_id, status), Some(task_run_id)))
-                                }
-                                Err(e) if e == "Loop stopped" => return,
-                                Err(e) => Err(e),
+                Ok((wf_id, _gen_task_run_id)) => match runner.start_workflow(&wf_id).await {
+                    Ok(task_run_id) => {
+                        match runner.poll_until_complete(&task_run_id, stop_rx).await {
+                            Ok(_state) => {
+                                let status = runner
+                                    .get_task_run_status_pub(&task_run_id)
+                                    .await
+                                    .unwrap_or_else(|_| "unknown".to_string());
+                                let success = matches!(status.as_str(), "completed" | "complete");
+                                Ok((
+                                    success,
+                                    format!(
+                                        "Generated workflow {} finished with status: {}",
+                                        wf_id, status
+                                    ),
+                                    Some(task_run_id),
+                                ))
                             }
+                            Err(e) if e == "Loop stopped" => return,
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     }
-                }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(format!("Workflow generation failed: {}", e)),
             }
         };
@@ -1357,8 +1418,14 @@ async fn run_pipeline_loop(
     let mut diagnostic_history: Vec<DiagnosticResult> = Vec::new();
 
     // Initialize stall detector and context summarizer from config
-    let mut stall_detector = config.stall_detection.as_ref().map(|c| StallDetector::new(c.clone()));
-    let mut context_summarizer_opt = config.summarization.as_ref().map(|c| ContextSummarizer::new(c.clone()));
+    let mut stall_detector = config
+        .stall_detection
+        .as_ref()
+        .map(|c| StallDetector::new(c.clone()));
+    let mut context_summarizer_opt = config
+        .summarization
+        .as_ref()
+        .map(|c| ContextSummarizer::new(c.clone()));
 
     info!(
         "Pipeline loop starting: max_iterations={}, has_build={}, has_fixes={}",
@@ -1402,12 +1469,17 @@ async fn run_pipeline_loop(
                 }
 
                 // Inject diagnostic context from previous iterations if available
-                let build_context = if pipeline.diagnose.is_some() && !diagnostic_history.is_empty() {
+                let build_context = if pipeline.diagnose.is_some() && !diagnostic_history.is_empty()
+                {
                     let ctx = diagnostician::build_diagnostic_context(
                         &diagnostic_history,
                         build_config.context.as_deref(),
                     );
-                    if ctx.is_empty() { build_config.context.clone() } else { Some(ctx) }
+                    if ctx.is_empty() {
+                        build_config.context.clone()
+                    } else {
+                        Some(ctx)
+                    }
                 } else {
                     build_config.context.clone()
                 };
@@ -1782,15 +1854,35 @@ async fn run_pipeline_loop(
         if let Some(ref mut summarizer) = context_summarizer_opt {
             let ctx = IterationContext {
                 iteration,
-                workflow_output: format!("Pipeline iteration {} completed with status: {}", iteration, workflow_status),
-                reflection_findings: fixes.iter().filter_map(|f| f.get("description").and_then(|v| v.as_str()).map(|s| s.to_string())).collect(),
-                fixes_applied: if fixes_implemented == Some(true) { vec![format!("{} fixes implemented", fix_count)] } else { vec![] },
+                workflow_output: format!(
+                    "Pipeline iteration {} completed with status: {}",
+                    iteration, workflow_status
+                ),
+                reflection_findings: fixes
+                    .iter()
+                    .filter_map(|f| {
+                        f.get("description")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect(),
+                fixes_applied: if fixes_implemented == Some(true) {
+                    vec![format!("{} fixes implemented", fix_count)]
+                } else {
+                    vec![]
+                },
                 exit_check_reason: format!("{} fixes found", fix_count),
-                token_estimate: estimate_tokens(&format!("Pipeline iteration {} context", iteration)) + 100,
+                token_estimate: estimate_tokens(&format!(
+                    "Pipeline iteration {} context",
+                    iteration
+                )) + 100,
             };
             summarizer.add_iteration_context(ctx);
             if summarizer.should_summarize() {
-                info!("Context summarization triggered at pipeline iteration {}", iteration);
+                info!(
+                    "Context summarization triggered at pipeline iteration {}",
+                    iteration
+                );
                 if let Some(prompt) = summarizer.build_summarization_prompt() {
                     // TODO: AI call for summarization
                     // let ai_response = run_prompt_sync(&prompt, None);

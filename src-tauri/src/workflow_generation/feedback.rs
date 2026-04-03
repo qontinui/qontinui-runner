@@ -55,8 +55,6 @@ pub struct FeedbackSummary {
 }
 
 /// Get aggregated feedback summary for a category or all workflows.
-pub fn get_workflow_feedback_summary(
-    category: Option<&str>,
-) -> Result<FeedbackSummary, String> {
+pub fn get_workflow_feedback_summary(category: Option<&str>) -> Result<FeedbackSummary, String> {
     Err("SQLite removed".to_string())
 }

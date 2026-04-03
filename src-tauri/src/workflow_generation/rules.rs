@@ -97,11 +97,7 @@ pub fn load_rules(agent: &str, section: &str) -> Vec<GenerationRule> {
 /// - `Critical` loads only `severity = 'critical'` rules
 /// - `Important` loads `'critical'` and `'important'` rules
 /// - `Full` loads all severities (`'critical'`, `'important'`, `'normal'`, `'hint'`)
-pub fn load_rules_progressive(
-    agent: &str,
-    section: &str,
-    tier: RuleTier,
-) -> Vec<GenerationRule> {
+pub fn load_rules_progressive(agent: &str, section: &str, tier: RuleTier) -> Vec<GenerationRule> {
     Vec::new()
 }
 
@@ -111,9 +107,7 @@ pub fn load_rules_by_agent(agent: &str) -> HashMap<String, Vec<GenerationRule>> 
 }
 
 /// List rules with optional filters.
-pub fn list_rules(
-    query: &ListRulesQuery,
-) -> Result<Vec<GenerationRule>, String> {
+pub fn list_rules(query: &ListRulesQuery) -> Result<Vec<GenerationRule>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -204,10 +198,7 @@ pub fn insert_rule(input: &InsertRuleInput) -> Result<GenerationRule, String> {
 }
 
 /// Update an existing generation rule.
-pub fn update_rule(
-    id: &str,
-    input: &UpdateRuleInput,
-) -> Result<GenerationRule, String> {
+pub fn update_rule(id: &str, input: &UpdateRuleInput) -> Result<GenerationRule, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -306,9 +297,7 @@ pub fn truncate_to_title(description: &str) -> String {
 /// exists, it is skipped.
 ///
 /// Returns the number of newly created rules.
-pub fn create_rules_from_reflection_fixes(
-    fixes: &[ReflectionFix],
-) -> Result<u32, String> {
+pub fn create_rules_from_reflection_fixes(fixes: &[ReflectionFix]) -> Result<u32, String> {
     Err("SQLite removed".to_string())
 }
 

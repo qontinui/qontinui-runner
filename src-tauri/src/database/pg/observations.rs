@@ -43,7 +43,11 @@ fn content_hash(title: &str, content: &str) -> String {
 ///
 /// Combines recency decay (~23-day half-life), currency boost (still-valid observations),
 /// and supersession penalty. Used to rank observations in retrieval.
-pub fn temporal_score(valid_from: &DateTime<Utc>, valid_until: Option<&DateTime<Utc>>, superseded_by: Option<i64>) -> f64 {
+pub fn temporal_score(
+    valid_from: &DateTime<Utc>,
+    valid_until: Option<&DateTime<Utc>>,
+    superseded_by: Option<i64>,
+) -> f64 {
     let now = Utc::now();
     let age_days = (now - *valid_from).num_days() as f64;
     let recency_score = (-0.03 * age_days).exp(); // half-life ~23 days
@@ -59,11 +63,12 @@ impl PgDb {
     /// into observation_history before being overwritten.
     ///
     /// Returns the observation ID (new or existing).
-    pub async fn save_observation(
-        &self,
-        input: &CreateObservationInput,
-    ) -> Result<i64, String> {
-        let mut conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn save_observation(&self, input: &CreateObservationInput) -> Result<i64, String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Strip private content before hashing or storing
         let clean_content = strip_private_tags(&input.content);
@@ -98,7 +103,9 @@ impl PgDb {
 
             // Use a transaction to atomically snapshot + upsert, preventing
             // concurrent upserts from losing history entries.
-            let txn = conn.transaction().await
+            let txn = conn
+                .transaction()
+                .await
                 .map_err(|e| format!("PG begin transaction: {}", e))?;
 
             // Snapshot the current version into history before overwriting
@@ -129,7 +136,8 @@ impl PgDb {
                 .await
                 .map_err(|e| format!("PG upsert_observation: {}", e))?;
 
-            txn.commit().await
+            txn.commit()
+                .await
                 .map_err(|e| format!("PG commit transaction: {}", e))?;
             return Ok(id);
         }
@@ -159,7 +167,11 @@ impl PgDb {
 
     /// Get a single observation by ID (full content).
     pub async fn get_observation(&self, id: i64) -> Result<Option<Observation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = qontinui_db::queries::observations::get_observation()
             .bind(&conn, &id)
@@ -197,7 +209,11 @@ impl PgDb {
         project_id: Option<&str>,
         max_results: i64,
     ) -> Result<Vec<ObservationSearchResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         if let Some(pid) = project_id {
             let rows = qontinui_db::queries::observations::search_observations_by_project()
@@ -206,22 +222,25 @@ impl PgDb {
                 .await
                 .map_err(|e| format!("PG search_observations: {}", e))?;
 
-            Ok(rows.into_iter().map(|r| ObservationSearchResult {
-                id: r.id,
-                title: r.title,
-                content_preview: r.content_preview,
-                observation_type: r.observation_type,
-                scope: r.scope,
-                topic_key: r.topic_key,
-                revision_count: r.revision_count,
-                project_id: r.project_id,
-                valid_from: r.valid_from.to_rfc3339(),
-                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-                superseded_by: r.superseded_by,
-                created_at: r.created_at.to_rfc3339(),
-                updated_at: r.updated_at.to_rfc3339(),
-                rank: Some(r.rank),
-            }).collect())
+            Ok(rows
+                .into_iter()
+                .map(|r| ObservationSearchResult {
+                    id: r.id,
+                    title: r.title,
+                    content_preview: r.content_preview,
+                    observation_type: r.observation_type,
+                    scope: r.scope,
+                    topic_key: r.topic_key,
+                    revision_count: r.revision_count,
+                    project_id: r.project_id,
+                    valid_from: r.valid_from.to_rfc3339(),
+                    valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                    superseded_by: r.superseded_by,
+                    created_at: r.created_at.to_rfc3339(),
+                    updated_at: r.updated_at.to_rfc3339(),
+                    rank: Some(r.rank),
+                })
+                .collect())
         } else {
             let rows = qontinui_db::queries::observations::search_observations()
                 .bind(&conn, &query, &max_results)
@@ -229,22 +248,25 @@ impl PgDb {
                 .await
                 .map_err(|e| format!("PG search_observations: {}", e))?;
 
-            Ok(rows.into_iter().map(|r| ObservationSearchResult {
-                id: r.id,
-                title: r.title,
-                content_preview: r.content_preview,
-                observation_type: r.observation_type,
-                scope: r.scope,
-                topic_key: r.topic_key,
-                revision_count: r.revision_count,
-                project_id: r.project_id,
-                valid_from: r.valid_from.to_rfc3339(),
-                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-                superseded_by: r.superseded_by,
-                created_at: r.created_at.to_rfc3339(),
-                updated_at: r.updated_at.to_rfc3339(),
-                rank: Some(r.rank),
-            }).collect())
+            Ok(rows
+                .into_iter()
+                .map(|r| ObservationSearchResult {
+                    id: r.id,
+                    title: r.title,
+                    content_preview: r.content_preview,
+                    observation_type: r.observation_type,
+                    scope: r.scope,
+                    topic_key: r.topic_key,
+                    revision_count: r.revision_count,
+                    project_id: r.project_id,
+                    valid_from: r.valid_from.to_rfc3339(),
+                    valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                    superseded_by: r.superseded_by,
+                    created_at: r.created_at.to_rfc3339(),
+                    updated_at: r.updated_at.to_rfc3339(),
+                    rank: Some(r.rank),
+                })
+                .collect())
         }
     }
 
@@ -255,7 +277,11 @@ impl PgDb {
         observation_type: Option<&str>,
         max_results: i64,
     ) -> Result<Vec<ObservationSearchResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_project_context()
             .bind(&conn, &project_id, &observation_type, &max_results)
@@ -263,22 +289,25 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_project_context: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ObservationSearchResult {
-            id: r.id,
-            title: r.title,
-            content_preview: r.content_preview,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            revision_count: r.revision_count,
-            project_id: r.project_id,
-            valid_from: r.valid_from.to_rfc3339(),
-            valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-            superseded_by: r.superseded_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            rank: None,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ObservationSearchResult {
+                id: r.id,
+                title: r.title,
+                content_preview: r.content_preview,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                revision_count: r.revision_count,
+                project_id: r.project_id,
+                valid_from: r.valid_from.to_rfc3339(),
+                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                superseded_by: r.superseded_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                rank: None,
+            })
+            .collect())
     }
 
     /// Update an observation's title, content, or type.
@@ -286,7 +315,11 @@ impl PgDb {
         &self,
         input: &UpdateObservationInput,
     ) -> Result<Option<i64>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Recompute hash when title or content changes.
         // If only one is provided, fetch the current value for the other.
@@ -332,7 +365,11 @@ impl PgDb {
 
     /// Soft-delete an observation.
     pub async fn delete_observation(&self, id: i64) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let deleted = qontinui_db::queries::observations::soft_delete_observation()
             .bind(&conn, &id)
@@ -348,7 +385,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<ObservationSearchResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_observations_by_task_run()
             .bind(&conn, &task_run_id)
@@ -356,22 +397,25 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_observations_by_task_run: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ObservationSearchResult {
-            id: r.id,
-            title: r.title,
-            content_preview: r.content_preview,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            revision_count: r.revision_count,
-            project_id: r.project_id,
-            valid_from: r.valid_from.to_rfc3339(),
-            valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-            superseded_by: r.superseded_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            rank: None,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ObservationSearchResult {
+                id: r.id,
+                title: r.title,
+                content_preview: r.content_preview,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                revision_count: r.revision_count,
+                project_id: r.project_id,
+                valid_from: r.valid_from.to_rfc3339(),
+                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                superseded_by: r.superseded_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                rank: None,
+            })
+            .collect())
     }
 
     /// Get all observations with full content (for graph loading).
@@ -380,7 +424,11 @@ impl PgDb {
         &self,
         max_results: i64,
     ) -> Result<Vec<Observation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_all_observations_full()
             .bind(&conn, &max_results)
@@ -388,27 +436,30 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_all_observations_full: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| Observation {
-            id: r.id,
-            title: r.title,
-            content: r.content,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            content_hash: r.content_hash,
-            revision_count: r.revision_count,
-            duplicate_count: r.duplicate_count,
-            project_id: r.project_id,
-            workflow_id: r.workflow_id,
-            task_run_id: r.task_run_id,
-            session_id: r.session_id,
-            is_deleted: r.is_deleted,
-            valid_from: r.valid_from.to_rfc3339(),
-            valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-            superseded_by: r.superseded_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| Observation {
+                id: r.id,
+                title: r.title,
+                content: r.content,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                content_hash: r.content_hash,
+                revision_count: r.revision_count,
+                duplicate_count: r.duplicate_count,
+                project_id: r.project_id,
+                workflow_id: r.workflow_id,
+                task_run_id: r.task_run_id,
+                session_id: r.session_id,
+                is_deleted: r.is_deleted,
+                valid_from: r.valid_from.to_rfc3339(),
+                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                superseded_by: r.superseded_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Soft-delete stale observations based on retention policy.
@@ -424,7 +475,11 @@ impl PgDb {
         retention_days: i32,
         max_revision_count: i32,
     ) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let retention_str = retention_days.to_string();
         let ids = qontinui_db::queries::observations::cleanup_stale_observations()
@@ -438,7 +493,11 @@ impl PgDb {
 
     /// Get observation type statistics.
     pub async fn get_observation_stats(&self) -> Result<Vec<ObservationTypeStat>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_observation_stats()
             .bind(&conn)
@@ -446,11 +505,14 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_observation_stats: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ObservationTypeStat {
-            observation_type: r.observation_type,
-            count: r.count,
-            latest_updated: r.latest_updated.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ObservationTypeStat {
+                observation_type: r.observation_type,
+                count: r.count,
+                latest_updated: r.latest_updated.to_rfc3339(),
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -462,7 +524,11 @@ impl PgDb {
         &self,
         max_results: i64,
     ) -> Result<Vec<crate::memory::consolidation::ConsolidationObservation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_observations_for_consolidation()
             .bind(&conn, &max_results)
@@ -470,29 +536,32 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_observations_for_consolidation: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| crate::memory::consolidation::ConsolidationObservation {
-            id: r.id,
-            title: r.title,
-            content: r.content,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            content_hash: r.content_hash,
-            revision_count: r.revision_count,
-            duplicate_count: r.duplicate_count,
-            importance: r.importance,
-            access_count: r.access_count,
-            decay_rate: r.decay_rate,
-            is_mental_model: r.is_mental_model,
-            consolidated_from: r.consolidated_from,
-            project_id: r.project_id,
-            workflow_id: r.workflow_id,
-            task_run_id: r.task_run_id,
-            session_id: r.session_id,
-            last_accessed_at: r.last_accessed_at.map(|t| t.with_timezone(&Utc)),
-            created_at: r.created_at.with_timezone(&Utc),
-            updated_at: r.updated_at.with_timezone(&Utc),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::memory::consolidation::ConsolidationObservation {
+                id: r.id,
+                title: r.title,
+                content: r.content,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                content_hash: r.content_hash,
+                revision_count: r.revision_count,
+                duplicate_count: r.duplicate_count,
+                importance: r.importance,
+                access_count: r.access_count,
+                decay_rate: r.decay_rate,
+                is_mental_model: r.is_mental_model,
+                consolidated_from: r.consolidated_from,
+                project_id: r.project_id,
+                workflow_id: r.workflow_id,
+                task_run_id: r.task_run_id,
+                session_id: r.session_id,
+                last_accessed_at: r.last_accessed_at.map(|t| t.with_timezone(&Utc)),
+                created_at: r.created_at.with_timezone(&Utc),
+                updated_at: r.updated_at.with_timezone(&Utc),
+            })
+            .collect())
     }
 
     /// Get all mental models.
@@ -500,7 +569,11 @@ impl PgDb {
         &self,
         max_results: i64,
     ) -> Result<Vec<crate::memory::consolidation::ConsolidationObservation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_mental_models()
             .bind(&conn, &max_results)
@@ -508,29 +581,32 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_mental_models: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| crate::memory::consolidation::ConsolidationObservation {
-            id: r.id,
-            title: r.title,
-            content: r.content,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            content_hash: r.content_hash,
-            revision_count: r.revision_count,
-            duplicate_count: r.duplicate_count,
-            importance: r.importance,
-            access_count: r.access_count,
-            decay_rate: r.decay_rate,
-            is_mental_model: r.is_mental_model,
-            consolidated_from: r.consolidated_from,
-            project_id: r.project_id,
-            workflow_id: r.workflow_id,
-            task_run_id: r.task_run_id,
-            session_id: r.session_id,
-            last_accessed_at: r.last_accessed_at.map(|t| t.with_timezone(&Utc)),
-            created_at: r.created_at.with_timezone(&Utc),
-            updated_at: r.updated_at.with_timezone(&Utc),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::memory::consolidation::ConsolidationObservation {
+                id: r.id,
+                title: r.title,
+                content: r.content,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                content_hash: r.content_hash,
+                revision_count: r.revision_count,
+                duplicate_count: r.duplicate_count,
+                importance: r.importance,
+                access_count: r.access_count,
+                decay_rate: r.decay_rate,
+                is_mental_model: r.is_mental_model,
+                consolidated_from: r.consolidated_from,
+                project_id: r.project_id,
+                workflow_id: r.workflow_id,
+                task_run_id: r.task_run_id,
+                session_id: r.session_id,
+                last_accessed_at: r.last_accessed_at.map(|t| t.with_timezone(&Utc)),
+                created_at: r.created_at.with_timezone(&Utc),
+                updated_at: r.updated_at.with_timezone(&Utc),
+            })
+            .collect())
     }
 
     /// Update an observation's importance and decay rate.
@@ -540,7 +616,11 @@ impl PgDb {
         importance: f64,
         decay_rate: f64,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::observations::update_observation_importance()
             .bind(&conn, &importance, &decay_rate, &id)
@@ -553,7 +633,11 @@ impl PgDb {
 
     /// Record an access to an observation (updates last_accessed_at and access_count).
     pub async fn record_observation_access(&self, id: i64) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::observations::record_observation_access()
             .bind(&conn, &id)
@@ -574,7 +658,11 @@ impl PgDb {
         importance: f64,
         source_ids: &[i64],
     ) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let hash = content_hash(title, content);
         let decay_rate = crate::memory::importance::compute_decay_rate(importance, true);
@@ -614,8 +702,16 @@ impl PgDb {
     }
 
     /// Reduce an observation's importance by a multiplicative factor.
-    pub async fn reduce_observation_importance(&self, id: i64, factor: f64) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn reduce_observation_importance(
+        &self,
+        id: i64,
+        factor: f64,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::observations::reduce_observation_importance()
             .bind(&conn, &factor, &id)
@@ -628,7 +724,11 @@ impl PgDb {
 
     /// Archive observations that have decayed below the retention threshold.
     pub async fn decay_and_archive_observations(&self, threshold: f64) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let ids = qontinui_db::queries::observations::decay_and_archive_observations()
             .bind(&conn, &threshold)
@@ -641,7 +741,11 @@ impl PgDb {
 
     /// Archive mental models that have decayed below the retention threshold.
     pub async fn decay_and_archive_mental_models(&self, threshold: f64) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let ids = qontinui_db::queries::observations::decay_and_archive_mental_models()
             .bind(&conn, &threshold)
@@ -654,7 +758,11 @@ impl PgDb {
 
     /// Insert a new consolidation log entry. Returns the log ID.
     pub async fn insert_consolidation_log(&self) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = qontinui_db::queries::observations::insert_consolidation_log()
             .bind(&conn)
@@ -672,7 +780,11 @@ impl PgDb {
         stats: &crate::memory::consolidation::ConsolidationStats,
         error: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         qontinui_db::queries::observations::complete_consolidation_log()
             .bind(
@@ -693,8 +805,14 @@ impl PgDb {
     }
 
     /// Get the most recent successful consolidation timestamp.
-    pub async fn get_last_consolidation_time(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_last_consolidation_time(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // MAX() aggregate always returns exactly one row; last_run is NULL when no successful runs exist.
         let row = qontinui_db::queries::observations::get_last_consolidation_time()
@@ -711,7 +829,11 @@ impl PgDb {
         &self,
         max_results: i64,
     ) -> Result<Vec<ConsolidationLogEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_consolidation_log()
             .bind(&conn, &max_results)
@@ -719,23 +841,30 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_consolidation_log: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ConsolidationLogEntry {
-            id: r.id,
-            started_at: r.started_at.to_rfc3339(),
-            completed_at: r.completed_at.map(|t| t.to_rfc3339()),
-            observations_scanned: r.observations_scanned,
-            groups_found: r.groups_found,
-            models_created: r.models_created,
-            observations_merged: r.observations_merged,
-            observations_decayed: r.observations_decayed,
-            observations_archived: r.observations_archived,
-            error: r.error,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ConsolidationLogEntry {
+                id: r.id,
+                started_at: r.started_at.to_rfc3339(),
+                completed_at: r.completed_at.map(|t| t.to_rfc3339()),
+                observations_scanned: r.observations_scanned,
+                groups_found: r.groups_found,
+                models_created: r.models_created,
+                observations_merged: r.observations_merged,
+                observations_decayed: r.observations_decayed,
+                observations_archived: r.observations_archived,
+                error: r.error,
+            })
+            .collect())
     }
 
     /// Get memory health statistics.
     pub async fn get_memory_health_stats(&self) -> Result<MemoryHealthStats, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = qontinui_db::queries::observations::get_memory_health_stats()
             .bind(&conn)
@@ -760,7 +889,11 @@ impl PgDb {
         &self,
         max_results: i64,
     ) -> Result<Vec<DecayPreviewEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_decay_preview()
             .bind(&conn, &max_results)
@@ -768,16 +901,19 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_decay_preview: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| DecayPreviewEntry {
-            id: r.id,
-            title: r.title,
-            observation_type: r.observation_type,
-            importance: r.importance,
-            decay_rate: r.decay_rate,
-            is_mental_model: r.is_mental_model,
-            last_activity: r.last_activity.to_rfc3339(),
-            current_retention: r.current_retention,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| DecayPreviewEntry {
+                id: r.id,
+                title: r.title,
+                observation_type: r.observation_type,
+                importance: r.importance,
+                decay_rate: r.decay_rate,
+                is_mental_model: r.is_mental_model,
+                last_activity: r.last_activity.to_rfc3339(),
+                current_retention: r.current_retention,
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -791,7 +927,11 @@ impl PgDb {
         observation_id: i64,
         new_observation_id: i64,
     ) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let result = qontinui_db::queries::observations::supersede_observation()
             .bind(&conn, &new_observation_id, &observation_id)
@@ -815,7 +955,11 @@ impl PgDb {
         as_of: Option<DateTime<Utc>>,
         max_results: i64,
     ) -> Result<Vec<ObservationSearchResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let from_fixed = from.map(|t| t.fixed_offset());
         let to_fixed = to.map(|t| t.fixed_offset());
@@ -834,27 +978,34 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG search_observations_temporal: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ObservationSearchResult {
-            id: r.id,
-            title: r.title,
-            content_preview: r.content_preview,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            revision_count: r.revision_count,
-            project_id: r.project_id,
-            valid_from: r.valid_from.to_rfc3339(),
-            valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-            superseded_by: r.superseded_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-            rank: Some(r.rank),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ObservationSearchResult {
+                id: r.id,
+                title: r.title,
+                content_preview: r.content_preview,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                revision_count: r.revision_count,
+                project_id: r.project_id,
+                valid_from: r.valid_from.to_rfc3339(),
+                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                superseded_by: r.superseded_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+                rank: Some(r.rank),
+            })
+            .collect())
     }
 
     /// Get weekly observation trend (count per type per week).
     pub async fn observation_trend(&self, weeks: i32) -> Result<Vec<WeeklyTrend>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let weeks_str = weeks.to_string();
         let rows = qontinui_db::queries::observations::observation_weekly_trend()
@@ -863,11 +1014,14 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG observation_weekly_trend: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| WeeklyTrend {
-            observation_type: r.observation_type,
-            week_start: r.week_start.to_rfc3339(),
-            count: r.count,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| WeeklyTrend {
+                observation_type: r.observation_type,
+                week_start: r.week_start.to_rfc3339(),
+                count: r.count,
+            })
+            .collect())
     }
 
     /// Get topics with the most revisions in a time period.
@@ -877,7 +1031,11 @@ impl PgDb {
         to: DateTime<Utc>,
         max_results: i64,
     ) -> Result<Vec<TopicRevisionCount>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let from_fixed = from.fixed_offset();
         let to_fixed = to.fixed_offset();
@@ -888,11 +1046,14 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG most_revised_topics: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| TopicRevisionCount {
-            topic_key: r.topic_key,
-            title: r.title,
-            revisions: r.revisions,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| TopicRevisionCount {
+                topic_key: r.topic_key,
+                title: r.title,
+                revisions: r.revisions,
+            })
+            .collect())
     }
 
     /// Get the full revision history of an observation.
@@ -900,7 +1061,11 @@ impl PgDb {
         &self,
         observation_id: i64,
     ) -> Result<Vec<ObservationHistoryEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = qontinui_db::queries::observations::get_observation_history()
             .bind(&conn, &observation_id)
@@ -908,17 +1073,20 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG get_observation_history: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ObservationHistoryEntry {
-            id: r.id,
-            observation_id: r.observation_id,
-            title: r.title,
-            content_preview: r.content_preview,
-            content_hash: r.content_hash,
-            valid_from: r.valid_from.to_rfc3339(),
-            valid_until: r.valid_until.to_rfc3339(),
-            revision_number: r.revision_number,
-            created_at: r.created_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ObservationHistoryEntry {
+                id: r.id,
+                observation_id: r.observation_id,
+                title: r.title,
+                content_preview: r.content_preview,
+                content_hash: r.content_hash,
+                valid_from: r.valid_from.to_rfc3339(),
+                valid_until: r.valid_until.to_rfc3339(),
+                revision_number: r.revision_number,
+                created_at: r.created_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Get a point-in-time snapshot of all observations as they were at `as_of`.
@@ -927,7 +1095,11 @@ impl PgDb {
         as_of: DateTime<Utc>,
         max_results: i64,
     ) -> Result<Vec<Observation>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let as_of_fixed = as_of.fixed_offset();
 
@@ -937,27 +1109,30 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG snapshot_observations_at: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| Observation {
-            id: r.id,
-            title: r.title,
-            content: r.content,
-            observation_type: r.observation_type,
-            scope: r.scope,
-            topic_key: r.topic_key,
-            content_hash: r.content_hash,
-            revision_count: r.revision_count,
-            duplicate_count: r.duplicate_count,
-            project_id: r.project_id,
-            workflow_id: r.workflow_id,
-            task_run_id: r.task_run_id,
-            session_id: r.session_id,
-            is_deleted: r.is_deleted,
-            valid_from: r.valid_from.to_rfc3339(),
-            valid_until: r.valid_until.map(|t| t.to_rfc3339()),
-            superseded_by: r.superseded_by,
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| Observation {
+                id: r.id,
+                title: r.title,
+                content: r.content,
+                observation_type: r.observation_type,
+                scope: r.scope,
+                topic_key: r.topic_key,
+                content_hash: r.content_hash,
+                revision_count: r.revision_count,
+                duplicate_count: r.duplicate_count,
+                project_id: r.project_id,
+                workflow_id: r.workflow_id,
+                task_run_id: r.task_run_id,
+                session_id: r.session_id,
+                is_deleted: r.is_deleted,
+                valid_from: r.valid_from.to_rfc3339(),
+                valid_until: r.valid_until.map(|t| t.to_rfc3339()),
+                superseded_by: r.superseded_by,
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 }
 
@@ -971,10 +1146,7 @@ mod tests {
             strip_private_tags("before <private>secret</private> after"),
             "before [REDACTED] after"
         );
-        assert_eq!(
-            strip_private_tags("no tags here"),
-            "no tags here"
-        );
+        assert_eq!(strip_private_tags("no tags here"), "no tags here");
         assert_eq!(
             strip_private_tags("<private>a</private> mid <private>b</private>"),
             "[REDACTED] mid [REDACTED]"
@@ -1015,7 +1187,12 @@ mod tests {
         let old = now - chrono::Duration::days(30);
         let score_new = temporal_score(&now, None, None);
         let score_old = temporal_score(&old, None, None);
-        assert!(score_new > score_old, "Newer should score higher: {} vs {}", score_new, score_old);
+        assert!(
+            score_new > score_old,
+            "Newer should score higher: {} vs {}",
+            score_new,
+            score_old
+        );
     }
 
     #[test]
@@ -1024,7 +1201,10 @@ mod tests {
         let valid_until = now - chrono::Duration::days(1);
         let score_current = temporal_score(&now, None, None);
         let score_expired = temporal_score(&now, Some(&valid_until), None);
-        assert!(score_current > score_expired, "Current should score higher than expired");
+        assert!(
+            score_current > score_expired,
+            "Current should score higher than expired"
+        );
     }
 
     #[test]
@@ -1032,6 +1212,9 @@ mod tests {
         let now = Utc::now();
         let score_active = temporal_score(&now, None, None);
         let score_superseded = temporal_score(&now, None, Some(42));
-        assert!(score_active > score_superseded, "Active should score higher than superseded");
+        assert!(
+            score_active > score_superseded,
+            "Active should score higher than superseded"
+        );
     }
 }

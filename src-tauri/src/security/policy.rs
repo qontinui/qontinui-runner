@@ -45,8 +45,7 @@ pub struct SecurityPolicy {
 ///
 /// Paths use glob patterns and are evaluated in order:
 /// denied > read_only > read_write.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FilesystemPolicy {
     /// Glob patterns for paths with read-write access.
     #[serde(default)]
@@ -62,7 +61,6 @@ pub struct FilesystemPolicy {
     #[serde(default)]
     pub read_only_root: bool,
 }
-
 
 // ============================================================================
 // Network Policy (L4)
@@ -108,7 +106,6 @@ pub enum NetworkMode {
     #[default]
     Unrestricted,
 }
-
 
 impl Default for NetworkPolicy {
     fn default() -> Self {
@@ -226,7 +223,6 @@ pub enum CredentialMode {
     /// No credentials are provided. Steps that need credentials will fail.
     Denied,
 }
-
 
 impl Default for CredentialPolicy {
     fn default() -> Self {

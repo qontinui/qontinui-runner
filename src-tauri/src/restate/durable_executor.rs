@@ -78,10 +78,7 @@ pub async fn execute_steps_batch(
     };
 
     if steps.is_empty() {
-        debug!(
-            "No {} steps to execute for {}",
-            phase_name, execution_id
-        );
+        debug!("No {} steps to execute for {}", phase_name, execution_id);
         return PhaseResult {
             success: true,
             all_passed: true,
@@ -94,8 +91,7 @@ pub async fn execute_steps_batch(
     }
 
     // Create a step executor
-    let mut executor =
-        StepExecutor::new(app_state.clone(), config_storage.clone());
+    let mut executor = StepExecutor::new(app_state.clone(), config_storage.clone());
     executor.set_task_run_id(execution_id.to_string());
 
     info!(
@@ -168,10 +164,7 @@ pub async fn execute_steps_batch(
         // For verification phases, continue even if a step fails
         // For other phases, stop on first failure
         if !success && phase_name != "verification" {
-            warn!(
-                "Stopping {} phase at step {} due to failure",
-                phase_name, i
-            );
+            warn!("Stopping {} phase at step {} due to failure", phase_name, i);
             break;
         }
     }
@@ -255,10 +248,7 @@ async fn execute_workflow_monolithic(
     );
 
     // Update task run status
-    if let Err(e) = pg_db
-        .update_task_run_status(execution_id, "running")
-        .await
-    {
+    if let Err(e) = pg_db.update_task_run_status(execution_id, "running").await {
         warn!("Failed to update task run status: {}", e);
     }
 
@@ -280,10 +270,7 @@ async fn execute_workflow_monolithic(
     .await;
 
     if !setup_result.success {
-        error!(
-            "Setup phase failed: {:?}",
-            setup_result.failure_context
-        );
+        error!("Setup phase failed: {:?}", setup_result.failure_context);
         return WorkflowOutput {
             success: false,
             verification_passed: false,
@@ -406,10 +393,7 @@ async fn execute_workflow_monolithic(
     // PHASE 4: COMPLETION
     // =========================================================================
     if verification_passed {
-        info!(
-            "Phase 4/4: Completion — execution_id={}",
-            execution_id
-        );
+        info!("Phase 4/4: Completion — execution_id={}", execution_id);
 
         // Completion automation steps
         let c_result = execute_steps_batch(
@@ -504,7 +488,10 @@ async fn is_stop_requested(app_state: &AppState, execution_id: &str) -> bool {
             false
         }
         Err(e) => {
-            warn!("is_stop_requested: failed to query task run {}: {}", execution_id, e);
+            warn!(
+                "is_stop_requested: failed to query task run {}: {}",
+                execution_id, e
+            );
             false
         }
     }
@@ -545,13 +532,11 @@ pub async fn get_modified_files() -> Vec<String> {
         .await;
 
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
         _ => vec![],
     }
 }
@@ -580,7 +565,9 @@ pub fn git_reset_compensation(
         recorded_at: chrono::Utc::now().to_rfc3339(),
         description: format!(
             "Reset {} to commit {} after {} phase failure",
-            repo_path, &commit_hash[..8.min(commit_hash.len())], phase
+            repo_path,
+            &commit_hash[..8.min(commit_hash.len())],
+            phase
         ),
     }
 }

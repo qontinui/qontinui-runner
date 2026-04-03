@@ -19,8 +19,18 @@ impl PgDb {
         duration_ms: Option<u64>,
     ) -> Result<(), String> {
         self.create_phase_token_usage_with_target(
-            task_run_id, phase, stage_index, iteration, model_used, provider_used,
-            input_tokens, output_tokens, cost_cents, duration_ms, None, None,
+            task_run_id,
+            phase,
+            stage_index,
+            iteration,
+            model_used,
+            provider_used,
+            input_tokens,
+            output_tokens,
+            cost_cents,
+            duration_ms,
+            None,
+            None,
         )
         .await
     }
@@ -41,7 +51,11 @@ impl PgDb {
         target_app: Option<&str>,
         target_page_url: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let stage_index_i = stage_index.map(|v| v as i32);
         let iteration_i = iteration.map(|v| v as i32);
         let model_owned = model_used.map(|s| s.to_string());
@@ -121,7 +135,11 @@ impl PgDb {
                 .await;
         }
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             r#"INSERT INTO phase_token_usage
                 (task_run_id, phase, stage_index, iteration, model_used, provider_used,
@@ -156,7 +174,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<PhaseTokenUsageRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::token_usage::get_phase_token_usage()
             .bind(&conn, &task_run_id)
             .all()
@@ -188,7 +210,11 @@ impl PgDb {
         task_run_id: &str,
         iteration: u32,
     ) -> Result<(u64, u64), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iteration_i = iteration as i32;
         let row = qontinui_db::queries::token_usage::get_iteration_token_totals()
             .bind(&conn, &task_run_id, &iteration_i)
@@ -201,7 +227,11 @@ impl PgDb {
 
     /// Update the aggregate token totals on a task run.
     pub async fn update_task_run_token_totals(&self, task_run_id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::token_usage::update_task_run_token_totals()
             .bind(&conn, &task_run_id)
             .await

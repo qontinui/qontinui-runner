@@ -101,10 +101,7 @@ impl ErrorEventStorage {
     }
 
     /// Link an error event to a finding
-    pub fn link_to_finding(
-        error_id: i64,
-        finding_id: i64,
-    ) -> Result<(), String> {
+    pub fn link_to_finding(error_id: i64, finding_id: i64) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
@@ -142,9 +139,7 @@ impl ErrorEventStorage {
     }
 
     /// Get error summary statistics
-    pub fn get_summary(
-        task_run_id: Option<&str>,
-    ) -> Result<ErrorSummary, String> {
+    pub fn get_summary(task_run_id: Option<&str>) -> Result<ErrorSummary, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -157,10 +152,7 @@ impl ErrorEventStorage {
     }
 
     /// Search errors by message content (FTS)
-    pub fn search(
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<StoredErrorEvent>, String> {
+    pub fn search(query: &str, limit: usize) -> Result<Vec<StoredErrorEvent>, String> {
         Err("SQLite removed".to_string())
     }
 

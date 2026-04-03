@@ -211,7 +211,11 @@ pub fn build_validation_retry_prompt<T: JsonSchema>(
     retry_prompt.push_str(&format!(
         "\n\n## Schema Validation Errors ({} error{})\n\n",
         validation_errors.len(),
-        if validation_errors.len() == 1 { "" } else { "s" }
+        if validation_errors.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
     ));
     retry_prompt.push_str(&format!(
         "Your previous JSON output did not match the required schema \"{}\".\n\n",
@@ -255,14 +259,13 @@ pub fn process_ai_response_for_structured_output<T: JsonSchema + DeserializeOwne
         });
     }
 
-    let json_str = extract_json_from_output(&response.output).ok_or_else(|| {
-        StructuredOutputError {
+    let json_str =
+        extract_json_from_output(&response.output).ok_or_else(|| StructuredOutputError {
             message: "No JSON block found in AI response".to_string(),
             attempts: 1,
             last_validation_errors: Vec::new(),
             last_raw_output: Some(response.output.clone()),
-        }
-    })?;
+        })?;
 
     validate_and_parse::<T>(&json_str, config).map_err(|errors| StructuredOutputError {
         message: format!("Schema validation failed with {} errors", errors.len()),
@@ -395,9 +398,8 @@ mod tests {
     #[test]
     fn test_process_ai_response_success() {
         let config = StructuredOutputConfig::default();
-        let response = AiResponse::success(
-            "```json\n{\"name\": \"test\", \"count\": 5}\n```".to_string(),
-        );
+        let response =
+            AiResponse::success("```json\n{\"name\": \"test\", \"count\": 5}\n```".to_string());
         let result = process_ai_response_for_structured_output::<TestSchema>(&response, &config);
         assert!(result.is_ok());
         let (value, _, _) = result.unwrap();

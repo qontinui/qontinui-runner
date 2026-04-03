@@ -62,7 +62,10 @@ impl Domain {
             Domain::Database
         } else if lower.contains("testing") {
             Domain::Testing
-        } else if lower.contains("infra") || lower.contains("orchestration") || lower.contains("meta-optimizer") {
+        } else if lower.contains("infra")
+            || lower.contains("orchestration")
+            || lower.contains("meta-optimizer")
+        {
             Domain::Infra
         } else if lower.contains("backend") || lower.contains("api") {
             Domain::Backend
@@ -340,7 +343,9 @@ impl QRouter {
 
     /// Get the override for a state, if any.
     pub fn get_override(&self, state: &TaskState) -> Option<WorkflowArchitecture> {
-        self.overrides.get(&state.to_key()).and_then(|s| parse_architecture(s))
+        self.overrides
+            .get(&state.to_key())
+            .and_then(|s| parse_architecture(s))
     }
 
     /// Get all overrides as serializable entries.
@@ -464,8 +469,7 @@ impl QRouter {
         .map(|a| self.get_q(task_state, a).visit_count)
         .sum();
 
-        let epsilon =
-            DEFAULT_EPSILON_BASE * (-(total_visits as f64) / EPSILON_DECAY_RATE).exp();
+        let epsilon = DEFAULT_EPSILON_BASE * (-(total_visits as f64) / EPSILON_DECAY_RATE).exp();
         epsilon.max(DEFAULT_EPSILON_MIN)
     }
 
@@ -680,11 +684,8 @@ mod tests {
 
     #[test]
     fn test_task_state_from_outcome_tags_backend() {
-        let state = TaskState::from_outcome_tags(
-            r#"["rust","sql"]"#,
-            r#"["backend","api"]"#,
-            "complex",
-        );
+        let state =
+            TaskState::from_outcome_tags(r#"["rust","sql"]"#, r#"["backend","api"]"#, "complex");
         assert_eq!(state.primary_domain, Domain::Backend);
         assert_eq!(state.complexity, ComplexityTier::Complex);
         assert!(!state.has_ui_component);
@@ -744,7 +745,11 @@ mod tests {
 
         let q = router.get_q(&state, &arch);
         // With recency bias from α=0.1, recent 0.0 rewards pull it down
-        assert!(q.q_value < 0.5, "Q-value {} should be pulled below 0.5", q.q_value);
+        assert!(
+            q.q_value < 0.5,
+            "Q-value {} should be pulled below 0.5",
+            q.q_value
+        );
     }
 
     #[test]
@@ -870,7 +875,10 @@ mod tests {
 
     #[test]
     fn test_domain_inference() {
-        assert_eq!(Domain::from_domain_tags("frontend,testing"), Domain::Frontend);
+        assert_eq!(
+            Domain::from_domain_tags("frontend,testing"),
+            Domain::Frontend
+        );
         assert_eq!(Domain::from_domain_tags("database"), Domain::Database);
         assert_eq!(Domain::from_domain_tags("api,backend"), Domain::Backend);
         assert_eq!(Domain::from_domain_tags("orchestration"), Domain::Infra);
@@ -882,8 +890,18 @@ mod tests {
     fn test_load_from_rows() {
         let mut router = QRouter::new();
         router.load_from_rows(vec![
-            ("backend:moderate:no_ui".into(), "traditional".into(), 0.7, 10),
-            ("backend:moderate:no_ui".into(), "agentic_verification".into(), 0.85, 15),
+            (
+                "backend:moderate:no_ui".into(),
+                "traditional".into(),
+                0.7,
+                10,
+            ),
+            (
+                "backend:moderate:no_ui".into(),
+                "agentic_verification".into(),
+                0.85,
+                15,
+            ),
         ]);
 
         let state = make_state(Domain::Backend, ComplexityTier::Moderate, false);
@@ -947,9 +965,10 @@ mod tests {
     #[test]
     fn test_load_overrides() {
         let mut router = QRouter::new();
-        router.load_overrides(vec![
-            ("frontend:moderate:ui".into(), "multi_agent_pipeline".into()),
-        ]);
+        router.load_overrides(vec![(
+            "frontend:moderate:ui".into(),
+            "multi_agent_pipeline".into(),
+        )]);
 
         let state = make_state(Domain::Frontend, ComplexityTier::Moderate, true);
         let forced = router.get_override(&state);
@@ -979,12 +998,26 @@ mod tests {
 
         // All entries should have valid state keys and actions
         for row in &snapshot {
-            assert!(TaskState::from_key(&row.state_key).is_some(), "Invalid state_key: {}", row.state_key);
             assert!(
-                ["traditional", "agentic_verification", "multi_agent_pipeline"].contains(&row.action.as_str()),
-                "Invalid action: {}", row.action
+                TaskState::from_key(&row.state_key).is_some(),
+                "Invalid state_key: {}",
+                row.state_key
             );
-            assert!(row.q_value >= 0.0 && row.q_value <= 1.0, "Q-value out of range: {}", row.q_value);
+            assert!(
+                [
+                    "traditional",
+                    "agentic_verification",
+                    "multi_agent_pipeline"
+                ]
+                .contains(&row.action.as_str()),
+                "Invalid action: {}",
+                row.action
+            );
+            assert!(
+                row.q_value >= 0.0 && row.q_value <= 1.0,
+                "Q-value out of range: {}",
+                row.q_value
+            );
             assert!(row.visit_count >= 1);
         }
     }
@@ -1041,9 +1074,21 @@ mod tests {
 
         // Simulate realistic outcomes: AgenticVerification consistently best
         for _ in 0..30 {
-            router.update(&state, &WorkflowArchitecture::Traditional, 0.4 + rand_offset());
-            router.update(&state, &WorkflowArchitecture::AgenticVerification, 0.8 + rand_offset());
-            router.update(&state, &WorkflowArchitecture::MultiAgentPipeline, 0.6 + rand_offset());
+            router.update(
+                &state,
+                &WorkflowArchitecture::Traditional,
+                0.4 + rand_offset(),
+            );
+            router.update(
+                &state,
+                &WorkflowArchitecture::AgenticVerification,
+                0.8 + rand_offset(),
+            );
+            router.update(
+                &state,
+                &WorkflowArchitecture::MultiAgentPipeline,
+                0.6 + rand_offset(),
+            );
         }
 
         // After 30 rounds, the policy should converge to AgenticVerification
@@ -1051,11 +1096,22 @@ mod tests {
         assert_eq!(best, WorkflowArchitecture::AgenticVerification);
 
         // Q-values should be in expected order
-        let q_trad = router.get_q(&state, &WorkflowArchitecture::Traditional).q_value;
-        let q_av = router.get_q(&state, &WorkflowArchitecture::AgenticVerification).q_value;
-        let q_map = router.get_q(&state, &WorkflowArchitecture::MultiAgentPipeline).q_value;
+        let q_trad = router
+            .get_q(&state, &WorkflowArchitecture::Traditional)
+            .q_value;
+        let q_av = router
+            .get_q(&state, &WorkflowArchitecture::AgenticVerification)
+            .q_value;
+        let q_map = router
+            .get_q(&state, &WorkflowArchitecture::MultiAgentPipeline)
+            .q_value;
         assert!(q_av > q_map, "AV ({}) should > MAP ({})", q_av, q_map);
-        assert!(q_map > q_trad, "MAP ({}) should > Traditional ({})", q_map, q_trad);
+        assert!(
+            q_map > q_trad,
+            "MAP ({}) should > Traditional ({})",
+            q_map,
+            q_trad
+        );
 
         // Epsilon should be near minimum after 90 total visits
         let eps = router.effective_epsilon(&state);

@@ -80,40 +80,36 @@ fn try_parse_json_summary(raw_output: &str) -> Option<AgenticPhaseOutput> {
                 // Must have a "status" field to be recognized as agentic output
                 if value.get("status").is_some() {
                     // Apply schema validation with coercion
-                    let deserialize_value =
-                        match SchemaValidator::for_type::<AgenticPhaseOutput>() {
-                            Ok(validator) => {
-                                let result = validator.validate(&value);
-                                if result.valid {
-                                    value
-                                } else {
-                                    // Try coercion
-                                    let schema = crate::schema_registry::schema_as_json::<
-                                        AgenticPhaseOutput,
-                                    >();
-                                    let (coerced, records) = apply_coercions(
-                                        &value,
-                                        &schema,
-                                        CoercionPolicy::Lenient,
+                    let deserialize_value = match SchemaValidator::for_type::<AgenticPhaseOutput>()
+                    {
+                        Ok(validator) => {
+                            let result = validator.validate(&value);
+                            if result.valid {
+                                value
+                            } else {
+                                // Try coercion
+                                let schema =
+                                    crate::schema_registry::schema_as_json::<AgenticPhaseOutput>();
+                                let (coerced, records) =
+                                    apply_coercions(&value, &schema, CoercionPolicy::Lenient);
+                                if !records.is_empty() {
+                                    debug!(
+                                        "Applied {} coercions to AgenticPhaseOutput",
+                                        records.len()
                                     );
-                                    if !records.is_empty() {
-                                        debug!(
-                                            "Applied {} coercions to AgenticPhaseOutput",
-                                            records.len()
-                                        );
-                                    }
-                                    let coerced_result = validator.validate(&coerced);
-                                    if !coerced_result.valid {
-                                        warn!(
+                                }
+                                let coerced_result = validator.validate(&coerced);
+                                if !coerced_result.valid {
+                                    warn!(
                                             "AgenticPhaseOutput schema validation failed with {} errors (proceeding with best-effort deserialization)",
                                             coerced_result.errors.len()
                                         );
-                                    }
-                                    coerced
                                 }
+                                coerced
                             }
-                            Err(_) => value, // Schema compilation failed — use raw value
-                        };
+                        }
+                        Err(_) => value, // Schema compilation failed — use raw value
+                    };
 
                     match serde_json::from_value::<AgenticPhaseOutput>(deserialize_value) {
                         Ok(mut parsed) => {

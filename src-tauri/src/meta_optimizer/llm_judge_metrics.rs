@@ -190,8 +190,7 @@ fn parse_single_metric_response(
             let truncated: String = response.chars().take(200).collect();
             warn!(
                 "Failed to parse LLM judge response: {}. Raw: {}",
-                e,
-                truncated
+                e, truncated
             );
             JudgeResult {
                 score: 0.5,
@@ -279,10 +278,7 @@ pub fn evaluate_factuality(input: &JudgeInput, min_factuality: f64) -> JudgeResu
     let prompt = build_factuality_prompt(input);
     let context = TaskContext::from_prompt(&prompt);
 
-    info!(
-        "Running factuality check ({} chars prompt)",
-        prompt.len()
-    );
+    info!("Running factuality check ({} chars prompt)", prompt.len());
 
     let response = run_prompt_with_routing(&prompt, &context, None);
 
@@ -306,10 +302,7 @@ pub fn evaluate_factuality(input: &JudgeInput, min_factuality: f64) -> JudgeResu
 /// is 1.0 (no unsafe content detected in any blocked category).
 ///
 /// This is a blocking call that makes one LLM API request.
-pub fn evaluate_content_safety(
-    input: &JudgeInput,
-    blocked_categories: &[String],
-) -> JudgeResult {
+pub fn evaluate_content_safety(input: &JudgeInput, blocked_categories: &[String]) -> JudgeResult {
     let prompt = build_content_safety_prompt(input, blocked_categories);
     let context = TaskContext::from_prompt(&prompt);
 

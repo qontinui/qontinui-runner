@@ -91,7 +91,12 @@ pub async fn create_test(
 ) -> Result<Json<ApiResponse<crate::database::VerificationTest>>, (StatusCode, Json<ApiResponse<()>>)>
 {
     // checkpoint_db removed — create not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Verification tests: SQLite removed, not yet migrated to PG".to_string()))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Verification tests: SQLite removed, not yet migrated to PG".to_string(),
+        )),
+    ))
 }
 
 /// Update a verification test
@@ -102,7 +107,12 @@ pub async fn update_test(
 ) -> Result<Json<ApiResponse<crate::database::VerificationTest>>, (StatusCode, Json<ApiResponse<()>>)>
 {
     // checkpoint_db removed — update not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Verification tests: SQLite removed, not yet migrated to PG".to_string()))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Verification tests: SQLite removed, not yet migrated to PG".to_string(),
+        )),
+    ))
 }
 
 /// Delete a verification test
@@ -111,7 +121,12 @@ pub async fn delete_test(
     Path(_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — delete not yet migrated to PG
-    Err((StatusCode::NOT_IMPLEMENTED, Json(api_error("Verification tests: SQLite removed, not yet migrated to PG".to_string()))))
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(api_error(
+            "Verification tests: SQLite removed, not yet migrated to PG".to_string(),
+        )),
+    ))
 }
 
 /// Execute a verification test by ID
@@ -186,7 +201,12 @@ pub async fn get_test_result(
     Path(_id): Path<String>,
 ) -> Result<Json<ApiResponse<crate::database::TestResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     // checkpoint_db removed — test results not yet migrated to PG
-    Err((StatusCode::NOT_FOUND, Json(api_error("Test result not found (SQLite removed)".to_string()))))
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(api_error(
+            "Test result not found (SQLite removed)".to_string(),
+        )),
+    ))
 }
 
 /// Get test history summary (aggregated stats)

@@ -314,7 +314,10 @@ mod tests {
 
         // Capture final state and check for result
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _final_snap = mgr.capture(None, false).await.expect("Final capture failed");
+        let _final_snap = mgr
+            .capture(None, false)
+            .await
+            .expect("Final capture failed");
         let context = mgr.to_ai_context(30, false).await;
         println!("\n=== Final State ===\n{}", context);
 

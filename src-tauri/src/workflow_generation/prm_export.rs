@@ -268,15 +268,35 @@ fn parse_steps_from_workflow(json: &Option<String>) -> Option<Vec<StepDefinition
         steps.push(StepDefinition {
             step_type,
             name,
-            command: step_val.get("command").and_then(|v| v.as_str()).map(String::from),
-            prompt: step_val.get("prompt").and_then(|v| v.as_str()).map(String::from),
-            check_type: step_val.get("check_type").and_then(|v| v.as_str()).map(String::from),
-            expected: step_val.get("expected").and_then(|v| v.as_str()).map(String::from),
+            command: step_val
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            prompt: step_val
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            check_type: step_val
+                .get("check_type")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            expected: step_val
+                .get("expected")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             parameters: {
                 // Filter out keys already captured in dedicated fields
                 let mut extra = step_val.clone();
                 if let Some(obj) = extra.as_object_mut() {
-                    for key in &["step_type", "type", "name", "command", "prompt", "check_type", "expected"] {
+                    for key in &[
+                        "step_type",
+                        "type",
+                        "name",
+                        "command",
+                        "prompt",
+                        "check_type",
+                        "expected",
+                    ] {
                         obj.remove(*key);
                     }
                 }

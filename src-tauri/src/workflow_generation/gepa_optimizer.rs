@@ -243,7 +243,9 @@ impl GepaIntegration {
         self.last_optimization = Some(std::time::Instant::now());
 
         match opt_response.result {
-            Some(result) if result.improvement >= GEPAConfig::default().min_improvement_threshold => {
+            Some(result)
+                if result.improvement >= GEPAConfig::default().min_improvement_threshold =>
+            {
                 info!(
                     domain = %domain,
                     old_score = result.old_score,

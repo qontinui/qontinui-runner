@@ -10,8 +10,8 @@
 //! The "AI" prefix was removed since task runs can now be pure automation or mixed.
 
 use crate::auth::AuthManager;
-use crate::database::TaskRun;
 use crate::database::pg::PgDb;
+use crate::database::TaskRun;
 use crate::findings::types::{Finding, FindingStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -397,20 +397,14 @@ pub fn json_to_deferred_question_sync(q: &serde_json::Value) -> DeferredQuestion
         id: q["id"].as_str().unwrap_or("").to_string(),
         iteration: q["iteration"].as_i64().unwrap_or(0) as i32,
         question: q["question"].as_str().unwrap_or("").to_string(),
-        context_json: q["context_json"]
-            .as_str()
-            .unwrap_or("{}")
-            .to_string(),
+        context_json: q["context_json"].as_str().unwrap_or("{}").to_string(),
         auto_decision_type: q["auto_decision_type"]
             .as_str()
             .unwrap_or("proceeded")
             .to_string(),
         auto_decision_detail: q["auto_decision_detail"].as_str().map(String::from),
         confidence: q["confidence"].as_f64().unwrap_or(0.0),
-        risk_level: q["risk_level"]
-            .as_str()
-            .unwrap_or("low")
-            .to_string(),
+        risk_level: q["risk_level"].as_str().unwrap_or("low").to_string(),
         status: q["status"].as_str().unwrap_or("pending").to_string(),
         git_checkpoint: q["git_checkpoint"].as_str().map(String::from),
         contingent_iterations: q["contingent_iterations"]
@@ -754,10 +748,7 @@ impl AITaskSyncService {
                 "Sync deferred questions failed with status {}: {}",
                 status, error_text
             );
-            return Err(format!(
-                "Failed to sync deferred questions: {}",
-                error_text
-            ));
+            return Err(format!("Failed to sync deferred questions: {}", error_text));
         }
 
         info!(
@@ -903,7 +894,8 @@ impl AITaskSyncService {
 
         // Get task from local database
         let task = db
-            .get_task_run(task_id).await?
+            .get_task_run(task_id)
+            .await?
             .ok_or_else(|| format!("Task {} not found in local database", task_id))?;
 
         // 1. Create or update task in backend
@@ -921,11 +913,10 @@ impl AITaskSyncService {
             .await
             .unwrap_or_default();
         if !dq_rows.is_empty() {
-            let sync_questions: Vec<DeferredQuestionSyncRequest> = dq_rows
-                .iter()
-                .map(json_to_deferred_question_sync)
-                .collect();
-            self.sync_deferred_questions(task_id, sync_questions).await?;
+            let sync_questions: Vec<DeferredQuestionSyncRequest> =
+                dq_rows.iter().map(json_to_deferred_question_sync).collect();
+            self.sync_deferred_questions(task_id, sync_questions)
+                .await?;
         }
 
         // 4. Verification results sync removed — was checkpoint_db-only
@@ -959,8 +950,11 @@ pub async fn sync_ai_task_created(
     project_id: Option<String>,
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<AITaskResponse, String> {
-    let task = app_state.pg_db.get_task_run(&task_id).await?
-    .ok_or_else(|| format!("Task {} not found", task_id))?;
+    let task = app_state
+        .pg_db
+        .get_task_run(&task_id)
+        .await?
+        .ok_or_else(|| format!("Task {} not found", task_id))?;
 
     let service = AITaskSyncService::new();
     service
@@ -1045,8 +1039,11 @@ pub async fn sync_ai_task_completed(
     task_id: String,
     app_state: tauri::State<'_, Arc<crate::commands::AppState>>,
 ) -> Result<AITaskResponse, String> {
-    let task = app_state.pg_db.get_task_run(&task_id).await?
-    .ok_or_else(|| format!("Task {} not found", task_id))?;
+    let task = app_state
+        .pg_db
+        .get_task_run(&task_id)
+        .await?
+        .ok_or_else(|| format!("Task {} not found", task_id))?;
 
     let service = AITaskSyncService::new();
     service.sync_task_completed(&task).await

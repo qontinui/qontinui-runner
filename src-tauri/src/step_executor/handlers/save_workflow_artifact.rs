@@ -158,7 +158,8 @@ impl SaveWorkflowArtifactHandler {
                 let id = task_run_id.to_string();
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     h.block_on(async move { pg.get_task_run(&id).await })
-                })).ok()
+                }))
+                .ok()
             })
             .and_then(|r| r.ok())
             .flatten()
@@ -179,21 +180,23 @@ impl SaveWorkflowArtifactHandler {
         };
 
         // Load the meta-workflow definition by name
-        let workflow: crate::unified_workflows::UnifiedWorkflow = match tokio::runtime::Handle::try_current()
-            .ok()
-            .and_then(|h| {
-                let pg = context.app_state.pg_db.clone();
-                let name = workflow_name.clone();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    h.block_on(async move { pg.get_unified_workflow_by_name(&name).await })
-                })).ok()
-            })
-            .and_then(|r| r.ok())
-            .flatten()
-        {
-            Some(wf) => wf,
-            None => return,
-        };
+        let workflow: crate::unified_workflows::UnifiedWorkflow =
+            match tokio::runtime::Handle::try_current()
+                .ok()
+                .and_then(|h| {
+                    let pg = context.app_state.pg_db.clone();
+                    let name = workflow_name.clone();
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        h.block_on(async move { pg.get_unified_workflow_by_name(&name).await })
+                    }))
+                    .ok()
+                })
+                .and_then(|r| r.ok())
+                .flatten()
+            {
+                Some(wf) => wf,
+                None => return,
+            };
 
         // Extract prompts from setup steps by name
         for step in &workflow.setup_steps {

@@ -186,8 +186,7 @@ pub async fn close_session(
     if let Some(mut entry) = sessions.remove(&request.session_id) {
         info!(
             "Closing headless browser: session={}, pid={}",
-            request.session_id,
-            entry.session.pid
+            request.session_id, entry.session.pid
         );
         // Kill the child process
         let _ = entry.child.kill().await;

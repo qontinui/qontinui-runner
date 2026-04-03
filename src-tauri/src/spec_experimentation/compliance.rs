@@ -409,8 +409,7 @@ pub async fn detect_broken_assertions(
         return Ok(Vec::new());
     }
 
-    let newest_details: Vec<AssertionDetail> =
-        serde_json::from_str(&runs[0].0).unwrap_or_default();
+    let newest_details: Vec<AssertionDetail> = serde_json::from_str(&runs[0].0).unwrap_or_default();
     let previous_details: Vec<AssertionDetail> =
         serde_json::from_str(&runs[1].0).unwrap_or_default();
 

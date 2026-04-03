@@ -64,7 +64,9 @@ async fn export_handler(
     let min_runs = query.min_runs;
     let format = query.format.clone();
 
-    let (examples, stats_val) = state.app_state.pg_db
+    let (examples, stats_val) = state
+        .app_state
+        .pg_db
         .export_prm_training_data(min_runs as i64)
         .await
         .map_err(|e| {
@@ -97,7 +99,8 @@ async fn export_handler(
         }
     } else {
         // Convert JSON values to JSONL format
-        let jsonl: String = examples.iter()
+        let jsonl: String = examples
+            .iter()
             .filter_map(|v| serde_json::to_string(v).ok())
             .collect::<Vec<_>>()
             .join("\n");
@@ -114,7 +117,9 @@ async fn export_handler(
 async fn export_stats_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<prm_export::PrmExportStats>, (StatusCode, Json<serde_json::Value>)> {
-    let stats_val = state.app_state.pg_db
+    let stats_val = state
+        .app_state
+        .pg_db
         .export_prm_stats()
         .await
         .map_err(|e| {
@@ -124,8 +129,12 @@ async fn export_stats_handler(
             )
         })?;
 
-    let stats: prm_export::PrmExportStats = serde_json::from_value(stats_val)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Deserialization: {e}")}))))?;
+    let stats: prm_export::PrmExportStats = serde_json::from_value(stats_val).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Deserialization: {e}")})),
+        )
+    })?;
 
     Ok(Json(stats))
 }

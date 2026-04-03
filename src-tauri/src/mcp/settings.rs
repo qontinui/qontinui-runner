@@ -824,7 +824,9 @@ async fn export_all_data(
     // checkpoint_db removed — export not yet migrated to PG
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Data export: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Data export: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -836,7 +838,9 @@ async fn import_all_data(
     // checkpoint_db removed — import not yet migrated to PG
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Data import: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Data import: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 

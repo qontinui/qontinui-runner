@@ -295,10 +295,7 @@ impl ErrorFixWorkflowGenerator {
     }
 
     /// Generate a quick-fix workflow for a single error.
-    pub fn generate_for_single_error(
-        &self,
-        error_id: i64,
-    ) -> Result<GeneratedWorkflow, String> {
+    pub fn generate_for_single_error(&self, error_id: i64) -> Result<GeneratedWorkflow, String> {
         Err("SQLite removed".to_string())
     }
 }

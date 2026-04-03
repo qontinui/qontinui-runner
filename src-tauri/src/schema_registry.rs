@@ -28,8 +28,7 @@ use once_cell::sync::Lazy;
 // ============================================================================
 
 /// Global schema cache keyed by type name.
-static SCHEMA_CACHE: Lazy<Mutex<HashMap<String, Value>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static SCHEMA_CACHE: Lazy<Mutex<HashMap<String, Value>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Get the JSON Schema for type `T` as a `serde_json::Value`.
 ///
@@ -139,7 +138,10 @@ fn generate_skeleton(schema: &Value, root: &Value, depth: usize) -> String {
                     let child = generate_skeleton(prop_schema, root, depth + 1);
                     let child_indent = "  ".repeat(depth + 1);
                     let comment = if !is_required { " // optional" } else { "" };
-                    result.push_str(&format!("{}\"{}\": {}{}", child_indent, key, child, comment));
+                    result.push_str(&format!(
+                        "{}\"{}\": {}{}",
+                        child_indent, key, child, comment
+                    ));
                     if i < props.len() - 1 {
                         result.push(',');
                     }
@@ -279,10 +281,7 @@ fn describe_type(schema: &Value) -> String {
         }
     }
 
-    let type_str = schema
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("any");
+    let type_str = schema.get("type").and_then(|v| v.as_str()).unwrap_or("any");
 
     match type_str {
         "array" => {

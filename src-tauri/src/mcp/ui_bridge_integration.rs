@@ -268,13 +268,9 @@ async fn analyze_project(path: &str) -> Result<ProjectAnalysis, String> {
                     // Detect server framework from dependencies
                     if framework == Framework::NextJs {
                         server_framework = ServerFramework::NextJs;
-                    } else if deps.get("express").is_some()
-                        || dev_deps.get("express").is_some()
-                    {
+                    } else if deps.get("express").is_some() || dev_deps.get("express").is_some() {
                         server_framework = ServerFramework::Express;
-                    } else if deps.get("fastify").is_some()
-                        || dev_deps.get("fastify").is_some()
-                    {
+                    } else if deps.get("fastify").is_some() || dev_deps.get("fastify").is_some() {
                         server_framework = ServerFramework::Fastify;
                     }
 
@@ -734,13 +730,7 @@ async fn integrate_source(
     // Next.js server relay is already handled in integrate_nextjs().
     match analysis.server_framework {
         ServerFramework::Express => {
-            integrate_express_server(
-                &project,
-                analysis,
-                &mut modifications,
-                &mut warnings,
-            )
-            .await;
+            integrate_express_server(&project, analysis, &mut modifications, &mut warnings).await;
             next_steps.push(
                 "Server-side: Express relay router created. Mount it in your server with: app.use('/api/ui-bridge', uiBridgeRouter)"
                     .to_string(),
@@ -1406,9 +1396,7 @@ fn save_integration(
     Ok(())
 }
 
-fn list_integrations(
-    _db: &crate::database::pg::PgDb,
-) -> Result<Vec<TrackedIntegration>, String> {
+fn list_integrations(_db: &crate::database::pg::PgDb) -> Result<Vec<TrackedIntegration>, String> {
     // checkpoint_db removed — integration list not yet migrated to PG
     Ok(vec![])
 }
@@ -2070,17 +2058,15 @@ async fn add_registration_imports(
         let mut new_content = content.clone();
 
         // Add import statement after the last existing import
-        let import_line = format!(
-            "import {{ {} }} from '{}';\n",
-            hook_name, import_path
-        );
+        let import_line = format!("import {{ {} }} from '{}';\n", hook_name, import_path);
         let import_pos = find_last_import_pos(&new_content);
         new_content.insert_str(import_pos, &import_line);
 
         // Add hook call at the start of the component function body
         // Find "export function" or "export default function" followed by "{"
         let hook_call = format!("  const {{ }} = {}();\n", hook_name);
-        if let Some(fn_pos) = new_content.find("export function ")
+        if let Some(fn_pos) = new_content
+            .find("export function ")
             .or_else(|| new_content.find("export default function "))
         {
             // Find the opening { of the function body
@@ -2105,7 +2091,10 @@ async fn add_registration_imports(
             warnings.push(format!(
                 "Added {} import to {}",
                 hook_name,
-                page_path.strip_prefix(project).unwrap_or(&page_path).display()
+                page_path
+                    .strip_prefix(project)
+                    .unwrap_or(&page_path)
+                    .display()
             ));
         }
     }
@@ -2139,7 +2128,9 @@ async fn update_tutorial_registry(
     // Find the tutorial registry file
     let registry_path = project.join("src/components/tutorial/data/index.ts");
     if !registry_path.exists() {
-        warnings.push("Tutorial registry not found at src/components/tutorial/data/index.ts".to_string());
+        warnings.push(
+            "Tutorial registry not found at src/components/tutorial/data/index.ts".to_string(),
+        );
         return warnings;
     }
 
@@ -2190,10 +2181,7 @@ async fn update_tutorial_registry(
         }
 
         // Add import statement at the end of imports
-        let import_line = format!(
-            "import {{ {} }} from \"./{}\";\n",
-            export_name, file_stem
-        );
+        let import_line = format!("import {{ {} }} from \"./{}\";\n", export_name, file_stem);
         let import_pos = find_last_import_pos(&new_content);
         new_content.insert_str(import_pos, &import_line);
 
@@ -2312,7 +2300,10 @@ async fn handle_cache_architecture_spec(
         project_name.to_lowercase().replace(' ', "-")
     );
 
-    if let Err(e) = db.upsert_cached_spec(&app_url, &project_name, &spec_id, &req.spec_json, None).await {
+    if let Err(e) = db
+        .upsert_cached_spec(&app_url, &project_name, &spec_id, &req.spec_json, None)
+        .await
+    {
         return Json(ApiResponse::error(format!("Failed to cache spec: {}", e)));
     }
 
@@ -2380,7 +2371,10 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
 
     // Check existing artifacts for each page
     for page in &mut pages {
-        let page_dir = project.join(&page.component_path).parent().map(|p| p.to_path_buf());
+        let page_dir = project
+            .join(&page.component_path)
+            .parent()
+            .map(|p| p.to_path_buf());
         let page_stem = std::path::Path::new(&page.component_path)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -2393,7 +2387,10 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
         }
 
         // Check for .spec.uibridge.json nearby or in specs/
-        let spec_name = format!("{}.spec.uibridge.json", page.route.trim_start_matches('/').replace('/', "-"));
+        let spec_name = format!(
+            "{}.spec.uibridge.json",
+            page.route.trim_start_matches('/').replace('/', "-")
+        );
         if let Some(ref dir) = page_dir {
             page.has_spec = dir.join(&spec_name).exists();
         }
@@ -2404,7 +2401,10 @@ async fn discover_pages(project_path: &str) -> Result<DiscoverPagesResult, Strin
         }
 
         // Check for tutorial data file
-        let tutorial_name = format!("{}.ts", page.route.trim_start_matches('/').replace('/', "-"));
+        let tutorial_name = format!(
+            "{}.ts",
+            page.route.trim_start_matches('/').replace('/', "-")
+        );
         page.has_tutorial = project
             .join("src/components/tutorial/data")
             .join(&tutorial_name)
@@ -2427,7 +2427,13 @@ async fn discover_nextjs_pages(project: &PathBuf, pages: &mut Vec<PageComponent>
         return;
     };
 
-    walk_for_pages(&app_dir, project, pages, &["page.tsx", "page.jsx", "page.ts"]).await;
+    walk_for_pages(
+        &app_dir,
+        project,
+        pages,
+        &["page.tsx", "page.jsx", "page.ts"],
+    )
+    .await;
 
     // Also check pages/ directory (Pages Router)
     let pages_dir = if project.join("src/pages").exists() {
@@ -2626,17 +2632,17 @@ async fn read_page_source(
                         .replace('\\', "/");
 
                     total_size += content.len();
-                    imported_sources.push(ImportedFile {
-                        path: rel,
-                        content,
-                    });
+                    imported_sources.push(ImportedFile { path: rel, content });
                 }
             }
         }
     }
 
     let total_lines = main_source.lines().count()
-        + imported_sources.iter().map(|f| f.content.lines().count()).sum::<usize>();
+        + imported_sources
+            .iter()
+            .map(|f| f.content.lines().count())
+            .sum::<usize>();
 
     Ok(ReadPageSourceResult {
         main_source,
@@ -2716,13 +2722,13 @@ async fn resolve_import(
 ) -> Option<PathBuf> {
     let base = if import_path.starts_with("@/") {
         // TypeScript path alias — resolve from tsconfig.json paths, fallback to src/
-        let alias_base = resolve_ts_alias(project_root, "@/")
-            .unwrap_or_else(|| project_root.join("src"));
+        let alias_base =
+            resolve_ts_alias(project_root, "@/").unwrap_or_else(|| project_root.join("src"));
         alias_base.join(&import_path[2..])
     } else if import_path.starts_with("~/") {
         // Some projects use ~/ as an alias
-        let alias_base = resolve_ts_alias(project_root, "~/")
-            .unwrap_or_else(|| project_root.join("src"));
+        let alias_base =
+            resolve_ts_alias(project_root, "~/").unwrap_or_else(|| project_root.join("src"));
         alias_base.join(&import_path[2..])
     } else {
         from_dir.join(import_path)

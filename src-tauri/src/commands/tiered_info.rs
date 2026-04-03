@@ -55,12 +55,13 @@ pub async fn get_config_statistics(
     config_id: String,
 ) -> Result<TieredInfoResponse<ConfigStatistics>, String> {
     match state.pg_db.get_config_statistics(&config_id).await {
-        Ok(Some(stats_val)) => {
-            match serde_json::from_value(stats_val) {
-                Ok(stats) => Ok(TieredInfoResponse::ok(stats)),
-                Err(e) => Ok(TieredInfoResponse::err(format!("Deserialization error: {}", e))),
-            }
-        }
+        Ok(Some(stats_val)) => match serde_json::from_value(stats_val) {
+            Ok(stats) => Ok(TieredInfoResponse::ok(stats)),
+            Err(e) => Ok(TieredInfoResponse::err(format!(
+                "Deserialization error: {}",
+                e
+            ))),
+        },
         Ok(None) => Ok(TieredInfoResponse::err(format!(
             "No statistics found for config {}",
             config_id
@@ -77,9 +78,16 @@ pub async fn get_flaky_transitions(
     threshold: Option<f64>,
 ) -> Result<TieredInfoResponse<Vec<FlakyItem>>, String> {
     let threshold = threshold.unwrap_or(0.2);
-    match state.pg_db.get_flaky_transitions(&config_id, threshold).await {
+    match state
+        .pg_db
+        .get_flaky_transitions(&config_id, threshold)
+        .await
+    {
         Ok(items) => {
-            let typed: Vec<FlakyItem> = items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let typed: Vec<FlakyItem> = items
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(TieredInfoResponse::ok(typed))
         }
         Err(e) => Ok(TieredInfoResponse::err(e)),
@@ -96,7 +104,10 @@ pub async fn get_flaky_templates(
     let threshold = threshold.unwrap_or(0.2);
     match state.pg_db.get_flaky_templates(&config_id, threshold).await {
         Ok(items) => {
-            let typed: Vec<FlakyItem> = items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let typed: Vec<FlakyItem> = items
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(TieredInfoResponse::ok(typed))
         }
         Err(e) => Ok(TieredInfoResponse::err(e)),
@@ -110,10 +121,17 @@ pub async fn get_debugging_context(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<DebuggingContext>, String> {
-    match state.pg_db.get_debugging_context(&config_id, config_name).await {
+    match state
+        .pg_db
+        .get_debugging_context(&config_id, config_name)
+        .await
+    {
         Ok(val) => match serde_json::from_value(val) {
             Ok(context) => Ok(TieredInfoResponse::ok(context)),
-            Err(e) => Ok(TieredInfoResponse::err(format!("Deserialization error: {}", e))),
+            Err(e) => Ok(TieredInfoResponse::err(format!(
+                "Deserialization error: {}",
+                e
+            ))),
         },
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -126,7 +144,11 @@ pub async fn get_debugging_context_prompt(
     config_id: String,
     config_name: Option<String>,
 ) -> Result<TieredInfoResponse<String>, String> {
-    match state.pg_db.get_debugging_context(&config_id, config_name).await {
+    match state
+        .pg_db
+        .get_debugging_context(&config_id, config_name)
+        .await
+    {
         Ok(val) => {
             // Format as markdown string from the JSON context
             let formatted = serde_json::to_string_pretty(&val).unwrap_or_default();
@@ -197,9 +219,16 @@ pub async fn get_recent_runs(
     limit: Option<u32>,
 ) -> Result<TieredInfoResponse<Vec<RunDetails>>, String> {
     let limit = limit.unwrap_or(10);
-    match state.pg_db.get_recent_runs(config_id.as_deref(), limit).await {
+    match state
+        .pg_db
+        .get_recent_runs(config_id.as_deref(), limit)
+        .await
+    {
         Ok(vals) => {
-            let runs: Vec<RunDetails> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let runs: Vec<RunDetails> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(TieredInfoResponse::ok(runs))
         }
         Err(e) => Ok(TieredInfoResponse::err(e)),
@@ -216,7 +245,10 @@ pub async fn get_failed_runs(
     let limit = limit.unwrap_or(5);
     match state.pg_db.get_failed_runs(&config_id, limit).await {
         Ok(vals) => {
-            let runs: Vec<RunDetails> = vals.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+            let runs: Vec<RunDetails> = vals
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect();
             Ok(TieredInfoResponse::ok(runs))
         }
         Err(e) => Ok(TieredInfoResponse::err(e)),
@@ -317,8 +349,15 @@ pub async fn record_run(
 
     let success = run.success.unwrap_or(false);
     let duration = run.duration_ms;
-    if let Err(e) = state.pg_db.update_statistics_after_run(&input.config_id, success, duration).await {
-        return Ok(TieredInfoResponse::err(format!("Run recorded but stats update failed: {}", e)));
+    if let Err(e) = state
+        .pg_db
+        .update_statistics_after_run(&input.config_id, success, duration)
+        .await
+    {
+        return Ok(TieredInfoResponse::err(format!(
+            "Run recorded but stats update failed: {}",
+            e
+        )));
     }
 
     Ok(TieredInfoResponse::ok(run_id))
@@ -368,9 +407,16 @@ pub async fn get_execution_options(
     transition_id: Option<String>,
     template_id: Option<String>,
 ) -> Result<TieredInfoResponse<ExecutionOptions>, String> {
-    match state.pg_db.get_execution_options(
-        &config_id, transition_id.as_deref(), template_id.as_deref(), 0.2,
-    ).await {
+    match state
+        .pg_db
+        .get_execution_options(
+            &config_id,
+            transition_id.as_deref(),
+            template_id.as_deref(),
+            0.2,
+        )
+        .await
+    {
         Ok(val) => match serde_json::from_value(val) {
             Ok(options) => Ok(TieredInfoResponse::ok(options)),
             Err(_) => Ok(TieredInfoResponse::ok(ExecutionOptions::default())),
@@ -409,10 +455,14 @@ pub async fn get_flakiness_summary(
 ) -> Result<TieredInfoResponse<FlakinessSummary>, String> {
     let threshold = threshold.unwrap_or(0.2);
 
-    match state.pg_db.get_flakiness_summary(&config_id, threshold).await {
+    match state
+        .pg_db
+        .get_flakiness_summary(&config_id, threshold)
+        .await
+    {
         Ok(val) => {
-            let summary: FlakinessSummary = serde_json::from_value(val)
-                .unwrap_or(FlakinessSummary {
+            let summary: FlakinessSummary =
+                serde_json::from_value(val).unwrap_or(FlakinessSummary {
                     flaky_transition_count: 0,
                     flaky_template_count: 0,
                     flaky_transition_ids: vec![],

@@ -56,12 +56,15 @@ pub async fn update_finding(
     let status =
         FindingStatus::from_str(&status).ok_or_else(|| format!("Invalid status: {}", status))?;
 
-    app_state.pg_db.update_finding_status(
-        &finding_id,
-        status.as_str(),
-        resolution.as_deref(),
-        session_num,
-    ).await?;
+    app_state
+        .pg_db
+        .update_finding_status(
+            &finding_id,
+            status.as_str(),
+            resolution.as_deref(),
+            session_num,
+        )
+        .await?;
 
     info!(
         "Updated finding {} to status {}",
@@ -79,12 +82,10 @@ pub async fn resolve_finding(
     session_num: Option<u32>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    app_state.pg_db.update_finding_status(
-        &finding_id,
-        "resolved",
-        Some(&resolution),
-        session_num,
-    ).await?;
+    app_state
+        .pg_db
+        .update_finding_status(&finding_id, "resolved", Some(&resolution), session_num)
+        .await?;
 
     info!("Resolved finding {}", finding_id);
     Ok(())
@@ -98,7 +99,10 @@ pub async fn provide_finding_response(
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     // checkpoint_db removed — finding user response was SQLite-only, no-op
-    info!("Set user response for finding {} (no-op, checkpoint_db removed)", finding_id);
+    info!(
+        "Set user response for finding {} (no-op, checkpoint_db removed)",
+        finding_id
+    );
     let _ = &response;
     Ok(())
 }
@@ -119,5 +123,8 @@ pub async fn list_task_knowledge_cmd(
     category: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<StoredTaskKnowledge>, String> {
-    app_state.pg_db.list_task_knowledge(&task_run_id, category.as_deref(), false).await
+    app_state
+        .pg_db
+        .list_task_knowledge(&task_run_id, category.as_deref(), false)
+        .await
 }

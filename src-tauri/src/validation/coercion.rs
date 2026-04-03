@@ -103,7 +103,9 @@ fn coerce_value(
         Some("object") => coerce_object(value, schema, root, path, records),
         Some("array") => coerce_array(value, schema, root, path, records),
         Some("string") => coerce_to_string(value, schema, path, records),
-        Some("integer") | Some("number") => coerce_to_number(value, expected_type.unwrap(), path, records),
+        Some("integer") | Some("number") => {
+            coerce_to_number(value, expected_type.unwrap(), path, records)
+        }
         Some("boolean") => coerce_to_boolean(value, path, records),
         _ => value.clone(),
     }

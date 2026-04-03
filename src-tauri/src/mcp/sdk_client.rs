@@ -483,10 +483,7 @@ async fn push_ctr_reliability_to_sdk(state: &Arc<ApiState>) {
 
     let mgr = sdk_conn.lock().await;
     if let Some(conn) = mgr.active_connection() {
-        let url = format!(
-            "{}{}/ctr/seed-reliability",
-            conn.app_url, conn.base_path
-        );
+        let url = format!("{}{}/ctr/seed-reliability", conn.app_url, conn.base_path);
         let count = reliability_data.len();
         let payload = serde_json::json!({ "reliabilityData": reliability_data });
         match conn
@@ -498,10 +495,16 @@ async fn push_ctr_reliability_to_sdk(state: &Arc<ApiState>) {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                info!("Pushed {} element reliability records to SDK for CTR seeding", count);
+                info!(
+                    "Pushed {} element reliability records to SDK for CTR seeding",
+                    count
+                );
             }
             Ok(resp) => {
-                debug!("SDK app did not accept CTR reliability data (HTTP {})", resp.status());
+                debug!(
+                    "SDK app did not accept CTR reliability data (HTTP {})",
+                    resp.status()
+                );
             }
             Err(e) => {
                 debug!("Failed to push CTR reliability data: {}", e);
@@ -898,7 +901,10 @@ async fn handle_element_action(
     let path = format!("/control/element/{}/action", id);
     let result = match sdk_request(&state, Method::POST, &path, Some(body.clone())).await {
         Ok(data) => {
-            let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+            let success = data
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             (Json(data), success, None)
         }
         Err(_) => {
@@ -926,7 +932,11 @@ async fn handle_element_action(
                         let err = data.get("error").and_then(|v| v.as_str()).map(String::from);
                         (Json(data), false, err)
                     } else {
-                        (Json(serde_json::json!({ "success": true, "data": data })), true, None)
+                        (
+                            Json(serde_json::json!({ "success": true, "data": data })),
+                            true,
+                            None,
+                        )
                     }
                 }
                 Err(e) => (
@@ -951,21 +961,24 @@ async fn handle_element_action(
         let action_for_db = action_name.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = pg_db.insert_ui_bridge_event(
-                Some(tr_id),
-                seq,
-                "action_executed",
-                Some(&element_id),
-                None,
-                None,
-                Some(&action_for_db),
-                None,
-                None,
-                Some(duration_ms),
-                success,
-                error_msg.as_deref(),
-                None,
-            ).await {
+            if let Err(e) = pg_db
+                .insert_ui_bridge_event(
+                    Some(tr_id),
+                    seq,
+                    "action_executed",
+                    Some(&element_id),
+                    None,
+                    None,
+                    Some(&action_for_db),
+                    None,
+                    None,
+                    Some(duration_ms),
+                    success,
+                    error_msg.as_deref(),
+                    None,
+                )
+                .await
+            {
                 tracing::warn!("Failed to persist SDK UI Bridge event: {}", e);
             }
         });
@@ -1964,7 +1977,10 @@ async fn handle_discover_and_cache(
 
         let spec_json_str = serde_json::to_string(spec).unwrap_or_default();
 
-        if let Err(e) = pg.upsert_cached_spec(&url, &app_name, spec_id, &spec_json_str, page_url).await {
+        if let Err(e) = pg
+            .upsert_cached_spec(&url, &app_name, spec_id, &spec_json_str, page_url)
+            .await
+        {
             warn!("Failed to cache spec {}: {}", spec_id, e);
             continue;
         }
@@ -3978,37 +3994,23 @@ async fn handle_find_by_text(
 }
 
 /// GET /ui-bridge/sdk/diagnostics — SDK diagnostic information
-async fn handle_diagnostics(
-    State(state): State<Arc<ApiState>>,
-) -> Json<serde_json::Value> {
+async fn handle_diagnostics(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/diagnostics", None).await {
         Ok(data) => Json(data),
-        Err(_) => match ui_bridge_request_sync(
-            &state,
-            "get_diagnostics",
-            serde_json::json!({}),
-        )
-        .await
-        {
-            Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
-            Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-        },
+        Err(_) => {
+            match ui_bridge_request_sync(&state, "get_diagnostics", serde_json::json!({})).await {
+                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+            }
+        }
     }
 }
 
 /// GET /ui-bridge/sdk/page/routes — List available routes
-async fn handle_page_routes(
-    State(state): State<Arc<ApiState>>,
-) -> Json<serde_json::Value> {
+async fn handle_page_routes(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
     match sdk_request(&state, Method::GET, "/control/page/routes", None).await {
         Ok(data) => Json(data),
-        Err(_) => match ui_bridge_request_sync(
-            &state,
-            "get_routes",
-            serde_json::json!({}),
-        )
-        .await
-        {
+        Err(_) => match ui_bridge_request_sync(&state, "get_routes", serde_json::json!({})).await {
             Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
             Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
         },

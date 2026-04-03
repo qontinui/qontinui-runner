@@ -21,7 +21,11 @@ impl PgDb {
         source_step_id: Option<&str>,
         positive: bool,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let positive_int: i32 = if positive { 1 } else { 0 };
         conn.execute(
             "INSERT INTO playbook_entries (id, lesson, category, domain, severity, source_run_id, source_step_id, positive)
@@ -40,7 +44,11 @@ impl PgDb {
         status: Option<&str>,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Build query with dynamic parameters
         let mut query = String::from(
@@ -123,7 +131,11 @@ impl PgDb {
     }
 
     pub async fn update_playbook_status(&self, id: &str, status: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE playbook_entries SET status = $1, updated_at = NOW() WHERE id = $2",
             &[&status, &id],
@@ -134,7 +146,11 @@ impl PgDb {
     }
 
     pub async fn delete_playbook_entry(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM playbook_entries WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("Delete playbook entry failed: {}", e))?;
@@ -142,11 +158,12 @@ impl PgDb {
     }
 
     /// Get full detail for a single playbook entry plus its source run context.
-    pub async fn get_playbook_entry_detail(
-        &self,
-        id: &str,
-    ) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_playbook_entry_detail(&self, id: &str) -> Result<serde_json::Value, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_one(
@@ -217,7 +234,11 @@ impl PgDb {
     }
 
     pub async fn increment_playbook_applied(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE playbook_entries SET times_applied = times_applied + 1, updated_at = NOW() WHERE id = $1",
             &[&id],
@@ -226,7 +247,11 @@ impl PgDb {
     }
 
     pub async fn increment_playbook_helped(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE playbook_entries SET times_helped = times_helped + 1, updated_at = NOW() WHERE id = $1",
             &[&id],
@@ -247,7 +272,11 @@ impl PgDb {
         quality_score: f64,
         execution_verified: bool,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let verified_int: i32 = if execution_verified { 1 } else { 0 };
         conn.execute(
             "INSERT INTO curated_examples (id, domain, criterion_description, steps_json, quality_score, execution_verified)
@@ -262,7 +291,11 @@ impl PgDb {
         domain: &str,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn.query(
             "SELECT id, domain, criterion_description, steps_json, quality_score, execution_verified, times_used, created_at
              FROM curated_examples WHERE domain = $1 ORDER BY quality_score DESC LIMIT $2",
@@ -291,7 +324,11 @@ impl PgDb {
     }
 
     pub async fn delete_curated_example(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM curated_examples WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("Delete curated example failed: {}", e))?;
@@ -309,7 +346,11 @@ impl PgDb {
         passed: bool,
         quality_score: f64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let (success_inc, failure_inc) = if passed { (1i32, 0i32) } else { (0i32, 1i32) };
         conn.execute(
             "INSERT INTO template_performance (template_id, template_name, success_count, failure_count, total_quality_score, last_used_at)
@@ -326,14 +367,21 @@ impl PgDb {
     }
 
     pub async fn get_all_template_performance(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT template_id, template_name, source, success_count, failure_count,
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT template_id, template_name, source, success_count, failure_count,
                     total_quality_score, last_used_at::TEXT
              FROM template_performance
              ORDER BY (success_count + failure_count) DESC",
-            &[],
-        ).await.map_err(|e| format!("Query template performance failed: {}", e))?;
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Query template performance failed: {}", e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -369,8 +417,16 @@ impl PgDb {
         Ok(results)
     }
 
-    pub async fn update_template_source(&self, template_id: &str, source: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn update_template_source(
+        &self,
+        template_id: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE template_performance SET source = $1, updated_at = NOW() WHERE template_id = $2",
             &[&source, &template_id],
@@ -386,7 +442,11 @@ impl PgDb {
         &self,
         template_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn.query(
             "SELECT id, template_id, action, old_source, new_source, confidence_at_transition, created_at
              FROM template_lifecycle_events
@@ -429,7 +489,11 @@ impl PgDb {
         improvement: Option<f64>,
         status: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO gepa_optimization_runs (id, domain, old_instructions, new_instructions, old_score, new_score, improvement, status)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -439,12 +503,19 @@ impl PgDb {
     }
 
     pub async fn get_recent_gepa_runs(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT id, domain, old_score, new_score, improvement, status, created_at
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, domain, old_score, new_score, improvement, status, created_at
              FROM gepa_optimization_runs ORDER BY created_at DESC LIMIT $1",
-            &[&limit],
-        ).await.map_err(|e| format!("Query GEPA runs failed: {}", e))?;
+                &[&limit],
+            )
+            .await
+            .map_err(|e| format!("Query GEPA runs failed: {}", e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -467,7 +538,11 @@ impl PgDb {
 
     /// Get full detail for a single GEPA run (including instructions).
     pub async fn get_gepa_run_detail(&self, id: &str) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_one(
                 "SELECT id, domain, old_instructions, new_instructions, old_score, new_score,
@@ -498,7 +573,11 @@ impl PgDb {
     // =========================================================================
 
     pub async fn get_adaptive_learning_stats(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let playbook_total: i64 = conn
             .query_one("SELECT COUNT(*) FROM playbook_entries", &[])
@@ -583,60 +662,82 @@ impl PgDb {
     // =========================================================================
 
     pub async fn get_learning_trends(&self, days: i64) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let interval = format!("{} days", days);
 
         // Playbook entries per day
-        let lesson_rows = conn.query(
-            "SELECT created_at::date::text AS day, COUNT(*) AS count, severity
+        let lesson_rows = conn
+            .query(
+                "SELECT created_at::date::text AS day, COUNT(*) AS count, severity
              FROM playbook_entries
              WHERE created_at >= NOW() - $1::interval
              GROUP BY day, severity
              ORDER BY day",
-            &[&interval],
-        ).await.map_err(|e| format!("Lesson trends: {}", e))?;
+                &[&interval],
+            )
+            .await
+            .map_err(|e| format!("Lesson trends: {}", e))?;
 
-        let lesson_trends: Vec<serde_json::Value> = lesson_rows.iter().map(|row| {
-            serde_json::json!({
-                "day": row.get::<_, String>(0),
-                "count": row.get::<_, i64>(1),
-                "severity": row.get::<_, String>(2),
+        let lesson_trends: Vec<serde_json::Value> = lesson_rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "day": row.get::<_, String>(0),
+                    "count": row.get::<_, i64>(1),
+                    "severity": row.get::<_, String>(2),
+                })
             })
-        }).collect();
+            .collect();
 
         // Curated examples per day
-        let example_rows = conn.query(
-            "SELECT created_at::date::text AS day, COUNT(*) AS count, domain
+        let example_rows = conn
+            .query(
+                "SELECT created_at::date::text AS day, COUNT(*) AS count, domain
              FROM curated_examples
              WHERE created_at >= NOW() - $1::interval
              GROUP BY day, domain
              ORDER BY day",
-            &[&interval],
-        ).await.map_err(|e| format!("Example trends: {}", e))?;
+                &[&interval],
+            )
+            .await
+            .map_err(|e| format!("Example trends: {}", e))?;
 
-        let example_trends: Vec<serde_json::Value> = example_rows.iter().map(|row| {
-            serde_json::json!({
-                "day": row.get::<_, String>(0),
-                "count": row.get::<_, i64>(1),
-                "domain": row.get::<_, String>(2),
+        let example_trends: Vec<serde_json::Value> = example_rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "day": row.get::<_, String>(0),
+                    "count": row.get::<_, i64>(1),
+                    "domain": row.get::<_, String>(2),
+                })
             })
-        }).collect();
+            .collect();
 
         // Domain distribution
-        let domain_rows = conn.query(
-            "SELECT COALESCE(domain, 'general') AS domain, COUNT(*) AS count
+        let domain_rows = conn
+            .query(
+                "SELECT COALESCE(domain, 'general') AS domain, COUNT(*) AS count
              FROM playbook_entries WHERE status != 'retired'
              GROUP BY domain ORDER BY count DESC",
-            &[],
-        ).await.map_err(|e| format!("Domain distribution: {}", e))?;
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Domain distribution: {}", e))?;
 
-        let domain_dist: Vec<serde_json::Value> = domain_rows.iter().map(|row| {
-            serde_json::json!({
-                "domain": row.get::<_, String>(0),
-                "count": row.get::<_, i64>(1),
+        let domain_dist: Vec<serde_json::Value> = domain_rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "domain": row.get::<_, String>(0),
+                    "count": row.get::<_, i64>(1),
+                })
             })
-        }).collect();
+            .collect();
 
         // Helpfulness over time
         let helpfulness_rows = conn.query(
@@ -649,13 +750,16 @@ impl PgDb {
             &[&interval],
         ).await.map_err(|e| format!("Helpfulness trends: {}", e))?;
 
-        let helpfulness_trends: Vec<serde_json::Value> = helpfulness_rows.iter().map(|row| {
-            serde_json::json!({
-                "day": row.get::<_, String>(0),
-                "avg_helpfulness": row.get::<_, Option<f64>>(1),
-                "total_applied": row.get::<_, i64>(2),
+        let helpfulness_trends: Vec<serde_json::Value> = helpfulness_rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "day": row.get::<_, String>(0),
+                    "avg_helpfulness": row.get::<_, Option<f64>>(1),
+                    "total_applied": row.get::<_, i64>(2),
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(serde_json::json!({
             "lesson_trends": lesson_trends,

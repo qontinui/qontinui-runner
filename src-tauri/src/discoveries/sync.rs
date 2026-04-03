@@ -190,9 +190,7 @@ pub async fn sync_discoveries_batch(discoveries: Vec<DiscoveryToSync>) -> Vec<Si
 /// Apply sync results to the database (sync operation).
 ///
 /// Updates the database based on what succeeded and failed.
-pub fn apply_sync_results(
-    results: Vec<SingleSyncResult>,
-) -> Result<SyncResult, String> {
+pub fn apply_sync_results(results: Vec<SingleSyncResult>) -> Result<SyncResult, String> {
     Err("SQLite removed".to_string())
 }
 

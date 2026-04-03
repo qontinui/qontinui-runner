@@ -229,21 +229,19 @@ async fn handle_connection(
 
         match evaluation {
             Err(denial) => {
-                log_network_event(&state, &domain, protocol, AuditDecision::Denied, Some(&denial.reason));
+                log_network_event(
+                    &state,
+                    &domain,
+                    protocol,
+                    AuditDecision::Denied,
+                    Some(&denial.reason),
+                );
                 warn!("Network proxy blocked HTTP: {} - {}", domain, denial.reason);
                 send_http_error(stream, 403, &denial.reason).await
             }
             Ok(()) => {
                 log_network_event(&state, &domain, protocol, AuditDecision::Allowed, None);
-                handle_http_forward(
-                    stream,
-                    &method,
-                    &target,
-                    &first_line,
-                    &headers,
-                    &state,
-                )
-                .await
+                handle_http_forward(stream, &method, &target, &first_line, &headers, &state).await
             }
         }
     }
@@ -262,8 +260,17 @@ async fn handle_connect_tunnel(
 
     match evaluation {
         Err(denial) => {
-            log_network_event(state, domain, protocol, AuditDecision::Denied, Some(&denial.reason));
-            warn!("Network proxy blocked CONNECT: {} - {}", domain, denial.reason);
+            log_network_event(
+                state,
+                domain,
+                protocol,
+                AuditDecision::Denied,
+                Some(&denial.reason),
+            );
+            warn!(
+                "Network proxy blocked CONNECT: {} - {}",
+                domain, denial.reason
+            );
 
             let response = format!(
                 "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{}",
@@ -385,15 +392,10 @@ async fn handle_http_forward(
         if let Some(ref cred_proxy) = state.credential_proxy {
             if let Some((name, _rest)) = header.split_once(':') {
                 if cred_proxy.should_scan_header(name.trim()) {
-                    let value = header
-                        .split_once(':')
-                        .map(|(_, v)| v.trim())
-                        .unwrap_or("");
-                    if let Some((replaced_value, cred_name)) =
-                        cred_proxy.resolve_placeholder(value)
+                    let value = header.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+                    if let Some((replaced_value, cred_name)) = cred_proxy.resolve_placeholder(value)
                     {
-                        header_line =
-                            format!("{}: {}\r\n", name.trim(), replaced_value);
+                        header_line = format!("{}: {}\r\n", name.trim(), replaced_value);
                         // Log credential injection (without the actual value)
                         state.audit_logger.log(
                             SecurityAuditEvent::new(

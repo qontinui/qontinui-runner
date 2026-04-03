@@ -17,14 +17,11 @@ const MAX_RETRIES: usize = 3;
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap()
 });
-static SNIPPET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#).unwrap()
-});
+static SNIPPET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#).unwrap());
 static FALLBACK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"href="(https?://[^"]+)"[^>]*>([^<]+)</a>.*?class="result__snippet"[^>]*>([^<]+)"#,
-    )
-    .unwrap()
+    Regex::new(r#"href="(https?://[^"]+)"[^>]*>([^<]+)</a>.*?class="result__snippet"[^>]*>([^<]+)"#)
+        .unwrap()
 });
 static HTML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 
@@ -156,9 +153,18 @@ fn parse_results(html: &str, query: &str, max_results: usize) -> Vec<KnowledgeRe
             if results.len() >= max_results {
                 break;
             }
-            let url = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
-            let title = cap.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
-            let snippet = cap.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let url = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let title = cap
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let snippet = cap
+                .get(3)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
 
             if !url.is_empty() && !title.is_empty() {
                 results.push(KnowledgeResult {
@@ -251,10 +257,7 @@ mod tests {
 
     #[test]
     fn test_decode_ddg_url_direct() {
-        assert_eq!(
-            decode_ddg_url("https://example.com"),
-            "https://example.com"
-        );
+        assert_eq!(decode_ddg_url("https://example.com"), "https://example.com");
     }
 
     #[test]
@@ -306,7 +309,11 @@ mod tests {
         let results = parse_results(html, "rust borrow error", 5);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "How to fix Rust borrow error");
-        assert!(results[0].url.as_ref().unwrap().contains("stackoverflow.com"));
+        assert!(results[0]
+            .url
+            .as_ref()
+            .unwrap()
+            .contains("stackoverflow.com"));
         assert!(results[0].content.contains("borrow checker"));
     }
 

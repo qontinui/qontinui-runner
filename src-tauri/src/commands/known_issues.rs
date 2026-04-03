@@ -110,7 +110,10 @@ pub async fn find_issues_for_spec(
     page_url: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<KnownIssue>, String> {
-    app_state.pg_db.find_issues_for_spec(&spec_id, page_url.as_deref()).await
+    app_state
+        .pg_db
+        .find_issues_for_spec(&spec_id, page_url.as_deref())
+        .await
 }
 
 /// Create a new known issue.
@@ -156,7 +159,10 @@ pub async fn resolve_known_issue(
     resolution: Option<String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    app_state.pg_db.resolve_known_issue(&id, resolution.as_deref()).await?;
+    app_state
+        .pg_db
+        .resolve_known_issue(&id, resolution.as_deref())
+        .await?;
     info!("Resolved known issue: {}", id);
     Ok(())
 }
@@ -219,7 +225,10 @@ pub async fn import_known_issues(
     }
 
     // Collect existing titles for dedup.
-    let existing = app_state.pg_db.list_known_issues(&ListKnownIssuesQuery::default()).await?;
+    let existing = app_state
+        .pg_db
+        .list_known_issues(&ListKnownIssuesQuery::default())
+        .await?;
     let existing_titles: std::collections::HashSet<String> =
         existing.iter().map(|i| i.title.clone()).collect();
 

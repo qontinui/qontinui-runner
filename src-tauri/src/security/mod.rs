@@ -133,8 +133,7 @@ pub fn build_container_security_env(
     let mut env = Vec::new();
 
     // Credential placeholders
-    if settings.credential_proxy_enabled
-        && policy.credentials.mode == policy::CredentialMode::Proxy
+    if settings.credential_proxy_enabled && policy.credentials.mode == policy::CredentialMode::Proxy
     {
         let cred_names: Vec<&str> = if policy.credentials.allowed_credentials.is_empty() {
             vec!["claude_api", "openai", "gemini"]

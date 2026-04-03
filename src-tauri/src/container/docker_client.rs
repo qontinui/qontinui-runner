@@ -242,21 +242,17 @@ impl DockerManager {
             .map_err(|e| format!("Failed to start container: {}", e))?;
 
         // Wait for completion with timeout
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_secs(config.timeout_secs),
-            async {
-                let mut stream = client.wait_container(
-                    &container_id,
-                    None::<WaitContainerOptions<String>>,
-                );
+        let wait_result =
+            tokio::time::timeout(std::time::Duration::from_secs(config.timeout_secs), async {
+                let mut stream =
+                    client.wait_container(&container_id, None::<WaitContainerOptions<String>>);
                 match stream.next().await {
                     Some(Ok(response)) => Ok(response.status_code),
                     Some(Err(e)) => Err(format!("Wait error: {}", e)),
                     None => Err("Container wait stream ended without result".to_string()),
                 }
-            },
-        )
-        .await;
+            })
+            .await;
 
         let exit_code = match wait_result {
             Ok(Ok(code)) => Some(code),

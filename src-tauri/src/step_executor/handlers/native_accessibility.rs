@@ -334,9 +334,8 @@ impl NativeAccessibilityHandler {
 
         if let Some(ref role_str) = step.a11y_query_role {
             // Deserialize the role string via serde (uses rename_all = "snake_case").
-            match serde_json::from_value::<UnifiedRole>(serde_json::Value::String(
-                role_str.clone(),
-            )) {
+            match serde_json::from_value::<UnifiedRole>(serde_json::Value::String(role_str.clone()))
+            {
                 Ok(role) => {
                     builder = builder.by_role(role);
                 }

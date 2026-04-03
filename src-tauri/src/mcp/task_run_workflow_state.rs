@@ -89,17 +89,28 @@ pub async fn get_workflow_state(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<WorkflowStateResponse>, (StatusCode, String)> {
     // First get the task run for metadata
-    let task_run = pg_get_task_run(&state, &id).await
+    let task_run = pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Try to get explicit workflow state
-    let explicit_state = state.app_state.pg_db.get_workflow_execution_state(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let explicit_state = state
+        .app_state
+        .pg_db
+        .get_workflow_execution_state(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Try to get workflow definition for max_iterations and verification info
     let workflow_def = if let Some(ref workflow_name) = task_run.workflow_name {
-        state.app_state.pg_db.get_unified_workflow_by_name(workflow_name).await.ok().flatten()
+        state
+            .app_state
+            .pg_db
+            .get_unified_workflow_by_name(workflow_name)
+            .await
+            .ok()
+            .flatten()
     } else {
         None
     };
@@ -387,13 +398,18 @@ pub async fn get_full_workflow_state(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<FullWorkflowStateResponse>, (StatusCode, String)> {
     // Get task run
-    let task_run = pg_get_task_run(&state, &id).await
+    let task_run = pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
     // Get orchestrator state
-    let explicit_state = state.app_state.pg_db.get_workflow_execution_state(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let explicit_state = state
+        .app_state
+        .pg_db
+        .get_workflow_execution_state(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let orchestrator_state = explicit_state.map(|ws| {
         let state_data: Option<serde_json::Value> = ws
@@ -443,8 +459,12 @@ pub async fn get_full_workflow_state(
         .collect();
 
     // Get current step progress
-    let progress_raw = state.app_state.pg_db.get_current_step_progress(&id).await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let progress_raw = state
+        .app_state
+        .pg_db
+        .get_current_step_progress(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let current_step_progress = progress_raw.map(|p| StepProgressData {
         checkpoint_id: p.checkpoint_id,
@@ -460,21 +480,13 @@ pub async fn get_full_workflow_state(
     });
 
     // Compute resume point using ResumeManager
-    let resume_point = compute_resume_point(
-        state.app_state.pg_db.clone(),
-        &id,
-        &orchestrator_state,
-    );
+    let resume_point =
+        compute_resume_point(state.app_state.pg_db.clone(), &id, &orchestrator_state);
 
     // Determine defined phases from the workflow definition
     let defined_phases = if task_run.workflow_type.as_deref() == Some("unified") {
         if let Some(ref wn) = task_run.workflow_name {
-            match state
-                .app_state
-                .pg_db
-                .get_unified_workflow_by_name(wn)
-                .await
-            {
+            match state.app_state.pg_db.get_unified_workflow_by_name(wn).await {
                 Ok(Some(wf)) => {
                     let mut phases = Vec::new();
                     if !wf.setup_steps.is_empty() {
@@ -510,9 +522,8 @@ pub async fn get_full_workflow_state(
     let stage_names: Vec<String> = extract_workflow_id_from_task_id(&id)
         .and_then(|wf_id| {
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    state.app_state.pg_db.get_unified_workflow(&wf_id)
-                )
+                tokio::runtime::Handle::current()
+                    .block_on(state.app_state.pg_db.get_unified_workflow(&wf_id))
             })
             .ok()
             .flatten()
@@ -571,7 +582,8 @@ pub async fn get_task_output(
     axum::extract::Query(query): axum::extract::Query<TaskOutputQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // First verify task exists
-    let task_run = pg_get_task_run(&state, &id).await
+    let task_run = pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -620,7 +632,8 @@ pub async fn resume_task_run(
     info!("Resume task run request: {}", id);
 
     // Get the task run
-    let task_run = pg_get_task_run(&state, &id).await
+    let task_run = pg_get_task_run(&state, &id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
 
@@ -670,9 +683,8 @@ pub async fn resume_task_run(
                     .or_else(|| wf_name.strip_prefix("Reflection: "));
                 stripped.and_then(|name| {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            state.app_state.pg_db.get_unified_workflow_by_name(name)
-                        )
+                        tokio::runtime::Handle::current()
+                            .block_on(state.app_state.pg_db.get_unified_workflow_by_name(name))
                     })
                     .ok()
                     .flatten()
@@ -809,11 +821,16 @@ pub async fn resume_task_run(
     if crate::restate::launch::should_use_restate(&restate_settings).await {
         match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
             Ok(input) => {
-                if let Err(e) = state.app_state.pg_db.save_restate_workflow_execution(
-                    &execution_id_for_guard,
-                    &execution_id_for_guard,
-                    None,
-                ).await {
+                if let Err(e) = state
+                    .app_state
+                    .pg_db
+                    .save_restate_workflow_execution(
+                        &execution_id_for_guard,
+                        &execution_id_for_guard,
+                        None,
+                    )
+                    .await
+                {
                     tracing::error!("Failed to record Restate workflow: {}", e);
                 }
 
@@ -821,7 +838,9 @@ pub async fn resume_task_run(
                     &execution_id_for_guard,
                     &input,
                     &restate_settings.ingress_url(),
-                ).await {
+                )
+                .await
+                {
                     tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                 } else {
                     use_legacy = false;

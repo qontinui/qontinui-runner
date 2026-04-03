@@ -42,11 +42,7 @@ impl QueryRoot {
             .ui_bridge_last_pong
             .load(std::sync::atomic::Ordering::Relaxed);
         let now_ms = now_epoch_ms();
-        let pong_age_ms = if last_pong > 0 {
-            now_ms - last_pong
-        } else {
-            0
-        };
+        let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
         let pending_count = pending_count_with_timeout(state).await;
         let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
 
@@ -115,10 +111,7 @@ impl QueryRoot {
     }
 
     /// Get console errors from the connected browser.
-    async fn ui_bridge_console_errors(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<Json<serde_json::Value>> {
+    async fn ui_bridge_console_errors(&self, ctx: &Context<'_>) -> Result<Json<serde_json::Value>> {
         let state = ctx.data::<Arc<ApiState>>()?;
         bridge_query(state, "get_console_errors", serde_json::json!({})).await
     }
@@ -253,10 +246,17 @@ impl QueryRoot {
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let runs = state.app_state.pg_db.get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port)).await
+        let runs = state
+            .app_state
+            .pg_db
+            .get_recent_task_runs_filtered(limit as u32, workflow_type.as_deref(), Some(port))
+            .await
             .map_err(|e| Error::new(format!("Failed to get task runs: {}", e)))?;
 
-        Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
+        Ok(runs
+            .into_iter()
+            .map(super::types::GqlTaskRun::from_db)
+            .collect())
     }
 
     /// Get a single task run by ID.
@@ -266,7 +266,11 @@ impl QueryRoot {
         id: String,
     ) -> Result<Option<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let run = state.app_state.pg_db.get_task_run(&id).await
+        let run = state
+            .app_state
+            .pg_db
+            .get_task_run(&id)
+            .await
             .map_err(|e| Error::new(format!("Failed to get task run: {}", e)))?;
 
         Ok(run.map(super::types::GqlTaskRun::from_db))
@@ -283,7 +287,11 @@ impl QueryRoot {
     ) -> Result<super::types::GqlTaskRunOutput> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let full_output = state.app_state.pg_db.get_task_output(&id).await
+        let full_output = state
+            .app_state
+            .pg_db
+            .get_task_output(&id)
+            .await
             .map_err(|e| Error::new(format!("Failed to get task output: {}", e)))?;
 
         let total_length = full_output.len() as i32;
@@ -309,20 +317,24 @@ impl QueryRoot {
     }
 
     /// List only currently running task runs.
-    async fn running_task_runs(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<Vec<super::types::GqlTaskRun>> {
+    async fn running_task_runs(&self, ctx: &Context<'_>) -> Result<Vec<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
         let port = state
             .app_state
             .api_port
             .load(std::sync::atomic::Ordering::Relaxed);
 
-        let runs = state.app_state.pg_db.get_running_task_runs(Some(port)).await
+        let runs = state
+            .app_state
+            .pg_db
+            .get_running_task_runs(Some(port))
+            .await
             .map_err(|e| Error::new(format!("Failed to get running task runs: {}", e)))?;
 
-        Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
+        Ok(runs
+            .into_iter()
+            .map(super::types::GqlTaskRun::from_db)
+            .collect())
     }
 
     /// Get child task runs of a parent task.
@@ -332,10 +344,17 @@ impl QueryRoot {
         parent_task_run_id: String,
     ) -> Result<Vec<super::types::GqlTaskRun>> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let runs = state.app_state.pg_db.get_child_task_runs(&parent_task_run_id).await
+        let runs = state
+            .app_state
+            .pg_db
+            .get_child_task_runs(&parent_task_run_id)
+            .await
             .map_err(|e| Error::new(format!("Failed to get child task runs: {}", e)))?;
 
-        Ok(runs.into_iter().map(super::types::GqlTaskRun::from_db).collect())
+        Ok(runs
+            .into_iter()
+            .map(super::types::GqlTaskRun::from_db)
+            .collect())
     }
 
     // ======================================================================
@@ -343,13 +362,14 @@ impl QueryRoot {
     // ======================================================================
 
     /// List all unified workflows (summary view).
-    async fn workflows(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<Vec<super::types::GqlWorkflowSummary>> {
+    async fn workflows(&self, ctx: &Context<'_>) -> Result<Vec<super::types::GqlWorkflowSummary>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let workflows = state.app_state.pg_db.list_unified_workflows().await
+        let workflows = state
+            .app_state
+            .pg_db
+            .list_unified_workflows()
+            .await
             .map_err(|e| Error::new(format!("Failed to list workflows: {}", e)))?;
 
         Ok(workflows
@@ -382,43 +402,41 @@ impl QueryRoot {
     ) -> Result<Option<super::types::GqlWorkflow>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let workflow = state.app_state.pg_db.get_unified_workflow(&id).await
+        let workflow = state
+            .app_state
+            .pg_db
+            .get_unified_workflow(&id)
+            .await
             .map_err(|e| Error::new(format!("Failed to get workflow: {}", e)))?;
 
-        Ok(workflow.map(|w| {
-            super::types::GqlWorkflow {
-                id: w.id,
-                name: w.name,
-                description: w.description,
-                category: w.category,
-                tags: w.tags,
-                setup_steps: Json(serde_json::to_value(&w.setup_steps).unwrap_or_default()),
-                verification_steps: Json(
-                    serde_json::to_value(&w.verification_steps).unwrap_or_default(),
-                ),
-                agentic_steps: Json(
-                    serde_json::to_value(&w.agentic_steps).unwrap_or_default(),
-                ),
-                completion_steps: Json(
-                    serde_json::to_value(&w.completion_steps).unwrap_or_default(),
-                ),
-                max_iterations: w.max_iterations as i32,
-                timeout_seconds: w.timeout_seconds.map(|v| v as i64),
-                provider: w.provider,
-                model: w.model,
-                is_favorite: w.is_favorite,
-                multi_agent_mode: w.multi_agent_mode,
-                reflection_mode: w.reflection_mode,
-                approval_gate: w.approval_gate,
-                stop_on_failure: w.stop_on_failure,
-                use_worktree: w.use_worktree,
-                strict_cwd: w.strict_cwd,
-                enforce_token_budget: w.enforce_token_budget,
-                workflow_architecture: w.workflow_architecture.map(|a| format!("{:?}", a)),
-                stages: Json(serde_json::to_value(&w.stages).unwrap_or_default()),
-                created_at: w.created_at,
-                updated_at: w.updated_at,
-            }
+        Ok(workflow.map(|w| super::types::GqlWorkflow {
+            id: w.id,
+            name: w.name,
+            description: w.description,
+            category: w.category,
+            tags: w.tags,
+            setup_steps: Json(serde_json::to_value(&w.setup_steps).unwrap_or_default()),
+            verification_steps: Json(
+                serde_json::to_value(&w.verification_steps).unwrap_or_default(),
+            ),
+            agentic_steps: Json(serde_json::to_value(&w.agentic_steps).unwrap_or_default()),
+            completion_steps: Json(serde_json::to_value(&w.completion_steps).unwrap_or_default()),
+            max_iterations: w.max_iterations as i32,
+            timeout_seconds: w.timeout_seconds.map(|v| v as i64),
+            provider: w.provider,
+            model: w.model,
+            is_favorite: w.is_favorite,
+            multi_agent_mode: w.multi_agent_mode,
+            reflection_mode: w.reflection_mode,
+            approval_gate: w.approval_gate,
+            stop_on_failure: w.stop_on_failure,
+            use_worktree: w.use_worktree,
+            strict_cwd: w.strict_cwd,
+            enforce_token_budget: w.enforce_token_budget,
+            workflow_architecture: w.workflow_architecture.map(|a| format!("{:?}", a)),
+            stages: Json(serde_json::to_value(&w.stages).unwrap_or_default()),
+            created_at: w.created_at,
+            updated_at: w.updated_at,
         }))
     }
 
@@ -434,7 +452,11 @@ impl QueryRoot {
     ) -> Result<Vec<super::types::GqlFinding>> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let findings = state.app_state.pg_db.get_findings_for_task(&task_run_id).await
+        let findings = state
+            .app_state
+            .pg_db
+            .get_findings_for_task(&task_run_id)
+            .await
             .map_err(|e| Error::new(format!("Failed to get findings: {}", e)))?;
 
         Ok(findings
@@ -451,7 +473,11 @@ impl QueryRoot {
     ) -> Result<super::types::GqlFindingSummary> {
         let state = ctx.data::<Arc<ApiState>>()?;
 
-        let summary = state.app_state.pg_db.get_finding_summary(&task_run_id).await
+        let summary = state
+            .app_state
+            .pg_db
+            .get_finding_summary(&task_run_id)
+            .await
             .map_err(|e| Error::new(format!("Failed to get finding summary: {}", e)))?;
 
         Ok(super::types::GqlFindingSummary {
@@ -471,10 +497,7 @@ impl QueryRoot {
     // ======================================================================
 
     /// Get the current runner status.
-    async fn runner_status(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<super::types::GqlRunnerStatus> {
+    async fn runner_status(&self, ctx: &Context<'_>) -> Result<super::types::GqlRunnerStatus> {
         let state = ctx.data::<Arc<ApiState>>()?;
         let app_state = state.app_state.clone();
 
@@ -500,10 +523,8 @@ impl QueryRoot {
             .map_err(|e| Error::new(format!("spawn_blocking: {}", e)))?;
 
         let ai_running = {
-            let pids = crate::safe_lock::safe_lock_or_recover(
-                &state.current_ai_pids,
-                "current_ai_pids",
-            );
+            let pids =
+                crate::safe_lock::safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
             !pids.is_empty()
         };
         let port = state
@@ -596,10 +617,14 @@ impl QueryRoot {
         let state = ctx.data::<Arc<ApiState>>()?;
 
         let status_strs: Option<Vec<String>> = status.map(|s| vec![s]);
-        let status_refs: Option<Vec<&str>> = status_strs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let status_refs: Option<Vec<&str>> = status_strs
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
 
         let severity_strs: Option<Vec<String>> = severity.map(|s| vec![s]);
-        let severity_refs: Option<Vec<&str>> = severity_strs.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
+        let severity_refs: Option<Vec<&str>> = severity_strs
+            .as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect());
 
         let pg_rows = state
             .app_state
@@ -641,9 +666,8 @@ impl QueryRoot {
             .await
             .map_err(|e| Error::new(format!("Failed to get error summary: {}", e)))?;
 
-        let summary: crate::error_monitor::types::ErrorSummary =
-            serde_json::from_value(pg_summary)
-                .map_err(|e| Error::new(format!("Failed to deserialize error summary: {}", e)))?;
+        let summary: crate::error_monitor::types::ErrorSummary = serde_json::from_value(pg_summary)
+            .map_err(|e| Error::new(format!("Failed to deserialize error summary: {}", e)))?;
 
         Ok(super::types::GqlErrorSummary {
             total_count: summary.total as i32,
@@ -703,11 +727,7 @@ pub(crate) async fn build_health_snapshot(state: &Arc<ApiState>) -> UiBridgeHeal
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
     let now_ms = now_epoch_ms();
-    let pong_age_ms = if last_pong > 0 {
-        now_ms - last_pong
-    } else {
-        0
-    };
+    let pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
     let responsive = last_pong > 0 && pong_age_ms < 15000;
     let pending_count = pending_count_with_timeout(state).await;
     let cb_state = state.ui_bridge_circuit_breaker.get_state().await;

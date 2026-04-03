@@ -4,8 +4,8 @@
 //! This enables historical queries on events while keeping JSONL for real-time streaming.
 
 use crate::database::{
-    CreateTaskRunApiRequestInput, CreateTaskRunEventInput,
-    CreateTaskRunPlaywrightResultInput, CreateTaskRunScreenshotInput,
+    CreateTaskRunApiRequestInput, CreateTaskRunEventInput, CreateTaskRunPlaywrightResultInput,
+    CreateTaskRunScreenshotInput,
 };
 use crate::iteration_bundle::{ActionEvent, ImageRecognitionEvent, PlaywrightLogs};
 use serde::{Deserialize, Serialize};
@@ -125,10 +125,7 @@ fn migrate_image_recognition_events(
 }
 
 /// Migrate Playwright results from runner-playwright.jsonl
-fn migrate_playwright_results(
-    task_run_id: &str,
-    path: &Path,
-) -> Result<usize, String> {
+fn migrate_playwright_results(task_run_id: &str, path: &Path) -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -142,10 +139,7 @@ fn migrate_ai_output_events(
 }
 
 /// Migrate API request events from runner-api-requests.jsonl
-fn migrate_api_request_events(
-    task_run_id: &str,
-    path: &Path,
-) -> Result<usize, String> {
+fn migrate_api_request_events(task_run_id: &str, path: &Path) -> Result<usize, String> {
     Err("SQLite removed".to_string())
 }
 

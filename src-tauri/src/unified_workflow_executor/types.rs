@@ -728,7 +728,9 @@ impl AgenticOutcome {
         match self {
             AgenticOutcome::Success { output, .. } => Some(output),
             AgenticOutcome::Failed { output, .. } => Some(output),
-            AgenticOutcome::Error { error } | AgenticOutcome::BudgetExceeded { reason: error } => Some(error),
+            AgenticOutcome::Error { error } | AgenticOutcome::BudgetExceeded { reason: error } => {
+                Some(error)
+            }
             AgenticOutcome::Skipped => None,
         }
     }
@@ -746,7 +748,9 @@ impl AgenticOutcome {
                 output_tokens,
                 ..
             } => (*input_tokens, *output_tokens),
-            AgenticOutcome::Error { .. } | AgenticOutcome::BudgetExceeded { .. } | AgenticOutcome::Skipped => (None, None),
+            AgenticOutcome::Error { .. }
+            | AgenticOutcome::BudgetExceeded { .. }
+            | AgenticOutcome::Skipped => (None, None),
         }
     }
 
@@ -755,7 +759,9 @@ impl AgenticOutcome {
         match self {
             AgenticOutcome::Success { parsed, .. } => parsed.as_ref(),
             AgenticOutcome::Failed { parsed, .. } => parsed.as_ref(),
-            AgenticOutcome::Error { .. } | AgenticOutcome::BudgetExceeded { .. } | AgenticOutcome::Skipped => None,
+            AgenticOutcome::Error { .. }
+            | AgenticOutcome::BudgetExceeded { .. }
+            | AgenticOutcome::Skipped => None,
         }
     }
 }

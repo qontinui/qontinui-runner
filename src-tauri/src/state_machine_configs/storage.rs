@@ -18,10 +18,7 @@ pub fn insert_config(req: &CreateSmConfigRequest) -> Result<SmConfig, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn update_config(
-    id: &str,
-    req: &UpdateSmConfigRequest,
-) -> Result<SmConfig, String> {
+pub fn update_config(id: &str, req: &UpdateSmConfigRequest) -> Result<SmConfig, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -51,17 +48,11 @@ pub fn get_state(id: &str) -> Result<Option<SmState>, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn insert_state(
-    config_id: &str,
-    req: &CreateSmStateRequest,
-) -> Result<SmState, String> {
+pub fn insert_state(config_id: &str, req: &CreateSmStateRequest) -> Result<SmState, String> {
     Err("SQLite removed".to_string())
 }
 
-pub fn update_state(
-    id: &str,
-    req: &UpdateSmStateRequest,
-) -> Result<SmState, String> {
+pub fn update_state(id: &str, req: &UpdateSmStateRequest) -> Result<SmState, String> {
     Err("SQLite removed".to_string())
 }
 

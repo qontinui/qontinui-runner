@@ -133,7 +133,9 @@ impl RoutingConfig {
         ];
 
         fn is_valid(model: &str) -> bool {
-            VALID_PREFIXES.iter().any(|prefix| model.starts_with(prefix))
+            VALID_PREFIXES
+                .iter()
+                .any(|prefix| model.starts_with(prefix))
                 || model.is_empty() // Empty = use default
         }
 
@@ -453,7 +455,10 @@ impl TaskRouter {
         &self,
         context: &TaskContext,
         bandit: &mut crate::online_learning::model_router::ModelRouterBandit,
-    ) -> (String, crate::online_learning::model_router::ModelRoutingDecision) {
+    ) -> (
+        String,
+        crate::online_learning::model_router::ModelRoutingDecision,
+    ) {
         use crate::online_learning::context::ModelRoutingContext;
 
         // Build bandit context from TaskContext
@@ -465,7 +470,7 @@ impl TaskRouter {
                 format!("{:?}", assessment.complexity).to_lowercase()
             },
             domain: "unknown".to_string(), // Domain not available at routing time
-            has_ui: false, // Not reliably available at routing time
+            has_ui: false,                 // Not reliably available at routing time
             step_type: context.phase.clone(),
         };
 

@@ -151,12 +151,15 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
         // PHASE 1: SETUP (each phase is a separate ctx.run() for journal replay)
         // =====================================================================
         info!(execution_id = %execution_id, "Phase 1/4: Setup");
-        ctx.set(STATE_KEY, DurableWorkflowState {
-            execution_id: execution_id.clone(),
-            workflow_name: String::from("workflow"),
-            phase: DurablePhase::Setup,
-            ..Default::default()
-        });
+        ctx.set(
+            STATE_KEY,
+            DurableWorkflowState {
+                execution_id: execution_id.clone(),
+                workflow_name: String::from("workflow"),
+                phase: DurablePhase::Setup,
+                ..Default::default()
+            },
+        );
 
         // Setup automation steps — journaled as a single side effect
         let setup_result: super::durable_executor::PhaseResult = {
@@ -167,17 +170,24 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             ctx.run(|| async move {
                 super::durable_executor::execute_steps_batch(
                     &as_clone, &cs_clone, &steps, "setup", None, &eid, None,
-                ).await
-            }).name("phase-setup-auto").await
-                .map_err(|e| TerminalError::new(format!("Setup failed: {}", e)))?
+                )
+                .await
+            })
+            .name("phase-setup-auto")
+            .await
+            .map_err(|e| TerminalError::new(format!("Setup failed: {}", e)))?
         };
 
         if !setup_result.success {
             let output = WorkflowOutput {
-                success: false, verification_passed: false, iterations_run: 0,
-                critical_failure: true, was_stopped: false,
+                success: false,
+                verification_passed: false,
+                iterations_run: 0,
+                critical_failure: true,
+                was_stopped: false,
                 duration_ms: start_time.elapsed().as_millis() as u64,
-                files_modified: vec![], error: setup_result.failure_context,
+                files_modified: vec![],
+                error: setup_result.failure_context,
             };
             if let Err(e) = pg_db.update_task_run_status(&execution_id, "failed").await {
                 warn!(execution_id = %execution_id, "Failed to update status: {}", e);
@@ -193,10 +203,19 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             let eid = execution_id.clone();
             ctx.run(|| async move {
                 super::durable_executor::execute_steps_batch(
-                    &as_clone, &cs_clone, &steps, "setup_prompt", None, &eid, None,
-                ).await
-            }).name("phase-setup-prompt").await
-                .map_err(|e| TerminalError::new(format!("Setup prompts failed: {}", e)))?
+                    &as_clone,
+                    &cs_clone,
+                    &steps,
+                    "setup_prompt",
+                    None,
+                    &eid,
+                    None,
+                )
+                .await
+            })
+            .name("phase-setup-prompt")
+            .await
+            .map_err(|e| TerminalError::new(format!("Setup prompts failed: {}", e)))?
         };
 
         // =====================================================================
@@ -218,13 +237,16 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             }
 
             // Update state for this iteration
-            ctx.set(STATE_KEY, DurableWorkflowState {
-                execution_id: execution_id.clone(),
-                workflow_name: String::from("workflow"),
-                phase: DurablePhase::Verification,
-                iteration,
-                ..Default::default()
-            });
+            ctx.set(
+                STATE_KEY,
+                DurableWorkflowState {
+                    execution_id: execution_id.clone(),
+                    workflow_name: String::from("workflow"),
+                    phase: DurablePhase::Verification,
+                    iteration,
+                    ..Default::default()
+                },
+            );
 
             // Verification — journaled per iteration
             let v_result: super::durable_executor::PhaseResult = {
@@ -235,10 +257,19 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 let iter = iteration;
                 ctx.run(|| async move {
                     super::durable_executor::execute_steps_batch(
-                        &as_clone, &cs_clone, &steps, "verification", Some(iter), &eid, None,
-                    ).await
-                }).name(&format!("phase-verify-{}", iteration)).await
-                    .map_err(|e| TerminalError::new(format!("Verification failed: {}", e)))?
+                        &as_clone,
+                        &cs_clone,
+                        &steps,
+                        "verification",
+                        Some(iter),
+                        &eid,
+                        None,
+                    )
+                    .await
+                })
+                .name(&format!("phase-verify-{}", iteration))
+                .await
+                .map_err(|e| TerminalError::new(format!("Verification failed: {}", e)))?
             };
 
             iterations_run = iteration;
@@ -249,18 +280,22 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 break;
             }
 
-            let failure_ctx = v_result.failure_context
+            let failure_ctx = v_result
+                .failure_context
                 .unwrap_or_else(|| "Verification failed".to_string());
 
             // Agentic — journaled per iteration
             if iteration < max_iterations {
-                ctx.set(STATE_KEY, DurableWorkflowState {
-                    execution_id: execution_id.clone(),
-                    workflow_name: String::from("workflow"),
-                    phase: DurablePhase::Agentic,
-                    iteration,
-                    ..Default::default()
-                });
+                ctx.set(
+                    STATE_KEY,
+                    DurableWorkflowState {
+                        execution_id: execution_id.clone(),
+                        workflow_name: String::from("workflow"),
+                        phase: DurablePhase::Agentic,
+                        iteration,
+                        ..Default::default()
+                    },
+                );
 
                 let _a_result: super::durable_executor::PhaseResult = {
                     let as_clone = app_state.clone();
@@ -271,11 +306,19 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                     let fail_ctx = failure_ctx.clone();
                     ctx.run(|| async move {
                         super::durable_executor::execute_steps_batch(
-                            &as_clone, &cs_clone, &steps, "agentic", Some(iter), &eid,
+                            &as_clone,
+                            &cs_clone,
+                            &steps,
+                            "agentic",
+                            Some(iter),
+                            &eid,
                             Some(&fail_ctx),
-                        ).await
-                    }).name(&format!("phase-agentic-{}", iteration)).await
-                        .map_err(|e| TerminalError::new(format!("Agentic failed: {}", e)))?
+                        )
+                        .await
+                    })
+                    .name(&format!("phase-agentic-{}", iteration))
+                    .await
+                    .map_err(|e| TerminalError::new(format!("Agentic failed: {}", e)))?
                 };
             }
 
@@ -287,13 +330,16 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
         // =====================================================================
         if verification_passed {
             info!(execution_id = %execution_id, "Phase 4/4: Completion");
-            ctx.set(STATE_KEY, DurableWorkflowState {
-                execution_id: execution_id.clone(),
-                workflow_name: String::from("workflow"),
-                phase: DurablePhase::Completion,
-                verification_passed: true,
-                ..Default::default()
-            });
+            ctx.set(
+                STATE_KEY,
+                DurableWorkflowState {
+                    execution_id: execution_id.clone(),
+                    workflow_name: String::from("workflow"),
+                    phase: DurablePhase::Completion,
+                    verification_passed: true,
+                    ..Default::default()
+                },
+            );
 
             // Completion automation
             let _c_result: super::durable_executor::PhaseResult = {
@@ -303,10 +349,19 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 let eid = execution_id.clone();
                 ctx.run(|| async move {
                     super::durable_executor::execute_steps_batch(
-                        &as_clone, &cs_clone, &steps, "completion", None, &eid, None,
-                    ).await
-                }).name("phase-completion-auto").await
-                    .map_err(|e| TerminalError::new(format!("Completion failed: {}", e)))?
+                        &as_clone,
+                        &cs_clone,
+                        &steps,
+                        "completion",
+                        None,
+                        &eid,
+                        None,
+                    )
+                    .await
+                })
+                .name("phase-completion-auto")
+                .await
+                .map_err(|e| TerminalError::new(format!("Completion failed: {}", e)))?
             };
 
             // Completion prompts
@@ -317,10 +372,19 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 let eid = execution_id.clone();
                 ctx.run(|| async move {
                     super::durable_executor::execute_steps_batch(
-                        &as_clone, &cs_clone, &steps, "completion_prompt", None, &eid, None,
-                    ).await
-                }).name("phase-completion-prompt").await
-                    .map_err(|e| TerminalError::new(format!("Completion prompts failed: {}", e)))?
+                        &as_clone,
+                        &cs_clone,
+                        &steps,
+                        "completion_prompt",
+                        None,
+                        &eid,
+                        None,
+                    )
+                    .await
+                })
+                .name("phase-completion-prompt")
+                .await
+                .map_err(|e| TerminalError::new(format!("Completion prompts failed: {}", e)))?
             };
         }
 
@@ -333,31 +397,47 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
         // Collect modified files via git
         let files_modified: Vec<String> = {
             let as_clone = app_state.clone();
-            ctx.run(|| async move {
-                super::durable_executor::get_modified_files().await
-            }).name("collect-modified-files").await
+            ctx.run(|| async move { super::durable_executor::get_modified_files().await })
+                .name("collect-modified-files")
+                .await
                 .unwrap_or_default()
         };
 
-        let final_status = if success { "complete" } else if was_stopped { "stopped" } else { "failed" };
-        if let Err(e) = pg_db.update_task_run_status(&execution_id, final_status).await {
+        let final_status = if success {
+            "complete"
+        } else if was_stopped {
+            "stopped"
+        } else {
+            "failed"
+        };
+        if let Err(e) = pg_db
+            .update_task_run_status(&execution_id, final_status)
+            .await
+        {
             warn!(execution_id = %execution_id, "Failed to update final status: {}", e);
         }
 
         // Update final Restate state
-        let final_phase = if was_stopped { DurablePhase::Stopped }
-            else if success { DurablePhase::Completed }
-            else { DurablePhase::Failed };
+        let final_phase = if was_stopped {
+            DurablePhase::Stopped
+        } else if success {
+            DurablePhase::Completed
+        } else {
+            DurablePhase::Failed
+        };
 
-        ctx.set(STATE_KEY, DurableWorkflowState {
-            execution_id: execution_id.clone(),
-            workflow_name: String::from("workflow"),
-            phase: final_phase,
-            iteration: iterations_run,
-            verification_passed,
-            stop_requested: was_stopped,
-            ..Default::default()
-        });
+        ctx.set(
+            STATE_KEY,
+            DurableWorkflowState {
+                execution_id: execution_id.clone(),
+                workflow_name: String::from("workflow"),
+                phase: final_phase,
+                iteration: iterations_run,
+                verification_passed,
+                stop_requested: was_stopped,
+                ..Default::default()
+            },
+        );
 
         // If failed, execute saga compensations
         if !success && !was_stopped {
@@ -406,17 +486,15 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
         &self,
         ctx: SharedWorkflowContext<'_>,
     ) -> Result<DurableWorkflowState, TerminalError> {
-        let state: Option<DurableWorkflowState> = ctx.get(STATE_KEY).await.map_err(|e| {
-            TerminalError::new(format!("Failed to read state: {}", e))
-        })?;
+        let state: Option<DurableWorkflowState> = ctx
+            .get(STATE_KEY)
+            .await
+            .map_err(|e| TerminalError::new(format!("Failed to read state: {}", e)))?;
 
         Ok(state.unwrap_or_default())
     }
 
-    async fn request_stop(
-        &self,
-        ctx: SharedWorkflowContext<'_>,
-    ) -> Result<(), TerminalError> {
+    async fn request_stop(&self, ctx: SharedWorkflowContext<'_>) -> Result<(), TerminalError> {
         let execution_id = ctx.key().to_string();
         warn!(
             execution_id = %execution_id,
@@ -436,10 +514,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
                 execution_id = %execution_id,
                 "Failed to set cancelling status in PG: {}", e
             );
-            return Err(TerminalError::new(format!(
-                "Failed to request stop: {}",
-                e
-            )));
+            return Err(TerminalError::new(format!("Failed to request stop: {}", e)));
         }
 
         info!(
@@ -469,9 +544,7 @@ impl QontinuiWorkflow for QontinuiWorkflowImpl {
             .pg_db
             .get_pending_awakeables(&execution_id)
             .await
-            .map_err(|e| {
-                TerminalError::new(format!("Failed to get pending awakeables: {}", e))
-            })?;
+            .map_err(|e| TerminalError::new(format!("Failed to get pending awakeables: {}", e)))?;
 
         if let Some(awakeable) = pending.first() {
             let restate_settings = crate::settings::load_settings().restate;
@@ -556,9 +629,10 @@ impl WorkflowStateObject for WorkflowStateObjectImpl {
         &self,
         ctx: SharedObjectContext<'_>,
     ) -> Result<DurableWorkflowState, TerminalError> {
-        let state: Option<DurableWorkflowState> = ctx.get(STATE_KEY).await.map_err(|e| {
-            TerminalError::new(format!("Failed to read state: {}", e))
-        })?;
+        let state: Option<DurableWorkflowState> = ctx
+            .get(STATE_KEY)
+            .await
+            .map_err(|e| TerminalError::new(format!("Failed to read state: {}", e)))?;
 
         Ok(state.unwrap_or_default())
     }
@@ -593,10 +667,11 @@ impl WorkflowStateObject for WorkflowStateObjectImpl {
             "Recording compensation action"
         );
 
-        let mut compensations: Vec<CompensationAction> =
-            ctx.get(COMPENSATIONS_KEY).await.map_err(|e| {
-                TerminalError::new(format!("Failed to read compensations: {}", e))
-            })?.unwrap_or_default();
+        let mut compensations: Vec<CompensationAction> = ctx
+            .get(COMPENSATIONS_KEY)
+            .await
+            .map_err(|e| TerminalError::new(format!("Failed to read compensations: {}", e)))?
+            .unwrap_or_default();
 
         compensations.push(action);
         ctx.set(COMPENSATIONS_KEY, compensations);
@@ -608,10 +683,11 @@ impl WorkflowStateObject for WorkflowStateObjectImpl {
         &self,
         ctx: SharedObjectContext<'_>,
     ) -> Result<Vec<CompensationAction>, TerminalError> {
-        let compensations: Vec<CompensationAction> =
-            ctx.get(COMPENSATIONS_KEY).await.map_err(|e| {
-                TerminalError::new(format!("Failed to read compensations: {}", e))
-            })?.unwrap_or_default();
+        let compensations: Vec<CompensationAction> = ctx
+            .get(COMPENSATIONS_KEY)
+            .await
+            .map_err(|e| TerminalError::new(format!("Failed to read compensations: {}", e)))?
+            .unwrap_or_default();
 
         Ok(compensations)
     }

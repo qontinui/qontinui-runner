@@ -121,8 +121,7 @@ pub struct WorkflowListItem {
 
 /// List unified workflows (id + name only) for campaign configuration.
 #[tauri::command]
-pub async fn list_unified_workflows(
-) -> Result<Vec<WorkflowListItem>, String> {
+pub async fn list_unified_workflows() -> Result<Vec<WorkflowListItem>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -138,9 +137,7 @@ async fn load_q_rows_pg_first(
 }
 
 /// Load overrides from PG.
-async fn load_overrides_pg_first(
-    app_state: &crate::commands::AppState,
-) -> Vec<(String, String)> {
+async fn load_overrides_pg_first(app_state: &crate::commands::AppState) -> Vec<(String, String)> {
     Vec::new()
 }
 
@@ -227,8 +224,7 @@ pub struct WorktreeListEntry {
 
 /// List all managed worktrees from the database.
 #[tauri::command]
-pub async fn list_worktree_records(
-) -> Result<Vec<WorktreeListEntry>, String> {
+pub async fn list_worktree_records() -> Result<Vec<WorktreeListEntry>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -241,9 +237,7 @@ pub struct WorktreeDiffResult {
 
 /// Get diff for a worktree branch, looking up repo/source from the DB.
 #[tauri::command]
-pub async fn get_worktree_diff(
-    branch_name: String,
-) -> Result<WorktreeDiffResult, String> {
+pub async fn get_worktree_diff(branch_name: String) -> Result<WorktreeDiffResult, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -258,22 +252,17 @@ pub async fn merge_worktree_branch(
 
 /// Remove a worktree and optionally delete its branch.
 #[tauri::command]
-pub async fn remove_worktree_branch(
-    branch_name: String,
-) -> Result<serde_json::Value, String> {
+pub async fn remove_worktree_branch(branch_name: String) -> Result<serde_json::Value, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Compare all active worktree branches.
 #[tauri::command]
-pub async fn compare_worktree_branches(
-) -> Result<serde_json::Value, String> {
+pub async fn compare_worktree_branches() -> Result<serde_json::Value, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Helper: find a worktree record by branch name.
-fn find_worktree_by_branch(
-    branch_name: &str,
-) -> Result<worktree::WorktreeRecord, String> {
+fn find_worktree_by_branch(branch_name: &str) -> Result<worktree::WorktreeRecord, String> {
     Err("SQLite removed".to_string())
 }

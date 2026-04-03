@@ -56,7 +56,10 @@ pub fn build_schema_context_full(
         let pg_clone = pg.clone();
         let desc = description.to_string();
         let examples = tokio::runtime::Handle::current().block_on(async {
-            pg_clone.search_unified_workflows_for_examples(&desc, 3).await.unwrap_or_default()
+            pg_clone
+                .search_unified_workflows_for_examples(&desc, 3)
+                .await
+                .unwrap_or_default()
         });
         if !examples.is_empty() {
             // Format PG example workflows for prompt context
@@ -80,10 +83,14 @@ pub fn build_schema_context_full(
     // Load step type knowledge filtered to relevant step types via PG
     let knowledge_section = if let Some(pg) = pg_db {
         let pg_clone = pg.clone();
-        let step_type_names: Vec<String> = filtered.iter().map(|m| m.step_type.to_string()).collect();
+        let step_type_names: Vec<String> =
+            filtered.iter().map(|m| m.step_type.to_string()).collect();
         let entries = tokio::runtime::Handle::current().block_on(async {
             let refs: Vec<&str> = step_type_names.iter().map(|s| s.as_str()).collect();
-            pg_clone.load_knowledge_for_step_types(&refs).await.unwrap_or_default()
+            pg_clone
+                .load_knowledge_for_step_types(&refs)
+                .await
+                .unwrap_or_default()
         });
         if !entries.is_empty() {
             step_type_knowledge::format_knowledge_as_markdown(&entries)
@@ -142,7 +149,12 @@ pub fn build_schema_context_partitioned(
         if !examples.is_empty() {
             let mut s = String::from("## Examples\n\n");
             for (i, wf) in examples.iter().take(3).enumerate() {
-                s.push_str(&format!("### Example {} — {}\n{}\n\n", i + 1, wf.name, wf.description));
+                s.push_str(&format!(
+                    "### Example {} — {}\n{}\n\n",
+                    i + 1,
+                    wf.name,
+                    wf.description
+                ));
             }
             dynamic_parts.push(s);
         }
@@ -170,9 +182,8 @@ fn assemble_prompt(
     confidence_section: &str,
     _pg_db: Option<&Arc<PgDb>>,
 ) -> String {
-    let mut parts = vec![
-        "You are a workflow generation assistant for Qontinui Runner.\n".to_string(),
-    ];
+    let mut parts =
+        vec!["You are a workflow generation assistant for Qontinui Runner.\n".to_string()];
     if !step_types_doc.is_empty() {
         parts.push(format!("## Step Types\n\n{}", step_types_doc));
     }

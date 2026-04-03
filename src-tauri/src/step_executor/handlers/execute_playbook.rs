@@ -46,10 +46,8 @@ struct PlaybookStep {
 fn parse_playbook(content: &str) -> Vec<PlaybookStep> {
     let step_header_re = Regex::new(r"###\s+Step\s+(\d+):\s*(.+)").unwrap();
     let action_re = Regex::new(r"-\s+\*\*Action\*\*:\s*(.+)").unwrap();
-    let transition_re =
-        Regex::new(r"-\s+\*\*Transition\*\*:\s*(.+?)\s*→\s*(.+)").unwrap();
-    let variable_re =
-        Regex::new(r"-\s+\*\*Variable\*\*:\s*`?\{\{(\w+)\}\}`?").unwrap();
+    let transition_re = Regex::new(r"-\s+\*\*Transition\*\*:\s*(.+?)\s*→\s*(.+)").unwrap();
+    let variable_re = Regex::new(r"-\s+\*\*Variable\*\*:\s*`?\{\{(\w+)\}\}`?").unwrap();
 
     let mut steps: Vec<PlaybookStep> = Vec::new();
     let mut current: Option<PlaybookStep> = None;
@@ -139,8 +137,13 @@ fn parse_action_description(desc: &str) -> (String, String) {
 
     if desc_lower.starts_with("type") || desc_lower.starts_with("enter") {
         // For "type X into Y", the target is Y (after "into"/"in")
-        if let Some(pos) = desc_lower.find(" into ").or_else(|| desc_lower.find(" in ")) {
-            let after = &desc[pos..].trim_start_matches(" into ").trim_start_matches(" in ");
+        if let Some(pos) = desc_lower
+            .find(" into ")
+            .or_else(|| desc_lower.find(" in "))
+        {
+            let after = &desc[pos..]
+                .trim_start_matches(" into ")
+                .trim_start_matches(" in ");
             let target = after.trim().trim_matches('"').to_string();
             return ("TYPE".to_string(), target);
         }
@@ -234,12 +237,7 @@ impl StepHandler for ExecutePlaybookHandler {
 
                 match context
                     .action_service
-                    .go_to_state(
-                        &resolved_target,
-                        None,
-                        None,
-                        Some(timeout_per_step),
-                    )
+                    .go_to_state(&resolved_target, None, None, Some(timeout_per_step))
                     .await
                 {
                     Ok(result) => {
@@ -298,10 +296,7 @@ impl StepHandler for ExecutePlaybookHandler {
                 // If the target is a natural-language description (e.g., "Sign In"),
                 // the action service may not be able to resolve it. In that case,
                 // we log a warning and skip rather than failing the entire playbook.
-                info!(
-                    "Playbook step {} action: {}",
-                    pb_step.number, action_desc,
-                );
+                info!("Playbook step {} action: {}", pb_step.number, action_desc,);
 
                 let (action_type, target) = parse_action_description(action_desc);
 
@@ -327,12 +322,7 @@ impl StepHandler for ExecutePlaybookHandler {
 
                 match context
                     .action_service
-                    .execute_action(
-                        &action_type,
-                        &target,
-                        None,
-                        None,
-                    )
+                    .execute_action(&action_type, &target, None, None)
                     .await
                 {
                     Ok(result) => {
@@ -356,10 +346,7 @@ impl StepHandler for ExecutePlaybookHandler {
                         }
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "Playbook step {} action error: {}",
-                            pb_step.number, e,
-                        );
+                        let msg = format!("Playbook step {} action error: {}", pb_step.number, e,);
                         error!("{}", msg);
                         failed = true;
                         failure_message = msg;

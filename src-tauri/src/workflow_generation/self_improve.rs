@@ -349,8 +349,14 @@ mod tests {
 ///
 /// PG equivalent of `analyze_generation_patterns`. Queries the same tables
 /// (task_run_findings, learning_outcomes, workflow_generation_feedback) via raw SQL.
-pub async fn analyze_generation_patterns_pg(pg: &Arc<PgDb>) -> Result<SelfImprovementContext, String> {
-    let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+pub async fn analyze_generation_patterns_pg(
+    pg: &Arc<PgDb>,
+) -> Result<SelfImprovementContext, String> {
+    let conn = pg
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool error: {}", e))?;
 
     // Common verifier issues
     let common_verifier_issues: Vec<(String, i64)> = conn
@@ -366,7 +372,11 @@ pub async fn analyze_generation_patterns_pg(pg: &Arc<PgDb>) -> Result<SelfImprov
             &[],
         )
         .await
-        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Fixer failures
@@ -381,7 +391,11 @@ pub async fn analyze_generation_patterns_pg(pg: &Arc<PgDb>) -> Result<SelfImprov
             &[],
         )
         .await
-        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Success rates by category
@@ -406,7 +420,17 @@ pub async fn analyze_generation_patterns_pg(pg: &Arc<PgDb>) -> Result<SelfImprov
             &[],
         )
         .await
-        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1), r.get::<_, i64>(2))).collect())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>(0),
+                        r.get::<_, i64>(1),
+                        r.get::<_, i64>(2),
+                    )
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     // Commonly edited fields
@@ -421,7 +445,11 @@ pub async fn analyze_generation_patterns_pg(pg: &Arc<PgDb>) -> Result<SelfImprov
             &[],
         )
         .await
-        .map(|rows| rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1))).collect())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Delete rate

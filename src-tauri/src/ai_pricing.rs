@@ -320,7 +320,11 @@ pub fn calculate_cost_cents_with_cache(
 ) -> Option<u32> {
     let _ = get_pricing(model_id)?;
     let cost_usd = calculate_cost_usd_with_cache(
-        input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, model_id,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        model_id,
     );
     Some((cost_usd * 100.0).round() as u32)
 }
@@ -336,9 +340,17 @@ mod tests {
     #[test]
     fn test_calculate_cost_usd_with_cache() {
         let cost = calculate_cost_usd_with_cache(
-            100_000, 10_000, 50_000, 200_000, "claude-sonnet-4-20250514",
+            100_000,
+            10_000,
+            50_000,
+            200_000,
+            "claude-sonnet-4-20250514",
         );
-        assert!((cost - 0.6975).abs() < 0.001, "Expected ~0.6975, got {}", cost);
+        assert!(
+            (cost - 0.6975).abs() < 0.001,
+            "Expected ~0.6975, got {}",
+            cost
+        );
 
         let cost = calculate_cost_usd_with_cache(0, 0, 0, 0, "claude-sonnet-4-20250514");
         assert_eq!(cost, 0.0);
@@ -347,7 +359,11 @@ mod tests {
     #[test]
     fn test_calculate_cache_savings() {
         let savings = calculate_cache_savings_usd(200_000, "claude-sonnet-4-20250514");
-        assert!((savings - 0.54).abs() < 0.001, "Expected ~0.54, got {}", savings);
+        assert!(
+            (savings - 0.54).abs() < 0.001,
+            "Expected ~0.54, got {}",
+            savings
+        );
 
         let savings = calculate_cache_savings_usd(0, "claude-sonnet-4-20250514");
         assert_eq!(savings, 0.0);

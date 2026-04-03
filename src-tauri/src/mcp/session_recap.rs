@@ -4,13 +4,7 @@
 //! recap: files changed, types defined, endpoints added, database changes,
 //! cross-language dependency edges, and an optional AI narrative.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -365,7 +359,13 @@ fn resolve_lookback_ref(repo_path: &Path, lookback: &str) -> String {
                 // Find the oldest commit in this time range
                 let result = run_git(
                     repo_path,
-                    &["log", "--reverse", "--format=%H", &format!("--since={}", since), "-1"],
+                    &[
+                        "log",
+                        "--reverse",
+                        "--format=%H",
+                        &format!("--since={}", since),
+                        "-1",
+                    ],
                 );
                 match result {
                     Ok(hash) if !hash.trim().is_empty() => {
@@ -385,11 +385,7 @@ fn resolve_lookback_ref(repo_path: &Path, lookback: &str) -> String {
     }
 }
 
-fn collect_file_changes(
-    repo_name: &str,
-    repo_path: &Path,
-    diff_ref: &str,
-) -> Vec<FileChange> {
+fn collect_file_changes(repo_name: &str, repo_path: &Path, diff_ref: &str) -> Vec<FileChange> {
     let mut changes = Vec::new();
 
     // Use git diff --numstat <ref> to get per-file stats
@@ -906,11 +902,7 @@ fn extract_table_name_after(sql: &str, keyword: &str) -> Option<String> {
     None
 }
 
-fn parse_axum_route(
-    content: &str,
-    file: &str,
-    repo: &str,
-) -> Option<EndpointInfo> {
+fn parse_axum_route(content: &str, file: &str, repo: &str) -> Option<EndpointInfo> {
     // .route("/path", get(handler))
     let route_start = content.find(".route(\"")?;
     let rest = &content[route_start + 8..];

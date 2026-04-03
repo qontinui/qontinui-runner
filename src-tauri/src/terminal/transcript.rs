@@ -43,12 +43,12 @@ pub struct SessionDigest {
     pub session_id: String,
     pub config_dir: String,
     pub project_path: String,
-    pub last_message_type: String,        // "user" | "assistant" | ""
-    pub last_message_timestamp: String,   // ISO 8601
-    pub last_message_preview: String,     // last ~200 chars of text
+    pub last_message_type: String,      // "user" | "assistant" | ""
+    pub last_message_timestamp: String, // ISO 8601
+    pub last_message_preview: String,   // last ~200 chars of text
     pub last_assistant_had_tool_use: bool,
-    pub likely_frozen: bool,              // heuristic: recent + mid-task + not completed
-    pub work_summary_hint: String,        // "Task: {first} — Last: {last_snippet}"
+    pub likely_frozen: bool, // heuristic: recent + mid-task + not completed
+    pub work_summary_hint: String, // "Task: {first} — Last: {last_snippet}"
 }
 
 // ── Config Dir Discovery ─────────────────────────────────────────────────────
@@ -732,17 +732,16 @@ pub fn session_digest(
 
     // Read last ~4KB for efficiency (enough for 2-3 messages)
     let content = {
-        let metadata = fs::metadata(&file_path)
-            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        let metadata =
+            fs::metadata(&file_path).map_err(|e| format!("Failed to read metadata: {}", e))?;
         let file_size = metadata.len();
 
         if file_size <= 4096 {
-            fs::read_to_string(&file_path)
-                .map_err(|e| format!("Failed to read file: {}", e))?
+            fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {}", e))?
         } else {
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = fs::File::open(&file_path)
-                .map_err(|e| format!("Failed to open file: {}", e))?;
+            let mut file =
+                fs::File::open(&file_path).map_err(|e| format!("Failed to open file: {}", e))?;
             file.seek(SeekFrom::End(-4096))
                 .map_err(|e| format!("Failed to seek: {}", e))?;
             let mut bytes = Vec::new();
@@ -856,9 +855,7 @@ pub fn session_digest(
     };
 
     // Build work summary hint
-    let task_part = first_preview
-        .as_deref()
-        .unwrap_or("Unknown task");
+    let task_part = first_preview.as_deref().unwrap_or("Unknown task");
     let last_part = if last_assistant_preview.is_empty() {
         "No assistant output".to_string()
     } else {
@@ -893,9 +890,7 @@ pub fn session_digest(
 }
 
 /// Compute digests for a batch of sessions.
-pub fn session_digests_batch(
-    sessions: &[TranscriptSession],
-) -> Vec<SessionDigest> {
+pub fn session_digests_batch(sessions: &[TranscriptSession]) -> Vec<SessionDigest> {
     sessions
         .iter()
         .filter_map(|s| {
@@ -987,9 +982,7 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
     #[cfg(not(target_os = "windows"))]
     {
         // On Unix, use ps + grep
-        let output = std::process::Command::new("ps")
-            .args(["aux"])
-            .output();
+        let output = std::process::Command::new("ps").args(["aux"]).output();
 
         if let Ok(output) = output {
             let stdout = String::from_utf8_lossy(&output.stdout);

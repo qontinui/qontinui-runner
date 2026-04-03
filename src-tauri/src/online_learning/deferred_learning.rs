@@ -41,15 +41,15 @@ struct BucketStats {
 ///
 /// Queries reviewed deferred questions for the workflow, computes approval
 /// rates by confidence bucket, and adjusts the stored confidence threshold.
-pub async fn update_confidence_threshold(
-    pg: &Arc<crate::database::pg::PgDb>,
-    workflow_id: &str,
-) {
+pub async fn update_confidence_threshold(pg: &Arc<crate::database::pg::PgDb>, workflow_id: &str) {
     // 1. Get all reviewed (non-pending) deferred questions for this workflow
     let questions = match get_reviewed_questions_for_workflow(pg, workflow_id).await {
         Ok(qs) => qs,
         Err(e) => {
-            debug!("Deferred learning: failed to query questions for {}: {}", workflow_id, e);
+            debug!(
+                "Deferred learning: failed to query questions for {}: {}",
+                workflow_id, e
+            );
             return;
         }
     };
@@ -235,12 +235,30 @@ mod tests {
     #[test]
     fn test_bucket_stats_mixed() {
         let questions = vec![
-            ReviewedQuestion { confidence: 0.3, approved: false },
-            ReviewedQuestion { confidence: 0.35, approved: false },
-            ReviewedQuestion { confidence: 0.5, approved: true },
-            ReviewedQuestion { confidence: 0.7, approved: true },
-            ReviewedQuestion { confidence: 0.8, approved: true },
-            ReviewedQuestion { confidence: 0.9, approved: true },
+            ReviewedQuestion {
+                confidence: 0.3,
+                approved: false,
+            },
+            ReviewedQuestion {
+                confidence: 0.35,
+                approved: false,
+            },
+            ReviewedQuestion {
+                confidence: 0.5,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.7,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.8,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.9,
+                approved: true,
+            },
         ];
         let buckets = compute_bucket_stats(&questions);
 
@@ -272,14 +290,38 @@ mod tests {
     #[test]
     fn test_find_threshold_low_confidence_rejected() {
         let questions = vec![
-            ReviewedQuestion { confidence: 0.1, approved: false },
-            ReviewedQuestion { confidence: 0.2, approved: false },
-            ReviewedQuestion { confidence: 0.3, approved: false },
-            ReviewedQuestion { confidence: 0.5, approved: true },
-            ReviewedQuestion { confidence: 0.6, approved: true },
-            ReviewedQuestion { confidence: 0.7, approved: true },
-            ReviewedQuestion { confidence: 0.8, approved: true },
-            ReviewedQuestion { confidence: 0.9, approved: true },
+            ReviewedQuestion {
+                confidence: 0.1,
+                approved: false,
+            },
+            ReviewedQuestion {
+                confidence: 0.2,
+                approved: false,
+            },
+            ReviewedQuestion {
+                confidence: 0.3,
+                approved: false,
+            },
+            ReviewedQuestion {
+                confidence: 0.5,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.6,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.7,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.8,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.9,
+                approved: true,
+            },
         ];
         let buckets = compute_bucket_stats(&questions);
         let threshold = find_optimal_threshold(&buckets);
@@ -292,10 +334,22 @@ mod tests {
     fn test_threshold_clamped() {
         // Edge case: all buckets have high approval rates
         let questions = vec![
-            ReviewedQuestion { confidence: 0.05, approved: true },
-            ReviewedQuestion { confidence: 0.05, approved: true },
-            ReviewedQuestion { confidence: 0.15, approved: true },
-            ReviewedQuestion { confidence: 0.15, approved: true },
+            ReviewedQuestion {
+                confidence: 0.05,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.05,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.15,
+                approved: true,
+            },
+            ReviewedQuestion {
+                confidence: 0.15,
+                approved: true,
+            },
         ];
         let buckets = compute_bucket_stats(&questions);
         let threshold = find_optimal_threshold(&buckets);
@@ -306,9 +360,27 @@ mod tests {
     #[test]
     fn test_format_evidence() {
         let buckets = vec![
-            BucketStats { min: 0.0, max: 0.2, total: 0, approved: 0, approval_rate: 1.0 },
-            BucketStats { min: 0.2, max: 0.4, total: 3, approved: 1, approval_rate: 0.333 },
-            BucketStats { min: 0.4, max: 0.6, total: 5, approved: 4, approval_rate: 0.8 },
+            BucketStats {
+                min: 0.0,
+                max: 0.2,
+                total: 0,
+                approved: 0,
+                approval_rate: 1.0,
+            },
+            BucketStats {
+                min: 0.2,
+                max: 0.4,
+                total: 3,
+                approved: 1,
+                approval_rate: 0.333,
+            },
+            BucketStats {
+                min: 0.4,
+                max: 0.6,
+                total: 5,
+                approved: 4,
+                approval_rate: 0.8,
+            },
         ];
         let evidence = format_evidence(&buckets);
         assert!(evidence.contains("[0.2-0.4): 1/3"));

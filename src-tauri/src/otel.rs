@@ -90,9 +90,8 @@ impl Drop for OtelGuard {
 /// Type alias for the boxed OTel layer.  Using a boxed layer avoids
 /// monomorphisation issues where `OpenTelemetryLayer<Registry, Tracer>` cannot
 /// satisfy `Layer<Layered<..., Registry>>`.
-pub type BoxedOtelLayer = Option<
-    Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
->;
+pub type BoxedOtelLayer =
+    Option<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>>;
 
 /// Initialise the OpenTelemetry tracing pipeline.
 ///
@@ -168,10 +167,7 @@ fn try_init_otel(
         .with_sampler(sampler)
         .with_resource(Resource::new(vec![
             KeyValue::new("service.name", config.service_name.clone()),
-            KeyValue::new(
-                "service.version",
-                env!("CARGO_PKG_VERSION").to_string(),
-            ),
+            KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
         ]))
         .build();
 

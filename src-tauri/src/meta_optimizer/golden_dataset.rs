@@ -3,8 +3,8 @@
 //! Curates test cases from successful historical runs to serve as regression
 //! baselines when evaluating new prompt variants.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::info;
 
@@ -62,7 +62,13 @@ pub fn save_golden_dataset(pg_db: &Arc<PgDb>, dataset: &GoldenDataset) -> Result
     let entry_count = dataset.entries.len() as i64;
 
     tokio::task::block_in_place(|| {
-        Handle::current().block_on(pg_db.save_golden_dataset(&id, &agent_type, &name, &entries_json, entry_count))
+        Handle::current().block_on(pg_db.save_golden_dataset(
+            &id,
+            &agent_type,
+            &name,
+            &entries_json,
+            entry_count,
+        ))
     })?;
     info!("Saved golden dataset {} ({} entries)", id, entry_count);
     Ok(())
@@ -76,10 +82,23 @@ pub fn list_golden_datasets(
     let tuples = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.list_golden_datasets(agent_type))
     })?;
-    let datasets: Vec<GoldenDataset> = tuples.into_iter().map(|(id, agent_type, name, entries_json, created_at, updated_at)| {
-        let entries: Vec<GoldenEntry> = serde_json::from_str(&entries_json).unwrap_or_default();
-        GoldenDataset { id, agent_type, name, entries, created_at, updated_at }
-    }).collect();
+    let datasets: Vec<GoldenDataset> = tuples
+        .into_iter()
+        .map(
+            |(id, agent_type, name, entries_json, created_at, updated_at)| {
+                let entries: Vec<GoldenEntry> =
+                    serde_json::from_str(&entries_json).unwrap_or_default();
+                GoldenDataset {
+                    id,
+                    agent_type,
+                    name,
+                    entries,
+                    created_at,
+                    updated_at,
+                }
+            },
+        )
+        .collect();
     Ok(datasets)
 }
 
@@ -105,20 +124,23 @@ pub fn build_from_history(
         Handle::current().block_on(pg_db.build_golden_entries_from_history(agent_type, limit))
     })?;
 
-    let entries: Vec<GoldenEntry> = raw_entries.into_iter().map(|(task_run_id, task_name, duration_ms, success)| {
-        let input_hash = format!("{:x}", md5_hash(&task_name));
-        GoldenEntry {
-            input_hash,
-            input_summary: task_name,
-            expected_success: true,
-            source_task_run_id: Some(task_run_id),
-            baseline_metrics: Some(GoldenEntryMetrics {
-                iterations: 0,
-                duration_ms: duration_ms as u64,
-                success,
-            }),
-        }
-    }).collect();
+    let entries: Vec<GoldenEntry> = raw_entries
+        .into_iter()
+        .map(|(task_run_id, task_name, duration_ms, success)| {
+            let input_hash = format!("{:x}", md5_hash(&task_name));
+            GoldenEntry {
+                input_hash,
+                input_summary: task_name,
+                expected_success: true,
+                source_task_run_id: Some(task_run_id),
+                baseline_metrics: Some(GoldenEntryMetrics {
+                    iterations: 0,
+                    duration_ms: duration_ms as u64,
+                    success,
+                }),
+            }
+        })
+        .collect();
 
     // Deduplicate by input_hash
     let mut seen = std::collections::HashSet::new();
@@ -150,21 +172,31 @@ pub fn build_from_history(
 /// Save a golden dataset with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use save_golden_dataset directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn save_golden_dataset_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset: &GoldenDataset) -> Result<(), String> {
+pub fn save_golden_dataset_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    dataset: &GoldenDataset,
+) -> Result<(), String> {
     save_golden_dataset(pg_db, dataset)
 }
 
 /// Delete a golden dataset with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use delete_golden_dataset directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn delete_golden_dataset_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, dataset_id: &str) -> Result<(), String> {
+pub fn delete_golden_dataset_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    dataset_id: &str,
+) -> Result<(), String> {
     delete_golden_dataset(pg_db, dataset_id)
 }
 
 /// Build a golden dataset from history with PG dual-write (fire-and-forget).
 #[deprecated(note = "Use build_from_history directly — it is now PG-primary")]
 #[allow(dead_code)]
-pub fn build_from_history_with_pg(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, agent_type: &str, max_entries: usize) -> Result<GoldenDataset, String> {
+pub fn build_from_history_with_pg(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    agent_type: &str,
+    max_entries: usize,
+) -> Result<GoldenDataset, String> {
     build_from_history(pg_db, agent_type, max_entries)
 }
 

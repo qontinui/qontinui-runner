@@ -38,8 +38,16 @@ fn query_total_tokens(
                         .unwrap_or("claude-sonnet-4-20250514"),
                 );
                 return (
-                    if total_tokens > 0 { Some(total_tokens) } else { None },
-                    if total_cost > 0.0 { Some(total_cost) } else { None },
+                    if total_tokens > 0 {
+                        Some(total_tokens)
+                    } else {
+                        None
+                    },
+                    if total_cost > 0.0 {
+                        Some(total_cost)
+                    } else {
+                        None
+                    },
                 );
             }
             return (None, None);
@@ -398,7 +406,8 @@ impl LoopController {
                     iteration_results,
                     final_verdict: None,
                     total_tokens: query_total_tokens(&self.app_state.pg_db, &config.execution_id).0,
-                    total_cost_usd: query_total_tokens(&self.app_state.pg_db, &config.execution_id).1,
+                    total_cost_usd: query_total_tokens(&self.app_state.pg_db, &config.execution_id)
+                        .1,
                 };
                 self.canvas_manager
                     .lock()
@@ -424,7 +433,8 @@ impl LoopController {
                     iteration_results: iteration_results.clone(),
                     final_verdict: iteration_results.last().map(|r| r.verdict.clone()),
                     total_tokens: query_total_tokens(&self.app_state.pg_db, &config.execution_id).0,
-                    total_cost_usd: query_total_tokens(&self.app_state.pg_db, &config.execution_id).1,
+                    total_cost_usd: query_total_tokens(&self.app_state.pg_db, &config.execution_id)
+                        .1,
                 };
                 self.canvas_manager
                     .lock()
@@ -596,7 +606,12 @@ impl LoopController {
                     verdict.confidence * 100.0,
                     verdict.observations,
                 );
-                if let Err(e) = self.app_state.pg_db.append_task_output_ex(&config.execution_id, &verifier_output, false, false).await {
+                if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .append_task_output_ex(&config.execution_id, &verifier_output, false, false)
+                    .await
+                {
                     warn!("PG append_task_output_ex failed: {}", e);
                 }
                 // PG write already done above; SQLite fallback removed
@@ -784,18 +799,26 @@ impl LoopController {
 
                     if !brain_ui.elements.is_empty() {
                         // Build element index text
-                        let element_index: String = brain_ui.elements
+                        let element_index: String = brain_ui
+                            .elements
                             .iter()
-                            .map(|e| format!(
-                                "[{}] \"{}\" {} at ({:.3}, {:.3})",
-                                e.index, e.label, e.element_type,
-                                e.normalized_rect.x, e.normalized_rect.y,
-                            ))
+                            .map(|e| {
+                                format!(
+                                    "[{}] \"{}\" {} at ({:.3}, {:.3})",
+                                    e.index,
+                                    e.label,
+                                    e.element_type,
+                                    e.normalized_rect.x,
+                                    e.normalized_rect.y,
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join("\n");
 
                         // Try to capture and annotate a screenshot for multimodal Brain call
-                        let brain_screenshot = self.try_capture_annotated_screenshot(&brain_ui.elements).await;
+                        let brain_screenshot = self
+                            .try_capture_annotated_screenshot(&brain_ui.elements)
+                            .await;
 
                         // Build Brain prompt
                         let brain_system = format!(
@@ -904,7 +927,9 @@ impl LoopController {
                     Some(format!("Failed: {} (output: {}...)", error, output_preview))
                 }
                 AgenticOutcome::Error { error } => Some(format!("Error: {}", error)),
-                AgenticOutcome::BudgetExceeded { reason } => Some(format!("Budget exceeded: {}", reason)),
+                AgenticOutcome::BudgetExceeded { reason } => {
+                    Some(format!("Budget exceeded: {}", reason))
+                }
                 AgenticOutcome::Skipped => None,
             };
 
@@ -984,7 +1009,12 @@ impl LoopController {
             config.provider_override = original_provider_override.clone();
 
             // Increment session count in DB
-            if let Err(e) = self.app_state.pg_db.append_task_output_ex(&config.execution_id, "", true, false).await {
+            if let Err(e) = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(&config.execution_id, "", true, false)
+                .await
+            {
                 warn!("PG append_task_output_ex (session increment) failed: {}", e);
             }
             // PG write already done above; SQLite fallback removed
@@ -1005,10 +1035,7 @@ impl LoopController {
 
         // Try to get a screenshot from the UI Bridge
         let port = crate::mcp::types::get_mcp_api_port();
-        let url = format!(
-            "http://127.0.0.1:{}/ui-bridge/sdk/control/screenshot",
-            port
-        );
+        let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/control/screenshot", port);
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))

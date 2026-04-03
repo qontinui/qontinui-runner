@@ -138,11 +138,7 @@ impl PgDb {
     }
 
     /// Cleanup old automation records for a config, keeping the most recent N.
-    pub async fn cleanup_old_runs(
-        &self,
-        config_id: &str,
-        keep_count: u32,
-    ) -> Result<u32, String> {
+    pub async fn cleanup_old_runs(&self, config_id: &str, keep_count: u32) -> Result<u32, String> {
         let conn = self
             .pool()
             .get()
@@ -442,10 +438,7 @@ impl PgDb {
     }
 
     /// Get a comparison run by ID.
-    pub async fn get_comparison(
-        &self,
-        id: &str,
-    ) -> Result<Option<serde_json::Value>, String> {
+    pub async fn get_comparison(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
         let conn = self
             .pool()
             .get()
@@ -479,11 +472,7 @@ impl PgDb {
     }
 
     /// Complete a comparison run.
-    pub async fn complete_comparison(
-        &self,
-        id: &str,
-        entries_json: &str,
-    ) -> Result<(), String> {
+    pub async fn complete_comparison(&self, id: &str, entries_json: &str) -> Result<(), String> {
         let conn = self
             .pool()
             .get()
@@ -546,8 +535,10 @@ impl PgDb {
             conditions.join(" AND ")
         );
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&sql, &param_refs)
@@ -558,8 +549,7 @@ impl PgDb {
             .iter()
             .map(|row| {
                 let tags_str: String = row.get(8);
-                let tags: serde_json::Value =
-                    serde_json::from_str(&tags_str).unwrap_or(json!([]));
+                let tags: serde_json::Value = serde_json::from_str(&tags_str).unwrap_or(json!([]));
                 json!({
                     "id": row.get::<_, String>(0),
                     "name": row.get::<_, String>(1),
@@ -677,7 +667,10 @@ impl PgDb {
     }
 
     /// Get prompt variant content by ID.
-    pub async fn get_prompt_variant_content(&self, variant_id: &str) -> Result<Option<String>, String> {
+    pub async fn get_prompt_variant_content(
+        &self,
+        variant_id: &str,
+    ) -> Result<Option<String>, String> {
         let conn = self
             .pool()
             .get()
@@ -733,33 +726,49 @@ impl PgDb {
 
     /// Get config statistics (PG equivalent of tiered_info::get_config_statistics).
     pub async fn get_config_statistics(
-        &self, config_id: &str,
+        &self,
+        config_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let row = conn.query_opt(
-            r#"SELECT config_id, total_runs, successful_runs, failed_runs,
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let row = conn
+            .query_opt(
+                r#"SELECT config_id, total_runs, successful_runs, failed_runs,
                       avg_duration_ms, last_run_at, success_rate, streak_current, streak_best
                FROM config_statistics WHERE config_id = $1"#,
-            &[&config_id],
-        ).await.map_err(|e| format!("PG get_config_statistics: {}", e))?;
-        Ok(row.map(|r| json!({
-            "config_id": r.get::<_, String>(0),
-            "total_runs": r.get::<_, i64>(1),
-            "successful_runs": r.get::<_, i64>(2),
-            "failed_runs": r.get::<_, i64>(3),
-            "avg_duration_ms": r.get::<_, Option<f64>>(4),
-            "last_run_at": r.get::<_, Option<String>>(5),
-            "success_rate": r.get::<_, Option<f64>>(6),
-            "streak_current": r.get::<_, Option<i64>>(7),
-            "streak_best": r.get::<_, Option<i64>>(8),
-        })))
+                &[&config_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_config_statistics: {}", e))?;
+        Ok(row.map(|r| {
+            json!({
+                "config_id": r.get::<_, String>(0),
+                "total_runs": r.get::<_, i64>(1),
+                "successful_runs": r.get::<_, i64>(2),
+                "failed_runs": r.get::<_, i64>(3),
+                "avg_duration_ms": r.get::<_, Option<f64>>(4),
+                "last_run_at": r.get::<_, Option<String>>(5),
+                "success_rate": r.get::<_, Option<f64>>(6),
+                "streak_current": r.get::<_, Option<i64>>(7),
+                "streak_best": r.get::<_, Option<i64>>(8),
+            })
+        }))
     }
 
     /// Get flaky transitions for a config.
     pub async fn get_flaky_transitions(
-        &self, config_id: &str, threshold: f64,
+        &self,
+        config_id: &str,
+        threshold: f64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let rows = conn.query(
             r#"SELECT transition_id, total_attempts, failure_count,
                       failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT as failure_rate
@@ -768,19 +777,30 @@ impl PgDb {
                ORDER BY failure_rate DESC"#,
             &[&config_id, &threshold],
         ).await.map_err(|e| format!("PG get_flaky_transitions: {}", e))?;
-        Ok(rows.iter().map(|r| json!({
-            "item_id": r.get::<_, String>(0),
-            "total_attempts": r.get::<_, i64>(1),
-            "failure_count": r.get::<_, i64>(2),
-            "failure_rate": r.get::<_, f64>(3),
-        })).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "item_id": r.get::<_, String>(0),
+                    "total_attempts": r.get::<_, i64>(1),
+                    "failure_count": r.get::<_, i64>(2),
+                    "failure_rate": r.get::<_, f64>(3),
+                })
+            })
+            .collect())
     }
 
     /// Get flaky templates for a config.
     pub async fn get_flaky_templates(
-        &self, config_id: &str, threshold: f64,
+        &self,
+        config_id: &str,
+        threshold: f64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let rows = conn.query(
             r#"SELECT template_id, total_attempts, failure_count,
                       failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT as failure_rate
@@ -789,35 +809,57 @@ impl PgDb {
                ORDER BY failure_rate DESC"#,
             &[&config_id, &threshold],
         ).await.map_err(|e| format!("PG get_flaky_templates: {}", e))?;
-        Ok(rows.iter().map(|r| json!({
-            "item_id": r.get::<_, String>(0),
-            "total_attempts": r.get::<_, i64>(1),
-            "failure_count": r.get::<_, i64>(2),
-            "failure_rate": r.get::<_, f64>(3),
-        })).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "item_id": r.get::<_, String>(0),
+                    "total_attempts": r.get::<_, i64>(1),
+                    "failure_count": r.get::<_, i64>(2),
+                    "failure_rate": r.get::<_, f64>(3),
+                })
+            })
+            .collect())
     }
 
     /// Get debugging context for a config.
     pub async fn get_debugging_context(
-        &self, config_id: &str, config_name: Option<String>,
+        &self,
+        config_id: &str,
+        config_name: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         // Get config stats
-        let stats = self.get_config_statistics(config_id).await?.unwrap_or(json!({}));
+        let stats = self
+            .get_config_statistics(config_id)
+            .await?
+            .unwrap_or(json!({}));
         // Get recent failures
-        let failures = conn.query(
-            r#"SELECT tra.error_type, tra.error_message, tra.ended_at::TEXT
+        let failures = conn
+            .query(
+                r#"SELECT tra.error_type, tra.error_message, tra.ended_at::TEXT
                FROM task_run_automation tra
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
                WHERE tr.config_id = $1 AND tra.success = false
                ORDER BY tra.ended_at DESC LIMIT 5"#,
-            &[&config_id],
-        ).await.unwrap_or_default();
-        let recent_errors: Vec<serde_json::Value> = failures.iter().map(|r| json!({
-            "error_type": r.get::<_, Option<String>>(0),
-            "error_message": r.get::<_, Option<String>>(1),
-            "ended_at": r.get::<_, Option<String>>(2),
-        })).collect();
+                &[&config_id],
+            )
+            .await
+            .unwrap_or_default();
+        let recent_errors: Vec<serde_json::Value> = failures
+            .iter()
+            .map(|r| {
+                json!({
+                    "error_type": r.get::<_, Option<String>>(0),
+                    "error_message": r.get::<_, Option<String>>(1),
+                    "ended_at": r.get::<_, Option<String>>(2),
+                })
+            })
+            .collect();
         Ok(json!({
             "config_id": config_id,
             "config_name": config_name,
@@ -828,44 +870,64 @@ impl PgDb {
 
     /// Get failed runs for a config.
     pub async fn get_failed_runs(
-        &self, config_id: &str, limit: u32,
+        &self,
+        config_id: &str,
+        limit: u32,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let limit_i64 = limit as i64;
-        let rows = conn.query(
-            r#"SELECT tra.id, tr.config_id, tra.workflow_name, tra.started_at::TEXT,
+        let rows = conn
+            .query(
+                r#"SELECT tra.id, tr.config_id, tra.workflow_name, tra.started_at::TEXT,
                       tra.ended_at::TEXT, tra.duration_ms, tra.automation_status,
                       tra.success, tra.error_type, tra.error_message
                FROM task_run_automation tra
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
                WHERE tr.config_id = $1 AND tra.success = false
                ORDER BY tra.started_at DESC LIMIT $2"#,
-            &[&config_id, &limit_i64],
-        ).await.map_err(|e| format!("PG get_failed_runs: {}", e))?;
-        Ok(rows.iter().map(|r| json!({
-            "id": r.get::<_, String>(0),
-            "config_id": r.get::<_, Option<String>>(1),
-            "workflow_name": r.get::<_, Option<String>>(2),
-            "started_at": r.get::<_, Option<String>>(3),
-            "ended_at": r.get::<_, Option<String>>(4),
-            "duration_ms": r.get::<_, Option<i64>>(5),
-            "status": r.get::<_, String>(6),
-            "success": r.get::<_, Option<bool>>(7),
-            "error_type": r.get::<_, Option<String>>(8),
-            "error_message": r.get::<_, Option<String>>(9),
-        })).collect())
+                &[&config_id, &limit_i64],
+            )
+            .await
+            .map_err(|e| format!("PG get_failed_runs: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<_, String>(0),
+                    "config_id": r.get::<_, Option<String>>(1),
+                    "workflow_name": r.get::<_, Option<String>>(2),
+                    "started_at": r.get::<_, Option<String>>(3),
+                    "ended_at": r.get::<_, Option<String>>(4),
+                    "duration_ms": r.get::<_, Option<i64>>(5),
+                    "status": r.get::<_, String>(6),
+                    "success": r.get::<_, Option<bool>>(7),
+                    "error_type": r.get::<_, Option<String>>(8),
+                    "error_message": r.get::<_, Option<String>>(9),
+                })
+            })
+            .collect())
     }
 
     /// Get flakiness summary for a config.
     pub async fn get_flakiness_summary(
-        &self, config_id: &str, threshold: f64,
+        &self,
+        config_id: &str,
+        threshold: f64,
     ) -> Result<serde_json::Value, String> {
         let flaky_transitions = self.get_flaky_transitions(config_id, threshold).await?;
         let flaky_templates = self.get_flaky_templates(config_id, threshold).await?;
-        let transition_ids: Vec<String> = flaky_transitions.iter()
-            .filter_map(|v| v["item_id"].as_str().map(String::from)).collect();
-        let template_ids: Vec<String> = flaky_templates.iter()
-            .filter_map(|v| v["item_id"].as_str().map(String::from)).collect();
+        let transition_ids: Vec<String> = flaky_transitions
+            .iter()
+            .filter_map(|v| v["item_id"].as_str().map(String::from))
+            .collect();
+        let template_ids: Vec<String> = flaky_templates
+            .iter()
+            .filter_map(|v| v["item_id"].as_str().map(String::from))
+            .collect();
         Ok(json!({
             "flaky_transition_count": flaky_transitions.len(),
             "flaky_template_count": flaky_templates.len(),
@@ -877,9 +939,17 @@ impl PgDb {
 
     /// Get execution options based on flakiness.
     pub async fn get_execution_options(
-        &self, config_id: &str, transition_id: Option<&str>, template_id: Option<&str>, threshold: f64,
+        &self,
+        config_id: &str,
+        transition_id: Option<&str>,
+        template_id: Option<&str>,
+        threshold: f64,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         // Default execution options
         let mut options = json!({
             "retry_count": 1,
@@ -887,11 +957,14 @@ impl PgDb {
             "confidence_threshold": 0.7,
         });
         if let Some(tid) = transition_id {
-            let row = conn.query_opt(
-                r#"SELECT failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT
+            let row = conn
+                .query_opt(
+                    r#"SELECT failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT
                    FROM transition_reliability WHERE config_id = $1 AND transition_id = $2"#,
-                &[&config_id, &tid],
-            ).await.unwrap_or(None);
+                    &[&config_id, &tid],
+                )
+                .await
+                .unwrap_or(None);
             if let Some(r) = row {
                 let rate: f64 = r.get(0);
                 if rate >= threshold {
@@ -899,11 +972,14 @@ impl PgDb {
                 }
             }
         } else if let Some(tmpl) = template_id {
-            let row = conn.query_opt(
-                r#"SELECT failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT
+            let row = conn
+                .query_opt(
+                    r#"SELECT failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT
                    FROM template_reliability WHERE config_id = $1 AND template_id = $2"#,
-                &[&config_id, &tmpl],
-            ).await.unwrap_or(None);
+                    &[&config_id, &tmpl],
+                )
+                .await
+                .unwrap_or(None);
             if let Some(r) = row {
                 let rate: f64 = r.get(0);
                 if rate >= threshold {
@@ -916,9 +992,16 @@ impl PgDb {
 
     /// Update statistics after a run (simplified PG version).
     pub async fn update_statistics_after_run(
-        &self, config_id: &str, success: bool, duration_ms: Option<u64>,
+        &self,
+        config_id: &str,
+        success: bool,
+        duration_ms: Option<u64>,
     ) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             r#"INSERT INTO config_statistics (config_id, total_runs, successful_runs, failed_runs, last_run_at)
@@ -939,10 +1022,19 @@ impl PgDb {
 
     /// Get discovery summary.
     pub async fn get_discovery_summary(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let pending_count: i64 = conn.query_one(
-            "SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending'", &[],
-        ).await.map(|r| r.get(0)).unwrap_or(0);
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let pending_count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending'",
+                &[],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
         let ready: i64 = conn.query_one(
             "SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending' AND attempt_count < 3", &[],
         ).await.map(|r| r.get(0)).unwrap_or(0);
@@ -958,25 +1050,44 @@ impl PgDb {
 
     /// Extract discoveries for sync (returns id + payload pairs).
     pub async fn extract_discoveries_for_sync(&self) -> Result<Vec<(String, String)>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let rows = conn.query(
             "SELECT id, payload FROM discovery_queue WHERE status = 'pending' AND attempt_count < 3 ORDER BY created_at ASC LIMIT 50",
             &[],
         ).await.map_err(|e| format!("PG extract_discoveries: {}", e))?;
-        Ok(rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect())
+        Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
     }
 
     /// Mark discovery as synced.
     pub async fn mark_discovery_synced(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        conn.execute("UPDATE discovery_queue SET status = 'synced' WHERE id = $1", &[&id])
-            .await.map_err(|e| format!("PG mark_discovery_synced: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        conn.execute(
+            "UPDATE discovery_queue SET status = 'synced' WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| format!("PG mark_discovery_synced: {}", e))?;
         Ok(())
     }
 
     /// Mark discovery as failed.
     pub async fn mark_discovery_failed(&self, id: &str, error: &str) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         conn.execute(
             "UPDATE discovery_queue SET status = 'failed', attempt_count = attempt_count + 1, error = $2 WHERE id = $1",
             &[&id, &error],
@@ -986,28 +1097,58 @@ impl PgDb {
 
     /// Delete a discovery.
     pub async fn delete_discovery(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let count = conn.execute("DELETE FROM discovery_queue WHERE id = $1", &[&id])
-            .await.map_err(|e| format!("PG delete_discovery: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let count = conn
+            .execute("DELETE FROM discovery_queue WHERE id = $1", &[&id])
+            .await
+            .map_err(|e| format!("PG delete_discovery: {}", e))?;
         Ok(count > 0)
     }
 
     /// Cleanup failed discoveries.
     pub async fn cleanup_failed_discoveries(&self) -> Result<u32, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let count = conn.execute(
-            "DELETE FROM discovery_queue WHERE status = 'failed' OR attempt_count >= 3", &[],
-        ).await.map_err(|e| format!("PG cleanup_failed: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let count = conn
+            .execute(
+                "DELETE FROM discovery_queue WHERE status = 'failed' OR attempt_count >= 3",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG cleanup_failed: {}", e))?;
         Ok(count as u32)
     }
 
     /// Get sync status.
     pub async fn get_sync_status(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let pending: i64 = conn.query_one("SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending'", &[])
-            .await.map(|r| r.get(0)).unwrap_or(0);
-        let failed: i64 = conn.query_one("SELECT COUNT(*) FROM discovery_queue WHERE status = 'failed'", &[])
-            .await.map(|r| r.get(0)).unwrap_or(0);
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let pending: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending'",
+                &[],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
+        let failed: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM discovery_queue WHERE status = 'failed'",
+                &[],
+            )
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
         let ready: i64 = conn.query_one("SELECT COUNT(*) FROM discovery_queue WHERE status = 'pending' AND attempt_count < 3", &[])
             .await.map(|r| r.get(0)).unwrap_or(0);
         Ok(json!({
@@ -1027,13 +1168,19 @@ impl PgDb {
     /// Produces one example per step per iteration, matching the format expected
     /// by qontinui-prm's Python extractor (PrmTrainingExample).
     pub async fn export_prm_training_data(
-        &self, min_runs: i64,
+        &self,
+        min_runs: i64,
     ) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {e}"))?;
 
         // Join task_runs with generation_pipeline_artifacts for step-level data
-        let rows = conn.query(
-            r#"SELECT
+        let rows = conn
+            .query(
+                r#"SELECT
                 tr.id AS run_id,
                 tr.workflow_id,
                 tr.task_name,
@@ -1051,8 +1198,10 @@ impl PgDb {
             WHERE tr.status IN ('complete', 'failed')
               AND gpa.final_json IS NOT NULL
             ORDER BY tr.created_at DESC"#,
-            &[],
-        ).await.map_err(|e| format!("PG prm export query: {e}"))?;
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG prm export query: {e}"))?;
 
         let runs_processed = rows.len();
         if (runs_processed as i64) < min_runs {
@@ -1089,7 +1238,8 @@ impl PgDb {
             // Parse steps from final workflow JSON
             let steps = match &final_json {
                 Some(j) => match serde_json::from_str::<serde_json::Value>(j) {
-                    Ok(v) => v.get("steps")
+                    Ok(v) => v
+                        .get("steps")
                         .or_else(|| v.get("verification_steps"))
                         .and_then(|s| s.as_array().cloned())
                         .unwrap_or_default(),
@@ -1106,7 +1256,8 @@ impl PgDb {
                     arr.into_iter()
                         .map(|entry| {
                             // If entry has a "results" or "steps" key, use that array
-                            entry.get("results")
+                            entry
+                                .get("results")
                                 .or_else(|| entry.get("steps"))
                                 .and_then(|v| v.as_array().cloned())
                                 // Otherwise treat entry itself as array of step results
@@ -1131,11 +1282,13 @@ impl PgDb {
                 .unwrap_or_default();
 
             for (step_idx, step_val) in steps.iter().enumerate() {
-                let step_type = step_val.get("step_type")
+                let step_type = step_val
+                    .get("step_type")
                     .or_else(|| step_val.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let step_name = step_val.get("name")
+                let step_name = step_val
+                    .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unnamed");
 
@@ -1164,17 +1317,22 @@ impl PgDb {
                     step_name.to_lowercase().contains(&cid.to_lowercase())
                 });
 
-                let criterion_text = criterion.map(|c| {
-                    format!(
-                        "Criterion: {}\nMethod: {}\nPriority: {}",
-                        c.get("description").and_then(|v| v.as_str()).unwrap_or("N/A"),
-                        c.get("method").and_then(|v| v.as_str()).unwrap_or("N/A"),
-                        c.get("priority").and_then(|v| v.as_str()).unwrap_or("N/A"),
-                    )
-                }).unwrap_or_else(|| "No specific acceptance criterion.".to_string());
+                let criterion_text = criterion
+                    .map(|c| {
+                        format!(
+                            "Criterion: {}\nMethod: {}\nPriority: {}",
+                            c.get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("N/A"),
+                            c.get("method").and_then(|v| v.as_str()).unwrap_or("N/A"),
+                            c.get("priority").and_then(|v| v.as_str()).unwrap_or("N/A"),
+                        )
+                    })
+                    .unwrap_or_else(|| "No specific acceptance criterion.".to_string());
 
                 // Determine execution result from iteration data
-                let step_iters: Vec<&serde_json::Value> = iterations.iter()
+                let step_iters: Vec<&serde_json::Value> = iterations
+                    .iter()
                     .filter_map(|iter| iter.get(step_idx))
                     .collect();
 
@@ -1186,7 +1344,11 @@ impl PgDb {
                         ("failed", "workflow_failed")
                     };
 
-                    if exec_result == "passed" { passed_count += 1; } else { failed_count += 1; }
+                    if exec_result == "passed" {
+                        passed_count += 1;
+                    } else {
+                        failed_count += 1;
+                    }
 
                     examples.push(json!({
                         "run_id": run_id,
@@ -1203,18 +1365,22 @@ impl PgDb {
                     }));
                 } else {
                     for (iter_idx, iter_result) in step_iters.iter().enumerate() {
-                        let passed = iter_result.get("passed")
+                        let passed = iter_result
+                            .get("passed")
                             .or_else(|| iter_result.get("success"))
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let error = iter_result.get("error")
+                        let error = iter_result
+                            .get("error")
                             .and_then(|v| v.as_str())
                             .map(String::from);
 
-                        let any_passed = step_iters.iter().any(|r|
-                            r.get("passed").or_else(|| r.get("success"))
-                                .and_then(|v| v.as_bool()).unwrap_or(false)
-                        );
+                        let any_passed = step_iters.iter().any(|r| {
+                            r.get("passed")
+                                .or_else(|| r.get("success"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                        });
 
                         let exec_result = if passed { "passed" } else { "failed" };
                         let final_outcome = if passed && workflow_passed {
@@ -1228,10 +1394,15 @@ impl PgDb {
                             "workflow_failed"
                         };
 
-                        if passed { passed_count += 1; } else { failed_count += 1; }
+                        if passed {
+                            passed_count += 1;
+                        } else {
+                            failed_count += 1;
+                        }
 
                         let fixer_diff = if !passed {
-                            fixer_diffs.get(iter_idx)
+                            fixer_diffs
+                                .get(iter_idx)
                                 .and_then(|d| d.get("diff").or_else(|| d.get("changes")))
                                 .and_then(|v| v.as_str())
                         } else {
@@ -1269,7 +1440,11 @@ impl PgDb {
 
     /// Lightweight PRM stats query — counts without materializing examples.
     pub async fn export_prm_stats(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {e}"))?;
         let row = conn.query_one(
             r#"SELECT
                 COUNT(DISTINCT tr.id) AS runs_processed,
@@ -1308,25 +1483,37 @@ impl PgDb {
 
     /// Compute automation health score.
     pub async fn compute_automation_health_score(
-        &self, since_epoch_ms: i64,
+        &self,
+        since_epoch_ms: i64,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let since_ts = chrono::DateTime::from_timestamp_millis(since_epoch_ms)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        let row = conn.query_one(
-            r#"SELECT
+        let row = conn
+            .query_one(
+                r#"SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN success = true THEN 1 ELSE 0 END) as successful,
                 AVG(duration_ms) as avg_duration
                FROM task_run_automation
                WHERE started_at::TEXT > $1"#,
-            &[&since_ts],
-        ).await.map_err(|e| format!("PG health_score: {}", e))?;
+                &[&since_ts],
+            )
+            .await
+            .map_err(|e| format!("PG health_score: {}", e))?;
         let total: i64 = row.get(0);
         let successful: i64 = row.get(1);
         let avg_duration: Option<f64> = row.get(2);
-        let score = if total > 0 { successful as f64 / total as f64 } else { 0.0 };
+        let score = if total > 0 {
+            successful as f64 / total as f64
+        } else {
+            0.0
+        };
         Ok(json!({
             "overall_score": score,
             "total_runs": total,
@@ -1337,20 +1524,28 @@ impl PgDb {
 
     /// Generate automation recommendations.
     pub async fn generate_recommendations(
-        &self, since_epoch_ms: i64,
+        &self,
+        since_epoch_ms: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let since_ts = chrono::DateTime::from_timestamp_millis(since_epoch_ms)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         // Get frequent error types
-        let rows = conn.query(
-            r#"SELECT error_type, COUNT(*) as cnt
+        let rows = conn
+            .query(
+                r#"SELECT error_type, COUNT(*) as cnt
                FROM task_run_automation
                WHERE started_at::TEXT > $1 AND error_type IS NOT NULL
                GROUP BY error_type ORDER BY cnt DESC LIMIT 5"#,
-            &[&since_ts],
-        ).await.unwrap_or_default();
+                &[&since_ts],
+            )
+            .await
+            .unwrap_or_default();
         let recommendations: Vec<serde_json::Value> = rows.iter().map(|r| {
             let error_type: String = r.get(0);
             let count: i64 = r.get(1);
@@ -1369,25 +1564,39 @@ impl PgDb {
 
     /// Generate fix workflow for errors (returns workflow JSON).
     pub async fn generate_error_fix_workflow(
-        &self, task_run_id: &str, max_iterations: u32,
+        &self,
+        task_run_id: &str,
+        max_iterations: u32,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         // Get errors for this task run
-        let errors = conn.query(
-            r#"SELECT id, title, description, category, severity
+        let errors = conn
+            .query(
+                r#"SELECT id, title, description, category, severity
                FROM task_run_findings
                WHERE task_run_id = $1 AND category = 'error'
                ORDER BY created_at DESC LIMIT 10"#,
-            &[&task_run_id],
-        ).await.map_err(|e| format!("PG get errors: {}", e))?;
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG get errors: {}", e))?;
 
-        let error_list: Vec<serde_json::Value> = errors.iter().map(|r| json!({
-            "id": r.get::<_, String>(0),
-            "title": r.get::<_, String>(1),
-            "description": r.get::<_, Option<String>>(2),
-            "category": r.get::<_, String>(3),
-            "severity": r.get::<_, Option<String>>(4),
-        })).collect();
+        let error_list: Vec<serde_json::Value> = errors
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.get::<_, String>(0),
+                    "title": r.get::<_, String>(1),
+                    "description": r.get::<_, Option<String>>(2),
+                    "category": r.get::<_, String>(3),
+                    "severity": r.get::<_, Option<String>>(4),
+                })
+            })
+            .collect();
 
         Ok(json!({
             "task_run_id": task_run_id,
@@ -1404,15 +1613,21 @@ impl PgDb {
 
     /// Recompute all agentic baselines.
     pub async fn recompute_agentic_baselines(&self) -> Result<u32, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         // Count existing metrics to report
-        let count: i64 = conn.query_one(
-            "SELECT COUNT(*) FROM agentic_metric_scores", &[],
-        ).await.map(|r| r.get(0)).unwrap_or(0);
+        let count: i64 = conn
+            .query_one("SELECT COUNT(*) FROM agentic_metric_scores", &[])
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or(0);
         // Mark baselines as recomputed
-        conn.execute(
-            "UPDATE agentic_baselines SET recomputed_at = NOW()", &[],
-        ).await.ok();
+        conn.execute("UPDATE agentic_baselines SET recomputed_at = NOW()", &[])
+            .await
+            .ok();
         Ok(count as u32)
     }
 
@@ -1422,13 +1637,22 @@ impl PgDb {
 
     /// Update comparison entries JSON.
     pub async fn update_comparison_entries(
-        &self, comparison_id: &str, entries_json: &str, status: &str,
+        &self,
+        comparison_id: &str,
+        entries_json: &str,
+        status: &str,
     ) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         conn.execute(
             "UPDATE comparison_runs SET entries_json = $1, status = $2 WHERE id = $3",
             &[&entries_json, &status, &comparison_id],
-        ).await.map_err(|e| format!("PG update_comparison_entries: {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG update_comparison_entries: {}", e))?;
         Ok(())
     }
 
@@ -1438,9 +1662,15 @@ impl PgDb {
 
     /// Get performance dashboard data.
     pub async fn get_performance_dashboard(
-        &self, config_id: &str, range_days: i64,
+        &self,
+        config_id: &str,
+        range_days: i64,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let since = (chrono::Utc::now() - chrono::Duration::days(range_days)).to_rfc3339();
 
         // Summary
@@ -1474,71 +1704,115 @@ impl PgDb {
 
     /// Get action performance metrics.
     pub async fn get_action_performance(
-        &self, config_id: &str, range_days: i64,
+        &self,
+        config_id: &str,
+        range_days: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
         // Simplified — return empty for now since action_metrics is deeply tied to SQLite schema
         Ok(vec![])
     }
 
     /// Get transition metrics.
-    pub async fn get_transition_metrics(&self, config_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT transition_id, total_attempts, failure_count,
+    pub async fn get_transition_metrics(
+        &self,
+        config_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT transition_id, total_attempts, failure_count,
                       failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT as failure_rate,
                       avg_duration_ms
                FROM transition_reliability WHERE config_id = $1 ORDER BY total_attempts DESC"#,
-            &[&config_id],
-        ).await.unwrap_or_default();
-        Ok(rows.iter().map(|r| json!({
-            "transition_id": r.get::<_, String>(0),
-            "total_attempts": r.get::<_, i64>(1),
-            "failure_count": r.get::<_, i64>(2),
-            "failure_rate": r.get::<_, Option<f64>>(3),
-            "avg_duration_ms": r.get::<_, Option<f64>>(4),
-        })).collect())
+                &[&config_id],
+            )
+            .await
+            .unwrap_or_default();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "transition_id": r.get::<_, String>(0),
+                    "total_attempts": r.get::<_, i64>(1),
+                    "failure_count": r.get::<_, i64>(2),
+                    "failure_rate": r.get::<_, Option<f64>>(3),
+                    "avg_duration_ms": r.get::<_, Option<f64>>(4),
+                })
+            })
+            .collect())
     }
 
     /// Get element resolution metrics.
-    pub async fn get_element_metrics(&self, config_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let rows = conn.query(
-            r#"SELECT element_id, total_attempts, failure_count, avg_resolution_ms
+    pub async fn get_element_metrics(
+        &self,
+        config_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT element_id, total_attempts, failure_count, avg_resolution_ms
                FROM element_resolution_metrics WHERE config_id = $1 ORDER BY total_attempts DESC"#,
-            &[&config_id],
-        ).await.unwrap_or_default();
-        Ok(rows.iter().map(|r| json!({
-            "element_id": r.get::<_, String>(0),
-            "total_attempts": r.get::<_, i64>(1),
-            "failure_count": r.get::<_, i64>(2),
-            "avg_resolution_ms": r.get::<_, Option<f64>>(3),
-        })).collect())
+                &[&config_id],
+            )
+            .await
+            .unwrap_or_default();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "element_id": r.get::<_, String>(0),
+                    "total_attempts": r.get::<_, i64>(1),
+                    "failure_count": r.get::<_, i64>(2),
+                    "avg_resolution_ms": r.get::<_, Option<f64>>(3),
+                })
+            })
+            .collect())
     }
 
     /// Get success rate trend.
     pub async fn get_success_rate_trend(
-        &self, config_id: &str, range_days: i64,
+        &self,
+        config_id: &str,
+        range_days: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
         let since = (chrono::Utc::now() - chrono::Duration::days(range_days)).to_rfc3339();
-        let rows = conn.query(
-            r#"SELECT DATE_TRUNC('day', tra.started_at)::TEXT as day,
+        let rows = conn
+            .query(
+                r#"SELECT DATE_TRUNC('day', tra.started_at)::TEXT as day,
                       COUNT(*) as total,
                       SUM(CASE WHEN tra.success THEN 1 ELSE 0 END) as successful
                FROM task_run_automation tra
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
                WHERE tr.config_id = $1 AND tra.started_at::TEXT > $2
                GROUP BY day ORDER BY day ASC"#,
-            &[&config_id, &since],
-        ).await.unwrap_or_default();
-        Ok(rows.iter().map(|r| {
-            let total: i64 = r.get(1);
-            let successful: i64 = r.get(2);
-            json!({
-                "timestamp": r.get::<_, String>(0),
-                "value": if total > 0 { successful as f64 / total as f64 } else { 0.0 },
+                &[&config_id, &since],
+            )
+            .await
+            .unwrap_or_default();
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let total: i64 = r.get(1);
+                let successful: i64 = r.get(2);
+                json!({
+                    "timestamp": r.get::<_, String>(0),
+                    "value": if total > 0 { successful as f64 / total as f64 } else { 0.0 },
+                })
             })
-        }).collect())
+            .collect())
     }
 
     // ========================================================================
@@ -1547,10 +1821,18 @@ impl PgDb {
 
     /// Record workflow learning outcome.
     pub async fn record_workflow_learning(
-        &self, outcome: &serde_json::Value,
+        &self,
+        outcome: &serde_json::Value,
     ) -> Result<(), String> {
-        let conn = self.pool().get().await.map_err(|e| format!("PG pool: {}", e))?;
-        let id = outcome["id"].as_str().unwrap_or(&uuid::Uuid::new_v4().to_string()).to_string();
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {}", e))?;
+        let id = outcome["id"]
+            .as_str()
+            .unwrap_or(&uuid::Uuid::new_v4().to_string())
+            .to_string();
         let workflow_name = outcome["workflow_name"].as_str().unwrap_or("");
         let status = outcome["status"].as_str().unwrap_or("unknown");
         let iterations = outcome["iterations"].as_i64();

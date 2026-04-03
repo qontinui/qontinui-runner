@@ -713,11 +713,11 @@ impl FlowExecutor {
                     &task_context,
                     doctor_handle_clone.as_ref(),
                     Some(model.as_str()),
-                    None,  // provider_override
-                    None,  // temperature_override
+                    None, // provider_override
+                    None, // temperature_override
                     max_tokens,
-                    None,  // fallback_model
-                    None,  // fallback_provider
+                    None, // fallback_model
+                    None, // fallback_provider
                 )
             } else {
                 ai_provider::run_prompt_with_routing(
@@ -756,11 +756,9 @@ impl FlowExecutor {
                         if !guard.is_unrestricted() {
                             result = result.with_output(
                                 "_tool_guard_allowed".to_string(),
-                                serde_json::json!(
-                                    resolved_role
-                                        .and_then(|r| r.allowed_tools.as_ref())
-                                        .unwrap_or(&Vec::new())
-                                ),
+                                serde_json::json!(resolved_role
+                                    .and_then(|r| r.allowed_tools.as_ref())
+                                    .unwrap_or(&Vec::new())),
                             );
                         }
                     }
@@ -912,9 +910,7 @@ impl FlowExecutor {
                 .unwrap_or("unknown");
             let guard = ToolGuard::new(role_id, &allowed_strs);
             // Strip the MCP prefix if present so guard matches bare tool names
-            let bare_tool = tool_id
-                .strip_prefix("mcp__qontinui__")
-                .unwrap_or(tool_id);
+            let bare_tool = tool_id.strip_prefix("mcp__qontinui__").unwrap_or(tool_id);
             if let Err(e) = guard.check_tool(bare_tool) {
                 warn!(
                     step_id = %step_id,

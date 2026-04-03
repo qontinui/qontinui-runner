@@ -13,7 +13,11 @@ impl PgDb {
         spec_json: &str,
         page_url: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("{}:{}", app_url, spec_id);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -34,8 +38,15 @@ impl PgDb {
     }
 
     /// Get all cached specs for a specific app URL.
-    pub async fn get_cached_specs_for_app(&self, app_url: &str) -> Result<Vec<CachedAppSpec>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_cached_specs_for_app(
+        &self,
+        app_url: &str,
+    ) -> Result<Vec<CachedAppSpec>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -64,7 +75,11 @@ impl PgDb {
 
     /// Get all cached specs across all apps.
     pub async fn get_all_cached_specs(&self) -> Result<Vec<CachedAppSpec>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -92,7 +107,11 @@ impl PgDb {
 
     /// Delete all cached specs for a specific app URL.
     pub async fn delete_cached_specs_for_app(&self, app_url: &str) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let deleted = conn
             .execute(

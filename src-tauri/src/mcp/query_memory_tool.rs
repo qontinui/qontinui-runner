@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
+use super::graph_api::get_or_build_graph;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::memory::unified_query::{self, MemoryResult, MemorySource, UnifiedMemoryQuery};
-use super::graph_api::get_or_build_graph;
 
 // ============================================================================
 // Request/Response types
@@ -67,7 +67,10 @@ async fn query_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<QueryMemoryRequest>,
 ) -> Result<Json<ApiResponse<QueryMemoryResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("MCP memory query: '{}' (limit={})", request.query, request.limit);
+    info!(
+        "MCP memory query: '{}' (limit={})",
+        request.query, request.limit
+    );
 
     let sources = request.sources.as_ref().map(|list| {
         list.iter()
@@ -75,17 +78,25 @@ async fn query_handler(
             .collect::<Vec<_>>()
     });
 
-    let from = request.from.as_deref()
+    let from = request
+        .from
+        .as_deref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
-    let to = request.to.as_deref()
+    let to = request
+        .to
+        .as_deref()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
     let sources_queried: Vec<String> = sources.as_ref().map_or_else(
         || vec!["all".to_string()],
-        |s| s.iter().map(|src| format!("{:?}", src).to_lowercase()).collect(),
+        |s| {
+            s.iter()
+                .map(|src| format!("{:?}", src).to_lowercase())
+                .collect()
+        },
     );
 
     let params = UnifiedMemoryQuery {
@@ -100,7 +111,9 @@ async fn query_handler(
     let pg = &state.app_state.pg_db;
 
     // Optionally build graph (only if graph source enabled or all sources)
-    let want_graph = params.sources.as_ref()
+    let want_graph = params
+        .sources
+        .as_ref()
         .is_none_or(|s| s.contains(&MemorySource::GraphNode));
 
     let graph = if want_graph {
@@ -140,7 +153,8 @@ async fn tool_descriptor_handler(
         name: "query_memory".to_string(),
         description: "Search all memory stores (observations, activity timeline, knowledge base, \
             findings, fixes, errors, rules, graph nodes) using Reciprocal Rank Fusion to produce \
-            a single ranked result set.".to_string(),
+            a single ranked result set."
+            .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

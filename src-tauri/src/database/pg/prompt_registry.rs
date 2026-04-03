@@ -245,11 +245,7 @@ impl PgDb {
     }
 
     /// Update performance metrics for a prompt variant.
-    pub async fn update_performance_metrics(
-        &self,
-        id: &str,
-        metrics: &str,
-    ) -> Result<(), String> {
+    pub async fn update_performance_metrics(&self, id: &str, metrics: &str) -> Result<(), String> {
         let conn = self
             .pool()
             .get()

@@ -96,9 +96,8 @@ pub fn evaluate_recommendation_outcome(
 
     // Fetch the recommendation
     let (target_agent, applied_at) = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.get_recommendation_outcome_info(&rec_id).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.get_recommendation_outcome_info(&rec_id).await })
     })?;
 
     let applied_at = match applied_at {
@@ -128,12 +127,16 @@ pub fn evaluate_recommendation_outcome(
 
         let before = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                pg_db.get_agent_aggregates_for_period(&agent, &before_start, &applied_at).await
+                pg_db
+                    .get_agent_aggregates_for_period(&agent, &before_start, &applied_at)
+                    .await
             })
         })?;
         let after = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                pg_db.get_agent_aggregates_for_period(&agent, &applied_at, &after_end).await
+                pg_db
+                    .get_agent_aggregates_for_period(&agent, &applied_at, &after_end)
+                    .await
             })
         })?;
 
@@ -142,9 +145,8 @@ pub fn evaluate_recommendation_outcome(
         // No target agent: compare post_apply snapshot against baseline
         let baseline = get_latest_baseline(pg_db, WorkflowCategory::Main)?;
         let post_snap = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                pg_db.get_post_apply_snapshot(&rec_id).await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async { pg_db.get_post_apply_snapshot(&rec_id).await })
         })?;
 
         let baseline_metrics = baseline
@@ -318,7 +320,9 @@ pub fn update_outcome(
 ) -> Result<(), String> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg_db.update_recommendation_outcome(recommendation_id, outcome_json).await
+            pg_db
+                .update_recommendation_outcome(recommendation_id, outcome_json)
+                .await
         })
     })
 }
@@ -350,7 +354,14 @@ pub fn capture_snapshot(
     let category_filter = category.sql_filter("tr");
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            pg_db.pg_capture_snapshot(snapshot_type, recommendation_id, lookback_days, &category_filter).await
+            pg_db
+                .pg_capture_snapshot(
+                    snapshot_type,
+                    recommendation_id,
+                    lookback_days,
+                    &category_filter,
+                )
+                .await
         })
     })
 }
@@ -364,7 +375,13 @@ pub fn capture_snapshot_with_pg(
     lookback_days: i64,
     category: WorkflowCategory,
 ) -> Result<MetaOptimizerSnapshot, String> {
-    capture_snapshot(pg_db, snapshot_type, recommendation_id, lookback_days, category)
+    capture_snapshot(
+        pg_db,
+        snapshot_type,
+        recommendation_id,
+        lookback_days,
+        category,
+    )
 }
 
 // ── Convenience wrappers ───────────────────────────────────────────────
@@ -407,9 +424,8 @@ pub fn get_latest_baseline(
 ) -> Result<Option<MetaOptimizerSnapshot>, String> {
     let snap_type = format!("baseline{}", category.snapshot_suffix());
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.get_latest_baseline_snapshot(&snap_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.get_latest_baseline_snapshot(&snap_type).await })
     })
 }
 
@@ -419,9 +435,8 @@ pub fn list_snapshots(
     snapshot_type: Option<&str>,
 ) -> Result<Vec<MetaOptimizerSnapshot>, String> {
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.list_snapshots(snapshot_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.list_snapshots(snapshot_type).await })
     })
 }
 
@@ -435,9 +450,8 @@ pub fn get_progress_summary(
     // Get latest periodic snapshot for this category
     let periodic_type = format!("periodic{}", category.snapshot_suffix());
     let current_snap: Option<MetaOptimizerSnapshot> = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.get_latest_baseline_snapshot(&periodic_type).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.get_latest_baseline_snapshot(&periodic_type).await })
     })?;
 
     let baseline_metrics = baseline_snap
@@ -461,9 +475,8 @@ pub fn get_progress_summary(
     let snapshots = list_snapshots(pg_db, None)?;
 
     let applied_recommendations_count: i64 = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            pg_db.count_applied_recommendations().await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { pg_db.count_applied_recommendations().await })
     })?;
 
     Ok(ProgressSummary {

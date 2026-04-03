@@ -4,9 +4,9 @@
 //! a comprehensive view of what's going wrong: abort reasons, verification failures,
 //! finding distributions, fix effectiveness, generation quality, and recurring issues.
 
+use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use super::types::WorkflowCategory;
@@ -131,18 +131,12 @@ pub fn get_failure_analysis_with_pg(
 
 // ── Private Query Functions ──────────────────────────────────────────────
 
-fn query_run_totals(
-    since: &str,
-    category: WorkflowCategory,
-) -> (i64, i64) {
+fn query_run_totals(since: &str, category: WorkflowCategory) -> (i64, i64) {
     // SQLite removed — return zero totals
     (0, 0)
 }
 
-fn query_abort_reasons(
-    since: &str,
-    category: WorkflowCategory,
-) -> Vec<AbortReason> {
+fn query_abort_reasons(since: &str, category: WorkflowCategory) -> Vec<AbortReason> {
     Vec::new()
 }
 
@@ -153,23 +147,15 @@ fn query_verification_failures(
     Vec::new()
 }
 
-fn query_finding_distribution(
-    since: &str,
-    category: WorkflowCategory,
-) -> Vec<CategoryCount> {
+fn query_finding_distribution(since: &str, category: WorkflowCategory) -> Vec<CategoryCount> {
     Vec::new()
 }
 
-fn query_severity_distribution(
-    since: &str,
-    category: WorkflowCategory,
-) -> Vec<CategoryCount> {
+fn query_severity_distribution(since: &str, category: WorkflowCategory) -> Vec<CategoryCount> {
     Vec::new()
 }
 
-fn query_fix_effectiveness(
-    since: &str,
-) -> Vec<FixEffectivenessRecord> {
+fn query_fix_effectiveness(since: &str) -> Vec<FixEffectivenessRecord> {
     Vec::new()
 }
 
@@ -192,9 +178,6 @@ fn query_pipeline_agent_failures(
     Vec::new()
 }
 
-fn query_recurring_issues(
-    since: &str,
-    category: WorkflowCategory,
-) -> Vec<RecurringIssue> {
+fn query_recurring_issues(since: &str, category: WorkflowCategory) -> Vec<RecurringIssue> {
     Vec::new()
 }

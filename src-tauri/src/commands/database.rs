@@ -41,7 +41,10 @@ pub fn optimize_database(
 
     Ok(CommandResponse {
         success: true,
-        message: Some("No-op: SQLite checkpoint_db has been removed. Use PostgreSQL maintenance tools.".to_string()),
+        message: Some(
+            "No-op: SQLite checkpoint_db has been removed. Use PostgreSQL maintenance tools."
+                .to_string(),
+        ),
         data: None,
     })
 }
@@ -62,7 +65,9 @@ pub fn optimize_database(
 /// * `Ok(CommandResponse)` - Success with database statistics
 /// * `Err(String)` - Error message if statistics cannot be retrieved
 #[tauri::command]
-pub async fn get_database_stats(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
+pub async fn get_database_stats(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     info!("Getting database statistics");
 
     let stats: DatabaseStats = state.pg_db.get_database_stats().await?;

@@ -9,14 +9,22 @@ use tracing::{debug, info, warn};
 
 /// Convert Clorinde empty string (from NULL) to Option::None.
 fn non_empty(s: &str) -> Option<String> {
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Convert Clorinde DateTime to Option<String> (empty = NULL).
 fn ts_to_opt(ts: &chrono::DateTime<chrono::FixedOffset>) -> Option<String> {
     let s = ts.to_rfc3339();
     // Clorinde uses epoch-zero for NULL timestamps
-    if s.starts_with("1970-01-01") { None } else { Some(s) }
+    if s.starts_with("1970-01-01") {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 impl PgDb {
@@ -26,7 +34,11 @@ impl PgDb {
 
     /// Persist a new queue entry with status 'pending'.
     pub async fn pg_queue_insert(&self, entry: &PersistedQueueEntry) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::queued_workflows::queue_insert()
             .bind(
                 &conn,
@@ -42,7 +54,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG queue_insert: {}", e))?;
 
-        debug!("PG: Persisted queue entry '{}' ({})", entry.workflow_name, entry.id);
+        debug!(
+            "PG: Persisted queue entry '{}' ({})",
+            entry.workflow_name, entry.id
+        );
         Ok(())
     }
 
@@ -52,7 +67,11 @@ impl PgDb {
         id: &str,
         status: &QueueEntryStatus,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Update status
         qontinui_db::queries::queued_workflows::queue_update_status()
@@ -88,7 +107,11 @@ impl PgDb {
 
     /// Set the error message on a queue entry.
     pub async fn pg_queue_set_error(&self, id: &str, error: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::queued_workflows::queue_set_error()
             .bind(&conn, &error, &id)
             .opt()
@@ -103,7 +126,11 @@ impl PgDb {
         id: &str,
         task_run_id: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::queued_workflows::queue_set_task_run_id()
             .bind(&conn, &task_run_id, &id)
             .opt()
@@ -114,7 +141,11 @@ impl PgDb {
 
     /// Increment retry count and reset to pending.
     pub async fn pg_queue_increment_retry(&self, id: &str) -> Result<i32, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let count = qontinui_db::queries::queued_workflows::queue_increment_retry()
             .bind(&conn, &id)
             .one()
@@ -127,7 +158,11 @@ impl PgDb {
 
     /// Load all pending/running queue entries for startup recovery.
     pub async fn pg_queue_load_pending(&self) -> Result<Vec<PersistedQueueEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::queued_workflows::queue_load_pending()
             .bind(&conn)
             .all()
@@ -158,7 +193,11 @@ impl PgDb {
 
     /// Mark any 'running' entries as 'pending' for crash recovery.
     pub async fn pg_queue_recover_crashed(&self) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let recovered = qontinui_db::queries::queued_workflows::queue_recover_crashed()
             .bind(&conn)
             .all()
@@ -167,16 +206,22 @@ impl PgDb {
 
         let count = recovered.len();
         if count > 0 {
-            warn!("PG: Recovered {} queue entries that were running when app crashed", count);
+            warn!(
+                "PG: Recovered {} queue entries that were running when app crashed",
+                count
+            );
         }
         Ok(count)
     }
 
     /// Clean up old terminal entries older than the given number of days.
     pub async fn pg_queue_cleanup(&self, older_than_days: i64) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(older_than_days))
-            .fixed_offset();
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(older_than_days)).fixed_offset();
         let deleted = qontinui_db::queries::queued_workflows::queue_cleanup()
             .bind(&conn, &cutoff)
             .all()

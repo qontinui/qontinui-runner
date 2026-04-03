@@ -75,12 +75,12 @@ impl Default for ClickHighlightConfig {
 /// Color presets for different action types.
 pub fn color_for_action(action_type: &str) -> &'static str {
     match action_type {
-        "click" | "doubleClick" => "#00c800",  // Green
-        "type" | "sendKeys" => "#0064ff",      // Blue
-        "scroll" => "#ff8c00",                 // Orange
-        "select" => "#b400b4",                 // Purple
-        "focus" => "#00b4b4",                  // Teal
-        _ => "#00c800",                        // Green default
+        "click" | "doubleClick" => "#00c800", // Green
+        "type" | "sendKeys" => "#0064ff",     // Blue
+        "scroll" => "#ff8c00",                // Orange
+        "select" => "#b400b4",                // Purple
+        "focus" => "#00b4b4",                 // Teal
+        _ => "#00c800",                       // Green default
     }
 }
 

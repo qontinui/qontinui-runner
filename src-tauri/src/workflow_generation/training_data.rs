@@ -158,17 +158,12 @@ pub fn collect_score_factors(
 }
 
 /// Count reflection fixes attributed to a specific agent for a workflow.
-fn count_attributed_fixes(
-    workflow_id: &str,
-    agent: &str,
-) -> Result<(u32, u32), String> {
+fn count_attributed_fixes(workflow_id: &str, agent: &str) -> Result<(u32, u32), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Get user feedback for a workflow.
-fn get_user_feedback(
-    workflow_id: &str,
-) -> Result<(u32, bool, Option<f64>), String> {
+fn get_user_feedback(workflow_id: &str) -> Result<(u32, bool, Option<f64>), String> {
     Err("SQLite removed".to_string())
 }
 

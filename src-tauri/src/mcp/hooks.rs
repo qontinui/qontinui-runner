@@ -300,18 +300,13 @@ fn json_to_hook_response(val: serde_json::Value) -> Result<HookResponse, String>
 async fn list_hooks(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<HookResponse>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let rows = state
-        .app_state
-        .pg_db
-        .list_hooks()
-        .await
-        .map_err(|e| {
-            error!("Failed to list hooks: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to list hooks: {}", e))),
-            )
-        })?;
+    let rows = state.app_state.pg_db.list_hooks().await.map_err(|e| {
+        error!("Failed to list hooks: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to list hooks: {}", e))),
+        )
+    })?;
 
     let mut hooks = Vec::new();
     for val in rows {
@@ -333,18 +328,13 @@ async fn get_hook(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<HookResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let row = state
-        .app_state
-        .pg_db
-        .get_hook(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get hook: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to get hook: {}", e))),
-            )
-        })?;
+    let row = state.app_state.pg_db.get_hook(&id).await.map_err(|e| {
+        error!("Failed to get hook: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get hook: {}", e))),
+        )
+    })?;
 
     match row {
         Some(val) => {
@@ -352,7 +342,10 @@ async fn get_hook(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
             Ok(Json(ApiResponse::success(hook)))
         }
-        None => Err((StatusCode::NOT_FOUND, Json(api_error("Hook not found".to_string())))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error("Hook not found".to_string())),
+        )),
     }
 }
 
@@ -369,11 +362,22 @@ async fn create_hook(
 
     let id = Uuid::new_v4().to_string();
 
-    let action_config_str = serde_json::to_string(&request.action_config)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(format!("Failed to serialize action config: {}", e)))))?;
+    let action_config_str = serde_json::to_string(&request.action_config).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Failed to serialize action config: {}",
+                e
+            ))),
+        )
+    })?;
 
-    let conditions_str = serde_json::to_string(&request.conditions)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(format!("Failed to serialize conditions: {}", e)))))?;
+    let conditions_str = serde_json::to_string(&request.conditions).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Failed to serialize conditions: {}", e))),
+        )
+    })?;
 
     state
         .app_state
@@ -400,7 +404,8 @@ async fn create_hook(
     // Build response from input (we just inserted, so we know the values)
     let now = chrono::Utc::now().to_rfc3339();
     let trigger = parse_trigger(&request.trigger).unwrap();
-    let action_config_val: serde_json::Value = serde_json::from_str(&action_config_str).unwrap_or_default();
+    let action_config_val: serde_json::Value =
+        serde_json::from_str(&action_config_str).unwrap_or_default();
     let action = parse_action(&request.action_type, action_config_val).unwrap();
     let conditions: Vec<HookCondition> = serde_json::from_str(&conditions_str).unwrap_or_default();
 
@@ -444,34 +449,80 @@ async fn update_hook(
         .get_hook(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error("Hook not found".to_string()))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error("Hook not found".to_string())),
+            )
+        })?;
 
-    let name = request.name.unwrap_or_else(|| current_val["name"].as_str().unwrap_or_default().to_string());
+    let name = request
+        .name
+        .unwrap_or_else(|| current_val["name"].as_str().unwrap_or_default().to_string());
     let description: Option<String> = match request.description {
         Some(d) => d, // User explicitly set it (Some(Some(str)) or Some(None))
         None => current_val["description"].as_str().map(|s| s.to_string()),
     };
-    let trigger = request.trigger.unwrap_or_else(|| current_val["trigger"].as_str().unwrap_or_default().to_string());
-    let action_type = request.action_type.unwrap_or_else(|| current_val["action_type"].as_str().unwrap_or_default().to_string());
+    let trigger = request.trigger.unwrap_or_else(|| {
+        current_val["trigger"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    let action_type = request.action_type.unwrap_or_else(|| {
+        current_val["action_type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
     let action_config_str = match request.action_config {
-        Some(config) => serde_json::to_string(&config)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(format!("Failed to serialize action config: {}", e)))))?,
-        None => current_val["action_config"].as_str().unwrap_or("{}").to_string(),
+        Some(config) => serde_json::to_string(&config).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "Failed to serialize action config: {}",
+                    e
+                ))),
+            )
+        })?,
+        None => current_val["action_config"]
+            .as_str()
+            .unwrap_or("{}")
+            .to_string(),
     };
-    let enabled = request.enabled.unwrap_or_else(|| current_val["enabled"].as_bool().unwrap_or(false));
-    let execution_order = request.execution_order.unwrap_or_else(|| current_val["execution_order"].as_i64().unwrap_or(0) as i32);
-    let continue_on_failure = request.continue_on_failure.unwrap_or_else(|| current_val["continue_on_failure"].as_bool().unwrap_or(false));
+    let enabled = request
+        .enabled
+        .unwrap_or_else(|| current_val["enabled"].as_bool().unwrap_or(false));
+    let execution_order = request
+        .execution_order
+        .unwrap_or_else(|| current_val["execution_order"].as_i64().unwrap_or(0) as i32);
+    let continue_on_failure = request.continue_on_failure.unwrap_or_else(|| {
+        current_val["continue_on_failure"]
+            .as_bool()
+            .unwrap_or(false)
+    });
     let conditions_str = match request.conditions {
-        Some(conditions) => serde_json::to_string(&conditions)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(format!("Failed to serialize conditions: {}", e)))))?,
-        None => current_val["conditions"].as_str().unwrap_or("[]").to_string(),
+        Some(conditions) => serde_json::to_string(&conditions).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("Failed to serialize conditions: {}", e))),
+            )
+        })?,
+        None => current_val["conditions"]
+            .as_str()
+            .unwrap_or("[]")
+            .to_string(),
     };
 
     // Validate
-    let _ = parse_trigger(&trigger)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
-    let action_config_val: serde_json::Value = serde_json::from_str(&action_config_str)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(format!("Failed to parse action config: {}", e)))))?;
+    let _ = parse_trigger(&trigger).map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
+    let action_config_val: serde_json::Value =
+        serde_json::from_str(&action_config_str).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("Failed to parse action config: {}", e))),
+            )
+        })?;
     let _ = parse_action(&action_type, action_config_val)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
 
@@ -503,7 +554,12 @@ async fn update_hook(
         .get_hook(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error("Hook not found after update".to_string()))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error("Hook not found after update".to_string())),
+            )
+        })?;
 
     let hook = json_to_hook_response(updated_val)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
@@ -517,18 +573,16 @@ async fn delete_hook_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let deleted = state
-        .app_state
-        .pg_db
-        .delete_hook(&id)
-        .await
-        .map_err(|e| {
-            error!("Failed to delete hook: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
-        })?;
+    let deleted = state.app_state.pg_db.delete_hook(&id).await.map_err(|e| {
+        error!("Failed to delete hook: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
+    })?;
 
     if !deleted {
-        return Err((StatusCode::NOT_FOUND, Json(api_error("Hook not found".to_string()))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error("Hook not found".to_string())),
+        ));
     }
 
     info!("Deleted hook: {}", id);
@@ -557,7 +611,10 @@ async fn set_hook_enabled(
         })?;
 
     if !updated {
-        return Err((StatusCode::NOT_FOUND, Json(api_error("Hook not found".to_string()))));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error("Hook not found".to_string())),
+        ));
     }
 
     Ok(Json(ApiResponse::success(())))
@@ -602,12 +659,22 @@ async fn test_hook(
         .get_hook(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error("Hook not found".to_string()))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error("Hook not found".to_string())),
+            )
+        })?;
 
     let action_type_str = row["action_type"].as_str().unwrap_or_default();
     let action_config_str = row["action_config"].as_str().unwrap_or("{}");
-    let action_config: serde_json::Value = serde_json::from_str(action_config_str)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("Failed to parse action config: {}", e)))))?;
+    let action_config: serde_json::Value =
+        serde_json::from_str(action_config_str).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to parse action config: {}", e))),
+            )
+        })?;
     let action = parse_action(action_type_str, action_config)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
@@ -661,7 +728,10 @@ async fn test_hook(
     .await
     .map_err(|e| {
         error!("Failed to test hook: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("Task failed: {}", e))))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
     })?;
 
     Ok(Json(ApiResponse::success(result)))

@@ -441,7 +441,11 @@ impl LoopController {
         // Load existing transitions when resuming to preserve prior phase history
         let (transitions, current_stage) = if !matches!(resume_point, ResumePoint::FromStart) {
             // Try to load existing transition history from database
-            let task_run_opt = self.app_state.pg_db.get_task_run(&config.execution_id).await;
+            let task_run_opt = self
+                .app_state
+                .pg_db
+                .get_task_run(&config.execution_id)
+                .await;
             if let Ok(Some(task_run)) = task_run_opt {
                 if let Some(ref history_json) = task_run.transition_history_json {
                     if let Ok(loaded_transitions) =
@@ -603,12 +607,19 @@ impl LoopController {
     ) -> WorkflowResult {
         // Load and enforce flow control from the workflow's flow_control_json
         let flow_enforcer = crate::flow_control::get_flow_control_enforcer();
-        let flow_control: crate::flow_control::FlowControl = crate::flow_control::FlowControl::default();
+        let flow_control: crate::flow_control::FlowControl =
+            crate::flow_control::FlowControl::default();
 
-        match flow_enforcer.check(&config.workflow_id, &flow_control).await {
+        match flow_enforcer
+            .check(&config.workflow_id, &flow_control)
+            .await
+        {
             crate::flow_control::FlowControlDecision::Allow => {}
             crate::flow_control::FlowControlDecision::Skip { reason } => {
-                warn!("Workflow {} skipped by flow control: {}", config.workflow_id, reason);
+                warn!(
+                    "Workflow {} skipped by flow control: {}",
+                    config.workflow_id, reason
+                );
                 return WorkflowResult {
                     success: false,
                     verification_passed: false,
@@ -704,7 +715,8 @@ impl LoopController {
                 ) {
                     Ok(overrides) => {
                         for (key, value) in overrides {
-                            let original = self.app_state.pg_db.get_setting(&key).await.ok().flatten();
+                            let original =
+                                self.app_state.pg_db.get_setting(&key).await.ok().flatten();
                             canary_config_originals.push((key.clone(), original));
                             let set_result = self.app_state.pg_db.set_setting(&key, &value).await;
                             if let Err(e) = set_result {
@@ -804,7 +816,11 @@ impl LoopController {
 
             // Check global max_sessions budget before starting a new stage
             if let Some(max) = config.max_sessions {
-                let sessions_task_run = self.app_state.pg_db.get_task_run(&config.execution_id).await;
+                let sessions_task_run = self
+                    .app_state
+                    .pg_db
+                    .get_task_run(&config.execution_id)
+                    .await;
                 if let Ok(Some(task_run)) = sessions_task_run {
                     if task_run.sessions_count >= max {
                         warn!(
@@ -863,12 +879,11 @@ impl LoopController {
                 "\n\n{}\n=== STAGE {}/{}: \"{}\" ===\n{}\n",
                 separator, stage_num, total_stages, stage.name, separator
             );
-            let _ = self.app_state.pg_db.append_task_output_ex(
-                &config.execution_id,
-                &stage_header,
-                false,
-                false,
-            ).await;
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(&config.execution_id, &stage_header, false, false)
+                .await;
 
             info!(
                 "=== STAGE {}/{}: {} (id: {}) ===",
@@ -945,12 +960,11 @@ impl LoopController {
                             sr.duration_ms,
                         ));
                     }
-                    let _ = self.app_state.pg_db.append_task_output_ex(
-                        &config.execution_id,
-                        &output,
-                        false,
-                        false,
-                    ).await;
+                    let _ = self
+                        .app_state
+                        .pg_db
+                        .append_task_output_ex(&config.execution_id, &output, false, false)
+                        .await;
                 }
 
                 all_step_results.extend(setup_results);
@@ -1241,7 +1255,8 @@ impl LoopController {
                     active_canary: config.active_canary.clone(),
                     is_canary_run: config.is_canary_run,
                     rollback_policy: config.rollback_policy.clone(),
-                    escalation_policy: crate::unified_workflow_executor::blame::EscalationPolicy::default(),
+                    escalation_policy:
+                        crate::unified_workflow_executor::blame::EscalationPolicy::default(),
                     iteration_diffs: Vec::new(),
                     phase_timeout_ms: config.phase_timeout_ms,
                 };
@@ -1325,12 +1340,11 @@ impl LoopController {
                         AgenticOutcome::Skipped => String::new(),
                     };
                     if !output_text.is_empty() {
-                        let _ = self.app_state.pg_db.append_task_output_ex(
-                            &config.execution_id,
-                            &output_text,
-                            true,
-                            false,
-                        ).await;
+                        let _ = self
+                            .app_state
+                            .pg_db
+                            .append_task_output_ex(&config.execution_id, &output_text, true, false)
+                            .await;
                     }
 
                     // If budget was exceeded, stop the run gracefully
@@ -1613,12 +1627,16 @@ impl LoopController {
 
             // Record verification result before completing
             if let Some(ref lr) = last_loop_result {
-                let vp_result = self.app_state.pg_db.set_verification_passed(
-                    &config.execution_id,
-                    lr.verification_passed,
-                ).await;
+                let vp_result = self
+                    .app_state
+                    .pg_db
+                    .set_verification_passed(&config.execution_id, lr.verification_passed)
+                    .await;
                 if let Err(e) = vp_result {
-                    error!("Failed to set verification_passed for {}: {}", config.execution_id, e);
+                    error!(
+                        "Failed to set verification_passed for {}: {}",
+                        config.execution_id, e
+                    );
                 }
             }
 
@@ -1661,9 +1679,17 @@ impl LoopController {
                 let provider = config.provider_override.clone();
                 tokio::spawn(async move {
                     match crate::summary_generator::generate_task_summary_async(
-                        exec_id.clone(), dh, model, provider,
-                    ).await {
-                        Ok(result) => info!("Summary generated for {}: goal_achieved={}", exec_id, result.goal_achieved),
+                        exec_id.clone(),
+                        dh,
+                        model,
+                        provider,
+                    )
+                    .await
+                    {
+                        Ok(result) => info!(
+                            "Summary generated for {}: goal_achieved={}",
+                            exec_id, result.goal_achieved
+                        ),
                         Err(e) => warn!("Summary generation failed for {}: {}", exec_id, e),
                     }
                 });
@@ -1738,9 +1764,17 @@ impl LoopController {
                 let provider = config.provider_override.clone();
                 tokio::spawn(async move {
                     match crate::summary_generator::generate_task_summary_async(
-                        exec_id.clone(), dh, model, provider,
-                    ).await {
-                        Ok(result) => info!("Summary generated for failed workflow {}: goal_achieved={}", exec_id, result.goal_achieved),
+                        exec_id.clone(),
+                        dh,
+                        model,
+                        provider,
+                    )
+                    .await
+                    {
+                        Ok(result) => info!(
+                            "Summary generated for failed workflow {}: goal_achieved={}",
+                            exec_id, result.goal_achieved
+                        ),
                         Err(e) => warn!("Summary generation failed for {}: {}", exec_id, e),
                     }
                 });
@@ -1898,7 +1932,9 @@ impl LoopController {
 
             let pg_db_for_q = self.app_state.pg_db.clone();
             tokio::spawn(async move {
-                let pg_learning_ok = pg_db_for_q.record_workflow_learning_from_outcome(&outcome).await;
+                let pg_learning_ok = pg_db_for_q
+                    .record_workflow_learning_from_outcome(&outcome)
+                    .await;
 
                 if let Err(ref e) = pg_learning_ok {
                     warn!("Failed to record learning outcome: {}", e);
@@ -1910,9 +1946,14 @@ impl LoopController {
                         .await
                         .unwrap_or(0.0);
 
-                    if let Err(e) = crate::orchestrator::learning_recorder::update_q_routing_table_pg(
-                        &pg_db_for_q, &outcome, composite_score,
-                    ).await {
+                    if let Err(e) =
+                        crate::orchestrator::learning_recorder::update_q_routing_table_pg(
+                            &pg_db_for_q,
+                            &outcome,
+                            composite_score,
+                        )
+                        .await
+                    {
                         warn!("Failed PG Q-routing update: {}", e);
                     }
                 }
@@ -1936,7 +1977,7 @@ impl LoopController {
             {
                 use crate::online_learning::coordinator::{self, OnlineLearningOutcome};
                 use crate::orchestrator::learning_recorder::{
-                    infer_technology_tags, infer_domain_tags, compute_complexity_tier,
+                    compute_complexity_tier, infer_domain_tags, infer_technology_tags,
                 };
 
                 let tech_tags = infer_technology_tags(&ol_files_modified);
@@ -1984,7 +2025,10 @@ impl LoopController {
 
                     let mut ol_outcome = ol_outcome;
                     if ol_outcome.composite_score.is_none() {
-                        if let Ok(score) = ol_pg.get_composite_agentic_score(&ol_outcome.task_run_id).await {
+                        if let Ok(score) = ol_pg
+                            .get_composite_agentic_score(&ol_outcome.task_run_id)
+                            .await
+                        {
                             if score > 0.0 {
                                 ol_outcome.composite_score = Some(score);
                             }
@@ -1998,19 +2042,20 @@ impl LoopController {
                             (Some(router_mtx), Some(drift_mtx)) => {
                                 let mut router =
                                     router_mtx.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut drift =
-                                    drift_mtx.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut drift = drift_mtx.lock().unwrap_or_else(|e| e.into_inner());
                                 coordinator::post_run_online_learning(
                                     &ol_outcome,
                                     &mut router,
                                     &mut drift,
                                 );
-                                Some((router.table_snapshot(), drift.serialize_state().ok(), drift.take_pending_signals()))
+                                Some((
+                                    router.table_snapshot(),
+                                    drift.serialize_state().ok(),
+                                    drift.take_pending_signals(),
+                                ))
                             }
                             _ => {
-                                tracing::debug!(
-                                    "Online learning not initialized — skipping"
-                                );
+                                tracing::debug!("Online learning not initialized — skipping");
                                 None
                             }
                         }
@@ -2020,10 +2065,16 @@ impl LoopController {
                         let mut persisted = 0usize;
 
                         for row in &routing_rows {
-                            if let Err(e) = ol_pg.upsert_model_routing_entry(
-                                &row.context_key, &row.arm,
-                                row.q_value, row.visit_count as i32, row.sum_of_squares,
-                            ).await {
+                            if let Err(e) = ol_pg
+                                .upsert_model_routing_entry(
+                                    &row.context_key,
+                                    &row.arm,
+                                    row.q_value,
+                                    row.visit_count as i32,
+                                    row.sum_of_squares,
+                                )
+                                .await
+                            {
                                 tracing::warn!("Failed to persist routing entry: {}", e);
                             } else {
                                 persisted += 1;
@@ -2032,12 +2083,33 @@ impl LoopController {
 
                         for signal in &drift_signals {
                             let drift_level = match signal.drift_level {
-                                crate::meta_optimizer::drift_detection::DriftLevel::Warning => "warning",
-                                crate::meta_optimizer::drift_detection::DriftLevel::Drift => "drift",
+                                crate::meta_optimizer::drift_detection::DriftLevel::Warning => {
+                                    "warning"
+                                }
+                                crate::meta_optimizer::drift_detection::DriftLevel::Drift => {
+                                    "drift"
+                                }
                                 _ => continue,
                             };
-                            let id = format!("{}:{}:{}:{}", signal.detector_type, signal.metric_name, signal.context_key, chrono::Utc::now().timestamp_millis());
-                            let _ = ol_pg.insert_drift_signal(&id, &signal.detector_type, &signal.metric_name, &signal.context_key, drift_level, signal.pre_drift_mean, signal.post_drift_mean, signal.window_size as i64).await;
+                            let id = format!(
+                                "{}:{}:{}:{}",
+                                signal.detector_type,
+                                signal.metric_name,
+                                signal.context_key,
+                                chrono::Utc::now().timestamp_millis()
+                            );
+                            let _ = ol_pg
+                                .insert_drift_signal(
+                                    &id,
+                                    &signal.detector_type,
+                                    &signal.metric_name,
+                                    &signal.context_key,
+                                    drift_level,
+                                    signal.pre_drift_mean,
+                                    signal.post_drift_mean,
+                                    signal.window_size as i64,
+                                )
+                                .await;
                             persisted += 1;
 
                             let _ = ol_app_handle.emit(
@@ -2054,16 +2126,26 @@ impl LoopController {
                         }
 
                         if let Some(ref state_json) = drift_state {
-                            let _ = ol_pg.save_drift_detector_state("global_monitor", "composite", state_json).await;
+                            let _ = ol_pg
+                                .save_drift_detector_state(
+                                    "global_monitor",
+                                    "composite",
+                                    state_json,
+                                )
+                                .await;
                         }
 
-                        let credits = crate::online_learning::credit_assignment::compute_step_credits(
-                            &ol_outcome.step_attributions,
-                            ol_outcome.composite_score.unwrap_or(0.0),
-                            ol_outcome.status == "success",
-                        );
+                        let credits =
+                            crate::online_learning::credit_assignment::compute_step_credits(
+                                &ol_outcome.step_attributions,
+                                ol_outcome.composite_score.unwrap_or(0.0),
+                                ol_outcome.status == "success",
+                            );
                         if !credits.is_empty() {
-                            if let Ok(n) = ol_pg.save_step_credits(&credits, &ol_outcome.task_run_id).await {
+                            if let Ok(n) = ol_pg
+                                .save_step_credits(&credits, &ol_outcome.task_run_id)
+                                .await
+                            {
                                 persisted += n;
                             }
                         }
@@ -2083,21 +2165,45 @@ impl LoopController {
                         let summary_id = format!("exp-{}", ol_outcome.task_run_id);
                         let kd = serde_json::to_string(&summary.key_decisions).unwrap_or_default();
                         let fp = serde_json::to_string(&summary.failure_points).unwrap_or_default();
-                        let ep = serde_json::to_string(&summary.effective_patterns).unwrap_or_default();
-                        if ol_pg.insert_experience_summary(&summary_id, &ol_outcome.task_run_id, &ol_outcome.domain, &ol_outcome.complexity_tier, &ol_outcome.status, &kd, &fp, &ep).await.is_ok() {
+                        let ep =
+                            serde_json::to_string(&summary.effective_patterns).unwrap_or_default();
+                        if ol_pg
+                            .insert_experience_summary(
+                                &summary_id,
+                                &ol_outcome.task_run_id,
+                                &ol_outcome.domain,
+                                &ol_outcome.complexity_tier,
+                                &ol_outcome.status,
+                                &kd,
+                                &fp,
+                                &ep,
+                            )
+                            .await
+                            .is_ok()
+                        {
                             persisted += 1;
                         }
 
                         if let Some(ref model) = ol_outcome.model_used {
-                            let _ = ol_pg.update_learning_outcome_model(&ol_outcome.task_run_id, model).await;
+                            let _ = ol_pg
+                                .update_learning_outcome_model(&ol_outcome.task_run_id, model)
+                                .await;
                         }
 
                         if ol_outcome.status == "success" || ol_outcome.status == "complete" {
                             if let Some(score) = ol_outcome.composite_score {
-                                let p90 = ol_pg.get_score_percentile(
-                                    &format!("{}:{}:{}", ol_outcome.domain, ol_outcome.complexity_tier, if ol_outcome.has_ui { "ui" } else { "no_ui" }),
-                                    90,
-                                ).await.unwrap_or(0.95);
+                                let p90 = ol_pg
+                                    .get_score_percentile(
+                                        &format!(
+                                            "{}:{}:{}",
+                                            ol_outcome.domain,
+                                            ol_outcome.complexity_tier,
+                                            if ol_outcome.has_ui { "ui" } else { "no_ui" }
+                                        ),
+                                        90,
+                                    )
+                                    .await
+                                    .unwrap_or(0.95);
 
                                 if score > p90 && score > 0.7 {
                                     let strategy = crate::online_learning::strategy_evolution::extract_strategy_from_run(
@@ -2113,17 +2219,32 @@ impl LoopController {
                                             duration_secs: ol_outcome.duration_secs.unwrap_or(0.0),
                                         },
                                     );
-                                    let app_json = serde_json::to_string(&strategy.applicability).unwrap_or_default();
-                                    let comp_json = serde_json::to_string(&strategy.components).unwrap_or_default();
-                                    let prov_json = serde_json::to_string(&strategy.provenance).unwrap_or_default();
-                                    if let Err(e) = ol_pg.insert_strategy(
-                                        &strategy.id, &strategy.name, &strategy.description,
-                                        &app_json, &comp_json, &prov_json,
-                                        "candidate", strategy.parent_strategy_id.as_deref(),
-                                    ).await {
+                                    let app_json = serde_json::to_string(&strategy.applicability)
+                                        .unwrap_or_default();
+                                    let comp_json = serde_json::to_string(&strategy.components)
+                                        .unwrap_or_default();
+                                    let prov_json = serde_json::to_string(&strategy.provenance)
+                                        .unwrap_or_default();
+                                    if let Err(e) = ol_pg
+                                        .insert_strategy(
+                                            &strategy.id,
+                                            &strategy.name,
+                                            &strategy.description,
+                                            &app_json,
+                                            &comp_json,
+                                            &prov_json,
+                                            "candidate",
+                                            strategy.parent_strategy_id.as_deref(),
+                                        )
+                                        .await
+                                    {
                                         tracing::debug!("Failed to insert strategy: {}", e);
                                     } else {
-                                        tracing::info!("Extracted candidate strategy '{}' from P90+ run {}", strategy.name, ol_outcome.task_run_id);
+                                        tracing::info!(
+                                            "Extracted candidate strategy '{}' from P90+ run {}",
+                                            strategy.name,
+                                            ol_outcome.task_run_id
+                                        );
                                         persisted += 1;
                                     }
                                 }
@@ -2131,7 +2252,11 @@ impl LoopController {
                         }
 
                         if persisted > 0 {
-                            tracing::debug!("Online learning persisted {} items for {}", persisted, ol_outcome.task_run_id);
+                            tracing::debug!(
+                                "Online learning persisted {} items for {}",
+                                persisted,
+                                ol_outcome.task_run_id
+                            );
                         }
                     }
                 });
@@ -2351,7 +2476,12 @@ impl LoopController {
                     let swf = source_wf_name.clone();
                     let ctri = cra_task_run_id.clone();
                     match cra_pg_db.post_run_analysis(&swf, &ctri).await {
-                        Ok((patterns, rules, fixes)) => Ok((patterns, rules, fixes, Vec::<crate::reflection::cross_run_learning::ExtractedSkill>::new())),
+                        Ok((patterns, rules, fixes)) => Ok((
+                            patterns,
+                            rules,
+                            fixes,
+                            Vec::<crate::reflection::cross_run_learning::ExtractedSkill>::new(),
+                        )),
                         Err(e) => Err(e),
                     }
                 };
@@ -2380,7 +2510,8 @@ impl LoopController {
                                             "source_fix_id": skill.source_fix_id,
                                             "source_task_run_id": skill.source_task_run_id,
                                         }),
-                                    ).await;
+                                    )
+                                    .await;
 
                                     {
                                         let pg = &pg_for_mirror;
@@ -2402,7 +2533,8 @@ impl LoopController {
                                         if let Err(e) = pg.save_observation(&obs_input).await {
                                             tracing::warn!(
                                                 "Failed to mirror skill '{}' to PG observation: {}",
-                                                skill.skill_slug, e
+                                                skill.skill_slug,
+                                                e
                                             );
                                         }
                                     }
@@ -2432,7 +2564,10 @@ impl LoopController {
                                         session_id: None,
                                     };
                                     if let Err(e) = pg.save_observation(&obs).await {
-                                        tracing::warn!("Failed to save cross-run pattern observation: {}", e);
+                                        tracing::warn!(
+                                            "Failed to save cross-run pattern observation: {}",
+                                            e
+                                        );
                                     }
                                 });
                             }
@@ -2450,8 +2585,14 @@ impl LoopController {
             let consolidation_pg = self.app_state.pg_db.clone();
             tokio::spawn(async move {
                 let settings = crate::settings::load_settings();
-                let config: crate::memory::consolidation::ConsolidationConfig = (&settings.memory_consolidation).into();
-                if !crate::memory::consolidation::can_run_consolidation(&consolidation_pg, config.cooldown_hours).await {
+                let config: crate::memory::consolidation::ConsolidationConfig =
+                    (&settings.memory_consolidation).into();
+                if !crate::memory::consolidation::can_run_consolidation(
+                    &consolidation_pg,
+                    config.cooldown_hours,
+                )
+                .await
+                {
                     return;
                 }
                 let count = consolidation_pg
@@ -2463,11 +2604,14 @@ impl LoopController {
                     return;
                 }
                 tracing::info!("Triggering background memory consolidation");
-                match crate::memory::consolidation::run_consolidation(&consolidation_pg, &config).await {
+                match crate::memory::consolidation::run_consolidation(&consolidation_pg, &config)
+                    .await
+                {
                     Ok(stats) => {
                         tracing::info!(
                             "Memory consolidation complete: {} models created, {} archived",
-                            stats.models_created, stats.observations_archived
+                            stats.models_created,
+                            stats.observations_archived
                         );
                     }
                     Err(e) => {
@@ -2533,9 +2677,7 @@ impl LoopController {
     }
 
     /// Restore canary config overrides to their original values.
-    fn restore_canary_config(
-        _originals: &[(String, Option<serde_json::Value>)],
-    ) {
+    fn restore_canary_config(_originals: &[(String, Option<serde_json::Value>)]) {
         // Canary config restore removed — settings persistence now via PgDb.
     }
 
@@ -2807,7 +2949,11 @@ impl LoopController {
                     )
                 }
                 AgenticOutcome::BudgetExceeded { reason } => {
-                    warn!("SWEEP: Iteration {} budget exceeded: {}", iteration + 1, reason);
+                    warn!(
+                        "SWEEP: Iteration {} budget exceeded: {}",
+                        iteration + 1,
+                        reason
+                    );
                     format!(
                         "\n\n=== Completion Sweep (Iteration {}/{}, BUDGET EXCEEDED: {}) ===\n\n",
                         iteration + 1,
@@ -2819,12 +2965,11 @@ impl LoopController {
             };
 
             if !output_text.is_empty() {
-                let _ = self.app_state.pg_db.append_task_output_ex(
-                    &config.execution_id,
-                    &output_text,
-                    true,
-                    false,
-                ).await;
+                let _ = self
+                    .app_state
+                    .pg_db
+                    .append_task_output_ex(&config.execution_id, &output_text, true, false)
+                    .await;
             }
 
             iterations_run = iteration + 1;

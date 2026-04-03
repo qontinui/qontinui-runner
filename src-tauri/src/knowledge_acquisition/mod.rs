@@ -6,8 +6,8 @@ pub mod types;
 pub mod vuln_enrichment;
 
 pub use types::{
-    KnowledgeAcquisitionConfig, KnowledgeDomain, KnowledgeMetadata, KnowledgeResult,
-    SearchBudget, SearchProvider,
+    KnowledgeAcquisitionConfig, KnowledgeDomain, KnowledgeMetadata, KnowledgeResult, SearchBudget,
+    SearchProvider,
 };
 
 use providers::duckduckgo::DuckDuckGo;
@@ -48,10 +48,7 @@ impl SearchContext {
     }
 
     /// Create with an explicit PG reference.
-    pub fn with_pg(
-        pg: Option<Arc<crate::database::pg::PgDb>>,
-        task_run_id: String,
-    ) -> Self {
+    pub fn with_pg(pg: Option<Arc<crate::database::pg::PgDb>>, task_run_id: String) -> Self {
         Self { pg, task_run_id }
     }
 }
@@ -171,11 +168,8 @@ impl KnowledgeAcquisition {
 
         // === Tier 1: UI Bridge (if connected) ===
         if budget.can_search() && domain != KnowledgeDomain::VulnerabilityIntelligence {
-            if let Ok(true) = tokio::time::timeout(
-                Duration::from_secs(3),
-                self.ui_bridge.is_available(),
-            )
-            .await
+            if let Ok(true) =
+                tokio::time::timeout(Duration::from_secs(3), self.ui_bridge.is_available()).await
             {
                 match tokio::time::timeout(
                     budget.timeout_per_call,
@@ -184,8 +178,7 @@ impl KnowledgeAcquisition {
                 .await
                 {
                     Ok(Ok(results)) if !results.is_empty() => {
-                        let content_bytes: usize =
-                            results.iter().map(|r| r.content.len()).sum();
+                        let content_bytes: usize = results.iter().map(|r| r.content.len()).sum();
                         self.stats
                             .ui_bridge
                             .record_success(results.len() as u64, content_bytes as u64);
@@ -251,8 +244,7 @@ impl KnowledgeAcquisition {
                 .await
                 {
                     Ok(Ok(results)) => {
-                        let content_bytes: usize =
-                            results.iter().map(|r| r.content.len()).sum();
+                        let content_bytes: usize = results.iter().map(|r| r.content.len()).sum();
                         self.stats
                             .tavily
                             .record_success(results.len() as u64, content_bytes as u64);
@@ -280,8 +272,7 @@ impl KnowledgeAcquisition {
                 match tokio::time::timeout(budget.timeout_per_call, perplexity.search(query)).await
                 {
                     Ok(Ok(results)) => {
-                        let content_bytes: usize =
-                            results.iter().map(|r| r.content.len()).sum();
+                        let content_bytes: usize = results.iter().map(|r| r.content.len()).sum();
                         self.stats
                             .perplexity
                             .record_success(results.len() as u64, content_bytes as u64);
@@ -322,12 +313,7 @@ impl KnowledgeAcquisition {
         if !all_results.is_empty() {
             if let Some(ctx) = ctx {
                 let outcomes =
-                    ingestor::ingest_results(
-                        &all_results,
-                        &ctx.task_run_id,
-                        ctx.pg.as_ref(),
-                    )
-                    .await;
+                    ingestor::ingest_results(&all_results, &ctx.task_run_id, ctx.pg.as_ref()).await;
                 let stored = outcomes
                     .iter()
                     .filter(|o| matches!(o, ingestor::IngestOutcome::Stored { .. }))
@@ -338,7 +324,15 @@ impl KnowledgeAcquisition {
                     .count();
                 let injections = outcomes
                     .iter()
-                    .filter(|o| matches!(o, ingestor::IngestOutcome::Stored { injection_flagged: true, .. }))
+                    .filter(|o| {
+                        matches!(
+                            o,
+                            ingestor::IngestOutcome::Stored {
+                                injection_flagged: true,
+                                ..
+                            }
+                        )
+                    })
                     .count();
                 self.stats
                     .results_ingested
@@ -497,9 +491,7 @@ impl KnowledgeAcquisition {
                     .collect()
             }
             Err(e) => {
-                eprintln!(
-                    "[knowledge_acquisition] Unified memory supplement failed: {e}"
-                );
+                eprintln!("[knowledge_acquisition] Unified memory supplement failed: {e}");
                 Vec::new()
             }
         }
@@ -590,9 +582,15 @@ impl KnowledgeAcquisition {
         max_results: usize,
     ) -> Result<Vec<KnowledgeResult>, String> {
         let (provider, result) = if let Some(ref tavily) = self.tavily {
-            (SearchProvider::Tavily, tavily.search(query, max_results, "advanced").await)
+            (
+                SearchProvider::Tavily,
+                tavily.search(query, max_results, "advanced").await,
+            )
         } else {
-            (SearchProvider::DuckDuckGo, self.duckduckgo.search(query, max_results).await)
+            (
+                SearchProvider::DuckDuckGo,
+                self.duckduckgo.search(query, max_results).await,
+            )
         };
         match &result {
             Ok(results) => {
@@ -621,7 +619,9 @@ impl KnowledgeAcquisition {
         match self.osv.query_package(name, ecosystem, version).await {
             Ok(results) => {
                 let bytes: usize = results.iter().map(|r| r.content.len()).sum();
-                self.stats.osv.record_success(results.len() as u64, bytes as u64);
+                self.stats
+                    .osv
+                    .record_success(results.len() as u64, bytes as u64);
                 Ok(results)
             }
             Err(e) => {

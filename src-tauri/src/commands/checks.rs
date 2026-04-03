@@ -158,20 +158,24 @@ pub async fn execute_check_by_id(
             .as_ref()
             .map(|o| serde_json::to_string(o).unwrap_or_default());
 
-        if let Err(e) = state.pg_db.save_check_result(
-            &result.check_id,
-            &status_str,
-            Some(result.started_at.as_str()),
-            Some(result.completed_at.as_str()),
-            Some(result.duration_ms as i64),
-            Some(result.output.as_str()),
-            result.error.as_deref(),
-            result.issues_found as i32,
-            result.issues_fixed as i32,
-            result.files_checked as i32,
-            structured.as_deref(),
-            Some(run_id.as_str()),
-        ).await {
+        if let Err(e) = state
+            .pg_db
+            .save_check_result(
+                &result.check_id,
+                &status_str,
+                Some(result.started_at.as_str()),
+                Some(result.completed_at.as_str()),
+                Some(result.duration_ms as i64),
+                Some(result.output.as_str()),
+                result.error.as_deref(),
+                result.issues_found as i32,
+                result.issues_fixed as i32,
+                result.files_checked as i32,
+                structured.as_deref(),
+                Some(run_id.as_str()),
+            )
+            .await
+        {
             error!("Failed to store check result in PG: {}", e);
         }
     }
@@ -204,16 +208,25 @@ pub async fn list_checks(
         Ok(checks) => {
             // Apply filters in memory since PG list_checks has no filter params
             let enabled_filter = enabled_only.unwrap_or(false);
-            let checks: Vec<_> = checks.into_iter().filter(|c| {
-                if enabled_filter && !c.enabled { return false; }
-                if let Some(ref ct) = check_type {
-                    if c.check_type != *ct { return false; }
-                }
-                if let Some(ref t) = tool {
-                    if c.tool != *t { return false; }
-                }
-                true
-            }).collect();
+            let checks: Vec<_> = checks
+                .into_iter()
+                .filter(|c| {
+                    if enabled_filter && !c.enabled {
+                        return false;
+                    }
+                    if let Some(ref ct) = check_type {
+                        if c.check_type != *ct {
+                            return false;
+                        }
+                    }
+                    if let Some(ref t) = tool {
+                        if c.tool != *t {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
             Ok(CommandResponse {
                 success: true,
                 message: Some(format!("Found {} checks", checks.len())),
@@ -715,20 +728,24 @@ pub async fn execute_check_group(
                 .as_ref()
                 .map(|o| serde_json::to_string(o).unwrap_or_default());
 
-            if let Err(e) = state.pg_db.save_check_result(
-                &result.check_id,
-                &status_str,
-                Some(result.started_at.as_str()),
-                Some(result.completed_at.as_str()),
-                Some(result.duration_ms as i64),
-                Some(result.output.as_str()),
-                result.error.as_deref(),
-                result.issues_found as i32,
-                result.issues_fixed as i32,
-                result.files_checked as i32,
-                structured.as_deref(),
-                Some(run_id.as_str()),
-            ).await {
+            if let Err(e) = state
+                .pg_db
+                .save_check_result(
+                    &result.check_id,
+                    &status_str,
+                    Some(result.started_at.as_str()),
+                    Some(result.completed_at.as_str()),
+                    Some(result.duration_ms as i64),
+                    Some(result.output.as_str()),
+                    result.error.as_deref(),
+                    result.issues_found as i32,
+                    result.issues_fixed as i32,
+                    result.files_checked as i32,
+                    structured.as_deref(),
+                    Some(run_id.as_str()),
+                )
+                .await
+            {
                 error!("Failed to store check result in PG: {}", e);
             }
         }

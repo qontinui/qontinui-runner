@@ -128,10 +128,7 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
         build_api_step(
             "Load prompt evolution history",
             "GET",
-            &format!(
-                "{}/meta-optimizer/prompt-evolution?limit=20",
-                base_url
-            ),
+            &format!("{}/meta-optimizer/prompt-evolution?limit=20", base_url),
             None,
             Some("prompt_evolution_history"),
         ),

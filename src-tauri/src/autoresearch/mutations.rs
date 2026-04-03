@@ -533,10 +533,15 @@ impl QLearningMutator {
         history: &[(u32, ExperimentResult)],
     ) -> Option<ExperimentConfig> {
         // Start with the fallback's next experiment (handles non-architecture dimensions)
-        let mut config = self.fallback.next_experiment(control, dimensions, history)?;
+        let mut config = self
+            .fallback
+            .next_experiment(control, dimensions, history)?;
 
         // Override the architecture dimension if we have a task state and Q-data
-        if dimensions.iter().any(|d| matches!(d, SearchDimension::WorkflowArchitecture)) {
+        if dimensions
+            .iter()
+            .any(|d| matches!(d, SearchDimension::WorkflowArchitecture))
+        {
             if let Some(ref task_state) = self.current_task_state {
                 if self.q_router.has_sufficient_data(task_state) {
                     let selected = self.q_router.select_architecture(task_state);

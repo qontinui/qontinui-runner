@@ -52,8 +52,7 @@ pub struct WorkflowEvent {
 }
 
 /// Identifies the source of an event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EventSource {
     /// Task run ID that produced the event (if any).
     pub task_run_id: Option<String>,
@@ -62,7 +61,6 @@ pub struct EventSource {
     /// Workflow name for logging.
     pub workflow_name: Option<String>,
 }
-
 
 /// A subscription that triggers when a matching event is emitted.
 #[derive(Debug, Clone)]
@@ -149,7 +147,8 @@ impl WorkflowEventBus {
         // 4. Find matching subscriptions and remove once-only matches atomically
         let matched_subscriptions = {
             let mut subs = self.subscriptions.write().await;
-            let matched: Vec<String> = subs.iter()
+            let matched: Vec<String> = subs
+                .iter()
                 .filter(|s| event_matches(&event_name, &s.event_pattern))
                 .map(|s| s.id.clone())
                 .collect();
@@ -438,11 +437,13 @@ mod tests {
         // Start a waiter in a background task
         let bus_clone = bus.clone();
         let waiter = tokio::spawn(async move {
-            bus_clone.wait_for_event(
-                "test-waiter",
-                "test.event",
-                std::time::Duration::from_secs(5),
-            ).await
+            bus_clone
+                .wait_for_event(
+                    "test-waiter",
+                    "test.event",
+                    std::time::Duration::from_secs(5),
+                )
+                .await
         });
 
         // Give the waiter a moment to register
@@ -455,7 +456,8 @@ mod tests {
             timestamp: chrono::Utc::now().to_rfc3339(),
             idempotency_key: None,
             source: EventSource::default(),
-        }).await;
+        })
+        .await;
 
         // Waiter should receive the event
         let result = waiter.await.unwrap();
@@ -468,11 +470,13 @@ mod tests {
         let bus = WorkflowEventBus::new();
 
         // Wait for an event that never arrives, with a short timeout
-        let result = bus.wait_for_event(
-            "timeout-waiter",
-            "never.arrives",
-            std::time::Duration::from_millis(50),
-        ).await;
+        let result = bus
+            .wait_for_event(
+                "timeout-waiter",
+                "never.arrives",
+                std::time::Duration::from_millis(50),
+            )
+            .await;
 
         assert!(result.is_none(), "Should have timed out");
     }
@@ -487,16 +491,19 @@ mod tests {
             condition: None,
             target_workflow_id: None,
             once: false,
-        }).await;
+        })
+        .await;
 
         // Should match before unsubscribe
-        let r1 = bus.emit(WorkflowEvent {
-            name: "test.event".to_string(),
-            data: serde_json::json!({}),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            idempotency_key: None,
-            source: EventSource::default(),
-        }).await;
+        let r1 = bus
+            .emit(WorkflowEvent {
+                name: "test.event".to_string(),
+                data: serde_json::json!({}),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                idempotency_key: None,
+                source: EventSource::default(),
+            })
+            .await;
         assert_eq!(r1.matched_subscriptions.len(), 1);
 
         // Unsubscribe
@@ -504,13 +511,15 @@ mod tests {
         assert!(!bus.unsubscribe("unsub-test").await); // Already removed
 
         // Should NOT match after unsubscribe
-        let r2 = bus.emit(WorkflowEvent {
-            name: "test.event".to_string(),
-            data: serde_json::json!({}),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            idempotency_key: None,
-            source: EventSource::default(),
-        }).await;
+        let r2 = bus
+            .emit(WorkflowEvent {
+                name: "test.event".to_string(),
+                data: serde_json::json!({}),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                idempotency_key: None,
+                source: EventSource::default(),
+            })
+            .await;
         assert_eq!(r2.matched_subscriptions.len(), 0);
     }
 

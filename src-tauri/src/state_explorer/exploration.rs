@@ -753,8 +753,7 @@ impl StateExplorer {
 
                 // Calculate cost — higher for transitions with flaky elements
                 let flaky_penalty = if self.flaky_elements.iter().any(|e| {
-                    transition.from_state_id.contains(e)
-                        || transition.to_state_id.contains(e)
+                    transition.from_state_id.contains(e) || transition.to_state_id.contains(e)
                 }) {
                     3.0 // Triple cost for flaky paths
                 } else {

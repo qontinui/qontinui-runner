@@ -387,7 +387,11 @@ async fn handle_relay_command(
 
                     // Persist to output log
                     let msg = format!("\n[USER_MESSAGE]\n{}\n[/USER_MESSAGE]\n", content);
-                    let _ = api_state.app_state.pg_db.append_task_output_ex(task_run_id, &msg, false, false).await;
+                    let _ = api_state
+                        .app_state
+                        .pg_db
+                        .append_task_output_ex(task_run_id, &msg, false, false)
+                        .await;
 
                     match session.send_user_message(content) {
                         Ok(sent_immediately) => Some(serde_json::json!({
@@ -421,32 +425,30 @@ async fn handle_relay_command(
             }
         }
 
-        "chat_list_running" => {
-            match api_state.app_state.pg_db.get_running_task_runs(None).await {
-                Ok(runs) => {
-                    let run_list: Vec<Value> = runs
-                        .iter()
-                        .map(|r| {
-                            serde_json::json!({
-                                "id": r.id,
-                                "task_name": r.task_name,
-                                "status": r.status,
-                                "created_at": r.created_at,
-                            })
+        "chat_list_running" => match api_state.app_state.pg_db.get_running_task_runs(None).await {
+            Ok(runs) => {
+                let run_list: Vec<Value> = runs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "task_name": r.task_name,
+                            "status": r.status,
+                            "created_at": r.created_at,
                         })
-                        .collect();
-                    Some(serde_json::json!({
-                        "type": "chat_running_tasks",
-                        "tasks": run_list
-                    }))
-                }
-                _ => Some(serde_json::json!({
+                    })
+                    .collect();
+                Some(serde_json::json!({
                     "type": "chat_running_tasks",
-                    "tasks": [],
-                    "error": "Failed to query running tasks"
-                })),
+                    "tasks": run_list
+                }))
             }
-        }
+            _ => Some(serde_json::json!({
+                "type": "chat_running_tasks",
+                "tasks": [],
+                "error": "Failed to query running tasks"
+            })),
+        },
 
         "chat_session_state" => {
             let task_run_id = data
@@ -514,7 +516,11 @@ async fn handle_relay_command(
             let create_input = crate::database::CreateTaskRunInput::new(&task_run_id, task_name)
                 .with_prompt("Remote AI session")
                 .with_workflow_type("chat");
-            let create_result = api_state.app_state.pg_db.create_task_run(&create_input).await;
+            let create_result = api_state
+                .app_state
+                .pg_db
+                .create_task_run(&create_input)
+                .await;
 
             if create_result.is_err() {
                 return Some(serde_json::json!({
@@ -690,7 +696,11 @@ async fn handle_relay_command(
             }
 
             // Update status in DB
-            let _ = api_state.app_state.pg_db.update_task_run_status(&task_run_id, "stopped").await;
+            let _ = api_state
+                .app_state
+                .pg_db
+                .update_task_run_status(&task_run_id, "stopped")
+                .await;
 
             Some(serde_json::json!({
                 "type": "chat_session_state",
@@ -726,7 +736,11 @@ async fn handle_relay_command(
             }
 
             // Get conversation from DB output_log
-            let output_log = api_state.app_state.pg_db.get_task_output(&task_run_id).await
+            let output_log = api_state
+                .app_state
+                .pg_db
+                .get_task_output(&task_run_id)
+                .await
                 .unwrap_or_default();
 
             if output_log.is_empty() {
@@ -835,7 +849,11 @@ async fn handle_relay_command(
                 }));
             }
 
-            let output = api_state.app_state.pg_db.get_task_output(&task_run_id).await
+            let output = api_state
+                .app_state
+                .pg_db
+                .get_task_output(&task_run_id)
+                .await
                 .unwrap_or_default();
             Some(serde_json::json!({
                 "type": "chat_output",
@@ -864,7 +882,11 @@ async fn handle_relay_command(
                 }));
             }
 
-            let rename_result = api_state.app_state.pg_db.update_task_name(&task_run_id, &new_name).await;
+            let rename_result = api_state
+                .app_state
+                .pg_db
+                .update_task_name(&task_run_id, &new_name)
+                .await;
 
             match rename_result {
                 Ok(()) => Some(serde_json::json!({

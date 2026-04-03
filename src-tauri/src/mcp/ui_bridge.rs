@@ -943,17 +943,14 @@ pub async fn ui_bridge_execute_action_handler(
                 let s = json_resp.success;
                 let err = json_resp.error.clone();
                 // Truncate result to 1KB to respect memory budgets
-                let res = json_resp
-                    .data
-                    .as_ref()
-                    .map(|d| {
-                        let s = d.to_string();
-                        if s.len() > 1024 {
-                            format!("{}...", &s[..1024])
-                        } else {
-                            s
-                        }
-                    });
+                let res = json_resp.data.as_ref().map(|d| {
+                    let s = d.to_string();
+                    if s.len() > 1024 {
+                        format!("{}...", &s[..1024])
+                    } else {
+                        s
+                    }
+                });
                 (s, err, res)
             }
             Err(_) => (false, Some("transport error".to_string()), None),
@@ -965,22 +962,28 @@ pub async fn ui_bridge_execute_action_handler(
 
         // Async PG write — fire-and-forget, never blocks the response
         tokio::spawn(async move {
-            match pg_db.insert_ui_bridge_event(
-                Some(tr_id),
-                seq,
-                "action_executed",
-                Some(&element_id),
-                None,
-                None,
-                Some(&action_for_db),
-                None,
-                result_json.as_deref(),
-                Some(duration_ms),
-                success,
-                error_msg.as_deref(),
-                None,
-            ).await {
-                Ok(row_id) => info!("UI Bridge event persisted: element={}, row_id={}", element_id, row_id),
+            match pg_db
+                .insert_ui_bridge_event(
+                    Some(tr_id),
+                    seq,
+                    "action_executed",
+                    Some(&element_id),
+                    None,
+                    None,
+                    Some(&action_for_db),
+                    None,
+                    result_json.as_deref(),
+                    Some(duration_ms),
+                    success,
+                    error_msg.as_deref(),
+                    None,
+                )
+                .await
+            {
+                Ok(row_id) => info!(
+                    "UI Bridge event persisted: element={}, row_id={}",
+                    element_id, row_id
+                ),
                 Err(e) => warn!("UI Bridge event persist failed: {}", e),
             }
         });
@@ -1317,10 +1320,9 @@ pub async fn ui_bridge_get_console_errors_handler(
         Ok(data) => {
             // Update the console error count for the health endpoint
             if let Some(errors) = data.get("errors").and_then(|e| e.as_array()) {
-                state.ui_bridge_console_error_count.store(
-                    errors.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                state
+                    .ui_bridge_console_error_count
+                    .store(errors.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             Ok(Json(ApiResponse::success(data)))
         }
@@ -1339,7 +1341,9 @@ pub async fn ui_bridge_clear_console_errors_handler(
 
     match ui_bridge_request_sync(&state, "clear_console_errors", serde_json::json!({})).await {
         Ok(data) => {
-            state.ui_bridge_console_error_count.store(0, std::sync::atomic::Ordering::Relaxed);
+            state
+                .ui_bridge_console_error_count
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
@@ -2052,7 +2056,10 @@ pub async fn ui_bridge_page_evaluate_handler(
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(ipc_err) => {
             // IPC failed — try direct WebView evaluation as fallback
-            debug!("UI Bridge: IPC evaluate failed ({}), trying direct WebView eval", ipc_err);
+            debug!(
+                "UI Bridge: IPC evaluate failed ({}), trying direct WebView eval",
+                ipc_err
+            );
 
             match direct_webview_evaluate_with_result(&state, &request.expression).await {
                 Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
@@ -2060,10 +2067,17 @@ pub async fn ui_bridge_page_evaluate_handler(
                     "source": "direct_eval"
                 })))),
                 Err(direct_err) => {
-                    error!("UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}", ipc_err, direct_err);
-                    Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!(
-                        "IPC: {}. Direct eval: {}", ipc_err, direct_err
-                    )))))
+                    error!(
+                        "UI Bridge API: Both IPC and direct eval failed. IPC: {}, Direct: {}",
+                        ipc_err, direct_err
+                    );
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!(
+                            "IPC: {}. Direct eval: {}",
+                            ipc_err, direct_err
+                        ))),
+                    ))
                 }
             }
         }
@@ -2132,12 +2146,18 @@ async fn direct_webview_evaluate_with_result(
         request_id, expression
     );
 
-    window.eval(&callback_js).map_err(|e| format!("WebView eval dispatch failed: {}", e))?;
+    window
+        .eval(&callback_js)
+        .map_err(|e| format!("WebView eval dispatch failed: {}", e))?;
 
     // Wait for the response with a timeout
     match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
         Ok(Ok(data)) => {
-            if let Some(result) = data.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
+            if let Some(result) = data
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+            {
                 Ok(result.to_string())
             } else if let Some(err) = data.get("error").and_then(|e| e.as_str()) {
                 Err(format!("JS error: {}", err))
@@ -2208,7 +2228,9 @@ async fn direct_webview_evaluate(
     // and use IPC to get the result back, but with error wrapping.
 
     // Use the existing IPC path but with our safe-wrapped expression
-    window.eval(&safe_js).map_err(|e| format!("WebView eval failed: {}", e))?;
+    window
+        .eval(&safe_js)
+        .map_err(|e| format!("WebView eval failed: {}", e))?;
 
     // Since eval() is fire-and-forget in Tauri v2, we can't get a return value
     // directly. Instead, we'll use the IPC request_sync path with our wrapped expression.
@@ -2233,10 +2255,17 @@ async fn safe_evaluate(
     match ui_bridge_request_sync(state, "page_evaluate", payload).await {
         Ok(data) => {
             // Try to parse the inner result
-            if let Some(result) = data.get("result").and_then(|r| r.get("value")).and_then(|v| v.as_str()) {
+            if let Some(result) = data
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.as_str())
+            {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result) {
                     if parsed.get("success") == Some(&serde_json::Value::Bool(false)) {
-                        let error_msg = parsed.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error");
+                        let error_msg = parsed
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("Unknown error");
                         return Err(format!("JavaScript evaluation error: {}", error_msg));
                     }
                     return Ok(parsed);
@@ -2330,8 +2359,8 @@ pub async fn ui_bridge_page_evaluate_batch_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("[]");
 
-            let results: Vec<BatchExpressionResult> =
-                serde_json::from_str(result_str).unwrap_or_else(|_| {
+            let results: Vec<BatchExpressionResult> = serde_json::from_str(result_str)
+                .unwrap_or_else(|_| {
                     request
                         .expressions
                         .iter()
@@ -2406,7 +2435,11 @@ pub async fn ui_bridge_structured_assert_handler(
             query_js, query_js
         ),
         "count" => {
-            let expected = request.expected.as_ref().and_then(|v| v.as_i64()).unwrap_or(0);
+            let expected = request
+                .expected
+                .as_ref()
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             format!(
                 r#"return JSON.stringify({{ found: ({}).length, passed: ({}).length === {}, expected: {} }})"#,
                 query_js, query_js, expected, expected
@@ -2485,7 +2518,10 @@ pub async fn ui_bridge_structured_assert_handler(
             let parsed: serde_json::Value =
                 serde_json::from_str(result_str).unwrap_or(serde_json::json!({"passed": false}));
 
-            let passed = parsed.get("passed").and_then(|p| p.as_bool()).unwrap_or(false);
+            let passed = parsed
+                .get("passed")
+                .and_then(|p| p.as_bool())
+                .unwrap_or(false);
 
             let result = AssertResult {
                 passed,
@@ -2494,7 +2530,10 @@ pub async fn ui_bridge_structured_assert_handler(
                 actual: parsed.clone(),
                 expected: request.expected.clone().unwrap_or(serde_json::Value::Null),
                 message: if passed {
-                    format!("Assertion '{}' passed for '{}'", request.assertion, request.query)
+                    format!(
+                        "Assertion '{}' passed for '{}'",
+                        request.assertion, request.query
+                    )
                 } else {
                     format!(
                         "Assertion '{}' failed for '{}': {:?}",
@@ -4762,7 +4801,10 @@ pub async fn ui_bridge_ai_snapshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<AiSnapshotQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: AI snapshot (maxTokens={:?})", query.max_tokens);
+    info!(
+        "UI Bridge API: AI snapshot (maxTokens={:?})",
+        query.max_tokens
+    );
     let mut payload = serde_json::json!({});
     if let Some(max_tokens) = query.max_tokens {
         payload["maxTokens"] = serde_json::json!(max_tokens);
@@ -5891,8 +5933,7 @@ pub async fn ui_bridge_execute_action_plan_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let result =
-                ui_bridge_request_sync(&state, "navigate", serde_json::json!({ "url": url }))
-                    .await;
+                ui_bridge_request_sync(&state, "navigate", serde_json::json!({ "url": url })).await;
             let duration = action_start.elapsed().as_millis() as u64;
             let (success, error) = match result {
                 Ok(_) => (true, None),
@@ -6403,8 +6444,12 @@ pub struct AnalyticsDaysQuery {
     #[serde(default = "default_analytics_limit")]
     pub limit: i64,
 }
-fn default_analytics_days() -> u32 { 7 }
-fn default_analytics_limit() -> i64 { 20 }
+fn default_analytics_days() -> u32 {
+    7
+}
+fn default_analytics_limit() -> i64 {
+    20
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DecayCurveQuery {
@@ -6414,8 +6459,12 @@ pub struct DecayCurveQuery {
     #[serde(default = "default_num_windows")]
     pub windows: i64,
 }
-fn default_window_ms() -> i64 { 86_400_000 } // 1 day
-fn default_num_windows() -> i64 { 7 }
+fn default_window_ms() -> i64 {
+    86_400_000
+} // 1 day
+fn default_num_windows() -> i64 {
+    7
+}
 
 fn days_to_epoch_ms(days: u32) -> i64 {
     let now = std::time::SystemTime::now()
@@ -6433,8 +6482,13 @@ fn days_to_sqlite_datetime(days: u32) -> String {
 pub async fn analytics_decay_curve_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<DecayCurveQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::DecayCurveBucket>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.pg_db
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::DecayCurveBucket>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    match state
+        .app_state
+        .pg_db
         .get_element_decay_curve(&q.element_id, q.window_ms, q.windows)
         .await
     {
@@ -6447,9 +6501,14 @@ pub async fn analytics_decay_curve_handler(
 pub async fn analytics_action_baselines_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ActionBaseline>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ActionBaseline>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = days_to_epoch_ms(q.days);
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_action_latency_baselines(since)
         .await
     {
@@ -6462,9 +6521,14 @@ pub async fn analytics_action_baselines_handler(
 pub async fn analytics_failure_taxonomy_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::FailureCluster>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::FailureCluster>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = days_to_epoch_ms(q.days);
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_failure_taxonomy(since, q.limit)
         .await
     {
@@ -6477,9 +6541,14 @@ pub async fn analytics_failure_taxonomy_handler(
 pub async fn analytics_fragility_heatmap_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementFragility>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementFragility>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = days_to_epoch_ms(q.days);
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_element_fragility_by_region(since)
         .await
     {
@@ -6492,9 +6561,14 @@ pub async fn analytics_fragility_heatmap_handler(
 pub async fn analytics_regressions_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AutomationRegression>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AutomationRegression>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = days_to_epoch_ms(q.days);
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_automation_regressions(since, q.limit)
         .await
     {
@@ -6507,12 +6581,12 @@ pub async fn analytics_regressions_handler(
 pub async fn analytics_stall_frequency_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::StallFrequency>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::StallFrequency>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = (chrono::Utc::now() - chrono::Duration::days(q.days as i64)).to_rfc3339();
-    match state.app_state.pg_db
-        .get_stall_frequency(&since)
-        .await
-    {
+    match state.app_state.pg_db.get_stall_frequency(&since).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
@@ -6522,9 +6596,14 @@ pub async fn analytics_stall_frequency_handler(
 pub async fn analytics_intervention_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::InterventionStats>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::InterventionStats>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = (chrono::Utc::now() - chrono::Duration::days(q.days as i64)).to_rfc3339();
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_intervention_effectiveness(&since)
         .await
     {
@@ -6543,7 +6622,9 @@ pub async fn analytics_state_coverage_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<StateCoverageQuery>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_state_coverage(q.task_run_id)
         .await
     {
@@ -6557,14 +6638,21 @@ pub struct AnnotationGapQuery {
     #[serde(default = "default_annotation_min")]
     pub min_interactions: i64,
 }
-fn default_annotation_min() -> i64 { 10 }
+fn default_annotation_min() -> i64 {
+    10
+}
 
 /// GET /ui-bridge/analytics/annotation-gaps
 pub async fn analytics_annotation_gaps_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnnotationGapQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AnnotationGap>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.pg_db
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::AnnotationGap>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    match state
+        .app_state
+        .pg_db
         .get_unannotated_high_interaction_elements(q.min_interactions)
         .await
     {
@@ -6577,15 +6665,25 @@ pub async fn analytics_annotation_gaps_handler(
 pub async fn analytics_health_score_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<crate::database::ui_bridge_ops::AutomationHealthScore>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::database::ui_bridge_ops::AutomationHealthScore>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = days_to_epoch_ms(q.days);
-    let data = state.app_state.pg_db
+    let data = state
+        .app_state
+        .pg_db
         .compute_automation_health_score(since)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     // Deserialize from serde_json::Value to the expected type
-    let typed: crate::database::ui_bridge_ops::AutomationHealthScore =
-        serde_json::from_value(data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("Deserialization error: {}", e)))))?;
+    let typed: crate::database::ui_bridge_ops::AutomationHealthScore = serde_json::from_value(data)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Deserialization error: {}", e))),
+            )
+        })?;
     Ok(Json(ApiResponse::success(typed)))
 }
 
@@ -6593,15 +6691,22 @@ pub async fn analytics_health_score_handler(
 pub async fn analytics_recommendations_handler(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<AnalyticsDaysQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::Recommendation>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::Recommendation>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     let since = days_to_epoch_ms(q.days);
-    let data = state.app_state.pg_db
+    let data = state
+        .app_state
+        .pg_db
         .generate_recommendations(since)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     // Deserialize from serde_json::Value to the expected type
-    let typed: Vec<crate::database::ui_bridge_ops::Recommendation> =
-        data.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    let typed: Vec<crate::database::ui_bridge_ops::Recommendation> = data
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
     Ok(Json(ApiResponse::success(typed)))
 }
 
@@ -6665,9 +6770,13 @@ pub struct HistoryElementsQuery {
 pub async fn ui_bridge_history_elements_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<HistoryElementsQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>, (StatusCode, Json<ApiResponse<()>>)>
-{
-    match state.app_state.pg_db
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    match state
+        .app_state
+        .pg_db
         .get_element_interactions(query.task_run_id)
         .await
     {
@@ -6695,9 +6804,13 @@ pub async fn ui_bridge_history_element_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<HistoryElementQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>, (StatusCode, Json<ApiResponse<()>>)>
-{
-    match state.app_state.pg_db
+) -> Result<
+    Json<ApiResponse<Vec<crate::database::ui_bridge_ops::UiBridgeEvent>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    match state
+        .app_state
+        .pg_db
         .get_element_history(&id, query.limit)
         .await
     {
@@ -6734,7 +6847,9 @@ pub async fn ui_bridge_history_flaky_handler(
     Json<ApiResponse<Vec<crate::database::ui_bridge_ops::ElementReliability>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_flaky_elements(query.min_interactions, query.max_success_rate)
         .await
     {
@@ -6760,7 +6875,9 @@ pub async fn ui_bridge_element_reliability_handler(
     Json<ApiResponse<Option<crate::database::ui_bridge_ops::ElementReliability>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    match state.app_state.pg_db
+    match state
+        .app_state
+        .pg_db
         .get_element_reliability(&query.element_id)
         .await
     {
@@ -6778,10 +6895,7 @@ pub async fn ui_bridge_element_reliability_handler(
 
 /// Evaluate a JS expression, trying IPC first then direct WebView eval.
 /// Returns the raw string result from the evaluation.
-async fn evaluate_js_expression(
-    state: &Arc<ApiState>,
-    expression: &str,
-) -> Result<String, String> {
+async fn evaluate_js_expression(state: &Arc<ApiState>, expression: &str) -> Result<String, String> {
     let payload = serde_json::json!({ "expression": expression });
 
     // Try IPC path first (uses SDK event handlers, fastest)
@@ -6923,8 +7037,8 @@ pub async fn ui_bridge_click_by_text_handler(
 
     match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&result).unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
             Ok(Json(ApiResponse::success(parsed)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -6938,10 +7052,7 @@ pub async fn ui_bridge_click_by_selector_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let selector = body
-        .get("selector")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
     let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
     if selector.is_empty() {
@@ -6977,8 +7088,8 @@ pub async fn ui_bridge_click_by_selector_handler(
 
     match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&result).unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
             Ok(Json(ApiResponse::success(parsed)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -6992,10 +7103,7 @@ pub async fn ui_bridge_read_value_handler(
     State(state): State<Arc<ApiState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let selector = body
-        .get("selector")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let selector = body.get("selector").and_then(|v| v.as_str()).unwrap_or("");
     let index = body.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
     if selector.is_empty() {
@@ -7033,8 +7141,8 @@ pub async fn ui_bridge_read_value_handler(
 
     match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&result).unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
             Ok(Json(ApiResponse::success(parsed)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -7110,8 +7218,8 @@ pub async fn ui_bridge_type_into_handler(
 
     match evaluate_js_expression(&state, &js).await {
         Ok(result) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&result).unwrap_or(serde_json::json!({"typed": false, "error": "Parse error"}));
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or(serde_json::json!({"typed": false, "error": "Parse error"}));
             Ok(Json(ApiResponse::success(parsed)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -7148,8 +7256,8 @@ pub async fn ui_bridge_page_summary_handler(
 
     match evaluate_js_expression(&state, js).await {
         Ok(result) => {
-            let parsed: serde_json::Value =
-                serde_json::from_str(&result).unwrap_or(serde_json::json!({"error": "Parse error"}));
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or(serde_json::json!({"error": "Parse error"}));
             Ok(Json(ApiResponse::success(parsed)))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -7880,15 +7988,48 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_element_reliability_handler),
         )
         // Analytics endpoints (Phase 1 + 2)
-        .route("/ui-bridge/analytics/decay-curve", get(analytics_decay_curve_handler))
-        .route("/ui-bridge/analytics/action-baselines", get(analytics_action_baselines_handler))
-        .route("/ui-bridge/analytics/failure-taxonomy", get(analytics_failure_taxonomy_handler))
-        .route("/ui-bridge/analytics/fragility-heatmap", get(analytics_fragility_heatmap_handler))
-        .route("/ui-bridge/analytics/regressions", get(analytics_regressions_handler))
-        .route("/ui-bridge/analytics/stall-frequency", get(analytics_stall_frequency_handler))
-        .route("/ui-bridge/analytics/intervention-effectiveness", get(analytics_intervention_handler))
-        .route("/ui-bridge/analytics/state-coverage", get(analytics_state_coverage_handler))
-        .route("/ui-bridge/analytics/annotation-gaps", get(analytics_annotation_gaps_handler))
-        .route("/ui-bridge/analytics/health-score", get(analytics_health_score_handler))
-        .route("/ui-bridge/analytics/recommendations", get(analytics_recommendations_handler))
+        .route(
+            "/ui-bridge/analytics/decay-curve",
+            get(analytics_decay_curve_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/action-baselines",
+            get(analytics_action_baselines_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/failure-taxonomy",
+            get(analytics_failure_taxonomy_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/fragility-heatmap",
+            get(analytics_fragility_heatmap_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/regressions",
+            get(analytics_regressions_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/stall-frequency",
+            get(analytics_stall_frequency_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/intervention-effectiveness",
+            get(analytics_intervention_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/state-coverage",
+            get(analytics_state_coverage_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/annotation-gaps",
+            get(analytics_annotation_gaps_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/health-score",
+            get(analytics_health_score_handler),
+        )
+        .route(
+            "/ui-bridge/analytics/recommendations",
+            get(analytics_recommendations_handler),
+        )
 }

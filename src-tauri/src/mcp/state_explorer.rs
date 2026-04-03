@@ -382,7 +382,11 @@ pub async fn get_cross_run_state_diff(
     let pg_db = state.app_state.pg_db.clone();
 
     match async {
-        let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+        let conn = pg_db
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool: {e}"))?;
 
         // Get distinct states from ui_bridge_states
         let all_rows = conn

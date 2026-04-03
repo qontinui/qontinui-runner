@@ -57,7 +57,9 @@ pub async fn get_error_monitor_errors(
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(100);
 
-    let pg_errors = state.app_state.pg_db
+    let pg_errors = state
+        .app_state
+        .pg_db
         .get_unresolved_errors(task_run_id.as_deref(), limit)
         .await
         .map_err(|e| {
@@ -86,7 +88,9 @@ pub async fn get_error_monitor_summary(
 > {
     let task_run_id = query.get("task_run_id").cloned();
 
-    let pg_summary = state.app_state.pg_db
+    let pg_summary = state
+        .app_state
+        .pg_db
         .get_error_summary(task_run_id.as_deref())
         .await
         .map_err(|e| {
@@ -117,7 +121,9 @@ pub async fn get_error_debug_context(
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
     let task_run_id = query.get("task_run_id").cloned();
 
-    let ctx = state.app_state.pg_db
+    let ctx = state
+        .app_state
+        .pg_db
         .get_error_debug_context(task_run_id.as_deref())
         .await
         .map_err(|e| {
@@ -138,10 +144,16 @@ pub async fn resolve_error_monitor_error(
     Json(request): Json<ResolveErrorRequest>,
 ) -> Json<ApiResponse<()>> {
     let result = if let Some(ref task_run_id) = request.resolved_by_task_run_id {
-        state.app_state.pg_db.mark_resolved_by_task(id, task_run_id, request.resolution_notes.as_deref())
+        state
+            .app_state
+            .pg_db
+            .mark_resolved_by_task(id, task_run_id, request.resolution_notes.as_deref())
             .await
     } else {
-        state.app_state.pg_db.update_error_status(id, "resolved", request.resolution_notes.as_deref())
+        state
+            .app_state
+            .pg_db
+            .update_error_status(id, "resolved", request.resolution_notes.as_deref())
             .await
     };
     match result {
@@ -155,7 +167,12 @@ pub async fn acknowledge_error_monitor_error(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<i64>,
 ) -> Json<ApiResponse<()>> {
-    match state.app_state.pg_db.update_error_status(id, "acknowledged", None).await {
+    match state
+        .app_state
+        .pg_db
+        .update_error_status(id, "acknowledged", None)
+        .await
+    {
         Ok(()) => Json(ApiResponse::success(())),
         Err(e) => Json(api_error(format!("Failed to acknowledge error: {}", e))),
     }
@@ -172,14 +189,21 @@ pub async fn generate_fix_workflow(
     let task_run_id = request.task_run_id.unwrap_or_default();
     let max_iterations = request.max_iterations.unwrap_or(10);
 
-    let result = state.app_state.pg_db
+    let result = state
+        .app_state
+        .pg_db
         .generate_error_fix_workflow(&task_run_id, max_iterations)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     // Convert to the expected type via serde
     let workflow: crate::error_monitor::GeneratedWorkflow = serde_json::from_value(result)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(format!("Deserialization: {}", e)))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Deserialization: {}", e))),
+            )
+        })?;
     Ok(Json(ApiResponse::success(workflow)))
 }
 

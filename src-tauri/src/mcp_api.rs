@@ -100,9 +100,7 @@ async fn health(
     let circuit_breaker_state = state.ui_bridge_circuit_breaker.get_state().await;
 
     let status = if last_pong > 0 { "ok" } else { "starting" };
-    let console_errors = state
-        .ui_bridge_console_error_count
-        .load(Ordering::Relaxed);
+    let console_errors = state.ui_bridge_console_error_count.load(Ordering::Relaxed);
 
     Json(serde_json::json!({
         "success": true,
@@ -336,9 +334,7 @@ pub fn create_router(
             // Wait a bit longer than unified workflows to let the server fully start
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-            let count =
-                crate::commands::ai_session::resume_ai_sessions(chat_sm, chat_handle)
-                    .await;
+            let count = crate::commands::ai_session::resume_ai_sessions(chat_sm, chat_handle).await;
 
             if count > 0 {
                 info!("Resumed {} AI session(s) on startup", count);
@@ -362,7 +358,8 @@ pub fn create_router(
             // Wait for server to start and auth to be available
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&sync_pg_db).await {
+            match crate::mcp::web_backend_workflows::sync_workflows_from_backend(&sync_pg_db).await
+            {
                 Ok(count) => {
                     if count > 0 {
                         info!("Synced {} workflows from web backend", count);
@@ -407,7 +404,10 @@ pub fn create_router(
             tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
             let settings = crate::settings::get_security_settings();
             if settings.audit_retention_days > 0 {
-                match pg_db.cleanup_old_audit_events(settings.audit_retention_days).await {
+                match pg_db
+                    .cleanup_old_audit_events(settings.audit_retention_days)
+                    .await
+                {
                     Ok(0) => {}
                     Ok(n) => {
                         tracing::info!(
@@ -465,7 +465,11 @@ pub fn create_router(
     // This prevents a burst of expensive queries from starving REST endpoints.
     // WebSocket subscriptions are excluded — they're long-lived by design.
     let graphql_routes = Router::new()
-        .route("/graphql", get(crate::graphql::schema::graphiql_handler).post(crate::graphql::schema::graphql_handler))
+        .route(
+            "/graphql",
+            get(crate::graphql::schema::graphiql_handler)
+                .post(crate::graphql::schema::graphql_handler),
+        )
         .layer(tower::limit::ConcurrencyLimitLayer::new(20));
 
     Router::new()

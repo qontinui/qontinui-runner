@@ -10,7 +10,11 @@ impl PgDb {
 
     /// Save a flow definition (upsert).
     pub async fn save_flow(&self, flow: &serde_json::Value) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let id = flow["id"].as_str().ok_or("Flow must have an id")?;
@@ -43,8 +47,17 @@ impl PgDb {
                 updated_at = $11
             "#,
             &[
-                &id, &name, &description, &steps, &start_step, &timeout_secs,
-                &inputs, &outputs, &tags, &version, &now,
+                &id,
+                &name,
+                &description,
+                &steps,
+                &start_step,
+                &timeout_secs,
+                &inputs,
+                &outputs,
+                &tags,
+                &version,
+                &now,
             ],
         )
         .await
@@ -55,7 +68,11 @@ impl PgDb {
 
     /// Get a flow by ID.
     pub async fn get_flow(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -95,7 +112,11 @@ impl PgDb {
 
     /// Delete a flow by ID.
     pub async fn delete_flow(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM orchestrator_flows WHERE id = $1", &[&id])
@@ -107,7 +128,11 @@ impl PgDb {
 
     /// List all flows (summaries).
     pub async fn list_flows(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -143,7 +168,11 @@ impl PgDb {
 
     /// Get flows filtered by tag.
     pub async fn get_flows_by_tag(&self, tag: &str) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let search_pattern = format!("%\"{}%", tag);
         let rows = conn
@@ -185,7 +214,11 @@ impl PgDb {
 
     /// Save flow execution state (upsert).
     pub async fn save_flow_execution(&self, execution: &serde_json::Value) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let instance_id = execution["instance_id"]
             .as_str()
@@ -233,7 +266,11 @@ impl PgDb {
         &self,
         instance_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -266,7 +303,11 @@ impl PgDb {
 
     /// List flow executions (most recent 50).
     pub async fn list_flow_executions(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -310,7 +351,11 @@ impl PgDb {
         message: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         // Get the next version number
@@ -353,7 +398,11 @@ impl PgDb {
         flow_id: &str,
         version: i32,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -385,7 +434,11 @@ impl PgDb {
 
     /// Get the latest version number of a flow.
     pub async fn get_latest_flow_version(&self, flow_id: &str) -> Result<Option<i32>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -399,8 +452,15 @@ impl PgDb {
     }
 
     /// List all versions of a flow.
-    pub async fn list_flow_versions(&self, flow_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_flow_versions(
+        &self,
+        flow_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -434,7 +494,11 @@ impl PgDb {
 
     /// Delete a specific version of a flow.
     pub async fn delete_flow_version(&self, flow_id: &str, version: i32) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute(
@@ -463,7 +527,11 @@ impl PgDb {
         flow_id: Option<&str>,
         status: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let (query, params): (String, Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>) =
             match (flow_id, status) {
@@ -485,8 +553,10 @@ impl PgDb {
                 ),
             };
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let rows = conn
             .query(&query, &param_refs)
@@ -519,7 +589,11 @@ impl PgDb {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = if let Some(fid) = flow_id {
             conn.query(
@@ -559,7 +633,11 @@ impl PgDb {
 
     /// Get total count of flow executions.
     pub async fn get_flow_executions_count(&self, flow_id: Option<&str>) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let count: i64 = if let Some(fid) = flow_id {
             let row = conn

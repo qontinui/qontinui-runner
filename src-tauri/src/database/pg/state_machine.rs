@@ -13,7 +13,11 @@ impl PgDb {
 
     /// List all state machine configs, ordered by updated_at DESC.
     pub async fn list_sm_configs(&self) -> Result<Vec<SmConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -33,7 +37,11 @@ impl PgDb {
 
     /// Get a single state machine config by ID.
     pub async fn get_sm_config(&self, id: &str) -> Result<Option<SmConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -53,7 +61,11 @@ impl PgDb {
 
     /// Insert a new state machine config. Returns the created config.
     pub async fn insert_sm_config(&self, req: &CreateSmConfigRequest) -> Result<SmConfig, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -84,11 +96,19 @@ impl PgDb {
             .await?
             .ok_or_else(|| format!("Config not found: {}", id))?;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let name = req.name.as_deref().unwrap_or(&existing.name).to_string();
-        let description = req.description.as_deref().or(existing.description.as_deref()).map(|s| s.to_string());
+        let description = req
+            .description
+            .as_deref()
+            .or(existing.description.as_deref())
+            .map(|s| s.to_string());
         let render_count = req.render_count.unwrap_or(existing.render_count) as i32;
         let element_count = req.element_count.unwrap_or(existing.element_count) as i32;
         let include_html_ids = req.include_html_ids.unwrap_or(existing.include_html_ids);
@@ -120,7 +140,11 @@ impl PgDb {
 
     /// Delete a state machine config by ID (cascades to states and transitions).
     pub async fn delete_sm_config(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM state_machine_configs WHERE id = $1", &[&id])
@@ -157,7 +181,11 @@ impl PgDb {
 
     /// List all states for a config.
     pub async fn list_sm_states(&self, config_id: &str) -> Result<Vec<SmState>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -179,7 +207,11 @@ impl PgDb {
 
     /// Get a single state by ID.
     pub async fn get_sm_state(&self, id: &str) -> Result<Option<SmState>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -203,7 +235,11 @@ impl PgDb {
         config_id: &str,
         req: &CreateSmStateRequest,
     ) -> Result<SmState, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let state_id = req
@@ -225,8 +261,9 @@ impl PgDb {
                 .unwrap_or(&serde_json::json!({})),
         )
         .map_err(|e| format!("Failed to serialize extra_metadata: {}", e))?;
-        let domain_knowledge = serde_json::to_string(req.domain_knowledge.as_deref().unwrap_or(&[]))
-            .map_err(|e| format!("Failed to serialize domain_knowledge: {}", e))?;
+        let domain_knowledge =
+            serde_json::to_string(req.domain_knowledge.as_deref().unwrap_or(&[]))
+                .map_err(|e| format!("Failed to serialize domain_knowledge: {}", e))?;
         let confidence = req.confidence.unwrap_or(0.9);
 
         conn.execute(
@@ -271,7 +308,11 @@ impl PgDb {
             .await?
             .ok_or_else(|| format!("State not found: {}", id))?;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let name = req.name.as_deref().unwrap_or(&existing.name).to_string();
@@ -337,7 +378,11 @@ impl PgDb {
 
     /// Delete a state by ID.
     pub async fn delete_sm_state(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM state_machine_states WHERE id = $1", &[&id])
@@ -353,7 +398,11 @@ impl PgDb {
 
     /// List all transitions for a config.
     pub async fn list_sm_transitions(&self, config_id: &str) -> Result<Vec<SmTransition>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -375,7 +424,11 @@ impl PgDb {
 
     /// Get a single transition by ID.
     pub async fn get_sm_transition(&self, id: &str) -> Result<Option<SmTransition>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -399,7 +452,11 @@ impl PgDb {
         config_id: &str,
         req: &CreateSmTransitionRequest,
     ) -> Result<SmTransition, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let transition_id = req
@@ -466,7 +523,11 @@ impl PgDb {
             .await?
             .ok_or_else(|| format!("Transition not found: {}", id))?;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         let name = req.name.as_deref().unwrap_or(&existing.name).to_string();
@@ -524,10 +585,17 @@ impl PgDb {
 
     /// Delete a transition by ID.
     pub async fn delete_sm_transition(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
-            .execute("DELETE FROM state_machine_transitions WHERE id = $1", &[&id])
+            .execute(
+                "DELETE FROM state_machine_transitions WHERE id = $1",
+                &[&id],
+            )
             .await
             .map_err(|e| format!("PG delete_sm_transition: {}", e))?;
 
@@ -696,7 +764,11 @@ impl PgDb {
         config_id: &str,
         thumbnails: &std::collections::HashMap<String, String>,
     ) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut count = 0;
         for (hash, data) in thumbnails {
             conn.execute(
@@ -719,7 +791,11 @@ impl PgDb {
         &self,
         config_id: &str,
     ) -> Result<std::collections::HashMap<String, String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 "SELECT fingerprint_hash, thumbnail_base64 FROM sm_element_thumbnails WHERE config_id = $1",
@@ -734,7 +810,11 @@ impl PgDb {
             let data: String = row.get(1);
             result.insert(hash, data);
         }
-        tracing::info!("Loaded {} thumbnails for config {}", result.len(), config_id);
+        tracing::info!(
+            "Loaded {} thumbnails for config {}",
+            result.len(),
+            config_id
+        );
         Ok(result)
     }
 
@@ -748,7 +828,11 @@ impl PgDb {
         config_id: &str,
         screenshots: &[SmCaptureScreenshotSave],
     ) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let mut count = 0;
         for ss in screenshots {
             let id = uuid::Uuid::new_v4().to_string();
@@ -796,7 +880,11 @@ impl PgDb {
             .map_err(|e| format!("PG save capture screenshot: {}", e))?;
             count += 1;
         }
-        tracing::info!("Saved {} capture screenshots for config {}", count, config_id);
+        tracing::info!(
+            "Saved {} capture screenshots for config {}",
+            count,
+            config_id
+        );
         Ok(count)
     }
 
@@ -805,7 +893,11 @@ impl PgDb {
         &self,
         config_id: &str,
     ) -> Result<Vec<SmCaptureScreenshotMeta>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, config_id, capture_index, width, height,
@@ -845,7 +937,11 @@ impl PgDb {
         &self,
         screenshot_id: &str,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_one(
                 "SELECT screenshot_webp FROM sm_capture_screenshots WHERE id = $1",
@@ -865,7 +961,11 @@ impl PgDb {
         from_config_id: &str,
         to_config_id: &str,
     ) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let affected = conn
             .execute(
                 "UPDATE sm_capture_screenshots SET config_id = $1 WHERE config_id = $2",
@@ -887,7 +987,11 @@ impl PgDb {
 
     /// Delete capture screenshots for a config.
     pub async fn delete_capture_screenshots(&self, config_id: &str) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let affected = conn
             .execute(
                 "DELETE FROM sm_capture_screenshots WHERE config_id = $1",
@@ -915,11 +1019,21 @@ impl PgDb {
     }
 
     fn sm_row_to_state(row: &tokio_postgres::Row) -> SmState {
-        let element_ids_json: String = row.get::<_, Option<String>>(5).unwrap_or_else(|| "[]".to_string());
-        let render_ids_json: String = row.get::<_, Option<String>>(6).unwrap_or_else(|| "[]".to_string());
-        let acceptance_criteria_json: String = row.get::<_, Option<String>>(8).unwrap_or_else(|| "[]".to_string());
-        let extra_metadata_json: String = row.get::<_, Option<String>>(9).unwrap_or_else(|| "{}".to_string());
-        let domain_knowledge_json: String = row.get::<_, Option<String>>(10).unwrap_or_else(|| "[]".to_string());
+        let element_ids_json: String = row
+            .get::<_, Option<String>>(5)
+            .unwrap_or_else(|| "[]".to_string());
+        let render_ids_json: String = row
+            .get::<_, Option<String>>(6)
+            .unwrap_or_else(|| "[]".to_string());
+        let acceptance_criteria_json: String = row
+            .get::<_, Option<String>>(8)
+            .unwrap_or_else(|| "[]".to_string());
+        let extra_metadata_json: String = row
+            .get::<_, Option<String>>(9)
+            .unwrap_or_else(|| "{}".to_string());
+        let domain_knowledge_json: String = row
+            .get::<_, Option<String>>(10)
+            .unwrap_or_else(|| "[]".to_string());
 
         SmState {
             id: row.get(0),
@@ -930,8 +1044,10 @@ impl PgDb {
             element_ids: serde_json::from_str(&element_ids_json).unwrap_or_default(),
             render_ids: serde_json::from_str(&render_ids_json).unwrap_or_default(),
             confidence: row.get(7),
-            acceptance_criteria: serde_json::from_str(&acceptance_criteria_json).unwrap_or_default(),
-            extra_metadata: serde_json::from_str(&extra_metadata_json).unwrap_or(serde_json::json!({})),
+            acceptance_criteria: serde_json::from_str(&acceptance_criteria_json)
+                .unwrap_or_default(),
+            extra_metadata: serde_json::from_str(&extra_metadata_json)
+                .unwrap_or(serde_json::json!({})),
             domain_knowledge: serde_json::from_str(&domain_knowledge_json).unwrap_or_default(),
             created_at: row.get(11),
             updated_at: row.get(12),
@@ -939,11 +1055,21 @@ impl PgDb {
     }
 
     fn sm_row_to_transition(row: &tokio_postgres::Row) -> SmTransition {
-        let from_states_json: String = row.get::<_, Option<String>>(4).unwrap_or_else(|| "[]".to_string());
-        let activate_states_json: String = row.get::<_, Option<String>>(5).unwrap_or_else(|| "[]".to_string());
-        let exit_states_json: String = row.get::<_, Option<String>>(6).unwrap_or_else(|| "[]".to_string());
-        let actions_json: String = row.get::<_, Option<String>>(7).unwrap_or_else(|| "[]".to_string());
-        let extra_metadata_json: String = row.get::<_, Option<String>>(10).unwrap_or_else(|| "{}".to_string());
+        let from_states_json: String = row
+            .get::<_, Option<String>>(4)
+            .unwrap_or_else(|| "[]".to_string());
+        let activate_states_json: String = row
+            .get::<_, Option<String>>(5)
+            .unwrap_or_else(|| "[]".to_string());
+        let exit_states_json: String = row
+            .get::<_, Option<String>>(6)
+            .unwrap_or_else(|| "[]".to_string());
+        let actions_json: String = row
+            .get::<_, Option<String>>(7)
+            .unwrap_or_else(|| "[]".to_string());
+        let extra_metadata_json: String = row
+            .get::<_, Option<String>>(10)
+            .unwrap_or_else(|| "{}".to_string());
 
         SmTransition {
             id: row.get(0),
@@ -956,7 +1082,8 @@ impl PgDb {
             actions: serde_json::from_str(&actions_json).unwrap_or_default(),
             path_cost: row.get(8),
             stays_visible: row.get(9),
-            extra_metadata: serde_json::from_str(&extra_metadata_json).unwrap_or(serde_json::json!({})),
+            extra_metadata: serde_json::from_str(&extra_metadata_json)
+                .unwrap_or(serde_json::json!({})),
             created_at: row.get(11),
             updated_at: row.get(12),
         }

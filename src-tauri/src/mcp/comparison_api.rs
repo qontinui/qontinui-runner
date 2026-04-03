@@ -219,12 +219,7 @@ pub async fn start_comparison(
             &now,
         )
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(e)),
-            )
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     // Spawn background task to launch all the workflow runs
     let pg_db = state.app_state.pg_db.clone();
@@ -323,7 +318,12 @@ pub async fn get_comparison(
         .get_comparison_run(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error(format!("Comparison run not found: {}", id)))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Comparison run not found: {}", id))),
+            )
+        })?;
 
     let id = row.id;
     let workflow_id = row.workflow_id;
@@ -384,7 +384,9 @@ pub async fn get_comparison(
         "completed".to_string()
     } else if any_running {
         let entries_str = serde_json::to_string(&entries).unwrap_or_default();
-        let _ = pg.update_comparison_run_entries(&id, &entries_str, &status).await;
+        let _ = pg
+            .update_comparison_run_entries(&id, &entries_str, &status)
+            .await;
         status
     } else {
         status
@@ -411,12 +413,7 @@ pub async fn list_comparisons(
         .pg_db
         .list_comparison_runs(50i64)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(e)),
-            )
-        })?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
 
     let views = rows
         .into_iter()

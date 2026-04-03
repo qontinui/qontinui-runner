@@ -3,7 +3,11 @@
 use super::PgDb;
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 impl PgDb {
@@ -16,7 +20,11 @@ impl PgDb {
         prompt: &str,
         context_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::approval_gates::insert_approval_gate()
             .bind(&conn, &id, &task_run_id, &iteration, &prompt, &context_json)
             .one()
@@ -33,7 +41,11 @@ impl PgDb {
         comment: Option<&str>,
         status: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         qontinui_db::queries::approval_gates::resolve_approval_gate()
             .bind(&conn, &action, &comment, &status, &id)
             .opt()
@@ -47,7 +59,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::approval_gates::get_approval_gates_for_task_run()
             .bind(&conn, &task_run_id)
             .all()

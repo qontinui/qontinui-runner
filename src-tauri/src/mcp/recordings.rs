@@ -16,8 +16,7 @@ use std::sync::Arc;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::recording::{
-    AddActionInput, CreateRecordingInput, RecordedAction, Recording,
-    RecordingStatus,
+    AddActionInput, CreateRecordingInput, RecordedAction, Recording, RecordingStatus,
 };
 
 // ============================================================================
@@ -40,7 +39,9 @@ pub async fn create_recording_handler(
 ) -> Result<Json<ApiResponse<Recording>>, (StatusCode, Json<ApiResponse<()>>)> {
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Recordings: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Recordings: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -51,7 +52,9 @@ pub async fn get_recording_handler(
 ) -> Result<Json<ApiResponse<Recording>>, (StatusCode, Json<ApiResponse<()>>)> {
     Err((
         StatusCode::NOT_FOUND,
-        Json(api_error("Recording not found (SQLite removed)".to_string())),
+        Json(api_error(
+            "Recording not found (SQLite removed)".to_string(),
+        )),
     ))
 }
 
@@ -80,7 +83,9 @@ pub async fn add_recording_action_handler(
 ) -> Result<Json<ApiResponse<RecordedAction>>, (StatusCode, Json<ApiResponse<()>>)> {
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Recordings: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Recordings: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -97,7 +102,9 @@ pub async fn update_recording_status_handler(
 ) -> Result<Json<ApiResponse<Recording>>, (StatusCode, Json<ApiResponse<()>>)> {
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Recordings: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Recordings: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 
@@ -109,7 +116,9 @@ pub async fn export_recording_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     Err((
         StatusCode::NOT_IMPLEMENTED,
-        Json(api_error("Recordings: SQLite removed, not yet migrated to PG".to_string())),
+        Json(api_error(
+            "Recordings: SQLite removed, not yet migrated to PG".to_string(),
+        )),
     ))
 }
 

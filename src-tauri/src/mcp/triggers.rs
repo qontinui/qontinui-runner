@@ -104,12 +104,17 @@ async fn create_trigger(
         updated_at: now,
     };
 
-    state.app_state.pg_db.create_trigger(&trigger).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to create trigger: {}", e))),
-        )
-    })?;
+    state
+        .app_state
+        .pg_db
+        .create_trigger(&trigger)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to create trigger: {}", e))),
+            )
+        })?;
 
     // Register watcher if service is running
     if let Some(service) = crate::trigger_system::get_trigger_service().await {
@@ -234,7 +239,12 @@ async fn set_enabled(
     Path(id): Path<String>,
     Json(request): Json<SetEnabledRequest>,
 ) -> Json<ApiResponse<()>> {
-    match state.app_state.pg_db.set_trigger_enabled(&id, request.enabled).await {
+    match state
+        .app_state
+        .pg_db
+        .set_trigger_enabled(&id, request.enabled)
+        .await
+    {
         Ok(()) => {
             info!(
                 "Trigger {} {}",
@@ -316,13 +326,18 @@ async fn get_history(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Json<ApiResponse<Vec<TriggerHistoryEntry>>> {
-    match state.app_state.pg_db.get_trigger_history_filtered(
-        &id,
-        query.limit,
-        query.action.as_deref(),
-        query.since.as_deref(),
-        query.until.as_deref(),
-    ).await {
+    match state
+        .app_state
+        .pg_db
+        .get_trigger_history_filtered(
+            &id,
+            query.limit,
+            query.action.as_deref(),
+            query.since.as_deref(),
+            query.until.as_deref(),
+        )
+        .await
+    {
         Ok(entries) => Json(ApiResponse::success(entries)),
         Err(e) => Json(ApiResponse::error(format!("Failed to get history: {}", e))),
     }

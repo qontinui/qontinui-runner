@@ -33,7 +33,10 @@ pub struct FixerDeps {
 /// - The source task run is itself a fixer, reflection, or follow-up run
 /// - Fixer is disabled in settings
 /// - The source run has insufficient output
-pub fn should_launch_fixer(pg_db: &std::sync::Arc<crate::database::pg::PgDb>, source_task_run_id: &str) -> Result<bool, String> {
+pub fn should_launch_fixer(
+    pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    source_task_run_id: &str,
+) -> Result<bool, String> {
     should_launch_fixer_sync(pg_db, source_task_run_id, None)
 }
 
@@ -47,9 +50,8 @@ fn should_launch_fixer_sync(
     let src_id = source_task_run_id.to_string();
     let exc_id = exclude_fixer_id.map(|s| s.to_string());
     tokio::task::block_in_place(move || {
-        tokio::runtime::Handle::current().block_on(async {
-            should_launch_fixer_pg(&pg, &src_id, exc_id.as_deref()).await
-        })
+        tokio::runtime::Handle::current()
+            .block_on(async { should_launch_fixer_pg(&pg, &src_id, exc_id.as_deref()).await })
     })
 }
 
@@ -81,32 +83,51 @@ async fn should_launch_fixer_pg(
         pg_db.get_task_run_flags(source_task_run_id).await?;
 
     if is_fixer {
-        debug!("Skipping fixer for {} — source is already a fixer run", source_task_run_id);
+        debug!(
+            "Skipping fixer for {} — source is already a fixer run",
+            source_task_run_id
+        );
         return Ok(false);
     }
     if is_reflection {
-        debug!("Skipping fixer for {} — source is a reflection run", source_task_run_id);
+        debug!(
+            "Skipping fixer for {} — source is a reflection run",
+            source_task_run_id
+        );
         return Ok(false);
     }
     if is_follow_up {
-        debug!("Skipping fixer for {} — source is a follow-up run", source_task_run_id);
+        debug!(
+            "Skipping fixer for {} — source is a follow-up run",
+            source_task_run_id
+        );
         return Ok(false);
     }
 
     // Guard 4: Check fixer_enabled setting
-    if !pg_db.get_dev_mode_setting_bool("fixer_enabled", true).await? {
+    if !pg_db
+        .get_dev_mode_setting_bool("fixer_enabled", true)
+        .await?
+    {
         debug!("Fixer disabled in settings");
         return Ok(false);
     }
 
     // Guard 5: Check output threshold
     if !pg_db.has_sufficient_output(source_task_run_id).await? {
-        debug!("Skipping fixer for {} — insufficient output to analyze", source_task_run_id);
+        debug!(
+            "Skipping fixer for {} — insufficient output to analyze",
+            source_task_run_id
+        );
         return Ok(false);
     }
 
     // Guard 6: Check that reflection fixes exist
-    let conn = pg_db.pool().get().await.map_err(|e| format!("PG pool: {e}"))?;
+    let conn = pg_db
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool: {e}"))?;
     let fix_count: i64 = conn
         .query_one(
             "SELECT COUNT(*) FROM reflection_fixes WHERE source_task_run_id = $1",
@@ -117,12 +138,17 @@ async fn should_launch_fixer_pg(
         .unwrap_or(0);
 
     if fix_count == 0 {
-        debug!("Skipping fixer: no reflection fixes found for source run {}", source_task_run_id);
+        debug!(
+            "Skipping fixer: no reflection fixes found for source run {}",
+            source_task_run_id
+        );
         return Ok(false);
     }
 
     // Guard 7: Skip fixer if source passed verification (fixer_on_failure_only)
-    let fixer_on_failure_only = pg_db.get_dev_mode_setting_bool("fixer_on_failure_only", true).await?;
+    let fixer_on_failure_only = pg_db
+        .get_dev_mode_setting_bool("fixer_on_failure_only", true)
+        .await?;
     if fixer_on_failure_only {
         let verification_passed: bool = conn
             .query_one(
@@ -134,14 +160,16 @@ async fn should_launch_fixer_pg(
             .unwrap_or(false);
 
         if verification_passed {
-            info!("Skipping fixer — parent workflow passed successfully (source: {})", source_task_run_id);
+            info!(
+                "Skipping fixer — parent workflow passed successfully (source: {})",
+                source_task_run_id
+            );
             return Ok(false);
         }
     }
 
     Ok(true)
 }
-
 
 /// Wait for all child task runs (reflections, follow-ups) of the given source
 /// to reach a terminal state. Polls every 5 seconds with a 10-minute timeout.
@@ -203,9 +231,8 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         let pg = pg_db.clone();
         let src_id = source_task_run_id.clone();
         tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async {
-                pg.get_task_run_workflow_name(&src_id).await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async { pg.get_task_run_workflow_name(&src_id).await })
         })?
     };
 
@@ -259,12 +286,16 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
                     source_id_clone
                 );
                 // Mark the fixer run as failed
-                let _ = pg_db_clone.update_task_run_status(&fixer_id_clone, "failed").await;
+                let _ = pg_db_clone
+                    .update_task_run_status(&fixer_id_clone, "failed")
+                    .await;
                 return;
             }
             Err(e) => {
                 warn!("Fixer error waiting for children: {}", e);
-                let _ = pg_db_clone.update_task_run_status(&fixer_id_clone, "failed").await;
+                let _ = pg_db_clone
+                    .update_task_run_status(&fixer_id_clone, "failed")
+                    .await;
                 return;
             }
         }
@@ -275,7 +306,9 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
             Ok(true) => {}
             _ => {
                 info!("Fixer guards no longer pass after waiting — skipping");
-                let _ = pg_db_clone.update_task_run_status(&fixer_id_clone, "stopped").await;
+                let _ = pg_db_clone
+                    .update_task_run_status(&fixer_id_clone, "stopped")
+                    .await;
                 return;
             }
         }
@@ -323,11 +356,12 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         if crate::restate::launch::should_use_restate(&restate_settings).await {
             match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
                 Ok(input) => {
-                    if let Err(e) = deps.app_state.pg_db.save_restate_workflow_execution(
-                        &exec_id,
-                        &exec_id,
-                        None,
-                    ).await {
+                    if let Err(e) = deps
+                        .app_state
+                        .pg_db
+                        .save_restate_workflow_execution(&exec_id, &exec_id, None)
+                        .await
+                    {
                         tracing::error!("Failed to record Restate workflow: {}", e);
                     }
 
@@ -335,7 +369,9 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
                         &exec_id,
                         &input,
                         &restate_settings.ingress_url(),
-                    ).await {
+                    )
+                    .await
+                    {
                         tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                     } else {
                         use_legacy = false;

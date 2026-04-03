@@ -69,9 +69,7 @@ impl CostCircuitBreaker {
     /// `Warning` if it exceeds 80% of the threshold, or `Ok` otherwise.
     pub fn check_single_call(&self, cost_usd: f64) -> CircuitBreakerResult {
         if self.tripped.load(Ordering::Relaxed) {
-            return CircuitBreakerResult::Tripped(
-                "Circuit breaker already tripped".to_string(),
-            );
+            return CircuitBreakerResult::Tripped("Circuit breaker already tripped".to_string());
         }
 
         if cost_usd > self.config.max_single_call_usd {
@@ -99,9 +97,7 @@ impl CostCircuitBreaker {
     /// Returns `Tripped` if `current_cost > budget_limit * (1 + budget_overage_pct)`.
     pub fn check_budget(&self, current_cost: f64, budget_limit: f64) -> CircuitBreakerResult {
         if self.tripped.load(Ordering::Relaxed) {
-            return CircuitBreakerResult::Tripped(
-                "Circuit breaker already tripped".to_string(),
-            );
+            return CircuitBreakerResult::Tripped("Circuit breaker already tripped".to_string());
         }
 
         if budget_limit <= 0.0 {
@@ -140,9 +136,7 @@ impl CostCircuitBreaker {
         cache_read_tokens: u64,
     ) -> CircuitBreakerResult {
         if self.tripped.load(Ordering::Relaxed) {
-            return CircuitBreakerResult::Tripped(
-                "Circuit breaker already tripped".to_string(),
-            );
+            return CircuitBreakerResult::Tripped("Circuit breaker already tripped".to_string());
         }
 
         let total = cache_creation_tokens + cache_read_tokens;
@@ -154,7 +148,10 @@ impl CostCircuitBreaker {
         let hit_rate = cache_read_tokens as f64 / total as f64;
 
         if hit_rate < self.config.min_cache_hit_rate {
-            let misses = self.consecutive_cache_misses.fetch_add(1, Ordering::Relaxed) + 1;
+            let misses = self
+                .consecutive_cache_misses
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
             if misses >= self.config.consecutive_miss_limit {
                 self.tripped.store(true, Ordering::Relaxed);
                 return CircuitBreakerResult::Tripped(format!(
@@ -312,7 +309,7 @@ mod tests {
     fn test_already_tripped_returns_tripped() {
         let cb = default_breaker();
         cb.check_single_call(3.0); // trip it
-        // All subsequent checks return Tripped
+                                   // All subsequent checks return Tripped
         assert!(matches!(
             cb.check_single_call(0.01),
             CircuitBreakerResult::Tripped(_)

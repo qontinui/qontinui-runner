@@ -7,9 +7,9 @@
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::step_executor::ExecutionStepConfig;
 use super::config::RestateSettings;
 use super::types::WorkflowInput;
+use crate::step_executor::ExecutionStepConfig;
 
 /// Launch a workflow execution via the Restate ingress API.
 ///
@@ -23,10 +23,7 @@ pub async fn launch_workflow_via_restate(
     input: &WorkflowInput,
     ingress_url: &str,
 ) -> Result<(), String> {
-    let url = format!(
-        "{}/QontinuiWorkflow/{}/run/send",
-        ingress_url, execution_id
-    );
+    let url = format!("{}/QontinuiWorkflow/{}/run/send", ingress_url, execution_id);
 
     info!(
         "Launching workflow via Restate: execution_id={}, url={}",
@@ -54,10 +51,7 @@ pub async fn launch_workflow_via_restate(
             .text()
             .await
             .unwrap_or_else(|_| "unknown".to_string());
-        error!(
-            "Restate workflow submission failed ({}): {}",
-            status, body
-        );
+        error!("Restate workflow submission failed ({}): {}", status, body);
         Err(format!(
             "Restate workflow submission failed ({}): {}",
             status, body
@@ -69,10 +63,7 @@ pub async fn launch_workflow_via_restate(
 ///
 /// Sends a signal to the workflow's shared `request_stop` handler,
 /// which sets a flag that the `run()` handler checks between iterations.
-pub async fn request_workflow_stop(
-    execution_id: &str,
-    ingress_url: &str,
-) -> Result<(), String> {
+pub async fn request_workflow_stop(execution_id: &str, ingress_url: &str) -> Result<(), String> {
     let url = format!(
         "{}/QontinuiWorkflow/{}/request_stop/send",
         ingress_url, execution_id
@@ -92,10 +83,7 @@ pub async fn request_workflow_stop(
         Ok(())
     } else {
         let status = response.status();
-        Err(format!(
-            "Restate stop request failed ({})",
-            status
-        ))
+        Err(format!("Restate stop request failed ({})", status))
     }
 }
 
@@ -127,10 +115,7 @@ pub async fn resolve_awakeable(
         Ok(())
     } else {
         let status = response.status();
-        Err(format!(
-            "Awakeable resolution failed ({})",
-            status
-        ))
+        Err(format!("Awakeable resolution failed ({})", status))
     }
 }
 

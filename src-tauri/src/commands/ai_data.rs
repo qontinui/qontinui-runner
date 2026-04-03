@@ -569,7 +569,9 @@ pub async fn reopen_task_run(
 
     // checkpoint_db removed — reopen_task_run was SQLite-only, no-op
     let _ = (&task_id, additional_sessions);
-    Ok(AiDataResponse::err("reopen_task_run: checkpoint_db has been removed".to_string()))
+    Ok(AiDataResponse::err(
+        "reopen_task_run: checkpoint_db has been removed".to_string(),
+    ))
 }
 
 // =============================================================================
@@ -1265,11 +1267,14 @@ pub async fn get_task_run_playwright_results_from_db(
     let lim = limit.unwrap_or(200) as i64;
     let off = offset.unwrap_or(0) as i64;
 
-    let total_count = state.pg_db
+    let total_count = state
+        .pg_db
         .count_task_run_table("task_run_playwright_results", &task_run_id)
-        .await.unwrap_or(0) as usize;
+        .await
+        .unwrap_or(0) as usize;
 
-    match state.pg_db
+    match state
+        .pg_db
         .get_task_run_playwright_results_paginated(&task_run_id, lim, off)
         .await
     {
@@ -1369,11 +1374,14 @@ pub async fn get_task_run_api_requests_from_db(
 
     // When no filter, use SQL-level LIMIT/OFFSET (avoids loading all rows into Rust memory)
     if success_filter.is_none() {
-        let total_count = state.pg_db
+        let total_count = state
+            .pg_db
             .count_task_run_table("task_run_api_requests", &task_run_id)
-            .await.unwrap_or(0) as usize;
+            .await
+            .unwrap_or(0) as usize;
 
-        match state.pg_db
+        match state
+            .pg_db
             .get_task_run_api_requests_paginated(&task_run_id, lim as i64, off as i64)
             .await
         {
@@ -1399,7 +1407,10 @@ pub async fn get_task_run_api_requests_from_db(
         match state.pg_db.get_task_run_api_requests(&task_run_id).await {
             Ok(all_requests) => {
                 let filter = success_filter.unwrap();
-                let filtered: Vec<_> = all_requests.into_iter().filter(|r| r.success == filter).collect();
+                let filtered: Vec<_> = all_requests
+                    .into_iter()
+                    .filter(|r| r.success == filter)
+                    .collect();
                 let total_count = filtered.len();
                 let success_count = filtered.iter().filter(|r| r.success).count();
                 let failed_count = filtered.iter().filter(|r| !r.success).count();
@@ -1447,11 +1458,14 @@ pub async fn get_task_run_awas_steps_from_db(
 
     // When no filter, use SQL-level LIMIT/OFFSET
     if step_type.is_none() {
-        let total_count = state.pg_db
+        let total_count = state
+            .pg_db
             .count_task_run_table("task_run_awas_steps", &task_run_id)
-            .await.unwrap_or(0) as usize;
+            .await
+            .unwrap_or(0) as usize;
 
-        match state.pg_db
+        match state
+            .pg_db
             .get_task_run_awas_steps_paginated(&task_run_id, lim as i64, off as i64)
             .await
         {
@@ -1477,7 +1491,10 @@ pub async fn get_task_run_awas_steps_from_db(
         match state.pg_db.get_task_run_awas_steps(&task_run_id).await {
             Ok(all_steps) => {
                 let filter_type = step_type.unwrap();
-                let filtered: Vec<_> = all_steps.into_iter().filter(|s| s.step_type == filter_type).collect();
+                let filtered: Vec<_> = all_steps
+                    .into_iter()
+                    .filter(|s| s.step_type == filter_type)
+                    .collect();
                 let total_count = filtered.len();
                 let success_count = filtered.iter().filter(|s| s.success).count();
                 let failed_count = filtered.iter().filter(|s| !s.success).count();

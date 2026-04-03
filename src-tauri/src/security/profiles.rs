@@ -112,10 +112,7 @@ pub fn standard() -> SecurityPolicy {
         },
         actions: ActionPolicy {
             allowed_commands: None,
-            blocked_commands: vec![
-                r"^\s*sudo\b".to_string(),
-                r"^\s*su\b".to_string(),
-            ],
+            blocked_commands: vec![r"^\s*sudo\b".to_string(), r"^\s*su\b".to_string()],
             block_destructive: true,
             max_recursion_depth: 10,
         },

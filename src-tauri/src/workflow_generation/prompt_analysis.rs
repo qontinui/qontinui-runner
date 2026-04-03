@@ -45,10 +45,7 @@ struct FixPattern {
 /// Analyze reflection fixes attributed to a specific agent to find recurring patterns.
 ///
 /// Fixes that recur 3+ times with "effective" status become insights.
-pub fn analyze_reflection_fixes(
-    agent: &str,
-    min_count: u32,
-) -> Result<Vec<PromptInsight>, String> {
+pub fn analyze_reflection_fixes(agent: &str, min_count: u32) -> Result<Vec<PromptInsight>, String> {
     Err("SQLite removed".to_string())
 }
 

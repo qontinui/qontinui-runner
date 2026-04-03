@@ -10,9 +10,11 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-use super::domain_generators::{DomainContext, DomainGenerationResult, DomainGenerator, get_domain_generator};
+use super::domain_generators::{
+    get_domain_generator, DomainContext, DomainGenerationResult, DomainGenerator,
+};
 use super::domain_routing::VerificationDomain;
-use super::evaluation::{ScoringStrategy, evaluate_workflow};
+use super::evaluation::{evaluate_workflow, ScoringStrategy};
 use super::specification::AcceptanceCriterion;
 use super::template_library::StepTemplate;
 use crate::doctor::DoctorHandle;
@@ -34,7 +36,6 @@ pub enum CandidateScorer {
     /// Full evaluation engine (Tiers 1+2, slower but accurate)
     FullEval,
 }
-
 
 /// Configuration for the exploration engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,11 +293,8 @@ impl SearchTree {
 
     /// Get the best and runner-up nodes by score.
     pub fn select_best_and_runner_up(&self) -> (Option<&SearchNode>, Option<&SearchNode>) {
-        let mut scored: Vec<&SearchNode> = self
-            .nodes
-            .values()
-            .filter(|n| n.score.is_some())
-            .collect();
+        let mut scored: Vec<&SearchNode> =
+            self.nodes.values().filter(|n| n.score.is_some()).collect();
         scored.sort_by(|a, b| {
             b.score
                 .unwrap_or(0.0)
@@ -310,11 +308,7 @@ impl SearchTree {
 
     /// Score variance across all scored nodes.
     pub fn score_variance(&self) -> f64 {
-        let scores: Vec<f64> = self
-            .nodes
-            .values()
-            .filter_map(|n| n.score)
-            .collect();
+        let scores: Vec<f64> = self.nodes.values().filter_map(|n| n.score).collect();
         if scores.len() < 2 {
             return 0.0;
         }
@@ -342,11 +336,8 @@ impl SearchTree {
 
     /// Number of distinct strategies explored.
     pub fn strategies_explored(&self) -> usize {
-        let labels: std::collections::HashSet<&str> = self
-            .nodes
-            .values()
-            .map(|n| n.strategy.label())
-            .collect();
+        let labels: std::collections::HashSet<&str> =
+            self.nodes.values().map(|n| n.strategy.label()).collect();
         labels.len()
     }
 
@@ -405,10 +396,9 @@ impl SearchTree {
                 }
             } else {
                 // No score attached: check heuristic signals for weakness
-                let has_expected = step.get("expected").is_some()
-                    || step.get("expected_output").is_some();
-                let has_check = step.get("check_type").is_some()
-                    || step.get("check").is_some();
+                let has_expected =
+                    step.get("expected").is_some() || step.get("expected_output").is_some();
+                let has_check = step.get("check_type").is_some() || step.get("check").is_some();
                 let is_command = step
                     .get("step_type")
                     .and_then(|v| v.as_str())
@@ -721,7 +711,8 @@ fn generate_with_strategy(
 
     // Inject strategy-specific system instruction into the context
     if let Some(instruction) = strategy.system_instruction() {
-        ctx.resolved_contexts.push_str(&format!("\n\n[Strategy Instruction]: {}", instruction));
+        ctx.resolved_contexts
+            .push_str(&format!("\n\n[Strategy Instruction]: {}", instruction));
     }
 
     // For TemplateFirst, promote templates to the front of the hint list
@@ -821,7 +812,14 @@ pub fn explore_candidates(
             provider_override,
         );
 
-        let score = score_candidate(&result.steps, criteria, config, doctor_handle, model_override, provider_override);
+        let score = score_candidate(
+            &result.steps,
+            criteria,
+            config,
+            doctor_handle,
+            model_override,
+            provider_override,
+        );
         let node = SearchNode {
             id: uuid::Uuid::new_v4().to_string(),
             steps: result.steps,
@@ -890,7 +888,14 @@ pub fn explore_candidates(
                     provider_override,
                 );
 
-                let score = score_candidate(&result.steps, criteria, config, doctor_handle, model_override, provider_override);
+                let score = score_candidate(
+                    &result.steps,
+                    criteria,
+                    config,
+                    doctor_handle,
+                    model_override,
+                    provider_override,
+                );
                 let node = SearchNode {
                     id: uuid::Uuid::new_v4().to_string(),
                     steps: result.steps,
@@ -913,8 +918,7 @@ pub fn explore_candidates(
             }
             BranchingAction::Deeper(parent_id) => {
                 // Refine the selected node by regenerating its weak steps
-                let weak_steps =
-                    tree.get_weak_steps(&parent_id, config.min_score_threshold);
+                let weak_steps = tree.get_weak_steps(&parent_id, config.min_score_threshold);
 
                 let strategy = if weak_steps.is_empty() {
                     // No identifiably weak steps -- use MaxCoverage as fallback
@@ -925,11 +929,7 @@ pub fn explore_candidates(
                     }
                 };
 
-                let parent_depth = tree
-                    .nodes
-                    .get(&parent_id)
-                    .map(|n| n.depth)
-                    .unwrap_or(0);
+                let parent_depth = tree.nodes.get(&parent_id).map(|n| n.depth).unwrap_or(0);
 
                 if (parent_depth as usize) >= config.max_depth {
                     debug!(
@@ -953,7 +953,14 @@ pub fn explore_candidates(
                         provider_override,
                     );
 
-                    let score = score_candidate(&result.steps, criteria, config, doctor_handle, model_override, provider_override);
+                    let score = score_candidate(
+                        &result.steps,
+                        criteria,
+                        config,
+                        doctor_handle,
+                        model_override,
+                        provider_override,
+                    );
                     let node = SearchNode {
                         id: uuid::Uuid::new_v4().to_string(),
                         steps: result.steps,
@@ -980,7 +987,14 @@ pub fn explore_candidates(
                     provider_override,
                 );
 
-                let score = score_candidate(&result.steps, criteria, config, doctor_handle, model_override, provider_override);
+                let score = score_candidate(
+                    &result.steps,
+                    criteria,
+                    config,
+                    doctor_handle,
+                    model_override,
+                    provider_override,
+                );
                 let child = SearchNode {
                     id: uuid::Uuid::new_v4().to_string(),
                     steps: result.steps,
@@ -1010,23 +1024,21 @@ pub fn explore_candidates(
 
     let (best, runner_up) = tree.select_best_and_runner_up();
 
-    let best_candidate = best
-        .cloned()
-        .unwrap_or_else(|| {
-            // Should never happen since Phase 1 always generates at least one,
-            // but produce a safe fallback.
-            warn!("AB-MCTS: no scored candidates found, returning empty fallback");
-            SearchNode {
-                id: uuid::Uuid::new_v4().to_string(),
-                steps: Vec::new(),
-                score: Some(0.0),
-                parent_id: None,
-                children: Vec::new(),
-                visits: 0,
-                strategy: GenerationVariant::Standard,
-                depth: 0,
-            }
-        });
+    let best_candidate = best.cloned().unwrap_or_else(|| {
+        // Should never happen since Phase 1 always generates at least one,
+        // but produce a safe fallback.
+        warn!("AB-MCTS: no scored candidates found, returning empty fallback");
+        SearchNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            steps: Vec::new(),
+            score: Some(0.0),
+            parent_id: None,
+            children: Vec::new(),
+            visits: 0,
+            strategy: GenerationVariant::Standard,
+            depth: 0,
+        }
+    });
 
     let runner_up_candidate = runner_up.cloned();
     let total_explored = tree.total_visits();
@@ -1036,7 +1048,10 @@ pub fn explore_candidates(
 
     info!(
         best_score = best_candidate.score.unwrap_or(0.0),
-        runner_up_score = runner_up_candidate.as_ref().and_then(|n| n.score).unwrap_or(0.0),
+        runner_up_score = runner_up_candidate
+            .as_ref()
+            .and_then(|n| n.score)
+            .unwrap_or(0.0),
         total_explored,
         depth_reached,
         elapsed_ms = elapsed,

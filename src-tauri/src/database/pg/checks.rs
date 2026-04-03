@@ -4,11 +4,19 @@ use super::PgDb;
 use crate::database::types::{Check, CheckGroup, TestType, VerificationTest};
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn json_or_default<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
-    if s.is_empty() { T::default() } else { serde_json::from_str(s).unwrap_or_default() }
+    if s.is_empty() {
+        T::default()
+    } else {
+        serde_json::from_str(s).unwrap_or_default()
+    }
 }
 
 /// Map a Clorinde row to Check.
@@ -25,7 +33,11 @@ macro_rules! row_to_check {
             config_path: non_empty($r.config_path),
             auto_fix: $r.auto_fix,
             fail_on_warning: $r.fail_on_warning,
-            timeout_seconds: if $r.timeout_seconds == 0 { None } else { Some($r.timeout_seconds as u32) },
+            timeout_seconds: if $r.timeout_seconds == 0 {
+                None
+            } else {
+                Some($r.timeout_seconds as u32)
+            },
             is_critical: $r.is_critical,
             enabled: $r.enabled,
             ai_generated: $r.ai_generated,
@@ -40,7 +52,11 @@ macro_rules! row_to_check {
 impl PgDb {
     /// List all checks.
     pub async fn list_checks(&self) -> Result<Vec<Check>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::checks::list_checks()
             .bind(&conn)
             .all()
@@ -51,7 +67,11 @@ impl PgDb {
 
     /// Get a single check by ID.
     pub async fn get_check(&self, id: &str) -> Result<Option<Check>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::checks::get_check()
             .bind(&conn, &id)
             .opt()
@@ -62,7 +82,11 @@ impl PgDb {
 
     /// Delete a check by ID.
     pub async fn delete_check(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::checks::delete_check()
             .bind(&conn, &id)
             .opt()
@@ -73,7 +97,11 @@ impl PgDb {
 
     /// Get a check group by ID.
     pub async fn get_check_group(&self, id: &str) -> Result<Option<CheckGroup>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::checks::get_check_group()
             .bind(&conn, &id)
             .opt()
@@ -97,7 +125,11 @@ impl PgDb {
 
     /// Delete a check group by ID.
     pub async fn delete_check_group(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::checks::delete_check_group()
             .bind(&conn, &id)
             .opt()
@@ -108,7 +140,11 @@ impl PgDb {
 
     /// Get checks in a group.
     pub async fn get_checks_in_group(&self, group_id: &str) -> Result<Vec<Check>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::checks::get_checks_in_group()
             .bind(&conn, &group_id)
             .all()
@@ -118,8 +154,15 @@ impl PgDb {
     }
 
     /// Create a new check.
-    pub async fn create_check(&self, input: &crate::database::types::CreateCheckInput) -> Result<Check, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn create_check(
+        &self,
+        input: &crate::database::types::CreateCheckInput,
+    ) -> Result<Check, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("check-{}", uuid::Uuid::new_v4());
         let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
         let timeout: Option<i32> = input.timeout_seconds.map(|t| t as i32);
@@ -148,14 +191,26 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG create_check: {}", e))?;
 
-        self.get_check(&id).await?
+        self.get_check(&id)
+            .await?
             .ok_or_else(|| "Failed to retrieve created check".to_string())
     }
 
     /// Update a check.
-    pub async fn update_check(&self, id: &str, input: &crate::database::types::UpdateCheckInput) -> Result<Check, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let tags_json = input.tags.as_ref().map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
+    pub async fn update_check(
+        &self,
+        id: &str,
+        input: &crate::database::types::UpdateCheckInput,
+    ) -> Result<Check, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let tags_json = input
+            .tags
+            .as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
         let timeout: Option<i32> = input.timeout_seconds.map(|t| t as i32);
 
         qontinui_db::queries::checks::update_check()
@@ -181,13 +236,21 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG update_check: {}", e))?;
 
-        self.get_check(id).await?
+        self.get_check(id)
+            .await?
             .ok_or_else(|| format!("Check not found after update: {}", id))
     }
 
     /// Get a single verification test by ID.
-    pub async fn get_verification_test(&self, id: &str) -> Result<Option<VerificationTest>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_verification_test(
+        &self,
+        id: &str,
+    ) -> Result<Option<VerificationTest>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 r#"SELECT id, name, description, test_type, timeout_seconds, enabled, tags,
@@ -235,8 +298,15 @@ impl PgDb {
     }
 
     /// Create a check group.
-    pub async fn create_check_group(&self, input: &crate::database::types::CreateCheckGroupInput) -> Result<CheckGroup, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn create_check_group(
+        &self,
+        input: &crate::database::types::CreateCheckGroupInput,
+    ) -> Result<CheckGroup, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("cg-{}", uuid::Uuid::new_v4());
         let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
 
@@ -256,13 +326,18 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG create_check_group: {}", e))?;
 
-        self.get_check_group(&id).await?
+        self.get_check_group(&id)
+            .await?
             .ok_or_else(|| "Failed to retrieve created check group".to_string())
     }
 
     /// List all check groups (optionally filtered to enabled only).
     pub async fn list_check_groups(&self, enabled_only: bool) -> Result<Vec<CheckGroup>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let sql = if enabled_only {
             r#"SELECT id, name, description, color, enabled, run_in_parallel,
@@ -274,7 +349,9 @@ impl PgDb {
                FROM check_groups ORDER BY name ASC"#
         };
 
-        let rows = conn.query(sql, &[]).await
+        let rows = conn
+            .query(sql, &[])
+            .await
             .map_err(|e| format!("PG list_check_groups: {}", e))?;
 
         let mut groups = Vec::new();
@@ -305,11 +382,21 @@ impl PgDb {
     }
 
     /// Update a check group.
-    pub async fn update_check_group(&self, id: &str, input: &crate::database::types::UpdateCheckGroupInput) -> Result<CheckGroup, String> {
-        let existing = self.get_check_group(id).await?
+    pub async fn update_check_group(
+        &self,
+        id: &str,
+        input: &crate::database::types::UpdateCheckGroupInput,
+    ) -> Result<CheckGroup, String> {
+        let existing = self
+            .get_check_group(id)
+            .await?
             .ok_or_else(|| format!("Check group not found: {}", id))?;
 
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let name = input.name.as_ref().unwrap_or(&existing.name);
         let description = input.description.clone().or(existing.description);
@@ -320,41 +407,55 @@ impl PgDb {
         let tags = input.tags.clone().unwrap_or(existing.tags);
         let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
 
-        let rows = conn.execute(
-            r#"UPDATE check_groups SET
+        let rows = conn
+            .execute(
+                r#"UPDATE check_groups SET
                 name = $1, description = $2, color = $3, enabled = $4,
                 run_in_parallel = $5, stop_on_failure = $6, tags = $7,
                 updated_at = NOW()
             WHERE id = $8"#,
-            &[
-                &name as &(dyn tokio_postgres::types::ToSql + Sync),
-                &description as &(dyn tokio_postgres::types::ToSql + Sync),
-                &color as &(dyn tokio_postgres::types::ToSql + Sync),
-                &enabled as &(dyn tokio_postgres::types::ToSql + Sync),
-                &run_in_parallel as &(dyn tokio_postgres::types::ToSql + Sync),
-                &stop_on_failure as &(dyn tokio_postgres::types::ToSql + Sync),
-                &tags_json as &(dyn tokio_postgres::types::ToSql + Sync),
-                &id as &(dyn tokio_postgres::types::ToSql + Sync),
-            ],
-        ).await.map_err(|e| format!("PG update_check_group: {}", e))?;
+                &[
+                    &name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &description as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &color as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &enabled as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &run_in_parallel as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &stop_on_failure as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &tags_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_check_group: {}", e))?;
 
         if rows == 0 {
             return Err(format!("Check group not found: {}", id));
         }
 
-        self.get_check_group(id).await?
+        self.get_check_group(id)
+            .await?
             .ok_or_else(|| "Failed to retrieve updated check group".to_string())
     }
 
     /// Set checks in a group (replace all existing assignments).
-    pub async fn set_checks_in_group(&self, group_id: &str, check_ids: &[String]) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn set_checks_in_group(
+        &self,
+        group_id: &str,
+        check_ids: &[String],
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         // Remove all existing members
         conn.execute(
             "DELETE FROM check_group_members WHERE group_id = $1",
             &[&group_id],
-        ).await.map_err(|e| format!("PG set_checks_in_group (delete): {}", e))?;
+        )
+        .await
+        .map_err(|e| format!("PG set_checks_in_group (delete): {}", e))?;
 
         // Add new members
         for (index, check_id) in check_ids.iter().enumerate() {
@@ -381,7 +482,11 @@ impl PgDb {
     /// Checks named "{group_name} - {tool_name}" are linked to matching groups.
     /// Returns the number of associations created.
     pub async fn repair_check_group_associations(&self) -> Result<usize, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows_affected = conn.execute(
             r#"INSERT INTO check_group_members (id, group_id, check_id, sort_order, created_at)
@@ -431,7 +536,11 @@ impl PgDb {
         structured_output: Option<&str>,
         task_run_id: Option<&str>,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -472,7 +581,11 @@ impl PgDb {
         check_id: &str,
         limit: u32,
     ) -> Result<Vec<crate::database::types::CheckResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
 
         let rows = conn

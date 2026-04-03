@@ -4,64 +4,64 @@
 //! via Clorinde-generated code. Callers prefer PG when available, fall back to SQLite.
 
 pub mod activity_timeline;
+pub mod adaptive_learning;
 pub mod agentic_metrics;
-pub mod cached_specs;
-pub mod graph_ops;
+pub mod ai_sessions;
 pub mod approval_gates;
-pub mod deferred_questions;
-pub mod error_monitor;
+pub mod cached_specs;
 pub mod canary;
+pub mod canvas;
+pub mod checkpoints;
 pub mod checks;
+pub mod comparison;
+pub mod decision_trail;
+pub mod deferred_questions;
+pub mod entailment_cache;
+pub mod error_monitor;
+pub mod export;
 pub mod findings;
+pub mod flows;
+pub mod generation;
+pub mod generation_artifacts;
+pub mod generation_feedback;
+pub mod graph_ops;
+pub mod hooks;
 pub mod knowledge;
+pub mod known_issues;
 pub mod learning;
+pub mod log_sources;
+pub mod meta_optimizer;
 pub mod misc_crud;
 pub mod observations;
+pub mod online_learning;
+pub mod orchestration_loop;
+pub mod pipeline_traces;
+pub mod process_sessions;
 pub mod prompt_evolution;
 pub mod prompt_registry;
 pub mod q_routing;
 pub mod queued_workflows;
+pub mod recordings;
+pub mod reflection;
+pub mod restate;
+pub mod scheduler;
+pub mod security_audit;
 pub mod settings;
 pub mod skills;
+pub mod spec_experimentation;
+pub mod state_machine;
+pub mod step_type_knowledge;
 pub mod task_run_events;
 pub mod task_runs;
+pub mod tiered_info;
 pub mod token_analytics;
 pub mod token_usage;
+pub mod triggers;
 pub mod ui_bridge;
 pub mod watchers;
 pub mod workflow_state;
 pub mod workflows;
-pub mod ai_sessions;
-pub mod checkpoints;
-pub mod flows;
 pub mod worktrees;
-pub mod export;
-pub mod decision_trail;
-pub mod generation;
-pub mod generation_artifacts;
-pub mod generation_feedback;
-pub mod meta_optimizer;
-pub mod pipeline_traces;
-pub mod reflection;
-pub mod log_sources;
-pub mod known_issues;
-pub mod state_machine;
-pub mod process_sessions;
-pub mod canvas;
-pub mod orchestration_loop;
-pub mod scheduler;
-pub mod recordings;
-pub mod spec_experimentation;
-pub mod step_type_knowledge;
-pub mod hooks;
-pub mod comparison;
-pub mod tiered_info;
-pub mod adaptive_learning;
-pub mod entailment_cache;
-pub mod triggers;
-pub mod online_learning;
-pub mod restate;
-pub mod security_audit;
 
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
@@ -114,7 +114,8 @@ impl PgDb {
             recycling_method: deadpool_postgres::RecyclingMethod::Fast,
         };
 
-        let mgr = deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
+        let mgr =
+            deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
 
         let pool = deadpool_postgres::Pool::builder(mgr)
             .max_size(16)
@@ -141,11 +142,11 @@ impl PgDb {
 
         // Verify the runner schema exists (search_path is already set by post_create)
         conn.query_one(
-                "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'runner'",
-                &[],
-            )
-            .await
-            .map_err(|e| format!("Runner schema not found in PostgreSQL: {}", e))?;
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'runner'",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("Runner schema not found in PostgreSQL: {}", e))?;
 
         info!("PostgreSQL connected (deadpool, max_size=16, schema=runner)");
 
@@ -1219,7 +1220,11 @@ impl PgDb {
         summary: Option<&str>,
         context_json: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             r#"INSERT INTO execution_state_snapshots
                (execution_id, span_id, snapshot_ts, state_type, summary, context_json)
@@ -1239,8 +1244,15 @@ impl PgDb {
     }
 
     /// Query execution state snapshots for replay.
-    pub async fn get_state_snapshots(&self, execution_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let client = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_state_snapshots(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = client
             .query(
                 "SELECT id, execution_id, span_id, snapshot_ts, state_type, summary, context_json, created_at
@@ -1252,18 +1264,21 @@ impl PgDb {
             .await
             .map_err(|e| format!("Failed to query snapshots: {}", e))?;
 
-        Ok(rows.iter().map(|row| {
-            serde_json::json!({
-                "id": row.get::<usize, i64>(0),
-                "execution_id": row.get::<usize, String>(1),
-                "span_id": row.get::<usize, String>(2),
-                "snapshot_ts": row.get::<usize, String>(3),
-                "state_type": row.get::<usize, String>(4),
-                "summary": row.get::<usize, Option<String>>(5),
-                "context_json": row.get::<usize, Option<String>>(6),
-                "created_at": row.get::<usize, String>(7),
+        Ok(rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "id": row.get::<usize, i64>(0),
+                    "execution_id": row.get::<usize, String>(1),
+                    "span_id": row.get::<usize, String>(2),
+                    "snapshot_ts": row.get::<usize, String>(3),
+                    "state_type": row.get::<usize, String>(4),
+                    "summary": row.get::<usize, Option<String>>(5),
+                    "context_json": row.get::<usize, Option<String>>(6),
+                    "created_at": row.get::<usize, String>(7),
+                })
             })
-        }).collect())
+            .collect())
     }
 
     /// Get a reference to the connection pool.
@@ -1297,6 +1312,9 @@ impl PgDb {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string());
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
-        std::sync::Arc::new(rt.block_on(Self::new(&url)).expect("PgDb connection for test"))
+        std::sync::Arc::new(
+            rt.block_on(Self::new(&url))
+                .expect("PgDb connection for test"),
+        )
     }
 }

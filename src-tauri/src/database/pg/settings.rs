@@ -8,7 +8,11 @@ use crate::database::types::ConfigStorageEntry;
 
 /// Convert Clorinde empty-string (from NULL) to Option::None.
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 impl PgDb {
@@ -18,7 +22,11 @@ impl PgDb {
 
     /// Get a setting value by key.
     pub async fn get_setting(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let value_str = qontinui_db::queries::settings::get_setting()
             .bind(&conn, &key)
             .opt()
@@ -37,7 +45,11 @@ impl PgDb {
 
     /// Set a setting value (upsert).
     pub async fn set_setting(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let value_str = value.to_string();
         qontinui_db::queries::settings::set_setting()
             .bind(&conn, &key, &value_str.as_str())
@@ -49,7 +61,11 @@ impl PgDb {
 
     /// Delete a setting by key. Returns true if a row was deleted.
     pub async fn delete_setting(&self, key: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::settings::delete_setting()
             .bind(&conn, &key)
             .opt()
@@ -60,7 +76,11 @@ impl PgDb {
 
     /// Get all settings as a JSON object.
     pub async fn get_all_settings(&self) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::settings::get_all_settings()
             .bind(&conn)
             .all()
@@ -89,7 +109,11 @@ impl PgDb {
         source_type: &str,
         source_path: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let config_json = config.to_string();
         let source_path_opt = source_path.map(|s| s.to_string());
         qontinui_db::queries::settings::save_config()
@@ -109,7 +133,11 @@ impl PgDb {
 
     /// Get a config by ID.
     pub async fn get_config(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let json_str = qontinui_db::queries::settings::get_config()
             .bind(&conn, &id)
             .opt()
@@ -128,26 +156,37 @@ impl PgDb {
 
     /// List all stored configs.
     pub async fn list_configs(&self) -> Result<Vec<ConfigStorageEntry>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::settings::list_configs()
             .bind(&conn)
             .all()
             .await
             .map_err(|e| format!("PG list_configs: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| ConfigStorageEntry {
-            id: r.id,
-            name: r.name,
-            source_type: r.source_type,
-            source_path: non_empty(r.source_path),
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ConfigStorageEntry {
+                id: r.id,
+                name: r.name,
+                source_type: r.source_type,
+                source_path: non_empty(r.source_path),
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Delete a config by ID. Returns true if a row was deleted.
     pub async fn delete_config(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::settings::delete_config()
             .bind(&conn, &id)
             .opt()

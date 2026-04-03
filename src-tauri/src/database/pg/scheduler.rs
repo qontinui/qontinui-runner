@@ -132,11 +132,18 @@ impl PgDb {
 
     /// Retrieve all scheduled tasks.
     pub async fn get_all_scheduled_tasks(&self) -> Result<Vec<ScheduledTask>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
-                &format!("SELECT {} FROM scheduled_tasks ORDER BY created_at", SELECT_TASK_COLS),
+                &format!(
+                    "SELECT {} FROM scheduled_tasks ORDER BY created_at",
+                    SELECT_TASK_COLS
+                ),
                 &[],
             )
             .await
@@ -147,11 +154,18 @@ impl PgDb {
 
     /// Retrieve a single scheduled task by ID, or None if not found.
     pub async fn get_scheduled_task(&self, id: &str) -> Result<Option<ScheduledTask>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
-                &format!("SELECT {} FROM scheduled_tasks WHERE id = $1", SELECT_TASK_COLS),
+                &format!(
+                    "SELECT {} FROM scheduled_tasks WHERE id = $1",
+                    SELECT_TASK_COLS
+                ),
                 &[&id],
             )
             .await
@@ -162,10 +176,14 @@ impl PgDb {
 
     /// Insert a new scheduled task.
     pub async fn insert_scheduled_task(&self, task: &ScheduledTask) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let (stype, svalue) = schedule_to_parts(&task.schedule);
-        let task_config =
-            serde_json::to_string(&task.task).map_err(|e| format!("Serialize task_config: {}", e))?;
+        let task_config = serde_json::to_string(&task.task)
+            .map_err(|e| format!("Serialize task_config: {}", e))?;
         let last_run_id = task.last_run.as_ref().map(|r| r.execution_id.clone());
 
         conn.execute(
@@ -202,10 +220,14 @@ impl PgDb {
 
     /// Update an existing scheduled task (full replacement of mutable fields).
     pub async fn update_scheduled_task(&self, task: &ScheduledTask) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let (stype, svalue) = schedule_to_parts(&task.schedule);
-        let task_config =
-            serde_json::to_string(&task.task).map_err(|e| format!("Serialize task_config: {}", e))?;
+        let task_config = serde_json::to_string(&task.task)
+            .map_err(|e| format!("Serialize task_config: {}", e))?;
         let last_run_id = task.last_run.as_ref().map(|r| r.execution_id.clone());
 
         conn.execute(
@@ -249,7 +271,11 @@ impl PgDb {
 
     /// Delete a scheduled task by ID. History is cascade-deleted by FK.
     pub async fn delete_scheduled_task(&self, id: &str) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM scheduled_tasks WHERE id = $1", &[&id])
             .await
             .map_err(|e| format!("PG delete_scheduled_task {}: {}", id, e))?;
@@ -266,7 +292,11 @@ impl PgDb {
         task_id: &str,
         last_run_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE scheduled_tasks SET last_run_id = $1, modified_at = $2 WHERE id = $3",
@@ -287,7 +317,11 @@ impl PgDb {
         task_id: &str,
         next_run: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE scheduled_tasks SET next_run = $1, modified_at = $2 WHERE id = $3",
@@ -308,7 +342,11 @@ impl PgDb {
         task_id: &str,
         status: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         let result = conn
             .execute(
@@ -336,7 +374,11 @@ impl PgDb {
         task_id: &str,
         record: &TaskExecutionRecord,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let status = match &record.status {
             ScheduledTaskStatus::Pending => "pending",
             ScheduledTaskStatus::Running => "running",
@@ -379,7 +421,11 @@ impl PgDb {
         task_id: &str,
         limit: i64,
     ) -> Result<Vec<TaskExecutionRecord>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -406,7 +452,11 @@ impl PgDb {
         task_id: &str,
         max_entries: i64,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         conn.execute(
             r#"
@@ -433,7 +483,11 @@ impl PgDb {
 
     /// Get global scheduler settings. Returns defaults if no row exists.
     pub async fn get_scheduler_settings(&self) -> Result<SchedulerSettings, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -454,8 +508,15 @@ impl PgDb {
     }
 
     /// Upsert global scheduler settings (single-row table, id=1).
-    pub async fn update_scheduler_settings(&self, settings: &SchedulerSettings) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn update_scheduler_settings(
+        &self,
+        settings: &SchedulerSettings,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let max_concurrent = settings.max_concurrent as i32;
 
         conn.execute(

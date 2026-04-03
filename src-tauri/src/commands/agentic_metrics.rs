@@ -23,10 +23,7 @@ pub async fn get_agentic_metric_aggregates(
     days: Option<i64>,
 ) -> Result<Vec<crate::database::agentic_metrics_ops::AgenticMetricAggregate>, String> {
     let interval = format!("{} days", days.unwrap_or(30));
-    state
-        .pg_db
-        .get_agentic_metric_aggregates(&interval)
-        .await
+    state.pg_db.get_agentic_metric_aggregates(&interval).await
 }
 
 /// Get composite agentic score trend over time, grouped by date.
@@ -184,7 +181,9 @@ pub async fn push_latest_agentic_scores(
 ) -> Result<PushScoresResult, String> {
     info!("Finding most recent task run with agentic scores...");
 
-    let task_run_id: String = state.pg_db.get_latest_scored_task_run_id()
+    let task_run_id: String = state
+        .pg_db
+        .get_latest_scored_task_run_id()
         .await?
         .ok_or_else(|| "No agentic scores found".to_string())?;
 

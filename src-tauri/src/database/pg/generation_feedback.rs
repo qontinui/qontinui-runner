@@ -25,7 +25,11 @@ impl PgDb {
         workflow_category: Option<&str>,
         workflow_description: Option<&str>,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -54,7 +58,10 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG record_generation_feedback: {}", e))?;
 
-        info!("Recorded PG {} feedback for workflow {} (id={})", feedback_type, workflow_id, id);
+        info!(
+            "Recorded PG {} feedback for workflow {} (id={})",
+            feedback_type, workflow_id, id
+        );
         Ok(id)
     }
 
@@ -63,7 +70,11 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -105,7 +116,11 @@ impl PgDb {
         &self,
         workflow_category: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let (sql, rows) = if let Some(cat) = workflow_category {
             let r = conn
@@ -139,7 +154,10 @@ impl PgDb {
             let ft: String = row.get(0);
             let count: i64 = row.get(1);
             let avg_rating: Option<f64> = row.get(2);
-            summary.insert(ft, serde_json::json!({ "count": count, "avg_rating": avg_rating }));
+            summary.insert(
+                ft,
+                serde_json::json!({ "count": count, "avg_rating": avg_rating }),
+            );
         }
 
         Ok(serde_json::json!({

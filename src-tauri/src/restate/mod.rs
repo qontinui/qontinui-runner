@@ -18,6 +18,6 @@ pub mod types;
 // These modules depend on the restate-sdk crate (proc macros, Endpoint, HttpServer)
 // and are only compiled when the `restate` feature flag is enabled.
 #[cfg(feature = "restate")]
-pub mod service;
-#[cfg(feature = "restate")]
 pub mod http_endpoint;
+#[cfg(feature = "restate")]
+pub mod service;

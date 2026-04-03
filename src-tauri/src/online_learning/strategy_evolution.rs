@@ -209,7 +209,9 @@ pub fn mutate_strategy(parent: &Strategy, mutation: MutationType) -> Strategy {
             components.preferred_architecture = Some(arch);
         }
         MutationType::AddStepOverride(step_type, override_val) => {
-            components.step_type_overrides.insert(step_type, override_val);
+            components
+                .step_type_overrides
+                .insert(step_type, override_val);
         }
         MutationType::RemoveStepOverride(step_type) => {
             components.step_type_overrides.remove(&step_type);
@@ -322,6 +324,9 @@ mod tests {
             mutant.components.preferred_model.as_deref(),
             Some("claude-opus-4-20250514")
         );
-        assert_eq!(mutant.parent_strategy_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(
+            mutant.parent_strategy_id.as_deref(),
+            Some(parent.id.as_str())
+        );
     }
 }

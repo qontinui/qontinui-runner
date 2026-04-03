@@ -112,10 +112,7 @@ async fn sweep_once(
 ///
 /// Waits for `STARTUP_GRACE` before the first sweep, then runs
 /// `sweep_once()` every `SWEEP_INTERVAL`.
-pub fn start_zombie_sweep(
-    session_manager: Arc<SessionManager>,
-    app_handle: AppHandle,
-) {
+pub fn start_zombie_sweep(session_manager: Arc<SessionManager>, app_handle: AppHandle) {
     // Zombie sweep: SQLite-dependent. Skipping until PG migration.
     let _ = (session_manager, app_handle);
     info!("Stale task sweep: disabled (pending PG port)");

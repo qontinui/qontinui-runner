@@ -25,10 +25,7 @@ use tracing::{debug, warn};
 /// Returns an empty vec if the UI Bridge is not connected or the fetch fails.
 pub async fn collect_from_ui_bridge() -> Vec<AnnotatedElement> {
     let port = get_mcp_api_port();
-    let url = format!(
-        "http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot",
-        port
-    );
+    let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot", port);
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -79,10 +76,7 @@ pub fn extract_elements_from_snapshot(snapshot: &serde_json::Value) -> Vec<Annot
     let mut index = 1_u32;
 
     for el in elements {
-        let el_type = el
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // Filter to interactive elements only
         if !interactive_types.contains(&el_type) {
@@ -114,10 +108,7 @@ pub fn extract_elements_from_snapshot(snapshot: &serde_json::Value) -> Vec<Annot
                     .and_then(|s| s.get("textContent"))
                     .and_then(|v| v.as_str())
             })
-            .or_else(|| {
-                el.get("accessibleName")
-                    .and_then(|v| v.as_str())
-            })
+            .or_else(|| el.get("accessibleName").and_then(|v| v.as_str()))
             .unwrap_or("(unlabeled)")
             .to_string();
 
@@ -158,21 +149,27 @@ pub fn extract_elements_from_snapshot(snapshot: &serde_json::Value) -> Vec<Annot
 /// with viewport dimensions for normalization.
 fn extract_normalized_rect(el: &serde_json::Value) -> Option<NormalizedRect> {
     // Try normalizedRect (UI Bridge provides this directly)
-    if let Some(nr) = el.get("normalizedRect").or_else(|| {
-        el.get("state").and_then(|s| s.get("normalizedRect"))
-    }) {
+    if let Some(nr) = el
+        .get("normalizedRect")
+        .or_else(|| el.get("state").and_then(|s| s.get("normalizedRect")))
+    {
         let x = nr.get("x").and_then(|v| v.as_f64())? as f32;
         let y = nr.get("y").and_then(|v| v.as_f64())? as f32;
         let width = nr.get("width").and_then(|v| v.as_f64())? as f32;
         let height = nr.get("height").and_then(|v| v.as_f64())? as f32;
-        return Some(NormalizedRect { x, y, width, height });
+        return Some(NormalizedRect {
+            x,
+            y,
+            width,
+            height,
+        });
     }
 
     // Fallback: use rect with absolute pixel coords
     // Need viewport dimensions to normalize
-    let rect = el.get("rect").or_else(|| {
-        el.get("state").and_then(|s| s.get("rect"))
-    })?;
+    let rect = el
+        .get("rect")
+        .or_else(|| el.get("state").and_then(|s| s.get("rect")))?;
 
     let x = rect.get("x").and_then(|v| v.as_f64())? as f32;
     let y = rect.get("y").and_then(|v| v.as_f64())? as f32;
@@ -219,14 +216,15 @@ pub fn collect_from_detected_elements(
         .iter()
         .enumerate()
         .filter_map(|(i, el)| {
-            let normalized_rect = el.normalized_bounding_box.as_ref().map(|nb| {
-                NormalizedRect {
+            let normalized_rect = el
+                .normalized_bounding_box
+                .as_ref()
+                .map(|nb| NormalizedRect {
                     x: nb.x,
                     y: nb.y,
                     width: nb.width,
                     height: nb.height,
-                }
-            })?;
+                })?;
 
             Some(AnnotatedElement {
                 index: (i + 1) as u32,
@@ -353,27 +351,25 @@ mod tests {
     fn test_collect_from_detected_elements() {
         use crate::commands::step_outputs::{BoundingBox, DetectedElement};
 
-        let detected = vec![
-            DetectedElement {
-                id: "1".into(),
-                label: "Button".into(),
-                element_type: "button".into(),
-                text_content: None,
-                bounding_box: BoundingBox {
-                    x: 100,
-                    y: 200,
-                    width: 50,
-                    height: 30,
-                },
-                normalized_bounding_box: Some(NormalizedRect {
-                    x: 0.05,
-                    y: 0.18,
-                    width: 0.026,
-                    height: 0.028,
-                }),
-                confidence: 0.95,
+        let detected = vec![DetectedElement {
+            id: "1".into(),
+            label: "Button".into(),
+            element_type: "button".into(),
+            text_content: None,
+            bounding_box: BoundingBox {
+                x: 100,
+                y: 200,
+                width: 50,
+                height: 30,
             },
-        ];
+            normalized_bounding_box: Some(NormalizedRect {
+                x: 0.05,
+                y: 0.18,
+                width: 0.026,
+                height: 0.028,
+            }),
+            confidence: 0.95,
+        }];
 
         let annotated = collect_from_detected_elements(&detected);
         assert_eq!(annotated.len(), 1);

@@ -20,10 +20,7 @@ pub fn insert_config(req: &CreateOlConfigRequest) -> Result<OlConfig, String> {
 }
 
 /// Update an existing config. Returns the updated config.
-pub fn update_config(
-    id: &str,
-    req: &UpdateOlConfigRequest,
-) -> Result<OlConfig, String> {
+pub fn update_config(id: &str, req: &UpdateOlConfigRequest) -> Result<OlConfig, String> {
     Err("SQLite removed".to_string())
 }
 

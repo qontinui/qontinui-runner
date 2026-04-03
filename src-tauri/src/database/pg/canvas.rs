@@ -12,7 +12,11 @@ impl PgDb {
 
     /// Insert or update a canvas panel.
     pub async fn insert_or_update_canvas_panel(&self, panel: &StoredPanel) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let data_json = panel.data.to_string();
 
         conn.execute(
@@ -52,7 +56,11 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<StoredPanel>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -90,7 +98,11 @@ impl PgDb {
 
     /// Delete a single canvas panel.
     pub async fn delete_canvas_panel(&self, panel_id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM canvas_panels WHERE id = $1", &[&panel_id])
@@ -102,7 +114,11 @@ impl PgDb {
 
     /// Clear all canvas panels for a task run.
     pub async fn clear_canvas_panels_for_task_run(&self, task_run_id: &str) -> Result<u64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute(

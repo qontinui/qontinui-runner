@@ -4,11 +4,19 @@
 use super::PgDb;
 
 fn non_empty(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn json_or_default<T: serde::de::DeserializeOwned + Default>(s: &str) -> T {
-    if s.is_empty() { T::default() } else { serde_json::from_str(s).unwrap_or_default() }
+    if s.is_empty() {
+        T::default()
+    } else {
+        serde_json::from_str(s).unwrap_or_default()
+    }
 }
 
 impl PgDb {
@@ -21,7 +29,11 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Option<crate::database::types::ShellCommand>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::misc_crud::get_shell_command()
             .bind(&conn, &id)
             .opt()
@@ -49,10 +61,18 @@ impl PgDb {
         &self,
         input: &crate::database::types::CreateShellCommandInput,
     ) -> Result<crate::database::types::ShellCommand, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = format!("sc-{}", uuid::Uuid::new_v4());
         let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
-        let timeout: Option<i32> = if input.timeout_seconds > 0 { Some(input.timeout_seconds) } else { None };
+        let timeout: Option<i32> = if input.timeout_seconds > 0 {
+            Some(input.timeout_seconds)
+        } else {
+            None
+        };
 
         qontinui_db::queries::misc_crud::create_shell_command()
             .bind(
@@ -72,13 +92,18 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG create_shell_command: {}", e))?;
 
-        self.get_shell_command(&id).await?
+        self.get_shell_command(&id)
+            .await?
             .ok_or_else(|| "Failed to retrieve created shell command".to_string())
     }
 
     /// Delete a shell command by ID.
     pub async fn delete_shell_command(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::misc_crud::delete_shell_command()
             .bind(&conn, &id)
             .opt()
@@ -93,7 +118,11 @@ impl PgDb {
 
     /// List all saved API requests (returns JSON values).
     pub async fn list_saved_api_requests(&self) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::misc_crud::list_saved_api_requests()
             .bind(&conn)
             .all()
@@ -122,8 +151,15 @@ impl PgDb {
     }
 
     /// Get a saved API request by ID.
-    pub async fn get_saved_api_request(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_saved_api_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::misc_crud::get_saved_api_request()
             .bind(&conn, &id)
             .opt()
@@ -153,7 +189,11 @@ impl PgDb {
 
     /// Delete a saved API request by ID.
     pub async fn delete_saved_api_request(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let deleted = qontinui_db::queries::misc_crud::delete_saved_api_request()
             .bind(&conn, &id)
             .opt()
@@ -164,7 +204,11 @@ impl PgDb {
 
     /// Get distinct tags from saved API requests.
     pub async fn get_saved_api_request_tags(&self) -> Result<Vec<String>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::misc_crud::get_saved_api_request_tags()
             .bind(&conn)
             .all()
@@ -190,32 +234,41 @@ impl PgDb {
     // ========================================================================
 
     /// List all MCP servers.
-    pub async fn list_mcp_servers(&self) -> Result<Vec<crate::mcp_client::McpServerConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn list_mcp_servers(
+        &self,
+    ) -> Result<Vec<crate::mcp_client::McpServerConfig>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = qontinui_db::queries::misc_crud::list_mcp_servers()
             .bind(&conn)
             .all()
             .await
             .map_err(|e| format!("PG list_mcp_servers: {}", e))?;
 
-        Ok(rows.into_iter().map(|r| crate::mcp_client::McpServerConfig {
-            id: r.id,
-            name: r.name,
-            description: non_empty(r.description),
-            transport: match r.transport.as_str() {
-                "http" => crate::mcp_client::McpTransport::Http,
-                _ => crate::mcp_client::McpTransport::Stdio,
-            },
-            stdio_config: non_empty(r.stdio_config).and_then(|s| serde_json::from_str(&s).ok()),
-            http_config: non_empty(r.http_config).and_then(|s| serde_json::from_str(&s).ok()),
-            enabled: r.enabled,
-            auto_start: r.auto_start,
-            timeout_seconds: r.timeout_seconds as u64,
-            cached_tools: non_empty(r.cached_tools).and_then(|s| serde_json::from_str(&s).ok()),
-            tools_cached_at: non_empty(r.tools_cached_at),
-            created_at: r.created_at.to_rfc3339(),
-            updated_at: r.updated_at.to_rfc3339(),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::mcp_client::McpServerConfig {
+                id: r.id,
+                name: r.name,
+                description: non_empty(r.description),
+                transport: match r.transport.as_str() {
+                    "http" => crate::mcp_client::McpTransport::Http,
+                    _ => crate::mcp_client::McpTransport::Stdio,
+                },
+                stdio_config: non_empty(r.stdio_config).and_then(|s| serde_json::from_str(&s).ok()),
+                http_config: non_empty(r.http_config).and_then(|s| serde_json::from_str(&s).ok()),
+                enabled: r.enabled,
+                auto_start: r.auto_start,
+                timeout_seconds: r.timeout_seconds as u64,
+                cached_tools: non_empty(r.cached_tools).and_then(|s| serde_json::from_str(&s).ok()),
+                tools_cached_at: non_empty(r.tools_cached_at),
+                created_at: r.created_at.to_rfc3339(),
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
     }
 
     /// Create a new MCP server configuration.
@@ -223,7 +276,11 @@ impl PgDb {
         &self,
         input: crate::mcp_client::CreateMcpServerInput,
     ) -> Result<crate::mcp_client::McpServerConfig, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = uuid::Uuid::new_v4().to_string();
 
         let transport_str = match input.transport {
@@ -262,7 +319,8 @@ impl PgDb {
         .await
         .map_err(|e| format!("PG create_mcp_server: {}", e))?;
 
-        self.get_mcp_server(&id).await?
+        self.get_mcp_server(&id)
+            .await?
             .ok_or_else(|| "Failed to retrieve created MCP server".to_string())
     }
 
@@ -271,7 +329,11 @@ impl PgDb {
         &self,
         input: &crate::database::types::CreateMobileLogInput,
     ) -> Result<crate::database::types::MobileLog, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_one(
@@ -336,7 +398,11 @@ impl PgDb {
         &self,
         input: &crate::database::types::CreateMobileStateInput,
     ) -> Result<crate::database::types::MobileState, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_one(
@@ -397,8 +463,15 @@ impl PgDb {
     }
 
     /// Get a single MCP server by ID.
-    pub async fn get_mcp_server(&self, id: &str) -> Result<Option<crate::mcp_client::McpServerConfig>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_mcp_server(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::mcp_client::McpServerConfig>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = qontinui_db::queries::misc_crud::get_mcp_server()
             .bind(&conn, &id)
             .opt()
@@ -442,7 +515,11 @@ impl PgDb {
         completed_at: Option<&str>,
         task_run_id: Option<&str>,
     ) -> Result<String, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -478,7 +555,11 @@ impl PgDb {
         shell_command_id: &str,
         limit: u32,
     ) -> Result<Vec<crate::database::types::ShellCommandResult>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit as i64;
 
         let rows = conn
@@ -519,7 +600,11 @@ impl PgDb {
         task_run_id: &str,
         limit: Option<u32>,
     ) -> Result<Vec<crate::database::types::MobileState>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit.unwrap_or(100) as i64;
 
         let rows = conn
@@ -574,7 +659,11 @@ impl PgDb {
         errors_only: bool,
         limit: Option<u32>,
     ) -> Result<Vec<crate::database::types::MobileLog>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = limit.unwrap_or(100) as i64;
 
         let rows = if errors_only {
@@ -587,7 +676,8 @@ impl PgDb {
                 WHERE task_run_id = $1 AND log_level IN ('error', 'fatal')
                 ORDER BY created_at DESC LIMIT $2"#,
                 &[&task_run_id, &limit_i64],
-            ).await
+            )
+            .await
         } else if let Some(source) = log_source {
             conn.query(
                 r#"SELECT id, task_run_id, mobile_state_id, log_source, log_level, log_tag,
@@ -598,7 +688,8 @@ impl PgDb {
                 WHERE task_run_id = $1 AND log_source = $2
                 ORDER BY created_at DESC LIMIT $3"#,
                 &[&task_run_id, &source, &limit_i64],
-            ).await
+            )
+            .await
         } else {
             conn.query(
                 r#"SELECT id, task_run_id, mobile_state_id, log_source, log_level, log_tag,
@@ -609,33 +700,38 @@ impl PgDb {
                 WHERE task_run_id = $1
                 ORDER BY created_at DESC LIMIT $2"#,
                 &[&task_run_id, &limit_i64],
-            ).await
-        }.map_err(|e| format!("PG get_mobile_logs: {}", e))?;
+            )
+            .await
+        }
+        .map_err(|e| format!("PG get_mobile_logs: {}", e))?;
 
-        Ok(rows.iter().map(|r| {
-            let ts: chrono::DateTime<chrono::Utc> = r.get(15);
-            let created: chrono::DateTime<chrono::Utc> = r.get(17);
-            crate::database::types::MobileLog {
-                id: r.get(0),
-                task_run_id: r.get(1),
-                mobile_state_id: r.get(2),
-                log_source: r.get(3),
-                log_level: r.get(4),
-                log_tag: r.get(5),
-                message: r.get(6),
-                raw_line: r.get(7),
-                data: r.get(8),
-                error_type: r.get(9),
-                error_code: r.get(10),
-                stack_trace: r.get(11),
-                file_path: r.get(12),
-                line_number: r.get(13),
-                column_number: r.get(14),
-                timestamp: ts.to_rfc3339(),
-                device_timestamp: r.get(16),
-                created_at: created.to_rfc3339(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let ts: chrono::DateTime<chrono::Utc> = r.get(15);
+                let created: chrono::DateTime<chrono::Utc> = r.get(17);
+                crate::database::types::MobileLog {
+                    id: r.get(0),
+                    task_run_id: r.get(1),
+                    mobile_state_id: r.get(2),
+                    log_source: r.get(3),
+                    log_level: r.get(4),
+                    log_tag: r.get(5),
+                    message: r.get(6),
+                    raw_line: r.get(7),
+                    data: r.get(8),
+                    error_type: r.get(9),
+                    error_code: r.get(10),
+                    stack_trace: r.get(11),
+                    file_path: r.get(12),
+                    line_number: r.get(13),
+                    column_number: r.get(14),
+                    timestamp: ts.to_rfc3339(),
+                    device_timestamp: r.get(16),
+                    created_at: created.to_rfc3339(),
+                }
+            })
+            .collect())
     }
 
     /// Get mobile error logs for a task run.
@@ -652,8 +748,15 @@ impl PgDb {
     // ========================================================================
 
     /// Save an artifact to the database.
-    pub async fn save_artifact(&self, artifact: &crate::database::types::Artifact) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn save_artifact(
+        &self,
+        artifact: &crate::database::types::Artifact,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             r#"INSERT INTO artifacts (artifact_id, source_json, result_json, environment_json, passed, created_at)
                VALUES ($1, $2, $3, $4, $5, NOW())
@@ -670,8 +773,15 @@ impl PgDb {
     }
 
     /// Get an artifact by ID.
-    pub async fn get_artifact(&self, artifact_id: &str) -> Result<Option<crate::database::types::Artifact>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<crate::database::types::Artifact>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_opt(
             "SELECT artifact_id, source_json, result_json, environment_json, created_at, passed FROM artifacts WHERE artifact_id = $1",
             &[&artifact_id],
@@ -691,8 +801,15 @@ impl PgDb {
     }
 
     /// Query artifacts with filters.
-    pub async fn query_artifacts(&self, query: &crate::database::types::ArtifactQuery) -> Result<Vec<crate::database::types::Artifact>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn query_artifacts(
+        &self,
+        query: &crate::database::types::ArtifactQuery,
+    ) -> Result<Vec<crate::database::types::Artifact>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let limit_i64 = query.limit.unwrap_or(100) as i64;
         let offset_i64 = query.offset.unwrap_or(0) as i64;
 
@@ -730,25 +847,41 @@ impl PgDb {
         params.push(Box::new(limit_i64));
         params.push(Box::new(offset_i64));
 
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let rows = conn.query(&sql, &param_refs).await.map_err(|e| format!("PG query_artifacts: {}", e))?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG query_artifacts: {}", e))?;
 
-        Ok(rows.iter().map(|r| {
-            let created: chrono::DateTime<chrono::Utc> = r.get(4);
-            crate::database::types::Artifact {
-                artifact_id: r.get(0),
-                source_json: r.get(1),
-                result_json: r.get(2),
-                environment_json: r.get(3),
-                created_at: created.to_rfc3339(),
-                passed: r.get(5),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let created: chrono::DateTime<chrono::Utc> = r.get(4);
+                crate::database::types::Artifact {
+                    artifact_id: r.get(0),
+                    source_json: r.get(1),
+                    result_json: r.get(2),
+                    environment_json: r.get(3),
+                    created_at: created.to_rfc3339(),
+                    passed: r.get(5),
+                }
+            })
+            .collect())
     }
 
     /// Count artifacts with optional filters.
-    pub async fn count_artifacts(&self, query: &crate::database::types::ArtifactCountQuery) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn count_artifacts(
+        &self,
+        query: &crate::database::types::ArtifactCountQuery,
+    ) -> Result<i64, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut conditions = vec!["1=1".to_string()];
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -781,8 +914,14 @@ impl PgDb {
             "SELECT COUNT(*) FROM artifacts WHERE {}",
             conditions.join(" AND ")
         );
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.iter().map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        let row = conn.query_one(&sql, &param_refs).await.map_err(|e| format!("PG count_artifacts: {}", e))?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let row = conn
+            .query_one(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG count_artifacts: {}", e))?;
         Ok(row.get(0))
     }
 }

@@ -107,12 +107,18 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                     output.push_str(&format!("- [{}] {}{}\n", label, desc, evidence));
                     if let Some(ref reasoning) = fix.reasoning {
                         if !reasoning.is_empty() {
-                            output.push_str(&format!("  Reasoning: {}\n", truncate_str(reasoning, 200)));
+                            output.push_str(&format!(
+                                "  Reasoning: {}\n",
+                                truncate_str(reasoning, 200)
+                            ));
                         }
                     }
                     if let Some(ref alternatives) = fix.alternatives_considered {
                         if !alternatives.is_empty() {
-                            output.push_str(&format!("  Alternatives considered: {}\n", truncate_str(alternatives, 200)));
+                            output.push_str(&format!(
+                                "  Alternatives considered: {}\n",
+                                truncate_str(alternatives, 200)
+                            ));
                         }
                     }
                 }
@@ -125,12 +131,18 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                     output.push_str(&format!("- [{}] {}{}\n", label, desc, evidence));
                     if let Some(ref reasoning) = fix.reasoning {
                         if !reasoning.is_empty() {
-                            output.push_str(&format!("  Reasoning: {}\n", truncate_str(reasoning, 200)));
+                            output.push_str(&format!(
+                                "  Reasoning: {}\n",
+                                truncate_str(reasoning, 200)
+                            ));
                         }
                     }
                     if let Some(ref alternatives) = fix.alternatives_considered {
                         if !alternatives.is_empty() {
-                            output.push_str(&format!("  Alternatives considered: {}\n", truncate_str(alternatives, 200)));
+                            output.push_str(&format!(
+                                "  Alternatives considered: {}\n",
+                                truncate_str(alternatives, 200)
+                            ));
                         }
                     }
                 }
@@ -138,12 +150,18 @@ pub fn build_already_tried_summary(fixes: &[ReflectionFix]) -> String {
                     output.push_str(&format!("- [{}] {}\n", label, desc));
                     if let Some(ref reasoning) = fix.reasoning {
                         if !reasoning.is_empty() {
-                            output.push_str(&format!("  Reasoning: {}\n", truncate_str(reasoning, 200)));
+                            output.push_str(&format!(
+                                "  Reasoning: {}\n",
+                                truncate_str(reasoning, 200)
+                            ));
                         }
                     }
                     if let Some(ref alternatives) = fix.alternatives_considered {
                         if !alternatives.is_empty() {
-                            output.push_str(&format!("  Alternatives considered: {}\n", truncate_str(alternatives, 200)));
+                            output.push_str(&format!(
+                                "  Alternatives considered: {}\n",
+                                truncate_str(alternatives, 200)
+                            ));
                         }
                     }
                 }

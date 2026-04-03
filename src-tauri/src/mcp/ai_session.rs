@@ -244,7 +244,11 @@ pub async fn stop_ai_analysis(
 
         // Release URL locks and file registry entries
         state.app_state.url_lock_manager.release_all(&task.id).await;
-        state.app_state.file_registry_manager.release_all(&task.id).await;
+        state
+            .app_state
+            .file_registry_manager
+            .release_all(&task.id)
+            .await;
 
         info!("MCP API: Stopped task run: {}", task.id);
     }
@@ -329,10 +333,7 @@ pub async fn has_running_ai_tasks_async() -> bool {
 
 /// Migrate JSONL logs to SQLite for a completed task run.
 /// This should be called after a task completes (success or failure) to persist logs.
-pub async fn migrate_logs_for_task(
-    task_id: &str,
-    workflow_name: Option<String>,
-) {
+pub async fn migrate_logs_for_task(task_id: &str, workflow_name: Option<String>) {
     // SQLite removed - no-op
 }
 

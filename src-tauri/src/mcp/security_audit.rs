@@ -96,7 +96,9 @@ async fn get_audit_events(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "success": false, "error": format!("Failed to query audit events: {}", e) })),
+            Json(
+                serde_json::json!({ "success": false, "error": format!("Failed to query audit events: {}", e) }),
+            ),
         ),
     }
 }
@@ -125,7 +127,9 @@ async fn get_audit_summary(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "success": false, "error": format!("Failed to get audit summary: {}", e) })),
+            Json(
+                serde_json::json!({ "success": false, "error": format!("Failed to get audit summary: {}", e) }),
+            ),
         ),
     }
 }
@@ -136,19 +140,16 @@ async fn cleanup_audit_events(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let days = params.older_than_days.unwrap_or(30);
 
-    match state
-        .app_state
-        .pg_db
-        .cleanup_old_audit_events(days)
-        .await
-    {
+    match state.app_state.pg_db.cleanup_old_audit_events(days).await {
         Ok(deleted) => (
             StatusCode::OK,
             Json(serde_json::json!({ "success": true, "deleted": deleted })),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "success": false, "error": format!("Failed to cleanup: {}", e) })),
+            Json(
+                serde_json::json!({ "success": false, "error": format!("Failed to cleanup: {}", e) }),
+            ),
         ),
     }
 }

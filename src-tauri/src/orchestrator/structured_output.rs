@@ -205,8 +205,7 @@ impl WorkerOutput {
                 StructuredSignal::Continue => {}
                 // RequestContext and RecordStore are handled by BrainActorOrchestrator,
                 // not the legacy signal conversion path.
-                StructuredSignal::RequestContext { .. }
-                | StructuredSignal::RecordStore { .. } => {}
+                StructuredSignal::RequestContext { .. } | StructuredSignal::RecordStore { .. } => {}
             }
         }
         None
@@ -835,7 +834,8 @@ pub fn worker_output_instructions() -> String {
     // Append hand-written guidance and example that the schema generator
     // does not produce — these give the AI concrete signal semantics and
     // a full example to imitate.
-    instructions.push_str(r#"
+    instructions.push_str(
+        r#"
 ### Signals
 
 Use signals to communicate with the orchestrator:
@@ -863,7 +863,8 @@ If neither applies, leave `signals` empty to continue working.
   "progress_estimate": 1.0
 }
 ```
-"#);
+"#,
+    );
 
     instructions
 }

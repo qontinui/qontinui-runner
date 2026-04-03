@@ -102,8 +102,7 @@ async fn list_decisions_handler(
         pg.list_decisions_by_category(category, query.max_results)
             .await
     } else if let Some(ref scale) = query.scale {
-        pg.list_decisions_by_scale(scale, query.max_results)
-            .await
+        pg.list_decisions_by_scale(scale, query.max_results).await
     } else {
         pg.list_decisions(query.max_results).await
     }
@@ -167,7 +166,9 @@ async fn update_decision_handler(
         )
     })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "updated": updated }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "updated": updated }),
+    )))
 }
 
 async fn delete_decision_handler(
@@ -183,7 +184,9 @@ async fn delete_decision_handler(
         )
     })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "deleted": deleted }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "deleted": deleted }),
+    )))
 }
 
 async fn update_status_handler(
@@ -193,14 +196,19 @@ async fn update_status_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
 
-    let updated = pg.update_decision_status(&id, &input.status).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to update status: {}", e))),
-        )
-    })?;
+    let updated = pg
+        .update_decision_status(&id, &input.status)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update status: {}", e))),
+            )
+        })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "updated": updated }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "updated": updated }),
+    )))
 }
 
 async fn supersede_handler(
@@ -210,14 +218,19 @@ async fn supersede_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg = &state.app_state.pg_db;
 
-    let updated = pg.supersede_decision(&id, &input.superseded_by).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to supersede decision: {}", e))),
-        )
-    })?;
+    let updated = pg
+        .supersede_decision(&id, &input.superseded_by)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to supersede decision: {}", e))),
+            )
+        })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "superseded": updated }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "superseded": updated }),
+    )))
 }
 
 // ============================================================================
@@ -309,7 +322,9 @@ async fn update_concept_handler(
         )
     })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "updated": updated }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "updated": updated }),
+    )))
 }
 
 async fn delete_concept_handler(
@@ -325,5 +340,7 @@ async fn delete_concept_handler(
         )
     })?;
 
-    Ok(Json(ApiResponse::success(serde_json::json!({ "deleted": deleted }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "deleted": deleted }),
+    )))
 }

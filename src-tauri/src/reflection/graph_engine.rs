@@ -65,7 +65,12 @@ impl KnowledgeGraph {
 
     /// Add an edge between two nodes looked up by their string keys.
     /// Returns `false` if either endpoint is missing from the graph.
-    pub(crate) fn add_edge_by_key(&mut self, from_key: &str, to_key: &str, edge: GraphEdge) -> bool {
+    pub(crate) fn add_edge_by_key(
+        &mut self,
+        from_key: &str,
+        to_key: &str,
+        edge: GraphEdge,
+    ) -> bool {
         let from_idx = match self.node_index.get(from_key) {
             Some(&idx) => idx,
             None => return false,
@@ -82,52 +87,31 @@ impl KnowledgeGraph {
     // Private loaders — Nodes
     // =========================================================================
 
-    fn load_workflows(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_workflows(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_workflow_versions(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_workflow_versions(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_task_runs(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_task_runs(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_findings(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_findings(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_fixes(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_fixes(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_errors(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_errors(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_components(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_components(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
@@ -135,33 +119,21 @@ impl KnowledgeGraph {
         Err("SQLite removed".to_string())
     }
 
-    fn load_patterns(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_patterns(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_knowledge(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_knowledge(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
-    fn load_step_defs(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_step_defs(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// Load UI Bridge elements that were interacted with during automation.
     /// Capped at 100 elements per workflow to respect memory budgets.
-    fn load_ui_elements(
-        &mut self,
-        _workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn load_ui_elements(&mut self, _workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
@@ -170,17 +142,13 @@ impl KnowledgeGraph {
     /// Each skill becomes a Skill node with properties for category, source,
     /// usage_count, version, and approval_status. Skills with source="auto"
     /// were procedurally generated from cross-run learning.
-    fn load_skills(
-        &mut self,
-    ) -> Result<(), String> {
+    fn load_skills(&mut self) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// Link skills to task runs, findings, and components based on skill_origin
     /// data stored in step provenance and fix applications.
-    fn link_skills(
-        &mut self,
-    ) -> Result<(), String> {
+    fn link_skills(&mut self) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
@@ -217,10 +185,7 @@ impl KnowledgeGraph {
     ///
     /// Must be called after load_observations_from_pg and after task_run/workflow
     /// nodes have been loaded.
-    pub fn link_observations(
-        &mut self,
-        observations: &[crate::database::types::Observation],
-    ) {
+    pub fn link_observations(&mut self, observations: &[crate::database::types::Observation]) {
         for obs in observations {
             let obs_key = format!("observation:{}", obs.id);
 
@@ -230,8 +195,7 @@ impl KnowledgeGraph {
                 self.add_edge_by_key(
                     &obs_key,
                     &tr_key,
-                    GraphEdge::new(GraphEdgeKind::LearnedFrom)
-                        .with_label(&obs.observation_type),
+                    GraphEdge::new(GraphEdgeKind::LearnedFrom).with_label(&obs.observation_type),
                 );
             }
 
@@ -241,8 +205,7 @@ impl KnowledgeGraph {
                 self.add_edge_by_key(
                     &wf_key,
                     &obs_key,
-                    GraphEdge::new(GraphEdgeKind::InformedBy)
-                        .with_label(&obs.observation_type),
+                    GraphEdge::new(GraphEdgeKind::InformedBy).with_label(&obs.observation_type),
                 );
             }
 
@@ -264,10 +227,7 @@ impl KnowledgeGraph {
     }
 
     /// Link task runs to UI elements via InteractedWith edges.
-    fn link_ui_interactions(
-        &mut self,
-        _workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_ui_interactions(&mut self, _workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
@@ -349,7 +309,11 @@ impl KnowledgeGraph {
     pub fn score_ui_fix_effectiveness(&self) -> Vec<(String, f64, u32, u32)> {
         let mut scores: Vec<(String, f64, u32, u32)> = Vec::new();
 
-        for (key, idx) in self.node_index.iter().filter(|(k, _)| k.starts_with("fix:")) {
+        for (key, idx) in self
+            .node_index
+            .iter()
+            .filter(|(k, _)| k.starts_with("fix:"))
+        {
             let _ = key;
             let mut resolved = 0u32;
             let mut regressions = 0u32;
@@ -366,8 +330,7 @@ impl KnowledgeGraph {
 
             if total > 0 {
                 let node = &self.graph[*idx];
-                let score =
-                    (resolved as f64 * 2.0 - regressions as f64 * 3.0) / total as f64;
+                let score = (resolved as f64 * 2.0 - regressions as f64 * 3.0) / total as f64;
                 scores.push((node.key.clone(), score, resolved, regressions));
             }
         }
@@ -382,83 +345,53 @@ impl KnowledgeGraph {
     // =========================================================================
 
     /// task_runs.workflow_name → BelongsTo → workflow
-    fn link_task_runs_to_workflows(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_task_runs_to_workflows(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// task_run_findings.task_run_id → DetectedDuring → task_run
-    fn link_findings_to_task_runs(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_findings_to_task_runs(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// reflection_fixes.source_finding_id → Caused (finding → fix)
     /// reflection_fixes where effective → Resolved (fix → finding)
-    fn link_fixes_to_findings(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_fixes_to_findings(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// causal_events → Caused / Resolved edges based on relationship type
-    fn link_causal_events(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_causal_events(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// workflow_versions parent → EvolvedFrom, generation_task_run_id → GeneratedBy
-    fn link_workflow_versions(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_workflow_versions(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// step_provenance → BuiltBy (step → pipeline_agent)
-    fn link_step_provenance(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_step_provenance(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// step_finding_links → DetectedDuring (step → finding)
-    fn link_step_finding_links(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_step_finding_links(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// rule_influence_log → InfluencedBy (rule → workflow)
-    fn link_rule_influence(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_rule_influence(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// component_relationships → ImpactsComponent
-    fn link_component_relationships(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_component_relationships(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
     /// fix_applications → AppliedIn (fix → task_run)
-    fn link_fix_applications(
-        &mut self,
-        workflow_name: Option<&str>,
-    ) -> Result<(), String> {
+    fn link_fix_applications(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())
     }
 
@@ -487,10 +420,7 @@ impl KnowledgeGraph {
 
     /// Ingest a single task run and its related entities into the graph.
     /// Returns the count of new nodes added.
-    pub fn ingest_task_run(
-        &mut self,
-        task_run_id: &str,
-    ) -> Result<u32, String> {
+    pub fn ingest_task_run(&mut self, task_run_id: &str) -> Result<u32, String> {
         Err("SQLite removed".to_string())
     }
 
@@ -552,12 +482,7 @@ impl KnowledgeGraph {
     // =========================================================================
 
     /// BFS to find all paths (up to 10) between two nodes, bounded by max_depth.
-    pub fn find_paths(
-        &self,
-        from_key: &str,
-        to_key: &str,
-        max_depth: u32,
-    ) -> Vec<GraphPath> {
+    pub fn find_paths(&self, from_key: &str, to_key: &str, max_depth: u32) -> Vec<GraphPath> {
         let from_idx = match self.node_index.get(from_key) {
             Some(&idx) => idx,
             None => return vec![],
@@ -853,8 +778,7 @@ impl KnowledgeGraph {
                         continue;
                     }
 
-                    let is_other_run =
-                        run_indices.contains(&neighbor) && neighbor != start_idx;
+                    let is_other_run = run_indices.contains(&neighbor) && neighbor != start_idx;
                     let now_crossed = crossed_run || is_other_run;
 
                     let mut new_path = path.clone();
@@ -918,8 +842,7 @@ impl KnowledgeGraph {
             }
 
             let score = if total_edges > 0 {
-                (resolved_count as f64 * 2.0 - regression_count as f64 * 3.0)
-                    / total_edges as f64
+                (resolved_count as f64 * 2.0 - regression_count as f64 * 3.0) / total_edges as f64
             } else {
                 0.0
             };
@@ -941,8 +864,7 @@ impl KnowledgeGraph {
         self.graph
             .node_weights()
             .filter(|node| {
-                node.label.to_lowercase().contains(&q)
-                    || node.entity_id.to_lowercase().contains(&q)
+                node.label.to_lowercase().contains(&q) || node.entity_id.to_lowercase().contains(&q)
             })
             .take(limit)
             .collect()
@@ -954,21 +876,15 @@ impl KnowledgeGraph {
 
     /// For a fix node, find other fix nodes that share neighbors (Jaccard similarity
     /// on neighbor sets). Returns fixes with similarity >= min_similarity.
-    pub fn find_similar_fixes(
-        &self,
-        fix_key: &str,
-        min_similarity: f64,
-    ) -> Vec<(String, f64)> {
+    pub fn find_similar_fixes(&self, fix_key: &str, min_similarity: f64) -> Vec<(String, f64)> {
         let &fix_idx = match self.node_index.get(fix_key) {
             Some(idx) => idx,
             None => return vec![],
         };
 
         // Collect the neighbor set for the target fix (both directions)
-        let target_neighbors: HashSet<NodeIndex> = self
-            .graph
-            .neighbors_undirected(fix_idx)
-            .collect();
+        let target_neighbors: HashSet<NodeIndex> =
+            self.graph.neighbors_undirected(fix_idx).collect();
 
         if target_neighbors.is_empty() {
             return vec![];
@@ -985,10 +901,8 @@ impl KnowledgeGraph {
                 continue;
             }
 
-            let other_neighbors: HashSet<NodeIndex> = self
-                .graph
-                .neighbors_undirected(idx)
-                .collect();
+            let other_neighbors: HashSet<NodeIndex> =
+                self.graph.neighbors_undirected(idx).collect();
 
             if other_neighbors.is_empty() {
                 continue;
@@ -1137,21 +1051,34 @@ mod tests {
         kg.get_or_insert_node(node);
 
         // Both missing
-        let result = kg.add_edge_by_key("bogus:1", "bogus:2", GraphEdge::new(GraphEdgeKind::Caused));
+        let result =
+            kg.add_edge_by_key("bogus:1", "bogus:2", GraphEdge::new(GraphEdgeKind::Caused));
         assert!(!result, "Should return false when both nodes missing");
 
         // From exists, to missing
-        let result = kg.add_edge_by_key("workflow:wf-1", "bogus:2", GraphEdge::new(GraphEdgeKind::Caused));
+        let result = kg.add_edge_by_key(
+            "workflow:wf-1",
+            "bogus:2",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
         assert!(!result, "Should return false when target node missing");
 
         // From missing, to exists
-        let result = kg.add_edge_by_key("bogus:1", "workflow:wf-1", GraphEdge::new(GraphEdgeKind::Caused));
+        let result = kg.add_edge_by_key(
+            "bogus:1",
+            "workflow:wf-1",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
         assert!(!result, "Should return false when source node missing");
 
         // Both exist
         let node2 = GraphNode::new(GraphNodeKind::Fix, "fix-1", "A Fix");
         kg.get_or_insert_node(node2);
-        let result = kg.add_edge_by_key("workflow:wf-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+        let result = kg.add_edge_by_key(
+            "workflow:wf-1",
+            "fix:fix-1",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
         assert!(result, "Should return true when both nodes exist");
         assert_eq!(kg.graph.edge_count(), 1);
     }
@@ -1171,8 +1098,16 @@ mod tests {
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding1"));
 
         // Add 2 edges
-        kg.add_edge_by_key("finding:f-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
-        kg.add_edge_by_key("fix:fix-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "finding:f-1",
+            "fix:fix-1",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
+        kg.add_edge_by_key(
+            "fix:fix-1",
+            "finding:f-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         let summary = kg.summary();
         assert_eq!(summary.total_nodes, 4);
@@ -1187,9 +1122,21 @@ mod tests {
     #[test]
     fn test_search_nodes() {
         let mut kg = KnowledgeGraph::new(None);
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "error in login flow"));
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "timeout in API call"));
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "fix for login error"));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-1",
+            "error in login flow",
+        ));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-2",
+            "timeout in API call",
+        ));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Fix,
+            "fix-1",
+            "fix for login error",
+        ));
 
         let results = kg.search_nodes("login", 10);
         assert_eq!(results.len(), 2);
@@ -1202,8 +1149,16 @@ mod tests {
     #[test]
     fn test_search_nodes_case_insensitive() {
         let mut kg = KnowledgeGraph::new(None);
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "error in login flow"));
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "timeout issue"));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-1",
+            "error in login flow",
+        ));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-2",
+            "timeout issue",
+        ));
 
         // Search uppercase "ERROR" should match lowercase "error"
         let results = kg.search_nodes("ERROR", 10);
@@ -1216,7 +1171,11 @@ mod tests {
         let mut kg = KnowledgeGraph::new(None);
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Fix"));
-        kg.add_edge_by_key("finding:f-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key(
+            "finding:f-1",
+            "fix:fix-1",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
 
         let paths = kg.find_paths("finding:f-1", "fix:fix-1", 5);
         assert_eq!(paths.len(), 1);
@@ -1247,17 +1206,36 @@ mod tests {
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "e", "E"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "f", "F"));
 
-        kg.add_edge_by_key("finding:a", "finding:b", GraphEdge::new(GraphEdgeKind::Caused));
-        kg.add_edge_by_key("finding:b", "finding:c", GraphEdge::new(GraphEdgeKind::Caused));
-        kg.add_edge_by_key("finding:c", "finding:d", GraphEdge::new(GraphEdgeKind::Caused));
-        kg.add_edge_by_key("finding:d", "finding:e", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key(
+            "finding:a",
+            "finding:b",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
+        kg.add_edge_by_key(
+            "finding:b",
+            "finding:c",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
+        kg.add_edge_by_key(
+            "finding:c",
+            "finding:d",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
+        kg.add_edge_by_key(
+            "finding:d",
+            "finding:e",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
         kg.add_edge_by_key("finding:e", "fix:f", GraphEdge::new(GraphEdgeKind::Caused));
 
         // Path exists at depth 5 but we limit to 3 — the BFS expands up to
         // max_depth+1 nodes in the path before checking the target, so
         // max_depth=3 can reach at most 4 edges. 5 edges should be unreachable.
         let paths = kg.find_paths("finding:a", "fix:f", 3);
-        assert!(paths.is_empty(), "Path at depth 5 should not be found with max_depth=3");
+        assert!(
+            paths.is_empty(),
+            "Path at depth 5 should not be found with max_depth=3"
+        );
 
         // With depth 5, it should be found
         let paths = kg.find_paths("finding:a", "fix:f", 5);
@@ -1279,14 +1257,32 @@ mod tests {
         kg.get_or_insert_node(n3);
 
         // Outgoing from center
-        kg.add_edge_by_key("fix:fix-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
-        kg.add_edge_by_key("fix:fix-1", "finding:f-2", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-1",
+            "finding:f-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
+        kg.add_edge_by_key(
+            "fix:fix-1",
+            "finding:f-2",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
         // Incoming to center
-        kg.add_edge_by_key("task_run:run-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::AppliedIn));
+        kg.add_edge_by_key(
+            "task_run:run-1",
+            "fix:fix-1",
+            GraphEdge::new(GraphEdgeKind::AppliedIn),
+        );
 
-        let hood = kg.neighborhood("fix:fix-1", 1).expect("Should find neighborhood");
+        let hood = kg
+            .neighborhood("fix:fix-1", 1)
+            .expect("Should find neighborhood");
         assert_eq!(hood.center.entity_id, "fix-1");
-        assert_eq!(hood.neighbors.len(), 3, "Should have 3 neighbors at depth 1");
+        assert_eq!(
+            hood.neighbors.len(),
+            3,
+            "Should have 3 neighbors at depth 1"
+        );
 
         let neighbor_ids: HashSet<String> = hood
             .neighbors
@@ -1306,8 +1302,16 @@ mod tests {
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "b", "B"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "c", "C"));
 
-        kg.add_edge_by_key("finding:a", "finding:b", GraphEdge::new(GraphEdgeKind::Caused));
-        kg.add_edge_by_key("finding:b", "finding:c", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key(
+            "finding:a",
+            "finding:b",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
+        kg.add_edge_by_key(
+            "finding:b",
+            "finding:c",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
 
         // depth=1 from A should only reach B
         let hood1 = kg.neighborhood("finding:a", 1).unwrap();
@@ -1346,15 +1350,30 @@ mod tests {
         // Tracing root causes from fix should find error at the root.
         let mut kg = KnowledgeGraph::new(None);
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Error, "err-1", "Root Error"));
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Intermediate Finding"));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-1",
+            "Intermediate Finding",
+        ));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Leaf Fix"));
 
         // error caused finding, finding caused fix
-        kg.add_edge_by_key("error:err-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Caused));
-        kg.add_edge_by_key("finding:f-1", "fix:fix-1", GraphEdge::new(GraphEdgeKind::Caused));
+        kg.add_edge_by_key(
+            "error:err-1",
+            "finding:f-1",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
+        kg.add_edge_by_key(
+            "finding:f-1",
+            "fix:fix-1",
+            GraphEdge::new(GraphEdgeKind::Caused),
+        );
 
         let traces = kg.trace_root_causes("fix:fix-1", 5);
-        assert!(!traces.is_empty(), "Should find at least one root cause path");
+        assert!(
+            !traces.is_empty(),
+            "Should find at least one root cause path"
+        );
 
         // The path should go from root (error) to the fix
         let first = &traces[0];
@@ -1368,9 +1387,17 @@ mod tests {
         // Tracing impact from fix should find finding.
         let mut kg = KnowledgeGraph::new(None);
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-1", "Applied Fix"));
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Resolved Finding"));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-1",
+            "Resolved Finding",
+        ));
 
-        kg.add_edge_by_key("fix:fix-1", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-1",
+            "finding:f-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         let traces = kg.trace_impact("fix:fix-1", 5);
         assert_eq!(traces.len(), 1);
@@ -1389,13 +1416,25 @@ mod tests {
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-good", "Good Fix"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "F1"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "F2"));
-        kg.add_edge_by_key("fix:fix-good", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
-        kg.add_edge_by_key("fix:fix-good", "finding:f-2", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-good",
+            "finding:f-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
+        kg.add_edge_by_key(
+            "fix:fix-good",
+            "finding:f-2",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         // fix-bad: 0 Resolved edges, just 1 BelongsTo (non-scoring)
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-bad", "Bad Fix"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::TaskRun, "run-1", "Run"));
-        kg.add_edge_by_key("fix:fix-bad", "task_run:run-1", GraphEdge::new(GraphEdgeKind::AppliedIn));
+        kg.add_edge_by_key(
+            "fix:fix-bad",
+            "task_run:run-1",
+            GraphEdge::new(GraphEdgeKind::AppliedIn),
+        );
 
         let rankings = kg.rank_effectiveness("fix");
         assert_eq!(rankings.len(), 2);
@@ -1419,21 +1458,49 @@ mod tests {
         let mut kg = KnowledgeGraph::new(None);
 
         // Shared neighbors
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-shared-1", "Shared1"));
-        kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-shared-2", "Shared2"));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-shared-1",
+            "Shared1",
+        ));
+        kg.get_or_insert_node(GraphNode::new(
+            GraphNodeKind::Finding,
+            "f-shared-2",
+            "Shared2",
+        ));
         // Unique neighbor
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-unique", "Unique"));
 
         // fix-a connects to shared-1, shared-2, unique (3 neighbors)
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-a", "Fix A"));
-        kg.add_edge_by_key("fix:fix-a", "finding:f-shared-1", GraphEdge::new(GraphEdgeKind::Resolved));
-        kg.add_edge_by_key("fix:fix-a", "finding:f-shared-2", GraphEdge::new(GraphEdgeKind::Resolved));
-        kg.add_edge_by_key("fix:fix-a", "finding:f-unique", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-a",
+            "finding:f-shared-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
+        kg.add_edge_by_key(
+            "fix:fix-a",
+            "finding:f-shared-2",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
+        kg.add_edge_by_key(
+            "fix:fix-a",
+            "finding:f-unique",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         // fix-b connects to shared-1, shared-2 (2 neighbors, both shared)
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-b", "Fix B"));
-        kg.add_edge_by_key("fix:fix-b", "finding:f-shared-1", GraphEdge::new(GraphEdgeKind::Resolved));
-        kg.add_edge_by_key("fix:fix-b", "finding:f-shared-2", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-b",
+            "finding:f-shared-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
+        kg.add_edge_by_key(
+            "fix:fix-b",
+            "finding:f-shared-2",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         // Jaccard(fix-a, fix-b) = |{shared1, shared2}| / |{shared1, shared2, unique}| = 2/3 ≈ 0.667
         let similar = kg.find_similar_fixes("fix:fix-a", 0.5);
@@ -1453,12 +1520,20 @@ mod tests {
         // fix-a has its own neighbors
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-a", "Fix A"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-1", "Finding 1"));
-        kg.add_edge_by_key("fix:fix-a", "finding:f-1", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-a",
+            "finding:f-1",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         // fix-b has completely different neighbors
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Fix, "fix-b", "Fix B"));
         kg.get_or_insert_node(GraphNode::new(GraphNodeKind::Finding, "f-2", "Finding 2"));
-        kg.add_edge_by_key("fix:fix-b", "finding:f-2", GraphEdge::new(GraphEdgeKind::Resolved));
+        kg.add_edge_by_key(
+            "fix:fix-b",
+            "finding:f-2",
+            GraphEdge::new(GraphEdgeKind::Resolved),
+        );
 
         // Jaccard = 0/2 = 0.0, so nothing should meet min_similarity 0.1
         let similar = kg.find_similar_fixes("fix:fix-a", 0.1);

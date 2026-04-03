@@ -17,10 +17,16 @@ impl LoopController {
     /// parse meta-optimizer recommendations, and check chain triggers.
     pub(crate) async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
         // Release advisory file registry entries on completion
-        self.app_state.file_registry_manager.release_all(execution_id).await;
+        self.app_state
+            .file_registry_manager
+            .release_all(execution_id)
+            .await;
 
         if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
-            error!("Failed to mark task {} as completed (PG): {}", execution_id, e);
+            error!(
+                "Failed to mark task {} as completed (PG): {}",
+                execution_id, e
+            );
         } else {
             info!("Marked task {} as COMPLETED", execution_id);
             // Broadcast task-run-update to both Tauri + WebSocket
@@ -75,7 +81,9 @@ impl LoopController {
                 let wf_name = pg2.get_workflow_name_for_task_run(&exec_id2).await.ok();
                 if let Some(wf_name) = wf_name {
                     if let Ok(metrics) = pg2.compute_convergence_score(&wf_name, "workflow").await {
-                        let _ = pg2.store_convergence_snapshot(&wf_name, None, "workflow", &metrics).await;
+                        let _ = pg2
+                            .store_convergence_snapshot(&wf_name, None, "workflow", &metrics)
+                            .await;
                     }
                 }
             });
@@ -104,17 +112,24 @@ impl LoopController {
                     }
 
                     // Look up the optimizer_run record by task_run_id (PG)
-                    let (optimizer_run_id, optimizer_type) = match pg.get_optimizer_run_by_task_run_id(&eid).await {
-                        Ok(Some((id, ot))) => (id, ot),
-                        Ok(None) => {
-                            warn!("Could not find optimizer run for meta-optimizer task {}", eid);
-                            return;
-                        }
-                        Err(e) => {
-                            warn!("Could not find optimizer run for meta-optimizer task {}: {}", eid, e);
-                            return;
-                        }
-                    };
+                    let (optimizer_run_id, optimizer_type) =
+                        match pg.get_optimizer_run_by_task_run_id(&eid).await {
+                            Ok(Some((id, ot))) => (id, ot),
+                            Ok(None) => {
+                                warn!(
+                                    "Could not find optimizer run for meta-optimizer task {}",
+                                    eid
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Could not find optimizer run for meta-optimizer task {}: {}",
+                                    eid, e
+                                );
+                                return;
+                            }
+                        };
 
                     // Parse recommendations from the output
                     let output = &task_run.output_log;
@@ -200,9 +215,17 @@ impl LoopController {
         workflow_id: Option<&str>,
     ) {
         // Release advisory file registry entries on failure
-        self.app_state.file_registry_manager.release_all(execution_id).await;
+        self.app_state
+            .file_registry_manager
+            .release_all(execution_id)
+            .await;
 
-        if let Err(e) = self.app_state.pg_db.fail_task_run(execution_id, reason).await {
+        if let Err(e) = self
+            .app_state
+            .pg_db
+            .fail_task_run(execution_id, reason)
+            .await
+        {
             error!("Failed to mark task {} as failed (PG): {}", execution_id, e);
         } else {
             info!("Marked task {} as FAILED: {}", execution_id, reason);
@@ -313,11 +336,12 @@ impl LoopController {
                 execution_id
             );
 
-            match self.app_state.pg_db.mark_resolved_by_task(
-                *error_id,
-                execution_id,
-                Some(&resolution_note),
-            ).await {
+            match self
+                .app_state
+                .pg_db
+                .mark_resolved_by_task(*error_id, execution_id, Some(&resolution_note))
+                .await
+            {
                 Ok(_) => {
                     resolved_count += 1;
                 }
@@ -344,10 +368,12 @@ impl LoopController {
     /// double-processed by the WHERE clause.
     pub(crate) async fn resolve_workflow_scoped_errors(&self, execution_id: &str) {
         // PG: resolve_errors_by_task_run
-        match self.app_state.pg_db.resolve_errors_by_task_run(
-            execution_id,
-            execution_id,
-        ).await {
+        match self
+            .app_state
+            .pg_db
+            .resolve_errors_by_task_run(execution_id, execution_id)
+            .await
+        {
             Ok(count) if count > 0 => {
                 info!(
                     "Auto-resolved {} workflow-scoped errors for task {}",
@@ -476,16 +502,16 @@ impl LoopController {
 /// - Task outcome (success/failure, duration, iteration count)
 /// - Key findings from verification phases
 /// - Error patterns encountered
-async fn auto_capture_observations(
-    pg: &crate::database::pg::PgDb,
-    execution_id: &str,
-) {
+async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id: &str) {
     let task_run = match pg.get_task_run(execution_id).await.ok().flatten() {
         Some(tr) => tr,
         None => return,
     };
 
-    let workflow_name = task_run.workflow_name.as_deref().unwrap_or(&task_run.task_name);
+    let workflow_name = task_run
+        .workflow_name
+        .as_deref()
+        .unwrap_or(&task_run.task_name);
     let status = &task_run.status;
     let iterations = task_run.sessions_count;
 
@@ -503,7 +529,11 @@ async fn auto_capture_observations(
 
     let title = format!(
         "Task {}: {} ({} iterations)",
-        if status == "completed" { "succeeded" } else { "failed" },
+        if status == "completed" {
+            "succeeded"
+        } else {
+            "failed"
+        },
         workflow_name,
         iterations
     );
@@ -531,11 +561,7 @@ async fn auto_capture_observations(
 
     // Extract findings from task knowledge (PG)
     let findings = pg
-        .get_task_knowledge_by_categories(
-            execution_id,
-            &["Finding", "RootCause", "Solution"],
-            10,
-        )
+        .get_task_knowledge_by_categories(execution_id, &["Finding", "RootCause", "Solution"], 10)
         .await
         .unwrap_or_default();
 
@@ -549,7 +575,10 @@ async fn auto_capture_observations(
     }
 
     let content = content_lines.join("\n");
-    let topic_key = format!("task-outcome/{}", workflow_name.to_lowercase().replace(' ', "-"));
+    let topic_key = format!(
+        "task-outcome/{}",
+        workflow_name.to_lowercase().replace(' ', "-")
+    );
 
     let input = crate::database::types::CreateObservationInput {
         title,

@@ -21,32 +21,24 @@ const MIN_SAMPLES_FOR_BASELINE: i64 = 20;
 /// Uses P25 (25th percentile) of iterations and step_count from successful runs.
 /// P25 is conservative — it sets the baseline at the efficient end, so runs
 /// taking more than this are penalized by step_efficiency scoring.
-pub fn compute_step_baseline(
-    workflow_id: Option<&str>,
-) -> Result<Option<StepBaseline>, String> {
+pub fn compute_step_baseline(workflow_id: Option<&str>) -> Result<Option<StepBaseline>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Compute and persist tool baselines for a workflow (or global if workflow_id is None).
 ///
 /// Takes the union of all tools_used across successful runs.
-pub fn compute_tool_baseline(
-    workflow_id: Option<&str>,
-) -> Result<Option<ToolBaseline>, String> {
+pub fn compute_tool_baseline(workflow_id: Option<&str>) -> Result<Option<ToolBaseline>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Load a previously persisted step baseline from the DB.
-pub fn load_step_baseline(
-    workflow_id: Option<&str>,
-) -> Result<Option<StepBaseline>, String> {
+pub fn load_step_baseline(workflow_id: Option<&str>) -> Result<Option<StepBaseline>, String> {
     Err("SQLite removed".to_string())
 }
 
 /// Load a previously persisted tool baseline from the DB.
-pub fn load_tool_baseline(
-    workflow_id: Option<&str>,
-) -> Result<Option<ToolBaseline>, String> {
+pub fn load_tool_baseline(workflow_id: Option<&str>) -> Result<Option<ToolBaseline>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -60,16 +52,12 @@ pub fn recompute_all_baselines() -> Result<u32, String> {
 // ── Private helpers ─────────────────────────────────────────────────────
 
 /// Query iteration and step count data from successful runs.
-fn query_step_data(
-    workflow_id: Option<&str>,
-) -> Result<(Vec<f64>, Vec<f64>, i64), String> {
+fn query_step_data(workflow_id: Option<&str>) -> Result<(Vec<f64>, Vec<f64>, i64), String> {
     Err("SQLite removed".to_string())
 }
 
 /// Query tools_used from successful runs.
-fn query_tool_data(
-    workflow_id: Option<&str>,
-) -> Result<(Vec<String>, i64), String> {
+fn query_tool_data(workflow_id: Option<&str>) -> Result<(Vec<String>, i64), String> {
     Err("SQLite removed".to_string())
 }
 

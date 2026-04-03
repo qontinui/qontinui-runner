@@ -361,8 +361,7 @@ pub async fn generate_task_summary(
 ) -> Result<SummaryResult, String> {
     info!("Generating summary for task run: {}", task_run_id);
 
-    let pg = PgDb::try_global()
-        .ok_or_else(|| "PgDb not initialized".to_string())?;
+    let pg = PgDb::try_global().ok_or_else(|| "PgDb not initialized".to_string())?;
 
     // Get the task run from the database
     let task = pg
@@ -374,10 +373,13 @@ pub async fn generate_task_summary(
     let is_failure = task.status == "failed" || task.status == "stopped";
 
     // Fetch findings for this task run
-    let findings = pg.get_findings_for_task(task_run_id).await.unwrap_or_else(|e| {
-        warn!("Failed to fetch findings for summary: {}", e);
-        Vec::new()
-    });
+    let findings = pg
+        .get_findings_for_task(task_run_id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to fetch findings for summary: {}", e);
+            Vec::new()
+        });
     let findings_section = format_findings_for_summary(&findings);
 
     // Build structured workflow metadata (verification results, transition history)

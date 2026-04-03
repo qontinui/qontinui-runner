@@ -21,7 +21,11 @@ impl PgDb {
         tab_id: Option<i32>,
         tags: &[String],
     ) -> Result<Recording, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -56,7 +60,11 @@ impl PgDb {
 
     /// Get a recording by ID.
     pub async fn get_recording(&self, id: &str) -> Result<Option<Recording>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let row = conn
             .query_opt(
@@ -77,7 +85,11 @@ impl PgDb {
 
     /// List all recordings, ordered by created_at DESC.
     pub async fn list_recordings(&self) -> Result<Vec<Recording>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let rows = conn
             .query(
@@ -93,12 +105,19 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG list_recordings: {}", e))?;
 
-        Ok(rows.iter().map(|r| Self::recording_row_to_struct(r)).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::recording_row_to_struct(r))
+            .collect())
     }
 
     /// Delete a recording by ID.
     pub async fn delete_recording(&self, id: &str) -> Result<bool, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
 
         let affected = conn
             .execute("DELETE FROM recordings WHERE id = $1", &[&id])
@@ -113,7 +132,9 @@ impl PgDb {
     fn recording_row_to_struct(row: &tokio_postgres::Row) -> Recording {
         let status_str: String = row.get(5);
         let browser_info_json: Option<String> = row.get(9);
-        let tags_json: String = row.get::<_, Option<String>>(11).unwrap_or_else(|| "[]".to_string());
+        let tags_json: String = row
+            .get::<_, Option<String>>(11)
+            .unwrap_or_else(|| "[]".to_string());
         let action_count: Option<i32> = row.get(4);
         let duration_ms_raw: Option<i32> = row.get(8);
 

@@ -205,11 +205,12 @@ pub async fn execute_triggered_workflow(
     if crate::restate::launch::should_use_restate(&restate_settings).await {
         match crate::restate::launch::build_workflow_input_from_loop_config(&loop_config) {
             Ok(input) => {
-                if let Err(e) = deps.app_state.pg_db.save_restate_workflow_execution(
-                    &execution_id,
-                    &execution_id,
-                    None,
-                ).await {
+                if let Err(e) = deps
+                    .app_state
+                    .pg_db
+                    .save_restate_workflow_execution(&execution_id, &execution_id, None)
+                    .await
+                {
                     tracing::error!("Failed to record Restate workflow: {}", e);
                 }
 
@@ -217,7 +218,9 @@ pub async fn execute_triggered_workflow(
                     &execution_id,
                     &input,
                     &restate_settings.ingress_url(),
-                ).await {
+                )
+                .await
+                {
                     tracing::error!("Restate launch failed, falling back to legacy: {}", e);
                 } else {
                     use_legacy = false;

@@ -75,9 +75,7 @@ pub struct ListKnowledgeQuery {
 // ============================================================================
 
 /// Load active knowledge entries for the given step types, ordered by priority DESC.
-pub fn load_knowledge_for_step_types(
-    step_types: &[&str],
-) -> Vec<StepTypeKnowledge> {
+pub fn load_knowledge_for_step_types(step_types: &[&str]) -> Vec<StepTypeKnowledge> {
     Vec::new()
 }
 
@@ -127,9 +125,7 @@ pub fn format_knowledge_as_markdown(entries: &[StepTypeKnowledge]) -> String {
 // ============================================================================
 
 /// List knowledge entries with optional filters.
-pub fn list_knowledge(
-    query: &ListKnowledgeQuery,
-) -> Result<Vec<StepTypeKnowledge>, String> {
+pub fn list_knowledge(query: &ListKnowledgeQuery) -> Result<Vec<StepTypeKnowledge>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -141,9 +137,7 @@ pub fn get_knowledge(id: &str) -> Result<Option<StepTypeKnowledge>, String> {
 /// Insert a new knowledge entry.
 /// If `source_fix_id` is provided and an entry with that source already exists, returns the
 /// existing entry instead of creating a duplicate.
-pub fn insert_knowledge(
-    input: &InsertKnowledgeInput,
-) -> Result<StepTypeKnowledge, String> {
+pub fn insert_knowledge(input: &InsertKnowledgeInput) -> Result<StepTypeKnowledge, String> {
     Err("SQLite removed".to_string())
 }
 

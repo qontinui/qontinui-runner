@@ -45,9 +45,7 @@ fn is_structural_fix_type(fix_type: &str) -> bool {
 ///
 /// Returns None if no verification data exists for the run (e.g., the run
 /// didn't have a verification phase or the table doesn't exist yet).
-fn get_verification_metrics(
-    task_run_id: &str,
-) -> Result<Option<VerificationMetrics>, String> {
+fn get_verification_metrics(task_run_id: &str) -> Result<Option<VerificationMetrics>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -123,9 +121,7 @@ fn evaluate_by_workflow_outcome(
 /// subsequent runs now provide enough signal to determine effectiveness.
 ///
 /// Called during the completion phase of each reflection run.
-pub fn evaluate_pending_fixes(
-    workflow_name: &str,
-) -> Result<Vec<EvaluationResult>, String> {
+pub fn evaluate_pending_fixes(workflow_name: &str) -> Result<Vec<EvaluationResult>, String> {
     Err("SQLite removed".to_string())
 }
 
@@ -226,13 +222,7 @@ mod tests {
     }
 
     /// Helper to insert verification results for a task run.
-    fn insert_verification(
-        id: &str,
-        task_run_id: &str,
-        iteration: u32,
-        total: u32,
-        passed: u32,
-    ) {
+    fn insert_verification(id: &str, task_run_id: &str, iteration: u32, total: u32, passed: u32) {
         // SQLite removed - no-op
     }
 

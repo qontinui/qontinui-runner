@@ -80,7 +80,10 @@ pub async fn sm_create_state(
     request: CreateSmStateRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<SmState, String> {
-    let state = app_state.pg_db.insert_sm_state(&config_id, &request).await?;
+    let state = app_state
+        .pg_db
+        .insert_sm_state(&config_id, &request)
+        .await?;
     info!("Created state: {} ({})", state.name, state.id);
     Ok(state)
 }
@@ -114,7 +117,10 @@ pub async fn sm_create_transition(
     request: CreateSmTransitionRequest,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<SmTransition, String> {
-    let transition = app_state.pg_db.insert_sm_transition(&config_id, &request).await?;
+    let transition = app_state
+        .pg_db
+        .insert_sm_transition(&config_id, &request)
+        .await?;
     info!(
         "Created transition: {} ({})",
         transition.name, transition.id
@@ -173,7 +179,10 @@ pub async fn sm_save_thumbnails(
     thumbnails: std::collections::HashMap<String, String>,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    let count = app_state.pg_db.save_sm_thumbnails(&config_id, &thumbnails).await?;
+    let count = app_state
+        .pg_db
+        .save_sm_thumbnails(&config_id, &thumbnails)
+        .await?;
     info!("Saved {} thumbnails for config {}", count, config_id);
     Ok(count)
 }
@@ -202,8 +211,13 @@ pub async fn sm_save_capture_screenshots(
 
     // Run on a blocking-compatible spawn since PNG->WebP is CPU-intensive.
     // The PG methods themselves are async, so we use spawn instead of spawn_blocking.
-    let count = pg_db.save_capture_screenshots(&config_id_clone, &screenshots).await?;
-    info!("Saved {} capture screenshots for config {}", count, config_id);
+    let count = pg_db
+        .save_capture_screenshots(&config_id_clone, &screenshots)
+        .await?;
+    info!(
+        "Saved {} capture screenshots for config {}",
+        count, config_id
+    );
     Ok(count)
 }
 
@@ -220,7 +234,10 @@ pub async fn sm_get_capture_screenshot_image(
     screenshot_id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    app_state.pg_db.get_capture_screenshot_image(&screenshot_id).await
+    app_state
+        .pg_db
+        .get_capture_screenshot_image(&screenshot_id)
+        .await
 }
 
 /// Move pending capture screenshots from a temporary config_id to the real config.
@@ -232,7 +249,10 @@ pub async fn sm_move_pending_screenshots(
     to_config_id: String,
     app_state: State<'_, Arc<AppState>>,
 ) -> Result<usize, String> {
-    app_state.pg_db.move_pending_screenshots(&from_config_id, &to_config_id).await
+    app_state
+        .pg_db
+        .move_pending_screenshots(&from_config_id, &to_config_id)
+        .await
 }
 
 /// Delete capture screenshots for a specific config_id.

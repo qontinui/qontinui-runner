@@ -112,19 +112,14 @@ pub async fn get_agent_trace_aggregates_handler(
 
     match tier {
         ContextTier::L0 => {
-            let summaries =
-                pipeline_traces::get_trace_summaries_l0(limit)
-                    .map_err(make_err)?;
+            let summaries = pipeline_traces::get_trace_summaries_l0(limit).map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(summaries).unwrap_or_default(),
             )))
         }
         ContextTier::L1 => {
-            let details = pipeline_traces::get_trace_details_l1(
-                query.agent_type.as_deref(),
-                limit,
-            )
-            .map_err(make_err)?;
+            let details = pipeline_traces::get_trace_details_l1(query.agent_type.as_deref(), limit)
+                .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
                 serde_json::to_value(details).unwrap_or_default(),
             )))
@@ -132,17 +127,13 @@ pub async fn get_agent_trace_aggregates_handler(
         ContextTier::L2 => {
             // If trace_id is provided, return a single full trace record
             if let Some(ref trace_id) = query.trace_id {
-                let trace =
-                    pipeline_traces::get_trace_full_l2(trace_id)
-                        .map_err(make_err)?;
+                let trace = pipeline_traces::get_trace_full_l2(trace_id).map_err(make_err)?;
                 Ok(Json(ApiResponse::success(
                     serde_json::to_value(trace).unwrap_or_default(),
                 )))
             } else {
-                let aggregates = pipeline_traces::get_agent_trace_aggregates(
-                    limit,
-                )
-                .map_err(make_err)?;
+                let aggregates =
+                    pipeline_traces::get_agent_trace_aggregates(limit).map_err(make_err)?;
                 Ok(Json(ApiResponse::success(
                     serde_json::to_value(aggregates).unwrap_or_default(),
                 )))
@@ -224,7 +215,9 @@ pub async fn get_optimizer_context_handler(
     let optimizer_type = query.optimizer_type.clone().unwrap_or_default();
     let is_pipeline = optimizer_type == "pipeline_prompt";
 
-    let context = state.app_state.pg_db
+    let context = state
+        .app_state
+        .pg_db
         .get_optimizer_context(is_pipeline)
         .await
         .map_err(|e| {
@@ -737,7 +730,11 @@ pub async fn get_learning_outcomes_handler(
             let details = state
                 .app_state
                 .pg_db
-                .get_learning_outcomes_l1(status.as_deref(), workflow_architecture.as_deref(), limit)
+                .get_learning_outcomes_l1(
+                    status.as_deref(),
+                    workflow_architecture.as_deref(),
+                    limit,
+                )
                 .await
                 .map_err(make_err)?;
             Ok(Json(ApiResponse::success(
@@ -748,7 +745,11 @@ pub async fn get_learning_outcomes_handler(
             let outcomes = state
                 .app_state
                 .pg_db
-                .get_learning_outcomes_l2(status.as_deref(), workflow_architecture.as_deref(), limit)
+                .get_learning_outcomes_l2(
+                    status.as_deref(),
+                    workflow_architecture.as_deref(),
+                    limit,
+                )
                 .await
                 .unwrap_or_default();
             Ok(Json(ApiResponse::success(
@@ -784,25 +785,37 @@ pub async fn get_generation_feedback_handler(
 
     match tier {
         ContextTier::L0 => {
-            let summaries = state.app_state.pg_db
+            let summaries = state
+                .app_state
+                .pg_db
                 .get_generation_feedback_l0(feedback_type.as_deref())
                 .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(summaries).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
         }
         ContextTier::L1 => {
-            let details = state.app_state.pg_db
+            let details = state
+                .app_state
+                .pg_db
                 .get_generation_feedback_l1(feedback_type.as_deref(), limit)
                 .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(details).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
         }
         ContextTier::L2 => {
-            let feedback = state.app_state.pg_db
+            let feedback = state
+                .app_state
+                .pg_db
                 .get_generation_feedback_l2(feedback_type.as_deref(), limit)
                 .await
                 .unwrap_or_default();
-            Ok(Json(ApiResponse::success(serde_json::to_value(feedback).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(feedback).unwrap_or_default(),
+            )))
         }
     }
 }
@@ -826,7 +839,9 @@ pub async fn get_autoresearch_campaigns_handler(
 ) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let limit = query.limit.unwrap_or(50) as i64;
 
-    let campaigns = state.app_state.pg_db
+    let campaigns = state
+        .app_state
+        .pg_db
         .get_autoresearch_campaigns_with_experiments(limit)
         .await
         .unwrap_or_default();
@@ -867,25 +882,37 @@ pub async fn get_reflection_fixes_handler(
 
     match tier {
         ContextTier::L0 => {
-            let summaries = state.app_state.pg_db
+            let summaries = state
+                .app_state
+                .pg_db
                 .get_reflection_fixes_l0(source_agent.as_deref())
                 .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(summaries).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(summaries).unwrap_or_default(),
+            )))
         }
         ContextTier::L1 => {
-            let details = state.app_state.pg_db
+            let details = state
+                .app_state
+                .pg_db
                 .get_reflection_fixes_l1(source_agent.as_deref(), limit)
                 .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(details).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(details).unwrap_or_default(),
+            )))
         }
         ContextTier::L2 => {
-            let fixes = state.app_state.pg_db
+            let fixes = state
+                .app_state
+                .pg_db
                 .get_reflection_fixes_l2(source_agent.as_deref(), limit)
                 .await
                 .map_err(make_err)?;
-            Ok(Json(ApiResponse::success(serde_json::to_value(fixes).unwrap_or_default())))
+            Ok(Json(ApiResponse::success(
+                serde_json::to_value(fixes).unwrap_or_default(),
+            )))
         }
     }
 }
@@ -901,13 +928,14 @@ pub async fn apply_recommendation_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    recommendations::apply_recommendation_with_side_effects(&state.app_state.pg_db, &id)
-        .map_err(|e| {
+    recommendations::apply_recommendation_with_side_effects(&state.app_state.pg_db, &id).map_err(
+        |e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to apply recommendation: {}", e))),
             )
-        })?;
+        },
+    )?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -999,7 +1027,6 @@ pub async fn get_iteration_history_handler(
 // Removed SQLite iteration history code — now served from PG.
 // The original dead code block has been deleted.
 // (Removed dead SQLite iteration_history code block)
-
 
 // ---------------------------------------------------------------------------
 // Eval spec handlers
@@ -1095,11 +1122,9 @@ async fn evaluate_recommendation_handler(
         )
     };
 
-    let result = crate::meta_optimizer::eval_runner::validate_recommendation(
-        &state.app_state.pg_db,
-        &id,
-    )
-    .map_err(make_err)?;
+    let result =
+        crate::meta_optimizer::eval_runner::validate_recommendation(&state.app_state.pg_db, &id)
+            .map_err(make_err)?;
 
     Ok(Json(ApiResponse::success(
         serde_json::to_value(result).unwrap_or_default(),
@@ -1139,22 +1164,20 @@ async fn evaluate_with_io_handler(
     };
 
     // Resolve the eval spec: either inline or by spec_id lookup.
-    let spec: crate::meta_optimizer::eval_spec::EvalSpec =
-        if let Some(spec_id) = body.eval_spec.get("spec_id").and_then(|v| v.as_str()) {
-            // Look up by ID
-            let specs = crate::meta_optimizer::eval_spec::list_eval_specs(
-                &state.app_state.pg_db,
-                None,
-            )
+    let spec: crate::meta_optimizer::eval_spec::EvalSpec = if let Some(spec_id) =
+        body.eval_spec.get("spec_id").and_then(|v| v.as_str())
+    {
+        // Look up by ID
+        let specs = crate::meta_optimizer::eval_spec::list_eval_specs(&state.app_state.pg_db, None)
             .map_err(make_err)?;
-            specs
-                .into_iter()
-                .find(|s| s.id == spec_id)
-                .ok_or_else(|| make_err(format!("Eval spec not found: {}", spec_id)))?
-        } else {
-            serde_json::from_value(body.eval_spec)
-                .map_err(|e| make_err(format!("Invalid eval spec: {}", e)))?
-        };
+        specs
+            .into_iter()
+            .find(|s| s.id == spec_id)
+            .ok_or_else(|| make_err(format!("Eval spec not found: {}", spec_id)))?
+    } else {
+        serde_json::from_value(body.eval_spec)
+            .map_err(|e| make_err(format!("Invalid eval spec: {}", e)))?
+    };
 
     // Build aggregate metrics for non-judge assertions
     let metrics = if let Some(ref agent) = spec.target_agent {
@@ -1168,17 +1191,19 @@ async fn evaluate_with_io_handler(
         )
         .ok()
         .flatten()
-        .map(|agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
-            success_rate: if agg.run_count > 0 {
-                agg.success_count as f64 / agg.run_count as f64
-            } else {
-                0.0
+        .map(
+            |agg| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
+                success_rate: if agg.run_count > 0 {
+                    agg.success_count as f64 / agg.run_count as f64
+                } else {
+                    0.0
+                },
+                mean_duration_ms: agg.avg_duration_ms,
+                mean_iterations: 0.0,
+                mean_cost_cents: agg.avg_cost_usd * 100.0,
+                trial_count: agg.run_count as u32,
             },
-            mean_duration_ms: agg.avg_duration_ms,
-            mean_iterations: 0.0,
-            mean_cost_cents: agg.avg_cost_usd * 100.0,
-            trial_count: agg.run_count as u32,
-        })
+        )
         .unwrap_or_else(|| crate::meta_optimizer::eval_spec::EvalAggregateMetrics {
             success_rate: 0.0,
             mean_duration_ms: 0.0,
@@ -1237,19 +1262,20 @@ async fn evaluate_with_io_handler(
 pub async fn get_canaries_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let canaries =
-        crate::meta_optimizer::canary::get_active_canaries(&state.app_state.pg_db)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to get canaries: {}", e))),
-                )
-            })?;
+    let canaries = crate::meta_optimizer::canary::get_active_canaries(&state.app_state.pg_db)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get canaries: {}", e))),
+            )
+        })?;
 
     // Enrich with recommendation metadata
     let mut enriched: Vec<serde_json::Value> = Vec::new();
     for c in &canaries {
-        let rec_info = state.app_state.pg_db
+        let rec_info = state
+            .app_state
+            .pg_db
             .get_recommendation_metadata(&c.recommendation_id)
             .await
             .ok()
@@ -1292,14 +1318,13 @@ pub async fn get_canary_history_handler(
         .and_then(|v| v.parse().ok())
         .unwrap_or(20u32);
 
-    let history =
-        crate::meta_optimizer::canary::get_canary_history(&state.app_state.pg_db, limit)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Failed to get canary history: {}", e))),
-                )
-            })?;
+    let history = crate::meta_optimizer::canary::get_canary_history(&state.app_state.pg_db, limit)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get canary history: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(
         serde_json::to_value(history).unwrap_or_default(),
@@ -1311,14 +1336,12 @@ pub async fn promote_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::meta_optimizer::canary::promote_canary(&state.app_state.pg_db, &id).map_err(
-        |e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to promote canary: {}", e))),
-            )
-        },
-    )?;
+    crate::meta_optimizer::canary::promote_canary(&state.app_state.pg_db, &id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to promote canary: {}", e))),
+        )
+    })?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -1327,14 +1350,12 @@ pub async fn rollback_canary_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::meta_optimizer::canary::rollback_canary(&state.app_state.pg_db, &id).map_err(
-        |e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to rollback canary: {}", e))),
-            )
-        },
-    )?;
+    crate::meta_optimizer::canary::rollback_canary(&state.app_state.pg_db, &id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to rollback canary: {}", e))),
+        )
+    })?;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -1378,13 +1399,12 @@ async fn get_prompt_optimization_status_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg_db = &state.app_state.pg_db;
 
-    let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
-    let evolution =
-        crate::meta_optimizer::prompt_evolution::get_evolution_history(pg_db, None, 50)
-            .unwrap_or_default();
+    let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let groups =
+        crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
+    let evolution = crate::meta_optimizer::prompt_evolution::get_evolution_history(pg_db, None, 50)
+        .unwrap_or_default();
 
     let active_canaries: Vec<_> = evolution
         .iter()
@@ -1409,10 +1429,10 @@ async fn get_prompt_group_metrics_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let pg_db = &state.app_state.pg_db;
 
-    let samples =
-        crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    let groups = crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
+    let samples = crate::meta_optimizer::prompt_extractor::extract_prompt_samples_pg(pg_db, 500)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
+    let groups =
+        crate::meta_optimizer::prompt_extractor::compute_group_metrics_with_db_pg(&samples, pg_db);
 
     Ok(Json(ApiResponse {
         success: true,
@@ -1581,7 +1601,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/meta-optimizer/prompt-evolution",
             get(get_prompt_evolution_handler),
         )
-        // Note: POST /prompt-optimization/trigger is handled via Tauri command
-        // `trigger_meta_optimizer` with optimizer_type="meta_prompt", not HTTP API,
-        // because launching workflows requires AppHandle and ConfigStorage.
+    // Note: POST /prompt-optimization/trigger is handled via Tauri command
+    // `trigger_meta_optimizer` with optimizer_type="meta_prompt", not HTTP API,
+    // because launching workflows requires AppHandle and ConfigStorage.
 }

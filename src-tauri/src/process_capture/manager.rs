@@ -588,10 +588,6 @@ impl ProcessCaptureManager {
 
 /// Attempt to connect to a managed process's UI Bridge SDK and cache its specs.
 /// This runs as a background task — failures are logged but not propagated.
-async fn auto_discover_specs(
-    port: u16,
-    process_name: &str,
-    app_handle: &tauri::AppHandle,
-) {
+async fn auto_discover_specs(port: u16, process_name: &str, app_handle: &tauri::AppHandle) {
     // SQLite removed - no-op
 }

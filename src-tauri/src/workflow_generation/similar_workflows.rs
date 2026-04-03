@@ -146,7 +146,11 @@ pub async fn find_similar_workflows_pg(
     category: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SimilarWorkflow>, String> {
-    let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    let conn = pg
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool error: {}", e))?;
 
     // Extract keywords from description for full-text search
     let search_terms = extract_search_terms(description);
@@ -172,7 +176,8 @@ pub async fn find_similar_workflows_pg(
                    ORDER BY rank DESC
                    LIMIT $3"#,
                 &[&ts_query, &cat, &lim],
-            ).await
+            )
+            .await
         }
         None => {
             conn.query(
@@ -187,25 +192,30 @@ pub async fn find_similar_workflows_pg(
                    ORDER BY rank DESC
                    LIMIT $2"#,
                 &[&ts_query, &lim],
-            ).await
+            )
+            .await
         }
-    }.map_err(|e| format!("PG find_similar_workflows: {}", e))?;
+    }
+    .map_err(|e| format!("PG find_similar_workflows: {}", e))?;
 
-    Ok(rows.iter().map(|r| {
-        let rank: f32 = r.get::<_, f64>(8) as f32;
-        SimilarWorkflow {
-            id: r.get(0),
-            name: r.get(1),
-            description: r.get(2),
-            category: r.get(3),
-            setup_step_count: count_json_array(r.get::<_, String>(4).as_str()),
-            verification_step_count: count_json_array(r.get::<_, String>(5).as_str()),
-            agentic_step_count: count_json_array(r.get::<_, String>(6).as_str()),
-            completion_step_count: count_json_array(r.get::<_, String>(7).as_str()),
-            similarity: rank.min(1.0),
-            full_json: None,
-        }
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let rank: f32 = r.get::<_, f64>(8) as f32;
+            SimilarWorkflow {
+                id: r.get(0),
+                name: r.get(1),
+                description: r.get(2),
+                category: r.get(3),
+                setup_step_count: count_json_array(r.get::<_, String>(4).as_str()),
+                verification_step_count: count_json_array(r.get::<_, String>(5).as_str()),
+                agentic_step_count: count_json_array(r.get::<_, String>(6).as_str()),
+                completion_step_count: count_json_array(r.get::<_, String>(7).as_str()),
+                similarity: rank.min(1.0),
+                full_json: None,
+            }
+        })
+        .collect())
 }
 
 /// Find ground truth reference workflows from PG using keyword overlap.
@@ -214,21 +224,28 @@ pub async fn find_gt_reference_workflows_pg(
     description: &str,
     limit: usize,
 ) -> Result<Vec<SimilarWorkflow>, String> {
-    let conn = pg.pool().get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    let conn = pg
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool error: {}", e))?;
 
     let search_terms = extract_search_terms(description);
     let lim = limit as i64;
 
     // For GT workflows, fetch all ground_truth workflows and score by keyword overlap
-    let rows = conn.query(
-        r#"SELECT id, name, COALESCE(description, '') as description, category,
+    let rows = conn
+        .query(
+            r#"SELECT id, name, COALESCE(description, '') as description, category,
                   setup_steps, verification_steps, agentic_steps, completion_steps
            FROM unified_workflows
            WHERE category = 'ground_truth'
            ORDER BY updated_at DESC
            LIMIT $1"#,
-        &[&lim],
-    ).await.map_err(|e| format!("PG find_gt_reference_workflows: {}", e))?;
+            &[&lim],
+        )
+        .await
+        .map_err(|e| format!("PG find_gt_reference_workflows: {}", e))?;
 
     let mut results: Vec<SimilarWorkflow> = rows.iter().map(|r| {
         let name: String = r.get(1);
@@ -262,17 +279,22 @@ pub async fn find_gt_reference_workflows_pg(
     }).collect();
 
     // Sort by similarity descending
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(results)
 }
 
 /// Extract meaningful search terms from a description for full-text search.
 fn extract_search_terms(description: &str) -> Vec<String> {
-    let stop_words = ["the", "a", "an", "is", "are", "was", "were", "be", "been",
-        "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
-        "that", "this", "it", "from", "by", "as", "not", "do", "does",
-        "has", "have", "had", "will", "would", "could", "should", "can",
-        "may", "might", "must", "shall", "need", "want"];
+    let stop_words = [
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "and", "or", "but", "in", "on",
+        "at", "to", "for", "of", "with", "that", "this", "it", "from", "by", "as", "not", "do",
+        "does", "has", "have", "had", "will", "would", "could", "should", "can", "may", "might",
+        "must", "shall", "need", "want",
+    ];
 
     description
         .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -290,7 +312,10 @@ fn keyword_overlap_score(terms: &[String], name: &str, description: &str) -> f32
         return 0.0;
     }
     let combined = format!("{} {}", name, description).to_lowercase();
-    let matches = terms.iter().filter(|t| combined.contains(t.as_str())).count();
+    let matches = terms
+        .iter()
+        .filter(|t| combined.contains(t.as_str()))
+        .count();
     (matches as f32) / (terms.len() as f32)
 }
 

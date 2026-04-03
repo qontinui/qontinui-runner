@@ -28,7 +28,9 @@ pub struct LearningDashboardData {
 
 /// Get the learning summary statistics.
 #[tauri::command]
-pub async fn get_learning_summary(state: State<'_, Arc<AppState>>) -> Result<LearningSummary, String> {
+pub async fn get_learning_summary(
+    state: State<'_, Arc<AppState>>,
+) -> Result<LearningSummary, String> {
     // Get outcomes from database
     let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
     let patterns = state.pg_db.get_learning_patterns().await?;
@@ -72,7 +74,9 @@ pub async fn get_learning_summary(state: State<'_, Arc<AppState>>) -> Result<Lea
 
 /// Get all identified patterns from the database.
 #[tauri::command]
-pub async fn get_learning_patterns(state: State<'_, Arc<AppState>>) -> Result<Vec<Pattern>, String> {
+pub async fn get_learning_patterns(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Pattern>, String> {
     let patterns_json = state.pg_db.get_learning_patterns().await?;
 
     let patterns: Vec<Pattern> = patterns_json
@@ -131,7 +135,9 @@ pub async fn get_learning_patterns(state: State<'_, Arc<AppState>>) -> Result<Ve
 
 /// Get all generated insights (uses in-memory analysis).
 #[tauri::command]
-pub async fn get_learning_insights(state: State<'_, Arc<AppState>>) -> Result<Vec<Insight>, String> {
+pub async fn get_learning_insights(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Insight>, String> {
     // Load outcomes from database into the learning system
     let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
@@ -150,7 +156,9 @@ pub async fn get_learning_insights(state: State<'_, Arc<AppState>>) -> Result<Ve
 
 /// Run full pattern analysis and return results.
 #[tauri::command]
-pub async fn analyze_learning_data(state: State<'_, Arc<AppState>>) -> Result<AnalysisResult, String> {
+pub async fn analyze_learning_data(
+    state: State<'_, Arc<AppState>>,
+) -> Result<AnalysisResult, String> {
     // Load outcomes from database
     let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
     let result = {
@@ -187,14 +195,17 @@ pub async fn analyze_learning_data(state: State<'_, Arc<AppState>>) -> Result<An
             "success_rate": pattern.success_rate,
         });
         let context_str = context.to_string();
-        let _ = state.pg_db.save_learning_pattern(
-            &pattern.id,
-            pattern_type,
-            &pattern.description,
-            pattern.confidence,
-            pattern.occurrences as i32,
-            Some(context_str.as_str()),
-        ).await;
+        let _ = state
+            .pg_db
+            .save_learning_pattern(
+                &pattern.id,
+                pattern_type,
+                &pattern.description,
+                pattern.confidence,
+                pattern.occurrences as i32,
+                Some(context_str.as_str()),
+            )
+            .await;
     }
 
     Ok(result)
@@ -273,47 +284,63 @@ pub async fn record_task_outcome(
         if outcome.metrics.is_empty() && outcome.decisions.is_empty() && outcome.tags.is_empty() {
             None
         } else {
-            Some(serde_json::json!({
-                "metrics": outcome.metrics,
-                "decisions": outcome.decisions,
-                "tags": outcome.tags,
-            }).to_string())
+            Some(
+                serde_json::json!({
+                    "metrics": outcome.metrics,
+                    "decisions": outcome.decisions,
+                    "tags": outcome.tags,
+                })
+                .to_string(),
+            )
         };
 
     let id = uuid::Uuid::new_v4().to_string();
-    let tools_json = if tools.is_empty() { None } else { Some(serde_json::json!(tools).to_string()) };
-    let agents_json = if agents.is_empty() { None } else { Some(serde_json::json!(agents).to_string()) };
+    let tools_json = if tools.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(tools).to_string())
+    };
+    let agents_json = if agents.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(agents).to_string())
+    };
 
-    state.pg_db.record_learning_outcome(
-        &id,
-        &outcome.task_id,
-        status,
-        outcome.duration_secs.map(|d| d as f64),
-        outcome.iterations.map(|i| i as i32),
-        outcome.strategy.as_deref(),
-        tools_json.as_deref(),
-        agents_json.as_deref(),
-        None, // error_type - not in TaskOutcome
-        error_message.as_deref(),
-        feedback_json.as_deref(),
-        outcome.workflow_architecture.as_deref(),
-        None,  // step_count
-        None,  // verification_step_count
-        None,  // agentic_step_count
-        false, // has_ui_bridge
-        None,  // total_tokens
-        None,  // total_cost_usd
-        None,  // technology_tags
-        None,  // domain_tags
-        None,  // complexity_tier
-    ).await?;
+    state
+        .pg_db
+        .record_learning_outcome(
+            &id,
+            &outcome.task_id,
+            status,
+            outcome.duration_secs.map(|d| d as f64),
+            outcome.iterations.map(|i| i as i32),
+            outcome.strategy.as_deref(),
+            tools_json.as_deref(),
+            agents_json.as_deref(),
+            None, // error_type - not in TaskOutcome
+            error_message.as_deref(),
+            feedback_json.as_deref(),
+            outcome.workflow_architecture.as_deref(),
+            None,  // step_count
+            None,  // verification_step_count
+            None,  // agentic_step_count
+            false, // has_ui_bridge
+            None,  // total_tokens
+            None,  // total_cost_usd
+            None,  // technology_tags
+            None,  // domain_tags
+            None,  // complexity_tier
+        )
+        .await?;
 
     Ok(())
 }
 
 /// Get the best performing strategy.
 #[tauri::command]
-pub async fn get_best_strategy(state: State<'_, Arc<AppState>>) -> Result<Option<(String, f64)>, String> {
+pub async fn get_best_strategy(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<(String, f64)>, String> {
     let outcomes = state.pg_db.get_learning_outcomes(Some(500)).await?;
 
     let mut strategy_stats: std::collections::HashMap<String, (u32, u32)> =
@@ -382,29 +409,32 @@ pub async fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result
         };
 
         let id = uuid::Uuid::new_v4().to_string();
-        state.pg_db.record_learning_outcome(
-            &id,
-            &format!("sample-task-{}", i),
-            "success",
-            Some(60.0 + (i * 10) as f64),
-            Some(3 + (i % 5) as i32),
-            Some(strategy),
-            Some(&tools_json),
-            None,
-            None,
-            None,
-            None,
-            Some("traditional"),
-            None,  // step_count
-            None,  // verification_step_count
-            None,  // agentic_step_count
-            false, // has_ui_bridge
-            None,  // total_tokens
-            None,  // total_cost_usd
-            None,  // technology_tags
-            None,  // domain_tags
-            None,  // complexity_tier
-        ).await?;
+        state
+            .pg_db
+            .record_learning_outcome(
+                &id,
+                &format!("sample-task-{}", i),
+                "success",
+                Some(60.0 + (i * 10) as f64),
+                Some(3 + (i % 5) as i32),
+                Some(strategy),
+                Some(&tools_json),
+                None,
+                None,
+                None,
+                None,
+                Some("traditional"),
+                None,  // step_count
+                None,  // verification_step_count
+                None,  // agentic_step_count
+                false, // has_ui_bridge
+                None,  // total_tokens
+                None,  // total_cost_usd
+                None,  // technology_tags
+                None,  // domain_tags
+                None,  // complexity_tier
+            )
+            .await?;
     }
 
     // Add some failures
@@ -412,29 +442,32 @@ pub async fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result
         let tools_json = serde_json::json!(["grep"]).to_string();
 
         let id = uuid::Uuid::new_v4().to_string();
-        state.pg_db.record_learning_outcome(
-            &id,
-            &format!("sample-fail-{}", i),
-            "failure",
-            None,
-            Some(8),
-            Some("exhaustive"),
-            Some(&tools_json),
-            None,
-            Some("verification"),
-            Some("Verification failed"),
-            None,
-            Some("traditional"),
-            None,  // step_count
-            None,  // verification_step_count
-            None,  // agentic_step_count
-            false, // has_ui_bridge
-            None,  // total_tokens
-            None,  // total_cost_usd
-            None,  // technology_tags
-            None,  // domain_tags
-            None,  // complexity_tier
-        ).await?;
+        state
+            .pg_db
+            .record_learning_outcome(
+                &id,
+                &format!("sample-fail-{}", i),
+                "failure",
+                None,
+                Some(8),
+                Some("exhaustive"),
+                Some(&tools_json),
+                None,
+                Some("verification"),
+                Some("Verification failed"),
+                None,
+                Some("traditional"),
+                None,  // step_count
+                None,  // verification_step_count
+                None,  // agentic_step_count
+                false, // has_ui_bridge
+                None,  // total_tokens
+                None,  // total_cost_usd
+                None,  // technology_tags
+                None,  // domain_tags
+                None,  // complexity_tier
+            )
+            .await?;
     }
 
     Ok(())
@@ -468,13 +501,15 @@ pub async fn get_learning_outcomes_filtered(
     state: State<'_, Arc<AppState>>,
     filter: LearningOutcomeFilter,
 ) -> Result<Vec<serde_json::Value>, String> {
-    state.pg_db.get_learning_outcomes_filtered(
-        filter.status.as_deref(),
-        filter.strategy.as_deref(),
-        filter.since.as_deref(),
-        filter.limit,
-    )
-    .await
+    state
+        .pg_db
+        .get_learning_outcomes_filtered(
+            filter.status.as_deref(),
+            filter.strategy.as_deref(),
+            filter.since.as_deref(),
+            filter.limit,
+        )
+        .await
 }
 
 /// Get learning outcomes with pagination.
@@ -528,10 +563,7 @@ pub async fn get_recent_tasks_with_outcomes(
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(10);
-    state
-        .pg_db
-        .get_recent_task_runs_with_outcomes(limit)
-        .await
+    state.pg_db.get_recent_task_runs_with_outcomes(limit).await
 }
 
 /// Get the current running task (if any).

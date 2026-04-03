@@ -43,16 +43,27 @@ impl PgDb {
         risk_level: &str,
         git_checkpoint: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "INSERT INTO deferred_questions \
              (id, task_run_id, iteration, question, context_json, auto_decision_type, \
               auto_decision_detail, confidence, risk_level, git_checkpoint) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
-                &id, &task_run_id, &iteration, &question, &context_json,
-                &auto_decision_type, &auto_decision_detail, &confidence,
-                &risk_level, &git_checkpoint,
+                &id,
+                &task_run_id,
+                &iteration,
+                &question,
+                &context_json,
+                &auto_decision_type,
+                &auto_decision_detail,
+                &confidence,
+                &risk_level,
+                &git_checkpoint,
             ],
         )
         .await
@@ -67,7 +78,11 @@ impl PgDb {
         status: &str,
         reviewer_comment: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE deferred_questions SET status = $1, reviewer_comment = $2, reviewed_at = NOW() WHERE id = $3",
             &[&status, &reviewer_comment, &id],
@@ -85,7 +100,11 @@ impl PgDb {
         id: &str,
         iteration: i32,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let iteration_json = format!("[{}]", iteration);
         conn.execute(
             "UPDATE deferred_questions \
@@ -103,17 +122,22 @@ impl PgDb {
         &self,
         task_run_id: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT id, task_run_id, iteration, question, context_json, \
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, task_run_id, iteration, question, context_json, \
                     auto_decision_type, auto_decision_detail, confidence, risk_level, \
                     status, git_checkpoint, contingent_iterations, reviewer_comment, \
                     created_at, reviewed_at \
              FROM deferred_questions WHERE task_run_id = $1 ORDER BY created_at ASC",
-            &[&task_run_id],
-        )
-        .await
-        .map_err(|e| format!("PG get_deferred_questions_for_task_run: {}", e))?;
+                &[&task_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_deferred_questions_for_task_run: {}", e))?;
 
         Ok(rows.iter().map(row_to_json).collect())
     }
@@ -124,7 +148,11 @@ impl PgDb {
         task_run_id: &str,
         status: &str,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn.query(
             "SELECT id, task_run_id, iteration, question, context_json, \
                     auto_decision_type, auto_decision_detail, confidence, risk_level, \
@@ -144,27 +172,33 @@ impl PgDb {
         &self,
         id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT id, task_run_id, iteration, question, context_json, \
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, task_run_id, iteration, question, context_json, \
                     auto_decision_type, auto_decision_detail, confidence, risk_level, \
                     status, git_checkpoint, contingent_iterations, reviewer_comment, \
                     created_at, reviewed_at \
              FROM deferred_questions WHERE id = $1",
-            &[&id],
-        )
-        .await
-        .map_err(|e| format!("PG get_deferred_question_by_id: {}", e))?;
+                &[&id],
+            )
+            .await
+            .map_err(|e| format!("PG get_deferred_question_by_id: {}", e))?;
 
         Ok(rows.first().map(row_to_json))
     }
 
     /// Count pending deferred questions for a task run.
-    pub async fn count_pending_deferred_questions(
-        &self,
-        task_run_id: &str,
-    ) -> Result<i64, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn count_pending_deferred_questions(&self, task_run_id: &str) -> Result<i64, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn.query_one(
             "SELECT COUNT(*) as count FROM deferred_questions WHERE task_run_id = $1 AND status = 'pending'",
             &[&task_run_id],
@@ -181,19 +215,24 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<(f64, bool)>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT dq.confidence, dq.status \
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT dq.confidence, dq.status \
              FROM deferred_questions dq \
              JOIN task_runs tr ON dq.task_run_id = tr.id \
              WHERE tr.workflow_id = $1 \
                AND dq.status IN ('approved', 'rejected') \
                AND dq.reviewed_at > NOW() - INTERVAL '30 days' \
              ORDER BY dq.created_at",
-            &[&workflow_id],
-        )
-        .await
-        .map_err(|e| format!("PG get_reviewed_deferred_questions: {}", e))?;
+                &[&workflow_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_reviewed_deferred_questions: {}", e))?;
 
         Ok(rows
             .iter()
@@ -215,7 +254,11 @@ impl PgDb {
         threshold: f64,
         evidence: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let baseline_value = serde_json::json!({
             "threshold": threshold,
             "evidence": evidence,
@@ -243,14 +286,19 @@ impl PgDb {
         &self,
         workflow_id: &str,
     ) -> Result<Option<f64>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
-        let rows = conn.query(
-            "SELECT baseline_value FROM agentic_metric_baselines \
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT baseline_value FROM agentic_metric_baselines \
              WHERE workflow_id = $1 AND metric_type = 'deferred_confidence_threshold'",
-            &[&workflow_id],
-        )
-        .await
-        .map_err(|e| format!("PG get_deferred_confidence_threshold: {}", e))?;
+                &[&workflow_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_deferred_confidence_threshold: {}", e))?;
 
         if let Some(row) = rows.first() {
             let value: String = row.get("baseline_value");

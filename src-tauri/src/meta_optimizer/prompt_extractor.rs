@@ -4,8 +4,8 @@
 //! joining with `learning_outcomes` for outcome scores, and grouping by
 //! (phase, agent_type) to identify which prompts have the worst outcomes.
 
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::debug;
 
@@ -41,9 +41,7 @@ pub struct PromptGroupMetrics {
 /// Extract prompt samples from recent runs, joining phase_token_usage with learning_outcomes.
 ///
 /// Returns samples ordered by outcome_score ascending (worst first).
-pub fn extract_prompt_samples(
-    limit: usize,
-) -> Result<Vec<PromptSample>, String> {
+pub fn extract_prompt_samples(limit: usize) -> Result<Vec<PromptSample>, String> {
     let pg = PgDb::global();
     extract_prompt_samples_pg(&pg, limit)
 }
@@ -59,23 +57,35 @@ pub fn extract_prompt_samples_pg(
         Handle::current().block_on(pg_db.extract_prompt_samples(limit))
     })?;
 
-    let samples: Vec<PromptSample> = rows.into_iter().map(|(task_run_id, phase, agent_type, outcome_score, outcome_status, iteration, cost_usd)| {
-        PromptSample {
-            task_run_id,
-            phase,
-            agent_type,
-            prompt_text: String::new(),
-            outcome_score,
-            outcome_status,
-            iteration: iteration as u32,
-            cost_usd,
-        }
-    }).collect();
+    let samples: Vec<PromptSample> = rows
+        .into_iter()
+        .map(
+            |(
+                task_run_id,
+                phase,
+                agent_type,
+                outcome_score,
+                outcome_status,
+                iteration,
+                cost_usd,
+            )| {
+                PromptSample {
+                    task_run_id,
+                    phase,
+                    agent_type,
+                    prompt_text: String::new(),
+                    outcome_score,
+                    outcome_status,
+                    iteration: iteration as u32,
+                    cost_usd,
+                }
+            },
+        )
+        .collect();
 
     debug!("Extracted {} prompt samples (PG)", samples.len());
     Ok(samples)
 }
-
 
 /// Group prompt samples by (phase, agent_type) and compute per-group metrics.
 ///
@@ -89,9 +99,7 @@ pub fn compute_group_metrics(samples: &[PromptSample]) -> Vec<PromptGroupMetrics
 }
 
 /// Like `compute_group_metrics` but enriches prompt text from the prompt registry.
-pub fn compute_group_metrics_with_db(
-    samples: &[PromptSample],
-) -> Vec<PromptGroupMetrics> {
+pub fn compute_group_metrics_with_db(samples: &[PromptSample]) -> Vec<PromptGroupMetrics> {
     compute_group_metrics_inner(samples, None)
 }
 
@@ -166,7 +174,11 @@ fn compute_group_metrics_inner(
         })
         .collect();
 
-    metrics.sort_by(|a, b| a.mean_score.partial_cmp(&b.mean_score).unwrap_or(std::cmp::Ordering::Equal));
+    metrics.sort_by(|a, b| {
+        a.mean_score
+            .partial_cmp(&b.mean_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     metrics
 }
 
@@ -266,14 +278,23 @@ pub fn collect_evidence_samples_pg(
 ) -> Result<(Vec<PromptSample>, Vec<PromptSample>), String> {
     let (fail_tuples, success_tuples) = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.collect_evidence_samples(
-            phase, agent_type, max_failures as i64, max_successes as i64,
+            phase,
+            agent_type,
+            max_failures as i64,
+            max_successes as i64,
         ))
     })?;
 
     let to_sample = |t: (String, String, String, f64, String, i64, f64)| -> PromptSample {
         PromptSample {
-            task_run_id: t.0, phase: t.1, agent_type: t.2, prompt_text: String::new(),
-            outcome_score: t.3, outcome_status: t.4, iteration: t.5 as u32, cost_usd: t.6,
+            task_run_id: t.0,
+            phase: t.1,
+            agent_type: t.2,
+            prompt_text: String::new(),
+            outcome_score: t.3,
+            outcome_status: t.4,
+            iteration: t.5 as u32,
+            cost_usd: t.6,
         }
     };
 
@@ -282,7 +303,6 @@ pub fn collect_evidence_samples_pg(
         success_tuples.into_iter().map(to_sample).collect(),
     ))
 }
-
 
 // ─��� PG dual-write wrappers ────────────────────────────��─────────────────
 

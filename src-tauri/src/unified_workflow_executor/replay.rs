@@ -52,9 +52,7 @@ impl ReplayManager {
         let verification_results = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        pg.get_workflow_verification_results(&eid).await
-                    })
+                    handle.block_on(async move { pg.get_workflow_verification_results(&eid).await })
                 })
             }));
             match result {

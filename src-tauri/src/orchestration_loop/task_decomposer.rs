@@ -346,10 +346,7 @@ mod tests {
             workflow_id: None,
             status: SubTaskStatus::Pending,
         };
-        assert!(dependencies_satisfied(
-            &subtask,
-            &["s1".to_string()]
-        ));
+        assert!(dependencies_satisfied(&subtask, &["s1".to_string()]));
     }
 
     #[test]
@@ -365,9 +362,6 @@ mod tests {
             status: SubTaskStatus::Pending,
         };
         // Only s1 is completed, s2 is not
-        assert!(!dependencies_satisfied(
-            &subtask,
-            &["s1".to_string()]
-        ));
+        assert!(!dependencies_satisfied(&subtask, &["s1".to_string()]));
     }
 }

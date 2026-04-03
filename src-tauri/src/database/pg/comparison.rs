@@ -12,7 +12,11 @@ impl PgDb {
         entries_json: &str,
         created_at: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             r#"INSERT INTO comparison_runs (id, workflow_id, variation_type, status, entries_json, created_at)
                VALUES ($1, $2, $3, 'running', $4, $5)"#,
@@ -30,7 +34,11 @@ impl PgDb {
         entries_json: &str,
         status: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute(
             "UPDATE comparison_runs SET entries_json = $1, status = $2 WHERE id = $3",
             &[&entries_json, &status, &id],
@@ -41,11 +49,12 @@ impl PgDb {
     }
 
     /// Get a comparison run by ID.
-    pub async fn get_comparison_run(
-        &self,
-        id: &str,
-    ) -> Result<Option<ComparisonRunRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+    pub async fn get_comparison_run(&self, id: &str) -> Result<Option<ComparisonRunRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_opt(
                 r#"SELECT id, workflow_id, variation_type, status, entries_json,
@@ -74,7 +83,11 @@ impl PgDb {
         id: &str,
         entries_json: &str,
     ) -> Result<(), String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE comparison_runs SET status = 'completed', completed_at = $1, entries_json = $2 WHERE id = $3",
@@ -87,7 +100,11 @@ impl PgDb {
 
     /// List recent comparison runs.
     pub async fn list_comparison_runs(&self, limit: i64) -> Result<Vec<ComparisonRunRow>, String> {
-        let conn = self.pool.get().await.map_err(|e| format!("PG pool error: {}", e))?;
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
                 r#"SELECT id, workflow_id, variation_type, status, entries_json,

@@ -279,10 +279,7 @@ impl ImplementerOutput {
 
 impl VerifierOutput {
     /// Build from existing pipeline context verifier failures and the full criteria list.
-    pub fn from_pipeline_data(
-        failures: &[VerifierFailure],
-        all_criteria_ids: &[String],
-    ) -> Self {
+    pub fn from_pipeline_data(failures: &[VerifierFailure], all_criteria_ids: &[String]) -> Self {
         let failed_ids: std::collections::HashSet<&str> =
             failures.iter().map(|f| f.criterion_id.as_str()).collect();
 
@@ -326,8 +323,7 @@ fn estimate_subtree_count(criteria: &[PipelineAcceptanceCriterion]) -> u32 {
     }
     // Simple heuristic: criteria with no dependencies that are not depended on
     // by anything form their own subtrees. For a real count, use the DAG builder.
-    let all_ids: std::collections::HashSet<&str> =
-        criteria.iter().map(|c| c.id.as_str()).collect();
+    let all_ids: std::collections::HashSet<&str> = criteria.iter().map(|c| c.id.as_str()).collect();
     let depended_on: std::collections::HashSet<&str> = criteria
         .iter()
         .flat_map(|c| c.depends_on.iter())
@@ -389,7 +385,10 @@ mod tests {
     #[test]
     fn test_spec_analyst_output_roundtrip() {
         let output = SpecAnalystOutput::from_pipeline_data(
-            vec![make_criterion("c1", vec![]), make_criterion("c2", vec!["c1".into()])],
+            vec![
+                make_criterion("c1", vec![]),
+                make_criterion("c2", vec!["c1".into()]),
+            ],
             ComplexityLevel::Moderate,
         );
         let json = serde_json::to_value(&output).unwrap();
@@ -453,7 +452,10 @@ mod tests {
         assert_eq!(estimate_subtree_count(&criteria), 2);
 
         // Two dependent criteria -> 1 subtree
-        let criteria = vec![make_criterion("a", vec![]), make_criterion("b", vec!["a".into()])];
+        let criteria = vec![
+            make_criterion("a", vec![]),
+            make_criterion("b", vec!["a".into()]),
+        ];
         assert_eq!(estimate_subtree_count(&criteria), 1);
 
         // Empty -> 0
@@ -462,7 +464,12 @@ mod tests {
 
     #[test]
     fn test_agent_role_roundtrip() {
-        for role in [AgentRole::SpecAnalyst, AgentRole::Locator, AgentRole::Implementer, AgentRole::Verifier] {
+        for role in [
+            AgentRole::SpecAnalyst,
+            AgentRole::Locator,
+            AgentRole::Implementer,
+            AgentRole::Verifier,
+        ] {
             let s = role.as_str();
             let parsed = AgentRole::from_str(s).unwrap();
             assert_eq!(parsed, role);

@@ -16,9 +16,7 @@ use crate::known_issues::types::{
 /// (appearing in 2+ distinct task runs) to known issues.
 ///
 /// Returns the IDs of any newly created known issues.
-pub fn check_and_promote_recurring_findings(
-    task_run_id: &str,
-) -> Result<Vec<String>, String> {
+pub fn check_and_promote_recurring_findings(task_run_id: &str) -> Result<Vec<String>, String> {
     Err("SQLite removed".to_string())
 }
 

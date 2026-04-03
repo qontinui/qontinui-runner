@@ -261,7 +261,11 @@ pub async fn list_shell_commands(
         .map(|row| {
             let tags: Vec<String> = row["tags"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             ShellCommand {
                 id: row["id"].as_str().unwrap_or("").to_string(),
@@ -323,7 +327,9 @@ pub async fn update_shell_command(
     let name = input.name.unwrap_or_else(|| current.name.clone());
     let description = input.description.or_else(|| current.description.clone());
     let command = input.command.unwrap_or_else(|| current.command.clone());
-    let working_directory = input.working_directory.or_else(|| current.working_directory.clone());
+    let working_directory = input
+        .working_directory
+        .or_else(|| current.working_directory.clone());
     let timeout_seconds = input.timeout_seconds.unwrap_or(current.timeout_seconds);
     let fail_on_error = input.fail_on_error.unwrap_or(current.fail_on_error);
     let category = input.category.or_else(|| Some(current.category.clone()));
@@ -450,19 +456,32 @@ pub async fn execute_shell_command(
     let security_settings = crate::settings::get_security_settings();
     let security_policy = crate::security::PolicyEngine::resolve(None, &security_settings);
 
-    if let Err(denial) = crate::security::PolicyEngine::evaluate_command(&security_policy, &command) {
-        warn!("Shell command '{}' blocked by security policy: {}", name, denial);
+    if let Err(denial) = crate::security::PolicyEngine::evaluate_command(&security_policy, &command)
+    {
+        warn!(
+            "Shell command '{}' blocked by security policy: {}",
+            name, denial
+        );
         return Err(format!("Security policy violation: {}", denial.reason));
     }
 
-    let extra_env = crate::security::build_container_security_env(&security_policy, &security_settings);
+    let extra_env =
+        crate::security::build_container_security_env(&security_policy, &security_settings);
 
     let container_result = {
         let executor_guard = state.container_executor.lock().await;
         if let Some(ref executor) = *executor_guard {
-            debug!("Container executor present, attempting container execution for '{}'", name);
+            debug!(
+                "Container executor present, attempting container execution for '{}'",
+                name
+            );
             match executor
-                .try_execute_with_policy(&command, working_directory.as_deref(), Some(&security_policy), &extra_env)
+                .try_execute_with_policy(
+                    &command,
+                    working_directory.as_deref(),
+                    Some(&security_policy),
+                    &extra_env,
+                )
                 .await
             {
                 Ok(Some(cr)) => {

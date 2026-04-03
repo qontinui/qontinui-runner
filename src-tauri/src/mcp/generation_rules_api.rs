@@ -138,20 +138,15 @@ pub async fn delete_rule_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let deleted = state
-        .app_state
-        .pg_db
-        .delete_rule(&id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!(
-                    "Failed to delete generation rule: {}",
-                    e
-                ))),
-            )
-        })?;
+    let deleted = state.app_state.pg_db.delete_rule(&id).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to delete generation rule: {}",
+                e
+            ))),
+        )
+    })?;
 
     if deleted {
         crate::mcp::graph_api::invalidate_graph_cache(&state, "delete_generation_rule").await;
