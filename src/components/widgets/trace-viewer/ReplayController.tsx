@@ -32,10 +32,14 @@ export function ReplayController({
     [totalSteps, onStepChange],
   );
 
+  // Stop playing when reaching the end
+  if (isPlaying && !canGoForward) {
+    setIsPlaying(false);
+  }
+
   // Auto-play
   useEffect(() => {
     if (!isPlaying || !canGoForward) {
-      if (!canGoForward) setIsPlaying(false);
       return;
     }
     const timer = setTimeout(() => {

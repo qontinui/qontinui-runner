@@ -138,8 +138,8 @@ export function TerminalPage({
   }
 
   // Resume Claude sessions from a loaded zone profile after assignments settle
-  const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
   useEffect(() => {
+    const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
     const sessions = pendingProfileSessionsRef.current;
     if (!sessions) return;
     pendingProfileSessionsRef.current = null;
@@ -638,9 +638,12 @@ export function TerminalPage({
               const cmd = isWindows
                 ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
                 : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
-              setTimeout(() => {
-                terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
-              }, 1500 + i * 300);
+              setTimeout(
+                () => {
+                  terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
+                },
+                1500 + i * 300,
+              );
             }
           }
         }}

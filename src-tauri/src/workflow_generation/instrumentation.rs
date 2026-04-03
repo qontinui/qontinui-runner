@@ -78,6 +78,7 @@ pub fn record_rule_influences(
 /// 1. Active cross-run patterns for this workflow (warnings about known issues)
 /// 2. Ineffective rules to exclude from the prompt
 /// 3. Phase stats showing which phases are bottlenecks
+///
 /// Returns a formatted string to include in the builder prompt.
 pub fn build_graph_context(workflow_name: Option<&str>) -> String {
     String::new()

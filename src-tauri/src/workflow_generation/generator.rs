@@ -961,7 +961,7 @@ pub fn generate_workflow(
     // ── Load Project Constitution ────────────────────────────────────────
     let constitution = std::env::current_dir().ok().and_then(|cwd| {
         cwd.to_str()
-            .and_then(|s| super::constitution::load_constitution(s))
+            .and_then(super::constitution::load_constitution)
     });
     if constitution.is_some() {
         info!("Project constitution loaded — will be injected into generation prompts");
@@ -1157,7 +1157,8 @@ pub fn generate_workflow(
             .and_then(|s| s.exploration_enabled)
             != Some(false)
     {
-        let criteria = acceptance_criteria.as_ref().unwrap();
+        // SAFETY: guarded by `acceptance_criteria.is_some()` above
+        let criteria = acceptance_criteria.as_ref().expect("checked is_some above");
         let assessment = assess_complexity(&criteria.criteria);
 
         // Re-classify any General-bucket criteria using LLM fallback

@@ -578,9 +578,7 @@ pub fn format_criteria_for_builder(criteria: &AcceptanceCriteria) -> String {
     // Bugfix context for the builder
     if let Some(ref bugfix) = criteria.bugfix_context {
         section.push_str("\n### Bugfix Context\n\n");
-        section.push_str(&format!(
-            "This is a **bug fix** task. Structure verification to confirm the fix and prevent regression.\n\n"
-        ));
+        section.push_str("This is a **bug fix** task. Structure verification to confirm the fix and prevent regression.\n\n");
         section.push_str(&format!(
             "- **Current (broken) behavior:** {}\n",
             bugfix.current_behavior

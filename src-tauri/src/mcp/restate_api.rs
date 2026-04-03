@@ -186,10 +186,7 @@ async fn get_restate_workflow_state(
         .await
     {
         Ok(response) if response.status().is_success() => {
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .unwrap_or_else(|_| serde_json::json!(null));
+            let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
             Ok(Json(ApiResponse::success(body)))
         }
         Ok(response) => {

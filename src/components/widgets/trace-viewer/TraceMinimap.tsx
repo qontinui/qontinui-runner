@@ -24,7 +24,7 @@ const PHASE_HEX: Record<WorkflowPhase, string> = {
 
 export function TraceMinimap({
   nodes,
-  traceStartMs,
+  traceStartMs: _traceStartMs,
   traceDurationMs,
   viewportStart,
   viewportEnd,

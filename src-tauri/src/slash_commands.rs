@@ -249,7 +249,7 @@ pub async fn sync_slash_commands(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "md") {
+        if path.extension().is_some_and(|ext| ext == "md") {
             match parse_command_file(&path, &workspace_root) {
                 Ok(parsed) => {
                     disk_commands.insert(parsed.relative_path.clone(), parsed);
