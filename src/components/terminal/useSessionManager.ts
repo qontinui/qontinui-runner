@@ -330,11 +330,29 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // ── Fetch account usage (every 5 minutes) ─────────────────────────────────
 
+  // Merge config dirs from transcript sessions AND saved settings so the
+  // launch menu shows accounts even when no sessions exist yet.
+  const [savedConfigDirs, setSavedConfigDirs] = useState<string[]>([]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await invoke<CommandResponse>("get_claude_config_dirs");
+        if (result.success && result.data) {
+          const data = result.data as { dirs: string[] };
+          if (data.dirs?.length) setSavedConfigDirs(data.dirs);
+        }
+      } catch {
+        // Silently fail
+      }
+    })();
+  }, []);
+
   // Stable key for config dirs so the interval doesn't reset on every session list change
   const configDirsKey = useMemo(() => {
-    const dirs = [...new Set(transcriptSessions.map((s) => s.config_dir))].sort();
+    const fromSessions = transcriptSessions.map((s) => s.config_dir);
+    const dirs = [...new Set([...fromSessions, ...savedConfigDirs])].sort();
     return dirs.join("|");
-  }, [transcriptSessions]);
+  }, [transcriptSessions, savedConfigDirs]);
 
   const configDirsRef = useRef<string[]>([]);
   useEffect(() => {

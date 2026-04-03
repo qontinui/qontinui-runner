@@ -81,7 +81,7 @@ export default function CostControlPanel() {
       {/* ============================================================ */}
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div data-tutorial-id="cc-summary-cards" className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <MetricCard
           title="Total Cost"
           value={dashboard ? formatCost(dashboard.total_cost_usd) : "$0.00"}
@@ -114,7 +114,7 @@ export default function CostControlPanel() {
       {/* Budget Gauge + Phase Breakdown */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Budget Gauge */}
-        <div className="bg-card rounded-lg border border-border/50 p-4">
+        <div data-tutorial-id="cc-budget-gauge" className="bg-card rounded-lg border border-border/50 p-4">
           <h3 className="text-sm font-semibold flex items-center gap-2 mb-4">
             <Wallet className="w-4 h-4" />
             Budget Utilization
@@ -144,7 +144,7 @@ export default function CostControlPanel() {
       {/* Section 2: Safety                                            */}
       {/* ============================================================ */}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div data-tutorial-id="cc-safety-section" className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <CircuitBreakerStatus budget={activeBudget} />
         <AnomalyFeed anomalies={anomalies} />
       </div>

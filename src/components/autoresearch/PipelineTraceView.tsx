@@ -191,7 +191,7 @@ export function PipelineTraceView({ result }: Props) {
       </div>
 
       {/* Agent Traces */}
-      <div className="border border-zinc-700 rounded overflow-auto max-h-80">
+      <div className="border border-zinc-700 rounded overflow-auto max-h-80" data-tutorial-id="pipeline-trace-table">
         <table className="w-full text-xs">
           <thead className="bg-zinc-800 sticky top-0">
             <tr>

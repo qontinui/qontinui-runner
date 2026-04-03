@@ -510,9 +510,9 @@ export function OrchestrationLoopPanel() {
   }
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
+    <div className="flex flex-col h-full overflow-hidden" data-tutorial-id="ol-panel">
       {/* Header bar */}
-      <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
+      <div className="px-4 py-2.5 border-b border-border flex items-center justify-between" data-tutorial-id="ol-header">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold">Orchestration Loop</h2>
           <button
@@ -746,7 +746,7 @@ export function OrchestrationLoopPanel() {
 
             {/* Config form */}
             {!running && (
-              <div className="border border-border rounded p-3 space-y-3">
+              <div className="border border-border rounded p-3 space-y-3" data-tutorial-id="ol-config-form">
                 <div className="flex items-center gap-4 flex-wrap">
                   <div className="flex items-center gap-2">
                     <label className="flex items-center gap-1 text-xs cursor-pointer">
@@ -886,7 +886,7 @@ export function OrchestrationLoopPanel() {
                   </div>
                 ) : (
                   <>
-                    <div className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")}>
+                    <div className={cn("grid gap-2", enableFixes ? "grid-cols-3" : "grid-cols-2")} data-tutorial-id="ol-pipeline-textareas">
                       <div>
                         <div className={cn(labelCls, "mb-1")}>Build Description</div>
                         <textarea
@@ -946,7 +946,7 @@ export function OrchestrationLoopPanel() {
                         </span>
                       </label>
                       {enableDiagnose && (
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5" data-tutorial-id="ol-diag-exit-strategy">
                           <span className={labelCls}>Exit</span>
                           <select
                             value={exitStrategy}
@@ -960,7 +960,7 @@ export function OrchestrationLoopPanel() {
                           </select>
                         </div>
                       )}
-                      <label className="flex items-center gap-1.5 text-xs cursor-pointer">
+                      <label data-tutorial-id="ol-enable-diagnose" className="flex items-center gap-1.5 text-xs cursor-pointer">
                         <input
                           type="checkbox"
                           checked={enableDiagnose}
@@ -974,7 +974,7 @@ export function OrchestrationLoopPanel() {
                       </label>
                     </div>
                     {enableDiagnose && (
-                      <div className="border border-teal-500/20 rounded p-3 space-y-2 bg-teal-500/5">
+                      <div data-tutorial-id="ol-diag-config-panel" className="border border-teal-500/20 rounded p-3 space-y-2 bg-teal-500/5">
                         <div className="text-[0.7rem] font-semibold text-teal-400 mb-1">
                           Diagnostic Configuration
                         </div>
@@ -1016,7 +1016,7 @@ export function OrchestrationLoopPanel() {
                               className={cn(inputCls, "w-20 text-center")}
                             />
                           </div>
-                          <div className="flex items-center gap-1.5">
+                          <div data-tutorial-id="ol-diag-model-override" className="flex items-center gap-1.5">
                             <span className={labelCls}>Model override</span>
                             <input
                               type="text"
@@ -1035,7 +1035,7 @@ export function OrchestrationLoopPanel() {
             )}
 
             {/* Iteration History */}
-            <div className="border border-border rounded">
+            <div data-tutorial-id="ol-iteration-history" className="border border-border rounded">
               <div className="px-3 py-1.5 border-b border-border flex items-center justify-between">
                 <span className="text-xs font-semibold">Iteration History</span>
                 <span className="text-[0.7rem] text-muted-foreground">

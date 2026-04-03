@@ -95,7 +95,7 @@ export function AgenticMetricsPanel({ selectedTaskRunId, days = 30 }: AgenticMet
   const totalRuns = aggregates.reduce((max, a) => Math.max(max, a.runs_scored), 0);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-tutorial-id="agentic-metrics-panel">
       {/* Header with composite score */}
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-zinc-300">Agentic Metrics</h3>

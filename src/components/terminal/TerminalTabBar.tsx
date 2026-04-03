@@ -2,6 +2,8 @@ import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
 import { Terminal, X, Plus, List, ChevronDown, FileText } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
+import type { AccountUsageInfo } from "./useSessionManager";
+import { LaunchMenu } from "./LaunchMenu";
 
 interface TerminalTabBarProps {
   tabs: TerminalTab[];
@@ -13,6 +15,9 @@ interface TerminalTabBarProps {
   sessionStates?: Record<string, SessionState>;
   layoutPicker?: ReactNode;
   onQuickLaunch?: (count: number, autoCommand?: string) => void;
+  onLaunchAiSession?: (count: number, configDir: string) => void;
+  onLaunchMultiAiSessions?: (configDirs: string[]) => void;
+  accountUsage?: AccountUsageInfo[];
   // Zone monitoring enrichments
   activityData?: Record<string, number[]>;
   stateDurations?: Record<string, string>;
@@ -146,6 +151,9 @@ export function TerminalTabBar({
   sessionStates,
   layoutPicker,
   onQuickLaunch,
+  onLaunchAiSession,
+  onLaunchMultiAiSessions,
+  accountUsage,
   activityData,
   stateDurations,
   unreadTabs,
@@ -158,9 +166,7 @@ export function TerminalTabBar({
   const [editValue, setEditValue] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
   const [showQuickLaunch, setShowQuickLaunch] = useState(false);
-  const [quickLaunchCmd, setQuickLaunchCmd] = useState("");
   const dropdownRef = useRef<HTMLDivElement>(null);
-  const quickLaunchRef = useRef<HTMLDivElement>(null);
 
   // Live elapsed-time tick (30s interval), only in multi-zone mode
   const [, setTick] = useState(0);
@@ -196,22 +202,15 @@ export function TerminalTabBar({
 
   // Close dropdowns when clicking outside
   useEffect(() => {
-    if (!showDropdown && !showQuickLaunch) return;
+    if (!showDropdown) return;
     const handleClick = (e: MouseEvent) => {
       if (showDropdown && dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
         setShowDropdown(false);
       }
-      if (
-        showQuickLaunch &&
-        quickLaunchRef.current &&
-        !quickLaunchRef.current.contains(e.target as Node)
-      ) {
-        setShowQuickLaunch(false);
-      }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [showDropdown, showQuickLaunch]);
+  }, [showDropdown]);
 
   // ── Helpers for per-tab enrichments ──────────────────────────────────────
 
@@ -385,48 +384,30 @@ export function TerminalTabBar({
         <Plus className="w-3.5 h-3.5" />
       </button>
 
-      {/* Quick-launch dropdown */}
+      {/* Launch menu dropdown */}
       {onQuickLaunch && (
-        <div className="relative shrink-0" ref={quickLaunchRef}>
+        <div className="relative shrink-0">
           <button
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={() => setShowQuickLaunch(!showQuickLaunch)}
             className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
               showQuickLaunch
                 ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
                 : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
             }`}
-            title="Launch multiple terminals"
+            title="Launch menu"
           >
             <ChevronDown className="w-3 h-3" />
           </button>
           {showQuickLaunch && (
-            <div className="absolute left-0 top-full mt-1 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden min-w-[200px]">
-              <div className="px-3 py-1.5 text-[9px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
-                Quick Launch
-              </div>
-              <div className="px-3 py-1.5 border-b border-[#2a2d3d]">
-                <input
-                  value={quickLaunchCmd}
-                  onChange={(e) => setQuickLaunchCmd(e.target.value)}
-                  onKeyDown={(e) => e.stopPropagation()}
-                  placeholder="Auto-run command (e.g. claude)"
-                  className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors"
-                />
-              </div>
-              {[2, 4, 6, 9].map((count) => (
-                <button
-                  key={count}
-                  onClick={() => {
-                    onQuickLaunch(count, quickLaunchCmd.trim() || undefined);
-                    setShowQuickLaunch(false);
-                  }}
-                  className="w-full text-left px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#7aa2f7]/10 transition-colors"
-                >
-                  Launch {count} terminals
-                  {quickLaunchCmd.trim() ? ` + "${quickLaunchCmd.trim()}"` : ""}
-                </button>
-              ))}
-            </div>
+            <LaunchMenu
+              onCreatePlain={(count) => onQuickLaunch(count)}
+              onCreateAiSession={(count, configDir) => onLaunchAiSession?.(count, configDir)}
+              onCreateMultiAiSessions={(configDirs) => onLaunchMultiAiSessions?.(configDirs)}
+              onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
+              accountUsage={accountUsage ?? []}
+              onClose={() => setShowQuickLaunch(false)}
+            />
           )}
         </div>
       )}
@@ -563,3 +544,4 @@ export function TerminalTabBar({
     </div>
   );
 }
+

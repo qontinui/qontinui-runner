@@ -290,11 +290,13 @@ export type TutorialFocusPage =
   | "help"
   | "evaluation"
   | "llm-analytics"
+  | "cost-control"
   | "meta-optimizer"
   | "knowledge-explorer"
   | "activity-timeline"
   | "watchers"
-  | "memory-search";
+  | "memory-search"
+  | "orchestration-loop";
 
 /**
  * Complete tutorial definition

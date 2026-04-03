@@ -591,6 +591,60 @@ export function TerminalPage({
             }, 1500);
           }
         }}
+        onLaunchAiSession={async (count, configDir) => {
+          const layoutMap: Record<number, string> = {
+            2: "split",
+            4: "quad",
+            6: "six-pack",
+            9: "full-grid",
+          };
+          if (count > 1) {
+            const layoutId = layoutMap[count] ?? "full-grid";
+            zoneLayout.setLayoutId(layoutId);
+          }
+          const isWindows = navigator.platform.startsWith("Win");
+          const cmd = isWindows
+            ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
+            : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
+          const createdTabIds: string[] = [];
+          for (let i = 0; i < count; i++) {
+            const tabId = await createAndAssignTerminal();
+            if (tabId) createdTabIds.push(tabId);
+          }
+          if (createdTabIds.length > 0) {
+            setTimeout(() => {
+              for (const tabId of createdTabIds) {
+                terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
+              }
+            }, 1500);
+          }
+        }}
+        onLaunchMultiAiSessions={async (configDirs) => {
+          const layoutMap: Record<number, string> = {
+            2: "split",
+            4: "quad",
+            6: "six-pack",
+            9: "full-grid",
+          };
+          const count = configDirs.length;
+          if (count > 1) {
+            const layoutId = layoutMap[count] ?? "full-grid";
+            zoneLayout.setLayoutId(layoutId);
+          }
+          const isWindows = navigator.platform.startsWith("Win");
+          for (let i = 0; i < count; i++) {
+            const tabId = await createAndAssignTerminal();
+            if (tabId) {
+              const cmd = isWindows
+                ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
+                : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
+              setTimeout(() => {
+                terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
+              }, 1500 + i * 300);
+            }
+          }
+        }}
+        accountUsage={sessionManager.accountUsage}
       />
       <ZoneStatusBar
         tabs={tabs}

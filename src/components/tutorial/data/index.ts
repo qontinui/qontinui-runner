@@ -30,6 +30,9 @@ import { securitySandboxingTutorial } from "./security-sandboxing";
 import { fileConflictDetectionTutorial } from "./file-conflict-detection";
 import { traceObservabilityTutorial } from "./trace-observability";
 import { nativeAccessibilityTutorial } from "./native-accessibility";
+import { diagnosticModelOverrideTutorial } from "./diagnostic-model-override";
+import { costControlTutorial } from "./cost-control";
+import { schemaValidationTutorial } from "./schema-validation";
 
 /**
  * All available tutorials
@@ -61,6 +64,9 @@ export const tutorials: Tutorial[] = [
   securitySandboxingTutorial, // Featured - AST 7-layer agent sandboxing & security
   fileConflictDetectionTutorial, // Featured - Advisory file registry for concurrent session conflict detection
   nativeAccessibilityTutorial, // Featured - Rust-native cross-platform desktop accessibility
+  diagnosticModelOverrideTutorial, // Featured - Diagnostic AI triage & model override in orchestration loop
+  costControlTutorial, // Featured - Cost optimization engine & budget tracking
+  schemaValidationTutorial, // Featured - 7-layer structured output & schema validation for AI agents
 ];
 
 /**
@@ -148,3 +154,6 @@ export { onlineLearningTutorial } from "./online-learning";
 export { securitySandboxingTutorial } from "./security-sandboxing";
 export { fileConflictDetectionTutorial } from "./file-conflict-detection";
 export { nativeAccessibilityTutorial } from "./native-accessibility";
+export { diagnosticModelOverrideTutorial } from "./diagnostic-model-override";
+export { costControlTutorial } from "./cost-control";
+export { schemaValidationTutorial } from "./schema-validation";
