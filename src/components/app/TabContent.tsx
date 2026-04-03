@@ -267,55 +267,59 @@ export function TabContent({
   switch (activeTab) {
     case "gui-automation":
       return (
-        <>
+        <div data-page-id="gui-automation" className="h-full flex flex-col">
           <PageRegistration
             id="gui-automation"
             name="Workflows"
             description="Configure and launch GUI automation workflows"
           />
           <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />
-        </>
+        </div>
       );
 
     case "workflow-queue":
       return (
-        <>
+        <div data-page-id="workflow-queue" className="h-full flex flex-col">
           <PageRegistration
             id="workflow-queue"
             name="Workflow Queue"
             description="Queue and manage multiple workflow executions"
           />
           <WorkflowQueueTab onNavigateToActive={() => setActiveTab("active")} onLog={addLog} />
-        </>
+        </div>
       );
 
     case "active":
       return (
-        <ActiveDashboardPage
-          onGoToExecute={() => setActiveTab("gui-automation")}
-          onGoToRecap={lastRun ? handleGoToRecap : undefined}
-          onRunLastWorkflow={lastRunWorkflowId ? handleRunLastWorkflow : undefined}
-          isRunningLastWorkflow={isRunningLastWorkflow}
-          lastRunWorkflowName={lastRunWorkflowName}
-          lastRunWorkflowId={lastRunWorkflowId}
-        />
+        <div data-page-id="active" className="h-full overflow-hidden">
+          <ActiveDashboardPage
+            onGoToExecute={() => setActiveTab("gui-automation")}
+            onGoToRecap={lastRun ? handleGoToRecap : undefined}
+            onRunLastWorkflow={lastRunWorkflowId ? handleRunLastWorkflow : undefined}
+            isRunningLastWorkflow={isRunningLastWorkflow}
+            lastRunWorkflowName={lastRunWorkflowName}
+            lastRunWorkflowId={lastRunWorkflowId}
+          />
+        </div>
       );
 
     case "runs":
     case "history":
       return (
-        <HistoryTab
-          onNavigateToRun={() => setActiveTab("gui-automation")}
-          onNavigateToAi={(runId) => {
-            instanceStorage.setJSON("qontinui-selected-task-run-id", runId);
-            setActiveTab("run-recap");
-          }}
-        />
+        <div data-page-id="runs" className="h-full overflow-hidden">
+          <HistoryTab
+            onNavigateToRun={() => setActiveTab("gui-automation")}
+            onNavigateToAi={(runId) => {
+              instanceStorage.setJSON("qontinui-selected-task-run-id", runId);
+              setActiveTab("run-recap");
+            }}
+          />
+        </div>
       );
 
     case "error-monitor":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="error-monitor" className="h-full overflow-hidden">
           <PageRegistration
             id="error-monitor"
             name="Error Monitor"
@@ -331,7 +335,7 @@ export function TabContent({
 
     case "processes":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="processes" className="h-full overflow-hidden">
           <PageRegistration
             id="processes"
             name="Process Manager"
@@ -343,7 +347,7 @@ export function TabContent({
 
     case "reflection":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="reflection" className="h-full overflow-hidden">
           <PageRegistration
             id="reflection"
             name="Reflection"
@@ -355,7 +359,7 @@ export function TabContent({
 
     case "observations":
       return (
-        <div className="h-full overflow-auto">
+        <div data-page-id="observations" className="h-full overflow-auto">
           <PageRegistration
             id="observations"
             name="Memory"
@@ -376,7 +380,7 @@ export function TabContent({
 
     case "activity-timeline":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="activity-timeline" className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <ActivityTimelinePanel />
           </Suspense>
@@ -385,7 +389,7 @@ export function TabContent({
 
     case "watchers":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="watchers" className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <WatcherManagementPanel />
           </Suspense>
@@ -394,42 +398,42 @@ export function TabContent({
 
     case "architecture":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="architecture" className="h-full overflow-hidden">
           <ArchitectureView />
         </div>
       );
 
     case "generator-eval":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="generator-eval" className="h-full overflow-hidden">
           <GeneratorEvalPage />
         </div>
       );
 
     case "autoresearch":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="autoresearch" className="h-full overflow-hidden">
           <AutoresearchPage />
         </div>
       );
 
     case "meta-optimizer":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="meta-optimizer" className="h-full overflow-hidden">
           <MetaOptimizerPage />
         </div>
       );
 
     case "online-learning":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="online-learning" className="h-full overflow-hidden">
           <OnlineLearningDashboard />
         </div>
       );
 
     case "skills":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="skills" className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <SkillApprovalPanel />
           </Suspense>
@@ -438,233 +442,255 @@ export function TabContent({
 
     case "orchestration-loop":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="orchestration-loop" className="h-full overflow-hidden">
           <OrchestrationLoopPanel />
         </div>
       );
 
     case "image-quality-tests":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="image-quality-tests" className="h-full overflow-hidden">
           <ImageQualityTestsPage />
         </div>
       );
 
     case "run-recap":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Recap"
-            icon={ClipboardCheck}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <RunRecapTab
-                onNavigateToAiOutput={(phase, iteration) => {
-                  instanceStorage.setJSON("qontinui-ai-output-navigate", {
-                    phase,
-                    phaseIteration: iteration,
-                  });
-                  setActiveTab("run-ai-output");
-                }}
-              />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-recap" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Recap"
+              icon={ClipboardCheck}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <RunRecapTab
+                  onNavigateToAiOutput={(phase, iteration) => {
+                    instanceStorage.setJSON("qontinui-ai-output-navigate", {
+                      phase,
+                      phaseIteration: iteration,
+                    });
+                    setActiveTab("run-ai-output");
+                  }}
+                />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-actions":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Actions"
-            icon={Zap}
-            badgeCount={actionLogViewData?.visible_count || 0}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full p-4 overflow-hidden">
-              <div className="h-full card overflow-hidden">
-                <RunActionsTab
-                  actionLogData={actionLogViewData}
-                  actionLogLoading={actionLogLoading}
-                  actionLogError={actionLogError}
-                  onActionRowClick={modalState.openActionModal}
-                  actionCount={actionLogViewData?.visible_count || 0}
-                />
+        <div data-page-id="run-actions" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Actions"
+              icon={Zap}
+              badgeCount={actionLogViewData?.visible_count || 0}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full p-4 overflow-hidden">
+                <div className="h-full card overflow-hidden">
+                  <RunActionsTab
+                    actionLogData={actionLogViewData}
+                    actionLogLoading={actionLogLoading}
+                    actionLogError={actionLogError}
+                    onActionRowClick={modalState.openActionModal}
+                    actionCount={actionLogViewData?.visible_count || 0}
+                  />
+                </div>
               </div>
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-image":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Image Recognition"
-            icon={Image}
-            badgeCount={imageLogCount}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full p-4 overflow-hidden">
-              <div className="h-full card overflow-hidden">
-                <RunImageRecognitionTab
-                  imageLogs={imageLogs}
-                  onImageRowClick={modalState.openImageModal}
-                  imageLogCount={imageLogCount}
-                />
+        <div data-page-id="run-image" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Image Recognition"
+              icon={Image}
+              badgeCount={imageLogCount}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full p-4 overflow-hidden">
+                <div className="h-full card overflow-hidden">
+                  <RunImageRecognitionTab
+                    imageLogs={imageLogs}
+                    onImageRowClick={modalState.openImageModal}
+                    imageLogCount={imageLogCount}
+                  />
+                </div>
               </div>
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-findings":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Findings"
-            icon={FileText}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <ExecutionReport />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-findings" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Findings"
+              icon={FileText}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <ExecutionReport />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-state-explorer":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="State Explorer"
-            icon={FileSearch}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <StateExplorerTab />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-state-explorer" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="State Explorer"
+              icon={FileSearch}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <StateExplorerTab />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-tests":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Test Results"
-            icon={TestTube}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <TestResultsTab />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-tests" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Test Results"
+              icon={TestTube}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <TestResultsTab />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-ai-output":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="AI Output"
-            icon={Bot}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <AiTab
-              aiOutputLines={aiOutputLogs}
-              onClearAiOutput={clearAiOutputLogs}
-              onAddAiOutputLine={(line) =>
-                addAiOutputLog(
-                  line.line,
-                  line.source,
-                  line.actionId,
-                  line.taskRunId,
-                  line.sessionId,
-                  line.sessionName,
-                  line.phase,
-                  line.phaseIteration,
-                )
-              }
-              onNavigateToLibrary={() => setActiveTab("library")}
-            />
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-ai-output" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="AI Output"
+              icon={Bot}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <AiTab
+                aiOutputLines={aiOutputLogs}
+                onClearAiOutput={clearAiOutputLogs}
+                onAddAiOutputLine={(line) =>
+                  addAiOutputLog(
+                    line.line,
+                    line.source,
+                    line.actionId,
+                    line.taskRunId,
+                    line.sessionId,
+                    line.sessionName,
+                    line.phase,
+                    line.phaseIteration,
+                  )
+                }
+                onNavigateToLibrary={() => setActiveTab("library")}
+              />
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-statistics":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Statistics"
-            icon={BarChart3}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <StatisticsTab
-                configId={execution.config?.path ?? null}
-                configName={execution.config?.name}
-              />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-statistics" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Statistics"
+              icon={BarChart3}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <StatisticsTab
+                  configId={execution.config?.path ?? null}
+                  configName={execution.config?.name}
+                />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-ai-data":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="AI Data Viewer"
-            icon={Database}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <AiDataViewerTab />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-ai-data" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="AI Data Viewer"
+              icon={Database}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <AiDataViewerTab />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "run-traces":
       return (
-        <RunSelectionProvider>
-          <RunPageLayout
-            title="Traces"
-            icon={Activity}
-            onNavigateToActive={() => setActiveTab("active")}
-          >
-            <div className="h-full overflow-hidden">
-              <TraceViewerPage />
-            </div>
-          </RunPageLayout>
-        </RunSelectionProvider>
+        <div data-page-id="run-traces" className="h-full overflow-hidden">
+          <RunSelectionProvider>
+            <RunPageLayout
+              title="Traces"
+              icon={Activity}
+              onNavigateToActive={() => setActiveTab("active")}
+            >
+              <div className="h-full overflow-hidden">
+                <TraceViewerPage />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        </div>
       );
 
     case "ai":
       return (
-        <AiTab
-          aiOutputLines={aiOutputLogs}
-          onClearAiOutput={clearAiOutputLogs}
-          onAddAiOutputLine={(line) =>
-            addAiOutputLog(
-              line.line,
-              line.source,
-              line.actionId,
-              line.taskRunId,
-              line.sessionId,
-              line.sessionName,
-              line.phase,
-              line.phaseIteration,
-            )
-          }
-          onNavigateToLibrary={() => setActiveTab("library")}
-        />
+        <div data-page-id="ai" className="h-full overflow-hidden">
+          <AiTab
+            aiOutputLines={aiOutputLogs}
+            onClearAiOutput={clearAiOutputLogs}
+            onAddAiOutputLine={(line) =>
+              addAiOutputLog(
+                line.line,
+                line.source,
+                line.actionId,
+                line.taskRunId,
+                line.sessionId,
+                line.sessionName,
+                line.phase,
+                line.phaseIteration,
+              )
+            }
+            onNavigateToLibrary={() => setActiveTab("library")}
+          />
+        </div>
       );
 
     case "logs":
       return (
-        <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
+        <div data-page-id="logs" className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
           <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
             <LogsTab
               logs={logs}
@@ -697,19 +723,19 @@ export function TabContent({
 
     case "library":
       return (
-        <>
+        <div data-page-id="library" className="h-full flex flex-col">
           <PageRegistration
             id="library"
             name="Library"
             description="Prompt library, macros, checks, shell commands, and reusable components"
           />
           <LibraryDashboard onLog={addLog} />
-        </>
+        </div>
       );
 
     case "specs":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="specs" className="h-full overflow-hidden">
           <SpecsPage
             onNavigateToWorkflowBuilder={(id) => {
               setEditWorkflowId(id);
@@ -721,35 +747,63 @@ export function TabContent({
 
     case "state-machine":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="state-machine" className="h-full overflow-hidden">
           <UIBridgeStateMachinePage />
         </div>
       );
 
     case "step-builders":
-      return <StepBuildersPage onNavigate={(id) => setActiveTab(id as MainTabId)} />;
+      return (
+        <div data-page-id="step-builders" className="h-full overflow-hidden">
+          <StepBuildersPage onNavigate={(id) => setActiveTab(id as MainTabId)} />
+        </div>
+      );
 
     case "check-builder":
-      return <ChecksPage />;
+      return (
+        <div data-page-id="check-builder" className="h-full overflow-hidden">
+          <ChecksPage />
+        </div>
+      );
 
     case "check-group-builder":
-      return <CheckGroupsPage />;
+      return (
+        <div data-page-id="check-group-builder" className="h-full overflow-hidden">
+          <CheckGroupsPage />
+        </div>
+      );
 
     case "shell-command-builder":
-      return <ShellCommandsPage />;
+      return (
+        <div data-page-id="shell-command-builder" className="h-full overflow-hidden">
+          <ShellCommandsPage />
+        </div>
+      );
 
     case "task-builder":
-      return <TasksPage />;
+      return (
+        <div data-page-id="task-builder" className="h-full overflow-hidden">
+          <TasksPage />
+        </div>
+      );
 
     case "context-builder":
-      return <ContextsPage />;
+      return (
+        <div data-page-id="context-builder" className="h-full overflow-hidden">
+          <ContextsPage />
+        </div>
+      );
 
     case "playwright-test-builder":
-      return <PlaywrightTestsPage />;
+      return (
+        <div data-page-id="playwright-test-builder" className="h-full overflow-hidden">
+          <PlaywrightTestsPage />
+        </div>
+      );
 
     case "unified-workflow-builder":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="unified-workflow-builder" className="h-full overflow-hidden">
           <PageRegistration
             id="workflow-builder"
             name="Workflow Builder"
@@ -764,21 +818,21 @@ export function TabContent({
 
     case "monitor-findings":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="monitor-findings" className="h-full overflow-hidden">
           <ExecutionReport />
         </div>
       );
 
     case "monitor-state-explorer":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="monitor-state-explorer" className="h-full overflow-hidden">
           <StateExplorerTab />
         </div>
       );
 
     case "monitor-statistics":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="monitor-statistics" className="h-full overflow-hidden">
           <StatisticsTab
             configId={execution.config?.path ?? null}
             configName={execution.config?.name}
@@ -788,42 +842,54 @@ export function TabContent({
 
     case "config-log-sources": {
       const sources = globalLogSourceSettings?.sources || [];
-      return <LogSourcesConfigTab sources={sources} onNavigate={setActiveTab} />;
+      return (
+        <div data-page-id="config-log-sources" className="h-full overflow-hidden">
+          <LogSourcesConfigTab sources={sources} onNavigate={setActiveTab} />
+        </div>
+      );
     }
 
     case "config-findings":
       return (
-        <div className="h-full overflow-y-auto">
+        <div data-page-id="config-findings" className="h-full overflow-y-auto">
           <CategoryManager onLog={addLog} />
         </div>
       );
 
     case "config-hooks":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="config-hooks" className="h-full overflow-hidden">
           <HooksManagerPanel />
         </div>
       );
 
     case "config-ui-bridge":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="config-ui-bridge" className="h-full overflow-hidden">
           <UIBridgeIntegrationPage />
         </div>
       );
 
     case "capture":
       return (
-        <div className="h-full overflow-y-auto">
+        <div data-page-id="capture" className="h-full overflow-y-auto">
           <CaptureTab onLog={addLog} />
         </div>
       );
 
     case "triggers":
-      return <TriggersTab />;
+      return (
+        <div data-page-id="triggers" className="h-full overflow-hidden">
+          <TriggersTab />
+        </div>
+      );
 
     case "tasks":
-      return <SchedulerTab />;
+      return (
+        <div data-page-id="tasks" className="h-full overflow-hidden">
+          <SchedulerTab />
+        </div>
+      );
 
     case "settings":
     case "settings-account":
@@ -866,7 +932,7 @@ export function TabContent({
       const defaultSettingsTab = settingsTabMap[activeTab] || "account";
 
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="settings" className="h-full overflow-hidden">
           <Settings
             defaultTab={defaultSettingsTab}
             onLog={addLog}
@@ -895,7 +961,7 @@ export function TabContent({
 
     case "llm-analytics":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="llm-analytics" className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <LlmObservabilityDashboard />
           </Suspense>
@@ -904,7 +970,7 @@ export function TabContent({
 
     case "cost-control":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="cost-control" className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <CostControlPanel />
           </Suspense>
@@ -913,7 +979,7 @@ export function TabContent({
 
     case "accessibility-explorer":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="accessibility-explorer" className="h-full overflow-hidden">
           <PageRegistration
             id="accessibility-explorer"
             name="Accessibility Explorer"
@@ -927,7 +993,7 @@ export function TabContent({
 
     case "evaluation":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="evaluation" className="h-full overflow-hidden">
           <Suspense fallback={<LazyFallback />}>
             <EvaluationDashboard />
           </Suspense>
@@ -939,7 +1005,7 @@ export function TabContent({
 
     case "automation-health":
       return (
-        <div className="h-full overflow-auto p-4">
+        <div data-page-id="automation-health" className="h-full overflow-auto p-4">
           <Suspense fallback={<LazyFallback />}>
             <AutomationHealthDashboard />
           </Suspense>
@@ -948,14 +1014,14 @@ export function TabContent({
 
     case "knowledge-explorer":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="knowledge-explorer" className="h-full overflow-hidden">
           <KnowledgeExplorerPage />
         </div>
       );
 
     case "decision-trail":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="decision-trail" className="h-full overflow-hidden">
           <PageRegistration
             id="decision-trail"
             name="Decision Trail"
@@ -969,14 +1035,14 @@ export function TabContent({
 
     case "event-history":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="event-history" className="h-full overflow-hidden">
           <EventHistoryPage />
         </div>
       );
 
     case "development-intelligence":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="development-intelligence" className="h-full overflow-hidden">
           <PageRegistration
             id="development-intelligence"
             name="Dev Intelligence"
@@ -990,7 +1056,7 @@ export function TabContent({
 
     case "demo-video":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="demo-video" className="h-full overflow-hidden">
           <PageRegistration
             id="demo-video"
             name="Demo Videos"
@@ -1004,7 +1070,7 @@ export function TabContent({
 
     case "product-tours":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="product-tours" className="h-full overflow-hidden">
           <PageRegistration
             id="product-tours"
             name="Product Tours"
@@ -1018,7 +1084,7 @@ export function TabContent({
 
     case "session-recap":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="session-recap" className="h-full overflow-hidden">
           <PageRegistration
             id="session-recap"
             name="Session Recap"
@@ -1032,7 +1098,7 @@ export function TabContent({
 
     case "api-surface":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="api-surface" className="h-full overflow-hidden">
           <PageRegistration
             id="api-surface"
             name="API Surface Map"
@@ -1046,7 +1112,7 @@ export function TabContent({
 
     case "memory-search":
       return (
-        <div className="h-full overflow-hidden">
+        <div data-page-id="memory-search" className="h-full overflow-hidden">
           <PageRegistration
             id="memory-search"
             name="Memory Search"
@@ -1060,14 +1126,14 @@ export function TabContent({
 
     case "help":
       return (
-        <>
+        <div data-page-id="help" className="h-full flex flex-col">
           <PageRegistration
             id="help"
             name="Help"
             description="Tutorials, documentation, and getting started guides"
           />
           <HelpTab />
-        </>
+        </div>
       );
 
     default:
