@@ -60,7 +60,7 @@ function DAGView({ result }: { result: MultiAgentPipelineResult }) {
         DAG Levels ({dag.levels.length} levels, {dag.roots.length} roots)
       </div>
       {dag.levels.map((level, i) => (
-        <div key={`level-${i}`} className="flex items-center gap-2">
+        <div key={level[0] ?? `level-${i}`} className="flex items-center gap-2">
           <span className="text-xs text-zinc-600 w-8 shrink-0">L{i}</span>
           <div className="flex gap-1 flex-wrap">
             {level.map((criterionId) => {
@@ -206,8 +206,8 @@ export function PipelineTraceView({ result }: Props) {
             </tr>
           </thead>
           <tbody>
-            {result.agent_traces.map((t, i) => (
-              <TraceRow key={`${t.agent_id}-${i}`} trace={t} />
+            {result.agent_traces.map((t) => (
+              <TraceRow key={t.run_id} trace={t} />
             ))}
           </tbody>
         </table>

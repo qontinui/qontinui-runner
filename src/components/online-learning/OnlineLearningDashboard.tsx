@@ -304,9 +304,9 @@ function OverviewTab({
             Active Drift Signals
           </h3>
           <div className="space-y-1">
-            {driftSignals.slice(0, 5).map((s, i) => (
+            {driftSignals.slice(0, 5).map((s) => (
               <div
-                key={i}
+                key={s.id}
                 className="text-xs text-white/60 flex items-center gap-2"
               >
                 <span
@@ -335,9 +335,9 @@ function OverviewTab({
             Model Routing Policy (Top Contexts)
           </h3>
           <div className="grid grid-cols-2 gap-2">
-            {routingState.policy.slice(0, 8).map((p, i) => (
+            {routingState.policy.slice(0, 8).map((p) => (
               <div
-                key={i}
+                key={p.context_key}
                 className="flex items-center justify-between bg-white/[0.03] rounded px-3 py-2"
               >
                 <span className="text-xs text-white/60 truncate max-w-[60%]">
@@ -364,8 +364,8 @@ function OverviewTab({
             Step Type Credit Scorecard
           </h3>
           <div className="space-y-1.5">
-            {scorecard.slice(0, 6).map((s, i) => (
-              <div key={i} className="flex items-center gap-3">
+            {scorecard.slice(0, 6).map((s) => (
+              <div key={s.step_type} className="flex items-center gap-3">
                 <span className="text-xs text-white/60 w-32 truncate">
                   {s.step_type}
                 </span>
@@ -431,9 +431,9 @@ function ModelRoutingTab({
             <tbody>
               {routingTable
                 .sort((a, b) => b.q_value - a.q_value)
-                .map((row, i) => (
+                .map((row) => (
                   <tr
-                    key={i}
+                    key={`${row.context_key}-${row.model_id}`}
                     className="border-t border-white/5 hover:bg-white/[0.02]"
                   >
                     <td className="px-3 py-1.5 text-white/60 font-mono">
@@ -500,9 +500,9 @@ function DriftTab({
               </tr>
             </thead>
             <tbody>
-              {driftSignals.map((s, i) => (
+              {driftSignals.map((s) => (
                 <tr
-                  key={i}
+                  key={s.id}
                   className="border-t border-white/5 hover:bg-white/[0.02]"
                 >
                   <td className="px-3 py-1.5">
@@ -563,9 +563,9 @@ function CreditsTab({ scorecard }: { scorecard: StepScorecard[] }) {
               </tr>
             </thead>
             <tbody>
-              {scorecard.map((s, i) => (
+              {scorecard.map((s) => (
                 <tr
-                  key={i}
+                  key={s.step_type}
                   className="border-t border-white/5 hover:bg-white/[0.02]"
                 >
                   <td className="px-3 py-1.5 text-white/70">{s.step_type}</td>

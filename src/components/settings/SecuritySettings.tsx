@@ -235,8 +235,9 @@ function CustomProfileEditor({
         <div className="space-y-2">
           <h5 className="text-xs font-medium text-neutral-300">Network</h5>
           <div className="flex gap-2 items-center">
-            <label className="text-[10px] text-neutral-500 w-14">Mode</label>
+            <label htmlFor="security-network-mode" className="text-[10px] text-neutral-500 w-14">Mode</label>
             <select
+              id="security-network-mode"
               value={p.network.mode}
               onChange={(e) => updateNetwork({ mode: e.target.value })}
               className="flex-1 px-2 py-1 text-[11px] bg-neutral-700/50 text-white border border-neutral-600/50 rounded outline-none"
@@ -285,8 +286,9 @@ function CustomProfileEditor({
             <span className="text-[10px] text-neutral-400">Block destructive commands</span>
           </div>
           <div className="space-y-1">
-            <label className="text-[10px] text-neutral-500">Blocked command patterns (regex, one per line)</label>
+            <label htmlFor="security-blocked-commands" className="text-[10px] text-neutral-500">Blocked command patterns (regex, one per line)</label>
             <textarea
+              id="security-blocked-commands"
               value={p.actions.blocked_commands.join("\n")}
               onChange={(e) => updateActions({ blocked_commands: e.target.value.split("\n").filter(Boolean) })}
               rows={2}
@@ -307,8 +309,9 @@ function CustomProfileEditor({
             <span className="text-[10px] text-neutral-400">Read-only root filesystem</span>
           </div>
           <div className="space-y-1">
-            <label className="text-[10px] text-neutral-500">Denied paths (glob, one per line)</label>
+            <label htmlFor="security-denied-paths" className="text-[10px] text-neutral-500">Denied paths (glob, one per line)</label>
             <textarea
+              id="security-denied-paths"
               value={p.filesystem.denied_paths.join("\n")}
               onChange={(e) => updateFilesystem({ denied_paths: e.target.value.split("\n").filter(Boolean) })}
               rows={2}
@@ -323,8 +326,9 @@ function CustomProfileEditor({
           <h5 className="text-xs font-medium text-neutral-300">Resources</h5>
           <div className="grid grid-cols-2 gap-2">
             <div className="space-y-0.5">
-              <label className="text-[10px] text-neutral-500">CPU limit (cores)</label>
+              <label htmlFor="security-cpu-limit" className="text-[10px] text-neutral-500">CPU limit (cores)</label>
               <input
+                id="security-cpu-limit"
                 type="number" step="0.5" min="0.5" max="16"
                 value={p.resources.cpu_limit ?? ""}
                 onChange={(e) => updateResources({ cpu_limit: e.target.value ? parseFloat(e.target.value) : null })}
@@ -333,8 +337,9 @@ function CustomProfileEditor({
               />
             </div>
             <div className="space-y-0.5">
-              <label className="text-[10px] text-neutral-500">Memory (MB)</label>
+              <label htmlFor="security-memory-limit" className="text-[10px] text-neutral-500">Memory (MB)</label>
               <input
+                id="security-memory-limit"
                 type="number" min="64" max="32768"
                 value={p.resources.memory_limit_mb ?? ""}
                 onChange={(e) => updateResources({ memory_limit_mb: e.target.value ? parseInt(e.target.value) : null })}
@@ -343,8 +348,9 @@ function CustomProfileEditor({
               />
             </div>
             <div className="space-y-0.5">
-              <label className="text-[10px] text-neutral-500">PID limit</label>
+              <label htmlFor="security-pids-limit" className="text-[10px] text-neutral-500">PID limit</label>
               <input
+                id="security-pids-limit"
                 type="number" min="16" max="4096"
                 value={p.resources.pids_limit ?? ""}
                 onChange={(e) => updateResources({ pids_limit: e.target.value ? parseInt(e.target.value) : null })}
