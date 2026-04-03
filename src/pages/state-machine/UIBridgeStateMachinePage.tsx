@@ -227,6 +227,22 @@ export function UIBridgeStateMachinePage() {
     showToast,
   });
 
+  // Handle static analysis import event from discovery panel
+  useEffect(() => {
+    const handleStaticImport = async (e: Event) => {
+      const detail = (e as CustomEvent).detail as { name: string; config: unknown; stateCount: number; transitionCount: number };
+      try {
+        await sm.importConfig(detail.name, detail.config as any);
+        showToast(`Imported static state machine: ${detail.stateCount} states, ${detail.transitionCount} transitions`, "success");
+        setActiveTab("graph");
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : "Import failed", "error");
+      }
+    };
+    window.addEventListener("sm-import-static", handleStaticImport);
+    return () => window.removeEventListener("sm-import-static", handleStaticImport);
+  }, [sm, showToast]);
+
   // When discovery creates a config, select it and switch to graph
   const handleConfigCreated = useCallback(
     async (configId: string) => {

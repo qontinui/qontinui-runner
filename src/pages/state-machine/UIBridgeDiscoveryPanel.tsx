@@ -11,6 +11,8 @@ import { useState, useCallback, useEffect } from "react";
 import {
   Compass,
   Camera,
+  Code2,
+  FolderOpen,
   Loader2,
   CheckCircle2,
   Save,
@@ -36,7 +38,10 @@ export function UIBridgeDiscoveryPanel({
   discovery,
   onConfigCreated,
 }: UIBridgeDiscoveryPanelProps) {
-  const [collectTab, setCollectTab] = useState<"explore" | "record">("explore");
+  const [collectTab, setCollectTab] = useState<"explore" | "record" | "analyze">("explore");
+  const [analyzeProjectPath, setAnalyzeProjectPath] = useState("");
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
 
   // App discovery and SDK connection
   const appDiscovery = useAppDiscovery();
@@ -121,6 +126,91 @@ export function UIBridgeDiscoveryPanel({
       await onConfigCreated(configId);
     }
   }, [discovery, onConfigCreated]);
+
+  // Static analysis handler — loads a pre-generated state machine JSON
+  // produced by the ui-bridge-auto static builder and imports it as a config.
+  const handleAnalyzeImport = useCallback(async () => {
+    setAnalyzeError(null);
+
+    // Use a hidden file input to pick the JSON file
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json";
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+
+      setIsAnalyzing(true);
+      try {
+        const text = await file.text();
+        const data = JSON.parse(text);
+
+        // Validate — expect PersistedStateMachine format from the static builder
+        if (!data.states || !Array.isArray(data.states) || !data.transitions) {
+          throw new Error("Invalid state machine JSON — expected states[] and transitions[]");
+        }
+
+        // Convert to StateMachineExportFormat for import
+        const exportFormat = {
+          states: Object.fromEntries(
+            data.states.map((s: { id: string; name: string; requiredElements?: unknown[]; [key: string]: unknown }) => [
+              s.id,
+              {
+                ...s,
+                elements: (s.requiredElements ?? []).map((el: unknown) => ({
+                  element_query: el,
+                })),
+                required_element_queries: s.requiredElements ?? [],
+              },
+            ]),
+          ),
+          transitions: Object.fromEntries(
+            data.transitions.map((t: { id: string; name: string; [key: string]: unknown }) => [
+              t.id,
+              { ...t },
+            ]),
+          ),
+          config: {
+            source: "static-analysis",
+            generated_at: data.createdAt ?? Date.now(),
+            version: data.version ?? "1.0.0",
+          },
+        };
+
+        const timestamp = new Date().toLocaleString("en-US", {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        const configName = `Static Analysis — ${timestamp}`;
+
+        // Import using the existing config import mechanism
+        // Access smConfig through the discovery prop's parent
+        const resp = await fetch("/api/state-machine/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: configName, config: exportFormat }),
+        });
+
+        // If API import isn't available, fall back to dispatchEvent for the parent to handle
+        if (!resp.ok) {
+          // Dispatch an event that the parent page can pick up
+          window.dispatchEvent(
+            new CustomEvent("sm-import-static", {
+              detail: { name: configName, config: exportFormat, stateCount: data.states.length, transitionCount: data.transitions.length },
+            }),
+          );
+        }
+
+        setIsAnalyzing(false);
+      } catch (err) {
+        setAnalyzeError(err instanceof Error ? err.message : "Failed to import");
+        setIsAnalyzing(false);
+      }
+    };
+    input.click();
+  }, []);
 
   // State checks
   const hasData = discovery.cooccurrenceData !== null;
@@ -210,12 +300,24 @@ export function UIBridgeDiscoveryPanel({
             </p>
           </div>
 
-          {/* Collection tabs — only when connected */}
-          <div className={isConnected ? "" : "hidden"}>
+          {/* Collection tabs — Analyze always visible, Explore/Record when connected */}
+          <div>
             <div className="inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground">
               <button
-                onClick={() => setCollectTab("explore")}
+                onClick={() => setCollectTab("analyze")}
                 className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
+                  collectTab === "analyze"
+                    ? "bg-background shadow-xs text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Code2 className="size-3.5" />
+                Analyze Source
+              </button>
+              <button
+                onClick={() => setCollectTab("explore")}
+                disabled={!isConnected}
+                className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] disabled:opacity-40 ${
                   collectTab === "explore"
                     ? "bg-background shadow-xs text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -226,7 +328,8 @@ export function UIBridgeDiscoveryPanel({
               </button>
               <button
                 onClick={() => setCollectTab("record")}
-                className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
+                disabled={!isConnected}
+                className={`inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] disabled:opacity-40 ${
                   collectTab === "record"
                     ? "bg-background shadow-xs text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -235,6 +338,53 @@ export function UIBridgeDiscoveryPanel({
                 <Camera className="size-3.5" />
                 Record
               </button>
+            </div>
+
+            {/* Analyze Source tab */}
+            <div className={`mt-3 ${collectTab !== "analyze" ? "hidden" : ""}`}>
+              <div className="rounded-lg border border-border-primary bg-surface-secondary p-4 space-y-3">
+                <p className="text-sm text-text-muted">
+                  Import a state machine generated from static source code analysis. Use the{" "}
+                  <code className="text-xs bg-muted px-1 py-0.5 rounded">ui-bridge-auto</code>{" "}
+                  static builder to analyze your React project and produce a state machine JSON file.
+                </p>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleAnalyzeImport}
+                    disabled={isAnalyzing}
+                    className="inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-brand-primary text-white hover:bg-brand-primary/90 disabled:opacity-50"
+                  >
+                    {isAnalyzing ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <FolderOpen className="size-3.5" />
+                    )}
+                    {isAnalyzing ? "Importing..." : "Import State Machine JSON"}
+                  </button>
+                </div>
+
+                {analyzeError && (
+                  <div className="text-xs text-red-400 bg-red-500/10 p-2 rounded">{analyzeError}</div>
+                )}
+
+                <div className="text-xs text-text-muted space-y-1 border-t border-border-primary pt-3">
+                  <p className="font-medium">How to generate:</p>
+                  <ol className="list-decimal list-inside space-y-0.5 ml-1">
+                    <li>
+                      Install: <code className="bg-muted px-1 py-0.5 rounded">npm install @qontinui/ui-bridge-auto</code>
+                    </li>
+                    <li>
+                      Create a build script that calls <code className="bg-muted px-1 py-0.5 rounded">buildStateMachine()</code>{" "}
+                      with your project config
+                    </li>
+                    <li>
+                      Output the result with <code className="bg-muted px-1 py-0.5 rounded">emitPersistedStateMachineJSON()</code>
+                    </li>
+                    <li>Import the generated JSON file here</li>
+                  </ol>
+                </div>
+              </div>
             </div>
 
             {/* Explore tab */}
