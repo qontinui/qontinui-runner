@@ -131,7 +131,7 @@ pub async fn get_active_budget_status(
     let trackers = state.run_cost_trackers.lock().await;
 
     // Return the first active run's status (most common case: single run)
-    for (execution_id, t) in trackers.iter() {
+    if let Some((execution_id, t)) = trackers.iter().next() {
         let snapshot = t.budget.snapshot();
         let remaining = t.budget.remaining_fraction();
         let (anomaly_count, anomaly_mean) = match t.anomaly_detector.lock() {
@@ -139,7 +139,7 @@ pub async fn get_active_budget_status(
             Err(_) => (0, 0.0),
         };
 
-        return Ok(Some(ActiveBudgetStatus {
+        Ok(Some(ActiveBudgetStatus {
             execution_id: execution_id.clone(),
             total_cost_usd: snapshot.total_cost_usd,
             max_cost_usd: snapshot.max_cost_usd,
@@ -149,8 +149,8 @@ pub async fn get_active_budget_status(
             circuit_breaker_tripped: t.circuit_breaker.is_tripped(),
             anomaly_detector_sample_count: anomaly_count,
             anomaly_detector_mean: anomaly_mean,
-        }));
+        }))
+    } else {
+        Ok(None)
     }
-
-    Ok(None)
 }
