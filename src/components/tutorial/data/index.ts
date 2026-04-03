@@ -25,6 +25,10 @@ import { proceduralSkillsTutorial } from "./procedural-skills";
 import { qLearningRouterTutorial } from "./q-learning-router";
 import { prmTrainingPipelineTutorial } from "./prm-training-pipeline";
 import { adaptiveLearningTutorial } from "./adaptive-learning";
+import { onlineLearningTutorial } from "./online-learning";
+import { securitySandboxingTutorial } from "./security-sandboxing";
+import { fileConflictDetectionTutorial } from "./file-conflict-detection";
+import { traceObservabilityTutorial } from "./trace-observability";
 
 /**
  * All available tutorials
@@ -45,12 +49,16 @@ export const tutorials: Tutorial[] = [
   blameAttributionTutorial, // Featured - Blame attribution & convergence
   multimodalVisionTutorial, // Featured - Multimodal vision pipeline
   traceAnalysisTutorial, // Featured - Trace analysis & critical path
+  traceObservabilityTutorial, // Featured - Token overlay, agent graph, replay, minimap, GenAI
   activityTimelineTutorial, // Featured - Screenpipe-inspired capture history & watchers
   metaPromptOptimizerTutorial, // Featured - LLM-based prompt rewriting with canary A/B testing
   proceduralSkillsTutorial, // Featured - Hermes-agent-inspired self-improving procedural memory
   qLearningRouterTutorial, // Featured - Q-learning architecture routing for autoresearch
   prmTrainingPipelineTutorial, // Featured - PRM training pipeline (Plan 14)
   adaptiveLearningTutorial, // Featured - Adaptive learning & prompt evolution (Plan 15)
+  onlineLearningTutorial, // Featured - Online/continual learning with bandit routing & drift detection
+  securitySandboxingTutorial, // Featured - AST 7-layer agent sandboxing & security
+  fileConflictDetectionTutorial, // Featured - Advisory file registry for concurrent session conflict detection
 ];
 
 /**
@@ -134,3 +142,6 @@ export { metaPromptOptimizerTutorial } from "./meta-prompt-optimizer";
 export { qLearningRouterTutorial } from "./q-learning-router";
 export { prmTrainingPipelineTutorial } from "./prm-training-pipeline";
 export { adaptiveLearningTutorial } from "./adaptive-learning";
+export { onlineLearningTutorial } from "./online-learning";
+export { securitySandboxingTutorial } from "./security-sandboxing";
+export { fileConflictDetectionTutorial } from "./file-conflict-detection";
