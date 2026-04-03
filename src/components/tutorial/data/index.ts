@@ -29,6 +29,7 @@ import { onlineLearningTutorial } from "./online-learning";
 import { securitySandboxingTutorial } from "./security-sandboxing";
 import { fileConflictDetectionTutorial } from "./file-conflict-detection";
 import { traceObservabilityTutorial } from "./trace-observability";
+import { nativeAccessibilityTutorial } from "./native-accessibility";
 
 /**
  * All available tutorials
@@ -59,6 +60,7 @@ export const tutorials: Tutorial[] = [
   onlineLearningTutorial, // Featured - Online/continual learning with bandit routing & drift detection
   securitySandboxingTutorial, // Featured - AST 7-layer agent sandboxing & security
   fileConflictDetectionTutorial, // Featured - Advisory file registry for concurrent session conflict detection
+  nativeAccessibilityTutorial, // Featured - Rust-native cross-platform desktop accessibility
 ];
 
 /**
@@ -145,3 +147,4 @@ export { adaptiveLearningTutorial } from "./adaptive-learning";
 export { onlineLearningTutorial } from "./online-learning";
 export { securitySandboxingTutorial } from "./security-sandboxing";
 export { fileConflictDetectionTutorial } from "./file-conflict-detection";
+export { nativeAccessibilityTutorial } from "./native-accessibility";
