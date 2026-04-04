@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Plus, X } from "lucide-react";
+import { Plus, X, Shuffle } from "lucide-react";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
 interface TerminalPageTabBarProps {
@@ -9,6 +9,7 @@ interface TerminalPageTabBarProps {
   onAddPage: (name: string) => void;
   onRemovePage: (id: string) => void;
   onRenamePage: (id: string, name: string) => void;
+  onReorganize?: () => void;
 }
 
 export function TerminalPageTabBar({
@@ -18,6 +19,7 @@ export function TerminalPageTabBar({
   onAddPage,
   onRemovePage,
   onRenamePage,
+  onReorganize,
 }: TerminalPageTabBarProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -125,6 +127,15 @@ export function TerminalPageTabBar({
       >
         <Plus className="w-3 h-3" />
       </button>
+      {pages.length >= 2 && onReorganize && (
+        <button
+          onClick={onReorganize}
+          className="flex items-center gap-0.5 px-1.5 py-1 rounded text-[10px] text-[#565f89] hover:text-[#bb9af7] hover:bg-[#bb9af7]/10 transition-colors"
+          title="Reorganize pages by topic (AI)"
+        >
+          <Shuffle className="w-3 h-3" />
+        </button>
+      )}
     </div>
   );
 }

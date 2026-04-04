@@ -294,3 +294,97 @@ pub fn terminal_cleanup_scrollback(
         data: Some(serde_json::json!({ "deleted": deleted })),
     })
 }
+
+/// Collect session metadata across terminal pages for AI analysis.
+///
+/// Returns structured data per session including title, working directory,
+/// scrollback preview (last lines), and page association. Used by the
+/// session reorganization feature.
+#[tauri::command]
+pub fn terminal_collect_session_metadata(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    page_ids: Vec<String>,
+    max_scrollback_lines: Option<usize>,
+) -> Result<CommandResponse, String> {
+    let max_lines = max_scrollback_lines.unwrap_or(20);
+    let terminals = terminal_manager.list();
+
+    let mut sessions = Vec::new();
+
+    for term in &terminals {
+        let page = &term.page_id;
+        if !page_ids.contains(page) {
+            continue;
+        }
+
+        // Get scrollback preview
+        let scrollback_preview = if let Some(session) = terminal_manager.get(&term.id) {
+            let (data, _offset) = session.get_scrollback_buffer();
+            // Decode and extract last N lines
+            let text = String::from_utf8_lossy(&data);
+            // Strip ANSI escape codes for readability
+            let clean: String = strip_ansi(&text);
+            let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+            let start = lines.len().saturating_sub(max_lines);
+            lines[start..].join("\n")
+        } else {
+            String::new()
+        };
+
+        sessions.push(serde_json::json!({
+            "id": term.id,
+            "title": term.title,
+            "page_id": page,
+            "working_dir": term.working_dir,
+            "is_alive": term.is_alive,
+            "pid": term.pid,
+            "created_at": term.created_at,
+            "total_bytes_produced": term.total_bytes_produced,
+            "scrollback_preview": scrollback_preview,
+        }));
+    }
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "sessions": sessions,
+            "page_ids": page_ids,
+        })),
+    })
+}
+
+/// Strip ANSI escape sequences from text for readable scrollback previews.
+fn strip_ansi(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip CSI sequences: ESC [ ... letter
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            // Skip OSC sequences: ESC ] ... BEL
+            } else if chars.peek() == Some(&']') {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '\x07' {
+                        break;
+                    }
+                }
+            } else {
+                // Skip next char (two-char escape)
+                chars.next();
+            }
+        } else if ch >= ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
+            result.push(ch);
+        }
+    }
+    result
+}

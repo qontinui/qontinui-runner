@@ -58,6 +58,7 @@ import { TerminalPage } from "./components/terminal";
 import { TerminalPageTabBar } from "./components/terminal/TerminalPageTabBar";
 import { useTerminalPages } from "./components/terminal/useTerminalPages";
 import { TerminalPageProvider } from "./components/terminal/TerminalPageContext";
+import { ReorganizeDialog, type ReorganizePlan } from "./components/terminal/ReorganizeDialog";
 import { PerformanceOverlay } from "./components/dev";
 import { CommandPalette } from "./components/unified-search/CommandPalette";
 import { useTaskRuns } from "./hooks/useAiData";
@@ -124,6 +125,28 @@ function AppContent() {
   } = useAppNavigation();
 
   const terminalPages = useTerminalPages();
+  const [showReorganize, setShowReorganize] = useState(false);
+
+  const handleReorganize = useCallback(
+    async (plan: ReorganizePlan) => {
+      // Create new pages for each group
+      for (const group of plan.pages) {
+        // Check if a page with this name already exists
+        const existing = terminalPages.pages.find((p) => p.name === group.name);
+        if (!existing) {
+          terminalPages.addPage(group.name);
+        }
+      }
+
+      // For now, just rename existing pages to match the AI proposal.
+      // Full session moving (close/recreate terminals) requires terminal manager
+      // access which is page-scoped. Rename is the safe first step.
+      for (let i = 0; i < plan.pages.length && i < terminalPages.pages.length; i++) {
+        terminalPages.renamePage(terminalPages.pages[i].id, plan.pages[i].name);
+      }
+    },
+    [terminalPages],
+  );
 
   const {
     isRunningLastWorkflow,
@@ -415,7 +438,18 @@ function AppContent() {
                   onAddPage={terminalPages.addPage}
                   onRemovePage={terminalPages.removePage}
                   onRenamePage={terminalPages.renamePage}
+                  onReorganize={() => setShowReorganize(true)}
                 />
+                {showReorganize && (
+                  <ReorganizeDialog
+                    pages={terminalPages.pages}
+                    onClose={() => setShowReorganize(false)}
+                    onApply={async (plan) => {
+                      await handleReorganize(plan);
+                      setShowReorganize(false);
+                    }}
+                  />
+                )}
                 <div className="flex-1 min-h-0">
                   <TerminalPageProvider value={terminalPages.activePageId}>
                     <TerminalPage

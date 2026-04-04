@@ -1142,6 +1142,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_save_scrollback,
             commands::terminal::terminal_get_saved_scrollback,
             commands::terminal::terminal_cleanup_scrollback,
+            commands::terminal::terminal_collect_session_metadata,
             // Runner instance management commands (dev feature)
             commands::instances::get_runner_instances,
             commands::instances::save_runner_instance,
