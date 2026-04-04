@@ -614,7 +614,7 @@ export function TerminalPage({
               : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
           // Smart tab naming: use custom command or account label
           const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-          const label = customCmd ?? (dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude");
+          const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
           const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
             const tabId = await createAndAssignTerminal(label);
@@ -655,8 +655,9 @@ export function TerminalPage({
           const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
             const customCmd = cmds[configDirs[i]];
-            const dirName = configDirs[i].replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
-            const label = customCmd ?? (dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude");
+            const dirName =
+              configDirs[i].replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+            const label = customCmd ?? dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude";
             const tabId = await createAndAssignTerminal(label);
             if (tabId) {
               createdTabIds.push(tabId);

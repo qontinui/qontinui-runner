@@ -690,7 +690,10 @@ export function TabContent({
 
     case "logs":
       return (
-        <div data-page-id="logs" className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
+        <div
+          data-page-id="logs"
+          className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden"
+        >
           <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
             <LogsTab
               logs={logs}

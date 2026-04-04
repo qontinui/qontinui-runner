@@ -112,8 +112,7 @@ export function LaunchMenu({
   const bestAccount = sortedAccounts.length > 0 ? sortedAccounts[0] : null;
   const hasAccounts = accountUsage.length > 0;
 
-  const getCustomCommand = (configDir: string): string | undefined =>
-    launchCommands?.[configDir];
+  const getCustomCommand = (configDir: string): string | undefined => launchCommands?.[configDir];
 
   const ctx = sessionContext.trim() || undefined;
 
@@ -171,22 +170,26 @@ export function LaunchMenu({
           <SectionHeader>AI Session</SectionHeader>
 
           {/* Active file locks summary */}
-          {fileLocks && fileLocks.length > 0 && (() => {
-            const byHolder = new Map<string, number>();
-            for (const lock of fileLocks) {
-              byHolder.set(lock.holder_name, (byHolder.get(lock.holder_name) ?? 0) + 1);
-            }
-            return (
-              <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] text-[#e0af68] bg-[#e0af68]/5 border-b border-[#2a2d3d]">
-                <Lock className="w-3 h-3 shrink-0" />
-                <span>
-                  {Array.from(byHolder.entries()).map(([name, count]) =>
-                    `${count} file${count > 1 ? "s" : ""} locked by ${name}`
-                  ).join(", ")}
-                </span>
-              </div>
-            );
-          })()}
+          {fileLocks &&
+            fileLocks.length > 0 &&
+            (() => {
+              const byHolder = new Map<string, number>();
+              for (const lock of fileLocks) {
+                byHolder.set(lock.holder_name, (byHolder.get(lock.holder_name) ?? 0) + 1);
+              }
+              return (
+                <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] text-[#e0af68] bg-[#e0af68]/5 border-b border-[#2a2d3d]">
+                  <Lock className="w-3 h-3 shrink-0" />
+                  <span>
+                    {Array.from(byHolder.entries())
+                      .map(
+                        ([name, count]) => `${count} file${count > 1 ? "s" : ""} locked by ${name}`,
+                      )
+                      .join(", ")}
+                  </span>
+                </div>
+              );
+            })()}
 
           {/* Session context / initial instructions */}
           <div className="px-3 py-1.5 border-b border-[#2a2d3d]">
@@ -245,9 +248,7 @@ export function LaunchMenu({
                 <span className="flex-1 text-left truncate">
                   {extractLabel(account.config_dir)}
                   {cmd && (
-                    <span className="ml-1.5 text-[10px] text-[#565f89] font-mono">
-                      {cmd}
-                    </span>
+                    <span className="ml-1.5 text-[10px] text-[#565f89] font-mono">{cmd}</span>
                   )}
                 </span>
                 <UtilizationBar utilization={account.utilization} />
@@ -264,7 +265,9 @@ export function LaunchMenu({
                 <span className="text-left">Round-robin accounts</span>
                 <CountButtons
                   counts={[2, 4, 6]}
-                  onSelect={(c) => fire(() => onCreateMultiAiSessions(distributeRoundRobin(c), ctx))}
+                  onSelect={(c) =>
+                    fire(() => onCreateMultiAiSessions(distributeRoundRobin(c), ctx))
+                  }
                 />
               </div>
             </>

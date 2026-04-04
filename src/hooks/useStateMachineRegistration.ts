@@ -84,30 +84,41 @@ function createRegistryAdapter(): RegistryLike {
   const registry = getGlobalRegistry() as any;
   return {
     getAllElements() {
-      return registry.getAllElements().map((el: { id: string; element: HTMLElement; type: string; label?: string; getState: () => Record<string, unknown>; getIdentifier: () => Record<string, string | undefined> }) => ({
-        id: el.id,
-        element: el.element,
-        type: el.type,
-        label: el.label,
-        getState: () => {
-          const s = el.getState();
-          return {
-            visible: s.visible,
-            enabled: s.enabled,
-            focused: s.focused,
-            checked: s.checked,
-            textContent: s.textContent,
-            value: s.value,
-            rect: s.rect,
-          };
-        },
-        getIdentifier: el.getIdentifier
-          ? () => {
-              const ident = el.getIdentifier();
-              return { selector: ident.selector, xpath: ident.xpath, htmlId: ident.htmlId };
-            }
-          : undefined,
-      }));
+      return registry
+        .getAllElements()
+        .map(
+          (el: {
+            id: string;
+            element: HTMLElement;
+            type: string;
+            label?: string;
+            getState: () => Record<string, unknown>;
+            getIdentifier: () => Record<string, string | undefined>;
+          }) => ({
+            id: el.id,
+            element: el.element,
+            type: el.type,
+            label: el.label,
+            getState: () => {
+              const s = el.getState();
+              return {
+                visible: s.visible,
+                enabled: s.enabled,
+                focused: s.focused,
+                checked: s.checked,
+                textContent: s.textContent,
+                value: s.value,
+                rect: s.rect,
+              };
+            },
+            getIdentifier: el.getIdentifier
+              ? () => {
+                  const ident = el.getIdentifier();
+                  return { selector: ident.selector, xpath: ident.xpath, htmlId: ident.htmlId };
+                }
+              : undefined,
+          }),
+        );
     },
     on(type, listener) {
       return registry.on(type, listener as (...args: unknown[]) => void);
@@ -160,7 +171,7 @@ function buildEngineAdapter(engine: AutomationEngine): StateMachineAPI {
     getTransitions: () => allTransitions(),
     getState: (id) => {
       const resolved = resolveStateId(id);
-      return resolved ? allDefs().find((d) => d.id === resolved) ?? null : null;
+      return resolved ? (allDefs().find((d) => d.id === resolved) ?? null) : null;
     },
     getGroups: () => [],
 
@@ -282,7 +293,12 @@ function createAndRegisterEngine(
         const states = (data.states ?? []) as StateDefinition[];
         const transitions = (data.transitions ?? []) as TransitionDefinition[];
         const newEngine = createAndRegisterEngine(states, transitions, engine);
-        return { success: true, states: states.length, transitions: transitions.length, active: Array.from(newEngine.getActiveStates()) };
+        return {
+          success: true,
+          states: states.length,
+          transitions: transitions.length,
+          active: Array.from(newEngine.getActiveStates()),
+        };
       } catch (e) {
         return { success: false, error: String(e) };
       }

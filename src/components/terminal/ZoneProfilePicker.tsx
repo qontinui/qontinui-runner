@@ -118,7 +118,9 @@ export function ZoneProfilePicker({
       setActiveProfileName(active);
       setLoaded(true);
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [pageId]);
 
   useEffect(() => {
@@ -172,28 +174,46 @@ export function ZoneProfilePicker({
     saveActiveProfileToDb(name, pageId);
     setShowSaveInput(false);
     setSaveName("");
-  }, [saveName, profileNames.length, profiles, zoneAssignments, tabs, currentLayoutId, zoneLabels, zoneNotes, pinnedZones, autoApprovePatterns, pageId]);
+  }, [
+    saveName,
+    profileNames.length,
+    profiles,
+    zoneAssignments,
+    tabs,
+    currentLayoutId,
+    zoneLabels,
+    zoneNotes,
+    pinnedZones,
+    autoApprovePatterns,
+    pageId,
+  ]);
 
-  const handleLoad = useCallback((name: string) => {
-    const profile = profiles[name];
-    if (profile) {
-      onLoadProfile(profile);
-      setActiveProfileName(name);
-      saveActiveProfileToDb(name, pageId);
-      setOpen(false);
-    }
-  }, [profiles, onLoadProfile, pageId]);
+  const handleLoad = useCallback(
+    (name: string) => {
+      const profile = profiles[name];
+      if (profile) {
+        onLoadProfile(profile);
+        setActiveProfileName(name);
+        saveActiveProfileToDb(name, pageId);
+        setOpen(false);
+      }
+    },
+    [profiles, onLoadProfile, pageId],
+  );
 
-  const handleDelete = useCallback((name: string) => {
-    const updated = { ...profiles };
-    delete updated[name];
-    setProfiles(updated);
-    saveProfilesToDb(updated, pageId);
-    if (activeProfileName === name) {
-      setActiveProfileName(null);
-      saveActiveProfileToDb(null, pageId);
-    }
-  }, [profiles, activeProfileName, pageId]);
+  const handleDelete = useCallback(
+    (name: string) => {
+      const updated = { ...profiles };
+      delete updated[name];
+      setProfiles(updated);
+      saveProfilesToDb(updated, pageId);
+      if (activeProfileName === name) {
+        setActiveProfileName(null);
+        saveActiveProfileToDb(null, pageId);
+      }
+    },
+    [profiles, activeProfileName, pageId],
+  );
 
   if (!loaded) return null;
 
@@ -208,12 +228,14 @@ export function ZoneProfilePicker({
               ? "text-[#7aa2f7] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10"
               : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
         }`}
-        title={activeProfileName ? `Profile: ${activeProfileName}` : "Zone profiles — save/load configurations"}
+        title={
+          activeProfileName
+            ? `Profile: ${activeProfileName}`
+            : "Zone profiles — save/load configurations"
+        }
       >
         <FolderOpen className="w-3 h-3" />
-        {activeProfileName && (
-          <span className="max-w-[80px] truncate">{activeProfileName}</span>
-        )}
+        {activeProfileName && <span className="max-w-[80px] truncate">{activeProfileName}</span>}
         <ChevronDown className="w-2.5 h-2.5" />
       </button>
 

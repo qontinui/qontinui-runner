@@ -155,16 +155,23 @@ export function UIBridgeDiscoveryPanel({
         // Convert to StateMachineExportFormat for import
         const exportFormat = {
           states: Object.fromEntries(
-            data.states.map((s: { id: string; name: string; requiredElements?: unknown[]; [key: string]: unknown }) => [
-              s.id,
-              {
-                ...s,
-                elements: (s.requiredElements ?? []).map((el: unknown) => ({
-                  element_query: el,
-                })),
-                required_element_queries: s.requiredElements ?? [],
-              },
-            ]),
+            data.states.map(
+              (s: {
+                id: string;
+                name: string;
+                requiredElements?: unknown[];
+                [key: string]: unknown;
+              }) => [
+                s.id,
+                {
+                  ...s,
+                  elements: (s.requiredElements ?? []).map((el: unknown) => ({
+                    element_query: el,
+                  })),
+                  required_element_queries: s.requiredElements ?? [],
+                },
+              ],
+            ),
           ),
           transitions: Object.fromEntries(
             data.transitions.map((t: { id: string; name: string; [key: string]: unknown }) => [
@@ -200,7 +207,12 @@ export function UIBridgeDiscoveryPanel({
           // Dispatch an event that the parent page can pick up
           window.dispatchEvent(
             new CustomEvent("sm-import-static", {
-              detail: { name: configName, config: exportFormat, stateCount: data.states.length, transitionCount: data.transitions.length },
+              detail: {
+                name: configName,
+                config: exportFormat,
+                stateCount: data.states.length,
+                transitionCount: data.transitions.length,
+              },
             }),
           );
         }
@@ -230,20 +242,26 @@ export function UIBridgeDiscoveryPanel({
       // Convert to StateMachineExportFormat and import
       const exportFormat = {
         states: Object.fromEntries(
-          data.states.map((s: { id: string; name: string; requiredElements?: unknown[]; [key: string]: unknown }) => [
-            s.id,
-            {
-              ...s,
-              elements: (s.requiredElements ?? []).map((el: unknown) => ({ element_query: el })),
-              required_element_queries: s.requiredElements ?? [],
-            },
-          ]),
+          data.states.map(
+            (s: {
+              id: string;
+              name: string;
+              requiredElements?: unknown[];
+              [key: string]: unknown;
+            }) => [
+              s.id,
+              {
+                ...s,
+                elements: (s.requiredElements ?? []).map((el: unknown) => ({ element_query: el })),
+                required_element_queries: s.requiredElements ?? [],
+              },
+            ],
+          ),
         ),
         transitions: Object.fromEntries(
-          (data.transitions ?? []).map((t: { id: string; name: string; [key: string]: unknown }) => [
-            t.id,
-            { ...t },
-          ]),
+          (data.transitions ?? []).map(
+            (t: { id: string; name: string; [key: string]: unknown }) => [t.id, { ...t }],
+          ),
         ),
         config: {
           source: "static-analysis",
@@ -411,7 +429,8 @@ export function UIBridgeDiscoveryPanel({
                 <p className="text-sm text-text-muted">
                   Import a state machine generated from static source code analysis. Use the{" "}
                   <code className="text-xs bg-muted px-1 py-0.5 rounded">ui-bridge-auto</code>{" "}
-                  static builder to analyze your React project and produce a state machine JSON file.
+                  static builder to analyze your React project and produce a state machine JSON
+                  file.
                 </p>
 
                 <div className="flex items-center gap-3">
@@ -438,21 +457,30 @@ export function UIBridgeDiscoveryPanel({
                 </div>
 
                 {analyzeError && (
-                  <div className="text-xs text-red-400 bg-red-500/10 p-2 rounded">{analyzeError}</div>
+                  <div className="text-xs text-red-400 bg-red-500/10 p-2 rounded">
+                    {analyzeError}
+                  </div>
                 )}
 
                 <div className="text-xs text-text-muted space-y-1 border-t border-border-primary pt-3">
                   <p className="font-medium">How to generate:</p>
                   <ol className="list-decimal list-inside space-y-0.5 ml-1">
                     <li>
-                      Install: <code className="bg-muted px-1 py-0.5 rounded">npm install @qontinui/ui-bridge-auto</code>
+                      Install:{" "}
+                      <code className="bg-muted px-1 py-0.5 rounded">
+                        npm install @qontinui/ui-bridge-auto
+                      </code>
                     </li>
                     <li>
-                      Create a build script that calls <code className="bg-muted px-1 py-0.5 rounded">buildStateMachine()</code>{" "}
-                      with your project config
+                      Create a build script that calls{" "}
+                      <code className="bg-muted px-1 py-0.5 rounded">buildStateMachine()</code> with
+                      your project config
                     </li>
                     <li>
-                      Output the result with <code className="bg-muted px-1 py-0.5 rounded">emitPersistedStateMachineJSON()</code>
+                      Output the result with{" "}
+                      <code className="bg-muted px-1 py-0.5 rounded">
+                        emitPersistedStateMachineJSON()
+                      </code>
                     </li>
                     <li>Import the generated JSON file here</li>
                   </ol>

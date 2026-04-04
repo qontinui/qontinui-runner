@@ -230,10 +230,18 @@ export function UIBridgeStateMachinePage() {
   // Handle static analysis import event from discovery panel
   useEffect(() => {
     const handleStaticImport = async (e: Event) => {
-      const detail = (e as CustomEvent).detail as { name: string; config: unknown; stateCount: number; transitionCount: number };
+      const detail = (e as CustomEvent).detail as {
+        name: string;
+        config: unknown;
+        stateCount: number;
+        transitionCount: number;
+      };
       try {
         await sm.importConfig(detail.name, detail.config as any);
-        showToast(`Imported static state machine: ${detail.stateCount} states, ${detail.transitionCount} transitions`, "success");
+        showToast(
+          `Imported static state machine: ${detail.stateCount} states, ${detail.transitionCount} transitions`,
+          "success",
+        );
         setActiveTab("graph");
       } catch (err) {
         showToast(err instanceof Error ? err.message : "Import failed", "error");

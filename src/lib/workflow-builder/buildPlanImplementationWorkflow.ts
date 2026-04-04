@@ -53,9 +53,7 @@ export interface BuildPlanImplementationWorkflowInput {
 // =============================================================================
 
 function buildTaskList(phase: PlanPhase): string {
-  return phase.tasks
-    .map((t, i) => `${i + 1}. **${t.name}**: ${t.description}`)
-    .join("\n");
+  return phase.tasks.map((t, i) => `${i + 1}. **${t.name}**: ${t.description}`).join("\n");
 }
 
 function buildImplementPrompt(
@@ -64,9 +62,7 @@ function buildImplementPrompt(
   projectContext?: string,
 ): string {
   const taskList = buildTaskList(phase);
-  const contextSection = projectContext
-    ? `\n### Project Context\n${projectContext}\n`
-    : "";
+  const contextSection = projectContext ? `\n### Project Context\n${projectContext}\n` : "";
 
   return `## Phase ${phaseIndex + 1}: ${phase.name}
 
@@ -86,15 +82,9 @@ ${contextSection}
 Some verification steps may have failed. Analyze the failures and implement the necessary changes to make all checks pass.`;
 }
 
-function buildReviewPrompt(
-  phase: PlanPhase,
-  phaseIndex: number,
-  projectContext?: string,
-): string {
+function buildReviewPrompt(phase: PlanPhase, phaseIndex: number, projectContext?: string): string {
   const taskList = buildTaskList(phase);
-  const contextSection = projectContext
-    ? `\n### Project Context\n${projectContext}\n`
-    : "";
+  const contextSection = projectContext ? `\n### Project Context\n${projectContext}\n` : "";
 
   return `## Review: Phase ${phaseIndex + 1} — ${phase.name}
 
@@ -137,9 +127,7 @@ function buildNextStepsPrompt(
   projectContext?: string,
 ): string {
   const taskList = buildTaskList(phase);
-  const contextSection = projectContext
-    ? `\n### Project Context\n${projectContext}\n`
-    : "";
+  const contextSection = projectContext ? `\n### Project Context\n${projectContext}\n` : "";
 
   return `## Next Steps: Phase ${phaseIndex + 1} — ${phase.name}
 
@@ -209,10 +197,7 @@ All implementation phases are complete and reviewed. Commit the changes.
 // Stage Builders
 // =============================================================================
 
-function buildPhaseVerificationSteps(
-  phase: PlanPhase,
-  snapshotTarget: string,
-): VerificationStep[] {
+function buildPhaseVerificationSteps(phase: PlanPhase, snapshotTarget: string): VerificationStep[] {
   const steps: VerificationStep[] = [];
   for (const task of phase.tasks) {
     for (const v of task.verifications) {
@@ -348,13 +333,31 @@ export function buildPlanImplementationWorkflow(
     const phase = phases[i];
 
     stages.push(
-      buildImplementStage(phase, i, buildPhaseVerificationSteps(phase, snapshotTarget), maxImplementIterations, projectContext),
+      buildImplementStage(
+        phase,
+        i,
+        buildPhaseVerificationSteps(phase, snapshotTarget),
+        maxImplementIterations,
+        projectContext,
+      ),
     );
     stages.push(
-      buildReviewStage(phase, i, buildPhaseVerificationSteps(phase, snapshotTarget), maxReviewIterations, projectContext),
+      buildReviewStage(
+        phase,
+        i,
+        buildPhaseVerificationSteps(phase, snapshotTarget),
+        maxReviewIterations,
+        projectContext,
+      ),
     );
     stages.push(
-      buildNextStepsStage(phase, i, buildPhaseVerificationSteps(phase, snapshotTarget), maxNextStepsIterations, projectContext),
+      buildNextStepsStage(
+        phase,
+        i,
+        buildPhaseVerificationSteps(phase, snapshotTarget),
+        maxNextStepsIterations,
+        projectContext,
+      ),
     );
   }
 

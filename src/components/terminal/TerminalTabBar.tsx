@@ -240,81 +240,84 @@ export function TerminalTabBar({
     <div className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0">
       {/* Pinned left: layout picker + terminal creation buttons */}
       <div className="flex items-center gap-0.5 px-1 shrink-0">
-      {layoutPicker && <div className="shrink-0 mr-1">{layoutPicker}</div>}
+        {layoutPicker && <div className="shrink-0 mr-1">{layoutPicker}</div>}
 
-      <button
-        onClick={onCreate}
-        className="flex items-center justify-center w-6 h-6 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50 transition-colors shrink-0"
-        title="New terminal (Ctrl+Shift+T)"
-      >
-        <Plus className="w-3.5 h-3.5" />
-      </button>
+        <button
+          onClick={onCreate}
+          className="flex items-center justify-center w-6 h-6 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50 transition-colors shrink-0"
+          title="New terminal (Ctrl+Shift+T)"
+        >
+          <Plus className="w-3.5 h-3.5" />
+        </button>
 
-      {/* Launch menu dropdown */}
-      {onQuickLaunch && (
-        <div className="relative shrink-0">
-          <button
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => setShowQuickLaunch(!showQuickLaunch)}
-            className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
-              showQuickLaunch
-                ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-                : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-            }`}
-            title="Launch menu"
-          >
-            <ChevronDown className="w-3 h-3" />
-          </button>
-          {showQuickLaunch && (
-            <LaunchMenu
-              onCreatePlain={(count) => onQuickLaunch(count)}
-              onCreateAiSession={(count, configDir, context) => onLaunchAiSession?.(count, configDir, context)}
-              onCreateMultiAiSessions={(configDirs, context) => onLaunchMultiAiSessions?.(configDirs, context)}
-              onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
-              accountUsage={accountUsage ?? []}
-              launchCommands={launchCommands}
-              fileLocks={fileLocks}
-              onClose={() => setShowQuickLaunch(false)}
-            />
-          )}
-        </div>
-      )}
+        {/* Launch menu dropdown */}
+        {onQuickLaunch && (
+          <div className="relative shrink-0">
+            <button
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={() => setShowQuickLaunch(!showQuickLaunch)}
+              className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
+                showQuickLaunch
+                  ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
+              }`}
+              title="Launch menu"
+            >
+              <ChevronDown className="w-3 h-3" />
+            </button>
+            {showQuickLaunch && (
+              <LaunchMenu
+                onCreatePlain={(count) => onQuickLaunch(count)}
+                onCreateAiSession={(count, configDir, context) =>
+                  onLaunchAiSession?.(count, configDir, context)
+                }
+                onCreateMultiAiSessions={(configDirs, context) =>
+                  onLaunchMultiAiSessions?.(configDirs, context)
+                }
+                onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
+                accountUsage={accountUsage ?? []}
+                launchCommands={launchCommands}
+                fileLocks={fileLocks}
+                onClose={() => setShowQuickLaunch(false)}
+              />
+            )}
+          </div>
+        )}
       </div>
 
       {/* Scrollable tab area */}
       <div className="flex items-center gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
+        {tabs.map((tab) => {
+          const isActive = tab.id === activeId;
+          const isDead = !tab.isAlive;
+          const isEditing = editingId === tab.id;
+          const state = sessionStates?.[tab.id] ?? "idle";
+          const hasUnread = unreadTabs?.has(tab.id) ?? false;
+          const isStale = staleTabs?.has(tab.id) ?? false;
+          const tabActivity = activityData?.[tab.id];
+          const tabDuration = stateDurations?.[tab.id];
+          const tabLabels = getTabLabels(tab.id);
+          const showSparkline =
+            isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
+          const lockState = fileLockStates?.[tab.id];
 
-      {tabs.map((tab) => {
-        const isActive = tab.id === activeId;
-        const isDead = !tab.isAlive;
-        const isEditing = editingId === tab.id;
-        const state = sessionStates?.[tab.id] ?? "idle";
-        const hasUnread = unreadTabs?.has(tab.id) ?? false;
-        const isStale = staleTabs?.has(tab.id) ?? false;
-        const tabActivity = activityData?.[tab.id];
-        const tabDuration = stateDurations?.[tab.id];
-        const tabLabels = getTabLabels(tab.id);
-        const showSparkline =
-          isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
-        const lockState = fileLockStates?.[tab.id];
-
-        return (
-          <button
-            key={tab.id}
-            onClick={() => onSelect(tab.id)}
-            onDoubleClick={() => startEditing(tab)}
-            onAuxClick={(e) => {
-              if (e.button === 1) {
-                e.preventDefault();
-                onClose(tab.id);
-              }
-            }}
-            draggable
-            onDragStart={(e) => {
-              e.dataTransfer.setData("text/tab-id", tab.id);
-              e.dataTransfer.effectAllowed = "move";
-            }}
-            className={`
+          return (
+            <button
+              key={tab.id}
+              onClick={() => onSelect(tab.id)}
+              onDoubleClick={() => startEditing(tab)}
+              onAuxClick={(e) => {
+                if (e.button === 1) {
+                  e.preventDefault();
+                  onClose(tab.id);
+                }
+              }}
+              draggable
+              onDragStart={(e) => {
+                e.dataTransfer.setData("text/tab-id", tab.id);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              className={`
               flex items-center gap-1.5 px-3 py-1 rounded-t text-xs font-medium
               transition-colors whitespace-nowrap max-w-[260px] group cursor-grab active:cursor-grabbing
               ${
@@ -325,248 +328,249 @@ export function TerminalTabBar({
               ${isDead ? "opacity-60" : ""}
               ${isStale ? "border-dashed border-[#565f89]/40" : ""}
             `}
-          >
-            {/* Session state dot / plan icon */}
-            {tab.type === "plan" ? (
-              <FileText className="w-3 h-3 shrink-0 text-[#7dcfff]" />
-            ) : sessionStates ? (
-              <div
-                className={`w-2 h-2 rounded-full shrink-0 ${STATE_DOT_COLORS[state]} ${
-                  state === "needs-input" ? "animate-pulse" : ""
-                }`}
-              />
-            ) : (
-              <Terminal className="w-3 h-3 shrink-0" />
-            )}
-
-            {/* File lock indicator */}
-            {lockState === "waiting" && (
-              <Lock className="w-2.5 h-2.5 shrink-0 text-[#e0af68] animate-pulse" />
-            )}
-            {lockState === "holding" && (
-              <Lock className="w-2.5 h-2.5 shrink-0 text-[#7aa2f7] opacity-60" />
-            )}
-
-            <span className="flex flex-col items-start min-w-0">
-              {/* Title row */}
-              <span className="flex items-center gap-1 min-w-0">
-                {isEditing ? (
-                  <input
-                    autoFocus
-                    value={editValue}
-                    onChange={(e) => setEditValue(e.target.value)}
-                    onBlur={commitEdit}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") commitEdit();
-                      if (e.key === "Escape") setEditingId(null);
-                      e.stopPropagation();
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                    className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-hidden"
-                  />
-                ) : (
-                  <span className="truncate">{tab.title}</span>
-                )}
-
-                {/* Inline sparkline + duration (active tab only) */}
-                {isActive && showSparkline && (
-                  <ActivitySparkline data={tabActivity!} color={STATE_BAR_COLORS[state]} />
-                )}
-                {isActive && tabDuration && <DurationBadge duration={tabDuration} state={state} />}
-              </span>
-
-              {/* Tags row (active tab only, multi-zone) */}
-              {isActive && tabLabels && isMultiZone && (
-                <TagBadges labels={tabLabels} colorMap={labelColorMap} />
+            >
+              {/* Session state dot / plan icon */}
+              {tab.type === "plan" ? (
+                <FileText className="w-3 h-3 shrink-0 text-[#7dcfff]" />
+              ) : sessionStates ? (
+                <div
+                  className={`w-2 h-2 rounded-full shrink-0 ${STATE_DOT_COLORS[state]} ${
+                    state === "needs-input" ? "animate-pulse" : ""
+                  }`}
+                />
+              ) : (
+                <Terminal className="w-3 h-3 shrink-0" />
               )}
 
-              {/* Working dir (active tab only) */}
-              {isActive && tab.workingDir && (
-                <span className="text-[9px] text-[#565f89] truncate max-w-[140px]">
-                  {tab.workingDir.split(/[/\\]/).slice(-2).join("/")}
+              {/* File lock indicator */}
+              {lockState === "waiting" && (
+                <Lock className="w-2.5 h-2.5 shrink-0 text-[#e0af68] animate-pulse" />
+              )}
+              {lockState === "holding" && (
+                <Lock className="w-2.5 h-2.5 shrink-0 text-[#7aa2f7] opacity-60" />
+              )}
+
+              <span className="flex flex-col items-start min-w-0">
+                {/* Title row */}
+                <span className="flex items-center gap-1 min-w-0">
+                  {isEditing ? (
+                    <input
+                      autoFocus
+                      value={editValue}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onBlur={commitEdit}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") commitEdit();
+                        if (e.key === "Escape") setEditingId(null);
+                        e.stopPropagation();
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      className="bg-transparent border-b border-[#565f89] text-[#c0caf5] text-xs w-20 outline-hidden"
+                    />
+                  ) : (
+                    <span className="truncate">{tab.title}</span>
+                  )}
+
+                  {/* Inline sparkline + duration (active tab only) */}
+                  {isActive && showSparkline && (
+                    <ActivitySparkline data={tabActivity!} color={STATE_BAR_COLORS[state]} />
+                  )}
+                  {isActive && tabDuration && (
+                    <DurationBadge duration={tabDuration} state={state} />
+                  )}
+                </span>
+
+                {/* Tags row (active tab only, multi-zone) */}
+                {isActive && tabLabels && isMultiZone && (
+                  <TagBadges labels={tabLabels} colorMap={labelColorMap} />
+                )}
+
+                {/* Working dir (active tab only) */}
+                {isActive && tab.workingDir && (
+                  <span className="text-[9px] text-[#565f89] truncate max-w-[140px]">
+                    {tab.workingDir.split(/[/\\]/).slice(-2).join("/")}
+                  </span>
+                )}
+              </span>
+
+              {/* Stale indicator (inactive tabs) */}
+              {!isActive && isStale && (
+                <span className="text-[8px] text-[#565f89] italic shrink-0">stalled?</span>
+              )}
+
+              {/* Duration badge on inactive tabs for attention states */}
+              {!isActive && tabDuration && <DurationBadge duration={tabDuration} state={state} />}
+
+              {/* Exit code badge */}
+              {isDead && tab.exitCode !== null && (
+                <span
+                  className={`text-[10px] px-1 rounded ${
+                    tab.exitCode === 0
+                      ? "bg-green-900/30 text-green-400"
+                      : "bg-red-900/30 text-red-400"
+                  }`}
+                >
+                  {tab.exitCode}
                 </span>
               )}
-            </span>
 
-            {/* Stale indicator (inactive tabs) */}
-            {!isActive && isStale && (
-              <span className="text-[8px] text-[#565f89] italic shrink-0">stalled?</span>
-            )}
+              {/* Unread indicator */}
+              {hasUnread && <span className="w-1.5 h-1.5 rounded-full bg-[#f7768e] shrink-0" />}
 
-            {/* Duration badge on inactive tabs for attention states */}
-            {!isActive && tabDuration && <DurationBadge duration={tabDuration} state={state} />}
-
-            {/* Exit code badge */}
-            {isDead && tab.exitCode !== null && (
+              {/* Close button */}
               <span
-                className={`text-[10px] px-1 rounded ${
-                  tab.exitCode === 0
-                    ? "bg-green-900/30 text-green-400"
-                    : "bg-red-900/30 text-red-400"
-                }`}
-              >
-                {tab.exitCode}
-              </span>
-            )}
-
-            {/* Unread indicator */}
-            {hasUnread && <span className="w-1.5 h-1.5 rounded-full bg-[#f7768e] shrink-0" />}
-
-            {/* Close button */}
-            <span
-              role="button"
-              tabIndex={0}
-              onClick={(e) => {
-                e.stopPropagation();
-                onClose(tab.id);
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
                   e.stopPropagation();
                   onClose(tab.id);
-                }
-              }}
-              className="ml-1 p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[#2a2d3d] transition-opacity"
-            >
-              <X className="w-3 h-3" />
-            </span>
-          </button>
-        );
-      })}
-
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    onClose(tab.id);
+                  }
+                }}
+                className="ml-1 p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[#2a2d3d] transition-opacity"
+              >
+                <X className="w-3 h-3" />
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       {/* Pinned right: session list dropdown */}
       <div className="flex items-center gap-0.5 px-1 shrink-0">
-      {/* Session dropdown */}
-      {tabs.length > 0 && (
-        <div className="relative ml-auto shrink-0" ref={dropdownRef}>
-          <button
-            onClick={() => setShowDropdown(!showDropdown)}
-            className={`flex items-center justify-center w-6 h-6 rounded transition-colors ${
-              showDropdown
-                ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-                : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-            }`}
-            title="All sessions"
-          >
-            <List className="w-3.5 h-3.5" />
-          </button>
+        {/* Session dropdown */}
+        {tabs.length > 0 && (
+          <div className="relative ml-auto shrink-0" ref={dropdownRef}>
+            <button
+              onClick={() => setShowDropdown(!showDropdown)}
+              className={`flex items-center justify-center w-6 h-6 rounded transition-colors ${
+                showDropdown
+                  ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+                  : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
+              }`}
+              title="All sessions"
+            >
+              <List className="w-3.5 h-3.5" />
+            </button>
 
-          {showDropdown && (
-            <div className="absolute right-0 top-full mt-1 w-80 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
-              <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
-                Sessions ({tabs.length})
-              </div>
-              <div className="max-h-64 overflow-y-auto scrollbar-dark">
-                {tabs.map((tab) => {
-                  const isActive = tab.id === activeId;
-                  const isDead = !tab.isAlive;
-                  const state = sessionStates?.[tab.id] ?? "idle";
-                  const tabActivity = activityData?.[tab.id];
-                  const tabDuration = stateDurations?.[tab.id];
-                  const tabLabels = getTabLabels(tab.id);
-                  const hasSparkline =
-                    isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
+            {showDropdown && (
+              <div className="absolute right-0 top-full mt-1 w-80 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden">
+                <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-[#565f89] border-b border-[#2a2d3d]">
+                  Sessions ({tabs.length})
+                </div>
+                <div className="max-h-64 overflow-y-auto scrollbar-dark">
+                  {tabs.map((tab) => {
+                    const isActive = tab.id === activeId;
+                    const isDead = !tab.isAlive;
+                    const state = sessionStates?.[tab.id] ?? "idle";
+                    const tabActivity = activityData?.[tab.id];
+                    const tabDuration = stateDurations?.[tab.id];
+                    const tabLabels = getTabLabels(tab.id);
+                    const hasSparkline =
+                      isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
 
-                  return (
-                    <div
-                      key={tab.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => {
-                        onSelect(tab.id);
-                        setShowDropdown(false);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
+                    return (
+                      <div
+                        key={tab.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => {
                           onSelect(tab.id);
                           setShowDropdown(false);
-                        }
-                      }}
-                      className={`flex items-start gap-2 px-3 py-2 cursor-pointer transition-colors ${
-                        isActive ? "bg-[#7aa2f7]/10" : "hover:bg-[#2a2d3d]/50"
-                      }`}
-                    >
-                      {/* Status dot */}
-                      <div className="mt-1 shrink-0">
-                        <div
-                          className={`w-2 h-2 rounded-full ${
-                            sessionStates
-                              ? `${STATE_DOT_COLORS[state]} ${state === "needs-input" ? "animate-pulse" : ""}`
-                              : isDead
-                                ? "bg-[#565f89]"
-                                : "bg-[#9ece6a]"
-                          }`}
-                        />
-                      </div>
-
-                      {/* Info */}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <span
-                            className={`text-xs font-medium truncate ${
-                              isActive ? "text-[#7aa2f7]" : "text-[#c0caf5]"
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            onSelect(tab.id);
+                            setShowDropdown(false);
+                          }
+                        }}
+                        className={`flex items-start gap-2 px-3 py-2 cursor-pointer transition-colors ${
+                          isActive ? "bg-[#7aa2f7]/10" : "hover:bg-[#2a2d3d]/50"
+                        }`}
+                      >
+                        {/* Status dot */}
+                        <div className="mt-1 shrink-0">
+                          <div
+                            className={`w-2 h-2 rounded-full ${
+                              sessionStates
+                                ? `${STATE_DOT_COLORS[state]} ${state === "needs-input" ? "animate-pulse" : ""}`
+                                : isDead
+                                  ? "bg-[#565f89]"
+                                  : "bg-[#9ece6a]"
                             }`}
-                          >
-                            {tab.title}
-                          </span>
-                          {isDead && tab.exitCode !== null && (
+                          />
+                        </div>
+
+                        {/* Info */}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5">
                             <span
-                              className={`text-[10px] px-1 rounded ${
-                                tab.exitCode === 0
-                                  ? "bg-green-900/30 text-green-400"
-                                  : "bg-red-900/30 text-red-400"
+                              className={`text-xs font-medium truncate ${
+                                isActive ? "text-[#7aa2f7]" : "text-[#c0caf5]"
                               }`}
                             >
-                              exit {tab.exitCode}
+                              {tab.title}
                             </span>
-                          )}
-                          {/* Sparkline in dropdown */}
-                          {hasSparkline && (
-                            <ActivitySparkline
-                              data={tabActivity!}
-                              color={STATE_BAR_COLORS[state]}
-                            />
-                          )}
-                          {/* Duration in dropdown */}
-                          {tabDuration && <DurationBadge duration={tabDuration} state={state} />}
-                        </div>
-                        <div className="flex items-center gap-2 text-[10px] text-[#565f89] mt-0.5">
-                          {tab.pid && <span>PID {tab.pid}</span>}
-                          {tab.workingDir && (
-                            <span className="truncate" title={tab.workingDir}>
-                              {tab.workingDir.split(/[/\\]/).pop()}
-                            </span>
-                          )}
-                          {tab.createdAt && <span>{formatTime(tab.createdAt)}</span>}
-                        </div>
-                        {/* Tag badges in dropdown */}
-                        {tabLabels && isMultiZone && (
-                          <div className="mt-0.5">
-                            <TagBadges labels={tabLabels} colorMap={labelColorMap} max={3} />
+                            {isDead && tab.exitCode !== null && (
+                              <span
+                                className={`text-[10px] px-1 rounded ${
+                                  tab.exitCode === 0
+                                    ? "bg-green-900/30 text-green-400"
+                                    : "bg-red-900/30 text-red-400"
+                                }`}
+                              >
+                                exit {tab.exitCode}
+                              </span>
+                            )}
+                            {/* Sparkline in dropdown */}
+                            {hasSparkline && (
+                              <ActivitySparkline
+                                data={tabActivity!}
+                                color={STATE_BAR_COLORS[state]}
+                              />
+                            )}
+                            {/* Duration in dropdown */}
+                            {tabDuration && <DurationBadge duration={tabDuration} state={state} />}
                           </div>
-                        )}
-                      </div>
+                          <div className="flex items-center gap-2 text-[10px] text-[#565f89] mt-0.5">
+                            {tab.pid && <span>PID {tab.pid}</span>}
+                            {tab.workingDir && (
+                              <span className="truncate" title={tab.workingDir}>
+                                {tab.workingDir.split(/[/\\]/).pop()}
+                              </span>
+                            )}
+                            {tab.createdAt && <span>{formatTime(tab.createdAt)}</span>}
+                          </div>
+                          {/* Tag badges in dropdown */}
+                          {tabLabels && isMultiZone && (
+                            <div className="mt-0.5">
+                              <TagBadges labels={tabLabels} colorMap={labelColorMap} max={3} />
+                            </div>
+                          )}
+                        </div>
 
-                      {/* Close button */}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onClose(tab.id);
-                        }}
-                        className="mt-0.5 p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors shrink-0"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
-                    </div>
-                  );
-                })}
+                        {/* Close button */}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onClose(tab.id);
+                          }}
+                          className="mt-0.5 p-0.5 rounded text-[#565f89] hover:text-[#f7768e] hover:bg-[#f7768e]/10 transition-colors shrink-0"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
-        </div>
-      )}
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

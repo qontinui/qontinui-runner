@@ -412,7 +412,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   const fetchFileLocks = useCallback(async () => {
     try {
       const port =
-        typeof window !== "undefined" && (window as unknown as Record<string, unknown>).__QONTINUI_PORT__
+        typeof window !== "undefined" &&
+        (window as unknown as Record<string, unknown>).__QONTINUI_PORT__
           ? Number((window as unknown as Record<string, unknown>).__QONTINUI_PORT__)
           : 9876;
       const resp = await fetch(`http://127.0.0.1:${port}/file-locks/info`);
