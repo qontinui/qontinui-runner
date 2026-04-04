@@ -290,6 +290,13 @@ export function useStateMachineRegistration(): void {
       // against the live DOM. This is a one-time operation before automation.
       engine.detectActiveStates();
 
+      // Dispose the event-driven StateDetector for statically-defined configs.
+      // The static builder's ElementQuery format (tagName, text, data-page-id)
+      // references arbitrary DOM elements not tracked by the UI Bridge registry,
+      // so registry events can't meaningfully update active states. The initial
+      // detection above is sufficient; transitions handle state changes from here.
+      engine.stateDetector.dispose();
+
       engineRef.current = engine;
 
       // Register adapter on the global bridge
