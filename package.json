@@ -5,6 +5,7 @@
     "@qontinui/design-tokens": "^1.0.0",
     "@qontinui/shared-types": "file:../qontinui-schemas/ts",
     "@qontinui/ui-bridge": "file:../ui-bridge/packages/ui-bridge",
+    "@qontinui/ui-bridge-auto": "file:../ui-bridge-auto",
     "@qontinui/workflow-ui": "file:../qontinui-workflow-ui",
     "@qontinui/workflow-utils": "file:../qontinui-workflow-utils",
     "@radix-ui/react-dialog": "^1.1.15",

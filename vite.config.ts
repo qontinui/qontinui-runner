@@ -57,6 +57,8 @@ export default defineConfig({
       // "ui-bridge" resolves, preventing duplicate module instances (singleton split).
       { find: /^@qontinui\/ui-bridge\/(.+)$/, replacement: path.resolve(__dirname, "../ui-bridge/packages/ui-bridge/dist/$1/index.mjs") },
       { find: "@qontinui/ui-bridge", replacement: path.resolve(__dirname, "../ui-bridge/packages/ui-bridge/dist/index.mjs") },
+      // ui-bridge-auto resolves to source (Vite transpiles TS on the fly)
+      { find: "@qontinui/ui-bridge-auto", replacement: path.resolve(__dirname, "../ui-bridge-auto/src/index.ts") },
       // workflow-ui subpaths resolve to source (Vite transpiles TSX on the fly)
       { find: "@qontinui/workflow-ui/state-machine", replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/components/state-machine/index.ts") },
       { find: "@qontinui/workflow-ui/chat", replacement: path.resolve(__dirname, "../qontinui-workflow-ui/src/components/chat/index.ts") },

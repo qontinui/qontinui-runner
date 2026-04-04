@@ -1,11 +1,13 @@
 /**
  * useStateMachineRegistration
  *
- * App-level hook that loads the selected state machine config from the database
- * and registers a StateMachineAPI adapter on `window.__UI_BRIDGE__.stateMachine`.
+ * App-level hook that loads the selected state machine config from the database,
+ * creates an AutomationEngine (from ui-bridge-auto), and registers it on
+ * `window.__UI_BRIDGE__.stateMachine`.
  *
- * This enables all UI Bridge IPC state machine operations (navigate_to_state,
- * get_states, get_active_states, find_state_path, etc.) to work on the Runner itself.
+ * The engine provides physical UI interaction (clicking sidebar items, etc.),
+ * event-driven state detection, pathfinding, and self-healing — all backed by
+ * the UI Bridge SDK's live element registry.
  */
 
 import { useEffect, useRef, useCallback } from "react";
@@ -15,172 +17,248 @@ import type {
   StateMachineState,
   StateMachineTransition,
 } from "@qontinui/shared-types";
+import {
+  AutomationEngine,
+  DefaultDOMExecutor,
+  navigate as navigatePath,
+  type RegistryLike,
+  type StateDefinition,
+  type TransitionDefinition,
+  type TransitionAction as EngineTransitionAction,
+  type ElementQuery,
+} from "@qontinui/ui-bridge-auto";
+import { getGlobalRegistry } from "@qontinui/ui-bridge/core";
 import { getUIBridgeGlobal } from "./ui-bridge-events/utils";
-import { findPath } from "./stateMachinePathfinder";
 
 const SM_SELECTED_CONFIG_KEY = "qontinui-runner-sm-selected-config";
 
-interface StateMachineAdapter {
-  // Query
-  getStates: () => StateMachineState[];
+// ---------------------------------------------------------------------------
+// DB → Engine format converters
+// ---------------------------------------------------------------------------
+
+/** Convert a DB StateMachineState to an engine StateDefinition. */
+function toStateDefinition(s: StateMachineState): StateDefinition {
+  const meta = s.extra_metadata as Record<string, unknown> | undefined;
+  // Static builder stores requiredElements in extra_metadata
+  const requiredElements = (meta?.requiredElements as ElementQuery[]) ?? [];
+  return {
+    id: s.state_id,
+    name: s.name,
+    requiredElements,
+    group: (meta?.group as string) || undefined,
+    pathCost: s.confidence < 0.5 ? 2 : 1,
+  };
+}
+
+/** Convert a DB StateMachineTransition to an engine TransitionDefinition. */
+function toTransitionDefinition(t: StateMachineTransition): TransitionDefinition {
+  // The static builder stores actions in ui-bridge-auto format already.
+  // DB actions are typed as TransitionAction[] from shared-types but stored as raw JSON.
+  const actions: EngineTransitionAction[] = (t.actions ?? []).map((a) => {
+    const raw = a as unknown as Record<string, unknown>;
+    return {
+      target: (raw.target ?? {}) as ElementQuery,
+      action: (raw.action ?? raw.type ?? "click") as string,
+      params: raw.params as Record<string, unknown> | undefined,
+      waitAfter: raw.waitAfter as EngineTransitionAction["waitAfter"],
+    };
+  });
+
+  return {
+    id: t.transition_id,
+    name: t.name,
+    fromStates: t.from_states,
+    activateStates: t.activate_states,
+    exitStates: t.exit_states,
+    actions,
+    pathCost: t.path_cost || 1,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Registry adapter — bridges UI Bridge SDK → ui-bridge-auto RegistryLike
+// ---------------------------------------------------------------------------
+
+function createRegistryAdapter(): RegistryLike {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const registry = getGlobalRegistry() as any;
+  return {
+    getAllElements() {
+      return registry.getAllElements().map((el: { id: string; element: HTMLElement; type: string; label?: string; getState: () => Record<string, unknown>; getIdentifier: () => Record<string, string | undefined> }) => ({
+        id: el.id,
+        element: el.element,
+        type: el.type,
+        label: el.label,
+        getState: () => {
+          const s = el.getState();
+          return {
+            visible: s.visible,
+            enabled: s.enabled,
+            focused: s.focused,
+            checked: s.checked,
+            textContent: s.textContent,
+            value: s.value,
+            rect: s.rect,
+          };
+        },
+        getIdentifier: el.getIdentifier
+          ? () => {
+              const ident = el.getIdentifier();
+              return { selector: ident.selector, xpath: ident.xpath, htmlId: ident.htmlId };
+            }
+          : undefined,
+      }));
+    },
+    on(type, listener) {
+      return registry.on(type, listener as (...args: unknown[]) => void);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// State machine API adapter — wraps AutomationEngine for IPC handlers
+// ---------------------------------------------------------------------------
+
+interface StateMachineAPI {
+  getStates: () => unknown;
   getActiveStates: () => string[];
-  getTransitions: () => StateMachineTransition[];
-  getState: (id: string) => StateMachineState | null;
+  getTransitions: () => unknown;
+  getState: (id: string) => unknown;
   getGroups: () => never[];
-  // Mutation
   activate: (id: string) => boolean;
   deactivate: (id: string) => boolean;
   setState: (id: string, active: boolean) => boolean;
   activateGroup: (id: string) => boolean;
   deactivateGroup: (id: string) => boolean;
-  // Transitions
   canExecuteTransition: (id: string) => boolean;
   executeTransition: (id: string) => Promise<unknown>;
-  // Navigation
   findPath: (from: string, to: string) => unknown;
   navigateTo: (id: string) => Promise<unknown>;
 }
 
-function buildAdapter(config: StateMachineConfigFull): StateMachineAdapter {
-  const activeStates = new Set<string>();
-  const { states, transitions } = config;
+function buildEngineAdapter(engine: AutomationEngine): StateMachineAPI {
+  const allDefs = () => engine.stateMachine.getAllStateDefinitions();
+  const allTransitions = () => engine.stateMachine.getTransitionDefinitions();
 
-  // Build lookup maps
-  const stateById = new Map<string, StateMachineState>();
-  const stateByName = new Map<string, StateMachineState>();
-  for (const s of states) {
-    stateById.set(s.state_id, s);
-    stateByName.set(s.name, s);
-  }
-
-  const transitionById = new Map<string, StateMachineTransition>();
-  for (const t of transitions) transitionById.set(t.transition_id, t);
-
-  /** Resolve a state by ID, exact name, or name prefix — returns its state_id. */
+  /** Resolve a state by ID or name prefix. */
   const resolveStateId = (idOrName: string): string | null => {
-    if (stateById.has(idOrName)) return idOrName;
-    const byName = stateByName.get(idOrName);
-    if (byName) return byName.state_id;
-    // Fuzzy: match by prefix (e.g., "AI Chat" matches "AI Chat (10 elements)")
+    const defs = allDefs();
+    // Exact ID match
+    if (defs.some((d) => d.id === idOrName)) return idOrName;
+    // Exact name match
+    const byName = defs.find((d) => d.name === idOrName);
+    if (byName) return byName.id;
+    // Prefix match
     const lower = idOrName.toLowerCase();
-    for (const s of states) {
-      if (s.name.toLowerCase().startsWith(lower)) return s.state_id;
-    }
-    return null;
+    const byPrefix = defs.find((d) => d.name.toLowerCase().startsWith(lower));
+    return byPrefix?.id ?? null;
   };
 
-  const adapter: StateMachineAdapter = {
-    // --- Query methods ---
-    getStates: () => states,
-    getActiveStates: () => [...activeStates],
-    getTransitions: () => transitions,
+  return {
+    getStates: () => allDefs(),
+    getActiveStates: () => Array.from(engine.getActiveStates()),
+    getTransitions: () => allTransitions(),
     getState: (id) => {
       const resolved = resolveStateId(id);
-      return resolved ? (stateById.get(resolved) ?? null) : null;
+      return resolved ? allDefs().find((d) => d.id === resolved) ?? null : null;
     },
     getGroups: () => [],
 
-    // --- Mutation methods ---
     activate: (id) => {
       const resolved = resolveStateId(id);
       if (!resolved) return false;
-      activeStates.add(resolved);
+      const next = new Set(engine.getActiveStates());
+      next.add(resolved);
+      engine.stateMachine.setActiveStates(next);
       return true;
     },
     deactivate: (id) => {
       const resolved = resolveStateId(id) ?? id;
-      activeStates.delete(resolved);
+      const next = new Set(engine.getActiveStates());
+      next.delete(resolved);
+      engine.stateMachine.setActiveStates(next);
       return true;
     },
     setState: (id, active) => {
       const resolved = resolveStateId(id) ?? id;
-      if (active) activeStates.add(resolved);
-      else activeStates.delete(resolved);
+      const next = new Set(engine.getActiveStates());
+      if (active) next.add(resolved);
+      else next.delete(resolved);
+      engine.stateMachine.setActiveStates(next);
       return true;
     },
     activateGroup: () => false,
     deactivateGroup: () => false,
 
-    // --- Transition methods ---
     canExecuteTransition: (id) => {
-      const t = transitionById.get(id);
+      const t = allTransitions().find((d) => d.id === id);
       if (!t) return false;
-      return t.from_states.length === 0 || t.from_states.every((s) => activeStates.has(s));
+      const active = engine.getActiveStates();
+      return t.fromStates.length === 0 || t.fromStates.some((s) => active.has(s));
     },
 
     executeTransition: async (id) => {
-      const t = transitionById.get(id);
+      const t = allTransitions().find((d) => d.id === id);
       if (!t) throw new Error(`Transition not found: ${id}`);
-      if (!adapter.canExecuteTransition(id)) {
-        throw new Error(`Preconditions not met for transition: ${id}`);
-      }
-      // Apply state changes
-      for (const s of t.exit_states) activeStates.delete(s);
-      for (const s of t.activate_states) activeStates.add(s);
-      return { executed: id, activeStates: [...activeStates] };
+      const next = new Set(engine.getActiveStates());
+      for (const s of t.exitStates) next.delete(s);
+      for (const s of t.activateStates) next.add(s);
+      engine.stateMachine.setActiveStates(next);
+      return { executed: id, activeStates: Array.from(engine.getActiveStates()) };
     },
 
-    // --- Pathfinding ---
-    findPath: (from, to) => {
-      const resolvedFrom = resolveStateId(from) ?? from;
+    findPath: (_from, to) => {
       const resolvedTo = resolveStateId(to) ?? to;
-      const fromSet = new Set<string>();
-      fromSet.add(resolvedFrom);
-      const result = findPath(fromSet, resolvedTo, transitions);
-      if (!result) return null;
-      return {
-        path: result.transitions.map((t) => ({
-          transition_id: t.transition_id,
-          name: t.name,
-          from_states: t.from_states,
-          activate_states: t.activate_states,
-        })),
-        totalCost: result.totalCost,
-      };
+      const active = engine.getActiveStates();
+      const transitions = engine.stateMachine.getTransitionDefinitions();
+      try {
+        const result = navigatePath(active, resolvedTo, transitions);
+        return {
+          path: result.path.map((t) => ({
+            id: t.id,
+            name: t.name,
+            fromStates: t.fromStates,
+            activateStates: t.activateStates,
+          })),
+          totalCost: result.totalCost,
+        };
+      } catch {
+        return null;
+      }
     },
 
-    // --- Navigation ---
     navigateTo: async (targetStateId) => {
-      const resolvedId = resolveStateId(targetStateId);
-      if (!resolvedId) throw new Error(`State not found: ${targetStateId}`);
-      targetStateId = resolvedId;
-
-      if (activeStates.has(targetStateId)) {
-        return { navigatedTo: targetStateId, path: [], alreadyActive: true };
-      }
-
-      const result = findPath(activeStates, targetStateId, transitions);
-      if (!result) throw new Error(`No path to state: ${targetStateId}`);
-
-      const executedPath: string[] = [];
-      for (const t of result.transitions) {
-        // Apply state changes for each transition in the path
-        for (const s of t.exit_states) activeStates.delete(s);
-        for (const s of t.activate_states) activeStates.add(s);
-        executedPath.push(t.transition_id);
-      }
-
+      const resolved = resolveStateId(targetStateId);
+      if (!resolved) throw new Error(`State not found: ${targetStateId}`);
+      const result = await engine.navigateToState(resolved);
       return {
-        navigatedTo: targetStateId,
-        path: executedPath,
+        navigatedTo: resolved,
+        path: result.path.map((t) => t.id),
         totalCost: result.totalCost,
-        activeStates: [...activeStates],
+        activeStates: Array.from(result.targetsReached),
+        strategy: result.strategy,
       };
     },
   };
-
-  return adapter;
 }
 
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
 export function useStateMachineRegistration(): void {
-  const adapterRef = useRef<StateMachineAdapter | null>(null);
+  const engineRef = useRef<AutomationEngine | null>(null);
 
   const loadAndRegister = useCallback(async (configId: string | null) => {
     const bridge = getUIBridgeGlobal();
 
+    // Dispose previous engine
+    if (engineRef.current) {
+      engineRef.current.stateDetector.dispose();
+      engineRef.current = null;
+    }
+
     if (!configId) {
-      // Unregister
-      adapterRef.current = null;
       if (bridge) delete bridge.stateMachine;
       return;
     }
@@ -188,21 +266,35 @@ export function useStateMachineRegistration(): void {
     try {
       const config = await invoke<StateMachineConfigFull | null>("sm_get_config", { id: configId });
       if (!config) {
-        adapterRef.current = null;
         if (bridge) delete bridge.stateMachine;
         return;
       }
 
-      const adapter = buildAdapter(config);
-      adapterRef.current = adapter;
+      // Create engine with UI Bridge registry and DefaultDOMExecutor
+      const registryAdapter = createRegistryAdapter();
+      const executor = new DefaultDOMExecutor(registryAdapter);
+      const engine = new AutomationEngine({
+        registry: registryAdapter,
+        executor,
+        enableHighlights: false,
+        enableReliabilityTracking: true,
+      });
 
+      // Convert DB format → engine format and load
+      const stateDefs = config.states.map(toStateDefinition);
+      const transitionDefs = config.transitions.map(toTransitionDefinition);
+      engine.defineStates(stateDefs);
+      engine.defineTransitions(transitionDefs);
+
+      engineRef.current = engine;
+
+      // Register adapter on the global bridge
       if (bridge) {
-        bridge.stateMachine = adapter;
+        bridge.stateMachine = buildEngineAdapter(engine);
       }
     } catch {
-      // Config load failed (e.g., deleted) — silently unregister
-      adapterRef.current = null;
       if (bridge) delete bridge.stateMachine;
+      engineRef.current = null;
     }
   }, []);
 
@@ -228,9 +320,12 @@ export function useStateMachineRegistration(): void {
     return () => {
       window.removeEventListener("sm-config-changed", handler);
       // Cleanup on unmount
+      if (engineRef.current) {
+        engineRef.current.stateDetector.dispose();
+        engineRef.current = null;
+      }
       const bridge = getUIBridgeGlobal();
       if (bridge) delete bridge.stateMachine;
-      adapterRef.current = null;
     };
   }, [loadAndRegister]);
 }
