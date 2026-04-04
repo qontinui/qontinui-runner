@@ -65,7 +65,7 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Wrap setActiveConfig to persist selection
+  // Wrap setActiveConfig to persist selection and notify listeners
   const setActiveConfig = useCallback((config: StateMachineConfigFull | null) => {
     setActiveConfigRaw(config);
     try {
@@ -77,6 +77,9 @@ export function useStateMachineConfig(): UseStateMachineConfigReturn {
     } catch {
       /* */
     }
+    window.dispatchEvent(
+      new CustomEvent("sm-config-changed", { detail: { configId: config?.id ?? null } }),
+    );
   }, []);
 
   // ---- Config list ----

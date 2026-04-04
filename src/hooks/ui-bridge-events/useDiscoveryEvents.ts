@@ -618,13 +618,23 @@ export function useDiscoveryEvents(
             return true;
           }
           const sm = getStateMachine();
+          if (!sm?.navigateTo) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "No state machine registered. Define states and transitions first.",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
           try {
-            const result = await Promise.resolve(sm?.navigateTo?.(targetState));
+            const result = await Promise.resolve(sm.navigateTo(targetState));
             await sendResponse({
               requestId,
               type,
               success: true,
-              data: { navigatedTo: targetState, result: result ?? true },
+              data: { navigatedTo: targetState, result: result ?? false },
               timestamp: Date.now(),
             });
           } catch (err) {

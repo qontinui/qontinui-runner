@@ -44,6 +44,7 @@ import { useGraphDataRefresh } from "./hooks/useGraphDataRefresh";
 import { useObservationServices } from "./hooks/useObservationServices";
 import { useToast } from "./hooks/useToast";
 import { useErrorNotifications } from "./hooks/useErrorNotifications";
+import { useStateMachineRegistration } from "./hooks/useStateMachineRegistration";
 
 import { ToastContainer } from "./components/ToastContainer";
 import StatusIndicator from "./components/StatusIndicator";
@@ -86,6 +87,7 @@ declare global {
     "navigate-to-error-monitor": CustomEvent<{ taskRunId?: string; taskRunName?: string }>;
     "navigate-to-active": Event;
     "sm-show-exploration": Event;
+    "sm-config-changed": CustomEvent<{ configId: string | null }>;
     "runner-name-changed": CustomEvent<string>;
   }
 }
@@ -94,6 +96,7 @@ function AppContent() {
   const auth = useAuth();
   const isApiReady = useApiReady();
   const execution = useExecution();
+  useStateMachineRegistration();
 
   const [setupCompleted, setSetupCompleted] = useState<boolean | null>(null);
   useEffect(() => {
