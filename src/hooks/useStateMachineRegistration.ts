@@ -243,6 +243,56 @@ function buildEngineAdapter(engine: AutomationEngine): StateMachineAPI {
 }
 
 // ---------------------------------------------------------------------------
+// Engine lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * Create and configure an AutomationEngine, register it on __UI_BRIDGE__,
+ * and return it. Disposes any previous engine.
+ */
+function createAndRegisterEngine(
+  stateDefs: StateDefinition[],
+  transitionDefs: TransitionDefinition[],
+  previousEngine: AutomationEngine | null,
+): AutomationEngine {
+  if (previousEngine) previousEngine.stateDetector.dispose();
+
+  const registryAdapter = createRegistryAdapter();
+  const executor = new DefaultDOMExecutor(registryAdapter);
+  const engine = new AutomationEngine({
+    registry: registryAdapter,
+    executor,
+    enableHighlights: false,
+    enableReliabilityTracking: true,
+  });
+
+  engine.defineStates(stateDefs);
+  engine.defineTransitions(transitionDefs);
+  engine.detectActiveStates();
+  engine.stateDetector.dispose();
+
+  const bridge = getUIBridgeGlobal();
+  if (bridge) {
+    bridge.stateMachine = buildEngineAdapter(engine);
+    // Expose a simple JSON loading function on the bridge for easy testing.
+    // Usage: window.__UI_BRIDGE__.loadStateMachine(jsonString)
+    bridge.loadStateMachine = (json: string) => {
+      try {
+        const data = JSON.parse(json);
+        const states = (data.states ?? []) as StateDefinition[];
+        const transitions = (data.transitions ?? []) as TransitionDefinition[];
+        const newEngine = createAndRegisterEngine(states, transitions, engine);
+        return { success: true, states: states.length, transitions: transitions.length, active: Array.from(newEngine.getActiveStates()) };
+      } catch (e) {
+        return { success: false, error: String(e) };
+      }
+    };
+  }
+
+  return engine;
+}
+
+// ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
 
@@ -252,13 +302,9 @@ export function useStateMachineRegistration(): void {
   const loadAndRegister = useCallback(async (configId: string | null) => {
     const bridge = getUIBridgeGlobal();
 
-    // Dispose previous engine
-    if (engineRef.current) {
-      engineRef.current.stateDetector.dispose();
-      engineRef.current = null;
-    }
-
     if (!configId) {
+      if (engineRef.current) engineRef.current.stateDetector.dispose();
+      engineRef.current = null;
       if (bridge) delete bridge.stateMachine;
       return;
     }
@@ -270,39 +316,9 @@ export function useStateMachineRegistration(): void {
         return;
       }
 
-      // Create engine with UI Bridge registry and DefaultDOMExecutor
-      const registryAdapter = createRegistryAdapter();
-      const executor = new DefaultDOMExecutor(registryAdapter);
-      const engine = new AutomationEngine({
-        registry: registryAdapter,
-        executor,
-        enableHighlights: false,
-        enableReliabilityTracking: true,
-      });
-
-      // Convert DB format → engine format and load
       const stateDefs = config.states.map(toStateDefinition);
       const transitionDefs = config.transitions.map(toTransitionDefinition);
-      engine.defineStates(stateDefs);
-      engine.defineTransitions(transitionDefs);
-
-      // Detect initial active states by batch-finding all required elements
-      // against the live DOM. This is a one-time operation before automation.
-      engine.detectActiveStates();
-
-      // Dispose the event-driven StateDetector for statically-defined configs.
-      // The static builder's ElementQuery format (tagName, text, data-page-id)
-      // references arbitrary DOM elements not tracked by the UI Bridge registry,
-      // so registry events can't meaningfully update active states. The initial
-      // detection above is sufficient; transitions handle state changes from here.
-      engine.stateDetector.dispose();
-
-      engineRef.current = engine;
-
-      // Register adapter on the global bridge
-      if (bridge) {
-        bridge.stateMachine = buildEngineAdapter(engine);
-      }
+      engineRef.current = createAndRegisterEngine(stateDefs, transitionDefs, engineRef.current);
     } catch {
       if (bridge) delete bridge.stateMachine;
       engineRef.current = null;
