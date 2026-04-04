@@ -43,6 +43,7 @@ import { useUIState } from "./useUIState";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
 import { useZoneActions } from "./useZoneActions";
+import { useFileLockTracking } from "./useFileLockTracking";
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -113,6 +114,7 @@ export function TerminalPage({
   }, [tabs.length, onSessionCountChange]);
 
   const fileConflicts = useFileConflicts();
+  const fileLockStates = useFileLockTracking(tabs);
   const { eventHistory, addHistoryEvent, metrics, incrementMetric } = useEventHistory();
   const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);
   const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
@@ -578,9 +580,10 @@ export function TerminalPage({
           };
           const layoutId = layoutMap[count];
           if (layoutId) zoneLayout.setLayoutId(layoutId);
+          const title = autoCommand ? autoCommand.slice(0, 20) : undefined;
           const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
-            const tabId = await createAndAssignTerminal();
+            const tabId = await createAndAssignTerminal(title);
             if (tabId) createdTabIds.push(tabId);
           }
           if (autoCommand && createdTabIds.length > 0) {
@@ -591,7 +594,7 @@ export function TerminalPage({
             }, 1500);
           }
         }}
-        onLaunchAiSession={async (count, configDir) => {
+        onLaunchAiSession={async (count, configDir, context) => {
           const layoutMap: Record<number, string> = {
             2: "split",
             4: "quad",
@@ -609,20 +612,33 @@ export function TerminalPage({
             : isWindows
               ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
               : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
+          // Smart tab naming: use custom command or account label
+          const dirName = configDir.replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+          const label = customCmd ?? (dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude");
           const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
-            const tabId = await createAndAssignTerminal();
+            const tabId = await createAndAssignTerminal(label);
             if (tabId) createdTabIds.push(tabId);
           }
           if (createdTabIds.length > 0) {
+            // Type the launch command
             setTimeout(() => {
               for (const tabId of createdTabIds) {
                 terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
               }
             }, 1500);
+            // Type the initial instructions after Claude starts
+            if (context) {
+              const safeContext = context.replace(/\n/g, " ");
+              setTimeout(() => {
+                for (const tabId of createdTabIds) {
+                  terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${safeContext}\r`);
+                }
+              }, 8000);
+            }
           }
         }}
-        onLaunchMultiAiSessions={async (configDirs) => {
+        onLaunchMultiAiSessions={async (configDirs, context) => {
           const layoutMap: Record<number, string> = {
             2: "split",
             4: "quad",
@@ -636,10 +652,14 @@ export function TerminalPage({
           }
           const isWindows = navigator.platform.startsWith("Win");
           const cmds = sessionManager.launchCommands ?? {};
+          const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
-            const tabId = await createAndAssignTerminal();
+            const customCmd = cmds[configDirs[i]];
+            const dirName = configDirs[i].replace(/\\/g, "/").replace(/\/$/, "").split("/").pop() ?? "";
+            const label = customCmd ?? (dirName.match(/^\.claude-(.+)$/)?.[1] ?? "claude");
+            const tabId = await createAndAssignTerminal(label);
             if (tabId) {
-              const customCmd = cmds[configDirs[i]];
+              createdTabIds.push(tabId);
               const cmd = customCmd
                 ? customCmd
                 : isWindows
@@ -653,9 +673,24 @@ export function TerminalPage({
               );
             }
           }
+          // Type initial instructions after Claude starts (stagger per session)
+          if (context && createdTabIds.length > 0) {
+            const safeContext = context.replace(/\n/g, " ");
+            for (let j = 0; j < createdTabIds.length; j++) {
+              const tabId = createdTabIds[j];
+              setTimeout(
+                () => {
+                  terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${safeContext}\r`);
+                },
+                1500 + j * 300 + 8000,
+              );
+            }
+          }
         }}
         accountUsage={sessionManager.accountUsage}
         launchCommands={sessionManager.launchCommands}
+        fileLocks={sessionManager.fileLocks}
+        fileLockStates={fileLockStates}
       />
       <ZoneStatusBar
         tabs={tabs}

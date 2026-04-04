@@ -193,6 +193,7 @@ pub fn launch_reflection(
     let wf_name = reflection_name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
 
     // Check if Restate durable execution should be used
     let mut use_legacy = true;
@@ -243,6 +244,7 @@ pub fn launch_reflection(
             wf_name,
             url_lock,
             file_registry,
+            file_lock,
             deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 controller
@@ -388,6 +390,7 @@ pub fn launch_project_reflection(
     let wf_name = reflection_name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
 
     // Check if Restate durable execution should be used
     let mut use_legacy = true;
@@ -438,6 +441,7 @@ pub fn launch_project_reflection(
             wf_name,
             url_lock,
             file_registry,
+            file_lock,
             deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 controller
@@ -581,6 +585,7 @@ pub fn launch_ui_bridge_reflection(
     let wf_name = reflection_name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
 
     // Check if Restate durable execution should be used
     let mut use_legacy = true;
@@ -631,6 +636,7 @@ pub fn launch_ui_bridge_reflection(
             wf_name,
             url_lock,
             file_registry,
+            file_lock,
             deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 controller

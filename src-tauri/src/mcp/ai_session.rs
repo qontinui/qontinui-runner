@@ -242,11 +242,16 @@ pub async fn stop_ai_analysis(
             warn!("MCP API: Failed to stop task run {}: {}", task.id, e);
         }
 
-        // Release URL locks and file registry entries
+        // Release URL locks, file registry entries, and exclusive file locks
         state.app_state.url_lock_manager.release_all(&task.id).await;
         state
             .app_state
             .file_registry_manager
+            .release_all(&task.id)
+            .await;
+        state
+            .app_state
+            .file_lock_manager
             .release_all(&task.id)
             .await;
 

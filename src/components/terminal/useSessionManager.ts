@@ -55,6 +55,13 @@ export interface AccountUsageInfo {
   error: string | null;
 }
 
+export interface FileLockInfo {
+  file_path: string;
+  holder_task_run_id: string;
+  holder_name: string;
+  acquired_at: number;
+}
+
 export interface UnifiedSession {
   sessionId: string;
   accountLabel: string;
@@ -109,6 +116,7 @@ export interface UseSessionManagerReturn {
   loading: boolean;
   accountUsage: AccountUsageInfo[];
   launchCommands: Record<string, string>;
+  fileLocks: FileLockInfo[];
 
   // Filters
   searchQuery: string;
@@ -217,6 +225,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // Per-account launch commands (e.g. "clg" for gmail, "clh" for hotmail)
   const [launchCommands, setLaunchCommands] = useState<Record<string, string>>({});
+
+  // Active file locks (for Launch Menu visibility)
+  const [fileLocks, setFileLocks] = useState<FileLockInfo[]>([]);
 
   // External process state
   const [externalProcessCount, setExternalProcessCount] = useState(0);
@@ -395,6 +406,30 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       return () => clearInterval(interval);
     }
   }, [fetchAccountUsage, configDirsKey]);
+
+  // ── Fetch active file locks (every 10s) ────────────────────────────────────
+
+  const fetchFileLocks = useCallback(async () => {
+    try {
+      const port =
+        typeof window !== "undefined" && (window as unknown as Record<string, unknown>).__QONTINUI_PORT__
+          ? Number((window as unknown as Record<string, unknown>).__QONTINUI_PORT__)
+          : 9876;
+      const resp = await fetch(`http://127.0.0.1:${port}/file-locks/info`);
+      if (resp.ok) {
+        const data = (await resp.json()) as FileLockInfo[];
+        setFileLocks(data);
+      }
+    } catch {
+      // Silently fail — endpoint may not be available yet
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchFileLocks();
+    const interval = setInterval(fetchFileLocks, 10_000);
+    return () => clearInterval(interval);
+  }, [fetchFileLocks]);
 
   // ── Detect external Claude processes (every 30s) ────────────────────────────
 
@@ -697,6 +732,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     loading: sessionsLoading || digestsLoading,
     accountUsage,
     launchCommands,
+    fileLocks,
     searchQuery,
     setSearchQuery,
     statusFilter,

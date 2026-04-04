@@ -1,16 +1,20 @@
-//! File Registry Module
+//! File Registry and Lock Module
 //!
-//! Advisory registry that tracks which files are under active development
-//! by concurrent sessions (workflows and AI sessions). Unlike the URL lock
-//! system, this is non-blocking — multiple sessions CAN work on the same
-//! file, but new sessions are alerted to potential conflicts.
+//! Two complementary systems for managing concurrent file access:
 //!
-//! This helps avoid merge conflicts when multiple Claude Code sessions
-//! run simultaneously on the same branch.
+//! 1. **FileRegistryManager** (advisory): Tracks which files are under active
+//!    development by concurrent sessions. Non-blocking — multiple sessions CAN
+//!    work on the same file, but new sessions are alerted to potential conflicts.
+//!
+//! 2. **FileLockManager** (exclusive): Provides per-file blocking locks. When
+//!    a session edits a file, it acquires an exclusive lock. If another session
+//!    tries to edit the same file, its stdout reader thread blocks until the
+//!    lock is released, creating backpressure that pauses Claude Code.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
 /// A single file registration by a session.
@@ -375,6 +379,188 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// =============================================================================
+// FileLockManager — exclusive per-file locks with blocking
+// =============================================================================
+
+/// Entry tracking who holds a file lock.
+#[derive(Debug, Clone)]
+struct FileLockEntry {
+    holder_task_run_id: String,
+    holder_name: String,
+    acquired_at: u64,
+}
+
+/// Exclusive per-file lock manager that blocks concurrent access.
+///
+/// When a session edits a file (Edit/Write tool), it acquires an exclusive lock.
+/// If another session tries to edit the same file, the `acquire` call blocks
+/// until the lock is released. This creates backpressure on the Claude Code
+/// stdout reader thread, which pauses the AI session deterministically.
+///
+/// Unlike the advisory `FileRegistryManager`, this is a hard blocking mechanism.
+#[derive(Debug, Clone)]
+pub struct FileLockManager {
+    state: Arc<RwLock<HashMap<String, FileLockEntry>>>,
+    notify: Arc<Notify>,
+}
+
+impl FileLockManager {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(HashMap::new())),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Acquire exclusive access to a file, blocking if another session holds it.
+    ///
+    /// If the same `task_run_id` already holds this file, returns immediately
+    /// (idempotent). If another session holds it, blocks until released.
+    ///
+    /// Returns the name of the session that was blocking (if any), for logging.
+    pub async fn acquire(
+        &self,
+        file_path: &str,
+        task_run_id: &str,
+        holder_name: &str,
+    ) -> Option<String> {
+        let normalized = normalize_path(file_path);
+        let mut waited_for: Option<String> = None;
+
+        loop {
+            {
+                let mut state = self.state.write().await;
+
+                // Check if already held by this session (idempotent)
+                if let Some(entry) = state.get(&normalized) {
+                    if entry.holder_task_run_id == task_run_id {
+                        return waited_for;
+                    }
+                    // Held by another session — record who we're waiting for, then wait
+                    waited_for = Some(entry.holder_name.clone());
+                } else {
+                    // Free — acquire it
+                    state.insert(
+                        normalized,
+                        FileLockEntry {
+                            holder_task_run_id: task_run_id.to_string(),
+                            holder_name: holder_name.to_string(),
+                            acquired_at: now_millis(),
+                        },
+                    );
+                    return waited_for;
+                }
+            }
+            // Drop the write lock before waiting
+            // Wait for any release notification, then retry
+            tokio::time::timeout(Duration::from_secs(5), self.notify.notified())
+                .await
+                .ok();
+        }
+    }
+
+    /// Release a specific file lock.
+    pub async fn release(&self, file_path: &str, task_run_id: &str) {
+        let normalized = normalize_path(file_path);
+        let mut state = self.state.write().await;
+
+        if let Some(entry) = state.get(&normalized) {
+            if entry.holder_task_run_id == task_run_id {
+                state.remove(&normalized);
+                drop(state);
+                self.notify.notify_waiters();
+            }
+        }
+    }
+
+    /// Release all file locks held by a session.
+    pub async fn release_all(&self, task_run_id: &str) {
+        let mut state = self.state.write().await;
+        let before = state.len();
+        state.retain(|_, entry| entry.holder_task_run_id != task_run_id);
+        let released = before - state.len();
+        if released > 0 {
+            info!(
+                "Released {} file lock(s) for task {}",
+                released, task_run_id
+            );
+            drop(state);
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Synchronous version for Drop impls.
+    pub fn release_all_sync(&self, task_run_id: &str) {
+        for attempt in 0..10 {
+            match self.state.try_write() {
+                Ok(mut state) => {
+                    let before = state.len();
+                    state.retain(|_, entry| entry.holder_task_run_id != task_run_id);
+                    let released = before - state.len();
+                    if released > 0 {
+                        drop(state);
+                        self.notify.notify_waiters();
+                    }
+                    return;
+                }
+                Err(_) => {
+                    if attempt < 9 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        warn!(
+            "Could not acquire file lock state after 10 retries for sync release (task {})",
+            task_run_id
+        );
+    }
+
+    /// Check if a file is held by a different session. Returns the holder name if so.
+    pub async fn is_held_by_other(
+        &self,
+        file_path: &str,
+        task_run_id: &str,
+    ) -> Option<String> {
+        let normalized = normalize_path(file_path);
+        let state = self.state.read().await;
+        state
+            .get(&normalized)
+            .filter(|e| e.holder_task_run_id != task_run_id)
+            .map(|e| e.holder_name.clone())
+    }
+
+    /// Get info about all currently held locks (for debugging/UI).
+    pub async fn info(&self) -> Vec<FileLockInfo> {
+        let state = self.state.read().await;
+        state
+            .iter()
+            .map(|(path, entry)| FileLockInfo {
+                file_path: path.clone(),
+                holder_task_run_id: entry.holder_task_run_id.clone(),
+                holder_name: entry.holder_name.clone(),
+                acquired_at: entry.acquired_at,
+            })
+            .collect()
+    }
+}
+
+impl Default for FileLockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Information about a held file lock.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileLockInfo {
+    pub file_path: String,
+    pub holder_task_run_id: String,
+    pub holder_name: String,
+    pub acquired_at: u64,
 }
 
 #[cfg(test)]

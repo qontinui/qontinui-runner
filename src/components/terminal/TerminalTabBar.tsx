@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, type ReactNode } from "react";
-import { Terminal, X, Plus, List, ChevronDown, FileText } from "lucide-react";
+import { Terminal, X, Plus, List, ChevronDown, FileText, Lock } from "lucide-react";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import type { AccountUsageInfo } from "./useSessionManager";
@@ -15,10 +15,12 @@ interface TerminalTabBarProps {
   sessionStates?: Record<string, SessionState>;
   layoutPicker?: ReactNode;
   onQuickLaunch?: (count: number, autoCommand?: string) => void;
-  onLaunchAiSession?: (count: number, configDir: string) => void;
-  onLaunchMultiAiSessions?: (configDirs: string[]) => void;
+  onLaunchAiSession?: (count: number, configDir: string, context?: string) => void;
+  onLaunchMultiAiSessions?: (configDirs: string[], context?: string) => void;
   accountUsage?: AccountUsageInfo[];
   launchCommands?: Record<string, string>;
+  fileLocks?: import("./useSessionManager").FileLockInfo[];
+  fileLockStates?: Record<string, import("./useFileLockTracking").FileLockState>;
   // Zone monitoring enrichments
   activityData?: Record<string, number[]>;
   stateDurations?: Record<string, string>;
@@ -156,6 +158,8 @@ export function TerminalTabBar({
   onLaunchMultiAiSessions,
   accountUsage,
   launchCommands,
+  fileLocks,
+  fileLockStates,
   activityData,
   stateDurations,
   unreadTabs,
@@ -234,10 +238,51 @@ export function TerminalTabBar({
 
   return (
     <div className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0">
+      {/* Pinned left: layout picker + terminal creation buttons */}
+      <div className="flex items-center gap-0.5 px-1 shrink-0">
+      {layoutPicker && <div className="shrink-0 mr-1">{layoutPicker}</div>}
+
+      <button
+        onClick={onCreate}
+        className="flex items-center justify-center w-6 h-6 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50 transition-colors shrink-0"
+        title="New terminal (Ctrl+Shift+T)"
+      >
+        <Plus className="w-3.5 h-3.5" />
+      </button>
+
+      {/* Launch menu dropdown */}
+      {onQuickLaunch && (
+        <div className="relative shrink-0">
+          <button
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={() => setShowQuickLaunch(!showQuickLaunch)}
+            className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
+              showQuickLaunch
+                ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
+                : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
+            }`}
+            title="Launch menu"
+          >
+            <ChevronDown className="w-3 h-3" />
+          </button>
+          {showQuickLaunch && (
+            <LaunchMenu
+              onCreatePlain={(count) => onQuickLaunch(count)}
+              onCreateAiSession={(count, configDir, context) => onLaunchAiSession?.(count, configDir, context)}
+              onCreateMultiAiSessions={(configDirs, context) => onLaunchMultiAiSessions?.(configDirs, context)}
+              onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
+              accountUsage={accountUsage ?? []}
+              launchCommands={launchCommands}
+              fileLocks={fileLocks}
+              onClose={() => setShowQuickLaunch(false)}
+            />
+          )}
+        </div>
+      )}
+      </div>
+
       {/* Scrollable tab area */}
       <div className="flex items-center gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
-      {/* Layout picker */}
-      {layoutPicker && <div className="shrink-0 mr-1">{layoutPicker}</div>}
 
       {tabs.map((tab) => {
         const isActive = tab.id === activeId;
@@ -251,6 +296,7 @@ export function TerminalTabBar({
         const tabLabels = getTabLabels(tab.id);
         const showSparkline =
           isMultiZone && isTabAssigned(tab.id) && tabActivity && tabActivity.length > 0;
+        const lockState = fileLockStates?.[tab.id];
 
         return (
           <button
@@ -291,6 +337,14 @@ export function TerminalTabBar({
               />
             ) : (
               <Terminal className="w-3 h-3 shrink-0" />
+            )}
+
+            {/* File lock indicator */}
+            {lockState === "waiting" && (
+              <Lock className="w-2.5 h-2.5 shrink-0 text-[#e0af68] animate-pulse" />
+            )}
+            {lockState === "holding" && (
+              <Lock className="w-2.5 h-2.5 shrink-0 text-[#7aa2f7] opacity-60" />
             )}
 
             <span className="flex flex-col items-start min-w-0">
@@ -382,45 +436,8 @@ export function TerminalTabBar({
 
       </div>
 
-      {/* Pinned action buttons — always visible */}
-      <div className="flex items-center gap-0.5 px-1 shrink-0 border-l border-[#2a2d3d]">
-      <button
-        onClick={onCreate}
-        className="flex items-center justify-center w-6 h-6 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50 transition-colors shrink-0"
-        title="New terminal (Ctrl+Shift+T)"
-      >
-        <Plus className="w-3.5 h-3.5" />
-      </button>
-
-      {/* Launch menu dropdown */}
-      {onQuickLaunch && (
-        <div className="relative shrink-0">
-          <button
-            onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => setShowQuickLaunch(!showQuickLaunch)}
-            className={`flex items-center justify-center w-5 h-6 rounded transition-colors ${
-              showQuickLaunch
-                ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-                : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50"
-            }`}
-            title="Launch menu"
-          >
-            <ChevronDown className="w-3 h-3" />
-          </button>
-          {showQuickLaunch && (
-            <LaunchMenu
-              onCreatePlain={(count) => onQuickLaunch(count)}
-              onCreateAiSession={(count, configDir) => onLaunchAiSession?.(count, configDir)}
-              onCreateMultiAiSessions={(configDirs) => onLaunchMultiAiSessions?.(configDirs)}
-              onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
-              accountUsage={accountUsage ?? []}
-              launchCommands={launchCommands}
-              onClose={() => setShowQuickLaunch(false)}
-            />
-          )}
-        </div>
-      )}
-
+      {/* Pinned right: session list dropdown */}
+      <div className="flex items-center gap-0.5 px-1 shrink-0">
       {/* Session dropdown */}
       {tabs.length > 0 && (
         <div className="relative ml-auto shrink-0" ref={dropdownRef}>

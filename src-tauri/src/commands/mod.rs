@@ -33,7 +33,9 @@ use crate::database::pg::PgDb;
 use crate::display::DisplayProcessor;
 use crate::doctor::DoctorHandle;
 use crate::error_monitor::ErrorMonitorHandle;
-use crate::executor::{BridgeManager, ExtractionExecutor, FileRegistryManager, UrlLockManager};
+use crate::executor::{
+    BridgeManager, ExtractionExecutor, FileLockManager, FileRegistryManager, UrlLockManager,
+};
 use crate::mcp_client::McpClientManager;
 use crate::process_capture::ProcessCaptureManager;
 use crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker;
@@ -184,6 +186,10 @@ pub struct AppState {
     /// potential conflicts. Non-blocking — multiple sessions can work on the
     /// same file but are warned about overlaps.
     pub file_registry_manager: Arc<FileRegistryManager>,
+    /// Exclusive per-file lock manager. When a session edits a file, other
+    /// sessions trying to edit the same file block until the lock is released.
+    /// This prevents concurrent edits deterministically (no AI judgment needed).
+    pub file_lock_manager: Arc<FileLockManager>,
     /// Tracks consecutive UI Bridge failures per URL.
     /// After 3+ consecutive failures to the same URL, triggers an AI diagnostic.
     pub ui_bridge_failure_tracker: UiBridgeFailureTracker,

@@ -194,6 +194,7 @@ pub async fn execute_triggered_workflow(
     let wf_name = workflow.name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
     let app_state = deps.app_state.clone();
     let config_storage = deps.config_storage.clone();
     let app_handle = deps.app_handle.clone();
@@ -238,6 +239,7 @@ pub async fn execute_triggered_workflow(
             wf_name,
             url_lock,
             file_registry,
+            file_lock,
             deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 let mut controller = crate::unified_workflow_executor::LoopController::new(

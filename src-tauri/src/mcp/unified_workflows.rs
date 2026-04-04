@@ -1096,11 +1096,13 @@ pub async fn generate_unified_workflow_async_handler(
         if use_legacy {
             let url_lock = Some(state.app_state.url_lock_manager.clone());
             let file_registry = Some(state.app_state.file_registry_manager.clone());
+            let file_lock = Some(state.app_state.file_lock_manager.clone());
             crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
                 execution_id_for_guard,
                 workflow_name,
                 url_lock,
                 file_registry,
+                file_lock,
                 state.app_state.pg_db.clone(),
                 async move {
                     let mut controller =
@@ -1488,6 +1490,7 @@ pub async fn run_unified_workflow(
         let pid_tracker = state.current_ai_pids.clone();
         let url_lock = Some(state.app_state.url_lock_manager.clone());
         let file_registry = Some(state.app_state.file_registry_manager.clone());
+        let file_lock = Some(state.app_state.file_lock_manager.clone());
 
         // Check if Restate durable execution should be used
         let mut use_legacy = true;
@@ -1532,6 +1535,7 @@ pub async fn run_unified_workflow(
                 workflow_name_for_guard,
                 url_lock,
                 file_registry,
+                file_lock,
                 app_state.pg_db.clone(),
                 async move {
                     let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
@@ -1623,12 +1627,14 @@ pub async fn run_unified_workflow(
     let app_handle = state.app_handle.clone();
     let url_lock = Some(state.app_state.url_lock_manager.clone());
     let file_registry = Some(state.app_state.file_registry_manager.clone());
+    let file_lock = Some(state.app_state.file_lock_manager.clone());
 
     crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
         execution_id_for_guard,
         workflow_name_for_guard,
         url_lock,
         file_registry,
+        file_lock,
         app_state.pg_db.clone(),
         async move {
             let executor = crate::step_executor::StepExecutor::with_app_handle(
@@ -2075,6 +2081,7 @@ pub async fn execute_inline_workflow(
                 workflow_name_for_guard,
                 None,
                 None,
+                None,
                 app_state.pg_db.clone(),
                 async move {
                     let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
@@ -2400,6 +2407,7 @@ pub async fn run_composed_workflow(
     let execution_id_for_guard = execution_id.clone();
     let url_lock_for_composed = Some(state.app_state.url_lock_manager.clone());
     let file_registry_for_composed = Some(state.app_state.file_registry_manager.clone());
+    let file_lock_for_composed = Some(state.app_state.file_lock_manager.clone());
 
     // Use panic-safe spawning to ensure task is marked as failed on panic
     crate::unified_workflow_executor::spawn_sequence_with_panic_guard(
@@ -2407,6 +2415,7 @@ pub async fn run_composed_workflow(
         sequence_name_for_guard,
         url_lock_for_composed,
         file_registry_for_composed,
+        file_lock_for_composed,
         state.app_state.pg_db.clone(),
         async move {
             info!(

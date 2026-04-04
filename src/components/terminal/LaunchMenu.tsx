@@ -1,14 +1,15 @@
 import { useState, useMemo, useRef, useEffect } from "react";
-import { Star, Terminal, Play, Loader2 } from "lucide-react";
-import type { AccountUsageInfo } from "./useSessionManager";
+import { Star, Terminal, Play, Loader2, Lock } from "lucide-react";
+import type { AccountUsageInfo, FileLockInfo } from "./useSessionManager";
 
 interface LaunchMenuProps {
   onCreatePlain: (count: number) => void;
-  onCreateAiSession: (count: number, configDir: string) => void;
-  onCreateMultiAiSessions: (configDirs: string[]) => void;
+  onCreateAiSession: (count: number, configDir: string, context?: string) => void;
+  onCreateMultiAiSessions: (configDirs: string[], context?: string) => void;
   onCreateWithCommand: (count: number, command: string) => void;
   accountUsage: AccountUsageInfo[];
   launchCommands?: Record<string, string>;
+  fileLocks?: FileLockInfo[];
   onClose: () => void;
 }
 
@@ -76,9 +77,11 @@ export function LaunchMenu({
   onCreateWithCommand,
   accountUsage,
   launchCommands,
+  fileLocks,
   onClose,
 }: LaunchMenuProps) {
   const [customCommand, setCustomCommand] = useState("");
+  const [sessionContext, setSessionContext] = useState("");
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -112,13 +115,12 @@ export function LaunchMenu({
   const getCustomCommand = (configDir: string): string | undefined =>
     launchCommands?.[configDir];
 
+  const ctx = sessionContext.trim() || undefined;
+
   const launchAccount = (count: number, configDir: string) => {
-    const cmd = getCustomCommand(configDir);
-    if (cmd) {
-      onCreateWithCommand(count, cmd);
-    } else {
-      onCreateAiSession(count, configDir);
-    }
+    // Always route through onCreateAiSession so context is preserved.
+    // The handler checks for custom launch commands internally.
+    onCreateAiSession(count, configDir, ctx);
   };
 
   const extractLabel = (configDir: string): string => {
@@ -144,7 +146,7 @@ export function LaunchMenu({
   return (
     <div
       ref={menuRef}
-      className="absolute right-0 top-full mt-1 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden min-w-[280px]"
+      className="absolute left-0 top-full mt-1 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden min-w-[280px]"
     >
       {/* ── Plain Terminal ────────────────────────────────────── */}
       <SectionHeader>Plain Terminal</SectionHeader>
@@ -167,6 +169,36 @@ export function LaunchMenu({
       {hasAccounts && (
         <>
           <SectionHeader>AI Session</SectionHeader>
+
+          {/* Active file locks summary */}
+          {fileLocks && fileLocks.length > 0 && (() => {
+            const byHolder = new Map<string, number>();
+            for (const lock of fileLocks) {
+              byHolder.set(lock.holder_name, (byHolder.get(lock.holder_name) ?? 0) + 1);
+            }
+            return (
+              <div className="flex items-center gap-1.5 px-3 py-1 text-[10px] text-[#e0af68] bg-[#e0af68]/5 border-b border-[#2a2d3d]">
+                <Lock className="w-3 h-3 shrink-0" />
+                <span>
+                  {Array.from(byHolder.entries()).map(([name, count]) =>
+                    `${count} file${count > 1 ? "s" : ""} locked by ${name}`
+                  ).join(", ")}
+                </span>
+              </div>
+            );
+          })()}
+
+          {/* Session context / initial instructions */}
+          <div className="px-3 py-1.5 border-b border-[#2a2d3d]">
+            <textarea
+              value={sessionContext}
+              onChange={(e) => setSessionContext(e.target.value)}
+              onKeyDown={(e) => e.stopPropagation()}
+              placeholder="Initial instructions (optional)"
+              rows={2}
+              className="w-full bg-[#13141f] border border-[#2a2d3d] rounded px-2 py-1 text-[10px] text-[#c0caf5] placeholder-[#565f89] outline-hidden focus:border-[#7aa2f7] transition-colors resize-none"
+            />
+          </div>
 
           {/* Best available - single */}
           {bestAccount && (
@@ -232,7 +264,7 @@ export function LaunchMenu({
                 <span className="text-left">Round-robin accounts</span>
                 <CountButtons
                   counts={[2, 4, 6]}
-                  onSelect={(c) => fire(() => onCreateMultiAiSessions(distributeRoundRobin(c)))}
+                  onSelect={(c) => fire(() => onCreateMultiAiSessions(distributeRoundRobin(c), ctx))}
                 />
               </div>
             </>

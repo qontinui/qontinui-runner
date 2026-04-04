@@ -11,7 +11,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::executor::file_registry::{FileConflict, FileRegistryInfo};
+use crate::executor::file_registry::{FileConflict, FileLockInfo, FileRegistryInfo};
 use crate::mcp::types::ApiState;
 
 // =============================================================================
@@ -163,6 +163,16 @@ async fn get_info(
     Ok(Json(info))
 }
 
+/// GET /file-locks/info
+///
+/// Get a snapshot of all currently held exclusive file locks.
+async fn get_lock_info(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Vec<FileLockInfo>>, (StatusCode, String)> {
+    let info = state.app_state.file_lock_manager.info().await;
+    Ok(Json(info))
+}
+
 // =============================================================================
 // Routes
 // =============================================================================
@@ -174,4 +184,5 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/file-registry/release-all", post(release_all))
         .route("/file-registry/check-conflicts", post(check_conflicts))
         .route("/file-registry/info", get(get_info))
+        .route("/file-locks/info", get(get_lock_info))
 }

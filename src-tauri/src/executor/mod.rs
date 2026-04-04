@@ -36,7 +36,7 @@ pub use python_bridge::PythonBridge;
 pub use results::{ExecutionOutcome, IntoOutcome};
 pub use state::ExecutorState;
 
-pub use file_registry::FileRegistryManager;
+pub use file_registry::{FileLockInfo, FileLockManager, FileRegistryManager};
 #[allow(unused_imports)]
 pub use url_lock::UrlLockInfo;
 pub use url_lock::UrlLockManager;

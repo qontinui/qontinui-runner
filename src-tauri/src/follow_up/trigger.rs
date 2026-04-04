@@ -266,6 +266,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     let wf_name = follow_up_name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
 
     // Check if Restate durable execution should be used
     let mut use_legacy = true;
@@ -316,6 +317,7 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
             wf_name,
             url_lock,
             file_registry,
+            file_lock,
             deps.app_state.pg_db.clone(),
             Box::pin(async move {
                 controller

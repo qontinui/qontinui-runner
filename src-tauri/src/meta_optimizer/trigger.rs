@@ -509,6 +509,7 @@ fn launch_optimizer_internal(
         let wf_name = task_name_clone.clone();
         let url_lock = Some(app_state.url_lock_manager.clone());
         let file_registry = Some(app_state.file_registry_manager.clone());
+        let file_lock = Some(app_state.file_lock_manager.clone());
 
         // Check if Restate durable execution should be used
         let mut use_legacy = true;
@@ -548,6 +549,7 @@ fn launch_optimizer_internal(
                 wf_name,
                 url_lock,
                 file_registry,
+                file_lock,
                 app_state.pg_db.clone(),
                 Box::pin(async move {
                     controller

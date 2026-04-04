@@ -154,6 +154,8 @@ struct WorkflowDropGuard {
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
     /// File registry manager for releasing per-execution file registrations on drop.
     file_registry_manager: Option<Arc<crate::executor::FileRegistryManager>>,
+    /// File lock manager for releasing per-file exclusive locks on drop.
+    file_lock_manager: Option<Arc<crate::executor::FileLockManager>>,
 }
 
 impl Drop for WorkflowDropGuard {
@@ -176,6 +178,19 @@ impl Drop for WorkflowDropGuard {
 
         // Always release file registry entries on drop.
         if let Some(ref mgr) = self.file_registry_manager {
+            let mgr = mgr.clone();
+            let id = self.execution_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    mgr.release_all(&id).await;
+                });
+            } else {
+                mgr.release_all_sync(&self.execution_id);
+            }
+        }
+
+        // Always release exclusive file locks on drop.
+        if let Some(ref mgr) = self.file_lock_manager {
             let mgr = mgr.clone();
             let id = self.execution_id.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -231,6 +246,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     workflow_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
     file_registry_manager: Option<Arc<crate::executor::FileRegistryManager>>,
+    file_lock_manager: Option<Arc<crate::executor::FileLockManager>>,
     pg_db: Arc<crate::database::pg::PgDb>,
     fut: F,
 ) where
@@ -240,6 +256,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
     let name_for_guard = workflow_name.clone();
     let url_lock_for_guard = url_lock_manager.clone();
     let file_registry_for_guard = file_registry_manager.clone();
+    let file_lock_for_guard = file_lock_manager.clone();
 
     tokio::spawn(async move {
         // The drop guard ensures cleanup even if this task is cancelled/aborted.
@@ -252,6 +269,7 @@ pub fn spawn_workflow_with_panic_guard<F>(
             completed: completed.clone(),
             url_lock_manager: url_lock_for_guard.clone(),
             file_registry_manager: file_registry_for_guard.clone(),
+            file_lock_manager: file_lock_for_guard.clone(),
         };
 
         // Wrap the future in AssertUnwindSafe and catch panics
@@ -268,6 +286,11 @@ pub fn spawn_workflow_with_panic_guard<F>(
 
         // Explicitly release file registry entries (async path)
         if let Some(ref mgr) = file_registry_manager {
+            mgr.release_all(&execution_id).await;
+        }
+
+        // Explicitly release exclusive file locks (async path)
+        if let Some(ref mgr) = file_lock_manager {
             mgr.release_all(&execution_id).await;
         }
 
@@ -329,6 +352,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     sequence_name: String,
     url_lock_manager: Option<Arc<crate::executor::UrlLockManager>>,
     file_registry_manager: Option<Arc<crate::executor::FileRegistryManager>>,
+    file_lock_manager: Option<Arc<crate::executor::FileLockManager>>,
     pg_db: Arc<crate::database::pg::PgDb>,
     fut: F,
 ) where
@@ -338,6 +362,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
     let name_for_guard = sequence_name.clone();
     let url_lock_for_guard = url_lock_manager.clone();
     let file_registry_for_guard = file_registry_manager.clone();
+    let file_lock_for_guard = file_lock_manager.clone();
 
     tokio::spawn(async move {
         let completed = Arc::new(AtomicBool::new(false));
@@ -347,6 +372,7 @@ pub fn spawn_sequence_with_panic_guard<F>(
             completed: completed.clone(),
             url_lock_manager: url_lock_for_guard.clone(),
             file_registry_manager: file_registry_for_guard.clone(),
+            file_lock_manager: file_lock_for_guard.clone(),
         };
 
         // Wrap the future in AssertUnwindSafe and catch panics
@@ -361,6 +387,11 @@ pub fn spawn_sequence_with_panic_guard<F>(
 
         // Explicitly release file registry entries (async path)
         if let Some(ref mgr) = file_registry_manager {
+            mgr.release_all(&execution_id).await;
+        }
+
+        // Explicitly release exclusive file locks (async path)
+        if let Some(ref mgr) = file_lock_manager {
             mgr.release_all(&execution_id).await;
         }
 

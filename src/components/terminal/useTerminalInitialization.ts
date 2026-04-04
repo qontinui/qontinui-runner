@@ -360,9 +360,8 @@ export function useTerminalInitialization({
           }
 
           sessionPersistence.clearSavedLayout();
-        } else {
-          await createTerminal();
         }
+        // No default terminal — start empty so users can launch AI sessions via the Launch Menu
       }
       setInitialized(true);
     })();

@@ -349,6 +349,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
         let wf_name = fixer_name_clone.clone();
         let url_lock = Some(deps.app_state.url_lock_manager.clone());
         let file_registry = Some(deps.app_state.file_registry_manager.clone());
+        let file_lock = Some(deps.app_state.file_lock_manager.clone());
 
         // Check if Restate durable execution should be used
         let mut use_legacy = true;
@@ -389,6 +390,7 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
                 wf_name,
                 url_lock,
                 file_registry,
+                file_lock,
                 deps.app_state.pg_db.clone(),
                 Box::pin(async move {
                     controller

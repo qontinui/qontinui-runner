@@ -339,6 +339,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         doctor_handle: TokioMutex::new(None),        // Initialized in setup()
         url_lock_manager: Arc::new(crate::executor::UrlLockManager::new()),
         file_registry_manager: Arc::new(crate::executor::FileRegistryManager::new()),
+        file_lock_manager: Arc::new(crate::executor::FileLockManager::new()),
         ui_bridge_failure_tracker:
             crate::step_executor::handlers::ui_bridge::UiBridgeFailureTracker::new(),
         process_capture_manager: TokioMutex::new(None), // Initialized in setup()

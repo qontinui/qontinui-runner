@@ -190,6 +190,7 @@ pub fn launch_generated_workflow(
     let wf_name = workflow.name.clone();
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
     let pg_db_spawn = deps.app_state.pg_db.clone();
     let app_state = deps.app_state;
     let config_storage = deps.config_storage;
@@ -239,6 +240,7 @@ pub fn launch_generated_workflow(
             wf_name,
             url_lock,
             file_registry,
+            file_lock,
             pg_db_spawn,
             Box::pin(async move {
                 let mut controller = super::LoopController::new(

@@ -344,10 +344,13 @@ pub(crate) fn format_tool_activity(
     }
 }
 
-/// Auto-register a file in the file registry when an Edit or Write tool is used.
+/// Acquire an exclusive file lock and register the file in the advisory registry.
 ///
-/// This enables automatic conflict detection — when one session edits a file,
-/// other sessions are warned about it on startup or via real-time events.
+/// When a session uses Edit or Write tools, this function:
+/// 1. Acquires an exclusive file lock — BLOCKS if another session holds it.
+///    Blocking the stdout reader thread creates backpressure that pauses Claude Code.
+/// 2. Registers the file in the advisory registry for conflict visibility.
+/// 3. Emits events for the frontend (conflict banners, waiting indicators).
 fn auto_register_file(
     app_handle: &tauri::AppHandle,
     session_ctx: Option<&AiSessionContext>,
@@ -374,28 +377,86 @@ fn auto_register_file(
         .map(|ctx| ctx.session_name.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Access file registry via Tauri managed state (non-blocking, fire-and-forget)
     use crate::commands::AppState;
     if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+        let lock_manager = app_state.file_lock_manager.clone();
         let registry = app_state.file_registry_manager.clone();
         let event_broadcast = app_state.event_broadcast.clone();
         let handle = app_handle.clone();
         let file_path_clone = file_path.clone();
 
-        // Spawn async task to avoid blocking the synchronous dispatcher
+        // Block the stdout reader thread to acquire the file lock.
+        // This creates backpressure that pauses Claude Code when another
+        // session holds the file — deterministic, no AI judgment needed.
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            // Use block_in_place to run async code on this sync thread
+            // without blocking the tokio runtime's thread pool.
+            let waited_for = tokio::task::block_in_place(|| {
+                rt.block_on(async {
+                    // Emit waiting event if the file is held by another session
+                    let blocker = lock_manager
+                        .is_held_by_other(&file_path_clone, &task_run_id)
+                        .await;
+
+                    if let Some(ref blocker_name) = blocker {
+                        info!(
+                            "Session '{}' waiting for file lock on '{}' (held by '{}')",
+                            holder_name, file_path_clone, blocker_name
+                        );
+                        let wait_data = serde_json::json!({
+                            "type": "file-lock-waiting",
+                            "file_path": file_path_clone,
+                            "task_run_id": task_run_id,
+                            "holder_name": holder_name,
+                            "blocked_by": blocker_name,
+                        });
+                        let _ = handle.emit("file-lock-waiting", &wait_data);
+                        let _ = event_broadcast.send(wait_data);
+                    }
+
+                    // This blocks until the file is available
+                    let waited = lock_manager
+                        .acquire(&file_path_clone, &task_run_id, &holder_name)
+                        .await;
+
+                    if waited.is_some() {
+                        info!(
+                            "Session '{}' acquired file lock on '{}' (was waiting)",
+                            holder_name, file_path_clone
+                        );
+                        let acquired_data = serde_json::json!({
+                            "type": "file-lock-acquired",
+                            "file_path": file_path_clone,
+                            "task_run_id": task_run_id,
+                            "holder_name": holder_name,
+                        });
+                        let _ = handle.emit("file-lock-acquired", &acquired_data);
+                        let _ = event_broadcast.send(acquired_data);
+                    }
+
+                    waited
+                })
+            });
+
+            // Also register in the advisory registry (non-blocking, fire-and-forget)
+            let file_path_reg = file_path.clone();
+            let task_run_id_reg = task_run_id.clone();
+            let holder_name_reg = holder_name.clone();
             rt.spawn(async move {
                 let conflicts = registry
-                    .register(std::slice::from_ref(&file_path_clone), &task_run_id, &holder_name)
+                    .register(
+                        std::slice::from_ref(&file_path_reg),
+                        &task_run_id_reg,
+                        &holder_name_reg,
+                    )
                     .await;
 
-                // Emit real-time event if conflicts detected
                 if !conflicts.is_empty() {
                     let conflict_data = serde_json::json!({
                         "type": "file-conflict-detected",
-                        "file_path": file_path_clone,
-                        "task_run_id": task_run_id,
-                        "holder_name": holder_name,
+                        "file_path": file_path_reg,
+                        "task_run_id": task_run_id_reg,
+                        "holder_name": holder_name_reg,
                         "conflicts": conflicts.iter().map(|c| serde_json::json!({
                             "file_path": c.file_path,
                             "other_holders": c.other_holders.iter().map(|h| serde_json::json!({
@@ -405,20 +466,17 @@ fn auto_register_file(
                         })).collect::<Vec<_>>(),
                     });
 
-                    // Emit to Tauri frontend
                     let _ = handle.emit("file-conflict-detected", &conflict_data);
-
-                    // Emit to WebSocket clients
                     let _ = event_broadcast.send(conflict_data);
-
-                    info!(
-                        "File conflict detected: '{}' edited by '{}' but also held by {} other session(s)",
-                        file_path_clone,
-                        holder_name,
-                        conflicts[0].other_holders.len()
-                    );
                 }
             });
+
+            let _ = waited_for;
+        } else {
+            warn!(
+                "No tokio runtime available for file lock acquire — edit of '{}' proceeding unblocked",
+                file_path
+            );
         }
     }
 }

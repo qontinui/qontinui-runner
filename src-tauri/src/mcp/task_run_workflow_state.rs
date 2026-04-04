@@ -856,11 +856,13 @@ pub async fn resume_task_run(
     if use_legacy {
         let url_lock = Some(state.app_state.url_lock_manager.clone());
         let file_registry = Some(state.app_state.file_registry_manager.clone());
+        let file_lock = Some(state.app_state.file_lock_manager.clone());
         crate::unified_workflow_executor::spawn_workflow_with_panic_guard(
             execution_id_for_guard,
             task_name.clone(),
             url_lock,
             file_registry,
+            file_lock,
             state.app_state.pg_db.clone(),
             async move {
                 let mut controller =

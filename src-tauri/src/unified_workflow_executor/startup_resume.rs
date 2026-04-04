@@ -337,11 +337,13 @@ pub async fn resume_interrupted_workflows(
 
                     let url_lock = Some(app_state.url_lock_manager.clone());
                     let file_registry = Some(app_state.file_registry_manager.clone());
+                    let file_lock = Some(app_state.file_lock_manager.clone());
                     super::spawn_workflow_with_panic_guard(
                         task_id.clone(),
                         task_name.clone(),
                         url_lock,
                         file_registry,
+                        file_lock,
                         app_state.pg_db.clone(),
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
@@ -556,12 +558,14 @@ pub async fn resume_interrupted_workflows(
 
                     let url_lock2 = Some(app_state.url_lock_manager.clone());
                     let file_registry2 = Some(app_state.file_registry_manager.clone());
+                    let file_lock2 = Some(app_state.file_lock_manager.clone());
                     let pg_db_for_spawn = app_state.pg_db.clone();
                     super::spawn_workflow_with_panic_guard(
                         task_id.clone(),
                         task_name.clone(),
                         url_lock2,
                         file_registry2,
+                        file_lock2,
                         pg_db_for_spawn,
                         async move {
                             let session_manager: Arc<crate::claude_session::SessionManager> =
