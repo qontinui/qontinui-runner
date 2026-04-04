@@ -6,7 +6,7 @@ export type {
   SpecAssertion,
 } from "./buildSpecWorkflow";
 
-export { buildPlanWorkflow } from "./buildPlanWorkflow";
+export { buildPlanWorkflow, buildVerificationStep } from "./buildPlanWorkflow";
 export type {
   BuildPlanWorkflowInput,
   PlanPhase,
@@ -15,6 +15,9 @@ export type {
   VerificationType,
   UiCheckAssertion,
 } from "./buildPlanWorkflow";
+
+export { buildPlanImplementationWorkflow } from "./buildPlanImplementationWorkflow";
+export type { BuildPlanImplementationWorkflowInput } from "./buildPlanImplementationWorkflow";
 
 export { parsePlanMarkdown, summarizeParsedPlan } from "./parsePlanMarkdown";
 

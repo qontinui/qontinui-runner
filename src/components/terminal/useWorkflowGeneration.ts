@@ -6,6 +6,7 @@ import type { TranscriptMessage } from "./useTranscriptSessions";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { parsePlanMarkdown, summarizeParsedPlan } from "@/lib/workflow-builder/parsePlanMarkdown";
 import { buildPlanWorkflow } from "@/lib/workflow-builder/buildPlanWorkflow";
+import { buildPlanImplementationWorkflow } from "@/lib/workflow-builder/buildPlanImplementationWorkflow";
 import type { CommandResponse } from "./types";
 
 interface GenerateWorkflowResponse {
@@ -60,6 +61,7 @@ interface UseWorkflowGenerationResult {
   handleEditInBuilder: () => void;
   handleRegenerate: () => Promise<void>;
   handleBuildPlanWorkflow: (planContent: string) => void;
+  handleBuildPlanImplementationWorkflow: (planContent: string) => void;
   handleBuildPlanFromFile: () => void;
   loadPlanContent: () => Promise<void>;
   handleSelectTranscriptSession: (sessionId: string) => Promise<void>;
@@ -359,6 +361,31 @@ export function useWorkflowGeneration({
     }
   }, []);
 
+  const handleBuildPlanImplementationWorkflow = useCallback((planContent: string) => {
+    try {
+      const phases = parsePlanMarkdown(planContent);
+      if (phases.length === 0) {
+        setNotification({ message: "No plan structure found in content", type: "error" });
+        return;
+      }
+
+      const summary = summarizeParsedPlan(phases);
+      const workflow = buildPlanImplementationWorkflow({ phases });
+
+      setGeneratedWorkflow(workflow);
+      setWorkflowError(undefined);
+      setRightPanelMode("workflow");
+      setNotification({
+        message: `Plan implementation workflow built: ${summary.phaseCount} phases, ${summary.phaseCount * 3} stages (implement/review/next-steps), ${summary.verificationCount} checks`,
+        type: "success",
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Failed to parse plan";
+      setWorkflowError(errMsg);
+      setNotification({ message: errMsg, type: "error" });
+    }
+  }, []);
+
   const handleBuildPlanFromFile = useCallback(() => {
     if (!latestPlanContent.trim()) {
       setNotification({ message: "No plan file loaded", type: "error" });
@@ -395,6 +422,7 @@ export function useWorkflowGeneration({
     handleEditInBuilder,
     handleRegenerate,
     handleBuildPlanWorkflow,
+    handleBuildPlanImplementationWorkflow,
     handleBuildPlanFromFile,
     loadPlanContent,
     handleSelectTranscriptSession,

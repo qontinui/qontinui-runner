@@ -115,7 +115,7 @@ export interface BuildPlanWorkflowInput {
 // Step Builders
 // =============================================================================
 
-function buildCompileStep(task: PlanTask, v: TaskVerification): CommandStep {
+export function buildCompileStep(task: PlanTask, v: TaskVerification): CommandStep {
   return {
     id: crypto.randomUUID(),
     type: "command",
@@ -128,7 +128,7 @@ function buildCompileStep(task: PlanTask, v: TaskVerification): CommandStep {
   };
 }
 
-function buildUiCheckStep(
+export function buildUiCheckStep(
   task: PlanTask,
   v: TaskVerification,
   defaultTarget: string,
@@ -153,7 +153,7 @@ function buildUiCheckStep(
   } as unknown as VerificationStep;
 }
 
-function buildCommandStep(task: PlanTask, v: TaskVerification): CommandStep {
+export function buildCommandStep(task: PlanTask, v: TaskVerification): CommandStep {
   return {
     id: crypto.randomUUID(),
     type: "command",
@@ -165,7 +165,7 @@ function buildCommandStep(task: PlanTask, v: TaskVerification): CommandStep {
   };
 }
 
-function buildFileExistsStep(task: PlanTask, v: TaskVerification): CommandStep {
+export function buildFileExistsStep(task: PlanTask, v: TaskVerification): CommandStep {
   const path = v.file_path ?? v.command ?? "";
   return {
     id: crypto.randomUUID(),
@@ -177,7 +177,7 @@ function buildFileExistsStep(task: PlanTask, v: TaskVerification): CommandStep {
   };
 }
 
-function buildApiCheckStep(task: PlanTask, v: TaskVerification): CommandStep {
+export function buildApiCheckStep(task: PlanTask, v: TaskVerification): CommandStep {
   const url = v.url ?? "";
   const expected = v.expected_status ?? 200;
   return {
@@ -190,7 +190,7 @@ function buildApiCheckStep(task: PlanTask, v: TaskVerification): CommandStep {
   };
 }
 
-function buildAiReviewStep(task: PlanTask, v: TaskVerification): PromptStep {
+export function buildAiReviewStep(task: PlanTask, v: TaskVerification): PromptStep {
   return {
     id: crypto.randomUUID(),
     type: "prompt",
@@ -201,7 +201,7 @@ function buildAiReviewStep(task: PlanTask, v: TaskVerification): PromptStep {
 }
 
 /** Map a single TaskVerification to the appropriate step. */
-function buildVerificationStep(
+export function buildVerificationStep(
   task: PlanTask,
   v: TaskVerification,
   defaultTarget: string,
