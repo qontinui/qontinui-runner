@@ -343,19 +343,18 @@ export function buildPlanImplementationWorkflow(
   const now = new Date().toISOString();
   const stages: WorkflowStage[] = [];
 
-  // Generate 3 stages per phase
+  // Generate 3 stages per phase — each gets its own verification steps with unique UUIDs
   for (let i = 0; i < phases.length; i++) {
     const phase = phases[i];
-    const verificationSteps = buildPhaseVerificationSteps(phase, snapshotTarget);
 
     stages.push(
-      buildImplementStage(phase, i, verificationSteps, maxImplementIterations, projectContext),
+      buildImplementStage(phase, i, buildPhaseVerificationSteps(phase, snapshotTarget), maxImplementIterations, projectContext),
     );
     stages.push(
-      buildReviewStage(phase, i, verificationSteps, maxReviewIterations, projectContext),
+      buildReviewStage(phase, i, buildPhaseVerificationSteps(phase, snapshotTarget), maxReviewIterations, projectContext),
     );
     stages.push(
-      buildNextStepsStage(phase, i, verificationSteps, maxNextStepsIterations, projectContext),
+      buildNextStepsStage(phase, i, buildPhaseVerificationSteps(phase, snapshotTarget), maxNextStepsIterations, projectContext),
     );
   }
 
