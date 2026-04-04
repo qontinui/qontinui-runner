@@ -286,6 +286,10 @@ export function useStateMachineRegistration(): void {
       engine.defineStates(stateDefs);
       engine.defineTransitions(transitionDefs);
 
+      // Detect initial active states by batch-finding all required elements
+      // against the live DOM. This is a one-time operation before automation.
+      engine.detectActiveStates();
+
       engineRef.current = engine;
 
       // Register adapter on the global bridge
