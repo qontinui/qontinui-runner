@@ -7,7 +7,7 @@
  * Provides a high-level overview of workflow execution progress.
  */
 
-import React, { useState, useCallback, useMemo, useRef } from "react";
+import React, { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import {
   Terminal,
   CheckCircle,
@@ -776,7 +776,7 @@ export function ExecutionTimelineWidget({
   // Auto-default: expand the latest iteration in each phase.
   // When a new iteration appears, user overrides for that phase are ignored so the latest expands.
   // Also updates prevIterationCountsRef so the next render can detect new iterations.
-  const expandedIterations = useMemo(() => {
+  const expandedIterationsResult = useMemo(() => {
     const result = new Set<string>();
     const nextCounts = new Map<string, number>();
 
@@ -813,11 +813,15 @@ export function ExecutionTimelineWidget({
       }
     }
 
-    // Update ref so the next render can detect new iterations
-    prevIterationCountsRef.current = nextCounts;
-
-    return result;
+    return { expanded: result, nextCounts };
   }, [phaseGroups, userIterationToggles]);
+
+  const expandedIterations = expandedIterationsResult.expanded;
+
+  // Sync the ref after render so the next render can detect new iterations
+  useEffect(() => {
+    prevIterationCountsRef.current = expandedIterationsResult.nextCounts;
+  }, [expandedIterationsResult.nextCounts]);
 
   const handleIterationToggle = useCallback((key: string, expanded: boolean) => {
     setUserIterationToggles((prev) => {

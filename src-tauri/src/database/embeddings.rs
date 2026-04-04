@@ -54,7 +54,7 @@ pub fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
 ///
 /// Returns `None` if the blob size is not a multiple of 4 bytes.
 pub fn blob_to_vector(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() % std::mem::size_of::<f32>() != 0 {
+    if !blob.len().is_multiple_of(std::mem::size_of::<f32>()) {
         return None;
     }
     let count = blob.len() / std::mem::size_of::<f32>();
