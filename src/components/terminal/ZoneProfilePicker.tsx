@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from "react";
-import { instanceStorage } from "@/lib/instance-storage";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Save, FolderOpen, Trash2, ChevronDown } from "lucide-react";
 
 export interface ZoneSessionInfo {
@@ -32,19 +32,58 @@ interface ZoneProfilePickerProps {
   onLoadProfile: (profile: ZoneProfile) => void;
 }
 
-const BASE_STORAGE_KEY = "zone-profiles";
 const MAX_PROFILES = 10;
 
-function profileStorageKey(pageId: string): string {
-  return pageId === "default" ? BASE_STORAGE_KEY : `page:${pageId}:${BASE_STORAGE_KEY}`;
+function profileSettingKey(pageId: string): string {
+  return pageId === "default" ? "zone-profiles" : `zone-profiles:${pageId}`;
 }
 
-function loadProfiles(pageId: string = "default"): Record<string, ZoneProfile> {
-  return instanceStorage.getJSON<Record<string, ZoneProfile>>(profileStorageKey(pageId), {});
+function activeProfileSettingKey(pageId: string): string {
+  return pageId === "default" ? "zone-active-profile" : `zone-active-profile:${pageId}`;
 }
 
-function saveProfiles(profiles: Record<string, ZoneProfile>, pageId: string = "default") {
-  instanceStorage.setJSON(profileStorageKey(pageId), profiles);
+async function loadProfilesFromDb(pageId: string): Promise<Record<string, ZoneProfile>> {
+  try {
+    const result = await invoke<Record<string, ZoneProfile> | null>("setting_get", {
+      key: profileSettingKey(pageId),
+    });
+    return result ?? {};
+  } catch {
+    return {};
+  }
+}
+
+async function saveProfilesToDb(profiles: Record<string, ZoneProfile>, pageId: string) {
+  try {
+    await invoke("setting_set", {
+      key: profileSettingKey(pageId),
+      value: profiles,
+    });
+  } catch {
+    /* ignore save failures */
+  }
+}
+
+async function loadActiveProfileFromDb(pageId: string): Promise<string | null> {
+  try {
+    const result = await invoke<string | null>("setting_get", {
+      key: activeProfileSettingKey(pageId),
+    });
+    return result ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveActiveProfileToDb(name: string | null, pageId: string) {
+  try {
+    await invoke("setting_set", {
+      key: activeProfileSettingKey(pageId),
+      value: name,
+    });
+  } catch {
+    /* ignore save failures */
+  }
 }
 
 export function ZoneProfilePicker({
@@ -59,10 +98,28 @@ export function ZoneProfilePicker({
   onLoadProfile,
 }: ZoneProfilePickerProps) {
   const [open, setOpen] = useState(false);
-  const [profiles, setProfiles] = useState(() => loadProfiles(pageId));
+  const [profiles, setProfiles] = useState<Record<string, ZoneProfile>>({});
   const [saveName, setSaveName] = useState("");
   const [showSaveInput, setShowSaveInput] = useState(false);
+  const [activeProfileName, setActiveProfileName] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+
+  // Load profiles and active profile from database on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [profs, active] = await Promise.all([
+        loadProfilesFromDb(pageId),
+        loadActiveProfileFromDb(pageId),
+      ]);
+      if (cancelled) return;
+      setProfiles(profs);
+      setActiveProfileName(active);
+      setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [pageId]);
 
   useEffect(() => {
     if (!open) return;
@@ -79,13 +136,11 @@ export function ZoneProfilePicker({
 
   const profileNames = Object.keys(profiles);
 
-  const handleSave = () => {
+  const handleSave = useCallback(() => {
     const name = saveName.trim();
     if (!name) return;
-    if (profileNames.length >= MAX_PROFILES && !profiles[name]) {
-      // At limit, don't save
-      return;
-    }
+    if (profileNames.length >= MAX_PROFILES && !profiles[name]) return;
+
     // Capture Claude session IDs from current zone assignments
     const sessions: ZoneSessionInfo[] = [];
     if (zoneAssignments && tabs) {
@@ -112,25 +167,35 @@ export function ZoneProfilePicker({
     };
     const updated = { ...profiles, [name]: profile };
     setProfiles(updated);
-    saveProfiles(updated, pageId);
+    saveProfilesToDb(updated, pageId);
+    setActiveProfileName(name);
+    saveActiveProfileToDb(name, pageId);
     setShowSaveInput(false);
     setSaveName("");
-  };
+  }, [saveName, profileNames.length, profiles, zoneAssignments, tabs, currentLayoutId, zoneLabels, zoneNotes, pinnedZones, autoApprovePatterns, pageId]);
 
-  const handleLoad = (name: string) => {
+  const handleLoad = useCallback((name: string) => {
     const profile = profiles[name];
     if (profile) {
       onLoadProfile(profile);
+      setActiveProfileName(name);
+      saveActiveProfileToDb(name, pageId);
       setOpen(false);
     }
-  };
+  }, [profiles, onLoadProfile, pageId]);
 
-  const handleDelete = (name: string) => {
+  const handleDelete = useCallback((name: string) => {
     const updated = { ...profiles };
     delete updated[name];
     setProfiles(updated);
-    saveProfiles(updated, pageId);
-  };
+    saveProfilesToDb(updated, pageId);
+    if (activeProfileName === name) {
+      setActiveProfileName(null);
+      saveActiveProfileToDb(null, pageId);
+    }
+  }, [profiles, activeProfileName, pageId]);
+
+  if (!loaded) return null;
 
   return (
     <div className="relative shrink-0" ref={ref}>
@@ -139,11 +204,16 @@ export function ZoneProfilePicker({
         className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
           open
             ? "text-[#7aa2f7] bg-[#7aa2f7]/10"
-            : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+            : activeProfileName
+              ? "text-[#7aa2f7] hover:text-[#7aa2f7] hover:bg-[#7aa2f7]/10"
+              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
         }`}
-        title="Zone profiles — save/load configurations"
+        title={activeProfileName ? `Profile: ${activeProfileName}` : "Zone profiles — save/load configurations"}
       >
         <FolderOpen className="w-3 h-3" />
+        {activeProfileName && (
+          <span className="max-w-[80px] truncate">{activeProfileName}</span>
+        )}
         <ChevronDown className="w-2.5 h-2.5" />
       </button>
 
@@ -210,7 +280,9 @@ export function ZoneProfilePicker({
                 return (
                   <div
                     key={name}
-                    className="flex items-center gap-1.5 px-2 py-1.5 hover:bg-[#2a2d3d]/50 transition-colors group"
+                    className={`flex items-center gap-1.5 px-2 py-1.5 hover:bg-[#2a2d3d]/50 transition-colors group ${
+                      name === activeProfileName ? "bg-[#7aa2f7]/5" : ""
+                    }`}
                   >
                     <button onClick={() => handleLoad(name)} className="flex-1 min-w-0 text-left">
                       <div className="text-[11px] text-[#c0caf5] truncate">{name}</div>
