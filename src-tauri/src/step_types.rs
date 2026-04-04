@@ -145,6 +145,13 @@ pub enum StepType {
     /// Scheduled watcher: queries the activity timeline, reasons with AI,
     /// and triggers a conditional action.
     Watcher,
+
+    // ========================================================================
+    // Visual Assertion Steps
+    // ========================================================================
+    /// Visual assertion via UI Bridge auto module: text assertions (DOM/OCR),
+    /// screenshot comparison, and element highlighting.
+    UiBridgeVisualAssertion,
 }
 
 impl StepType {
@@ -170,6 +177,7 @@ impl StepType {
                 | StepType::Screenshot
                 | StepType::UiBridge
                 | StepType::UiBridgeDesignAudit
+                | StepType::UiBridgeVisualAssertion
                 | StepType::NativeAccessibility
         )
     }
@@ -259,6 +267,9 @@ impl StepType {
 
             // Watcher
             StepType::Watcher => Some(120_000), // 120 seconds (includes AI reasoning)
+
+            // Visual Assertion
+            StepType::UiBridgeVisualAssertion => Some(5_000), // 5 seconds
         }
     }
 
@@ -330,6 +341,10 @@ impl StepType {
             // Watcher
             "watcher" => Some(StepType::Watcher),
 
+            // Visual Assertion
+            "ui_bridge_visual_assertion" | "uibridgevisualassertion" | "visual_assertion"
+            | "visualassertion" => Some(StepType::UiBridgeVisualAssertion),
+
             _ => {
                 warn!(
                     "Unknown step type '{}' (normalized: '{}') - defaulting to automation",
@@ -365,6 +380,7 @@ impl StepType {
             StepType::SaveWorkflowArtifact => "save_workflow_artifact",
             StepType::Macro => "macro",
             StepType::Watcher => "watcher",
+            StepType::UiBridgeVisualAssertion => "ui_bridge_visual_assertion",
         }
     }
 }

@@ -133,6 +133,30 @@ impl StepHandler for UiBridgeDesignAuditHandler {
             "issues": issues,
         });
 
+        // Step 4: Optionally highlight error elements via visual module
+        if !error_issues.is_empty() {
+            let highlight_url = format!("{}/ui-bridge/sdk/auto/highlightElement", self_base);
+            for issue in &error_issues {
+                let element_id = issue.get("elementId").and_then(|e| e.as_str());
+                let description = issue.get("issue").and_then(|i| i.as_str());
+                if let (Some(id), Some(desc)) = (element_id, description) {
+                    let _ = client
+                        .post(&highlight_url)
+                        .json(&json!({
+                            "elementId": id,
+                            "options": {
+                                "color": "#ff0000",
+                                "duration": 3000,
+                                "label": desc,
+                                "flash": true
+                            }
+                        }))
+                        .send()
+                        .await;
+                }
+            }
+        }
+
         if !error_issues.is_empty() {
             let error_descriptions: Vec<String> = error_issues
                 .iter()

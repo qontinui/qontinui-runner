@@ -86,6 +86,7 @@ pub mod restart_process;
 mod save_workflow_artifact;
 pub(crate) mod ui_bridge;
 mod ui_bridge_design_audit;
+mod ui_bridge_visual_assertion;
 mod workflow;
 mod workflow_fixup;
 mod workflow_ref;
@@ -98,6 +99,7 @@ use restart_process::RestartProcessHandler;
 use save_workflow_artifact::SaveWorkflowArtifactHandler;
 use ui_bridge::UiBridgeHandler;
 use ui_bridge_design_audit::UiBridgeDesignAuditHandler;
+use ui_bridge_visual_assertion::UiBridgeVisualAssertionHandler;
 use workflow::WorkflowStepHandler;
 use workflow_fixup::WorkflowFixupHandler;
 use workflow_ref::WorkflowRefHandler;
@@ -486,6 +488,7 @@ impl HandlerRegistry {
         registry.register(WorkflowFixupHandler);
         registry.register(UiBridgeHandler);
         registry.register(UiBridgeDesignAuditHandler);
+        registry.register(UiBridgeVisualAssertionHandler);
         registry.register(WorkflowStepHandler);
         registry.register(WorkflowRefHandler);
 

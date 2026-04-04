@@ -473,6 +473,25 @@ pub struct ExecutionStepConfig {
     pub a11y_max_depth: Option<u32>,
 
     // ========================================================================
+    // Visual Assertion
+    // ========================================================================
+    /// Visual assertion type: "text", "screenshot", or "highlight".
+    #[serde(alias = "visualAssertionType", alias = "visual_assertion_type", default)]
+    pub visual_assertion_type: Option<String>,
+
+    /// Element query (JSON) for text assertions.
+    #[serde(alias = "visualAssertionQuery", alias = "visual_assertion_query", default)]
+    pub visual_assertion_query: Option<serde_json::Value>,
+
+    /// Expected text (for text assertion) or element ID (for screenshot/highlight).
+    #[serde(alias = "visualAssertionExpected", alias = "visual_assertion_expected", default)]
+    pub visual_assertion_expected: Option<String>,
+
+    /// Options JSON for the assertion (TextAssertionOptions or ScreenshotAssertionOptions).
+    #[serde(alias = "visualAssertionOptions", alias = "visual_assertion_options", default)]
+    pub visual_assertion_options: Option<serde_json::Value>,
+
+    // ========================================================================
     // Console Error Handling
     // ========================================================================
     /// If true, step fails when console errors are captured during execution
