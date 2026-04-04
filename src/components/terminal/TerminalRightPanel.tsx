@@ -17,6 +17,7 @@ interface TerminalRightPanelProps {
   onGenerateFromTranscript: (desc: string, ctx: string) => void;
   onGenerateAndRunFromTranscript: (desc: string, ctx: string) => void;
   onBuildPlanWorkflow: (planContent: string) => void;
+  onBuildPlanImplementationWorkflow: (planContent: string) => void;
   onResumeSession: (session: TranscriptSession) => void;
   onSummarizeSession?: (messages: TranscriptMessage[]) => void;
   sessionSummary?: string | null;
@@ -52,6 +53,7 @@ export function TerminalRightPanel({
   onGenerateFromTranscript,
   onGenerateAndRunFromTranscript,
   onBuildPlanWorkflow,
+  onBuildPlanImplementationWorkflow,
   onResumeSession,
   onSummarizeSession,
   sessionSummary,
@@ -89,6 +91,7 @@ export function TerminalRightPanel({
         onGenerate={onGenerateFromTranscript}
         onGenerateAndRun={onGenerateAndRunFromTranscript}
         onBuildPlanWorkflow={onBuildPlanWorkflow}
+        onBuildPlanImplementationWorkflow={onBuildPlanImplementationWorkflow}
         onResume={onResumeSession}
         onSummarize={onSummarizeSession}
         summaryText={sessionSummary}

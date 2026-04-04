@@ -967,6 +967,7 @@ export function TerminalPage({
           onGenerateFromTranscript={workflowGen.handleGenerateFromTranscript}
           onGenerateAndRunFromTranscript={workflowGen.handleGenerateAndRunFromTranscript}
           onBuildPlanWorkflow={workflowGen.handleBuildPlanWorkflow}
+          onBuildPlanImplementationWorkflow={workflowGen.handleBuildPlanImplementationWorkflow}
           onResumeSession={shellIntegration.handleResumeSession}
           onSummarizeSession={handleSummarizeSession}
           sessionSummary={sessionSummary}
