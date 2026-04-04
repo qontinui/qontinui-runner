@@ -376,7 +376,7 @@ export function TranscriptContentPanel({
               title="Build plan workflow with verification-only loop (lighter, no review/next-steps)"
             >
               <ListChecks className="w-3 h-3" />
-              Plan
+              Verify
             </button>
           )}
           {onGenerateAndRun && (
