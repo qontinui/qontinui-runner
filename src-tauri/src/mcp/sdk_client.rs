@@ -2117,6 +2117,94 @@ async fn handle_design_clear_style_guide(
 }
 
 // =============================================================================
+// Visual Automation Handlers (ui-bridge-auto proxy)
+// =============================================================================
+
+/// Generic proxy for ui-bridge-auto endpoints.
+/// Routes POST requests to the connected SDK app's /auto/{endpoint} path.
+async fn proxy_auto_endpoint(
+    state: &Arc<ApiState>,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Json<serde_json::Value> {
+    match sdk_request(
+        state,
+        Method::POST,
+        &format!("/auto/{}", endpoint),
+        Some(body),
+    )
+    .await
+    {
+        Ok(data) => Json(data),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+/// POST /ui-bridge/sdk/auto/assertText — Assert text content in an element
+async fn handle_auto_assert_text(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "assertText", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/extractText — Extract text from an element
+async fn handle_auto_extract_text(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "extractText", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/assertScreenshot — Visual regression assertion
+async fn handle_auto_assert_screenshot(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "assertScreenshot", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/captureBaseline — Capture a screenshot baseline
+async fn handle_auto_capture_baseline(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "captureBaseline", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/highlightElement — Highlight an element
+async fn handle_auto_highlight_element(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "highlightElement", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/dismissHighlight — Dismiss a specific highlight
+async fn handle_auto_dismiss_highlight(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "dismissHighlight", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/dismissAllHighlights — Dismiss all highlights
+async fn handle_auto_dismiss_all_highlights(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "dismissAllHighlights", body).await
+}
+
+/// POST /ui-bridge/sdk/auto/translateCoordinate — Translate coordinates between spaces
+async fn handle_auto_translate_coordinate(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    proxy_auto_endpoint(&state, "translateCoordinate", body).await
+}
+
+// =============================================================================
 // Console Capture / Error Tracking Handlers
 // =============================================================================
 
@@ -3278,6 +3366,15 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/sdk/design/style-guide",
             get(handle_design_get_style_guide).delete(handle_design_clear_style_guide),
         )
+        // Visual automation (ui-bridge-auto)
+        .route("/ui-bridge/sdk/auto/assertText", post(handle_auto_assert_text))
+        .route("/ui-bridge/sdk/auto/extractText", post(handle_auto_extract_text))
+        .route("/ui-bridge/sdk/auto/assertScreenshot", post(handle_auto_assert_screenshot))
+        .route("/ui-bridge/sdk/auto/captureBaseline", post(handle_auto_capture_baseline))
+        .route("/ui-bridge/sdk/auto/highlightElement", post(handle_auto_highlight_element))
+        .route("/ui-bridge/sdk/auto/dismissHighlight", post(handle_auto_dismiss_highlight))
+        .route("/ui-bridge/sdk/auto/dismissAllHighlights", post(handle_auto_dismiss_all_highlights))
+        .route("/ui-bridge/sdk/auto/translateCoordinate", post(handle_auto_translate_coordinate))
         // Console capture / error tracking
         .route("/ui-bridge/sdk/console/health", get(handle_console_health))
         .route(
