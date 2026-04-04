@@ -38,7 +38,7 @@ export function UIBridgeDiscoveryPanel({
   discovery,
   onConfigCreated,
 }: UIBridgeDiscoveryPanelProps) {
-  const [collectTab, setCollectTab] = useState<"explore" | "record" | "analyze">("explore");
+  const [collectTab, setCollectTab] = useState<"explore" | "record" | "analyze">("analyze");
   const [analyzeProjectPath, setAnalyzeProjectPath] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);

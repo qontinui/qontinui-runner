@@ -4,7 +4,6 @@
 
 use super::PgDb;
 use crate::state_machine_configs::types::*;
-use chrono::Utc;
 
 impl PgDb {
     // ========================================================================
@@ -68,14 +67,14 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let id = uuid::Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
+        let description = req.description.as_deref().unwrap_or("");
 
         conn.execute(
             r#"
             INSERT INTO state_machine_configs (id, name, description, render_count, element_count, include_html_ids, created_at, updated_at)
-            VALUES ($1, $2, $3, 0, 0, FALSE, $4::TIMESTAMPTZ, $4::TIMESTAMPTZ)
+            VALUES ($1, $2, $3, 0, 0, FALSE, NOW(), NOW())
             "#,
-            &[&id, &req.name, &req.description, &now],
+            &[&id, &req.name, &description],
         )
         .await
         .map_err(|e| format!("PG insert_sm_config: {}", e))?;
@@ -101,7 +100,6 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now().to_rfc3339();
 
         let name = req.name.as_deref().unwrap_or(&existing.name).to_string();
         let description = req
@@ -117,8 +115,8 @@ impl PgDb {
             r#"
             UPDATE state_machine_configs
             SET name = $1, description = $2, render_count = $3, element_count = $4,
-                include_html_ids = $5, updated_at = $6::TIMESTAMPTZ
-            WHERE id = $7
+                include_html_ids = $5, updated_at = NOW()
+            WHERE id = $6
             "#,
             &[
                 &name as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -126,7 +124,6 @@ impl PgDb {
                 &render_count as &(dyn tokio_postgres::types::ToSql + Sync),
                 &element_count as &(dyn tokio_postgres::types::ToSql + Sync),
                 &include_html_ids as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         )
@@ -246,8 +243,6 @@ impl PgDb {
             .state_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let now = Utc::now().to_rfc3339();
-
         let element_ids = serde_json::to_string(req.element_ids.as_deref().unwrap_or(&[]))
             .map_err(|e| format!("Failed to serialize element_ids: {}", e))?;
         let render_ids = serde_json::to_string(req.render_ids.as_deref().unwrap_or(&[]))
@@ -272,7 +267,7 @@ impl PgDb {
             (id, config_id, state_id, name, description, element_ids, render_ids,
              confidence, acceptance_criteria, extra_metadata, domain_knowledge,
              created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::TIMESTAMPTZ, $12::TIMESTAMPTZ)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
             "#,
             &[
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -286,7 +281,6 @@ impl PgDb {
                 &acceptance_criteria as &(dyn tokio_postgres::types::ToSql + Sync),
                 &extra_metadata as &(dyn tokio_postgres::types::ToSql + Sync),
                 &domain_knowledge as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         )
         .await
@@ -313,8 +307,6 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now().to_rfc3339();
-
         let name = req.name.as_deref().unwrap_or(&existing.name).to_string();
         let description = req
             .description
@@ -352,8 +344,8 @@ impl PgDb {
             UPDATE state_machine_states
             SET name = $1, description = $2, element_ids = $3, render_ids = $4,
                 confidence = $5, acceptance_criteria = $6, extra_metadata = $7,
-                domain_knowledge = $8, updated_at = $9::TIMESTAMPTZ
-            WHERE id = $10
+                domain_knowledge = $8, updated_at = NOW()
+            WHERE id = $9
             "#,
             &[
                 &name as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -364,7 +356,6 @@ impl PgDb {
                 &acceptance_criteria as &(dyn tokio_postgres::types::ToSql + Sync),
                 &extra_metadata as &(dyn tokio_postgres::types::ToSql + Sync),
                 &domain_knowledge as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         )
@@ -463,8 +454,6 @@ impl PgDb {
             .transition_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let now = Utc::now().to_rfc3339();
-
         let from_states = serde_json::to_string(&req.from_states)
             .map_err(|e| format!("Failed to serialize from_states: {}", e))?;
         let activate_states = serde_json::to_string(&req.activate_states)
@@ -487,7 +476,7 @@ impl PgDb {
             INSERT INTO state_machine_transitions
             (id, config_id, transition_id, name, from_states, activate_states, exit_states,
              actions, path_cost, stays_visible, extra_metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::TIMESTAMPTZ, $12::TIMESTAMPTZ)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
             "#,
             &[
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -501,7 +490,6 @@ impl PgDb {
                 &path_cost as &(dyn tokio_postgres::types::ToSql + Sync),
                 &stays_visible as &(dyn tokio_postgres::types::ToSql + Sync),
                 &extra_metadata as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         )
         .await
@@ -528,8 +516,6 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = Utc::now().to_rfc3339();
-
         let name = req.name.as_deref().unwrap_or(&existing.name).to_string();
         let from_states =
             serde_json::to_string(req.from_states.as_ref().unwrap_or(&existing.from_states))
@@ -559,8 +545,8 @@ impl PgDb {
             UPDATE state_machine_transitions
             SET name = $1, from_states = $2, activate_states = $3, exit_states = $4,
                 actions = $5, path_cost = $6, stays_visible = $7, extra_metadata = $8,
-                updated_at = $9::TIMESTAMPTZ
-            WHERE id = $10
+                updated_at = NOW()
+            WHERE id = $9
             "#,
             &[
                 &name as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -571,7 +557,6 @@ impl PgDb {
                 &path_cost as &(dyn tokio_postgres::types::ToSql + Sync),
                 &stays_visible as &(dyn tokio_postgres::types::ToSql + Sync),
                 &extra_metadata as &(dyn tokio_postgres::types::ToSql + Sync),
-                &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
         )
@@ -863,7 +848,7 @@ impl PgDb {
                 r#"INSERT INTO sm_capture_screenshots
                    (id, config_id, capture_index, screenshot_webp, width, height,
                     element_bounds_json, fingerprint_hashes_json, captured_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::TIMESTAMPTZ)"#,
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"#,
                 &[
                     &id as &(dyn tokio_postgres::types::ToSql + Sync),
                     &config_id as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -873,7 +858,6 @@ impl PgDb {
                     &height as &(dyn tokio_postgres::types::ToSql + Sync),
                     &ss.element_bounds_json as &(dyn tokio_postgres::types::ToSql + Sync),
                     &ss.fingerprint_hashes_json as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &ss.captured_at as &(dyn tokio_postgres::types::ToSql + Sync),
                 ],
             )
             .await
