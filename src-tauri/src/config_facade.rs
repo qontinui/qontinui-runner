@@ -598,6 +598,21 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
     save_settings(&settings)
 }
 
+/// Get custom launch commands per account config directory.
+pub fn get_claude_account_launch_commands() -> std::collections::HashMap<String, String> {
+    load_settings().claude_account_launch_commands
+}
+
+/// Save custom launch commands per account config directory.
+pub fn save_claude_account_launch_commands(
+    commands: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    info!("Saving {} account launch commands", commands.len());
+    let mut settings = load_settings();
+    settings.claude_account_launch_commands = commands;
+    save_settings(&settings)
+}
+
 /// Get the dev_logs_dir override (used by paths module).
 pub fn get_dev_logs_dir_override() -> Option<String> {
     load_settings().paths.dev_logs_dir

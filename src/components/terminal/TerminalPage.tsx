@@ -603,9 +603,12 @@ export function TerminalPage({
             zoneLayout.setLayoutId(layoutId);
           }
           const isWindows = navigator.platform.startsWith("Win");
-          const cmd = isWindows
-            ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
-            : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
+          const customCmd = sessionManager.launchCommands?.[configDir];
+          const cmd = customCmd
+            ? customCmd
+            : isWindows
+              ? `$env:CLAUDE_CONFIG_DIR="${configDir}"; claude`
+              : `CLAUDE_CONFIG_DIR="${configDir}" claude`;
           const createdTabIds: string[] = [];
           for (let i = 0; i < count; i++) {
             const tabId = await createAndAssignTerminal();
@@ -632,12 +635,16 @@ export function TerminalPage({
             zoneLayout.setLayoutId(layoutId);
           }
           const isWindows = navigator.platform.startsWith("Win");
+          const cmds = sessionManager.launchCommands ?? {};
           for (let i = 0; i < count; i++) {
             const tabId = await createAndAssignTerminal();
             if (tabId) {
-              const cmd = isWindows
-                ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
-                : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
+              const customCmd = cmds[configDirs[i]];
+              const cmd = customCmd
+                ? customCmd
+                : isWindows
+                  ? `$env:CLAUDE_CONFIG_DIR="${configDirs[i]}"; claude`
+                  : `CLAUDE_CONFIG_DIR="${configDirs[i]}" claude`;
               setTimeout(
                 () => {
                   terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${cmd}\r`);
@@ -648,6 +655,7 @@ export function TerminalPage({
           }
         }}
         accountUsage={sessionManager.accountUsage}
+        launchCommands={sessionManager.launchCommands}
       />
       <ZoneStatusBar
         tabs={tabs}

@@ -485,3 +485,35 @@ pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<CommandResponse, Str
         data: Some(serde_json::json!({ "dirs": valid_dirs })),
     })
 }
+
+/// Get custom launch commands per account config directory.
+#[tauri::command]
+pub fn get_claude_account_launch_commands() -> Result<CommandResponse, String> {
+    let commands = settings::get_claude_account_launch_commands();
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "commands": commands })),
+    })
+}
+
+/// Save custom launch commands per account config directory.
+///
+/// # Arguments
+/// * `commands` - Map of config_dir path -> shell command
+#[tauri::command]
+pub fn save_claude_account_launch_commands(
+    commands: std::collections::HashMap<String, String>,
+) -> Result<CommandResponse, String> {
+    info!("Saving {} account launch commands", commands.len());
+
+    settings::save_claude_account_launch_commands(commands.clone())
+        .map_err(|e| format!("Failed to save account launch commands: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Saved {} account launch commands", commands.len())),
+        data: Some(serde_json::json!({ "commands": commands })),
+    })
+}

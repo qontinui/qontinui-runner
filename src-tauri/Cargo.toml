@@ -144,6 +144,9 @@ zbus = "4"
 [features]
 default = []
 restate = ["restate-sdk"]
+# Tells Tauri to embed the frontend from dist/ instead of loading from devUrl.
+# Without this, debug builds load from localhost:1420 (Vite dev server).
+custom-protocol = ["tauri/custom-protocol"]
 
 [[bin]]
 name = "mock_claude_cli"

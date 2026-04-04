@@ -194,12 +194,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [checkAuthStatus]);
 
   /**
-   * Development mode auto-login
-   * Automatically logs in with dev credentials when not authenticated in dev mode
+   * Auto-login with configured credentials
+   * Automatically logs in when VITE_DEV_EMAIL/VITE_DEV_PASSWORD are set in .env
+   * Works in both dev mode (Vite) and exe mode (embedded build)
    */
   useEffect(() => {
-    // Only run in development mode
-    if (!import.meta.env.DEV) {
+    // Skip if no credentials configured (covers both dev and production builds)
+    if (!DEV_AUTO_LOGIN.email || !DEV_AUTO_LOGIN.password) {
       return;
     }
 
@@ -223,13 +224,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
     // Don't retry after a non-retryable failure (auth error, rate limit, etc.)
     if (devLoginFailed.current) {
-      return;
-    }
-
-    // Skip auto-login if credentials are not configured
-    if (!DEV_AUTO_LOGIN.email || !DEV_AUTO_LOGIN.password) {
-      log.debug("Dev mode: No dev credentials configured, skipping auto-login");
-      log.debug("Dev mode: Set VITE_DEV_EMAIL and VITE_DEV_PASSWORD in .env to enable auto-login");
       return;
     }
 

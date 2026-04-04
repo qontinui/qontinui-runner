@@ -433,6 +433,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::get_workspace_paths,
             commands::config::get_claude_config_dirs,
             commands::config::save_claude_config_dirs,
+            commands::config::get_claude_account_launch_commands,
+            commands::config::save_claude_account_launch_commands,
             // Dataset commands
             commands::dataset::scan_local_images,
             commands::dataset::package_dataset,

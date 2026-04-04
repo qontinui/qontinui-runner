@@ -886,6 +886,10 @@ pub struct Settings {
     /// Used by Terminal > Browse Sessions to find transcript files.
     #[serde(default)]
     pub claude_config_dirs: Vec<String>,
+    /// Custom launch commands per account config directory.
+    /// Key: config_dir path, Value: shell command (e.g. "clg" instead of default CLAUDE_CONFIG_DIR pattern).
+    #[serde(default)]
+    pub claude_account_launch_commands: std::collections::HashMap<String, String>,
     /// OpenTelemetry configuration for optional OTLP trace export.
     /// Note: OTel cannot be hot-reloaded; changes require a runner restart.
     #[serde(default)]
@@ -1095,6 +1099,18 @@ pub fn get_claude_config_dirs() -> Vec<String> {
 /// Save the configured Claude Code config directories
 pub fn save_claude_config_dirs(dirs: Vec<String>) -> Result<(), String> {
     crate::config_facade::save_claude_config_dirs(dirs)
+}
+
+/// Get custom launch commands per account config directory
+pub fn get_claude_account_launch_commands() -> std::collections::HashMap<String, String> {
+    crate::config_facade::get_claude_account_launch_commands()
+}
+
+/// Save custom launch commands per account config directory
+pub fn save_claude_account_launch_commands(
+    commands: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    crate::config_facade::save_claude_account_launch_commands(commands)
 }
 
 /// Get the current AI settings

@@ -161,7 +161,11 @@ export function useTerminalManager(pageId: string = "default") {
           createdAt: info.created_at,
         };
 
-        setTabs((prev) => [...prev, tab]);
+        setTabs((prev) => {
+          // Deduplicate: the terminal-created event listener may have already added this tab
+          if (prev.some((t) => t.id === info.id)) return prev;
+          return [...prev, tab];
+        });
         setActiveId(info.id);
         return info.id;
       } catch (err) {

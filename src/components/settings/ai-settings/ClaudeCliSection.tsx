@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -53,6 +53,48 @@ export function ClaudeCliSection({
 }: ClaudeCliSectionProps) {
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
+
+  // Per-account custom launch commands (e.g. "clg" for gmail)
+  const [launchCommands, setLaunchCommands] = useState<Record<string, string>>({});
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await invoke<TauriResult<{ commands: Record<string, string> }>>(
+          "get_claude_account_launch_commands",
+        );
+        if (result?.success && result.data?.commands) {
+          setLaunchCommands(result.data.commands);
+        }
+      } catch {
+        // Silently fail
+      }
+    })();
+  }, []);
+
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveLaunchCommand = useCallback(
+    (dir: string, command: string) => {
+      setLaunchCommands((prev) => {
+        const updated = { ...prev };
+        if (command.trim()) {
+          updated[dir] = command.trim();
+        } else {
+          delete updated[dir];
+        }
+        // Debounce the IPC save to avoid a write per keystroke
+        if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = setTimeout(async () => {
+          try {
+            await invoke("save_claude_account_launch_commands", { commands: updated });
+          } catch (e) {
+            onLog("error", `Failed to save launch command: ${e}`);
+          }
+        }, 400);
+        return updated;
+      });
+    },
+    [onLog],
+  );
 
   const saveClaudeConfigDirs = useCallback(
     async (dirs: string[]) => {
@@ -401,6 +443,18 @@ export function ClaudeCliSection({
                         {usage.error}
                       </div>
                     )}
+
+                    {/* Per-account launch command */}
+                    <div className="flex items-center gap-1.5 mt-1.5 ml-6">
+                      <Terminal className="w-3 h-3 text-muted-foreground shrink-0" />
+                      <input
+                        type="text"
+                        value={launchCommands[dir] ?? ""}
+                        onChange={(e) => saveLaunchCommand(dir, e.target.value)}
+                        placeholder="Launch command (e.g. clg)"
+                        className="flex-1 text-[10px] px-1.5 py-0.5 bg-background/50 border border-border/30 rounded text-foreground placeholder-muted-foreground/50 outline-none focus:border-primary/50 transition-colors"
+                      />
+                    </div>
                   </div>
                 );
               })

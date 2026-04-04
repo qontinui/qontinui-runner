@@ -18,6 +18,7 @@ interface TerminalTabBarProps {
   onLaunchAiSession?: (count: number, configDir: string) => void;
   onLaunchMultiAiSessions?: (configDirs: string[]) => void;
   accountUsage?: AccountUsageInfo[];
+  launchCommands?: Record<string, string>;
   // Zone monitoring enrichments
   activityData?: Record<string, number[]>;
   stateDurations?: Record<string, string>;
@@ -154,6 +155,7 @@ export function TerminalTabBar({
   onLaunchAiSession,
   onLaunchMultiAiSessions,
   accountUsage,
+  launchCommands,
   activityData,
   stateDurations,
   unreadTabs,
@@ -231,7 +233,9 @@ export function TerminalTabBar({
   // ── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex items-center gap-0.5 bg-[#13141f] border-b border-[#2a2d3d] px-1 h-9 shrink-0 overflow-x-auto scrollbar-none">
+    <div className="flex items-center bg-[#13141f] border-b border-[#2a2d3d] h-9 shrink-0">
+      {/* Scrollable tab area */}
+      <div className="flex items-center gap-0.5 px-1 overflow-x-auto scrollbar-none flex-1 min-w-0 h-full">
       {/* Layout picker */}
       {layoutPicker && <div className="shrink-0 mr-1">{layoutPicker}</div>}
 
@@ -376,9 +380,13 @@ export function TerminalTabBar({
         );
       })}
 
+      </div>
+
+      {/* Pinned action buttons — always visible */}
+      <div className="flex items-center gap-0.5 px-1 shrink-0 border-l border-[#2a2d3d]">
       <button
         onClick={onCreate}
-        className="flex items-center justify-center w-6 h-6 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50 transition-colors ml-1 shrink-0"
+        className="flex items-center justify-center w-6 h-6 rounded text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#1a1b26]/50 transition-colors shrink-0"
         title="New terminal (Ctrl+Shift+T)"
       >
         <Plus className="w-3.5 h-3.5" />
@@ -406,6 +414,7 @@ export function TerminalTabBar({
               onCreateMultiAiSessions={(configDirs) => onLaunchMultiAiSessions?.(configDirs)}
               onCreateWithCommand={(count, command) => onQuickLaunch(count, command)}
               accountUsage={accountUsage ?? []}
+              launchCommands={launchCommands}
               onClose={() => setShowQuickLaunch(false)}
             />
           )}
@@ -541,6 +550,7 @@ export function TerminalTabBar({
           )}
         </div>
       )}
+      </div>
     </div>
   );
 }

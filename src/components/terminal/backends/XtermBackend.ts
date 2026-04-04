@@ -36,9 +36,11 @@ export class XtermBackend implements ITerminalBackend {
 
   open(container: HTMLElement): void {
     this.container = container;
-    this.term.loadAddon(new WebLinksAddon());
     this.term.open(container);
 
+    // Load rendering addons BEFORE WebLinksAddon so the renderer's
+    // onShowLinkUnderline / onHideLinkUnderline are available when
+    // the link decorator initialises.
     try {
       const webgl = new WebglAddon();
       webgl.onContextLoss(() => {
@@ -60,6 +62,8 @@ export class XtermBackend implements ITerminalBackend {
         // DOM renderer is the final fallback — already active
       }
     }
+
+    this.term.loadAddon(new WebLinksAddon());
   }
 
   dispose(): void {

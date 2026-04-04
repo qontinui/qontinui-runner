@@ -108,6 +108,7 @@ export interface UseSessionManagerReturn {
   sessions: UnifiedSession[];
   loading: boolean;
   accountUsage: AccountUsageInfo[];
+  launchCommands: Record<string, string>;
 
   // Filters
   searchQuery: string;
@@ -213,6 +214,9 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
 
   // Account usage state
   const [accountUsage, setAccountUsage] = useState<AccountUsageInfo[]>([]);
+
+  // Per-account launch commands (e.g. "clg" for gmail, "clh" for hotmail)
+  const [launchCommands, setLaunchCommands] = useState<Record<string, string>>({});
 
   // External process state
   const [externalProcessCount, setExternalProcessCount] = useState(0);
@@ -340,6 +344,15 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         if (result.success && result.data) {
           const data = result.data as { dirs: string[] };
           if (data.dirs?.length) setSavedConfigDirs(data.dirs);
+        }
+      } catch {
+        // Silently fail
+      }
+      try {
+        const result = await invoke<CommandResponse>("get_claude_account_launch_commands");
+        if (result.success && result.data) {
+          const data = result.data as { commands: Record<string, string> };
+          if (data.commands) setLaunchCommands(data.commands);
         }
       } catch {
         // Silently fail
@@ -683,6 +696,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
     sessions,
     loading: sessionsLoading || digestsLoading,
     accountUsage,
+    launchCommands,
     searchQuery,
     setSearchQuery,
     statusFilter,

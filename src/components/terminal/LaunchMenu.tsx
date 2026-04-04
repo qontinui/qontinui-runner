@@ -8,6 +8,7 @@ interface LaunchMenuProps {
   onCreateMultiAiSessions: (configDirs: string[]) => void;
   onCreateWithCommand: (count: number, command: string) => void;
   accountUsage: AccountUsageInfo[];
+  launchCommands?: Record<string, string>;
   onClose: () => void;
 }
 
@@ -74,6 +75,7 @@ export function LaunchMenu({
   onCreateMultiAiSessions,
   onCreateWithCommand,
   accountUsage,
+  launchCommands,
   onClose,
 }: LaunchMenuProps) {
   const [customCommand, setCustomCommand] = useState("");
@@ -107,6 +109,18 @@ export function LaunchMenu({
   const bestAccount = sortedAccounts.length > 0 ? sortedAccounts[0] : null;
   const hasAccounts = accountUsage.length > 0;
 
+  const getCustomCommand = (configDir: string): string | undefined =>
+    launchCommands?.[configDir];
+
+  const launchAccount = (count: number, configDir: string) => {
+    const cmd = getCustomCommand(configDir);
+    if (cmd) {
+      onCreateWithCommand(count, cmd);
+    } else {
+      onCreateAiSession(count, configDir);
+    }
+  };
+
   const extractLabel = (configDir: string): string => {
     const normalized = configDir.replace(/\\/g, "/").replace(/\/$/, "");
     const last = normalized.split("/").pop() ?? "";
@@ -130,7 +144,7 @@ export function LaunchMenu({
   return (
     <div
       ref={menuRef}
-      className="absolute left-0 top-full mt-1 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden min-w-[280px]"
+      className="absolute right-0 top-full mt-1 bg-[#1a1b26] border border-[#2a2d3d] rounded-lg shadow-xl z-50 overflow-hidden min-w-[280px]"
     >
       {/* ── Plain Terminal ────────────────────────────────────── */}
       <SectionHeader>Plain Terminal</SectionHeader>
@@ -158,7 +172,7 @@ export function LaunchMenu({
           {bestAccount && (
             <>
               <button
-                onClick={() => fire(() => onCreateAiSession(1, bestAccount.config_dir))}
+                onClick={() => fire(() => launchAccount(1, bestAccount.config_dir))}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#9ece6a]/10 transition-colors"
               >
                 <Star className="w-3.5 h-3.5 text-[#e0af68]" />
@@ -177,7 +191,7 @@ export function LaunchMenu({
                 <span className="text-left">Best Account x N</span>
                 <CountButtons
                   counts={[2, 4, 6]}
-                  onSelect={(c) => fire(() => onCreateAiSession(c, bestAccount.config_dir))}
+                  onSelect={(c) => fire(() => launchAccount(c, bestAccount.config_dir))}
                 />
               </div>
             </>
@@ -187,17 +201,27 @@ export function LaunchMenu({
           <div className="mx-3 border-t border-[#2a2d3d]" />
 
           {/* Individual accounts */}
-          {sortedAccounts.map((account) => (
-            <button
-              key={account.config_dir}
-              onClick={() => fire(() => onCreateAiSession(1, account.config_dir))}
-              className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#7aa2f7]/10 transition-colors"
-            >
-              <span className="w-2 h-2 rounded-full bg-[#7aa2f7] shrink-0" />
-              <span className="flex-1 text-left truncate">{extractLabel(account.config_dir)}</span>
-              <UtilizationBar utilization={account.utilization} />
-            </button>
-          ))}
+          {sortedAccounts.map((account) => {
+            const cmd = getCustomCommand(account.config_dir);
+            return (
+              <button
+                key={account.config_dir}
+                onClick={() => fire(() => launchAccount(1, account.config_dir))}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-[#c0caf5] hover:bg-[#7aa2f7]/10 transition-colors"
+              >
+                <span className="w-2 h-2 rounded-full bg-[#7aa2f7] shrink-0" />
+                <span className="flex-1 text-left truncate">
+                  {extractLabel(account.config_dir)}
+                  {cmd && (
+                    <span className="ml-1.5 text-[10px] text-[#565f89] font-mono">
+                      {cmd}
+                    </span>
+                  )}
+                </span>
+                <UtilizationBar utilization={account.utilization} />
+              </button>
+            );
+          })}
 
           {/* Multi-account round-robin */}
           {sortedAccounts.length > 1 && (
