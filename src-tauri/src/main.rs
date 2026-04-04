@@ -660,6 +660,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine_configs::sm_get_capture_screenshot_image,
             commands::state_machine_configs::sm_move_pending_screenshots,
             commands::state_machine_configs::sm_delete_capture_screenshots,
+            commands::state_machine_configs::sm_generate_static,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,

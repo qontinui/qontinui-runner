@@ -264,3 +264,61 @@ pub async fn sm_delete_capture_screenshots(
 ) -> Result<usize, String> {
     app_state.pg_db.delete_capture_screenshots(&config_id).await
 }
+
+// =============================================================================
+// Static Analysis Generation
+// =============================================================================
+
+/// Generate a state machine from the Runner's source code using the static builder.
+/// Runs `buildStateMachine()` + `emitPersistedStateMachineJSON()` via Node.js.
+#[tauri::command]
+pub async fn sm_generate_static(project_root: String) -> Result<String, String> {
+    let script = format!(
+        r#"
+const {{ buildStateMachine, emitPersistedStateMachineJSON }} = require('./ui-bridge-auto/dist/index.js');
+const result = buildStateMachine({{
+    projectRoot: '{root}',
+    routeFile: 'src/components/app/TabContent.tsx',
+    routeFunction: 'TabContent',
+    routeDiscriminant: 'activeTab',
+    appShellFile: 'src/App.tsx',
+    navigationFunctions: ['setActiveTab'],
+    navigationEvents: ['ui-bridge-navigate', 'navigate-to-active', 'navigate-to-error-monitor'],
+    tsconfigPath: 'tsconfig.json',
+    maxComponentDepth: 2,
+}});
+process.stdout.write(emitPersistedStateMachineJSON(result.states, result.transitions));
+"#,
+        root = project_root.replace('\\', "/")
+    );
+
+    // Run in the qontinui-root directory (parent of both runner and ui-bridge-auto)
+    let working_dir = std::path::Path::new(&project_root)
+        .parent()
+        .unwrap_or(std::path::Path::new(&project_root));
+
+    let output = tokio::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run node: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Static analysis failed: {}", stderr));
+    }
+
+    let json = String::from_utf8_lossy(&output.stdout).to_string();
+    if json.is_empty() {
+        return Err("Static analysis produced no output".to_string());
+    }
+
+    info!(
+        "Generated state machine: {} bytes",
+        json.len()
+    );
+
+    Ok(json)
+}

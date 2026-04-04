@@ -24,7 +24,9 @@ import {
   Plug,
   Circle,
   Square,
+  Zap,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { useAppDiscovery, type DiscoveredApp } from "@/hooks/useAppDiscovery";
 import { useSdkUIBridge } from "@/hooks/useSdkUIBridge";
 import type { useUIBridgeDiscovery } from "@/hooks/useUIBridgeDiscovery";
@@ -212,6 +214,69 @@ export function UIBridgeDiscoveryPanel({
     input.click();
   }, []);
 
+  // Generate state machine for the Runner project via Tauri command
+  const handleGenerateForRunner = useCallback(async () => {
+    setAnalyzeError(null);
+    setIsAnalyzing(true);
+    try {
+      const json = await invoke<string>("sm_generate_static", {
+        projectRoot: "D:/qontinui-root/qontinui-runner",
+      });
+      const data = JSON.parse(json);
+      if (!data.states || !Array.isArray(data.states)) {
+        throw new Error("Generated JSON missing states array");
+      }
+
+      // Convert to StateMachineExportFormat and import
+      const exportFormat = {
+        states: Object.fromEntries(
+          data.states.map((s: { id: string; name: string; requiredElements?: unknown[]; [key: string]: unknown }) => [
+            s.id,
+            {
+              ...s,
+              elements: (s.requiredElements ?? []).map((el: unknown) => ({ element_query: el })),
+              required_element_queries: s.requiredElements ?? [],
+            },
+          ]),
+        ),
+        transitions: Object.fromEntries(
+          (data.transitions ?? []).map((t: { id: string; name: string; [key: string]: unknown }) => [
+            t.id,
+            { ...t },
+          ]),
+        ),
+        config: {
+          source: "static-analysis",
+          generated_at: data.createdAt ?? Date.now(),
+          version: data.version ?? "1.0.0",
+        },
+      };
+
+      const timestamp = new Date().toLocaleString("en-US", {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      const configName = `Static Analysis — ${timestamp}`;
+
+      window.dispatchEvent(
+        new CustomEvent("sm-import-static", {
+          detail: {
+            name: configName,
+            config: exportFormat,
+            stateCount: data.states.length,
+            transitionCount: data.transitions?.length ?? 0,
+          },
+        }),
+      );
+    } catch (err) {
+      setAnalyzeError(err instanceof Error ? err.message : "Generation failed");
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, []);
+
   // State checks
   const hasData = discovery.cooccurrenceData !== null;
   const hasDiscoveryResult = discovery.discoveryResult !== null;
@@ -351,16 +416,24 @@ export function UIBridgeDiscoveryPanel({
 
                 <div className="flex items-center gap-3">
                   <button
-                    onClick={handleAnalyzeImport}
+                    onClick={handleGenerateForRunner}
                     disabled={isAnalyzing}
                     className="inline-flex items-center gap-1.5 rounded-md px-3 py-2 text-sm font-medium bg-brand-primary text-white hover:bg-brand-primary/90 disabled:opacity-50"
                   >
                     {isAnalyzing ? (
                       <Loader2 className="size-3.5 animate-spin" />
                     ) : (
-                      <FolderOpen className="size-3.5" />
+                      <Zap className="size-3.5" />
                     )}
-                    {isAnalyzing ? "Importing..." : "Import State Machine JSON"}
+                    {isAnalyzing ? "Generating..." : "Generate for Runner"}
+                  </button>
+                  <button
+                    onClick={handleAnalyzeImport}
+                    disabled={isAnalyzing}
+                    className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-text-secondary border border-border-primary hover:bg-surface-hover disabled:opacity-50"
+                  >
+                    <FolderOpen className="size-3" />
+                    Import JSON
                   </button>
                 </div>
 
