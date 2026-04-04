@@ -14,6 +14,7 @@ import {
   Keyboard,
   ListChecks,
   MessageSquare,
+  Rocket,
   PanelLeft,
   RefreshCw,
   Shield,
@@ -99,6 +100,7 @@ interface ZoneStatusBarProps {
   isPlanLoading: boolean;
   onRefreshPlan: () => void;
   onBuildPlanFromFile?: () => void;
+  onBuildPlanImplementationFromFile?: () => void;
   onToggleFindings: () => void;
   findingsActive: boolean;
   findingsCount: number;
@@ -165,6 +167,7 @@ export function ZoneStatusBar({
   isPlanLoading,
   onRefreshPlan,
   onBuildPlanFromFile,
+  onBuildPlanImplementationFromFile,
   onToggleFindings,
   findingsActive,
   findingsCount,
@@ -589,18 +592,32 @@ export function ZoneStatusBar({
             >
               {planFileName}
             </span>
-            {onBuildPlanFromFile && (
+            {onBuildPlanImplementationFromFile && (
               <button
-                onClick={onBuildPlanFromFile}
+                onClick={onBuildPlanImplementationFromFile}
                 disabled={busy}
-                title="Build workflow from plan file with deterministic verification steps"
+                title="Build plan implementation workflow (implement + review + next-steps per phase)"
                 className={`
                   flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors
                   ${busy ? "text-[#414868] cursor-not-allowed" : "text-[#e0af68] hover:bg-[#e0af68]/10 hover:text-[#e8b96e]"}
                 `}
               >
+                <Rocket className="w-3 h-3" />
+                Implement
+              </button>
+            )}
+            {onBuildPlanFromFile && (
+              <button
+                onClick={onBuildPlanFromFile}
+                disabled={busy}
+                title="Build plan workflow with verification-only loop (lighter, no review/next-steps)"
+                className={`
+                  flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors
+                  ${busy ? "text-[#414868] cursor-not-allowed" : "text-[#565f89] hover:bg-[#414868]/20 hover:text-[#a9b1d6]"}
+                `}
+              >
                 <ListChecks className="w-3 h-3" />
-                Build
+                Verify
               </button>
             )}
           </>

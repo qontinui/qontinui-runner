@@ -756,6 +756,7 @@ export function TerminalPage({
         isPlanLoading={workflowGen.isPlanLoading}
         onRefreshPlan={workflowGen.loadPlanContent}
         onBuildPlanFromFile={workflowGen.handleBuildPlanFromFile}
+        onBuildPlanImplementationFromFile={workflowGen.handleBuildPlanImplementationFromFile}
         onToggleFindings={findingsActions.handleToggleFindings}
         findingsActive={workflowGen.rightPanelMode === "findings"}
         findingsCount={activeFindings.length}

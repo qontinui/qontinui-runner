@@ -63,6 +63,7 @@ interface UseWorkflowGenerationResult {
   handleBuildPlanWorkflow: (planContent: string) => void;
   handleBuildPlanImplementationWorkflow: (planContent: string) => void;
   handleBuildPlanFromFile: () => void;
+  handleBuildPlanImplementationFromFile: () => void;
   loadPlanContent: () => Promise<void>;
   handleSelectTranscriptSession: (sessionId: string) => Promise<void>;
 }
@@ -394,6 +395,14 @@ export function useWorkflowGeneration({
     handleBuildPlanWorkflow(latestPlanContent);
   }, [latestPlanContent, handleBuildPlanWorkflow]);
 
+  const handleBuildPlanImplementationFromFile = useCallback(() => {
+    if (!latestPlanContent.trim()) {
+      setNotification({ message: "No plan file loaded", type: "error" });
+      return;
+    }
+    handleBuildPlanImplementationWorkflow(latestPlanContent);
+  }, [latestPlanContent, handleBuildPlanImplementationWorkflow]);
+
   return {
     // State
     isGenerating,
@@ -424,6 +433,7 @@ export function useWorkflowGeneration({
     handleBuildPlanWorkflow,
     handleBuildPlanImplementationWorkflow,
     handleBuildPlanFromFile,
+    handleBuildPlanImplementationFromFile,
     loadPlanContent,
     handleSelectTranscriptSession,
   };
