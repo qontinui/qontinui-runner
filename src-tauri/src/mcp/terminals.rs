@@ -1,23 +1,22 @@
-//! Terminal session HTTP handlers for MCP API
+//! Terminal session HTTP + WebSocket handlers for MCP API
 //!
-//! Provides HTTP handlers for managing embedded terminal sessions:
-//! list, create, write, get buffer, resize, close.
+//! Provides HTTP handlers for terminal CRUD and a WebSocket endpoint
+//! for bidirectional terminal I/O (output streaming + input/resize).
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive},
-        Json, Sse,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
     },
+    http::StatusCode,
+    response::{IntoResponse, Json},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::StreamExt as FuturesStreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tauri::Manager;
-use tokio_stream::wrappers::BroadcastStream;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::terminal::TerminalManager;
@@ -261,19 +260,21 @@ pub async fn close_terminal_handler(
     }))))
 }
 
-/// Stream terminal output as Server-Sent Events.
+/// WebSocket endpoint for bidirectional terminal I/O.
 ///
-/// Sends an initial `buffer` event with the scrollback contents, then streams
-/// live `output` events. When the terminal exits, sends an `exit` event.
-pub async fn stream_terminal_handler(
-    State(state): State<Arc<ApiState>>,
+/// Upgrades to WebSocket, then:
+/// - Sends scrollback buffer as initial `buffer` frame
+/// - Streams live output as `output` frames
+/// - Accepts `input` frames (keystrokes) and `resize` frames from the client
+/// - Sends `exit` frame when the terminal process dies
+pub async fn ws_terminal_handler(
+    ws: WebSocketUpgrade,
     Path(id): Path<String>,
-) -> Result<
-    Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
-    (StatusCode, Json<ApiResponse<()>>),
-> {
+    State(state): State<Arc<ApiState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     let terminal_manager = get_terminal_manager(&state);
 
+    // Validate terminal exists before upgrading the connection
     let session = terminal_manager.get(&id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -283,52 +284,124 @@ pub async fn stream_terminal_handler(
 
     // Subscribe before reading scrollback to avoid missing data in between
     let output_rx = session.subscribe_output();
-    let (scrollback_data, _start_offset) = session.get_scrollback_buffer();
+    let (scrollback_data, _) = session.get_scrollback_buffer();
     let is_alive = session.is_alive();
 
-    info!("SSE client connected for terminal {} output streaming", id);
+    info!("WebSocket client connecting for terminal {}", id);
 
-    let terminal_id = id.clone();
-    let stream = async_stream::stream! {
-        // Send the scrollback buffer as the initial event
-        if !scrollback_data.is_empty() {
-            let encoded = STANDARD.encode(&scrollback_data);
-            yield Ok(Event::default().event("buffer").data(encoded));
-        }
+    Ok(ws.on_upgrade(move |socket| {
+        handle_ws_terminal(socket, id, session, output_rx, scrollback_data, is_alive)
+    }))
+}
 
-        // If terminal is already dead, send exit event immediately
-        if !is_alive {
-            yield Ok(Event::default().event("exit").data(
-                serde_json::json!({ "terminal_id": terminal_id }).to_string()
-            ));
+/// Handle a WebSocket connection for a terminal session.
+async fn handle_ws_terminal(
+    socket: WebSocket,
+    terminal_id: String,
+    session: Arc<crate::terminal::session::TerminalSession>,
+    mut output_rx: tokio::sync::broadcast::Receiver<String>,
+    scrollback_data: Vec<u8>,
+    is_alive: bool,
+) {
+    let (mut sender, mut receiver) = socket.split();
+
+    info!("WebSocket connected for terminal {}", terminal_id);
+
+    // Send scrollback buffer as initial frame
+    if !scrollback_data.is_empty() {
+        let encoded = STANDARD.encode(&scrollback_data);
+        let msg = serde_json::json!({"type": "buffer", "data": encoded}).to_string();
+        if sender.send(Message::Text(msg.into())).await.is_err() {
+            debug!("WebSocket disconnected during scrollback send for terminal {}", terminal_id);
             return;
         }
+    }
 
-        // Stream live output from broadcast channel
-        let mut broadcast_stream = BroadcastStream::new(output_rx);
+    // If terminal is already dead, send exit and close
+    if !is_alive {
+        let exit_code = session.info().exit_code;
+        let msg = serde_json::json!({"type": "exit", "exitCode": exit_code}).to_string();
+        let _ = sender.send(Message::Text(msg.into())).await;
+        return;
+    }
+
+    // Spawn output forwarding task: broadcast → WebSocket sender
+    let tid_out = terminal_id.clone();
+    let session_out = session.clone();
+    let output_task = tokio::spawn(async move {
         loop {
-            match broadcast_stream.next().await {
-                Some(Ok(data)) => {
-                    yield Ok(Event::default().event("output").data(data));
+            match output_rx.recv().await {
+                Ok(data) => {
+                    let msg = serde_json::json!({"type": "output", "data": data}).to_string();
+                    if sender.send(Message::Text(msg.into())).await.is_err() {
+                        debug!("WebSocket sender closed for terminal {}", tid_out);
+                        break;
+                    }
                 }
-                Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n))) => {
-                    yield Ok(Event::default().event("warning").data(format!(
-                        "{{\"message\": \"Skipped {} output chunks due to lag\"}}",
-                        n
-                    )));
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("WebSocket client lagged for terminal {}, skipped {} chunks", tid_out, n);
+                    let msg = serde_json::json!({
+                        "type": "warning",
+                        "message": format!("Skipped {} output chunks due to lag", n)
+                    })
+                    .to_string();
+                    if sender.send(Message::Text(msg.into())).await.is_err() {
+                        break;
+                    }
                 }
-                None => {
-                    // Channel closed — terminal exited
-                    yield Ok(Event::default().event("exit").data(
-                        serde_json::json!({ "terminal_id": terminal_id }).to_string()
-                    ));
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // Broadcast channel closed — terminal exited
+                    let exit_code = session_out.info().exit_code;
+                    let msg =
+                        serde_json::json!({"type": "exit", "exitCode": exit_code}).to_string();
+                    let _ = sender.send(Message::Text(msg.into())).await;
                     break;
                 }
             }
         }
-    };
+    });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    // Inbound loop: receive client frames → dispatch to terminal session
+    while let Some(result) = receiver.next().await {
+        match result {
+            Ok(Message::Text(text)) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                    match msg.get("type").and_then(|t| t.as_str()) {
+                        Some("input") => {
+                            if let Some(data) = msg.get("data").and_then(|d| d.as_str()) {
+                                if let Ok(bytes) = STANDARD.decode(data) {
+                                    if let Err(e) = session.write(&bytes) {
+                                        warn!("Failed to write to terminal {}: {}", terminal_id, e);
+                                    }
+                                }
+                            }
+                        }
+                        Some("resize") => {
+                            if let (Some(cols), Some(rows)) = (
+                                msg.get("cols").and_then(|c| c.as_u64()),
+                                msg.get("rows").and_then(|r| r.as_u64()),
+                            ) {
+                                if let Err(e) = session.resize(cols as u16, rows as u16) {
+                                    warn!("Failed to resize terminal {}: {}", terminal_id, e);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {} // Ping/Pong handled automatically by axum
+            Err(e) => {
+                debug!("WebSocket receive error for terminal {}: {}", terminal_id, e);
+                break;
+            }
+        }
+    }
+
+    // Clean up
+    output_task.abort();
+    info!("WebSocket disconnected for terminal {}", terminal_id);
 }
 
 // ============================================================================
@@ -347,6 +420,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
-        .route("/terminals/{id}/stream", get(stream_terminal_handler))
+        .route("/terminals/{id}/ws", get(ws_terminal_handler))
         .route("/terminals/{id}", delete(close_terminal_handler))
 }
