@@ -1,6 +1,7 @@
 export type LogSubTab = "general" | "image" | "actions";
 
 export type MainTabId =
+  | "prompt-home"
   | "gui-automation"
   | "workflow-queue"
   | "active"
@@ -94,6 +95,7 @@ export type MainTabId =
   | "online-learning";
 
 const VALID_TAB_IDS: MainTabId[] = [
+  "prompt-home",
   "gui-automation",
   "workflow-queue",
   "active",
@@ -190,7 +192,7 @@ const VALID_TAB_IDS: MainTabId[] = [
 export const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
 
 export function migrateTabId(stored: string | null): MainTabId {
-  if (!stored) return "gui-automation";
+  if (!stored) return "prompt-home";
 
   const migrations: Record<string, MainTabId> = {
     run: "gui-automation",
@@ -248,5 +250,5 @@ export function migrateTabId(stored: string | null): MainTabId {
     return stored as MainTabId;
   }
 
-  return "gui-automation";
+  return "prompt-home";
 }

@@ -1,0 +1,508 @@
+{
+  "version": "1.0.0",
+  "description": "Prompt Home — the runner's Google-style landing page. Users type a natural language request (e.g., 'schedule a workflow at 3am'), the AI plans a sequence of UI actions, and the runner steers itself via the state machine and NLActionExecutor. Optional 'Explain steps' mode narrates each action via tutorial overlays.",
+  "groups": [
+    {
+      "id": "ph-layout",
+      "name": "Page Layout & Structure",
+      "description": "The page is a full-height centered flex column with the app wordmark, a search-style input bar, suggestion chips, and an explain toggle. Content is vertically and horizontally centered.",
+      "category": "layout",
+      "assertions": [
+        {
+          "id": "ph-page-container",
+          "description": "The prompt-home page container exists and is visible",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Prompt Home page container" },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-centered-layout",
+          "description": "The page content is centered both vertically and horizontally within the page container. The main content area uses flexbox centering (items-center justify-center).",
+          "category": "layout",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Prompt Home page container" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-wordmark",
+      "name": "App Wordmark",
+      "description": "A subtle 'qontinui' wordmark with a Sparkles icon appears above the input, establishing brand identity without dominating the page.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ph-wordmark-text",
+          "description": "The 'qontinui' wordmark text is present above the search input",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContent": "qontinui" }, "label": "App wordmark" },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-wordmark-muted",
+          "description": "The wordmark uses muted foreground color at 60% opacity (text-muted-foreground/60), keeping it subtle",
+          "category": "design",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContent": "qontinui" }, "label": "App wordmark" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-search-input",
+      "name": "Search Input Bar",
+      "description": "The primary input — a rounded search bar with a search icon, placeholder text, and a submit arrow that appears when text is entered.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ph-input-exists",
+          "description": "A text input with placeholder 'What would you like to do?' is present",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input" },
+          "assertionType": "visible",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-input-focused-on-mount",
+          "description": "The input receives focus automatically when the page loads, so the user can start typing immediately",
+          "category": "interaction",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input" },
+          "assertionType": "focused",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-input-rounded-bar",
+          "description": "The input container has rounded-2xl borders (border-radius ~16px), a card background, and subtle shadow, giving it a Google-style search bar appearance",
+          "category": "design",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input container" },
+          "assertionType": "semantic",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-submit-arrow-appears",
+          "description": "When the user types text into the input, a submit button with a ChevronRight icon appears to the right of the input. The button disappears when the input is empty.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-submit-on-enter",
+          "description": "Pressing Enter while the input has text submits the prompt (form submission). The prompt is saved to history and the planning phase begins.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-suggestions",
+      "name": "Suggestion Chips",
+      "description": "Below the input, suggestion chips show recent prompts (if history exists) or example prompts for new users. Chips are rounded-full pill buttons.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ph-suggestion-chips-visible",
+          "description": "At least 3 suggestion chip buttons are visible below the search input in idle state",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContent": "Show me the error monitor" }, "label": "Example suggestion chip" },
+          "assertionType": "visible",
+          "precondition": "Page is in idle state (no active execution) and no prompt history exists",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-suggestion-click-submits",
+          "description": "Clicking a suggestion chip fills the input with the chip's text and immediately submits it, starting the planning phase",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContent": "Show me the error monitor" }, "label": "Example suggestion chip" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-suggestions-hidden-during-execution",
+          "description": "Suggestion chips are hidden when the page is in any active state (planning, executing, done, error)",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContent": "Show me the error monitor" }, "label": "Example suggestion chip" },
+          "assertionType": "hidden",
+          "precondition": "A prompt has been submitted and is being processed",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-explain-toggle",
+      "name": "Explain Steps Toggle",
+      "description": "A checkbox toggle below suggestions that enables tutorial overlay narration during execution. Persisted to instanceStorage.",
+      "category": "element-presence",
+      "assertions": [
+        {
+          "id": "ph-explain-checkbox-visible",
+          "description": "A checkbox labeled 'Explain steps' is visible below the suggestion chips in idle state",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContains": "Explain steps" }, "label": "Explain steps label" },
+          "assertionType": "visible",
+          "precondition": "Page is in idle state",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-explain-persisted",
+          "description": "The Explain steps toggle state is persisted across sessions. If the user checks it and reloads, it remains checked.",
+          "category": "behavior",
+          "severity": "info",
+          "target": { "type": "search", "criteria": { "textContains": "Explain steps" }, "label": "Explain steps checkbox" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-planning-state",
+      "name": "Planning State",
+      "description": "After submission, the page shows a spinner with 'Understanding your request...' while the AI plans the action sequence.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "ph-planning-spinner",
+          "description": "While planning, a spinning loader icon and the text 'Understanding your request...' are displayed centered below the input",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Understanding your request" }, "label": "Planning status text" },
+          "assertionType": "visible",
+          "precondition": "A prompt has just been submitted and the backend is generating a plan",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-input-disabled-during-planning",
+          "description": "The text input is disabled (non-editable) during the planning and executing phases",
+          "category": "state-consistency",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input" },
+          "assertionType": "disabled",
+          "precondition": "Page is in planning or executing phase",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-executing-state",
+      "name": "Executing State — Step Progress",
+      "description": "During execution, the page displays the AI's plan summary and a step-by-step progress list. Each step shows a status icon (done/current/pending) and its explanation text.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "ph-plan-summary-shown",
+          "description": "The AI-generated plan summary text is displayed centered above the step list during execution",
+          "category": "data-display",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "tagName": "p" }, "label": "Plan summary" },
+          "assertionType": "semantic",
+          "precondition": "Page is in executing phase with a plan loaded",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-step-progress-icons",
+          "description": "Completed steps show a green CheckCircle2 icon, the current step shows a spinning Loader2 icon in primary color, and pending steps show an empty circle outline. Steps transition from pending → current → done as execution progresses.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Step progress list" },
+          "assertionType": "semantic",
+          "precondition": "Page is in executing phase with multiple steps",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-current-step-highlighted",
+          "description": "The currently executing step has a primary/10 background tint and foreground text color, distinguishing it from completed (muted) and pending (muted/40) steps",
+          "category": "design",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Current step row" },
+          "assertionType": "semantic",
+          "precondition": "Page is in executing phase",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-done-state",
+      "name": "Done State",
+      "description": "After all steps complete, shows a green 'Done!' message with a 'Start another task' link to reset.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "ph-done-message",
+          "description": "The text 'Done!' with a green CheckCircle2 icon is displayed when execution completes successfully",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "textContains": "Done!" }, "label": "Done message" },
+          "assertionType": "visible",
+          "precondition": "All plan steps have completed successfully",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-start-another-task",
+          "description": "A 'Start another task' button is shown after completion. Clicking it resets the page to idle state, clears the input, and focuses it.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContent": "Start another task" }, "label": "Reset button" },
+          "assertionType": "behavior",
+          "precondition": "Page is in done state",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-error-state",
+      "name": "Error State",
+      "description": "If planning or execution fails, shows a red error message with Retry and Start over options.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "ph-error-message-shown",
+          "description": "Error messages are displayed in red text with an XCircle icon when the backend returns an error or execution fails",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Error display area" },
+          "assertionType": "semantic",
+          "precondition": "The backend returned an error or a step failed during execution",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-retry-button",
+          "description": "A 'Retry' link re-submits the same prompt. A 'Start over' link resets to idle state.",
+          "category": "behavior",
+          "severity": "warning",
+          "target": { "type": "search", "criteria": { "textContent": "Retry" }, "label": "Retry button" },
+          "assertionType": "behavior",
+          "precondition": "Page is in error state",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "ph-self-steering",
+      "name": "Self-Steering Execution — Domain Logic",
+      "description": "The core feature: the runner steers itself by using the UI Bridge state machine for navigation and NLActionExecutor for page interactions. The AI plans a sequence of navigate + action steps, and the runner executes them visibly.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "ph-navigate-uses-state-machine",
+          "description": "Navigate steps use window.__UI_BRIDGE__.stateMachine.navigateTo() which triggers pathfinding and visible sidebar clicks. After navigation, the runner should be on the target page with its page context updated.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Page container" },
+          "assertionType": "semantic",
+          "precondition": "A navigate step is executing during plan execution",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-action-uses-nl-executor",
+          "description": "Action steps use NLActionExecutor to parse natural language instructions (e.g., 'click the Save button') and execute them on the current page's DOM elements. The executor discovers elements via bridge.discover() and finds the best match by confidence scoring.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "dataAttributes": { "page-id": "prompt-home" } }, "label": "Page container" },
+          "assertionType": "semantic",
+          "precondition": "An action step is executing during plan execution",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "ph-simple-navigation-prompt",
+          "description": "A prompt like 'Show me the error monitor' should produce a single navigate step to page-error-monitor. After execution, the runner should be on the Error Monitor page.",
+          "category": "behavior",
+          "severity": "critical",
+          "target": { "type": "search", "criteria": { "placeholder": "What would you like to do?" }, "label": "Prompt input" },
+          "assertionType": "behavior",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    }
+  ],
+  "metadata": {
+    "component": "PromptHomePage",
+    "pageUrl": "/prompt-home",
+    "tags": ["prompt", "home", "self-steering", "navigation", "landing-page"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "ph-idle",
+        "name": "Idle — Ready for Input",
+        "description": "Default state: search input visible, suggestion chips shown, explain toggle visible, no execution in progress",
+        "elements": [
+          { "placeholder": "What would you like to do?" },
+          { "textContains": "Show me the error monitor" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-planning",
+            "name": "Submit a prompt",
+            "description": "Type a prompt and press Enter or click the submit arrow",
+            "activateStates": ["ph-planning"],
+            "deactivateStates": ["ph-idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "What would you like to do?" },
+                "params": { "text": "Show me the error monitor", "clear": true }
+              },
+              {
+                "action": "sendKeys",
+                "target": { "placeholder": "What would you like to do?" },
+                "params": { "keys": [{ "key": "Enter" }] },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ph-planning",
+        "name": "Planning — AI Generating Plan",
+        "description": "The backend is calling Claude API to generate an action plan. Shows spinner and 'Understanding your request...'",
+        "elements": [
+          { "textContains": "Understanding your request" }
+        ],
+        "transitions": []
+      },
+      {
+        "id": "ph-executing",
+        "name": "Executing — Running Plan Steps",
+        "description": "The runner is executing planned steps one by one. Shows step progress list with status icons.",
+        "elements": [
+          { "dataAttributes": { "page-id": "prompt-home" } }
+        ],
+        "transitions": []
+      },
+      {
+        "id": "ph-done",
+        "name": "Done — Execution Complete",
+        "description": "All steps finished successfully. Shows 'Done!' and 'Start another task' link.",
+        "elements": [
+          { "textContains": "Done!" },
+          { "textContent": "Start another task" }
+        ],
+        "transitions": [
+          {
+            "id": "done-to-idle",
+            "name": "Start another task",
+            "description": "Click 'Start another task' to reset to idle state",
+            "activateStates": ["ph-idle"],
+            "deactivateStates": ["ph-done"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Start another task" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ph-error",
+        "name": "Error — Planning or Execution Failed",
+        "description": "An error occurred. Shows error message with Retry and Start over options.",
+        "elements": [
+          { "textContent": "Retry" },
+          { "textContent": "Start over" }
+        ],
+        "transitions": [
+          {
+            "id": "error-to-idle",
+            "name": "Start over",
+            "description": "Click 'Start over' to reset to idle state",
+            "activateStates": ["ph-idle"],
+            "deactivateStates": ["ph-error"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Start over" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

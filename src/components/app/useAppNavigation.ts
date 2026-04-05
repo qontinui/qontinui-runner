@@ -8,6 +8,8 @@ import { migrateTabId, SIDEBAR_COLLAPSED_KEY } from "./tab-types";
 import { useNavigation } from "./NavigationContext";
 
 const PAGE_TO_TAB: Record<string, MainTabId> = {
+  "prompt-home": "prompt-home",
+  home: "prompt-home",
   run: "gui-automation",
   "gui-automation": "gui-automation",
   active: "active",
@@ -23,6 +25,7 @@ const PAGE_TO_TAB: Record<string, MainTabId> = {
   logs: "logs",
   "error-monitor": "error-monitor",
   "state-machine": "state-machine",
+  specs: "specs",
 };
 
 export interface ErrorMonitorScope {

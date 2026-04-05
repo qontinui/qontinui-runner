@@ -135,6 +135,9 @@ const MemorySearchPanel = lazy(() =>
 const AccessibilityExplorer = lazy(
   () => import("@/components/accessibility-explorer/AccessibilityExplorer"),
 );
+const PromptHomePage = lazy(() =>
+  import("../prompt-home/PromptHomePage").then((m) => ({ default: m.PromptHomePage })),
+);
 
 /** Register the active page with UI Bridge for AI discoverability */
 function PageRegistration({
@@ -265,6 +268,20 @@ export function TabContent({
   const execution = useExecution();
 
   switch (activeTab) {
+    case "prompt-home":
+      return (
+        <div data-page-id="prompt-home" className="h-full overflow-hidden">
+          <PageRegistration
+            id="prompt-home"
+            name="Home"
+            description="Tell the runner what to do in plain English"
+          />
+          <Suspense fallback={<LazyFallback />}>
+            <PromptHomePage />
+          </Suspense>
+        </div>
+      );
+
     case "gui-automation":
       return (
         <div data-page-id="gui-automation" className="h-full flex flex-col">

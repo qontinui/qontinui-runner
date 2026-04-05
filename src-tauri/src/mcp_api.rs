@@ -531,6 +531,7 @@ pub fn create_router(
         .merge(crate::mcp::playwright::routes())
         .merge(crate::mcp::processes::routes())
         .merge(crate::mcp::prompts::routes())
+        .merge(crate::mcp::prompt_home::routes())
         .merge(crate::mcp::query_tool::routes())
         .merge(crate::mcp::queue::routes())
         .merge(crate::mcp::rag::routes())
@@ -576,6 +577,7 @@ pub fn create_router(
         .merge(crate::mcp::api_surface_diff::routes())
         .merge(crate::mcp::prm_export::routes())
         .merge(crate::mcp::restate_api::routes())
+        .merge(crate::mcp::streaming::routes())
         .route("/cloud-relay/start", post(cloud_relay_start))
         .route("/cloud-relay/status", get(cloud_relay_status))
         .layer(axum::middleware::from_fn(

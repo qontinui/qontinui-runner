@@ -37,6 +37,7 @@ import runnerHelpSpec from "../specs/help.spec.uibridge.json";
 import runnerLibrarySpec from "../specs/library.spec.uibridge.json";
 import runnerPlaywrightTestBuilderSpec from "../specs/playwright-test-builder.spec.uibridge.json";
 import runnerProcessesSpec from "../specs/processes.spec.uibridge.json";
+import runnerPromptHomeSpec from "../specs/prompt-home.spec.uibridge.json";
 import runnerReflectionSpec from "../specs/reflection.spec.uibridge.json";
 import runnerRunActionsSpec from "../specs/run-actions.spec.uibridge.json";
 import runnerRunAiDataSpec from "../specs/run-ai-data.spec.uibridge.json";
@@ -108,6 +109,7 @@ const ALL_SPECS: RawSpec[] = [
     json: runnerPlaywrightTestBuilderSpec,
   },
   { specId: "runner:processes", appName: "Qontinui Runner", json: runnerProcessesSpec },
+  { specId: "runner:prompt-home", appName: "Qontinui Runner", json: runnerPromptHomeSpec },
   { specId: "runner:reflection", appName: "Qontinui Runner", json: runnerReflectionSpec },
   { specId: "runner:run-actions", appName: "Qontinui Runner", json: runnerRunActionsSpec },
   { specId: "runner:run-ai-data", appName: "Qontinui Runner", json: runnerRunAiDataSpec },
@@ -168,6 +170,7 @@ export function getAllSpecs(): DiscoveredSpec[] {
         description: json.description ?? "",
         groups,
         metadata: json.metadata,
+        stateMachine: json.stateMachine,
       },
     });
   }

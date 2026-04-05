@@ -276,6 +276,7 @@ export interface TutorialTriggers {
  * Page/tab identifiers that tutorials can navigate to
  */
 export type TutorialFocusPage =
+  | "prompt-home"
   | "gui-automation"
   | "run" // Legacy alias for gui-automation
   | "active"

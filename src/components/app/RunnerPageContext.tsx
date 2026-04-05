@@ -9,6 +9,7 @@ export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
     }
 
     const map: Record<string, { name: string; section: string; breadcrumb: string[] }> = {
+      "prompt-home": { name: "Home", section: "run", breadcrumb: ["Home"] },
       "gui-automation": { name: "Execute", section: "run", breadcrumb: ["Run", "Execute"] },
       active: { name: "Active Dashboard", section: "run", breadcrumb: ["Run", "Active Dashboard"] },
       history: { name: "History", section: "run", breadcrumb: ["Run", "History"] },
