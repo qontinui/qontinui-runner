@@ -260,6 +260,7 @@ impl PgDb {
             serde_json::to_string(req.domain_knowledge.as_deref().unwrap_or(&[]))
                 .map_err(|e| format!("Failed to serialize domain_knowledge: {}", e))?;
         let confidence = req.confidence.unwrap_or(0.9);
+        let description = req.description.as_deref().unwrap_or("");
 
         conn.execute(
             r#"
@@ -274,7 +275,7 @@ impl PgDb {
                 &config_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &state_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &req.name as &(dyn tokio_postgres::types::ToSql + Sync),
-                &req.description as &(dyn tokio_postgres::types::ToSql + Sync),
+                &description as &(dyn tokio_postgres::types::ToSql + Sync),
                 &element_ids as &(dyn tokio_postgres::types::ToSql + Sync),
                 &render_ids as &(dyn tokio_postgres::types::ToSql + Sync),
                 &confidence as &(dyn tokio_postgres::types::ToSql + Sync),
