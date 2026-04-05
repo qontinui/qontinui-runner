@@ -549,14 +549,22 @@ export function TerminalPage({
               pageId={pageId}
               zoneAssignments={zoneLayout.assignments}
               tabs={tabs}
-              onLoadProfile={(profile) => {
+              onLoadProfile={async (profile) => {
                 zoneLayout.setLayoutId(profile.layoutId);
                 labelsAndTags.setZoneLabels(profile.labels);
                 labelsAndTags.setZoneNotes(profile.notes);
                 labelsAndTags.setPinnedZones(new Set(profile.pins));
                 transitionEffects.setAutoApprovePatterns(profile.autoApprovePatterns);
-                // Stash sessions for resume after assignments settle (useEffect above)
+                // Create terminals for profile sessions that need them
                 if (profile.sessions && profile.sessions.length > 0) {
+                  // Count how many new terminals we need (sessions without existing tabs)
+                  const existingTabCount = tabs.length;
+                  const neededCount = profile.sessions.length;
+                  const toCreate = Math.max(0, neededCount - existingTabCount);
+                  for (let i = 0; i < toCreate; i++) {
+                    await createAndAssignTerminal();
+                  }
+                  // Stash sessions for resume after assignments settle (useEffect above)
                   pendingProfileSessionsRef.current = profile.sessions;
                 }
               }}

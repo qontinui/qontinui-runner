@@ -559,7 +559,12 @@ export const TerminalInstance = forwardRef<TerminalInstanceHandle, TerminalInsta
         uiBridge?.registry?.unregisterElement(`terminal-input-${terminalId}`);
         outputUnsub?.();
         exitUnsub?.();
-        backendRef.current?.dispose();
+        try {
+          backendRef.current?.dispose();
+        } catch {
+          // xterm.js WebGL renderer may throw during disposal when its internal
+          // options are already cleaned up (known issue with onShowLinkUnderline).
+        }
         backendRef.current = null;
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps -- uiBridge is stable context
