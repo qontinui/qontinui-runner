@@ -31,6 +31,36 @@ export interface SpecGroup {
   source?: string;
 }
 
+export interface SpecTransitionAction {
+  action: string;
+  target: Record<string, unknown>;
+  params?: Record<string, unknown>;
+  waitAfter?: { type: string; timeout?: number };
+}
+
+export interface SpecTransition {
+  id: string;
+  name: string;
+  description?: string;
+  activateStates: string[];
+  deactivateStates: string[];
+  staysVisible?: boolean;
+  process: SpecTransitionAction[];
+}
+
+export interface SpecState {
+  id: string;
+  name: string;
+  description?: string;
+  elements: Record<string, unknown>[];
+  isInitial?: boolean;
+  transitions: SpecTransition[];
+}
+
+export interface SpecStateMachine {
+  states: SpecState[];
+}
+
 export interface SpecConfig {
   version: string;
   description?: string;
@@ -41,6 +71,7 @@ export interface SpecConfig {
     tags?: string[];
     [key: string]: unknown;
   };
+  stateMachine?: SpecStateMachine;
 }
 
 export interface DiscoveredSpec {
@@ -480,6 +511,93 @@ Key points about domain logic groups:
 7. Include metadata with component name, page URL, and relevant tags
 8. Write the top-level description as a comprehensive summary of what the page does
 9. Ground all assertions in what you actually found in the code — use real text content, real data attributes, real component names
+
+## State Machine Section (Optional)
+
+If the page has distinct UI configurations (tabs, panels, modals, modes, empty/loaded states),
+generate a \`stateMachine\` section alongside the assertion groups. This defines states and
+transitions for the ui-bridge-auto automation engine.
+
+### States
+
+Each state represents a distinct UI configuration within this page. States own their transitions.
+
+\`\`\`json
+{
+  "stateMachine": {
+    "states": [
+      {
+        "id": "kebab-case-id",
+        "name": "Human-Readable Name",
+        "description": "What this UI configuration represents",
+        "elements": [
+          { "dataAttributes": { "page-id": "settings-general" } },
+          { "role": "heading", "textContent": "General Settings" }
+        ],
+        "isInitial": true,
+        "transitions": [...]
+      }
+    ]
+  }
+}
+\`\`\`
+
+- \`id\`: unique identifier scoped to this spec (kebab-case)
+- \`name\`: human-readable name for the state
+- \`elements\`: elements that identify this state (same criteria format as assertion targets). Any match = state is active.
+- \`isInitial\`: true for the default state when the page first loads
+- \`transitions\`: outgoing transitions FROM this state (see below)
+
+### Transitions
+
+Transitions belong to their originating state (listed in the state's \`transitions\` array).
+Each transition is a **process** — an ordered sequence of actions.
+
+\`\`\`json
+{
+  "id": "general-to-ai",
+  "name": "Switch to AI Settings tab",
+  "description": "Click the AI tab in the settings tab bar",
+  "activateStates": ["settings-ai"],
+  "deactivateStates": ["settings-general"],
+  "staysVisible": false,
+  "process": [
+    {
+      "action": "click",
+      "target": { "role": "tab", "textContent": "AI" },
+      "waitAfter": { "type": "idle", "timeout": 3000 }
+    }
+  ]
+}
+\`\`\`
+
+- \`activateStates\`: states activated when this transition completes
+- \`deactivateStates\`: states deactivated when this transition completes
+- \`staysVisible\`: if true, the originating state stays active (use for modals/overlays where the background page remains visible)
+- \`process\`: ordered action sequence. Each action has:
+  - \`action\`: click, type, scroll, sendKeys, etc.
+  - \`target\`: element to act on (same criteria format as assertion targets)
+  - \`params\`: action-specific parameters (e.g., \`{ "text": "search query" }\` for type)
+  - \`waitAfter\`: optional wait after this action
+
+### Rules
+
+- **Elements must not overlap** between states in the same spec
+- **Transitions are processes** — use multi-step action sequences for complex transitions (open dropdown → select option → confirm)
+- **Set staysVisible: true** for transitions that open modals, overlays, or panels where the background stays visible
+- **Do NOT include cross-page navigation** — sidebar/menu navigation belongs in a separate sidebar spec
+- **States represent configurations WITHIN this page** — not different pages
+
+### When to include stateMachine
+
+Include it when the page has:
+- Tab navigation (each tab = a state)
+- Modals or dialogs (modal open = a state, with staysVisible transition)
+- Empty/loaded/error states (each = a state)
+- Expandable panels or sidebars within the page
+- Mode switches (edit mode, view mode)
+
+Do NOT include it for simple pages with only one configuration.
 `.trim();
 
 /**

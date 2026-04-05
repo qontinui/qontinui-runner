@@ -194,6 +194,9 @@ export function buildPageSpecPrompt(
   parts.push(
     "\nInclude groups for ALL applicable categories: element-presence, interaction, data-display, behavior, state-consistency, navigation, semantic, accessibility, layout, design.",
   );
+  parts.push(
+    "\nIf the page has tabs, modals, panels, or other distinct UI configurations, include a stateMachine section with states and transitions. See the State Machine Section in the instructions above.",
+  );
 
   return parts.join("\n");
 }
