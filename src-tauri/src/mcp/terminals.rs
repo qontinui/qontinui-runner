@@ -6,12 +6,17 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::Json,
+    response::{
+        sse::{Event, KeepAlive},
+        Json, Sse,
+    },
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::StreamExt as FuturesStreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use tauri::Manager;
+use tokio_stream::wrappers::BroadcastStream;
 use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
@@ -256,6 +261,76 @@ pub async fn close_terminal_handler(
     }))))
 }
 
+/// Stream terminal output as Server-Sent Events.
+///
+/// Sends an initial `buffer` event with the scrollback contents, then streams
+/// live `output` events. When the terminal exits, sends an `exit` event.
+pub async fn stream_terminal_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let terminal_manager = get_terminal_manager(&state);
+
+    let session = terminal_manager.get(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Terminal not found: {}", id))),
+        )
+    })?;
+
+    // Subscribe before reading scrollback to avoid missing data in between
+    let output_rx = session.subscribe_output();
+    let (scrollback_data, _start_offset) = session.get_scrollback_buffer();
+    let is_alive = session.is_alive();
+
+    info!("SSE client connected for terminal {} output streaming", id);
+
+    let terminal_id = id.clone();
+    let stream = async_stream::stream! {
+        // Send the scrollback buffer as the initial event
+        if !scrollback_data.is_empty() {
+            let encoded = STANDARD.encode(&scrollback_data);
+            yield Ok(Event::default().event("buffer").data(encoded));
+        }
+
+        // If terminal is already dead, send exit event immediately
+        if !is_alive {
+            yield Ok(Event::default().event("exit").data(
+                serde_json::json!({ "terminal_id": terminal_id }).to_string()
+            ));
+            return;
+        }
+
+        // Stream live output from broadcast channel
+        let mut broadcast_stream = BroadcastStream::new(output_rx);
+        loop {
+            match broadcast_stream.next().await {
+                Some(Ok(data)) => {
+                    yield Ok(Event::default().event("output").data(data));
+                }
+                Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n))) => {
+                    yield Ok(Event::default().event("warning").data(format!(
+                        "{{\"message\": \"Skipped {} output chunks due to lag\"}}",
+                        n
+                    )));
+                }
+                None => {
+                    // Channel closed — terminal exited
+                    yield Ok(Event::default().event("exit").data(
+                        serde_json::json!({ "terminal_id": terminal_id }).to_string()
+                    ));
+                    break;
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -272,5 +347,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/terminals/{id}/write", post(write_terminal_handler))
         .route("/terminals/{id}/buffer", get(get_buffer_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
+        .route("/terminals/{id}/stream", get(stream_terminal_handler))
         .route("/terminals/{id}", delete(close_terminal_handler))
 }

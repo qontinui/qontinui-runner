@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -70,6 +71,8 @@ pub struct TerminalSession {
     total_bytes_produced: Arc<AtomicU64>,
     /// Unix timestamp in milliseconds when the session was created.
     created_at: u64,
+    /// Broadcast channel for HTTP/SSE subscribers to receive base64-encoded output chunks.
+    output_tx: broadcast::Sender<String>,
 }
 
 impl TerminalSession {
@@ -158,6 +161,7 @@ impl TerminalSession {
         let bytes_acked = Arc::new(AtomicU64::new(0));
         let scrollback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
         let total_bytes_produced = Arc::new(AtomicU64::new(0));
+        let (output_tx, _) = broadcast::channel::<String>(256);
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -177,6 +181,7 @@ impl TerminalSession {
         let reader_bytes_acked = bytes_acked.clone();
         let reader_scrollback = scrollback_buffer.clone();
         let reader_total_bytes = total_bytes_produced.clone();
+        let reader_output_tx = output_tx.clone();
         let reader_handle = thread::Builder::new()
             .name(format!("terminal-reader-{}", &id))
             .spawn(move || {
@@ -215,6 +220,8 @@ impl TerminalSession {
                             reader_total_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
 
                             let encoded = STANDARD.encode(&data);
+                            // Broadcast to HTTP/SSE subscribers (ignore if no receivers)
+                            let _ = reader_output_tx.send(encoded.clone());
                             let event = TerminalOutputEvent {
                                 terminal_id: reader_id.clone(),
                                 data: encoded,
@@ -310,6 +317,7 @@ impl TerminalSession {
             scrollback_buffer,
             total_bytes_produced,
             created_at,
+            output_tx,
         })
     }
 
@@ -437,6 +445,12 @@ impl TerminalSession {
     pub fn reset_flow_control(&self) {
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         self.bytes_acked.store(sent, Ordering::Relaxed);
+    }
+
+    /// Subscribe to the terminal output broadcast channel.
+    /// Returns a receiver that yields base64-encoded output chunks.
+    pub fn subscribe_output(&self) -> broadcast::Receiver<String> {
+        self.output_tx.subscribe()
     }
 
     /// Check if the shell process is still alive.
