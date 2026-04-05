@@ -2323,5 +2323,191 @@
       ],
       "source": "manual"
     }
-  ]
+  ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "sm-discovery",
+        "name": "Discovery Tab",
+        "description": "Connect to SDK apps, explore/record UI, discover states via fingerprint analysis",
+        "elements": [
+          { "textContent": "Discovery", "role": "tab" },
+          { "textContent": "Scan for Apps" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "discovery-to-graph",
+            "name": "Switch to Graph Editor",
+            "activateStates": ["sm-graph"],
+            "deactivateStates": ["sm-discovery"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Graph Editor", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "discovery-to-states",
+            "name": "Switch to State View",
+            "activateStates": ["sm-states"],
+            "deactivateStates": ["sm-discovery"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "State View", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "discovery-to-transitions",
+            "name": "Switch to Transitions",
+            "activateStates": ["sm-transitions"],
+            "deactivateStates": ["sm-discovery"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Transitions", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "discovery-to-pathfinding",
+            "name": "Switch to Pathfinding",
+            "activateStates": ["sm-pathfinding"],
+            "deactivateStates": ["sm-discovery"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Pathfinding", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "discovery-to-export",
+            "name": "Switch to Export",
+            "activateStates": ["sm-export"],
+            "deactivateStates": ["sm-discovery"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Export", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sm-graph",
+        "name": "Graph Editor Tab",
+        "description": "Interactive dagre node-edge layout with element thumbnails and transition editing",
+        "elements": [
+          { "textContent": "Graph Editor", "role": "tab" }
+        ],
+        "transitions": [
+          {
+            "id": "graph-to-discovery",
+            "name": "Switch to Discovery",
+            "activateStates": ["sm-discovery"],
+            "deactivateStates": ["sm-graph"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "graph-to-states",
+            "name": "Switch to State View",
+            "activateStates": ["sm-states"],
+            "deactivateStates": ["sm-graph"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "State View", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sm-states",
+        "name": "State View Tab",
+        "description": "View states in list, spatial, or screenshot mode with element details",
+        "elements": [
+          { "textContent": "State View", "role": "tab" }
+        ],
+        "transitions": [
+          {
+            "id": "states-to-discovery",
+            "name": "Switch to Discovery",
+            "activateStates": ["sm-discovery"],
+            "deactivateStates": ["sm-states"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "states-to-graph",
+            "name": "Switch to Graph Editor",
+            "activateStates": ["sm-graph"],
+            "deactivateStates": ["sm-states"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Graph Editor", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sm-transitions",
+        "name": "Transitions Tab",
+        "description": "Manage and view transitions between states",
+        "elements": [
+          { "textContent": "Transitions", "role": "tab" }
+        ],
+        "transitions": [
+          {
+            "id": "transitions-to-discovery",
+            "name": "Switch to Discovery",
+            "activateStates": ["sm-discovery"],
+            "deactivateStates": ["sm-transitions"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sm-pathfinding",
+        "name": "Pathfinding Tab",
+        "description": "Find optimal paths between states",
+        "elements": [
+          { "textContent": "Pathfinding", "role": "tab" }
+        ],
+        "transitions": [
+          {
+            "id": "pathfinding-to-discovery",
+            "name": "Switch to Discovery",
+            "activateStates": ["sm-discovery"],
+            "deactivateStates": ["sm-pathfinding"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sm-export",
+        "name": "Export Tab",
+        "description": "Export state machine configuration to JSON or load into Python runtime",
+        "elements": [
+          { "textContent": "Export", "role": "tab" }
+        ],
+        "transitions": [
+          {
+            "id": "export-to-discovery",
+            "name": "Switch to Discovery",
+            "activateStates": ["sm-discovery"],
+            "deactivateStates": ["sm-export"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Discovery", "role": "tab" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }
