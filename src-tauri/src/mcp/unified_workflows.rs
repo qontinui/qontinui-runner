@@ -1910,7 +1910,9 @@ pub async fn execute_inline_workflow(
 
     if has_prompt_steps {
         // AI-based execution with verification-agentic loop
-        let wf_type = if workflow.category == "plan-generated" {
+        let wf_type = if workflow.category == "plan-generated"
+            || workflow.category == "plan-implementation"
+        {
             "plan"
         } else {
             "unified"
@@ -2743,11 +2745,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/generate-async",
             post(generate_unified_workflow_async_handler),
         )
-        // TODO: execute_inline_workflow handler has axum 0.7/0.8 version conflict
-        // .route(
-        //     "/unified-workflows/execute-inline",
-        //     post(execute_inline_workflow),
-        // )
+        .route(
+            "/unified-workflows/execute-inline",
+            post(execute_inline_workflow),
+        )
         .route(
             "/unified-workflows/last-inline",
             get(get_last_inline_workflow),
