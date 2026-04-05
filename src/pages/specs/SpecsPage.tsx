@@ -32,6 +32,8 @@ import { useKnownIssues } from "@/hooks/useKnownIssues";
 import { SpecExperimentationDashboard } from "@/components/specs/SpecExperimentationDashboard";
 import { ContractBuilder } from "./ContractBuilder";
 import type { LoadedSpec } from "./types";
+import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
+import type { SpecConfig } from "@/lib/spec-prompt-builder";
 
 // ============================================================================
 // SpecsPage reducer
@@ -286,6 +288,34 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     ],
   );
 
+  // Compile all specs' stateMachine sections into a runtime state machine
+  const handleCompileStateMachine = useCallback(() => {
+    const allSpecs = state.specs.map((s) => s.config as SpecConfig);
+    const { stateMachine, stats } = compileStateMachineFromSpecs(allSpecs);
+
+    // Load into the engine via the bridge
+    const bridge = (window as unknown as Record<string, unknown>).__UI_BRIDGE__ as
+      | Record<string, unknown>
+      | undefined;
+    if (bridge?.loadStateMachine) {
+      const json = JSON.stringify(stateMachine);
+      const result = (bridge.loadStateMachine as (json: string) => Record<string, unknown>)(json);
+      console.log(
+        `[Specs] State machine compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions from ${stats.specsProcessed} specs`,
+        result,
+      );
+    } else {
+      // loadStateMachine not available — dispatch config-changed event as fallback
+      console.log(
+        `[Specs] State machine compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions (engine not available — loadStateMachine not found on bridge)`,
+      );
+    }
+
+    if (stats.warnings.length > 0) {
+      console.warn("[Specs] Compilation warnings:", stats.warnings);
+    }
+  }, [state.specs]);
+
   // Triage: "Update Spec" — trigger merge review in chat panel
   const handleTriageUpdateSpec = useCallback(
     (groupId: string) => {
@@ -380,6 +410,7 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             onToggleRegressionChecks={() => dispatch({ type: "TOGGLE_REGRESSION_CHECKS" })}
             regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
             onBuildWorkflow={() => handleBuildWorkflow()}
+            onCompileStateMachine={handleCompileStateMachine}
             onToggleEditMode={() => state.setEditMode(!state.editMode)}
           />
 

@@ -16,6 +16,7 @@ import {
   PencilOff,
   Brain,
   Bug,
+  Network,
 } from "lucide-react";
 import type { ConnectionState } from "./types";
 
@@ -36,6 +37,7 @@ interface ConnectionBarProps {
   onLoadFromFile: () => void;
   onSaveToFile: () => void;
   onBuildWorkflow: () => void;
+  onCompileStateMachine: () => void;
   onToggleEditMode: () => void;
 }
 
@@ -56,6 +58,7 @@ export function ConnectionBar({
   onLoadFromFile,
   onSaveToFile,
   onBuildWorkflow,
+  onCompileStateMachine,
   onToggleEditMode,
 }: ConnectionBarProps) {
   const [url, setUrl] = useState(connection.url || "http://localhost:3001");
@@ -192,6 +195,16 @@ export function ConnectionBar({
             Build Workflow
           </button>
         )}
+        <button
+          onClick={onCompileStateMachine}
+          disabled={isLoading || stats.totalSpecs === 0}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
+          bg-violet-600 text-white shadow-xs shadow-violet-600/25
+          hover:bg-violet-700 disabled:opacity-50 transition-colors shrink-0"
+        >
+          <Network className="w-3.5 h-3.5" />
+          Compile State Machine
+        </button>
 
         {/* Stats */}
         {stats.totalSpecs > 0 && (
