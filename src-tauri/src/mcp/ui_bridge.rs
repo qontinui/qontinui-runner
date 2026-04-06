@@ -1957,17 +1957,25 @@ pub async fn ui_bridge_page_navigate_handler(
             Json(api_error(format!("Unsafe URL scheme rejected: {}", url))),
         ));
     }
-    if !url.starts_with('/')
-        && !url.starts_with("http://localhost")
-        && !url.starts_with("https://localhost")
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(format!(
-                "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
-                url
-            ))),
-        ));
+    if !url.starts_with('/') {
+        // Validate absolute URLs: must be http(s)://localhost or http(s)://127.0.0.1
+        // Use strict patterns that prevent authority confusion (e.g. http://localhost@evil.com)
+        let is_valid_localhost = ["http://localhost/", "http://localhost:", "https://localhost/", "https://localhost:",
+                                  "http://127.0.0.1/", "http://127.0.0.1:", "https://127.0.0.1/", "https://127.0.0.1:"]
+            .iter()
+            .any(|prefix| url.starts_with(prefix))
+            || url == "http://localhost" || url == "https://localhost"
+            || url == "http://127.0.0.1" || url == "https://127.0.0.1";
+
+        if !is_valid_localhost {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!(
+                    "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
+                    url
+                ))),
+            ));
+        }
     }
 
     let payload = serde_json::json!({ "url": url });

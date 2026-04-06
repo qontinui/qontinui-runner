@@ -406,13 +406,13 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     if (bridge?.loadStateMachine) {
       const json = JSON.stringify(stateMachine);
       const result = (bridge.loadStateMachine as (json: string) => Record<string, unknown>)(json);
-      console.log(
+      console.warn(
         `[Specs] State machine compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions from ${stats.specsProcessed} specs`,
         result,
       );
     } else {
       // loadStateMachine not available — dispatch config-changed event as fallback
-      console.log(
+      console.warn(
         `[Specs] State machine compiled: ${stats.statesCompiled} states, ${stats.transitionsCompiled} transitions (engine not available — loadStateMachine not found on bridge)`,
       );
     }
