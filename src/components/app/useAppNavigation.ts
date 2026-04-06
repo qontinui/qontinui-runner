@@ -92,11 +92,21 @@ export function useAppNavigation(): UseAppNavigationReturn {
   useEffect(() => {
     const handler = (e: WindowEventMap["ui-bridge-navigate"]) => {
       const { page } = e.detail;
-      const tabId = PAGE_TO_TAB[page] ?? (page as MainTabId);
-      setActiveTab(tabId);
+      const tabId = PAGE_TO_TAB[page];
+      if (tabId) {
+        setActiveTab(tabId);
+      }
+    };
+    // Direct tab setter (bypasses PAGE_TO_TAB for navigate_tab endpoint)
+    const directHandler = (e: CustomEvent<{ tab: MainTabId }>) => {
+      setActiveTab(e.detail.tab);
     };
     window.addEventListener("ui-bridge-navigate", handler);
-    return () => window.removeEventListener("ui-bridge-navigate", handler);
+    window.addEventListener("ui-bridge-set-tab", directHandler as EventListener);
+    return () => {
+      window.removeEventListener("ui-bridge-navigate", handler);
+      window.removeEventListener("ui-bridge-set-tab", directHandler as EventListener);
+    };
   }, []);
 
   useEffect(() => {

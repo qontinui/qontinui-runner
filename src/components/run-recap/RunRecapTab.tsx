@@ -272,4 +272,3 @@ export function RunRecapTab({ onNavigateToAiOutput }: RunRecapTabProps = {}) {
   );
 }
 
-export default RunRecapTab;

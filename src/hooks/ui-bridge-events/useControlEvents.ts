@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import { getApiPort } from "@/lib/runner-api";
-import { instanceStorage } from "@/lib/instance-storage";
+import type { MainTabId } from "@/components/app/tab-types";
+import { migrateTabId } from "@/components/app/tab-types";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { serializeElement, serializeComponent } from "./utils";
 
@@ -234,10 +235,17 @@ export function useControlEvents(
             return true;
           }
 
-          // Dispatch navigation event — useAppNavigation listens for this
-          // It resolves via PAGE_TO_TAB, or falls back to direct tab ID
+          // Validate: migrateTabId returns the tab if valid, or default if not
+          const resolved = migrateTabId(tab);
+          if (resolved !== tab && resolved !== migrateTabId(null)) {
+            // Tab was migrated to a different ID — use the migrated one
+          }
+
+          // Use Tauri event for direct tab navigation (bypasses PAGE_TO_TAB)
           window.dispatchEvent(
-            new CustomEvent("ui-bridge-navigate", { detail: { page: tab } }),
+            new CustomEvent("ui-bridge-set-tab", {
+              detail: { tab: resolved as MainTabId },
+            }),
           );
 
           // Wait for navigation to settle
@@ -247,7 +255,7 @@ export function useControlEvents(
             requestId,
             type,
             success: true,
-            data: { navigatedTo: tab },
+            data: { navigatedTo: resolved },
             timestamp: Date.now(),
           });
           return true;
@@ -256,12 +264,22 @@ export function useControlEvents(
         case "clear_storage": {
           // Clear all localStorage keys for the current instance port namespace
           const port = getApiPort();
-          const suffix = port === 9876 ? "" : `:${port}`;
           const keysToRemove: string[] = [];
+          const otherPortPattern = /:\d+$/;
           for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
-            if (key && (suffix === "" || key.endsWith(suffix))) {
-              keysToRemove.push(key);
+            if (!key) continue;
+            if (port === 9876) {
+              // Default port: keys have no suffix. Only clear keys that don't
+              // belong to another port (i.e., don't end with :<digits>).
+              if (!otherPortPattern.test(key)) {
+                keysToRemove.push(key);
+              }
+            } else {
+              // Non-default port: keys end with :<port>
+              if (key.endsWith(`:${port}`)) {
+                keysToRemove.push(key);
+              }
             }
           }
           for (const key of keysToRemove) {
