@@ -518,3 +518,12 @@ export {
 } from "./performance-metrics";
 
 export * from "./pipeline";
+
+// Streaming types (Sunshine/Moonlight screen streaming)
+export type {
+  StreamingStatus,
+  PairResponse,
+  FocusRequest,
+  FocusResponse,
+  ScreenshotQuery,
+} from "./streaming";
