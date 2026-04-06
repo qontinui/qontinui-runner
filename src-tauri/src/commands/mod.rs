@@ -66,6 +66,7 @@ pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
 pub mod comparison; // Side-by-side architecture comparison runs
 pub mod config;
+pub mod file_browser; // Safe read-only filesystem browsing for mobile
 pub mod container_settings;
 pub mod context;
 pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns

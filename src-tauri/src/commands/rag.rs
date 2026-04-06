@@ -17,16 +17,7 @@ use tauri::{AppHandle, State};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
-/// Get API base URL for qontinui-web backend
-fn get_api_base_url() -> String {
-    std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            "http://127.0.0.1:8000".to_string()
-        } else {
-            "https://qontinui.io".to_string()
-        }
-    })
-}
+use crate::api_config::get_api_base_url;
 
 /// Send embedding results to the web backend
 ///

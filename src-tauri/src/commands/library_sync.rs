@@ -16,16 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// Get API base URL for qontinui-web backend
-fn get_api_base_url() -> String {
-    std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            "http://127.0.0.1:8000".to_string()
-        } else {
-            "https://qontinui-prod-py.eba-km2u4s23.eu-central-1.elasticbeanstalk.com".to_string()
-        }
-    })
-}
+use crate::api_config::get_api_base_url;
 
 // ============================================================================
 // Request Types (matching backend schemas)

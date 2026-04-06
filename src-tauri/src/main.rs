@@ -12,6 +12,7 @@
 mod action_service;
 mod ai_pricing;
 mod ai_provider;
+pub mod api_config;
 mod ai_router;
 mod ai_workflows;
 mod api_request;
@@ -423,6 +424,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Clipboard sync and file sharing commands
             commands::clipboard::share_to_mobile,
             commands::clipboard::share_file_to_mobile,
+            // File browser commands (safe directory browsing for mobile)
+            commands::file_browser::get_safe_browse_roots,
+            commands::file_browser::browse_directory,
+            commands::file_browser::read_file_content,
             // Configuration commands
             commands::config::load_configuration,
             commands::config::get_current_configuration,

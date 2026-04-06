@@ -7,16 +7,7 @@ use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-/// Get API base URL for qontinui-web backend
-fn get_api_base_url() -> String {
-    std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            "http://127.0.0.1:8000".to_string()
-        } else {
-            "https://qontinui-prod-py.eba-km2u4s23.eu-central-1.elasticbeanstalk.com".to_string()
-        }
-    })
-}
+use crate::api_config::get_api_base_url;
 
 /// Issue source information - where the AI found/detected the error
 #[derive(Debug, Clone, Serialize, Deserialize)]
