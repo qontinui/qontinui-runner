@@ -49,6 +49,7 @@ pub mod generator_eval;
 pub mod goals;
 pub mod graph_api;
 pub mod gui_config;
+pub mod hitl;
 pub mod gui_execution;
 pub mod headless_browser;
 pub mod hooks;

@@ -117,6 +117,28 @@ impl PgDb {
         Ok(())
     }
 
+    /// Get all pending deferred questions across all task runs.
+    pub async fn get_all_pending_questions(&self) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, task_run_id, iteration, question, context_json, \
+                    auto_decision_type, auto_decision_detail, confidence, risk_level, \
+                    status, git_checkpoint, contingent_iterations, reviewer_comment, \
+                    created_at, reviewed_at \
+                 FROM deferred_questions WHERE status = 'pending' ORDER BY created_at DESC",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_all_pending_questions: {}", e))?;
+
+        Ok(rows.iter().map(row_to_json).collect())
+    }
+
     /// Get all deferred questions for a task run.
     pub async fn get_deferred_questions_for_task_run(
         &self,
