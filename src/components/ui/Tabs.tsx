@@ -4,7 +4,7 @@
  * Lightweight tabs implementation for the UI library.
  */
 
-import { createContext, useContext, useState, type ReactNode } from "react";
+import { createContext, useContext, useState, forwardRef, type ReactNode } from "react";
 import { cn } from "../../lib/utils";
 
 // Context for tab state
@@ -77,12 +77,13 @@ interface TabsTriggerProps {
   disabled?: boolean;
 }
 
-export function TabsTrigger({ value, children, className, disabled }: TabsTriggerProps) {
+export const TabsTrigger = forwardRef<HTMLButtonElement, TabsTriggerProps>(function TabsTrigger({ value, children, className, disabled }, ref) {
   const { value: currentValue, onValueChange } = useTabsContext();
   const isActive = currentValue === value;
 
   return (
     <button
+      ref={ref}
       type="button"
       role="tab"
       aria-selected={isActive}
@@ -99,7 +100,7 @@ export function TabsTrigger({ value, children, className, disabled }: TabsTrigge
       {children}
     </button>
   );
-}
+});
 
 // Tab content panel
 interface TabsContentProps {

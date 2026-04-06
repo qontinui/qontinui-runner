@@ -13,6 +13,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Brain, MessageSquare, Loader2, Send, Square, Copy, Check } from "lucide-react";
 import { getAccentColors } from "@/design-system";
+import { ShareToMobileButton } from "./ClipboardSync";
 // Note: Issue and findings detection is now done in EventHandlers.ts to ensure
 // ALL lines are processed, not just filtered ones displayed in this component.
 import { groupEntriesIntoLoops, type AiOutputLine } from "../types/aiLoop";
@@ -496,6 +497,19 @@ export function AiOutputTab({
                 </button>
               </>
             )}
+            <ShareToMobileButton
+              getText={() => {
+                if (!currentLoop) return "";
+                return currentLoop.entries
+                  .map((entry) => {
+                    const prefix = entry.source === "prompt" ? "[Prompt]\n" : "";
+                    return prefix + entry.line;
+                  })
+                  .join("\n\n");
+              }}
+              className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              size={12}
+            />
             <button
               onClick={handleCopyLoop}
               disabled={!currentLoop}

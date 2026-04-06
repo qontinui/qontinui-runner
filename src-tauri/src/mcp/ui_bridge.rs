@@ -5273,6 +5273,10 @@ ipc_handler_path_post!(
 ipc_handler_post!(ui_bridge_find_state_path_handler, "find_state_path");
 ipc_handler_post!(ui_bridge_navigate_to_state_handler, "navigate_to_state");
 
+// Runner-specific: tab navigation and storage management
+ipc_handler_post!(ui_bridge_navigate_tab_handler, "navigate_tab");
+ipc_handler_post!(ui_bridge_clear_storage_handler, "clear_storage");
+
 // AI semantic search & diff
 ipc_handler_post!(ui_bridge_ai_semantic_search_handler, "ai_semantic_search");
 ipc_handler_get!(ui_bridge_ai_diff_handler, "ai_diff");
@@ -8031,5 +8035,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/analytics/recommendations",
             get(analytics_recommendations_handler),
+        )
+        // Runner-specific: tab navigation and storage management
+        .route(
+            "/ui-bridge/control/navigate-tab",
+            post(ui_bridge_navigate_tab_handler),
+        )
+        .route(
+            "/ui-bridge/control/clear-storage",
+            post(ui_bridge_clear_storage_handler),
         )
 }

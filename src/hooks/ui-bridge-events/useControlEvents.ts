@@ -1,10 +1,12 @@
 import { useCallback } from "react";
 import { getApiPort } from "@/lib/runner-api";
+import { instanceStorage } from "@/lib/instance-storage";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 import { serializeElement, serializeComponent } from "./utils";
 
 /**
- * Handles: get_elements, get_element, execute_action, get_components, get_component, execute_component_action
+ * Handles: get_elements, get_element, execute_action, get_components, get_component,
+ *          execute_component_action, navigate_tab, clear_storage
  */
 export function useControlEvents(
   context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">,
@@ -43,23 +45,43 @@ export function useControlEvents(
             return true;
           }
 
+          // Try registry lookup first
           const element = currentBridge.getElement(elementId);
-          if (!element) {
+          if (element) {
             await sendResponse({
               requestId,
               type,
-              success: false,
-              error: `Element not found: ${elementId}`,
+              success: true,
+              data: serializeElement(element),
               timestamp: Date.now(),
             });
             return true;
           }
 
+          // Fallback: search discovered elements by ID
+          // This handles auto-discovered elements not in the registry
+          try {
+            const discovered = await currentBridge.discover({ includeHidden: true });
+            const match = discovered.elements.find((e) => e.id === elementId);
+            if (match) {
+              await sendResponse({
+                requestId,
+                type,
+                success: true,
+                data: match,
+                timestamp: Date.now(),
+              });
+              return true;
+            }
+          } catch {
+            // Discovery fallback failed — continue to error
+          }
+
           await sendResponse({
             requestId,
             type,
-            success: true,
-            data: serializeElement(element),
+            success: false,
+            error: `Element not found: ${elementId}`,
             timestamp: Date.now(),
           });
           return true;
@@ -192,6 +214,65 @@ export function useControlEvents(
             success: result.success,
             data: result,
             error: result.error,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "navigate_tab": {
+          const tab = (payload.params as Record<string, unknown> | undefined)?.tab as
+            | string
+            | undefined;
+          if (!tab) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "params.tab is required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // Dispatch navigation event — useAppNavigation listens for this
+          // It resolves via PAGE_TO_TAB, or falls back to direct tab ID
+          window.dispatchEvent(
+            new CustomEvent("ui-bridge-navigate", { detail: { page: tab } }),
+          );
+
+          // Wait for navigation to settle
+          await new Promise((r) => setTimeout(r, 500));
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { navigatedTo: tab },
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
+        case "clear_storage": {
+          // Clear all localStorage keys for the current instance port namespace
+          const port = getApiPort();
+          const suffix = port === 9876 ? "" : `:${port}`;
+          const keysToRemove: string[] = [];
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && (suffix === "" || key.endsWith(suffix))) {
+              keysToRemove.push(key);
+            }
+          }
+          for (const key of keysToRemove) {
+            localStorage.removeItem(key);
+          }
+
+          await sendResponse({
+            requestId,
+            type,
+            success: true,
+            data: { cleared: keysToRemove.length, port },
             timestamp: Date.now(),
           });
           return true;

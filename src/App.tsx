@@ -65,7 +65,7 @@ import { useTaskRuns } from "./hooks/useAiData";
 import { getAllSpecs } from "./lib/spec-registry";
 import { getGlobalSpecStore } from "@qontinui/ui-bridge/specs";
 import { autoPopulateCtr, getGlobalCtr } from "@qontinui/ui-bridge/ctr";
-import { getGlobalRegistry } from "@qontinui/ui-bridge/core";
+import { getGlobalRegistry } from "ui-bridge";
 
 import { instanceStorage } from "@/lib/instance-storage";
 

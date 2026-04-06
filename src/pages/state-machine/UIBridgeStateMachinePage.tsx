@@ -7,8 +7,9 @@
  * Tabs: Discovery, Graph Editor, State View, Transitions, Pathfinding, Export
  */
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, type ComponentType } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useUIElement, useUIComponent } from "ui-bridge";
 import {
   Network,
   GitBranch,
@@ -57,10 +58,55 @@ const TABS = [
 
 type TabValue = (typeof TABS)[number]["value"];
 
+/** Tab button with UI Bridge element registration. */
+function SMTabButton({
+  value,
+  label,
+  icon: Icon,
+  active,
+  onClick,
+}: {
+  value: string;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+  active: boolean;
+  onClick: () => void;
+}) {
+  const { ref } = useUIElement({
+    id: `sm-tab-${value}`,
+    type: "button",
+    label: `${label} tab`,
+    actions: ["click"],
+  });
+  return (
+    <button
+      ref={ref}
+      onClick={onClick}
+      aria-label={
+        value === "exploration" ? "exploration results navigation link or tab" : undefined
+      }
+      className={`inline-flex items-center justify-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
+        active
+          ? "bg-background shadow-xs text-foreground"
+          : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      <Icon className="size-3.5" />
+      {label}
+    </button>
+  );
+}
+
 export function UIBridgeStateMachinePage() {
   const sm = useStateMachineConfig();
   const { toasts, showToast, dismissToast } = useToast();
   const discovery = useUIBridgeDiscovery(sm, showToast);
+
+  useUIComponent({
+    id: "state-machine-page",
+    name: "State Machine Builder",
+    description: "Build and explore state machines from UI Bridge SDK apps",
+  });
 
   const [activeTab, setActiveTab] = useState<TabValue>(() => {
     // Default to exploration tab when navigated via API (e.g., test verification)
@@ -314,22 +360,15 @@ export function UIBridgeStateMachinePage() {
       {/* Tab Navigation */}
       <div className="border-b border-border-primary bg-surface-primary px-6">
         <div className="inline-flex h-9 w-fit items-center justify-center rounded-lg p-[3px]">
-          {TABS.map(({ value, label, icon: Icon }) => (
-            <button
+          {TABS.map(({ value, label, icon }) => (
+            <SMTabButton
               key={value}
+              value={value}
+              label={label}
+              icon={icon}
+              active={activeTab === value}
               onClick={() => setActiveTab(value)}
-              aria-label={
-                value === "exploration" ? "exploration results navigation link or tab" : undefined
-              }
-              className={`inline-flex items-center justify-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium whitespace-nowrap transition-[color,box-shadow] ${
-                activeTab === value
-                  ? "bg-background shadow-xs text-foreground"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              <Icon className="size-3.5" />
-              {label}
-            </button>
+            />
           ))}
         </div>
       </div>

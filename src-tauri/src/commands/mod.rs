@@ -63,6 +63,7 @@ pub mod backup; // Comprehensive backup and restore
 pub mod checkpoint_browser; // Orchestrator checkpoint browser (time-travel debugging)
 pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)
+pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
 pub mod comparison; // Side-by-side architecture comparison runs
 pub mod config;
 pub mod container_settings;
@@ -123,6 +124,7 @@ pub mod verification;
 pub mod video;
 pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents
 pub mod websocket;
+pub mod workflow_events; // Workflow event emission to backend for mobile push notifications
 
 // Re-export all command functions for easy access in main.rs
 

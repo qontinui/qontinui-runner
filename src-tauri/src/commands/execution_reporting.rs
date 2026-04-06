@@ -588,6 +588,9 @@ pub async fn create_execution_run(
 
     info!("Execution run created successfully: {}", run.run_id);
 
+    // Emit workflow event for mobile push notifications (fire-and-forget)
+    super::workflow_events::emit_run_started(&run.run_id, &run.run_name);
+
     Ok(run)
 }
 
@@ -918,6 +921,31 @@ pub async fn complete_execution_run(
         "Execution run {} completed with duration: {}s",
         result.run_id, result.duration_seconds
     );
+
+    // Emit workflow event for mobile push notifications (fire-and-forget)
+    match &result.status {
+        RunStatus::Completed => {
+            let summary = format!(
+                "Run completed in {:.0}s ({} actions, {} failed)",
+                result.duration_seconds,
+                result.stats.total_actions,
+                result.stats.failed_actions
+            );
+            super::workflow_events::emit_run_completed(
+                &result.run_id,
+                &summary,
+                serde_json::to_value(&result.stats).ok(),
+            );
+        }
+        RunStatus::Failed | RunStatus::Timeout => {
+            let error_msg = request
+                .error_message
+                .as_deref()
+                .unwrap_or("Unknown error");
+            super::workflow_events::emit_run_failed(&result.run_id, error_msg);
+        }
+        _ => {} // Cancelled, Paused, etc. — no push notification
+    }
 
     Ok(result)
 }

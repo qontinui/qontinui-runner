@@ -324,6 +324,12 @@ impl ClaudeSession {
         let progress_ctx_for_stdout = progress_ctx.clone();
         let persist_tx_for_stdout = turn_persist_tx_option.clone();
         let persisted_len_for_stdout = persisted_output_len.clone();
+        // Fallback session ID for file locking when session_ctx is None (terminal sessions)
+        let fallback_id_for_stdout = if session_ctx.is_none() {
+            Some(session_id.to_string())
+        } else {
+            None
+        };
 
         let stdout_handle = thread::spawn(move || {
             let mut all_text = String::new();
@@ -374,6 +380,7 @@ impl ClaudeSession {
                                 &user_interacted_for_stdout,
                                 &persist_tx_for_stdout,
                                 &persisted_len_for_stdout,
+                                fallback_id_for_stdout.as_deref(),
                             ) {
                                 has_output_stdout.store(true, Ordering::Relaxed);
                                 all_text.push_str(&text);
@@ -424,6 +431,17 @@ impl ClaudeSession {
             if !all_text.is_empty() {
                 if let Ok(mut buf) = shared_output_for_thread.lock() {
                     *buf = all_text.clone();
+                }
+            }
+
+            // Release file locks held by this terminal session
+            if let Some(ref fallback_id) = fallback_id_for_stdout {
+                use crate::commands::AppState;
+                use tauri::Manager;
+                if let Some(app_state) = app_handle_stdout.try_state::<std::sync::Arc<AppState>>() {
+                    app_state.file_lock_manager.release_all_sync(fallback_id);
+                    app_state.file_registry_manager.release_all_sync(fallback_id);
+                    info!("[STDOUT_READER] Released file locks for terminal session {}", fallback_id);
                 }
             }
 

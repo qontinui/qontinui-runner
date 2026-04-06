@@ -3,6 +3,7 @@
  */
 
 import { useState } from "react";
+import { useUIElement } from "ui-bridge";
 import {
   Loader2,
   BookOpen,
@@ -17,6 +18,7 @@ import {
   Brain,
   Bug,
   Network,
+  RefreshCw,
 } from "lucide-react";
 import type { ConnectionState } from "./types";
 
@@ -38,6 +40,8 @@ interface ConnectionBarProps {
   onSaveToFile: () => void;
   onBuildWorkflow: () => void;
   onCompileStateMachine: () => void;
+  onSyncAllSpecs: () => void;
+  isSyncing: boolean;
   onToggleEditMode: () => void;
 }
 
@@ -59,15 +63,29 @@ export function ConnectionBar({
   onSaveToFile,
   onBuildWorkflow,
   onCompileStateMachine,
+  onSyncAllSpecs,
+  isSyncing,
   onToggleEditMode,
 }: ConnectionBarProps) {
   const [url, setUrl] = useState(connection.url || "http://localhost:3001");
+
+  const { ref: bundledRef } = useUIElement({ id: "specs-btn-bundled", type: "button", label: "Load bundled specs", actions: ["click"] });
+  const { ref: fileRef } = useUIElement({ id: "specs-btn-file", type: "button", label: "Load specs from file", actions: ["click"] });
+  const { ref: discoverRef } = useUIElement({ id: "specs-btn-discover", type: "button", label: "Discover specs from app", actions: ["click"] });
+  const { ref: discoverInputRef } = useUIElement({ id: "specs-input-url", type: "input", label: "App URL for spec discovery" });
+  const { ref: editRef } = useUIElement({ id: "specs-btn-edit", type: "button", label: "Toggle edit mode", actions: ["click"] });
+  const { ref: saveRef } = useUIElement({ id: "specs-btn-save", type: "button", label: "Save spec to file", actions: ["click"] });
+  const { ref: aiEvalRef } = useUIElement({ id: "specs-btn-ai-eval", type: "button", label: "Toggle AI evaluation mode", actions: ["click"] });
+  const { ref: buildRef } = useUIElement({ id: "specs-btn-build-workflow", type: "button", label: "Build workflow from spec", actions: ["click"] });
+  const { ref: syncRef } = useUIElement({ id: "specs-btn-sync-all", type: "button", label: "Sync all specs with AI", actions: ["click"] });
+  const { ref: compileRef } = useUIElement({ id: "specs-btn-compile-sm", type: "button", label: "Compile state machine", actions: ["click"] });
 
   return (
     <div className="border-b border-border bg-white/[0.01]">
       <div className="flex items-center gap-2 px-4 py-2 flex-wrap">
         {/* Load bundled */}
         <button
+          ref={bundledRef}
           onClick={onLoadBundled}
           className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
           bg-purple-500/10 text-purple-400 border border-purple-500/20
@@ -79,6 +97,7 @@ export function ConnectionBar({
 
         {/* Load from file */}
         <button
+          ref={fileRef}
           onClick={onLoadFromFile}
           className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
           bg-emerald-500/10 text-emerald-400 border border-emerald-500/20
@@ -93,6 +112,7 @@ export function ConnectionBar({
         {/* Discover from app */}
         <div className="flex items-center gap-1.5 flex-1 min-w-0">
           <input
+            ref={discoverInputRef}
             type="text"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
@@ -106,6 +126,7 @@ export function ConnectionBar({
             }}
           />
           <button
+            ref={discoverRef}
             onClick={() => url.trim() && onDiscover(url.trim())}
             disabled={isLoading || !url.trim()}
             className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
@@ -126,6 +147,7 @@ export function ConnectionBar({
         {/* Edit mode toggle */}
         {hasSelectedSpec && selectedSpecKind === "page-spec" && (
           <button
+            ref={editRef}
             onClick={onToggleEditMode}
             className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
             border transition-colors shrink-0 ${
@@ -142,6 +164,7 @@ export function ConnectionBar({
         {/* Save to file */}
         {hasSelectedSpec && (
           <button
+            ref={saveRef}
             onClick={onSaveToFile}
             className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
             bg-white/5 text-muted-foreground border border-white/10
@@ -155,6 +178,7 @@ export function ConnectionBar({
         {/* Force AI evaluation toggle + Build workflow */}
         {hasSelectedSpec && selectedSpecKind === "page-spec" && (
           <button
+            ref={aiEvalRef}
             onClick={onToggleForcePromptOnly}
             className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded
             border transition-colors shrink-0 ${
@@ -185,6 +209,7 @@ export function ConnectionBar({
         )}
         {hasSelectedSpec && (
           <button
+            ref={buildRef}
             onClick={onBuildWorkflow}
             disabled={isLoading}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
@@ -196,6 +221,18 @@ export function ConnectionBar({
           </button>
         )}
         <button
+          ref={syncRef}
+          onClick={onSyncAllSpecs}
+          disabled={isLoading || isSyncing || stats.totalSpecs === 0}
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md
+          bg-teal-600 text-white shadow-xs shadow-teal-600/25
+          hover:bg-teal-700 disabled:opacity-50 transition-colors shrink-0"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? "animate-spin" : ""}`} />
+          Sync All Specs
+        </button>
+        <button
+          ref={compileRef}
           onClick={onCompileStateMachine}
           disabled={isLoading || stats.totalSpecs === 0}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-md

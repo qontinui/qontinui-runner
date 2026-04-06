@@ -80,6 +80,8 @@ pub fn dispatch_line(
     user_has_interacted: &std::sync::atomic::AtomicBool,
     turn_persist_tx: &Option<Sender<String>>,
     persisted_output_len: &AtomicUsize,
+    // Fallback session ID for file locking when session_ctx is None
+    fallback_session_id: Option<&str>,
 ) -> Option<String> {
     // Decode the NDJSON line
     let msg = match decode_message(line) {
@@ -99,7 +101,7 @@ pub fn dispatch_line(
             emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
         }));
         // Auto-register files under active development when Edit/Write tools are used
-        auto_register_file(app_handle, session_ctx, tool_name, &data);
+        auto_register_file(app_handle, session_ctx, fallback_session_id, tool_name, &data);
     }
 
     // Also extract tool activity from content_block_start messages.
@@ -354,6 +356,7 @@ pub(crate) fn format_tool_activity(
 fn auto_register_file(
     app_handle: &tauri::AppHandle,
     session_ctx: Option<&AiSessionContext>,
+    fallback_session_id: Option<&str>,
     tool_name: &str,
     data: &serde_json::Map<String, serde_json::Value>,
 ) {
@@ -368,14 +371,17 @@ fn auto_register_file(
         None => return,
     };
 
-    let task_run_id = match session_ctx {
-        Some(ctx) => ctx.task_run_id().to_string(),
-        None => return,
+    // For workflow sessions, use the task_run_id. For terminal-launched sessions
+    // (no session context), use the fallback session ID (typically the Claude
+    // session_id from ClaudeSession::spawn). This ensures file locks are
+    // tied to a known identifier that can be cleaned up when the session ends.
+    let (task_run_id, holder_name) = match session_ctx {
+        Some(ctx) => (ctx.task_run_id().to_string(), ctx.session_name.clone()),
+        None => match fallback_session_id {
+            Some(id) => (id.to_string(), id.to_string()),
+            None => return, // No identifier available — skip file locking
+        },
     };
-
-    let holder_name = session_ctx
-        .map(|ctx| ctx.session_name.clone())
-        .unwrap_or_else(|| "unknown".to_string());
 
     use crate::commands::AppState;
     if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {

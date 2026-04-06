@@ -7,7 +7,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getGlobalRegistry, UIBridgeRegistry } from "@qontinui/ui-bridge/core";
+import { getGlobalRegistry, type UIBridgeRegistry } from "ui-bridge";
 import {
   BackgroundObserver,
   type BackgroundObserverDeps,

@@ -420,6 +420,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::send_device_heartbeat,
             commands::auth::is_api_ready,
             commands::auth::get_api_port,
+            // Clipboard sync commands
+            commands::clipboard::share_to_mobile,
             // Configuration commands
             commands::config::load_configuration,
             commands::config::get_current_configuration,
@@ -608,6 +610,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_reporting::upload_execution_screenshot,
             commands::execution_reporting::report_execution_issues,
             commands::execution_reporting::complete_execution_run,
+            // Workflow events (mobile push notifications)
+            commands::workflow_events::emit_workflow_event,
             // Checkpoint/session commands (SQLite database)
             commands::checkpoints::checkpoint_get,
             commands::checkpoints::checkpoint_save,

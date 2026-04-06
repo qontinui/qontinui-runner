@@ -27,7 +27,10 @@ import {
   type TransitionAction as EngineTransitionAction,
   type ElementQuery,
 } from "@qontinui/ui-bridge-auto";
-import { getGlobalRegistry } from "@qontinui/ui-bridge/core";
+// Import from main entry to share the same globalRegistry singleton as UIBridgeProvider.
+// Importing from "@qontinui/ui-bridge/core" resolves to a separate dist bundle with
+// its own isolated globalRegistry variable, causing elements to be invisible to the engine.
+import { getGlobalRegistry } from "ui-bridge";
 import { getUIBridgeGlobal } from "./ui-bridge-events/utils";
 
 const SM_SELECTED_CONFIG_KEY = "qontinui-runner-sm-selected-config";

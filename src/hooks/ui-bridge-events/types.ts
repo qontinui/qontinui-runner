@@ -183,7 +183,10 @@ export type UIBridgeRequestType =
   | "get_diagnostics"
   // Navigation adapter
   | "get_routes"
-  | "navigate_by_adapter";
+  | "navigate_by_adapter"
+  // Runner-specific
+  | "navigate_tab"
+  | "clear_storage";
 
 /**
  * Payload structure for UI Bridge requests from Rust

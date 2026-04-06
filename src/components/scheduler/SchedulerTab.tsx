@@ -10,6 +10,7 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
+import { useUIElement, useUIComponent } from "ui-bridge";
 import { Calendar, History, Settings, Plus, RefreshCw, Wrench, Sparkles } from "lucide-react";
 import { getAccentColors, getStatusColors } from "@/design-system";
 import { useScheduler } from "../../hooks/useScheduler";
@@ -29,6 +30,11 @@ interface SchedulerTabProps {
 
 export function SchedulerTab({ className = "" }: SchedulerTabProps) {
   const [activeSubTab, setActiveSubTab] = useState<SchedulerSubTab>("tasks");
+
+  useUIComponent({ id: "scheduler-page", name: "Scheduled Tasks", description: "Manage scheduled tasks, execution history, and scheduler settings" });
+  const { ref: tasksTabRef } = useUIElement({ id: "scheduler-tab-tasks", type: "button", label: "Scheduled tasks tab", actions: ["click"] });
+  const { ref: historyTabRef } = useUIElement({ id: "scheduler-tab-history", type: "button", label: "Task history tab", actions: ["click"] });
+  const { ref: settingsTabRef } = useUIElement({ id: "scheduler-tab-settings", type: "button", label: "Scheduler settings tab", actions: ["click"] });
   const [isCreating, setIsCreating] = useState(false);
   const [isAiBuilding, setIsAiBuilding] = useState(false);
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
@@ -171,6 +177,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
       >
         <Tabs.List className="flex items-center gap-1 px-4 pt-2 border-b border-border">
           <Tabs.Trigger
+            ref={tasksTabRef}
             value="tasks"
             className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground data-[state=active]:text-foreground data-[state=active]:border-b-2 data-[state=active]:border-primary transition-colors"
           >
@@ -178,6 +185,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
             Scheduled ({tasks.length})
           </Tabs.Trigger>
           <Tabs.Trigger
+            ref={historyTabRef}
             value="history"
             className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground data-[state=active]:text-foreground data-[state=active]:border-b-2 data-[state=active]:border-primary transition-colors"
           >
@@ -185,6 +193,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
             History
           </Tabs.Trigger>
           <Tabs.Trigger
+            ref={settingsTabRef}
             value="settings"
             className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground data-[state=active]:text-foreground data-[state=active]:border-b-2 data-[state=active]:border-primary transition-colors"
           >

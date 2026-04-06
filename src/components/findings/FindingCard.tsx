@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect } from "react";
+import { ShareToMobileButton } from "../ClipboardSync";
 import {
   Bug,
   CheckSquare,
@@ -321,6 +322,19 @@ export function FindingCard({
                   )}
                 </button>
               ))}
+
+            {/* Share to Mobile */}
+            <ShareToMobileButton
+              getText={() => {
+                let text = `[${finding.severity}] ${finding.title}\n\n${finding.description}`;
+                if (finding.codeContext?.snippet) {
+                  text += `\n\nCode:\n${finding.codeContext.snippet}`;
+                }
+                return text;
+              }}
+              className="text-muted-foreground hover:text-blue-400 hover:bg-blue-500/10"
+              size={16}
+            />
 
             {/* Dismiss Button */}
             {finding.status !== "resolved" && onDismiss && (

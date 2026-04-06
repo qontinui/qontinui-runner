@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import { cn } from "../../lib/utils";
 import { Copy, Check, FileCode, ExternalLink } from "lucide-react";
+import { ShareToMobileButton } from "../ClipboardSync";
 
 /**
  * Extract text content from React children.
@@ -126,17 +127,20 @@ export function SyntaxHighlightedCodeBlock({ code, language }: { code: string; l
           {language}
         </div>
       )}
-      <button
-        onClick={handleCopy}
-        className="absolute top-1 right-1 p-1.5 rounded bg-muted/80 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-muted z-10"
-        title="Copy code"
-      >
-        {copied ? (
-          <Check className="w-3.5 h-3.5 text-green-500" />
-        ) : (
-          <Copy className="w-3.5 h-3.5 text-muted-foreground" />
-        )}
-      </button>
+      <div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+        <ShareToMobileButton getText={() => code} className="bg-muted/80 hover:bg-muted" size={14} />
+        <button
+          onClick={handleCopy}
+          className="p-1.5 rounded bg-muted/80 hover:bg-muted"
+          title="Copy code"
+        >
+          {copied ? (
+            <Check className="w-3.5 h-3.5 text-green-500" />
+          ) : (
+            <Copy className="w-3.5 h-3.5 text-muted-foreground" />
+          )}
+        </button>
+      </div>
       <Highlight
         theme={themes.oneDark}
         code={code.trim()}
@@ -191,17 +195,20 @@ export function SimpleCodeBlock({ children }: { children: React.ReactNode }) {
       <pre className="bg-muted/50 p-3 rounded-md whitespace-pre-wrap [overflow-wrap:anywhere] border-l-2 border-border text-xs font-mono">
         {children}
       </pre>
-      <button
-        onClick={handleCopy}
-        className="absolute top-1 right-1 p-1.5 rounded bg-muted/80 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-muted"
-        title="Copy code"
-      >
-        {copied ? (
-          <Check className="w-3.5 h-3.5 text-green-500" />
-        ) : (
-          <Copy className="w-3.5 h-3.5 text-muted-foreground" />
-        )}
-      </button>
+      <div className="absolute top-1 right-1 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+        <ShareToMobileButton getText={() => extractTextContent(children)} className="bg-muted/80 hover:bg-muted" size={14} />
+        <button
+          onClick={handleCopy}
+          className="p-1.5 rounded bg-muted/80 hover:bg-muted"
+          title="Copy code"
+        >
+          {copied ? (
+            <Check className="w-3.5 h-3.5 text-green-500" />
+          ) : (
+            <Copy className="w-3.5 h-3.5 text-muted-foreground" />
+          )}
+        </button>
+      </div>
     </div>
   );
 }

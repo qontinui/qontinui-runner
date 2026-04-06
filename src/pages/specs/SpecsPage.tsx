@@ -16,7 +16,8 @@
  */
 
 import { useEffect, useCallback, useReducer, useState } from "react";
-import { ShieldCheck, FlaskConical, FileJson } from "lucide-react";
+import { ShieldCheck, FlaskConical, FileJson, X, CheckCircle2, AlertTriangle } from "lucide-react";
+import { useUIComponent } from "ui-bridge";
 import { useSpecsState } from "./useSpecsState";
 import { ConnectionBar } from "./ConnectionBar";
 import { SpecTree } from "./SpecTree";
@@ -34,6 +35,7 @@ import { ContractBuilder } from "./ContractBuilder";
 import type { LoadedSpec } from "./types";
 import { compileStateMachineFromSpecs } from "@/lib/compile-state-machine";
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
+import { useSpecSync } from "@/hooks/useSpecSync";
 
 // ============================================================================
 // SpecsPage reducer
@@ -167,6 +169,101 @@ function SpecsPageHeader({
   );
 }
 
+// ============================================================================
+// SyncProgressBanner — shows sync progress inline below ConnectionBar
+// ============================================================================
+
+function SyncProgressBanner({
+  phase,
+  progress,
+  results,
+  warnings,
+  onCancel,
+  onDismiss,
+}: {
+  phase: import("@/hooks/useSpecSync").SyncPhase;
+  progress: import("@/hooks/useSpecSync").SyncProgress;
+  results: import("@/hooks/useSpecSync").SyncResults;
+  warnings: string[];
+  onCancel: () => void;
+  onDismiss: () => void;
+}) {
+  if (phase === "idle") return null;
+
+  const isDone = phase === "done";
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+
+  const phaseLabel =
+    phase === "analyzing"
+      ? "Analyzing specs..."
+      : phase === "syncing"
+        ? `Syncing ${progress.current + 1}/${progress.total}`
+        : phase === "compiling"
+          ? "Compiling state machine..."
+          : "Sync complete";
+
+  return (
+    <div className="border-b border-border bg-teal-500/5 px-4 py-2">
+      <div className="flex items-center gap-3">
+        {/* Phase label */}
+        <span className="text-xs font-medium text-teal-400 shrink-0">
+          {phaseLabel}
+        </span>
+
+        {/* Progress bar */}
+        {!isDone && progress.total > 0 && (
+          <div className="flex-1 max-w-xs h-1.5 bg-white/5 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-teal-500 rounded-full transition-all duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        )}
+
+        {/* Current spec */}
+        {!isDone && progress.currentSpec && (
+          <span className="text-[10px] text-muted-foreground truncate max-w-[200px]">
+            {progress.currentSpec}
+          </span>
+        )}
+
+        {/* Done summary */}
+        {isDone && (
+          <div className="flex items-center gap-3 text-[10px]">
+            {results.updated.length > 0 && (
+              <span className="flex items-center gap-1 text-green-400">
+                <CheckCircle2 className="w-3 h-3" />
+                {results.updated.length} updated
+              </span>
+            )}
+            {results.skipped.length > 0 && (
+              <span className="text-muted-foreground">{results.skipped.length} skipped</span>
+            )}
+            {results.failed.length > 0 && (
+              <span className="flex items-center gap-1 text-red-400">
+                <AlertTriangle className="w-3 h-3" />
+                {results.failed.length} failed
+              </span>
+            )}
+            {warnings.length > 0 && (
+              <span className="text-amber-400">{warnings.length} warnings</span>
+            )}
+          </div>
+        )}
+
+        {/* Cancel / Dismiss */}
+        <button
+          onClick={isDone ? onDismiss : onCancel}
+          className="ml-auto shrink-0 p-0.5 rounded hover:bg-white/10 text-muted-foreground hover:text-foreground transition-colors"
+          title={isDone ? "Dismiss" : "Cancel sync"}
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 interface SpecsPageProps {
   onNavigateToWorkflowBuilder?: (workflowId: string) => void;
 }
@@ -182,6 +279,15 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     generateSpecRequest,
   } = pageState;
   const { issues: knownIssues, loadIssuesForSpec } = useKnownIssues();
+
+  useUIComponent({
+    id: "specs-page",
+    name: "Specs Page",
+    description: "View, edit, and manage project specifications with AI-driven sync and state machine compilation",
+  });
+
+  // Spec sync — batch update all stale specs with AI merge mode
+  const specSync = useSpecSync(state.specs, state.addSpec);
 
   // Triage resolution context — set when user clicks "Update Spec" in SpecTriageView
   const [triageContext, setTriageContext] = useState<{
@@ -411,8 +517,22 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
             regressionIssueCount={knownIssues.filter((i) => i.status === "active").length}
             onBuildWorkflow={() => handleBuildWorkflow()}
             onCompileStateMachine={handleCompileStateMachine}
+            onSyncAllSpecs={specSync.startSync}
+            isSyncing={specSync.isSyncing}
             onToggleEditMode={() => state.setEditMode(!state.editMode)}
           />
+
+          {/* Sync progress banner */}
+          {specSync.state.phase !== "idle" && (
+            <SyncProgressBanner
+              phase={specSync.state.phase}
+              progress={specSync.state.progress}
+              results={specSync.state.results}
+              warnings={specSync.state.warnings}
+              onCancel={specSync.cancel}
+              onDismiss={specSync.reset}
+            />
+          )}
 
           {/* Main content: tree + detail + chat */}
           <div className="flex-1 flex min-h-0">

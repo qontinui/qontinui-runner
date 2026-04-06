@@ -92,10 +92,8 @@ export function useAppNavigation(): UseAppNavigationReturn {
   useEffect(() => {
     const handler = (e: WindowEventMap["ui-bridge-navigate"]) => {
       const { page } = e.detail;
-      const tabId = PAGE_TO_TAB[page];
-      if (tabId) {
-        setActiveTab(tabId);
-      }
+      const tabId = PAGE_TO_TAB[page] ?? (page as MainTabId);
+      setActiveTab(tabId);
     };
     window.addEventListener("ui-bridge-navigate", handler);
     return () => window.removeEventListener("ui-bridge-navigate", handler);

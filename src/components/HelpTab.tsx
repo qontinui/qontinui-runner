@@ -9,8 +9,9 @@
  * - About: Version info, credits, and links
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, type ComponentType } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
+import { useUIElement, useUIComponent } from "ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
 import {
   Keyboard,
@@ -943,6 +944,40 @@ function AboutPage() {
   );
 }
 
+/** Help sub-page tab with UI Bridge registration. */
+function HelpTabTrigger({
+  id,
+  label,
+  icon: Icon,
+}: {
+  id: string;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+}) {
+  const { ref } = useUIElement({
+    id: `help-tab-${id}`,
+    type: "button",
+    label: `${label} help tab`,
+    actions: ["click"],
+  });
+  return (
+    <Tabs.Trigger
+      ref={ref}
+      value={id}
+      className={`
+        flex items-center gap-3 px-3 py-2.5 rounded-md text-left text-sm font-medium
+        transition-colors duration-150 outline-hidden
+        data-[state=active]:bg-primary data-[state=active]:text-primary-foreground
+        data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:bg-muted/50
+        focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
+      `}
+    >
+      <Icon className="w-4 h-4 shrink-0" />
+      <span>{label}</span>
+    </Tabs.Trigger>
+  );
+}
+
 export function HelpTab() {
   const [activeSubPage, setActiveSubPage] = useState<HelpSubPage>(() => {
     // Load persisted tab on mount
@@ -967,6 +1002,12 @@ export function HelpTab() {
   useEffect(() => {
     instanceStorage.setItem(STORAGE_KEY, activeSubPage);
   }, [activeSubPage]);
+
+  useUIComponent({
+    id: "help-page",
+    name: "Help",
+    description: "Tutorials, shortcuts, documentation, and troubleshooting",
+  });
 
   const subPages = [
     { id: "tutorials" as const, label: "Tutorials", icon: GraduationCap },
@@ -1002,25 +1043,9 @@ export function HelpTab() {
           </div>
         </div>
 
-        {subPages.map((page) => {
-          const Icon = page.icon;
-          return (
-            <Tabs.Trigger
-              key={page.id}
-              value={page.id}
-              className={`
-                flex items-center gap-3 px-3 py-2.5 rounded-md text-left text-sm font-medium
-                transition-colors duration-150 outline-hidden
-                data-[state=active]:bg-primary data-[state=active]:text-primary-foreground
-                data-[state=inactive]:text-muted-foreground data-[state=inactive]:hover:bg-muted/50
-                focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
-              `}
-            >
-              <Icon className="w-4 h-4 shrink-0" />
-              <span>{page.label}</span>
-            </Tabs.Trigger>
-          );
-        })}
+        {subPages.map((page) => (
+          <HelpTabTrigger key={page.id} id={page.id} label={page.label} icon={page.icon} />
+        ))}
 
         {/* Spacer to push help text to bottom */}
         <div className="flex-1" />
