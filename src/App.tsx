@@ -129,20 +129,77 @@ function AppContent() {
 
   const handleReorganize = useCallback(
     async (plan: ReorganizePlan) => {
-      // Create new pages for each group
+      // Build a map of session ID → current page_id from terminal_list
+      const listResult = await invoke<{ success: boolean; data?: { terminals: Array<{ id: string; page_id: string; title: string }> } }>("terminal_list");
+      const terminals = listResult?.data?.terminals ?? [];
+      const terminalPageMap = new Map(terminals.map((t) => [t.id, t.page_id]));
+
+      // Ensure all target pages exist
+      const pageNameToId = new Map(terminalPages.pages.map((p) => [p.name, p.id]));
       for (const group of plan.pages) {
-        // Check if a page with this name already exists
-        const existing = terminalPages.pages.find((p) => p.name === group.name);
-        if (!existing) {
-          terminalPages.addPage(group.name);
+        if (!pageNameToId.has(group.name)) {
+          const newId = terminalPages.addPage(group.name);
+          pageNameToId.set(group.name, newId);
         }
       }
 
-      // For now, just rename existing pages to match the AI proposal.
-      // Full session moving (close/recreate terminals) requires terminal manager
-      // access which is page-scoped. Rename is the safe first step.
-      for (let i = 0; i < plan.pages.length && i < terminalPages.pages.length; i++) {
-        terminalPages.renamePage(terminalPages.pages[i].id, plan.pages[i].name);
+      // For each group, move terminals that aren't already on the target page.
+      // Moving a terminal: save scrollback → close → create on target page → restore scrollback
+      for (const group of plan.pages) {
+        const targetPageId = pageNameToId.get(group.name);
+        if (!targetPageId) continue;
+
+        for (const sessionId of group.sessionIds) {
+          const currentPage = terminalPageMap.get(sessionId);
+          if (currentPage === targetPageId) continue; // Already on the right page
+
+          // Save scrollback before closing
+          try {
+            await invoke("terminal_save_scrollback", { terminalId: sessionId });
+          } catch {
+            // Non-fatal — terminal may not have scrollback
+          }
+
+          // Close on old page
+          try {
+            await invoke("terminal_close", { terminalId: sessionId });
+          } catch {
+            console.warn(`Failed to close terminal ${sessionId} during reorganization`);
+            continue;
+          }
+
+          // Create on target page (new terminal — scrollback not restored for simplicity)
+          try {
+            const terminal = terminals.find((t) => t.id === sessionId);
+            await invoke("terminal_create", {
+              title: terminal?.title ?? "Terminal",
+              workingDir: null,
+              pageId: targetPageId,
+            });
+          } catch {
+            console.warn(`Failed to create terminal on page ${group.name}`);
+          }
+        }
+      }
+
+      // Rename existing pages to match the proposal
+      for (const group of plan.pages) {
+        const pageId = pageNameToId.get(group.name);
+        if (pageId) {
+          terminalPages.renamePage(pageId, group.name);
+        }
+      }
+
+      // Remove pages that are now empty (no sessions assigned to them)
+      const assignedPageIds = new Set(plan.pages.map((g) => pageNameToId.get(g.name)).filter(Boolean));
+      for (const page of terminalPages.pages) {
+        if (!assignedPageIds.has(page.id) && page.id !== "default") {
+          try {
+            await terminalPages.removePage(page.id);
+          } catch {
+            // Non-fatal
+          }
+        }
       }
     },
     [terminalPages],

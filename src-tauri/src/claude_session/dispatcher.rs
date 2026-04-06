@@ -113,7 +113,7 @@ pub fn dispatch_line(
             emit_ai_output(app_handle, &activity, "tool_activity", None, session_ctx);
         }));
         // Auto-register files under active development when Edit/Write tools are used
-        auto_register_file(app_handle, session_ctx, &tool_name, &data);
+        auto_register_file(app_handle, session_ctx, fallback_session_id, &tool_name, &data);
     }
 
     // Handle control requests from CLI (auto-approve tool use in bypass mode)
