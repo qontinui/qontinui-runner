@@ -2,6 +2,7 @@
 //!
 //! Receives a natural language prompt and uses AI to plan a sequence of
 //! runner UI actions (navigate pages, click buttons, fill forms).
+//! Uses the runner's configured AI provider (Claude CLI, Claude API, etc.).
 
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::{Deserialize, Serialize};
@@ -106,104 +107,52 @@ pub async fn plan_intent_handler(
         ));
     }
 
-    // Get API key from keychain
-    let api_key = crate::config_facade::ai_keychain()
-        .get("claude_api")
-        .map_err(|e| {
-            error!("HTTP: Failed to get API key: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("API key error: {}", e))),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(api_error(
-                    "No Claude API key configured. Please set up your API key in Settings > AI.",
-                )),
-            )
-        })?;
-
-    // Get model from settings
-    let ai_settings = crate::settings::get_ai_settings();
-    let model = ai_settings.claude_api.model.clone();
-
-    // Build system prompt based on explain mode
+    // Build combined prompt with system instructions + user request
     let system_prompt = if request.explain {
         format!("{}{}", SYSTEM_PROMPT_BASE, EXPLAIN_SUFFIX)
     } else {
         format!("{}{}", SYSTEM_PROMPT_BASE, BRIEF_SUFFIX)
     };
+    let full_prompt = format!("{}\n\nUser request: {}", system_prompt, request.prompt);
 
-    // Call Claude API with a request timeout
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
-
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": model,
-            "max_tokens": 2048,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": request.prompt}]
-        }))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("HTTP: Claude API request failed: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(api_error(format!("AI request failed: {}", e))),
-            )
-        })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        error!("HTTP: Claude API error ({}): {}", status, body);
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(api_error(format!("AI error ({}): {}", status, body))),
-        ));
-    }
-
-    // Parse Claude's response
-    let api_response: serde_json::Value = response.json().await.map_err(|e| {
-        error!("HTTP: Failed to parse Claude response: {}", e);
+    // Run through the configured AI provider (Claude CLI, Claude API, Gemini, etc.)
+    let ai_response = tokio::task::spawn_blocking(move || {
+        crate::ai_provider::routing::run_prompt_sync(&full_prompt, None)
+    })
+    .await
+    .map_err(|e| {
+        error!("HTTP: spawn_blocking error: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "Failed to parse AI response: {}",
-                e
-            ))),
+            Json(api_error(format!("Internal error: {}", e))),
         )
     })?;
 
-    // Extract text content from Claude's response
-    let text_content = api_response["content"]
-        .as_array()
-        .and_then(|arr| arr.iter().find(|b| b["type"] == "text"))
-        .and_then(|b| b["text"].as_str())
-        .ok_or_else(|| {
-            error!("HTTP: No text in Claude response");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error("No text in AI response")),
-            )
-        })?;
+    if !ai_response.success {
+        let err_msg = ai_response
+            .error
+            .unwrap_or_else(|| "AI provider returned an error".to_string());
+        error!("HTTP: AI provider error: {}", err_msg);
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(api_error(format!("AI error: {}", err_msg))),
+        ));
+    }
 
-    // Extract JSON from Claude's text (find outermost braces)
-    let json_str = if let Some(start) = text_content.find('{') {
-        let end = text_content.rfind('}').unwrap_or(text_content.len() - 1);
-        &text_content[start..=end]
+    let output = &ai_response.output;
+    if output.trim().is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error("AI returned empty response")),
+        ));
+    }
+
+    // Extract JSON from AI output (find outermost braces)
+    let json_str = if let Some(start) = output.find('{') {
+        let end = output.rfind('}').unwrap_or(output.len() - 1);
+        &output[start..=end]
     } else {
-        text_content
+        output.as_str()
     };
 
     let plan: PlanIntentResponse = serde_json::from_str(json_str).map_err(|e| {
