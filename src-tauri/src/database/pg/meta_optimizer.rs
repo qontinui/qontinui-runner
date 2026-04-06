@@ -3693,4 +3693,438 @@ impl PgDb {
             agentic_metric_summary: Vec::new(), // caller fills this
         })
     }
+
+    // ========================================================================
+    // Duel Pools (Prompt Duel Optimizer)
+    // ========================================================================
+
+    /// Create a new duel pool for pairwise prompt comparison.
+    pub async fn create_duel_pool(
+        &self,
+        id: &str,
+        agent_type: &str,
+        config_json: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO duel_pools (id, agent_type, status, generation, config_json, created_at)
+               VALUES ($1, $2, 'active', 0, $3, $4)"#,
+            &[&id, &agent_type, &config_json, &now],
+        )
+        .await
+        .map_err(|e| format!("PG create_duel_pool: {}", e))?;
+        Ok(())
+    }
+
+    /// Add a candidate to a duel pool.
+    pub async fn add_duel_candidate(
+        &self,
+        id: &str,
+        pool_id: &str,
+        prompt_content: &str,
+        variant_id: Option<&str>,
+        generation: i32,
+        parent_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO duel_candidates
+               (id, pool_id, prompt_content, variant_id, generation, parent_id,
+                copeland_score, alpha, beta, status, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, 0.0, 1.0, 1.0, 'active', $7)"#,
+            &[
+                &id,
+                &pool_id,
+                &prompt_content,
+                &variant_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &generation,
+                &parent_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG add_duel_candidate: {}", e))?;
+        Ok(())
+    }
+
+    /// Record a duel result.
+    pub async fn record_duel_result(
+        &self,
+        id: &str,
+        pool_id: &str,
+        candidate_a_id: &str,
+        candidate_b_id: &str,
+        winner_id: &str,
+        judge_rationale: Option<&str>,
+        position_swapped: bool,
+        confidence: f64,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO duel_results
+               (id, pool_id, candidate_a_id, candidate_b_id, winner_id,
+                judge_rationale, position_swapped, confidence, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+            &[
+                &id,
+                &pool_id,
+                &candidate_a_id,
+                &candidate_b_id,
+                &winner_id,
+                &judge_rationale as &(dyn tokio_postgres::types::ToSql + Sync),
+                &position_swapped,
+                &confidence,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG record_duel_result: {}", e))?;
+        Ok(())
+    }
+
+    /// Update candidate scores and posteriors after duels.
+    /// Each tuple: (candidate_id, copeland_score, alpha, beta)
+    pub async fn update_candidate_scores(
+        &self,
+        pool_id: &str,
+        scores: &[(String, f64, f64, f64)],
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        for (candidate_id, copeland, alpha, beta) in scores {
+            conn.execute(
+                "UPDATE duel_candidates SET copeland_score = $1, alpha = $2, beta = $3 WHERE id = $4 AND pool_id = $5",
+                &[copeland, alpha, beta, candidate_id, &pool_id],
+            )
+            .await
+            .map_err(|e| format!("PG update_candidate_scores: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Get the active duel pool for an agent type (if any).
+    pub async fn get_active_duel_pool(
+        &self,
+        agent_type: &str,
+    ) -> Result<Option<(String, String, i32)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, config_json, generation FROM duel_pools WHERE agent_type = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+                &[&agent_type],
+            )
+            .await
+            .map_err(|e| format!("PG get_active_duel_pool: {}", e))?;
+        if let Some(row) = rows.first() {
+            Ok(Some((row.get(0), row.get(1), row.get(2))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get all active candidates in a pool.
+    pub async fn get_pool_candidates(
+        &self,
+        pool_id: &str,
+    ) -> Result<Vec<(String, String, f64, f64, f64)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, prompt_content, copeland_score, alpha, beta
+                   FROM duel_candidates
+                   WHERE pool_id = $1 AND status = 'active'
+                   ORDER BY copeland_score DESC"#,
+                &[&pool_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_pool_candidates: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            .collect())
+    }
+
+    /// Prune candidates from a pool by setting status to 'pruned'.
+    pub async fn prune_candidates(
+        &self,
+        pool_id: &str,
+        keep_ids: &[String],
+    ) -> Result<usize, String> {
+        if keep_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Build a parameterized IN clause
+        let placeholders: Vec<String> = (2..=keep_ids.len() + 1)
+            .map(|i| format!("${}", i))
+            .collect();
+        let sql = format!(
+            "UPDATE duel_candidates SET status = 'pruned' WHERE pool_id = $1 AND status = 'active' AND id NOT IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&pool_id];
+        for id in keep_ids {
+            params.push(id);
+        }
+
+        let updated = conn
+            .execute_raw(&sql, params)
+            .await
+            .map_err(|e| format!("PG prune_candidates: {}", e))?;
+
+        Ok(updated as usize)
+    }
+
+    /// Complete a duel pool.
+    pub async fn complete_duel_pool(&self, pool_id: &str) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE duel_pools SET status = 'completed', completed_at = $1 WHERE id = $2",
+            &[&now, &pool_id],
+        )
+        .await
+        .map_err(|e| format!("PG complete_duel_pool: {}", e))?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Beam Search Runs
+    // ========================================================================
+
+    /// Create a new beam search run.
+    pub async fn create_beam_search_run(
+        &self,
+        id: &str,
+        agent_type: &str,
+        pool_id: Option<&str>,
+        config_json: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO beam_search_runs (id, agent_type, pool_id, config_json, generation, status, created_at)
+               VALUES ($1, $2, $3, $4, 0, 'running', $5)"#,
+            &[
+                &id,
+                &agent_type,
+                &pool_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &config_json,
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG create_beam_search_run: {}", e))?;
+        Ok(())
+    }
+
+    /// Add a beam candidate.
+    pub async fn add_beam_candidate(
+        &self,
+        id: &str,
+        beam_run_id: &str,
+        parent_id: Option<&str>,
+        prompt_content: &str,
+        critique: Option<&str>,
+        changes_summary: Option<&str>,
+        generation: i32,
+        thinking_style: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO beam_candidates
+               (id, beam_run_id, parent_id, prompt_content, critique, changes_summary,
+                generation, thinking_style, status, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', $9)"#,
+            &[
+                &id,
+                &beam_run_id,
+                &parent_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                &prompt_content,
+                &critique as &(dyn tokio_postgres::types::ToSql + Sync),
+                &changes_summary as &(dyn tokio_postgres::types::ToSql + Sync),
+                &generation,
+                &thinking_style as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG add_beam_candidate: {}", e))?;
+        Ok(())
+    }
+
+    /// Complete a beam search run.
+    pub async fn complete_beam_search_run(
+        &self,
+        id: &str,
+        final_generation: i32,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE beam_search_runs SET status = 'completed', generation = $1, completed_at = $2 WHERE id = $3",
+            &[&final_generation, &now, &id],
+        )
+        .await
+        .map_err(|e| format!("PG complete_beam_search_run: {}", e))?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Resource Versions (immutable snapshots)
+    // ========================================================================
+
+    /// Create a new immutable resource version.
+    pub async fn create_resource_version(
+        &self,
+        id: &str,
+        resource_type: &str,
+        resource_key: &str,
+        version: i64,
+        content_hash: &str,
+        content: &str,
+        metadata_json: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            r#"INSERT INTO resource_versions
+               (id, resource_type, resource_key, version, content_hash, content, metadata_json, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+            &[
+                &id,
+                &resource_type,
+                &resource_key,
+                &version,
+                &content_hash,
+                &content,
+                &metadata_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                &now,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG create_resource_version: {}", e))?;
+        Ok(())
+    }
+
+    /// Get a specific version of a resource.
+    pub async fn get_resource_version(
+        &self,
+        resource_type: &str,
+        resource_key: &str,
+        version: i64,
+    ) -> Result<Option<crate::meta_optimizer::resource_versioning::ResourceVersion>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, resource_type, resource_key, version, content_hash, content, metadata_json, created_at::text
+                   FROM resource_versions
+                   WHERE resource_type = $1 AND resource_key = $2 AND version = $3"#,
+                &[&resource_type, &resource_key, &version],
+            )
+            .await
+            .map_err(|e| format!("PG get_resource_version: {}", e))?;
+        Ok(rows.first().map(|r| crate::meta_optimizer::resource_versioning::ResourceVersion {
+            id: r.get(0),
+            resource_type: r.get(1),
+            resource_key: r.get(2),
+            version: r.get(3),
+            content_hash: r.get(4),
+            content: r.get(5),
+            metadata_json: r.get(6),
+            created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
+        }))
+    }
+
+    /// Get the latest version of a resource.
+    pub async fn get_latest_resource_version(
+        &self,
+        resource_type: &str,
+        resource_key: &str,
+    ) -> Result<Option<crate::meta_optimizer::resource_versioning::ResourceVersion>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                r#"SELECT id, resource_type, resource_key, version, content_hash, content, metadata_json, created_at::text
+                   FROM resource_versions
+                   WHERE resource_type = $1 AND resource_key = $2
+                   ORDER BY version DESC
+                   LIMIT 1"#,
+                &[&resource_type, &resource_key],
+            )
+            .await
+            .map_err(|e| format!("PG get_latest_resource_version: {}", e))?;
+        Ok(rows.first().map(|r| crate::meta_optimizer::resource_versioning::ResourceVersion {
+            id: r.get(0),
+            resource_type: r.get(1),
+            resource_key: r.get(2),
+            version: r.get(3),
+            content_hash: r.get(4),
+            content: r.get(5),
+            metadata_json: r.get(6),
+            created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
+        }))
+    }
 }

@@ -387,6 +387,37 @@ pub fn parse_meta_prompt_rewrites(output: &str) -> Vec<ParsedMetaPromptRewrite> 
         .collect()
 }
 
+/// A parsed beam search rewrite candidate from beam_search output.
+#[derive(Debug, Clone)]
+pub struct ParsedBeamCandidate {
+    pub critique: String,
+    pub changes_summary: String,
+    pub rewritten_prompt: String,
+}
+
+/// Parse `[BEAM_REWRITE]` blocks from beam search LLM output.
+///
+/// Returns all valid blocks found (there may be multiple per response
+/// when branch_factor > 1 and the LLM outputs multiple rewrites).
+pub fn parse_beam_candidates(output: &str) -> Vec<ParsedBeamCandidate> {
+    extract_marker_blocks(output, "BEAM_REWRITE")
+        .into_iter()
+        .filter_map(|block| {
+            let kv = parse_key_value_pairs(&block);
+            let rewritten_prompt = get_str(&kv, "rewritten_prompt");
+            if rewritten_prompt.is_empty() {
+                warn!("Skipping BEAM_REWRITE with missing rewritten_prompt");
+                return None;
+            }
+            Some(ParsedBeamCandidate {
+                critique: get_str(&kv, "critique"),
+                changes_summary: get_str(&kv, "changes_summary"),
+                rewritten_prompt,
+            })
+        })
+        .collect()
+}
+
 // ── Deduplication helper ─────────────────────────────────────────────────
 
 /// Check if a recommendation with the same content already exists in a non-terminal state.

@@ -14,9 +14,11 @@ pub mod canvas;
 pub mod checkpoints;
 pub mod checks;
 pub mod comparison;
+pub mod contradiction;
 pub mod decision_trail;
 pub mod deferred_questions;
 pub mod entailment_cache;
+pub mod entity_profiles;
 pub mod error_monitor;
 pub mod export;
 pub mod findings;
@@ -36,6 +38,7 @@ pub mod observations;
 pub mod online_learning;
 pub mod orchestration_loop;
 pub mod pipeline_traces;
+pub mod pr_watch_ops;
 pub mod process_sessions;
 pub mod prompt_evolution;
 pub mod prompt_registry;
@@ -64,7 +67,104 @@ pub mod workflows;
 pub mod worktrees;
 
 use std::sync::{Arc, OnceLock};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Schema Migration System
+// ============================================================================
+
+/// A versioned schema migration. Each migration has a unique version number,
+/// a human-readable description, and SQL to execute. Migrations run in order
+/// and are tracked in the `schema_migrations` table.
+struct Migration {
+    version: i32,
+    description: &'static str,
+    sql: &'static str,
+}
+
+/// Ordered list of schema migrations. New migrations are appended at the end
+/// with an incrementing version number. Each migration runs inside its own
+/// transaction; on failure the transaction is rolled back and startup halts.
+///
+/// Guidelines for writing migrations:
+/// - Use `IF NOT EXISTS` / `IF EXISTS` where PostgreSQL supports it.
+/// - For `ALTER TABLE ADD COLUMN` (which PG supports `IF NOT EXISTS` since v9.6),
+///   always include `IF NOT EXISTS` so re-runs are safe.
+/// - Keep each migration focused on a single logical change.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "Baseline schema — marks existing tables as version 1",
+        sql: "", // No-op: existing tables are created by ensure_tables()
+    },
+    Migration {
+        version: 2,
+        description: "Add connection_state tracking to mcp_servers",
+        sql: r#"
+            ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS connection_state TEXT NOT NULL DEFAULT 'disconnected';
+            ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_error TEXT;
+            ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_connected_at TIMESTAMPTZ;
+        "#,
+    },
+    Migration {
+        version: 3,
+        description: "Add contradiction_resolutions table for Honcho-inspired contradiction handling",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS contradiction_resolutions (
+                id BIGSERIAL PRIMARY KEY,
+                observation_a_id BIGINT NOT NULL REFERENCES observations(id),
+                observation_b_id BIGINT NOT NULL REFERENCES observations(id),
+                resolution_type TEXT NOT NULL,
+                winner_id BIGINT REFERENCES observations(id),
+                loser_id BIGINT REFERENCES observations(id),
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                rationale TEXT NOT NULL,
+                evidence_json TEXT,
+                resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_by TEXT NOT NULL DEFAULT 'system',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_cr_obs_a ON contradiction_resolutions(observation_a_id);
+            CREATE INDEX IF NOT EXISTS idx_cr_obs_b ON contradiction_resolutions(observation_b_id);
+            CREATE INDEX IF NOT EXISTS idx_cr_resolved ON contradiction_resolutions(resolved_at);
+        "#,
+    },
+    Migration {
+        version: 4,
+        description: "Add entity_profiles table for Honcho-inspired evolving representations",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS entity_profiles (
+                id BIGSERIAL PRIMARY KEY,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                entity_label TEXT NOT NULL,
+                profile_summary TEXT NOT NULL,
+                profile_detail TEXT,
+                topic_key TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                importance DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                decay_rate DOUBLE PRECISION NOT NULL DEFAULT 0.02,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed_at TIMESTAMPTZ,
+                revision_count INTEGER NOT NULL DEFAULT 1,
+                source_observation_ids BIGINT[],
+                source_finding_ids TEXT[],
+                source_fix_ids TEXT[],
+                source_cross_run_pattern_ids TEXT[],
+                valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                valid_until TIMESTAMPTZ,
+                superseded_by BIGINT REFERENCES entity_profiles(id),
+                is_deleted BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ep_entity ON entity_profiles(entity_kind, entity_id) WHERE NOT is_deleted;
+            CREATE INDEX IF NOT EXISTS idx_ep_topic_key ON entity_profiles(topic_key) WHERE NOT is_deleted;
+            CREATE INDEX IF NOT EXISTS idx_ep_importance ON entity_profiles(importance) WHERE NOT is_deleted;
+            CREATE INDEX IF NOT EXISTS idx_ep_fts ON entity_profiles USING GIN (to_tsvector('english', entity_label || ' ' || profile_summary)) WHERE NOT is_deleted;
+        "#,
+    },
+];
 
 /// Global PgDb instance, set once during app initialization.
 /// Allows sync-context code (thread spawns, closures) to access PG
@@ -152,6 +252,7 @@ impl PgDb {
 
         let db = Self { pool };
         db.ensure_tables().await;
+        db.run_migrations().await?;
         Ok(db)
     }
 
@@ -168,6 +269,12 @@ impl PgDb {
         };
 
         let ddl = [
+            // Schema Migrations (version tracking for incremental schema changes)
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version     INTEGER PRIMARY KEY,
+                description TEXT NOT NULL,
+                applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
             // Activity Timeline
             "CREATE TABLE IF NOT EXISTS activity_timeline (
                 id              BIGSERIAL PRIMARY KEY,
@@ -1195,6 +1302,137 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_ra_execution ON restate_awakeables(execution_id)",
             "CREATE INDEX IF NOT EXISTS idx_ra_status ON restate_awakeables(status)",
+            // ── Span Events (agent-lightning instrumentation) ──────────────
+            "CREATE TABLE IF NOT EXISTS span_events (
+                id              TEXT PRIMARY KEY,
+                execution_id    TEXT NOT NULL,
+                trace_id        TEXT NOT NULL,
+                agent_type      TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                step_index      INTEGER NOT NULL DEFAULT 0,
+                metric_name     TEXT,
+                reward_value    DOUBLE PRECISION,
+                data_key        TEXT,
+                data_json       TEXT,
+                role            TEXT,
+                content         TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_span_events_exec ON span_events(execution_id)",
+            "CREATE INDEX IF NOT EXISTS idx_span_events_trace ON span_events(trace_id)",
+            "CREATE INDEX IF NOT EXISTS idx_span_events_type ON span_events(event_type)",
+            // ── Duel Pools (prompt-ops dueling bandits) ────────────────────
+            "CREATE TABLE IF NOT EXISTS duel_pools (
+                id              TEXT PRIMARY KEY,
+                agent_type      TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'active',
+                generation      INTEGER NOT NULL DEFAULT 0,
+                config_json     TEXT NOT NULL DEFAULT '{}',
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at    TIMESTAMPTZ
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_dp_agent ON duel_pools(agent_type)",
+            "CREATE INDEX IF NOT EXISTS idx_dp_status ON duel_pools(status)",
+            // ── Duel Candidates ────────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS duel_candidates (
+                id              TEXT PRIMARY KEY,
+                pool_id         TEXT NOT NULL,
+                prompt_content  TEXT NOT NULL,
+                variant_id      TEXT,
+                generation      INTEGER NOT NULL DEFAULT 0,
+                parent_id       TEXT,
+                copeland_score  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                alpha           DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                beta            DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+                status          TEXT NOT NULL DEFAULT 'active',
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_dc_pool ON duel_candidates(pool_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dc_status ON duel_candidates(pool_id, status)",
+            // ── Duel Results ───────────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS duel_results (
+                id                  TEXT PRIMARY KEY,
+                pool_id             TEXT NOT NULL,
+                candidate_a_id      TEXT NOT NULL,
+                candidate_b_id      TEXT NOT NULL,
+                winner_id           TEXT NOT NULL,
+                judge_rationale     TEXT,
+                position_swapped    BOOLEAN NOT NULL DEFAULT false,
+                confidence          DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_dr_pool ON duel_results(pool_id)",
+            // ── Beam Search Runs ───────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS beam_search_runs (
+                id              TEXT PRIMARY KEY,
+                agent_type      TEXT NOT NULL,
+                pool_id         TEXT,
+                config_json     TEXT NOT NULL,
+                generation      INTEGER NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL DEFAULT 'running',
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at    TIMESTAMPTZ
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_bsr_agent ON beam_search_runs(agent_type)",
+            "CREATE INDEX IF NOT EXISTS idx_bsr_pool ON beam_search_runs(pool_id)",
+            // ── Beam Candidates ────────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS beam_candidates (
+                id              TEXT PRIMARY KEY,
+                beam_run_id     TEXT NOT NULL,
+                parent_id       TEXT,
+                prompt_content  TEXT NOT NULL,
+                critique        TEXT,
+                changes_summary TEXT,
+                generation      INTEGER NOT NULL DEFAULT 0,
+                thinking_style  TEXT,
+                variant_id      TEXT,
+                status          TEXT NOT NULL DEFAULT 'active',
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_bc_run ON beam_candidates(beam_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_bc_gen ON beam_candidates(beam_run_id, generation)",
+            // Phase 1: Bounded Fix Loop — track fix attempts and CI auto-resumes per task run
+            "ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS fix_attempts INTEGER DEFAULT 0",
+            "ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS ci_auto_resumes INTEGER DEFAULT 0",
+            // ── Prompt Evolution extensions (Phase 4: optimization pipeline) ──
+            "ALTER TABLE prompt_evolution ADD COLUMN IF NOT EXISTS generation INTEGER",
+            "ALTER TABLE prompt_evolution ADD COLUMN IF NOT EXISTS beam_run_id TEXT",
+            // ── Resource Versions (Phase 5: immutable snapshots) ───────
+            "CREATE TABLE IF NOT EXISTS resource_versions (
+                id              TEXT PRIMARY KEY,
+                resource_type   TEXT NOT NULL,
+                resource_key    TEXT NOT NULL,
+                version         BIGINT NOT NULL,
+                content_hash    TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                metadata_json   TEXT,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (resource_type, resource_key, version)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_rv_resource ON resource_versions(resource_type, resource_key)",
+            "CREATE INDEX IF NOT EXISTS idx_rv_latest ON resource_versions(resource_type, resource_key, version DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_rv_hash ON resource_versions(content_hash)",
+            // ── Phase 2: PR Watch State (CI feedback loop) ───────
+            "CREATE TABLE IF NOT EXISTS pr_watch_state (
+                id                  TEXT PRIMARY KEY,
+                task_run_id         TEXT NOT NULL,
+                pr_number           BIGINT NOT NULL,
+                repo_full_name      TEXT NOT NULL,
+                head_sha            TEXT NOT NULL DEFAULT '',
+                workflow_id         TEXT NOT NULL DEFAULT '',
+                last_checks_status  TEXT NOT NULL DEFAULT 'pending',
+                last_review_status  TEXT NOT NULL DEFAULT 'pending',
+                auto_resume_count   INTEGER NOT NULL DEFAULT 0,
+                max_auto_resumes    INTEGER NOT NULL DEFAULT 10,
+                completed_at        TIMESTAMPTZ,
+                completion_reason   TEXT,
+                last_polled_at      TIMESTAMPTZ,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(task_run_id, pr_number)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_prw_active ON pr_watch_state(completed_at) WHERE completed_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS idx_prw_task_run ON pr_watch_state(task_run_id)",
         ];
 
         for sql in &ddl {
@@ -1204,6 +1442,112 @@ impl PgDb {
         }
 
         info!("All managed PG tables ensured (activity_timeline, watchers, agentic_metric_scores, prompt_registry, canary_rollouts, canary_run_records, prompt_template_canaries, error_events, decisions, concept_summaries)");
+    }
+
+    /// Run all pending schema migrations in order.
+    ///
+    /// Each migration executes inside its own transaction. If a migration fails,
+    /// that transaction is rolled back and this method returns an error — the
+    /// database is left at the last successfully applied version.
+    async fn run_migrations(&self) -> Result<(), String> {
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error during migrations: {}", e))?;
+
+        // Determine current schema version (0 if no migrations have run yet).
+        let current_version: i32 = conn
+            .query_one(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                &[],
+            )
+            .await
+            .map(|row| row.get(0))
+            .unwrap_or(0);
+
+        let pending: Vec<&Migration> = MIGRATIONS
+            .iter()
+            .filter(|m| m.version > current_version)
+            .collect();
+
+        if pending.is_empty() {
+            info!(
+                "Schema is up to date at version {}",
+                current_version
+            );
+            return Ok(());
+        }
+
+        info!(
+            "Schema at version {}, {} migration(s) pending",
+            current_version,
+            pending.len()
+        );
+
+        for migration in &pending {
+            info!(
+                "Running migration v{}: {}",
+                migration.version, migration.description
+            );
+
+            // Each migration runs in its own transaction.
+            let txn = conn.transaction().await.map_err(|e| {
+                format!(
+                    "Failed to begin transaction for migration v{}: {}",
+                    migration.version, e
+                )
+            })?;
+
+            // Execute the migration SQL (skip empty / no-op migrations).
+            if !migration.sql.trim().is_empty() {
+                txn.batch_execute(migration.sql).await.map_err(|e| {
+                    error!(
+                        "Migration v{} failed: {}",
+                        migration.version, e
+                    );
+                    format!(
+                        "Migration v{} ({}) failed: {}",
+                        migration.version, migration.description, e
+                    )
+                })?;
+            }
+
+            // Record the migration.
+            txn.execute(
+                "INSERT INTO schema_migrations (version, description) VALUES ($1, $2)",
+                &[
+                    &migration.version as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &migration.description as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to record migration v{}: {}",
+                    migration.version, e
+                )
+            })?;
+
+            txn.commit().await.map_err(|e| {
+                format!(
+                    "Failed to commit migration v{}: {}",
+                    migration.version, e
+                )
+            })?;
+
+            info!(
+                "Migration v{} applied successfully: {}",
+                migration.version, migration.description
+            );
+        }
+
+        info!(
+            "All migrations applied — schema now at version {}",
+            pending.last().map(|m| m.version).unwrap_or(current_version)
+        );
+
+        Ok(())
     }
 
     // ========================================================================

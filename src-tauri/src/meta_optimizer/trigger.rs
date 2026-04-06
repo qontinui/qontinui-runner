@@ -63,6 +63,22 @@ fn should_launch_meta_prompt_optimizer(pg_db: &std::sync::Arc<crate::database::p
         }
     };
 
+    // Check no active duel pool for this agent_type
+    {
+        let pg = pg_db.clone();
+        let at = target.agent_type.clone();
+        let has_pool = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(pg.get_active_duel_pool(&at))
+        });
+        if matches!(has_pool, Ok(Some(_))) {
+            debug!(
+                "MetaPrompt guard: active duel pool for {} — skipping",
+                target.agent_type
+            );
+            return false;
+        }
+    }
+
     // Check no active canary for this agent_type
     if super::prompt_evolution::has_active_evolution(pg_db, &target.agent_type) {
         debug!(

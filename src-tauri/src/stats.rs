@@ -564,6 +564,19 @@ pub fn ln_gamma(x: f64) -> f64 {
 }
 
 // =============================================================================
+// Copeland score (dueling bandits ranking)
+// =============================================================================
+
+/// Compute Copeland score for a candidate given pairwise win/loss counts.
+///
+/// Score = (wins - losses) / max(1, num_opponents), normalized to [-1.0, 1.0].
+/// Used by the duel engine to rank prompt candidates after pairwise duels.
+pub fn copeland_score(wins: u32, losses: u32, num_opponents: u32) -> f64 {
+    let denom = num_opponents.max(1) as f64;
+    (wins as f64 - losses as f64) / denom
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -785,6 +798,22 @@ mod tests {
         // CI lower bound is ~-41pp which is < -5pp, so canary should NOT promote
         assert_eq!(v, Verdict::Neutral);
         assert_eq!(v.as_canary_str(), "continue");
+    }
+
+    #[test]
+    fn test_copeland_score_basic() {
+        // 3 wins, 1 loss out of 4 opponents
+        let score = copeland_score(3, 1, 4);
+        assert!((score - 0.5).abs() < 1e-10);
+
+        // All wins
+        assert!((copeland_score(4, 0, 4) - 1.0).abs() < 1e-10);
+
+        // All losses
+        assert!((copeland_score(0, 4, 4) - -1.0).abs() < 1e-10);
+
+        // No opponents
+        assert!((copeland_score(0, 0, 0) - 0.0).abs() < 1e-10);
     }
 
     #[test]

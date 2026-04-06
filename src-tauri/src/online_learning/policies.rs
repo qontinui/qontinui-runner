@@ -363,6 +363,62 @@ impl SelectionPolicy for ThompsonSampling {
 }
 
 // =============================================================================
+// Public standalone sampling functions
+// =============================================================================
+
+/// Draw a sample from Beta(alpha, beta) using the gamma ratio method.
+///
+/// Extracted as a public function so other modules (e.g., duel_engine) can
+/// reuse Beta sampling without depending on the ThompsonSampling struct.
+pub fn sample_beta_distribution(rng: &mut StdRng, alpha: f64, beta: f64) -> f64 {
+    if alpha <= 0.0 || beta <= 0.0 {
+        return 0.5;
+    }
+    if (alpha - 1.0).abs() < 1e-10 && (beta - 1.0).abs() < 1e-10 {
+        return rng.random::<f64>();
+    }
+    let x = sample_gamma_distribution(rng, alpha);
+    let y = sample_gamma_distribution(rng, beta);
+    if x + y == 0.0 {
+        0.5
+    } else {
+        x / (x + y)
+    }
+}
+
+/// Draw a sample from Gamma(shape, 1) using Marsaglia and Tsang's method.
+///
+/// Extracted as a public function for reuse by duel_engine and other modules.
+pub fn sample_gamma_distribution(rng: &mut StdRng, shape: f64) -> f64 {
+    if shape < 1.0 {
+        let x = sample_gamma_distribution(rng, shape + 1.0);
+        let u: f64 = rng.random();
+        return x * u.powf(1.0 / shape);
+    }
+
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+
+    loop {
+        let u1: f64 = rng.random::<f64>().max(1e-10);
+        let u2: f64 = rng.random::<f64>();
+        let x: f64 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        let v = 1.0 + c * x;
+        if v <= 0.0 {
+            continue;
+        }
+        let v = v * v * v;
+        let u: f64 = rng.random();
+        if u < 1.0 - 0.0331 * (x * x) * (x * x) {
+            return d * v;
+        }
+        if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v;
+        }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

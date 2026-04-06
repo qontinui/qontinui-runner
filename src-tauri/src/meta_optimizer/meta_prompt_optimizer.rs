@@ -86,6 +86,9 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
+        ci_failure_context: None,
     }
 }
 
@@ -178,6 +181,71 @@ If the analysis concluded that all prompts are performing adequately and no rewr
         step.phase = Some("verification".to_string());
         step
     }]
+}
+
+/// Build a critique-and-rewrite prompt for a specific parent prompt.
+///
+/// Used by beam search to generate multiple rewrite candidates.
+/// The `parent_prompt` is included as context for the LLM to critique and improve.
+/// The `failure_evidence` provides specific failure examples to address.
+pub fn build_critique_rewrite_prompt(
+    base_url: &str,
+    thinking_style: &str,
+    parent_prompt: &str,
+    failure_evidence: &str,
+) -> String {
+    format!(
+        r#"You are rewriting a prompt to improve its performance based on failure analysis.
+
+## Thinking Style
+
+{thinking_style}
+
+## Current Prompt to Improve
+
+```
+{parent_prompt}
+```
+
+## Failure Evidence
+
+{failure_evidence}
+
+## Drill-Down Endpoints
+
+If you need more detail:
+```bash
+curl -s '{base_url}/meta-optimizer/prompt-optimization/evidence?phase=verification&max_failures=5&max_successes=2'
+```
+
+## Your Task
+
+1. **Critique** the current prompt: identify specific weaknesses that cause the failures above
+2. **Rewrite** the prompt to fix those weaknesses while preserving what works
+3. Output your result in this exact format:
+
+```
+[BEAM_REWRITE]
+critique: |
+  <detailed critique of what's wrong>
+changes_summary: |
+  <what you changed and why>
+rewritten_prompt: |
+  <the complete rewritten prompt>
+[/BEAM_REWRITE]
+```
+
+## Quality Gates
+- The rewrite must be a complete prompt replacement, not a diff
+- Must directly address the failure patterns from the evidence
+- Must preserve strengths from the current prompt
+- Minimum confidence: 0.45"#,
+    )
+}
+
+/// Get the thinking styles for beam search and meta-prompt optimization.
+pub fn get_thinking_styles() -> &'static [&'static str] {
+    META_PROMPT_THINKING_STYLES
 }
 
 fn build_agentic_prompt(base_url: &str, thinking_style: &str) -> String {

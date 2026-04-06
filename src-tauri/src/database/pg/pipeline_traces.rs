@@ -1,11 +1,12 @@
-//! PostgreSQL pipeline agent traces operations.
+//! PostgreSQL pipeline agent traces and span events operations.
 //!
-//! Provides save/query for the `pipeline_agent_traces` table using raw SQL.
+//! Provides save/query for `pipeline_agent_traces` and `span_events` tables.
 
 use super::PgDb;
 use crate::autoresearch::agentic_verification::{
     GuardrailResult, HandoffContext, PipelineAgentTrace,
 };
+use crate::meta_optimizer::span_instrumentation::SpanEventRow;
 use tracing::debug;
 
 impl PgDb {
@@ -174,6 +175,135 @@ impl PgDb {
             })
             .collect())
     }
+
+    // ========================================================================
+    // Span Events
+    // ========================================================================
+
+    /// Save a batch of span events.
+    pub async fn save_span_events(&self, events: &[SpanEventRow]) -> Result<usize, String> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let mut count = 0;
+        for event in events {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                r#"INSERT INTO span_events
+                   (id, execution_id, trace_id, agent_type, event_type, step_index,
+                    metric_name, reward_value, data_key, data_json, role, content, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"#,
+                &[
+                    &event.id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &event.execution_id,
+                    &event.trace_id,
+                    &event.agent_type,
+                    &event.event_type,
+                    &event.step_index,
+                    &event.metric_name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &event.reward_value as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &event.data_key as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &event.data_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &event.role as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &event.content as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG save_span_event: {}", e))?;
+            count += 1;
+        }
+
+        debug!("Persisted {} PG span events", count);
+        Ok(count)
+    }
+
+    /// Get all span events for an execution.
+    pub async fn get_span_events_for_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<Vec<SpanEventRow>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, execution_id, trace_id, agent_type, event_type, step_index,
+                          metric_name, reward_value, data_key, data_json, role, content
+                   FROM span_events
+                   WHERE execution_id = $1
+                   ORDER BY step_index ASC, created_at ASC"#,
+                &[&execution_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_span_events_for_execution: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| SpanEventRow {
+                id: row.get(0),
+                execution_id: row.get(1),
+                trace_id: row.get(2),
+                agent_type: row.get(3),
+                event_type: row.get(4),
+                step_index: row.get(5),
+                metric_name: row.get(6),
+                reward_value: row.get(7),
+                data_key: row.get(8),
+                data_json: row.get(9),
+                role: row.get(10),
+                content: row.get(11),
+            })
+            .collect())
+    }
+
+    /// Get reward events for a specific agent type, ordered by most recent.
+    pub async fn get_reward_events_for_agent(
+        &self,
+        agent_type: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, f64, String)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT execution_id, reward_value, metric_name
+                   FROM span_events
+                   WHERE agent_type = $1 AND event_type = 'reward' AND reward_value IS NOT NULL
+                   ORDER BY created_at DESC
+                   LIMIT $2"#,
+                &[&agent_type, &limit],
+            )
+            .await
+            .map_err(|e| format!("PG get_reward_events_for_agent: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let exec_id: String = row.get(0);
+                let reward: f64 = row.get(1);
+                let metric: String = row.get::<_, Option<String>>(2).unwrap_or_default();
+                (exec_id, reward, metric)
+            })
+            .collect())
+    }
+
+    // ========================================================================
+    // Pipeline Agent Traces (continued)
+    // ========================================================================
 
     /// Backfill downstream_success on all traces for a completed execution.
     pub async fn backfill_pipeline_downstream_success(

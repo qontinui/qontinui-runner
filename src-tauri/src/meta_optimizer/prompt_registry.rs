@@ -20,6 +20,8 @@ pub fn get_active_prompt(
 }
 
 /// Create a new prompt variant (initially inactive).
+///
+/// Also creates an immutable resource version snapshot for reproducibility.
 pub fn create_variant(
     pg_db: &Arc<PgDb>,
     agent_type: &str,
@@ -27,14 +29,30 @@ pub fn create_variant(
     prompt_content: &str,
     source_recommendation_id: Option<&str>,
 ) -> Result<PromptVariant, String> {
-    tokio::task::block_in_place(|| {
+    let variant = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.create_prompt_variant(
             agent_type,
             variant_name,
             prompt_content,
             source_recommendation_id,
         ))
-    })
+    })?;
+
+    // Create immutable resource version snapshot (best-effort — don't fail the variant creation)
+    if let Err(e) = super::resource_versioning::create_version_sync(
+        pg_db,
+        "prompt",
+        agent_type,
+        prompt_content,
+        Some(&format!(
+            r#"{{"variant_id":"{}","variant_name":"{}"}}"#,
+            variant.id, variant_name
+        )),
+    ) {
+        tracing::warn!("Failed to create resource version for prompt variant: {}", e);
+    }
+
+    Ok(variant)
 }
 
 /// Activate a prompt variant (deactivating any previously active variant for that agent_type).

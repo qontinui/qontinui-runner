@@ -26,9 +26,11 @@
 
 pub mod agentic_metrics;
 pub mod architecture_optimizer;
+pub mod beam_search;
 pub mod canary;
 pub mod comparison_bridge;
 pub mod cost_optimizer;
+pub mod duel_engine;
 pub mod drift_detection;
 pub mod eval_runner;
 pub mod eval_spec;
@@ -37,14 +39,19 @@ pub mod generation_template_optimizer;
 pub mod golden_dataset;
 pub mod llm_judge_metrics;
 pub mod meta_prompt_optimizer;
+pub mod optimization_pipeline;
+pub mod pairwise_judge;
 pub mod parser;
 pub mod pipeline_prompt_optimizer;
 pub mod prompt_evolution;
 pub mod prompt_extractor;
 pub mod prompt_registry;
 pub mod recommendations;
+pub mod resource_versioning;
 pub mod robustness;
 pub mod snapshots;
+pub mod span_instrumentation;
+pub mod trace_adapter;
 pub mod trigger;
 pub mod types;
 
