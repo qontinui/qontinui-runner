@@ -235,13 +235,10 @@ export function useControlEvents(
             return true;
           }
 
-          // Validate: migrateTabId returns the tab if valid, or default if not
+          // Validate via migrateTabId (maps legacy names, validates against VALID_TAB_IDS)
           const resolved = migrateTabId(tab);
-          if (resolved !== tab && resolved !== migrateTabId(null)) {
-            // Tab was migrated to a different ID — use the migrated one
-          }
 
-          // Use Tauri event for direct tab navigation (bypasses PAGE_TO_TAB)
+          // Use direct tab setter (bypasses PAGE_TO_TAB)
           window.dispatchEvent(
             new CustomEvent("ui-bridge-set-tab", {
               detail: { tab: resolved as MainTabId },
