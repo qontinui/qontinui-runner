@@ -61,10 +61,12 @@ pub struct LoggingConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        let log_dir = dirs::data_local_dir()
+        // Scoped per-runner for secondary instances so concurrent runners
+        // don't interleave log lines in the same daily-rolling file.
+        let base = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("qontinui-runner")
-            .join("logs");
+            .join("qontinui-runner");
+        let log_dir = crate::instance::scope_path(&base).join("logs");
 
         Self {
             level: Level::INFO,
@@ -199,30 +201,34 @@ macro_rules! log_debug {
     };
 }
 
-/// Get the crash dump directory
+/// Get the crash dump directory.
+///
+/// Scoped per-runner for secondary instances so the `latest_crash.txt` file
+/// from one runner doesn't overwrite another's.
 pub fn get_crash_dump_dir() -> PathBuf {
     // Try to use the .dev-logs directory in the parent directory
-    if let Ok(exe_path) = std::env::current_exe() {
+    let base = if let Ok(exe_path) = std::env::current_exe() {
         // Navigate from exe to qontinui_parent_directory/.dev-logs
-        if let Some(parent_dir) = exe_path
+        exe_path
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
-        {
-            let dev_logs = parent_dir.join(".dev-logs");
-            if dev_logs.exists() || std::fs::create_dir_all(&dev_logs).is_ok() {
-                return dev_logs;
-            }
-        }
+            .map(|parent_dir| parent_dir.join(".dev-logs"))
+            .filter(|dev_logs| dev_logs.exists() || std::fs::create_dir_all(dev_logs).is_ok())
+    } else {
+        None
     }
+    .unwrap_or_else(|| {
+        // Fallback to local app data
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("qontinui-runner")
+            .join("crash-dumps")
+    });
 
-    // Fallback to local app data
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qontinui-runner")
-        .join("crash-dumps")
+    crate::instance::scope_path(&base)
 }
 
 /// Write a crash dump file with detailed information

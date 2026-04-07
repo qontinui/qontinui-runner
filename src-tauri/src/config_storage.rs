@@ -102,14 +102,17 @@ impl Default for ConfigStorage {
 }
 
 impl ConfigStorage {
-    /// Create a new ConfigStorage with default path
+    /// Create a new ConfigStorage with default path.
+    ///
+    /// Scoped per-runner for secondary instances so themed runners don't
+    /// share their config library with the primary.
     pub fn new() -> Result<Self, ConfigStorageError> {
-        let config_dir = dirs::config_dir()
+        let base = dirs::config_dir()
             .ok_or_else(|| {
                 ConfigStorageError::InvalidPath("Could not determine config directory".to_string())
             })?
-            .join("com.qontinui.runner")
-            .join("configs");
+            .join("com.qontinui.runner");
+        let config_dir = crate::instance::scope_path(&base).join("configs");
 
         // Create directory if it doesn't exist
         fs::create_dir_all(&config_dir)?;

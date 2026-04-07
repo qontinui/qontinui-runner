@@ -102,10 +102,13 @@ impl PromptSnippetLibrary {
 /// Get the prompt snippets directory path in the app data directory.
 /// Includes migration logic: if old "scriptlets" directory exists and new
 /// "prompt-snippets" directory doesn't, renames it automatically.
+///
+/// Scoped per-runner for secondary instances.
 fn get_prompt_snippets_dir() -> Result<PathBuf, String> {
-    let base_dir = dirs::config_dir()
+    let raw_base = dirs::config_dir()
         .ok_or("Failed to get config directory")?
         .join("com.qontinui.runner");
+    let base_dir = crate::instance::scope_path(&raw_base);
 
     let new_dir = base_dir.join("prompt-snippets");
     let old_dir = base_dir.join("scriptlets");
