@@ -819,29 +819,37 @@ async fn get_backup_summary(
 
 /// POST /settings/backup/export
 async fn export_all_data(
-    State(_api_state): State<Arc<ApiState>>,
+    State(api_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ComprehensiveExport>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // checkpoint_db removed — export not yet migrated to PG
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(api_error(
-            "Data export: SQLite removed, not yet migrated to PG".to_string(),
-        )),
-    ))
+    match crate::commands::backup::export_all_data_impl(&api_state.app_state.pg_db, None).await {
+        Ok(export) => Ok(Json(ApiResponse::success(export))),
+        Err(e) => {
+            error!("Failed to export all data: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to export data: {}", e))),
+            ))
+        }
+    }
 }
 
 /// POST /settings/backup/import
 async fn import_all_data(
-    State(_api_state): State<Arc<ApiState>>,
-    Json(_data): Json<ComprehensiveExport>,
+    State(api_state): State<Arc<ApiState>>,
+    Json(data): Json<ComprehensiveExport>,
 ) -> Result<Json<ApiResponse<ComprehensiveImportResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // checkpoint_db removed — import not yet migrated to PG
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(api_error(
-            "Data import: SQLite removed, not yet migrated to PG".to_string(),
-        )),
-    ))
+    match crate::commands::backup::import_all_data_impl(&api_state.app_state.pg_db, data, None)
+        .await
+    {
+        Ok(result) => Ok(Json(ApiResponse::success(result))),
+        Err(e) => {
+            error!("Failed to import all data: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to import data: {}", e))),
+            ))
+        }
+    }
 }
 
 // ============================================================================

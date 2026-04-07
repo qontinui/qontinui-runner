@@ -7,6 +7,7 @@
 //! - Preview of what will be imported
 
 use crate::commands::AppState;
+use crate::database::pg::PgDb;
 use crate::database::ImportResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -149,85 +150,94 @@ pub async fn export_all_data(
     state: State<'_, Arc<AppState>>,
     options: Option<ExportOptions>,
 ) -> Result<ComprehensiveExport, String> {
+    export_all_data_impl(&state.pg_db, options).await
+}
+
+/// Free-function implementation of comprehensive export, callable from any
+/// context that has access to a `PgDb` handle (Tauri commands, MCP handlers).
+pub async fn export_all_data_impl(
+    pg_db: &PgDb,
+    options: Option<ExportOptions>,
+) -> Result<ComprehensiveExport, String> {
     info!("Exporting all user data");
     let opts = options.unwrap_or_default();
 
-    let summary = state.pg_db.get_export_summary().await?;
+    let summary = pg_db.get_export_summary().await?;
 
     let flows = if opts.flows {
-        state.pg_db.export_all_flows().await?
+        pg_db.export_all_flows().await?
     } else {
         vec![]
     };
 
     let flow_executions = if opts.flow_executions {
-        state.pg_db.export_all_flow_executions().await?
+        pg_db.export_all_flow_executions().await?
     } else {
         vec![]
     };
 
     let checkpoints = if opts.checkpoints {
-        state.pg_db.export_all_orchestrator_checkpoints().await?
+        pg_db.export_all_orchestrator_checkpoints().await?
     } else {
         vec![]
     };
 
     let learning_outcomes = if opts.learning_outcomes {
-        state.pg_db.get_learning_outcomes(None).await?
+        pg_db.get_learning_outcomes(None).await?
     } else {
         vec![]
     };
 
     let learning_patterns = if opts.learning_patterns {
-        state.pg_db.get_learning_patterns().await?
+        pg_db.get_learning_patterns().await?
     } else {
         vec![]
     };
 
     let settings = if opts.settings {
-        state.pg_db.export_all_settings().await?
+        pg_db.export_all_settings().await?
     } else {
         vec![]
     };
 
     let prompts = if opts.prompts {
-        state.pg_db.export_all_prompts().await?
+        pg_db.export_all_prompts().await?
     } else {
         vec![]
     };
 
     let unified_workflows = if opts.unified_workflows {
-        state.pg_db.export_all_unified_workflows().await?
+        pg_db.export_all_unified_workflows().await?
     } else {
         vec![]
     };
 
     let verification_tests = if opts.verification_tests {
-        state.pg_db.export_all_verification_tests().await?
+        pg_db.export_all_verification_tests().await?
     } else {
         vec![]
     };
 
     let task_hooks = if opts.task_hooks {
-        state.pg_db.export_all_task_hooks().await?
+        pg_db.export_all_task_hooks().await?
     } else {
         vec![]
     };
 
     let scheduled_tasks = if opts.scheduled_tasks {
-        state.pg_db.export_all_scheduled_tasks().await?
+        pg_db.export_all_scheduled_tasks().await?
     } else {
         vec![]
     };
 
     let saved_api_requests = if opts.saved_api_requests {
-        state.pg_db.export_all_saved_api_requests().await?
+        pg_db.export_all_saved_api_requests().await?
     } else {
         vec![]
     };
 
     let configs = if opts.configs {
-        state.pg_db.export_all_configs().await?
+        pg_db.export_all_configs().await?
     } else {
         vec![]
     };
@@ -310,6 +320,16 @@ pub async fn import_all_data(
     data: ComprehensiveExport,
     options: Option<ImportOptions>,
 ) -> Result<ComprehensiveImportResult, String> {
+    import_all_data_impl(&state.pg_db, data, options).await
+}
+
+/// Free-function implementation of comprehensive import, callable from any
+/// context that has access to a `PgDb` handle (Tauri commands, MCP handlers).
+pub async fn import_all_data_impl(
+    pg_db: &PgDb,
+    data: ComprehensiveExport,
+    options: Option<ImportOptions>,
+) -> Result<ComprehensiveImportResult, String> {
     info!("Importing all user data");
     let opts = options.unwrap_or_default();
     let conflict_mode = &opts.conflict_mode;
@@ -321,7 +341,7 @@ pub async fn import_all_data(
 
     // Import flows
     if opts.flows && !data.flows.is_empty() {
-        match state.pg_db.import_flows(&data.flows).await {
+        match pg_db.import_flows(&data.flows).await {
             Ok(count) => {
                 total_imported += count as usize;
                 results.insert(
@@ -389,7 +409,7 @@ pub async fn import_all_data(
                    ON CONFLICT (id) DO NOTHING"#
             };
 
-            match state.pg_db.pool().get().await {
+            match pg_db.pool().get().await {
                 Ok(conn) => match conn
                     .execute(sql, &[&id, &name, &category, &content, &variables])
                     .await
@@ -449,7 +469,7 @@ pub async fn import_all_data(
                 "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING"
             };
 
-            match state.pg_db.pool().get().await {
+            match pg_db.pool().get().await {
                 Ok(conn) => match conn.execute(sql, &[&key, &value]).await {
                     Ok(n) => {
                         if n > 0 {
@@ -540,7 +560,7 @@ pub async fn import_all_data(
                    ON CONFLICT (id) DO NOTHING"#
             };
 
-            match state.pg_db.pool().get().await {
+            match pg_db.pool().get().await {
                 Ok(conn) => match conn
                     .execute(
                         sql,
@@ -626,7 +646,7 @@ pub async fn import_all_data(
                    ON CONFLICT (id) DO NOTHING"#
             };
 
-            match state.pg_db.pool().get().await {
+            match pg_db.pool().get().await {
                 Ok(conn) => match conn
                     .execute(
                         sql,
@@ -711,7 +731,7 @@ pub async fn import_all_data(
                    ON CONFLICT (id) DO NOTHING"#
             };
 
-            match state.pg_db.pool().get().await {
+            match pg_db.pool().get().await {
                 Ok(conn) => match conn
                     .execute(
                         sql,
