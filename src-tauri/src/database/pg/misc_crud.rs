@@ -383,26 +383,27 @@ impl PgDb {
 
         // Use CASE expressions for stdio_config/http_config so we can express
         // three states: update (param is non-null), clear to NULL (flag param is true),
-        // or keep current (COALESCE fallback).
+        // or keep current (COALESCE fallback). Explicit ::TEXT casts are required
+        // so PostgreSQL can infer parameter types when branches return NULL.
         let rows_affected = conn
             .execute(
                 r#"UPDATE mcp_servers SET
-                    name = COALESCE($2, name),
-                    description = COALESCE($3, description),
-                    transport = COALESCE($4, transport),
+                    name = COALESCE($2::TEXT, name),
+                    description = COALESCE($3::TEXT, description),
+                    transport = COALESCE($4::TEXT, transport),
                     stdio_config = CASE
-                        WHEN $10 THEN NULL
-                        WHEN $5 IS NOT NULL THEN $5
+                        WHEN $10::BOOLEAN THEN NULL
+                        WHEN $5::TEXT IS NOT NULL THEN $5::TEXT
                         ELSE stdio_config
                     END,
                     http_config = CASE
-                        WHEN $11 THEN NULL
-                        WHEN $6 IS NOT NULL THEN $6
+                        WHEN $11::BOOLEAN THEN NULL
+                        WHEN $6::TEXT IS NOT NULL THEN $6::TEXT
                         ELSE http_config
                     END,
-                    enabled = COALESCE($7, enabled),
-                    auto_start = COALESCE($8, auto_start),
-                    timeout_seconds = COALESCE($9, timeout_seconds),
+                    enabled = COALESCE($7::BOOLEAN, enabled),
+                    auto_start = COALESCE($8::BOOLEAN, auto_start),
+                    timeout_seconds = COALESCE($9::INTEGER, timeout_seconds),
                     updated_at = NOW()
                 WHERE id = $1"#,
                 &[
@@ -420,7 +421,16 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_mcp_server: {}", e))?;
+            .map_err(|e| {
+                // Include the DbError source chain for debugging (default Display is "db error")
+                let mut msg = format!("PG update_mcp_server: {}", e);
+                let mut source = std::error::Error::source(&e);
+                while let Some(src) = source {
+                    msg.push_str(&format!(" — {}", src));
+                    source = src.source();
+                }
+                msg
+            })?;
 
         if rows_affected == 0 {
             return Err(format!("MCP server not found: {}", id));
