@@ -62,7 +62,6 @@ mod job_object;
 mod knowledge_acquisition;
 mod known_issues;
 mod log_consolidation;
-mod log_migration;
 mod logging;
 mod macros;
 mod mcp;

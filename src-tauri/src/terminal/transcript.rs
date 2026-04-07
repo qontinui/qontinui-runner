@@ -950,7 +950,7 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
         // Use PowerShell to get Claude Code processes with their PIDs and command lines
         // Note: Win32_Process doesn't expose CWD directly, so we extract the
         // CLAUDE_CONFIG_DIR or project path from the command line as a proxy.
-        let output = std::process::Command::new("powershell")
+        let output = crate::process_helpers::no_window("powershell")
             .args([
                 "-NoProfile",
                 "-Command",

@@ -1874,7 +1874,11 @@ pub async fn get_execution_spans(
     })))
 }
 
-/// Migrate JSONL logs to SQLite for a task run.
+/// Migrate JSONL logs to the database for a task run.
+///
+/// TODO: Port the old log_migration logic to write into PostgreSQL. Currently
+/// this endpoint is a stub that returns an error so the client knows the
+/// feature isn't live yet.
 pub async fn migrate_task_run_logs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1882,7 +1886,7 @@ pub async fn migrate_task_run_logs(
     use std::path::PathBuf;
     use tracing::info;
 
-    info!("Migrating JSONL logs to SQLite for task run: {}", id);
+    info!("Migrating JSONL logs for task run: {}", id);
 
     // Verify task exists
     let task_run = state
@@ -1905,12 +1909,12 @@ pub async fn migrate_task_run_logs(
             )
         })?;
 
-    // Log migration requires CheckpointDb — stubbed until ported to PgDb
+    // Stub until log migration is implemented against PG.
     let _task_run = task_run;
     let _dev_logs_dir = dev_logs_dir;
     Err((
         StatusCode::INTERNAL_SERVER_ERROR,
-        "Log migration not yet ported to PgDb".to_string(),
+        "Log migration to PostgreSQL is not yet implemented".to_string(),
     ))
 }
 
