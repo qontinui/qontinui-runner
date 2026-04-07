@@ -102,6 +102,20 @@ async fn health(
     let status = if last_pong > 0 { "ok" } else { "starting" };
     let console_errors = state.ui_bridge_console_error_count.load(Ordering::Relaxed);
 
+    // AI provider circuit breaker states
+    let ai_provider_states: Vec<serde_json::Value> =
+        crate::ai_provider::circuit_breaker::all_provider_states()
+            .into_iter()
+            .map(|(key, cb_state)| {
+                let available = crate::ai_provider::circuit_breaker::is_provider_available(&key);
+                serde_json::json!({
+                    "providerKey": key,
+                    "state": cb_state.to_string(),
+                    "available": available,
+                })
+            })
+            .collect();
+
     Json(serde_json::json!({
         "success": true,
         "data": {
@@ -114,6 +128,7 @@ async fn health(
             "pendingRequests": pending_count,
             "circuitBreaker": format!("{:?}", circuit_breaker_state),
             "consoleErrorCount": console_errors,
+            "aiProviderCircuitBreakers": ai_provider_states,
         },
         "uiBridge": {
             "appId": "qontinui-runner",
@@ -530,6 +545,7 @@ pub fn create_router(
         .merge(crate::mcp::orchestration_loop_api::routes())
         .merge(crate::mcp::playwright::routes())
         .merge(crate::mcp::processes::routes())
+        .merge(crate::mcp::provider_health::routes())
         .merge(crate::mcp::prompts::routes())
         .merge(crate::mcp::prompt_home::routes())
         .merge(crate::mcp::query_tool::routes())
@@ -539,6 +555,7 @@ pub fn create_router(
         .merge(crate::mcp::reflection_api::routes())
         .merge(crate::mcp::graph_api::routes())
         .merge(crate::mcp::observations_api::routes())
+        .merge(crate::mcp::entity_profiles_api::routes())
         .merge(crate::mcp::online_learning_api::routes())
         .merge(crate::mcp::memory_consolidation_api::routes())
         .merge(crate::mcp::query_memory_tool::routes())

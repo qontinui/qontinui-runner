@@ -578,6 +578,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::refresh_claude_cli_auth,
             commands::ai_settings::get_agentic_settings,
             commands::ai_settings::save_agentic_settings,
+            // AI provider circuit breaker commands
+            commands::ai_settings::get_provider_circuit_states,
+            commands::ai_settings::reset_provider_circuit,
             // Accessibility commands
             commands::accessibility::get_accessibility_settings,
             commands::accessibility::save_accessibility_settings,
@@ -1637,6 +1640,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 memory::scheduler::MemorySchedulerConfig::default(),
             );
 
+            // Start dreamer (formal reasoning) scheduler in background
+            info!("Starting dreamer scheduler");
+            let dreamer_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();
+            memory::scheduler::start_dreamer_scheduler(
+                dreamer_pg,
+                memory::scheduler::MemorySchedulerConfig::default(),
+            );
+
             // Auto-start MCP servers marked with auto_start in background
             let app_state_for_mcp_auto = app.state::<Arc<AppState>>().inner().clone();
             tauri::async_runtime::spawn(async move {
@@ -1645,6 +1656,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             // Cloud relay auto-start is handled in mcp_api.rs where ApiState is available
+
+            // Forward circuit breaker state-change events to the frontend
+            let app_handle_cb = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut rx = crate::ai_provider::circuit_breaker::event_receiver();
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            let _ = tauri::Emitter::emit(&app_handle_cb, "circuit-breaker-change", &event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Circuit breaker event listener lagged by {} events", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
 
             // Check Claude CLI auth status on startup
             let app_handle_for_auth = app.handle().clone();

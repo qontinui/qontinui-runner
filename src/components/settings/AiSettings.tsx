@@ -25,6 +25,7 @@ import { ClaudeCliSection } from "./ai-settings/ClaudeCliSection";
 import { ClaudeApiSection } from "./ai-settings/ClaudeApiSection";
 import { GeminiCliSection } from "./ai-settings/GeminiCliSection";
 import { GeminiApiSection } from "./ai-settings/GeminiApiSection";
+import { ProviderHealthStatus } from "./ai-settings/ProviderHealthStatus";
 
 interface AiSettingsProps {
   onLog: LogFunction;
@@ -433,6 +434,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           </span>
         </div>
       )}
+
+      {/* Circuit Breaker Status */}
+      <ProviderHealthStatus />
 
       {/* Provider Selection */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">

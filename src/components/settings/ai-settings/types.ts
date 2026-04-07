@@ -24,6 +24,12 @@ export interface TauriResult<T> {
   message?: string;
 }
 
+export interface ProviderCircuitState {
+  provider_key: string;
+  state: "Closed" | "Open" | "HalfOpen";
+  available: boolean;
+}
+
 export interface HasApiKeyData {
   has_key: boolean;
 }

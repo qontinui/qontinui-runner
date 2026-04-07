@@ -1239,3 +1239,24 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
 pub fn get_provider_api_key(provider: &str) -> Result<Option<String>, String> {
     get_ai_api_key(provider).map_err(|e| format!("Failed to get API key: {}", e))
 }
+
+// ============================================================================
+// Circuit Breaker Commands
+// ============================================================================
+
+/// Get circuit breaker states for all AI providers.
+///
+/// Returns a snapshot of every provider that has been seen by the circuit breaker
+/// registry, along with its current state and availability.
+#[tauri::command]
+pub async fn get_provider_circuit_states() -> Result<Vec<crate::ai_provider::circuit_breaker::ProviderCircuitState>, String> {
+    Ok(crate::ai_provider::circuit_breaker::all_provider_circuit_states())
+}
+
+/// Manually reset a provider's circuit breaker to the Closed (healthy) state.
+#[tauri::command]
+pub async fn reset_provider_circuit(provider_key: String) -> Result<(), String> {
+    info!("Resetting circuit breaker for provider: {}", provider_key);
+    crate::ai_provider::circuit_breaker::reset_provider(&provider_key);
+    Ok(())
+}
