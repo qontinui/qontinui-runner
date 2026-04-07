@@ -552,24 +552,14 @@ fn run_claude_session_inline(
                 if session_done_flush.load(Ordering::Relaxed) {
                     break;
                 }
-                // Read current output length
+                // Partial-AI-output flush is pending a PG port; see Bug 4 in
+                // plans/sqlite-vestige-followup.md. The scaffolding (thread,
+                // stop channel, snapshot buffer) is kept in place so the
+                // eventual flush implementation can plug in without rewiring.
                 let current_len = flush_buf.lock().map(|buf| buf.len()).unwrap_or(0);
-                // Only flush if there's new content (at least 1KB of new data)
-                if current_len > last_flushed_len && (current_len - last_flushed_len) >= 1024 {
-                    let output_snapshot =
-                        flush_buf.lock().map(|buf| buf.clone()).unwrap_or_default();
-                    if !output_snapshot.is_empty() {
-                        if let Err(e) = Err::<(), String>("SQLite removed".into()) {
-                            warn!("Failed to flush partial AI output: {}", e);
-                        } else {
-                            last_flushed_len = output_snapshot.len();
-                            debug!(
-                                "Flushed {} chars of partial AI output for iteration {}",
-                                last_flushed_len, iteration
-                            );
-                        }
-                    }
-                }
+                let _ = last_flushed_len;
+                let _ = current_len;
+                let _ = iteration;
             }
         }))
     } else {

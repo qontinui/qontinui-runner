@@ -1,9 +1,9 @@
-//! Causal Chain types and legacy insert stub.
+//! Causal chain types shared across the reflection and blame-engine paths.
 //!
-//! The PG implementations live on `PgDb` in `database/pg/reflection.rs`.
-//! Only the shared types and the still-called `insert_causal_event` stub
-//! remain here; the latter is a no-op pending a proper PG port and is
-//! tracked as deferred work.
+//! The actual insert/query implementations live on `PgDb` in
+//! `database/pg/spec_experimentation.rs` (`insert_causal_event`,
+//! `get_causal_events_for_workflow`, etc.). This module only carries the
+//! wire types.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,22 +49,3 @@ pub struct CausalSummary {
     pub avg_chain_length: f64,
 }
 
-// ---------------------------------------------------------------------------
-// Insert (legacy stub — pending PG port, called from blame engine)
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-pub fn insert_causal_event(
-    _cause_type: &str,
-    _cause_id: &str,
-    _effect_type: &str,
-    _effect_id: &str,
-    _relationship: &str,
-    _confidence: &str,
-    _source: &str,
-    _task_run_id: Option<&str>,
-    _workflow_name: Option<&str>,
-    _description: Option<&str>,
-) -> Result<String, String> {
-    Err("SQLite removed".to_string())
-}
