@@ -131,11 +131,6 @@ pub struct SyncResultResponse {
 }
 
 /// Trigger sync of pending discoveries to qontinui-web.
-///
-/// Uses a three-phase approach to avoid Send issues with rusqlite Connection:
-/// 1. Extract discoveries (sync, with connection)
-/// 2. Push to backend (async, no connection needed)
-/// 3. Apply results (sync, with new connection)
 #[tauri::command]
 pub async fn sync_discoveries(
     state: State<'_, Arc<AppState>>,

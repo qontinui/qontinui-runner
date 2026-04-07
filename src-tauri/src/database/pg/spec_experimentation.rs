@@ -848,25 +848,6 @@ impl PgDb {
             .collect())
     }
 
-    // ========================================================================
-    // Q-Routing SQLite mirrors
-    // ========================================================================
-
-    /// Insert or update a Q-routing override (SQLite fallback mirror).
-    pub async fn upsert_q_override_sqlite_mirror(
-        &self,
-        state_key: &str,
-        forced_action: &str,
-    ) -> Result<(), String> {
-        // This is handled by the existing upsert_q_override method
-        self.upsert_q_override(state_key, forced_action).await
-    }
-
-    /// Delete Q-routing override (SQLite fallback mirror).
-    pub async fn delete_q_override_sqlite_mirror(&self, state_key: &str) -> Result<bool, String> {
-        self.delete_q_override(state_key).await
-    }
-
     /// Load all Q-table entries.
     pub async fn load_q_table(&self) -> Result<Vec<(String, String, f64, u32)>, String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;

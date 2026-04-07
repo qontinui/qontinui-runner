@@ -727,31 +727,3 @@ pub fn check_and_launch_optimizers_with_pg(
     Ok(launched)
 }
 
-#[cfg(all(test, feature = "sqlite_tests"))]
-mod tests {
-    use super::*;
-
-    fn setup_test_db() {
-        panic!("SQLite tests disabled — use PG-based tests instead")
-    }
-
-    #[test]
-    fn test_guard_skips_when_meta_optimizer_running() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_guard_skips_when_source_is_fixer() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_guard_skips_when_disabled() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_threshold_counts_correctly() {
-        // SQLite removed - no-op
-    }
-}

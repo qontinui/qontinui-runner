@@ -388,7 +388,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "sqlite_tests")]
     #[test]
     fn test_seed_templates_idempotent() {
         let conn = Connection::open_in_memory().unwrap();

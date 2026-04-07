@@ -6486,10 +6486,6 @@ fn days_to_epoch_ms(days: u32) -> i64 {
     now - (days as i64 * 86_400_000)
 }
 
-fn days_to_sqlite_datetime(days: u32) -> String {
-    format!("-{} days", days)
-}
-
 /// GET /ui-bridge/analytics/decay-curve
 pub async fn analytics_decay_curve_handler(
     State(state): State<Arc<ApiState>>,

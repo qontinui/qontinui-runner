@@ -2,7 +2,6 @@ use chrono::Local;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tracing::Level;
 use tracing_appender::{non_blocking, rolling};
 use tracing_subscriber::{
@@ -12,7 +11,7 @@ use tracing_subscriber::{
     EnvFilter, Registry,
 };
 
-use crate::tracing_layers::{JsonlSpanLayer, SpanLayerConfig, SqliteSpanLayer};
+use crate::tracing_layers::{JsonlSpanLayer, SpanLayerConfig};
 
 /// Flag to track if we're already handling a crash (prevent recursive crashes)
 static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
@@ -55,8 +54,6 @@ pub struct LoggingConfig {
     pub log_dir: PathBuf,
     /// Enable JSONL span output for real-time debugging
     pub enable_span_jsonl: bool,
-    /// Enable SQLite span output for AI analysis
-    pub enable_span_sqlite: bool,
     /// OpenTelemetry configuration, read from persisted settings at startup.
     /// The tracing subscriber is set once, so OTel changes require a restart.
     pub otel: crate::otel::OtelConfig,
@@ -75,16 +72,13 @@ impl Default for LoggingConfig {
             log_to_console: cfg!(debug_assertions),
             log_dir,
             enable_span_jsonl: true,
-            enable_span_sqlite: true,
             otel: crate::otel::OtelConfig::default(),
         }
     }
 }
 
-/// Result of logging initialization, containing layers that need post-init configuration
+/// Result of logging initialization.
 pub struct LoggingInitResult {
-    /// SQLite span layer (needs database pool to be set after DB init)
-    pub sqlite_span_layer: Option<Arc<SqliteSpanLayer>>,
     /// OTel guard — keeps the TracerProvider alive; drops on shutdown.
     pub _otel_guard: crate::otel::OtelGuard,
 }
@@ -110,14 +104,10 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     let span_config = SpanLayerConfig {
         dev_logs_dir: crate::paths::get_dev_logs_dir(),
         enable_jsonl: config.enable_span_jsonl,
-        enable_sqlite: config.enable_span_sqlite,
-        ..Default::default()
     };
 
-    // Create the span layers
-    let jsonl_layer = JsonlSpanLayer::new(span_config.clone());
-    let sqlite_layer = Arc::new(SqliteSpanLayer::new(span_config));
-    let sqlite_layer_for_registry = Arc::clone(&sqlite_layer);
+    // Create the JSONL span layer
+    let jsonl_layer = JsonlSpanLayer::new(span_config);
 
     // Store log_dir for logging before it's moved
     let log_dir_path = config.log_dir.clone();
@@ -138,11 +128,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
                 "%Y-%m-%d %H:%M:%S%.3f".to_string(),
             ));
 
-        // Add span layers
-        let subscriber = registry
-            .with(file_layer)
-            .with(jsonl_layer)
-            .with(SqliteSpanLayerWrapper(sqlite_layer_for_registry));
+        let subscriber = registry.with(file_layer).with(jsonl_layer);
 
         if config.log_to_console {
             let console_layer = fmt::layer()
@@ -158,66 +144,19 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
             .with_writer(std::io::stdout)
             .with_span_events(FmtSpan::CLOSE);
 
-        registry
-            .with(console_layer)
-            .with(jsonl_layer)
-            .with(SqliteSpanLayerWrapper(sqlite_layer_for_registry))
-            .init();
+        registry.with(console_layer).with(jsonl_layer).init();
     } else {
-        // No file or console, but still add span layers
-        registry
-            .with(jsonl_layer)
-            .with(SqliteSpanLayerWrapper(sqlite_layer_for_registry))
-            .init();
+        registry.with(jsonl_layer).init();
     }
 
     tracing::info!("Logging initialized at level: {:?}", config.level);
     tracing::info!("Log directory: {:?}", log_dir_path);
-    tracing::info!(
-        "Span layers enabled: JSONL={}, SQLite={}",
-        config.enable_span_jsonl,
-        config.enable_span_sqlite
-    );
+    tracing::info!("JSONL span layer enabled: {}", config.enable_span_jsonl);
     tracing::info!("Application started at {}", Local::now());
 
     Ok(LoggingInitResult {
-        sqlite_span_layer: Some(sqlite_layer),
         _otel_guard: otel_guard,
     })
-}
-
-/// Wrapper to allow Arc<SqliteSpanLayer> to implement Layer
-struct SqliteSpanLayerWrapper(Arc<SqliteSpanLayer>);
-
-impl<S> tracing_subscriber::Layer<S> for SqliteSpanLayerWrapper
-where
-    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
-{
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        id: &tracing::span::Id,
-        ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        self.0.on_new_span(attrs, id, ctx);
-    }
-
-    fn on_record(
-        &self,
-        id: &tracing::span::Id,
-        values: &tracing::span::Record<'_>,
-        ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        self.0.on_record(id, values, ctx);
-    }
-
-    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        self.0.on_event(event, ctx);
-    }
-
-    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
-        self.0.on_close(id, ctx);
-    }
 }
 
 #[macro_export]

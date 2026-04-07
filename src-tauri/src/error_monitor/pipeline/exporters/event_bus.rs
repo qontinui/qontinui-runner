@@ -29,8 +29,9 @@ impl Exporter for EventBusExporter {
         let error_count = records.iter().filter(|r| r.parsed.is_some()).count();
 
         if error_count > 0 {
-            // Emit a NewErrors event as a notification (the actual errors
-            // are stored by the SqliteExporter — this just notifies the UI)
+            // Emit a NewErrors notification to wake up the UI. The payload is
+            // empty because this exporter only signals presence — subscribers
+            // fetch the actual records via the PG-backed query API.
             let _ = self.tx.send(ErrorMonitorEvent::NewErrors(Vec::new())).await;
             let source = records
                 .first()

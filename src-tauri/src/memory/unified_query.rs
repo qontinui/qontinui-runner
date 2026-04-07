@@ -386,7 +386,7 @@ async fn retrieve_knowledge(pg: &PgDb, query: &str, limit: i64) -> Vec<MemoryRes
     }
 }
 
-/// LIKE search via PG unified_search (replaces SQLite retrieve_sqlite).
+/// LIKE search via PG unified_search.
 async fn retrieve_pg_unified(
     pg: &crate::database::pg::PgDb,
     query: &str,

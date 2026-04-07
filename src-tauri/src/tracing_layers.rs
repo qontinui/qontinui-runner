@@ -1,29 +1,8 @@
-//! Custom tracing subscriber layers for span instrumentation.
+//! Custom tracing subscriber layer for span instrumentation.
 //!
-//! This module provides two layers:
-//! 1. `JsonlSpanLayer` - Writes all spans to runner-spans.jsonl for real-time debugging
-//! 2. `SqliteSpanLayer` - Persists summary spans to the database for AI analysis
-//!
-//! # Architecture
-//!
-//! ```text
-//!                           ┌─────────────────────────────────┐
-//!                           │     Tracing Subscriber          │
-//!                           │  (tracing-subscriber Registry)  │
-//!                           └─────────────┬───────────────────┘
-//!                                         │
-//!               ┌─────────────────────────┼─────────────────────────┐
-//!               │                         │                         │
-//!               ▼                         ▼                         ▼
-//!     ┌─────────────────┐     ┌─────────────────────┐    ┌──────────────────┐
-//!     │  Console/File   │     │   JSONL Layer       │    │  SQLite Layer    │
-//!     │  (existing)     │     │   (all spans)       │    │  (summary only)  │
-//!     └─────────────────┘     └─────────────────────┘    └──────────────────┘
-//!            │                         │                         │
-//!            ▼                         ▼                         ▼
-//!     qontinui-runner.log    runner-spans.jsonl         execution_spans table
-//!     (text, rolling)        (cleared per run)          (persistent)
-//! ```
+//! Provides `JsonlSpanLayer` — writes all spans to `runner-spans.jsonl` for
+//! real-time debugging. Spans are also flushed to file/console via the standard
+//! tracing-subscriber fmt layer configured in `logging.rs`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -49,23 +28,13 @@ pub struct SpanLayerConfig {
     pub dev_logs_dir: PathBuf,
     /// Whether to enable JSONL output
     pub enable_jsonl: bool,
-    /// Whether to enable SQLite output
-    pub enable_sqlite: bool,
-    /// Span names to persist to SQLite (summary spans only)
-    pub summary_span_names: Vec<String>,
 }
 
 impl Default for SpanLayerConfig {
     fn default() -> Self {
-        use crate::semantic_conventions::spans;
-
-        let names: Vec<String> = spans::SUMMARY_SPANS.iter().map(|s| s.to_string()).collect();
-
         Self {
             dev_logs_dir: crate::paths::get_dev_logs_dir(),
             enable_jsonl: true,
-            enable_sqlite: true,
-            summary_span_names: names,
         }
     }
 }
@@ -329,36 +298,6 @@ where
 }
 
 // ============================================================================
-// SQLite Span Layer (stub -- SQLite removed, PG span persistence TBD)
-// ============================================================================
-
-/// No-op span layer stub. Previously persisted spans to SQLite; the SQLite
-/// backend has been removed. Retains the public API so callers compile.
-pub struct SqliteSpanLayer {
-    config: SpanLayerConfig,
-    /// Track active spans by their ID (unused, kept for API compat)
-    active_spans: Arc<RwLock<HashMap<u64, ActiveSpanData>>>,
-}
-
-impl SqliteSpanLayer {
-    /// Create a new (no-op) span layer
-    pub fn new(config: SpanLayerConfig) -> Self {
-        Self {
-            config,
-            active_spans: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-}
-
-// No-op Layer implementation for SqliteSpanLayer (SQLite removed)
-impl<S> Layer<S> for SqliteSpanLayer
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    // All methods use default no-op implementations
-}
-
-// ============================================================================
 // Visitor Helpers
 // ============================================================================
 
@@ -490,14 +429,4 @@ mod tests {
         assert!(json.contains("abc12345"));
     }
 
-    #[test]
-    fn test_config_default_summary_spans() {
-        let config = SpanLayerConfig::default();
-        assert!(config
-            .summary_span_names
-            .contains(&"qontinui.workflow".to_string()));
-        assert!(config
-            .summary_span_names
-            .contains(&"qontinui.ai.session".to_string()));
-    }
 }

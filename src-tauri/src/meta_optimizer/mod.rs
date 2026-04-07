@@ -54,6 +54,3 @@ pub mod span_instrumentation;
 pub mod trace_adapter;
 pub mod trigger;
 pub mod types;
-
-#[cfg(test)]
-mod scout_integration_tests;

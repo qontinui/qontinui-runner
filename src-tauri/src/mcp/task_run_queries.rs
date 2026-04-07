@@ -1163,46 +1163,6 @@ pub async fn get_execution_spans(
     })))
 }
 
-/// Migrate JSONL logs to SQLite for a task run.
-pub async fn migrate_task_run_logs(
-    State(state): State<Arc<ApiState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use std::path::PathBuf;
-    use tracing::info;
-
-    info!("Migrating JSONL logs to SQLite for task run: {}", id);
-
-    // Verify task exists
-    let task_run = state
-        .app_state
-        .pg_db
-        .get_task_run(&id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
-
-    // Get the dev-logs directory path
-    let dev_logs_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join(".dev-logs"))
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to resolve .dev-logs path".to_string(),
-            )
-        })?;
-
-    // Log migration stub — CheckpointDb removed, log_migration not yet ported to PgDb
-    let _task_run = task_run;
-    let _dev_logs_dir = dev_logs_dir;
-    Err((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Log migration not yet ported to PgDb".to_string(),
-    ))
-}
-
 /// Aggregate raw task run events into per-step execution summaries.
 ///
 /// This extracts the event aggregation logic that was previously inline in

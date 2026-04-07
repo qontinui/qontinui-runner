@@ -1717,25 +1717,6 @@ impl PgDb {
         &self.pool
     }
 
-    /// Try to connect to PostgreSQL. Returns None with a warning if unavailable.
-    /// Used during startup for graceful degradation to SQLite.
-    pub async fn try_new(database_url: &str) -> Option<Self> {
-        match Self::new(database_url).await {
-            Ok(db) => Some(db),
-            Err(e) => {
-                warn!("PostgreSQL unavailable, using SQLite only: {}", e);
-                None
-            }
-        }
-    }
-
-    /// One-time migration of token usage data from SQLite to PostgreSQL.
-    /// SQLite has been removed — this is now a no-op.
-    pub async fn migrate_token_data_from_sqlite(&self) -> Result<u64, String> {
-        info!("SQLite removed — token data migration is a no-op");
-        Ok(0)
-    }
-
     /// Blocking helper for tests: create a PgDb using DATABASE_URL.
     /// Panics if PG is not available.
     #[cfg(test)]

@@ -18,7 +18,6 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::RwLock;
 
 use crate::error_monitor::pipeline::exporters::event_bus::EventBusExporter;
-use crate::error_monitor::pipeline::exporters::sqlite::SqliteExporter;
 use crate::error_monitor::pipeline::processors::dedup::DedupProcessor;
 use crate::error_monitor::pipeline::processors::jsonl_preprocess::JsonlPreprocessor;
 use crate::error_monitor::pipeline::processors::parser::ParserProcessor;
@@ -320,7 +319,7 @@ pub struct ErrorMonitorService {
     config: ErrorMonitorConfig,
     /// Currently monitored files with their state
     file_states: HashMap<String, FileState>,
-    /// Current workflow context (shared with SqliteExporter)
+    /// Current workflow context, attached to emitted events.
     current_task_run_id: Arc<RwLock<Option<String>>>,
     current_workflow_name: Arc<RwLock<Option<String>>>,
     /// Event sender (kept for non-pipeline events like SourceAdded)
@@ -329,8 +328,7 @@ pub struct ErrorMonitorService {
     jsonl_preprocessor: JsonlPreprocessor,
     parser_processor: ParserProcessor,
     dedup_processor: DedupProcessor,
-    /// Pipeline exporters
-    sqlite_exporter: SqliteExporter,
+    /// Pipeline exporter — dispatches parsed events onto the service event bus.
     event_bus_exporter: EventBusExporter,
 }
 
@@ -346,8 +344,6 @@ impl ErrorMonitorService {
         let current_task_run_id: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
         let current_workflow_name: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
-        let sqlite_exporter =
-            SqliteExporter::new(current_task_run_id.clone(), current_workflow_name.clone());
         let event_bus_exporter = EventBusExporter::new(event_tx.clone());
 
         let handle = ErrorMonitorHandle {
@@ -365,7 +361,6 @@ impl ErrorMonitorService {
             jsonl_preprocessor: JsonlPreprocessor,
             parser_processor: ParserProcessor::new(),
             dedup_processor: DedupProcessor::new(10_000),
-            sqlite_exporter,
             event_bus_exporter,
         };
 
@@ -758,10 +753,6 @@ impl ErrorMonitorService {
             return;
         }
 
-        // Fan out to exporters
-        if let Err(e) = self.sqlite_exporter.export(&records).await {
-            tracing::warn!("SQLite export failed: {}", e);
-        }
         if let Err(e) = self.event_bus_exporter.export(&records).await {
             tracing::warn!("Event bus export failed: {}", e);
         }

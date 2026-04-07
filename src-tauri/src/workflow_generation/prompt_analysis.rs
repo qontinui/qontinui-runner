@@ -68,36 +68,3 @@ pub fn analyze_all() -> Result<Vec<PromptInsight>, String> {
     Err("SQLite removed".to_string())
 }
 
-#[cfg(all(test, feature = "sqlite_tests"))]
-mod tests {
-    use super::*;
-
-    fn setup_test_db() {
-        panic!("SQLite tests disabled — use PG-based tests instead")
-    }
-
-    #[test]
-    fn test_analyze_reflection_fixes_above_threshold() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_analyze_reflection_fixes_below_threshold() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_analyze_specification_gaps() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_analyze_verification_blind_spots() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_analyze_all_combines_insights() {
-        // SQLite removed - no-op
-    }
-}
