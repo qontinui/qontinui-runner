@@ -327,7 +327,39 @@ fn db_test_to_definition(test: &VerificationTest) -> TestDefinition {
     }
 }
 
-// executor_status_to_db removed — test result storage not yet on PgDb
+/// Persist a `TestExecutionResult` into the `test_results` table (Bug 9).
+async fn persist_test_result(
+    pg_db: &crate::database::pg::PgDb,
+    test_id: &str,
+    task_run_id: Option<&str>,
+    exec: &TestExecutionResult,
+) -> Result<String, String> {
+    let status_str = match exec.status {
+        TestStatus::Pending => "pending",
+        TestStatus::Running => "running",
+        TestStatus::Passed => "passed",
+        TestStatus::Failed => "failed",
+        TestStatus::Skipped => "skipped",
+        TestStatus::Error => "error",
+        TestStatus::Timeout => "timeout",
+    };
+    pg_db
+        .create_test_result(
+            test_id,
+            task_run_id,
+            status_str,
+            Some(exec.started_at.as_str()),
+            Some(exec.completed_at.as_str()),
+            Some(exec.duration_ms as i64),
+            Some(exec.output.as_str()),
+            exec.error.as_deref(),
+            exec.structured_output.as_ref(),
+            exec.assertions_passed,
+            exec.assertions_failed,
+            &exec.screenshots,
+        )
+        .await
+}
 
 // ========================================================================
 // Database CRUD Commands
@@ -341,16 +373,23 @@ pub async fn list_verification_tests(
     category: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    // list_verification_tests not yet implemented on PgDb — return empty
-    let _db = &state.pg_db;
-    let _enabled_only = enabled_only;
-    let _test_type = test_type;
-    let _category = category;
-    Ok(CommandResponse {
-        success: true,
-        message: Some("Found 0 verification tests".to_string()),
-        data: Some(serde_json::to_value(Vec::<VerificationTest>::new()).unwrap_or_default()),
-    })
+    let filter = crate::database::pg::verification_tests::VerificationTestFilter {
+        enabled_only: enabled_only.unwrap_or(false),
+        test_type,
+        category,
+    };
+    match state.pg_db.list_verification_tests(filter).await {
+        Ok(tests) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} verification tests", tests.len())),
+            data: Some(serde_json::to_value(tests).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to list tests: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 /// Get a single verification test by ID
@@ -390,19 +429,22 @@ pub async fn create_verification_test(
     input: CreateVerificationTestInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
-
     info!(
         "Creating verification test: {} (type: {:?})",
         input.name, input.test_type
     );
-
-    // create_verification_test not yet implemented on PgDb — stub
-    Ok(CommandResponse {
-        success: false,
-        message: Some("create_verification_test not yet implemented on PgDb".to_string()),
-        data: None,
-    })
+    match state.pg_db.create_verification_test(&input).await {
+        Ok(test) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Created test: {}", test.id)),
+            data: Some(serde_json::to_value(test).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to create test: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 /// Update an existing verification test
@@ -412,16 +454,19 @@ pub async fn update_verification_test(
     input: CreateVerificationTestInput,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
-
     info!("Updating verification test: {} ({})", input.name, id);
-
-    // update_verification_test not yet implemented on PgDb — stub
-    Ok(CommandResponse {
-        success: false,
-        message: Some("update_verification_test not yet implemented on PgDb".to_string()),
-        data: None,
-    })
+    match state.pg_db.update_verification_test(&id, &input).await {
+        Ok(test) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Updated test: {}", test.id)),
+            data: Some(serde_json::to_value(test).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to update test: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 /// Delete a verification test
@@ -430,16 +475,24 @@ pub async fn delete_verification_test(
     id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
-
     info!("Deleting verification test: {}", id);
-
-    // delete_verification_test not yet implemented on PgDb — stub
-    Ok(CommandResponse {
-        success: false,
-        message: Some("delete_verification_test not yet implemented on PgDb".to_string()),
-        data: None,
-    })
+    match state.pg_db.delete_verification_test(&id).await {
+        Ok(true) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Deleted test: {}", id)),
+            data: None,
+        }),
+        Ok(false) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Test not found: {}", id)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to delete test: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 // ========================================================================
@@ -483,9 +536,10 @@ pub async fn execute_test_by_id(
     let test_def = db_test_to_definition(&test);
     let exec_result = execute_test(&test_def);
 
-    let _task_run_id = task_run_id;
-
-    // create_test_result / update_test_result not yet on PgDb — skip result storage
+    // Persist the test result so it shows up in history.
+    if let Err(e) = persist_test_result(db, &test.id, task_run_id.as_deref(), &exec_result).await {
+        info!("Failed to persist test result for {}: {}", test.id, e);
+    }
 
     let success = matches!(exec_result.status, TestStatus::Passed);
 
@@ -517,7 +571,6 @@ pub async fn execute_tests_by_ids(
 ) -> Result<CommandResponse, String> {
     let db = &state.pg_db;
     let stop_on_failure = stop_on_failure.unwrap_or(false);
-    let _task_run_id = task_run_id;
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut total_passed = 0u32;
@@ -541,7 +594,12 @@ pub async fn execute_tests_by_ids(
         let test_def = db_test_to_definition(&test);
         let exec_result = execute_test(&test_def);
 
-        // create_test_result / update_test_result not yet on PgDb — skip result storage
+        // Persist the test result so it shows up in history.
+        if let Err(e) =
+            persist_test_result(db, &test.id, task_run_id.as_deref(), &exec_result).await
+        {
+            info!("Failed to persist test result for {}: {}", test.id, e);
+        }
 
         let passed = matches!(exec_result.status, TestStatus::Passed);
         if passed {
@@ -596,16 +654,22 @@ pub async fn get_test_results(
     limit: Option<u32>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
-    let _test_id = test_id;
-    let _limit = limit;
-
-    // get_results_for_test not yet implemented on PgDb — return empty
-    Ok(CommandResponse {
-        success: true,
-        message: Some("Found 0 results".to_string()),
-        data: Some(serde_json::json!([])),
-    })
+    match state
+        .pg_db
+        .list_test_results(Some(&test_id), None, None, limit)
+        .await
+    {
+        Ok(results) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} results", results.len())),
+            data: Some(serde_json::to_value(results).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to list results: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 /// Get test results for a task run
@@ -614,15 +678,22 @@ pub async fn get_task_run_test_results(
     task_run_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let _db = &state.pg_db;
-    let _task_run_id = task_run_id;
-
-    // get_results_for_task_run not yet implemented on PgDb — return empty
-    Ok(CommandResponse {
-        success: true,
-        message: Some("Found 0 results".to_string()),
-        data: Some(serde_json::json!([])),
-    })
+    match state
+        .pg_db
+        .list_test_results(None, Some(&task_run_id), None, None)
+        .await
+    {
+        Ok(results) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} results", results.len())),
+            data: Some(serde_json::to_value(results).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to list results: {}", e)),
+            data: None,
+        }),
+    }
 }
 
 // ========================================================================

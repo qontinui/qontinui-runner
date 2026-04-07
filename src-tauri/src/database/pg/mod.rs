@@ -64,6 +64,7 @@ pub mod token_analytics;
 pub mod token_usage;
 pub mod triggers;
 pub mod ui_bridge;
+pub mod verification_tests;
 pub mod watchers;
 pub mod workflow_state;
 pub mod workflows;
@@ -205,6 +206,64 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_task_runs_blocking_children
                 ON task_runs(parent_task_run_id, blocks_parent)
                 WHERE blocks_parent = true AND status NOT IN ('complete', 'failed', 'stopped');
+        "#,
+    },
+    Migration {
+        version: 7,
+        description: "Extend verification_tests with rich-test columns and ensure test_results table (Bug 9)",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS verification_tests (
+                id                  TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                description         TEXT,
+                workflow_id         TEXT,
+                test_type           TEXT NOT NULL DEFAULT 'python_script',
+                command             TEXT,
+                expected_exit_code  INTEGER DEFAULT 0,
+                expected_output     TEXT,
+                timeout_seconds     INTEGER DEFAULT 60,
+                enabled             BOOLEAN NOT NULL DEFAULT true,
+                tags                TEXT DEFAULT '[]',
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS category TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS playwright_code TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS vision_config TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS python_code TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS repo_test_config TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS success_criteria TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS config TEXT NOT NULL DEFAULT '{}';
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS is_critical BOOLEAN NOT NULL DEFAULT false;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS ai_generated BOOLEAN NOT NULL DEFAULT false;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS ai_generation_prompt TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS creation_analysis TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS source_file TEXT;
+            ALTER TABLE verification_tests ADD COLUMN IF NOT EXISTS last_exported_at TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_verification_tests_category ON verification_tests(category) WHERE category IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_verification_tests_enabled ON verification_tests(enabled) WHERE enabled;
+            CREATE TABLE IF NOT EXISTS test_results (
+                id                  TEXT PRIMARY KEY,
+                test_id             TEXT NOT NULL,
+                task_run_id         TEXT,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                started_at          TIMESTAMPTZ,
+                completed_at        TIMESTAMPTZ,
+                duration_ms         INTEGER,
+                output              TEXT,
+                error_message       TEXT,
+                structured_output   TEXT,
+                assertions_passed   INTEGER NOT NULL DEFAULT 0,
+                assertions_failed   INTEGER NOT NULL DEFAULT 0,
+                screenshots         TEXT NOT NULL DEFAULT '[]',
+                visual_evidence     TEXT,
+                ai_analysis         TEXT,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_test_results_test_id ON test_results(test_id);
+            CREATE INDEX IF NOT EXISTS idx_test_results_task_run_id ON test_results(task_run_id) WHERE task_run_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_test_results_status ON test_results(status);
+            CREATE INDEX IF NOT EXISTS idx_test_results_created_at ON test_results(created_at);
         "#,
     },
 ];
@@ -450,12 +509,18 @@ impl PgDb {
                 resolution_notes        TEXT,
                 resolved_at             TIMESTAMPTZ,
                 content_embedding       BYTEA,
+                archived_at             TIMESTAMPTZ,
+                summary_entry_id        TEXT REFERENCES task_knowledge(id) ON DELETE SET NULL,
                 created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
+            // Backfill columns for databases that already have task_knowledge.
+            "ALTER TABLE task_knowledge ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ",
+            "ALTER TABLE task_knowledge ADD COLUMN IF NOT EXISTS summary_entry_id TEXT REFERENCES task_knowledge(id) ON DELETE SET NULL",
             "CREATE INDEX IF NOT EXISTS idx_tk_task_run ON task_knowledge(task_run_id)",
             "CREATE INDEX IF NOT EXISTS idx_tk_category ON task_knowledge(category)",
             "CREATE INDEX IF NOT EXISTS idx_tk_resolved ON task_knowledge(is_resolved) WHERE NOT is_resolved",
             "CREATE INDEX IF NOT EXISTS idx_tk_created ON task_knowledge(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_tk_active ON task_knowledge(task_run_id, category) WHERE archived_at IS NULL",
             // Prompt Evolution (meta-prompt optimizer history)
             "CREATE TABLE IF NOT EXISTS prompt_evolution (
                 id                      TEXT PRIMARY KEY,

@@ -1545,17 +1545,33 @@ CREATE TABLE IF NOT EXISTS verification_tests (
     name TEXT NOT NULL,
     description TEXT,
     workflow_id TEXT,
-    test_type TEXT NOT NULL DEFAULT 'command',
+    test_type TEXT NOT NULL DEFAULT 'python_script',
     command TEXT,
     expected_exit_code INTEGER DEFAULT 0,
     expected_output TEXT,
     timeout_seconds INTEGER DEFAULT 60,
     enabled BOOLEAN NOT NULL DEFAULT true,
     tags TEXT DEFAULT '[]',
+    -- Rich-test columns added in v7 migration (Bug 9)
+    category TEXT,
+    playwright_code TEXT,
+    vision_config TEXT,
+    python_code TEXT,
+    repo_test_config TEXT,
+    success_criteria TEXT,
+    config TEXT NOT NULL DEFAULT '{}',
+    is_critical BOOLEAN NOT NULL DEFAULT false,
+    ai_generated BOOLEAN NOT NULL DEFAULT false,
+    ai_generation_prompt TEXT,
+    creation_analysis TEXT,
+    source_file TEXT,
+    last_exported_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_verification_tests_workflow ON verification_tests(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_verification_tests_category ON verification_tests(category) WHERE category IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_verification_tests_enabled ON verification_tests(enabled) WHERE enabled;
 
 -- Task Hooks
 CREATE TABLE IF NOT EXISTS task_hooks (
@@ -2609,34 +2625,6 @@ CREATE TABLE IF NOT EXISTS component_health_snapshots (
 CREATE INDEX IF NOT EXISTS idx_comp_health_snap_wf ON component_health_snapshots(workflow_name);
 CREATE INDEX IF NOT EXISTS idx_comp_health_snap_comp ON component_health_snapshots(workflow_name, component_path);
 CREATE INDEX IF NOT EXISTS idx_comp_health_snap_at ON component_health_snapshots(snapshot_at);
-
--- Autoresearch Campaigns (A/B testing campaigns)
-CREATE TABLE IF NOT EXISTS autoresearch_campaigns (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    config_json TEXT NOT NULL,
-    current_control_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'running',
-    experiment_count INTEGER NOT NULL DEFAULT 0,
-    accepted_count INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Autoresearch Experiments (individual A/B experiments)
-CREATE TABLE IF NOT EXISTS autoresearch_experiments (
-    id TEXT PRIMARY KEY,
-    campaign_id TEXT NOT NULL REFERENCES autoresearch_campaigns(id) ON DELETE CASCADE,
-    experiment_number INTEGER NOT NULL,
-    config_json TEXT NOT NULL,
-    trials_json TEXT NOT NULL,
-    aggregate_json TEXT NOT NULL,
-    accepted INTEGER NOT NULL DEFAULT 0,
-    reason TEXT,
-    p_value DOUBLE PRECISION,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_campaign ON autoresearch_experiments(campaign_id);
-CREATE INDEX IF NOT EXISTS idx_autoresearch_exp_number ON autoresearch_experiments(campaign_id, experiment_number);
 
 -- Agentic Metric Baselines (learned baselines per workflow)
 CREATE TABLE IF NOT EXISTS agentic_metric_baselines (

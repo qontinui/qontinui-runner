@@ -16,9 +16,12 @@ use crate::commands::testing::{
     execute_verification_test, execute_verification_test_suite, ExecuteTestResponse,
     ExecuteTestSuiteRequest, ExecuteTestSuiteResponse,
 };
-use crate::database::{CreateVerificationTestInput, TestResultStatus};
+use crate::database::pg::verification_tests::VerificationTestFilter;
+use crate::database::CreateVerificationTestInput;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::test_executor::{RepoTestConfig, TestCategory, TestDefinition, TestType, VisionConfig};
+use crate::test_executor::{
+    RepoTestConfig, TestCategory, TestDefinition, TestStatus, TestType, VisionConfig,
+};
 
 // ============================================================================
 // Types
@@ -59,9 +62,18 @@ pub async fn list_tests(
     Json<ApiResponse<Vec<crate::database::VerificationTest>>>,
     (StatusCode, Json<ApiResponse<()>>),
 > {
-    // checkpoint_db removed — verification tests not yet migrated to PG
-    let _ = query;
-    Ok(Json(ApiResponse::success(vec![])))
+    let filter = VerificationTestFilter {
+        enabled_only: query.enabled_only.unwrap_or(false),
+        test_type: query.test_type,
+        category: query.category,
+    };
+    match state.app_state.pg_db.list_verification_tests(filter).await {
+        Ok(tests) => Ok(Json(ApiResponse::success(tests))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to list tests: {}", e))),
+        )),
+    }
 }
 
 /// Get a verification test by ID
@@ -86,47 +98,60 @@ pub async fn get_test(
 
 /// Create a new verification test
 pub async fn create_test(
-    State(_state): State<Arc<ApiState>>,
-    Json(_input): Json<CreateVerificationTestInput>,
+    State(state): State<Arc<ApiState>>,
+    Json(input): Json<CreateVerificationTestInput>,
 ) -> Result<Json<ApiResponse<crate::database::VerificationTest>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    // checkpoint_db removed — create not yet migrated to PG
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(api_error(
-            "Verification tests: SQLite removed, not yet migrated to PG".to_string(),
+    match state.app_state.pg_db.create_verification_test(&input).await {
+        Ok(test) => Ok(Json(ApiResponse::success(test))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to create test: {}", e))),
         )),
-    ))
+    }
 }
 
 /// Update a verification test
 pub async fn update_test(
-    State(_state): State<Arc<ApiState>>,
-    Path(_id): Path<String>,
-    Json(_input): Json<CreateVerificationTestInput>,
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(input): Json<CreateVerificationTestInput>,
 ) -> Result<Json<ApiResponse<crate::database::VerificationTest>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    // checkpoint_db removed — update not yet migrated to PG
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(api_error(
-            "Verification tests: SQLite removed, not yet migrated to PG".to_string(),
-        )),
-    ))
+    match state
+        .app_state
+        .pg_db
+        .update_verification_test(&id, &input)
+        .await
+    {
+        Ok(test) => Ok(Json(ApiResponse::success(test))),
+        Err(e) => {
+            let status = if e.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((status, Json(api_error(format!("Failed to update test: {}", e)))))
+        }
+    }
 }
 
 /// Delete a verification test
 pub async fn delete_test(
-    State(_state): State<Arc<ApiState>>,
-    Path(_id): Path<String>,
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // checkpoint_db removed — delete not yet migrated to PG
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(api_error(
-            "Verification tests: SQLite removed, not yet migrated to PG".to_string(),
+    match state.app_state.pg_db.delete_verification_test(&id).await {
+        Ok(true) => Ok(Json(ApiResponse::success(()))),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Test not found: {}", id))),
         )),
-    ))
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to delete test: {}", e))),
+        )),
+    }
 }
 
 /// Execute a verification test by ID
@@ -163,8 +188,39 @@ pub async fn execute_test_by_id(
     // Execute the test
     let response = execute_verification_test(test_def);
 
-    // checkpoint_db removed — test result storage not yet migrated to PG
-    let _ = request.task_run_id;
+    // Persist the result so history/listing endpoints can see it.
+    let exec = &response.result;
+    let status_str = match exec.status {
+        TestStatus::Pending => "pending",
+        TestStatus::Running => "running",
+        TestStatus::Passed => "passed",
+        TestStatus::Failed => "failed",
+        TestStatus::Skipped => "skipped",
+        TestStatus::Error => "error",
+        TestStatus::Timeout => "timeout",
+    };
+    let task_run_id_ref = request.task_run_id.as_deref();
+    if let Err(e) = state
+        .app_state
+        .pg_db
+        .create_test_result(
+            &test.id,
+            task_run_id_ref,
+            status_str,
+            Some(exec.started_at.as_str()),
+            Some(exec.completed_at.as_str()),
+            Some(exec.duration_ms as i64),
+            Some(exec.output.as_str()),
+            exec.error.as_deref(),
+            exec.structured_output.as_ref(),
+            exec.assertions_passed,
+            exec.assertions_failed,
+            &exec.screenshots,
+        )
+        .await
+    {
+        warn!("Failed to persist test result for {}: {}", test.id, e);
+    }
 
     Ok(Json(ApiResponse::success(response)))
 }
@@ -190,43 +246,61 @@ pub async fn list_test_results(
     Query(query): Query<ListTestResultsQuery>,
 ) -> Result<Json<ApiResponse<Vec<crate::database::TestResult>>>, (StatusCode, Json<ApiResponse<()>>)>
 {
-    // checkpoint_db removed — test results not yet migrated to PG
-    let _ = query;
-    Ok(Json(ApiResponse::success(vec![])))
+    match state
+        .app_state
+        .pg_db
+        .list_test_results(
+            query.test_id.as_deref(),
+            query.task_run_id.as_deref(),
+            query.status.as_deref(),
+            query.limit,
+        )
+        .await
+    {
+        Ok(results) => Ok(Json(ApiResponse::success(results))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to list test results: {}", e))),
+        )),
+    }
 }
 
 /// Get a specific test result by ID
 pub async fn get_test_result(
-    State(_state): State<Arc<ApiState>>,
-    Path(_id): Path<String>,
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<crate::database::TestResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // checkpoint_db removed — test results not yet migrated to PG
-    Err((
-        StatusCode::NOT_FOUND,
-        Json(api_error(
-            "Test result not found (SQLite removed)".to_string(),
+    match state.app_state.pg_db.get_test_result(&id).await {
+        Ok(Some(r)) => Ok(Json(ApiResponse::success(r))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Test result not found: {}", id))),
         )),
-    ))
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get test result: {}", e))),
+        )),
+    }
 }
 
 /// Get test history summary (aggregated stats)
 pub async fn get_test_history(
-    State(_state): State<Arc<ApiState>>,
-    Query(_query): Query<ListTestResultsQuery>,
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ListTestResultsQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // checkpoint_db removed — test history not yet migrated to PG
-    Ok(Json(ApiResponse::success(serde_json::json!({
-        "total_runs": 0,
-        "passed": 0,
-        "failed": 0,
-        "error": 0,
-        "timeout": 0,
-        "skipped": 0,
-        "pass_rate": "0.0%",
-        "total_duration_ms": 0,
-        "average_duration_ms": 0,
-        "recent_results": [],
-    }))))
+    let limit = query.limit.unwrap_or(20);
+    match state
+        .app_state
+        .pg_db
+        .get_test_history(query.test_id.as_deref(), limit)
+        .await
+    {
+        Ok(history) => Ok(Json(ApiResponse::success(history))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get test history: {}", e))),
+        )),
+    }
 }
 
 // ============================================================================

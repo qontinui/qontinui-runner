@@ -1,7 +1,7 @@
 //! PostgreSQL check and check group operations via Clorinde-generated queries.
 
 use super::PgDb;
-use crate::database::types::{Check, CheckGroup, TestType, VerificationTest};
+use crate::database::types::{Check, CheckGroup};
 
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
@@ -241,61 +241,7 @@ impl PgDb {
             .ok_or_else(|| format!("Check not found after update: {}", id))
     }
 
-    /// Get a single verification test by ID.
-    pub async fn get_verification_test(
-        &self,
-        id: &str,
-    ) -> Result<Option<VerificationTest>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        let row = conn
-            .query_opt(
-                r#"SELECT id, name, description, test_type, timeout_seconds, enabled, tags,
-                          created_at, updated_at
-                   FROM verification_tests
-                   WHERE id = $1"#,
-                &[&id],
-            )
-            .await
-            .map_err(|e| format!("PG get_verification_test: {}", e))?;
-
-        Ok(row.map(|r| {
-            let test_type_str: String = r.get(3);
-            let tags_str: Option<String> = r.get(6);
-            let created: chrono::DateTime<chrono::Utc> = r.get(7);
-            let updated: chrono::DateTime<chrono::Utc> = r.get(8);
-
-            VerificationTest {
-                id: r.get(0),
-                name: r.get(1),
-                description: r.get(2),
-                test_type: test_type_str.parse().unwrap_or(TestType::PythonScript),
-                category: None,
-                playwright_code: None,
-                vision_config: None,
-                python_code: None,
-                repo_test_config: None,
-                success_criteria: None,
-                config: serde_json::json!({}),
-                timeout_seconds: r.get::<_, Option<i32>>(4).map(|v| v as u32),
-                is_critical: false,
-                enabled: r.get(5),
-                ai_generated: false,
-                ai_generation_prompt: None,
-                creation_analysis: None,
-                tags: tags_str
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default(),
-                source_file: None,
-                last_exported_at: None,
-                created_at: created.to_rfc3339(),
-                updated_at: updated.to_rfc3339(),
-            }
-        }))
-    }
+    // get_verification_test moved to pg::verification_tests module (Bug 9 — Bug 9 refactor)
 
     /// Create a check group.
     pub async fn create_check_group(
