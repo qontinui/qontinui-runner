@@ -30,7 +30,6 @@ pub mod backup_restore;
 pub mod bridges;
 pub mod canvas;
 pub mod cascade;
-pub mod checkpoints;
 pub mod checks;
 pub mod comparison_api;
 pub mod configs;

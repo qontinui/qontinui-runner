@@ -133,9 +133,6 @@ export { learningService } from "./learning-service";
 // Flow Service (Flow Designer for deterministic workflows)
 export { flowService } from "./flow-service";
 
-// Checkpoint Service (Checkpoint Browser for time-travel debugging)
-export { checkpointService } from "./checkpoint-service";
-
 // Element Description Service (UI Bridge element annotation persistence)
 export { ElementDescriptionService } from "./element-description-service";
 export type { PersistedElementDescription } from "./element-description-service";

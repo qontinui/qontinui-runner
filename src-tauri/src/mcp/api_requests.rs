@@ -184,14 +184,55 @@ pub async fn import_curl_to_library(
         format!("{} Request", parsed.method)
     });
 
-    // checkpoint_db removed — saved API requests not yet migrated to PG
-    let _ = name;
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(api_error(
-            "Saved API requests: SQLite removed, not yet migrated to PG".to_string(),
-        )),
-    ))
+    let create_req = crate::saved_api_requests::CreateSavedApiRequestRequest {
+        name,
+        description: String::new(),
+        category: request.category.unwrap_or_else(|| "imported".to_string()),
+        tags: vec!["imported".to_string(), "curl".to_string()],
+        method: parsed.method,
+        url: parsed.url,
+        headers: parsed.headers,
+        body: parsed.body,
+        body_content_type: parsed.content_type,
+        timeout_ms: 30000,
+        follow_redirects: true,
+        variable_extractions: Vec::new(),
+        assertions: Vec::new(),
+        credential_id: None,
+    };
+
+    match state
+        .app_state
+        .pg_db
+        .create_saved_api_request(&create_req)
+        .await
+    {
+        Ok(value) => match serde_json::from_value::<crate::saved_api_requests::SavedApiRequest>(
+            value,
+        ) {
+            Ok(parsed_req) => Ok(Json(ApiResponse::success(parsed_req))),
+            Err(e) => {
+                error!("Failed to parse created saved API request: {}", e);
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!(
+                        "Failed to parse created saved API request: {}",
+                        e
+                    ))),
+                ))
+            }
+        },
+        Err(e) => {
+            error!("Failed to save imported cURL to library: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to save imported cURL to library: {}",
+                    e
+                ))),
+            ))
+        }
+    }
 }
 
 /// Create routes for this module.

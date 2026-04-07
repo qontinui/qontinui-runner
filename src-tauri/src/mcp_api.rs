@@ -511,7 +511,6 @@ pub fn create_router(
         .merge(crate::mcp::api_requests::routes())
         .merge(crate::mcp::app_discovery::routes())
         .merge(crate::mcp::automation_runs::routes())
-        .merge(crate::mcp::checkpoints::routes())
         .merge(crate::mcp::comparison_api::routes())
         .merge(crate::mcp::checks::routes())
         .merge(crate::mcp::configs::routes())

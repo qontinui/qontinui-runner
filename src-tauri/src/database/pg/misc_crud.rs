@@ -202,6 +202,387 @@ impl PgDb {
         Ok(deleted.is_some())
     }
 
+    /// Create a new saved API request.
+    pub async fn create_saved_api_request(
+        &self,
+        input: &crate::saved_api_requests::CreateSavedApiRequestRequest,
+    ) -> Result<serde_json::Value, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let id = format!("sar-{}", uuid::Uuid::new_v4());
+        let method_str = serde_json::to_string(&input.method)
+            .map(|s| s.trim_matches('"').to_string())
+            .unwrap_or_else(|_| "GET".to_string());
+        let headers_json = serde_json::to_string(&input.headers).unwrap_or_else(|_| "{}".to_string());
+        let tags_json = serde_json::to_string(&input.tags).unwrap_or_else(|_| "[]".to_string());
+        let extractions_json = serde_json::to_string(&input.variable_extractions)
+            .unwrap_or_else(|_| "[]".to_string());
+        let assertions_json =
+            serde_json::to_string(&input.assertions).unwrap_or_else(|_| "[]".to_string());
+        let timeout_ms: i32 = input.timeout_ms as i32;
+
+        conn.execute(
+            r#"
+            INSERT INTO saved_api_requests (
+                id, name, description, category, tags, method, url, headers,
+                body, body_content_type, timeout_ms, follow_redirects,
+                variable_extractions, assertions, credential_id,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                NOW(), NOW()
+            )
+            "#,
+            &[
+                &id,
+                &input.name,
+                &input.description,
+                &input.category,
+                &tags_json,
+                &method_str,
+                &input.url,
+                &headers_json,
+                &input.body,
+                &input.body_content_type,
+                &timeout_ms,
+                &input.follow_redirects,
+                &extractions_json,
+                &assertions_json,
+                &input.credential_id,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG create_saved_api_request: {}", e))?;
+
+        self.get_saved_api_request(&id)
+            .await?
+            .ok_or_else(|| "Failed to retrieve created saved API request".to_string())
+    }
+
+    /// Update an existing saved API request.
+    /// Applies only the fields present in `input`; unset fields keep their current values.
+    pub async fn update_saved_api_request(
+        &self,
+        id: &str,
+        input: &crate::saved_api_requests::UpdateSavedApiRequestRequest,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let current = match self.get_saved_api_request(id).await? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let name = input
+            .name
+            .clone()
+            .unwrap_or_else(|| current["name"].as_str().unwrap_or("").to_string());
+        let description = input
+            .description
+            .clone()
+            .unwrap_or_else(|| current["description"].as_str().unwrap_or("").to_string());
+        let category = input
+            .category
+            .clone()
+            .unwrap_or_else(|| current["category"].as_str().unwrap_or("").to_string());
+        let tags_json = match &input.tags {
+            Some(t) => serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()),
+            None => serde_json::to_string(&current["tags"]).unwrap_or_else(|_| "[]".to_string()),
+        };
+        let method_str = match &input.method {
+            Some(m) => serde_json::to_string(m)
+                .map(|s| s.trim_matches('"').to_string())
+                .unwrap_or_else(|_| "GET".to_string()),
+            None => current["method"].as_str().unwrap_or("GET").to_string(),
+        };
+        let url = input
+            .url
+            .clone()
+            .unwrap_or_else(|| current["url"].as_str().unwrap_or("").to_string());
+        let headers_json = match &input.headers {
+            Some(h) => serde_json::to_string(h).unwrap_or_else(|_| "{}".to_string()),
+            None => serde_json::to_string(&current["headers"]).unwrap_or_else(|_| "{}".to_string()),
+        };
+        let body: Option<String> = match &input.body {
+            Some(b) => Some(b.clone()),
+            None => current["body"].as_str().map(|s| s.to_string()),
+        };
+        let body_content_type: Option<String> = match &input.body_content_type {
+            Some(b) => Some(b.clone()),
+            None => current["body_content_type"].as_str().map(|s| s.to_string()),
+        };
+        let timeout_ms: i32 = match input.timeout_ms {
+            Some(t) => t as i32,
+            None => current["timeout_ms"].as_i64().unwrap_or(30000) as i32,
+        };
+        let follow_redirects: bool = input
+            .follow_redirects
+            .unwrap_or_else(|| current["follow_redirects"].as_bool().unwrap_or(true));
+        let extractions_json = match &input.variable_extractions {
+            Some(e) => serde_json::to_string(e).unwrap_or_else(|_| "[]".to_string()),
+            None => serde_json::to_string(&current["variable_extractions"])
+                .unwrap_or_else(|_| "[]".to_string()),
+        };
+        let assertions_json = match &input.assertions {
+            Some(a) => serde_json::to_string(a).unwrap_or_else(|_| "[]".to_string()),
+            None => serde_json::to_string(&current["assertions"])
+                .unwrap_or_else(|_| "[]".to_string()),
+        };
+        let credential_id: Option<String> = match &input.credential_id {
+            Some(c) => Some(c.clone()),
+            None => current["credential_id"].as_str().map(|s| s.to_string()),
+        };
+
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let count = conn
+            .execute(
+                r#"
+                UPDATE saved_api_requests SET
+                    name = $1, description = $2, category = $3, tags = $4,
+                    method = $5, url = $6, headers = $7, body = $8,
+                    body_content_type = $9, timeout_ms = $10, follow_redirects = $11,
+                    variable_extractions = $12, assertions = $13, credential_id = $14,
+                    updated_at = NOW()
+                WHERE id = $15
+                "#,
+                &[
+                    &name,
+                    &description,
+                    &category,
+                    &tags_json,
+                    &method_str,
+                    &url,
+                    &headers_json,
+                    &body,
+                    &body_content_type,
+                    &timeout_ms,
+                    &follow_redirects,
+                    &extractions_json,
+                    &assertions_json,
+                    &credential_id,
+                    &id,
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_saved_api_request: {}", e))?;
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        self.get_saved_api_request(id).await
+    }
+
+    /// Search saved API requests by name/description/url, category, and tag.
+    pub async fn search_saved_api_requests(
+        &self,
+        query: Option<&str>,
+        category: Option<&str>,
+        tag: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let mut conditions: Vec<String> = vec!["1=1".to_string()];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut idx = 1u32;
+
+        if let Some(q) = query {
+            if !q.is_empty() {
+                let pattern = format!("%{}%", q);
+                conditions.push(format!(
+                    "(name ILIKE ${idx} OR description ILIKE ${idx} OR url ILIKE ${idx})",
+                    idx = idx
+                ));
+                params.push(Box::new(pattern));
+                idx += 1;
+            }
+        }
+
+        if let Some(cat) = category {
+            if !cat.is_empty() {
+                conditions.push(format!("category = ${}", idx));
+                params.push(Box::new(cat.to_string()));
+                idx += 1;
+            }
+        }
+
+        if let Some(t) = tag {
+            if !t.is_empty() {
+                conditions.push(format!("tags LIKE ${}", idx));
+                params.push(Box::new(format!("%\"{}\"%", t)));
+                idx += 1;
+            }
+        }
+
+        let _ = idx;
+
+        let sql = format!(
+            r#"
+            SELECT id, name, COALESCE(description, '') AS description,
+                   COALESCE(category, '') AS category, COALESCE(tags, '[]') AS tags,
+                   method, url, COALESCE(headers, '{{}}') AS headers,
+                   COALESCE(body, '') AS body,
+                   COALESCE(body_content_type, '') AS body_content_type,
+                   COALESCE(timeout_ms, 30000) AS timeout_ms,
+                   COALESCE(follow_redirects, true) AS follow_redirects,
+                   COALESCE(variable_extractions, '[]') AS variable_extractions,
+                   COALESCE(assertions, '[]') AS assertions,
+                   COALESCE(credential_id, '') AS credential_id,
+                   created_at::TEXT, updated_at::TEXT
+            FROM saved_api_requests
+            WHERE {}
+            ORDER BY updated_at DESC
+            "#,
+            conditions.join(" AND ")
+        );
+
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let rows = conn
+            .query(&sql, &param_refs)
+            .await
+            .map_err(|e| format!("PG search_saved_api_requests: {}", e))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let headers_str: String = row.get(7);
+                let tags_str: String = row.get(4);
+                let extractions_str: String = row.get(12);
+                let assertions_str: String = row.get(13);
+                serde_json::json!({
+                    "id": row.get::<_, String>(0),
+                    "name": row.get::<_, String>(1),
+                    "description": row.get::<_, String>(2),
+                    "category": row.get::<_, String>(3),
+                    "tags": serde_json::from_str::<serde_json::Value>(&tags_str).unwrap_or(serde_json::json!([])),
+                    "method": row.get::<_, String>(5),
+                    "url": row.get::<_, String>(6),
+                    "headers": serde_json::from_str::<serde_json::Value>(&headers_str).unwrap_or(serde_json::json!({})),
+                    "body": row.get::<_, String>(8),
+                    "body_content_type": row.get::<_, String>(9),
+                    "timeout_ms": row.get::<_, i32>(10),
+                    "follow_redirects": row.get::<_, bool>(11),
+                    "variable_extractions": serde_json::from_str::<serde_json::Value>(&extractions_str).unwrap_or(serde_json::json!([])),
+                    "assertions": serde_json::from_str::<serde_json::Value>(&assertions_str).unwrap_or(serde_json::json!([])),
+                    "credential_id": row.get::<_, String>(14),
+                    "created_at": row.get::<_, String>(15),
+                    "updated_at": row.get::<_, String>(16),
+                })
+            })
+            .collect())
+    }
+
+    /// Get distinct categories from saved API requests.
+    pub async fn get_saved_api_request_categories(&self) -> Result<Vec<String>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT DISTINCT category
+                FROM saved_api_requests
+                WHERE category IS NOT NULL AND category != ''
+                ORDER BY category ASC
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_saved_api_request_categories: {}", e))?;
+
+        Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+    }
+
+    /// Duplicate a saved API request (creates a copy with "(Copy)" suffix).
+    pub async fn duplicate_saved_api_request(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let source = match self.get_saved_api_request(id).await? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let new_id = format!("sar-{}", uuid::Uuid::new_v4());
+        let name = format!("{} (Copy)", source["name"].as_str().unwrap_or(""));
+        let description = source["description"].as_str().unwrap_or("").to_string();
+        let category = source["category"].as_str().unwrap_or("").to_string();
+        let tags_json = serde_json::to_string(&source["tags"]).unwrap_or_else(|_| "[]".to_string());
+        let method_str = source["method"].as_str().unwrap_or("GET").to_string();
+        let url = source["url"].as_str().unwrap_or("").to_string();
+        let headers_json =
+            serde_json::to_string(&source["headers"]).unwrap_or_else(|_| "{}".to_string());
+        let body: Option<String> = source["body"].as_str().map(|s| s.to_string());
+        let body_content_type: Option<String> =
+            source["body_content_type"].as_str().map(|s| s.to_string());
+        let timeout_ms: i32 = source["timeout_ms"].as_i64().unwrap_or(30000) as i32;
+        let follow_redirects: bool = source["follow_redirects"].as_bool().unwrap_or(true);
+        let extractions_json = serde_json::to_string(&source["variable_extractions"])
+            .unwrap_or_else(|_| "[]".to_string());
+        let assertions_json =
+            serde_json::to_string(&source["assertions"]).unwrap_or_else(|_| "[]".to_string());
+        let credential_id: Option<String> = source["credential_id"].as_str().map(|s| s.to_string());
+
+        conn.execute(
+            r#"
+            INSERT INTO saved_api_requests (
+                id, name, description, category, tags, method, url, headers,
+                body, body_content_type, timeout_ms, follow_redirects,
+                variable_extractions, assertions, credential_id,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                NOW(), NOW()
+            )
+            "#,
+            &[
+                &new_id,
+                &name,
+                &description,
+                &category,
+                &tags_json,
+                &method_str,
+                &url,
+                &headers_json,
+                &body,
+                &body_content_type,
+                &timeout_ms,
+                &follow_redirects,
+                &extractions_json,
+                &assertions_json,
+                &credential_id,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG duplicate_saved_api_request: {}", e))?;
+
+        self.get_saved_api_request(&new_id).await
+    }
+
     /// Get distinct tags from saved API requests.
     pub async fn get_saved_api_request_tags(&self) -> Result<Vec<String>, String> {
         let conn = self
