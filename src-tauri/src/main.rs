@@ -55,6 +55,7 @@ mod follow_up;
 mod graphql;
 mod health_monitor;
 mod heartbeat;
+mod instance;
 mod instance_manager;
 mod iteration_bundle;
 #[cfg(windows)]

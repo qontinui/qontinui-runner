@@ -42,18 +42,21 @@ pub fn get_dev_logs_dir() -> PathBuf {
     DEV_LOGS_DIR_CACHE
         .get_or_init(|| {
             // Check settings override
-            if let Some(override_path) = crate::settings::get_dev_logs_dir_override() {
-                let path = PathBuf::from(&override_path);
-                debug!("Using dev_logs_dir override: {}", path.display());
-                ensure_dir_exists(&path);
-                return path;
-            }
+            let base = if let Some(override_path) = crate::settings::get_dev_logs_dir_override() {
+                debug!("Using dev_logs_dir override: {}", override_path);
+                PathBuf::from(override_path)
+            } else {
+                let default_path = get_default_dev_logs_dir();
+                debug!("Using default dev_logs_dir: {}", default_path.display());
+                default_path
+            };
 
-            // Use portable default
-            let default_path = get_default_dev_logs_dir();
-            debug!("Using default dev_logs_dir: {}", default_path.display());
-            ensure_dir_exists(&default_path);
-            default_path
+            // For secondary runners, scope all dev logs under an instance-<name>
+            // subdirectory so concurrent runners don't clobber each other's JSONL
+            // streams. Primary runner keeps the bare path.
+            let path = crate::instance::scope_path(&base);
+            ensure_dir_exists(&path);
+            path
         })
         .clone()
 }

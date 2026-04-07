@@ -164,12 +164,16 @@ impl Default for PlaywrightLibrary {
 // File Operations
 // ============================================================================
 
-/// Get the playwright directory path in the app data directory
+/// Get the playwright directory path in the app data directory.
+///
+/// For secondary runners, the per-runner instance subdirectory is inserted
+/// between `com.qontinui.runner` and `playwright`, so concurrent runners
+/// don't share playwright tests or results.
 fn get_playwright_dir() -> Result<PathBuf, String> {
-    let app_data_dir = dirs::config_dir()
+    let base = dirs::config_dir()
         .ok_or("Failed to get config directory")?
-        .join("com.qontinui.runner")
-        .join("playwright");
+        .join("com.qontinui.runner");
+    let app_data_dir = crate::instance::scope_path(&base).join("playwright");
 
     // Create directory if it doesn't exist
     if !app_data_dir.exists() {

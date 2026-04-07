@@ -135,11 +135,15 @@ fn default_version() -> String {
 // File Operations
 // ============================================================================
 
-/// Get the prompts file path in the app data directory
+/// Get the prompts file path in the app data directory.
+///
+/// Scoped per-runner for secondary instances so themed/test runners don't
+/// share a prompt library with the primary.
 fn get_prompts_path() -> Result<PathBuf, String> {
-    let app_data_dir = dirs::config_dir()
+    let base = dirs::config_dir()
         .ok_or("Failed to get config directory")?
         .join("com.qontinui.runner");
+    let app_data_dir = crate::instance::scope_path(&base);
 
     // Create directory if it doesn't exist
     if !app_data_dir.exists() {

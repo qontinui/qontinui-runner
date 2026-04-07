@@ -60,12 +60,17 @@ impl Default for RestateSettings {
 
 impl RestateSettings {
     /// Resolve the data directory path, using the custom path or the default.
+    ///
+    /// For secondary runners an `instance-<name>` subdirectory is appended so
+    /// concurrent runners don't corrupt each other's RocksDB journal — RocksDB
+    /// refuses concurrent writers and would crash on startup otherwise.
     pub fn resolve_data_dir(&self, app_data_dir: &Path) -> PathBuf {
-        if let Some(ref custom) = self.data_dir {
+        let base = if let Some(ref custom) = self.data_dir {
             PathBuf::from(custom)
         } else {
             app_data_dir.join("restate").join("data")
-        }
+        };
+        crate::instance::scope_path(&base)
     }
 
     /// Resolve the binary directory path (where restate-server is stored).

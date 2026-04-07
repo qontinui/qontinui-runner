@@ -56,20 +56,30 @@ pub struct RestoreResult {
     pub backup_date: String,
 }
 
-/// Get the path to settings.json
+/// Get the path to settings.json.
+///
+/// `settings.json` is intentionally shared across all runners on the machine,
+/// so this path is NOT scoped to the current instance.
 fn get_settings_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("com.qontinui.runner").join("settings.json"))
 }
 
-/// Get the path to prompts.json
+/// Get the path to prompts.json.
+///
+/// Matches `prompts::get_prompts_path` — under `config_dir()/com.qontinui.runner`
+/// (the previous implementation used `data_local_dir()` which was a bug: the
+/// backup would always miss the real prompts file). Scoped per-runner for
+/// secondary instances.
 fn get_prompts_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.qontinui.runner").join("prompts.json"))
+    dirs::config_dir().map(|d| {
+        crate::instance::scope_path(&d.join("com.qontinui.runner")).join("prompts.json")
+    })
 }
 
-/// Get the path to playwright-tests.json
+/// Get the path to playwright-tests.json (per-runner for secondary instances).
 fn get_playwright_tests_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| {
-        d.join("com.qontinui.runner")
+        crate::instance::scope_path(&d.join("com.qontinui.runner"))
             .join("playwright")
             .join("playwright-tests.json")
     })

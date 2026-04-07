@@ -160,12 +160,13 @@ impl AiWorkflow {
 // Storage Functions
 // ============================================================================
 
-/// Get the path to the AI workflows storage file
+/// Get the path to the AI workflows storage file (per-runner for secondary instances).
 fn get_storage_path() -> PathBuf {
     // Store in the app's local data directory
-    let base_dir = dirs::data_local_dir()
+    let base = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("qontinui-runner");
+    let base_dir = crate::instance::scope_path(&base);
 
     // Create directory if it doesn't exist
     if !base_dir.exists() {
