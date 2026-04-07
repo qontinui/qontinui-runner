@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::error;
 
 use crate::ai_router::RoutingConfig;
@@ -983,13 +985,57 @@ pub fn load_settings() -> Settings {
     }
 }
 
-/// Save settings to file
+/// Atomically write data to a file using a temp-file-then-rename pattern.
+/// This prevents corruption if the process crashes mid-write.
+fn atomic_write(path: &Path, data: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Settings path has no parent directory".to_string())?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("settings.json");
+    let tmp = parent.join(format!("{}.tmp.{}", file_name, ts));
+
+    // Write to temp file with full flush
+    let result = (|| -> Result<(), String> {
+        let mut f =
+            fs::File::create(&tmp).map_err(|e| format!("Failed to create temp file: {}", e))?;
+        f.write_all(data)
+            .map_err(|e| format!("Failed to write temp file: {}", e))?;
+        f.flush()
+            .map_err(|e| format!("Failed to flush temp file: {}", e))?;
+        f.sync_all()
+            .map_err(|e| format!("Failed to sync temp file: {}", e))?;
+        drop(f);
+
+        // Since Rust 1.58+, fs::rename on Windows uses MoveFileExW with
+        // MOVEFILE_REPLACE_EXISTING, so it atomically replaces the target on NTFS.
+        // No need for a separate remove_file call (which would leave a crash-unsafe gap).
+        fs::rename(&tmp, path)
+            .map_err(|e| format!("Failed to rename temp file to settings: {}", e))?;
+        Ok(())
+    })();
+
+    // Clean up temp file on any error
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+
+    result
+}
+
+/// Save settings to file (atomic write to prevent corruption on crash)
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
     let path = get_settings_path()?;
     let contents = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
 
-    fs::write(&path, contents).map_err(|e| format!("Failed to write settings file: {}", e))?;
+    atomic_write(&path, contents.as_bytes())?;
 
     Ok(())
 }
