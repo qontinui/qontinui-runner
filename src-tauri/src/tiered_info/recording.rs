@@ -517,23 +517,122 @@ impl RunRecorder {
     // ========================================================================
 
     /// Finish recording with success status and save to database.
-    pub fn finish_success_with_db(self) -> Result<String, String> {
-        Err("SQLite removed".to_string())
+    pub async fn finish_success_with_db(self) -> Result<String, String> {
+        let run = self.build_run_details(RunStatus::Completed, None);
+        self.persist_run(run).await
     }
 
     /// Finish recording with failure status and save to database.
-    pub fn finish_failure_with_db(self, error: &str) -> Result<String, String> {
-        Err("SQLite removed".to_string())
+    pub async fn finish_failure_with_db(self, error: &str) -> Result<String, String> {
+        let run = self.build_run_details(RunStatus::Failed, Some(error));
+        self.persist_run(run).await
     }
 
     /// Finish recording with timeout status and save to database.
-    pub fn finish_timeout_with_db(self) -> Result<String, String> {
-        Err("SQLite removed".to_string())
+    pub async fn finish_timeout_with_db(self) -> Result<String, String> {
+        let run = self.build_run_details(RunStatus::Timeout, Some("Workflow execution timed out"));
+        self.persist_run(run).await
     }
 
     /// Finish recording with cancelled status and save to database.
-    pub fn finish_cancelled_with_db(self) -> Result<String, String> {
-        Err("SQLite removed".to_string())
+    pub async fn finish_cancelled_with_db(self) -> Result<String, String> {
+        let run = self.build_run_details(RunStatus::Cancelled, None);
+        self.persist_run(run).await
+    }
+
+    /// Persist a built RunDetails. If a task_run_id is set, writes a full
+    /// row to `task_run_automation` via PG; otherwise logs stats only.
+    async fn persist_run(self, run: RunDetails) -> Result<String, String> {
+        let task_run_id = self.task_run_id.clone();
+        let iteration_number = self.iteration_number;
+        let run_id = run.id.clone();
+
+        let Some(task_run_id) = task_run_id else {
+            warn!(
+                "Run {} does not have a task_run_id - logging stats only (no task_run_automation record)",
+                run_id
+            );
+            info!(
+                "Run {} stats: states={}, transitions={}, anomalies={}",
+                run_id,
+                run.states_visited.len(),
+                run.transitions_executed.len(),
+                run.anomalies.len()
+            );
+            return Ok(run_id);
+        };
+
+        let Some(pg) = crate::database::pg::PgDb::try_global() else {
+            warn!(
+                "Run {}: PG not initialized, cannot persist task_run_automation",
+                run_id
+            );
+            return Err("PG not initialized".to_string());
+        };
+
+        // Map RunStatus to schema status string (matches existing
+        // create/complete/fail_task_run_automation conventions).
+        let automation_status = match run.status {
+            RunStatus::Completed => "success",
+            RunStatus::Failed => "failed",
+            RunStatus::Timeout => "failed",
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::Running => "running",
+        };
+
+        // Override error_type for timeouts so it's distinguishable.
+        let error_type = match run.status {
+            RunStatus::Timeout => Some("Timeout".to_string()),
+            _ => run.error_type.clone(),
+        };
+
+        let ended_at = run.ended_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let duration_ms = run.duration_ms.unwrap_or(0).min(i32::MAX as u64) as i32;
+
+        // Serialize JSON-blob columns. Schema uses TEXT for these.
+        let actions_summary = run
+            .actions_summary
+            .as_ref()
+            .and_then(|a| serde_json::to_string(a).ok());
+        let states_visited = serde_json::to_string(&run.states_visited).ok();
+        let transitions_executed = serde_json::to_string(&run.transitions_executed).ok();
+        let template_matches = serde_json::to_string(&run.template_matches).ok();
+        let anomalies = serde_json::to_string(&run.anomalies).ok();
+
+        if !run.screenshots.is_empty() {
+            debug!(
+                "Run {}: dropping {} screenshot records (no schema column)",
+                run_id,
+                run.screenshots.len()
+            );
+        }
+
+        pg.save_task_run_automation(
+            &run_id,
+            &task_run_id,
+            run.workflow_name.as_deref(),
+            &run.started_at,
+            &ended_at,
+            duration_ms,
+            automation_status,
+            run.success,
+            error_type.as_deref(),
+            run.error_message.as_deref(),
+            actions_summary.as_deref(),
+            states_visited.as_deref(),
+            transitions_executed.as_deref(),
+            template_matches.as_deref(),
+            anomalies.as_deref(),
+            iteration_number,
+        )
+        .await?;
+
+        info!(
+            "Persisted run {} to task_run_automation (task_run_id={}, status={})",
+            run_id, task_run_id, automation_status
+        );
+
+        Ok(run_id)
     }
 
     /// Save run without DB (statistics-only logging, no table to write to for non-task-run recordings).

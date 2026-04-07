@@ -466,7 +466,7 @@ impl RunRecordingHandler {
             );
 
             safe_eprintln!("[RUN_RECORDING] Calling finish_success_with_db...");
-            match recorder.finish_success_with_db() {
+            match recorder.finish_success_with_db().await {
                 Ok(run_id) => {
                     safe_eprintln!("[RUN_RECORDING] SUCCESS: Run {} saved to database!", run_id);
                     info!(
@@ -490,7 +490,7 @@ impl RunRecordingHandler {
     /// Handle workflow failed.
     pub async fn on_workflow_failed(&self, error: &str) {
         if let Some(recorder) = self.active_recorder.lock().await.take() {
-            match recorder.finish_failure_with_db(error) {
+            match recorder.finish_failure_with_db(error).await {
                 Ok(run_id) => {
                     info!("Run {} recorded as failed: {}", run_id, error);
                 }
@@ -504,7 +504,7 @@ impl RunRecordingHandler {
     /// Handle workflow timeout.
     pub async fn on_workflow_timeout(&self) {
         if let Some(recorder) = self.active_recorder.lock().await.take() {
-            match recorder.finish_timeout_with_db() {
+            match recorder.finish_timeout_with_db().await {
                 Ok(run_id) => {
                     info!("Run {} recorded as timeout", run_id);
                 }
@@ -558,7 +558,7 @@ impl RunRecordingHandler {
     pub async fn cancel_recording(&self) {
         if let Some(recorder) = self.active_recorder.lock().await.take() {
             // Still save the run but as cancelled
-            match recorder.finish_cancelled_with_db() {
+            match recorder.finish_cancelled_with_db().await {
                 Ok(run_id) => {
                     info!("Run {} recorded as cancelled", run_id);
                 }
