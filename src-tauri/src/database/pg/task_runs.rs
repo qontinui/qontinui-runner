@@ -62,6 +62,8 @@ macro_rules! full_task_run {
             is_fixer: $r.is_fixer,
             fixer_source_task_run_id: non_empty($r.fixer_source_task_run_id),
             is_meta_optimizer: $r.is_meta_optimizer,
+            is_review: false,     // Column exists in DB but not in Clorinde-generated struct
+            blocks_parent: false, // Column exists in DB but not in Clorinde-generated struct
             created_at: $r.created_at.to_rfc3339(),
             updated_at: $r.updated_at.to_rfc3339(),
             completed_at: if $r.completed_at.timestamp() == 0 {
@@ -229,6 +231,8 @@ impl PgDb {
                 is_fixer: false,
                 fixer_source_task_run_id: None,
                 is_meta_optimizer: false,
+                is_review: false,
+                blocks_parent: false,
                 created_at: r.created_at.to_rfc3339(),
                 updated_at: r.updated_at.to_rfc3339(),
                 completed_at: if r.completed_at.timestamp() == 0 {
@@ -309,6 +313,8 @@ impl PgDb {
                 is_fixer: false,
                 fixer_source_task_run_id: None,
                 is_meta_optimizer: false,
+                is_review: false,
+                blocks_parent: false,
                 created_at: r.created_at.to_rfc3339(),
                 updated_at: r.updated_at.to_rfc3339(),
                 completed_at: if r.completed_at.timestamp() == 0 {
@@ -536,6 +542,29 @@ impl PgDb {
         )
         .await
         .map_err(|e| format!("PG set_verification_passed: {}", e))?;
+        Ok(())
+    }
+
+    /// Update fix_attempts and ci_auto_resumes counters on a task run.
+    /// Called when the workflow loop completes (success or failure) to persist
+    /// the bounded-fix-loop metrics added in Phase 1.
+    pub async fn update_task_run_fix_metrics(
+        &self,
+        id: &str,
+        fix_attempts: i32,
+        ci_auto_resumes: i32,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET fix_attempts = $1, ci_auto_resumes = $2 WHERE id = $3",
+            &[&fix_attempts, &ci_auto_resumes, &id],
+        )
+        .await
+        .map_err(|e| format!("PG update_task_run_fix_metrics: {}", e))?;
         Ok(())
     }
 
@@ -863,12 +892,124 @@ impl PgDb {
                 is_fixer: r.is_fixer,
                 fixer_source_task_run_id: non_empty(r.fixer_source_task_run_id),
                 is_meta_optimizer: r.is_meta_optimizer,
+                is_review: false,
+                blocks_parent: false,
                 created_at: r.created_at.to_rfc3339(),
                 updated_at: r.updated_at.to_rfc3339(),
                 completed_at: if r.completed_at.timestamp() == 0 {
                     None
                 } else {
                     Some(r.completed_at.to_rfc3339())
+                },
+            })
+            .collect())
+    }
+
+    /// Stricter variant of `get_running_task_runs` used by the startup-resume
+    /// path: returns only rows whose `runner_port` exactly matches the caller.
+    /// Excludes NULL-port rows so multiple runners can't both claim the same
+    /// orphaned task. NULL-port tasks are handled by `claim_orphaned_task_runs`.
+    pub async fn get_resumable_task_runs_for_runner(
+        &self,
+        runner_port: u16,
+    ) -> Result<Vec<TaskRun>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let port = runner_port as i32;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, task_name, COALESCE(prompt, '') as prompt,
+                          COALESCE(task_type, 'task') as task_type,
+                          COALESCE(status, 'running') as status,
+                          COALESCE(sessions_count, 0) as sessions_count,
+                          COALESCE(max_sessions, 0) as max_sessions,
+                          COALESCE(error_message, '') as error_message,
+                          COALESCE(auto_continue, true) as auto_continue,
+                          COALESCE(config_id, '') as config_id,
+                          COALESCE(workflow_name, '') as workflow_name,
+                          COALESCE(workflow_id, '') as workflow_id,
+                          COALESCE(workflow_type, 'task') as workflow_type,
+                          COALESCE(workspace_id, '') as workspace_id,
+                          COALESCE(triggered_by, '') as triggered_by,
+                          COALESCE(parent_task_run_id, '') as parent_task_run_id,
+                          COALESCE(root_task_run_id, '') as root_task_run_id,
+                          COALESCE(depth, 0) as depth,
+                          COALESCE(bridge_id, '') as bridge_id,
+                          COALESCE(is_reflection, false) as is_reflection,
+                          COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id,
+                          COALESCE(is_follow_up, false) as is_follow_up,
+                          COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id,
+                          COALESCE(is_fixer, false) as is_fixer,
+                          COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
+                          COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
+                          to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
+                          to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as updated_at,
+                          to_char(completed_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at
+                   FROM task_runs
+                   WHERE status = 'running' AND runner_port = $1
+                   ORDER BY created_at DESC"#,
+                &[&port],
+            )
+            .await
+            .map_err(|e| format!("PG get_resumable_task_runs_for_runner: {}", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TaskRun {
+                id: r.get("id"),
+                task_name: r.get("task_name"),
+                prompt: non_empty(r.get::<_, String>("prompt")),
+                task_type: r.get("task_type"),
+                status: r.get("status"),
+                sessions_count: r.get::<_, i32>("sessions_count") as u32,
+                max_sessions: {
+                    let v: i32 = r.get("max_sessions");
+                    if v == 0 { None } else { Some(v as u32) }
+                },
+                output_log: String::new(),
+                error_message: non_empty(r.get::<_, String>("error_message")),
+                auto_continue: r.get("auto_continue"),
+                execution_steps_json: None,
+                log_sources_json: None,
+                config_id: non_empty(r.get::<_, String>("config_id")),
+                workflow_name: non_empty(r.get::<_, String>("workflow_name")),
+                workflow_id: non_empty(r.get::<_, String>("workflow_id")),
+                summary: None,
+                ai_summary: None,
+                goal_achieved: None,
+                remaining_work: None,
+                summary_generated_at: None,
+                transition_history_json: None,
+                workflow_type: non_empty(r.get::<_, String>("workflow_type")),
+                workspace_id: non_empty(r.get::<_, String>("workspace_id")),
+                triggered_by: non_empty(r.get::<_, String>("triggered_by")),
+                parent_task_run_id: non_empty(r.get::<_, String>("parent_task_run_id")),
+                root_task_run_id: non_empty(r.get::<_, String>("root_task_run_id")),
+                depth: r.get::<_, i32>("depth") as u32,
+                bridge_id: non_empty(r.get::<_, String>("bridge_id")),
+                result_data: None,
+                is_reflection: r.get("is_reflection"),
+                reflection_source_task_run_id: non_empty(
+                    r.get::<_, String>("reflection_source_task_run_id"),
+                ),
+                is_follow_up: r.get("is_follow_up"),
+                follow_up_source_task_run_id: non_empty(
+                    r.get::<_, String>("follow_up_source_task_run_id"),
+                ),
+                is_fixer: r.get("is_fixer"),
+                fixer_source_task_run_id: non_empty(r.get::<_, String>("fixer_source_task_run_id")),
+                is_meta_optimizer: r.get("is_meta_optimizer"),
+                is_review: false,
+                blocks_parent: false,
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+                completed_at: {
+                    let s: String = r.get("completed_at");
+                    if s.is_empty() { None } else { Some(s) }
                 },
             })
             .collect())
@@ -1749,5 +1890,211 @@ impl PgDb {
     ) -> Result<Option<serde_json::Value>, String> {
         // Verification plans table may not exist in PG yet. Return None.
         Ok(None)
+    }
+
+    // ========================================================================
+    // Review Subtask Operations (raw SQL — columns not yet in Clorinde)
+    // ========================================================================
+
+    /// Set the is_review and blocks_parent flags on a task run.
+    /// Used after Clorinde-based create_task_run to set review-specific columns.
+    pub async fn set_review_flags(
+        &self,
+        task_run_id: &str,
+        is_review: bool,
+        blocks_parent: bool,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET is_review = $1, blocks_parent = $2 WHERE id = $3",
+            &[
+                &is_review as &(dyn tokio_postgres::types::ToSql + Sync),
+                &blocks_parent as &(dyn tokio_postgres::types::ToSql + Sync),
+                &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG set_review_flags: {}", e))?;
+        Ok(())
+    }
+
+    /// Check if a task has any incomplete blocking children.
+    pub async fn has_blocking_incomplete_children(&self, task_run_id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*) FROM task_runs \
+                 WHERE parent_task_run_id = $1 \
+                   AND blocks_parent = true \
+                   AND status NOT IN ('complete', 'failed', 'stopped')",
+                &[&task_run_id as &(dyn tokio_postgres::types::ToSql + Sync)],
+            )
+            .await
+            .map_err(|e| format!("PG has_blocking_incomplete_children: {}", e))?;
+        let count: i64 = row.get(0);
+        Ok(count > 0)
+    }
+
+    /// Check if a review subtask already exists for a given parent + PR number.
+    pub async fn has_review_subtask_for_pr(
+        &self,
+        parent_task_run_id: &str,
+        pr_number: u64,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        // Use "PR #N (" pattern to avoid false matches (e.g. PR #12 matching PR #123)
+        let pr_pattern = format!("%PR #{} (%", pr_number);
+        let row = conn
+            .query_one(
+                "SELECT EXISTS(\
+                    SELECT 1 FROM task_runs \
+                    WHERE parent_task_run_id = $1 \
+                      AND is_review = true \
+                      AND task_name LIKE $2 \
+                      AND status NOT IN ('failed', 'stopped')\
+                 )",
+                &[
+                    &parent_task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &pr_pattern as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG has_review_subtask_for_pr: {}", e))?;
+        let exists: bool = row.get(0);
+        Ok(exists)
+    }
+
+    /// Set the result_data JSON column on a task run.
+    pub async fn set_task_run_result_data(
+        &self,
+        task_run_id: &str,
+        result_data: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            "UPDATE task_runs SET result_data = $1, updated_at = NOW() WHERE id = $2",
+            &[
+                &result_data as &(dyn tokio_postgres::types::ToSql + Sync),
+                &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG set_task_run_result_data: {}", e))?;
+        Ok(())
+    }
+
+    /// Get the parent_task_run_id and blocks_parent flag for a task.
+    /// Returns Some((parent_id, blocks_parent)) if the task has a parent, None otherwise.
+    /// Uses raw SQL since blocks_parent is not in the Clorinde-generated struct.
+    pub async fn get_blocking_parent_info(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<(String, bool)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT parent_task_run_id, COALESCE(blocks_parent, false) \
+                 FROM task_runs WHERE id = $1 AND parent_task_run_id IS NOT NULL",
+                &[&task_run_id as &(dyn tokio_postgres::types::ToSql + Sync)],
+            )
+            .await
+            .map_err(|e| format!("PG get_blocking_parent_info: {}", e))?;
+        if let Some(row) = rows.first() {
+            let parent_id: String = row.get(0);
+            let blocks_parent: bool = row.get(1);
+            if parent_id.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some((parent_id, blocks_parent)))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Save a complete task run automation row in a single INSERT.
+    ///
+    /// Used by `RunRecorder::finish_*_with_db` to persist a fully-built
+    /// run recording (including states, transitions, anomalies, etc.) at the
+    /// end of the workflow. Unlike the create+update pattern, this writes
+    /// everything in one statement.
+    ///
+    /// Note: the `task_run_automation` schema has no `screenshots` column;
+    /// screenshot records are not persisted by this path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_task_run_automation(
+        &self,
+        id: &str,
+        task_run_id: &str,
+        workflow_name: Option<&str>,
+        started_at: &str,
+        ended_at: &str,
+        duration_ms: i32,
+        automation_status: &str,
+        success: Option<bool>,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        actions_summary: Option<&str>,
+        states_visited: Option<&str>,
+        transitions_executed: Option<&str>,
+        template_matches: Option<&str>,
+        anomalies: Option<&str>,
+        iteration_number: u32,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let iter_num = iteration_number as i32;
+        conn.execute(
+            r#"INSERT INTO task_run_automation (
+                id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                automation_status, success, error_type, error_message,
+                actions_summary, states_visited, transitions_executed,
+                template_matches, anomalies, iteration_number
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#,
+            &[
+                &id,
+                &task_run_id,
+                &workflow_name,
+                &started_at,
+                &ended_at,
+                &duration_ms,
+                &automation_status,
+                &success,
+                &error_type,
+                &error_message,
+                &actions_summary,
+                &states_visited,
+                &transitions_executed,
+                &template_matches,
+                &anomalies,
+                &iter_num,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG save_task_run_automation: {}", e))?;
+        Ok(())
     }
 }
