@@ -1495,6 +1495,182 @@ async fn get_prompt_evolution_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Duel pools / beam search / span events (read-only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DuelPoolsQuery {
+    pub agent_type: Option<String>,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// GET /meta-optimizer/duel-pools
+pub async fn list_duel_pools_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<DuelPoolsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let pools = state
+        .app_state
+        .pg_db
+        .list_duel_pools(
+            query.agent_type.as_deref(),
+            query.status.as_deref(),
+            query.limit.unwrap_or(50),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list duel pools: {}", e))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(serde_json::json!(pools))))
+}
+
+/// GET /meta-optimizer/duel-pools/{id}
+/// Returns pool info plus all candidates.
+pub async fn get_duel_pool_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let make_err = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to get duel pool: {}", e))),
+        )
+    };
+    let pool = state
+        .app_state
+        .pg_db
+        .get_duel_pool(&id)
+        .await
+        .map_err(make_err)?;
+    let pool = match pool {
+        Some(p) => p,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("duel pool {} not found", id))),
+            ))
+        }
+    };
+    let candidates = state
+        .app_state
+        .pg_db
+        .list_pool_candidates_full(&id)
+        .await
+        .map_err(make_err)?;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "pool": pool,
+        "candidates": candidates,
+    }))))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DuelResultsQuery {
+    pub limit: Option<i64>,
+}
+
+/// GET /meta-optimizer/duel-pools/{id}/results
+pub async fn list_duel_results_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<DuelResultsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let results = state
+        .app_state
+        .pg_db
+        .list_duel_results(&id, query.limit.unwrap_or(200))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list duel results: {}", e))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(serde_json::json!(results))))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BeamRunsQuery {
+    pub agent_type: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// GET /meta-optimizer/beam-runs
+pub async fn list_beam_runs_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<BeamRunsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let runs = state
+        .app_state
+        .pg_db
+        .list_beam_search_runs(query.agent_type.as_deref(), query.limit.unwrap_or(50))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list beam runs: {}", e))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(serde_json::json!(runs))))
+}
+
+/// GET /meta-optimizer/beam-runs/{id}
+/// Returns run candidates.
+pub async fn get_beam_run_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let candidates = state
+        .app_state
+        .pg_db
+        .list_beam_candidates(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list beam candidates: {}", e))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "beam_run_id": id,
+        "candidates": candidates,
+    }))))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpanEventsQuery {
+    pub execution_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// GET /meta-optimizer/span-events?execution_id=X
+pub async fn list_span_events_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<SpanEventsQuery>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let events = state
+        .app_state
+        .pg_db
+        .list_span_events(
+            query.execution_id.as_deref(),
+            query.trace_id.as_deref(),
+            query.limit.unwrap_or(500),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list span events: {}", e))),
+            )
+        })?;
+    Ok(Json(ApiResponse::success(serde_json::json!(events))))
+}
+
+// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -1601,6 +1777,16 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             "/meta-optimizer/prompt-evolution",
             get(get_prompt_evolution_handler),
         )
+        // Duel pools / beam search / span events (read-only)
+        .route("/meta-optimizer/duel-pools", get(list_duel_pools_handler))
+        .route("/meta-optimizer/duel-pools/{id}", get(get_duel_pool_handler))
+        .route(
+            "/meta-optimizer/duel-pools/{id}/results",
+            get(list_duel_results_handler),
+        )
+        .route("/meta-optimizer/beam-runs", get(list_beam_runs_handler))
+        .route("/meta-optimizer/beam-runs/{id}", get(get_beam_run_handler))
+        .route("/meta-optimizer/span-events", get(list_span_events_handler))
     // Note: POST /prompt-optimization/trigger is handled via Tauri command
     // `trigger_meta_optimizer` with optimizer_type="meta_prompt", not HTTP API,
     // because launching workflows requires AppHandle and ConfigStorage.

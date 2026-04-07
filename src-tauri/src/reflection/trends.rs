@@ -137,12 +137,12 @@ pub fn store_component_health_snapshots(
 // Tests
 // =============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
 
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

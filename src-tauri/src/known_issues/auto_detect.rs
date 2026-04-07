@@ -52,12 +52,12 @@ fn map_finding_severity(severity: &str) -> IssueSeverity {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
     use crate::known_issues::storage::ensure_tables;
 
-    fn create_test_db() -> Connection {
+    fn create_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

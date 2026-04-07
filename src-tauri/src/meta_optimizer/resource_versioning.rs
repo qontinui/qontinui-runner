@@ -184,8 +184,9 @@ mod tests {
         let diff = diff_versions(&a, &b);
         assert!(diff.contains(" line1"));
         assert!(diff.contains(" line2"));
-        assert!(!diff.contains("+"));
-        assert!(!diff.contains("-line"));
+        // No content additions (excluding the +++ header line)
+        assert!(!diff.lines().any(|l| l.starts_with('+') && !l.starts_with("+++")));
+        assert!(!diff.lines().any(|l| l.starts_with('-') && !l.starts_with("---")));
     }
 
     #[test]

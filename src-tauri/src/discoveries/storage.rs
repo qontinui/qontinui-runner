@@ -73,6 +73,7 @@ pub fn cleanup_old_discoveries(days_old: i64) -> Result<u32, String> {
 mod tests {
     use super::*;
     use crate::discoveries::types::{DiscoveryEvidence, DiscoveryType};
+    use chrono::Utc;
 
     fn create_test_payload() -> DiscoveryPayload {
         let evidence = DiscoveryEvidence::new(Utc::now().to_rfc3339());

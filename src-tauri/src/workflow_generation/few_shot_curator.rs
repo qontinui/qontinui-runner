@@ -190,7 +190,7 @@ impl Default for FewShotCurator {
 // Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 

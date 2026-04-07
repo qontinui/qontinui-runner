@@ -780,6 +780,24 @@ impl LoopController {
         ) {
             warn!("Failed to persist spec_analyst trace: {}", e);
         }
+        // Span instrumentation: emit object snapshot + reward
+        {
+            use crate::meta_optimizer::span_instrumentation::{SpanCollector, SpanEventRow};
+            let mut collector = SpanCollector::new(&config.execution_id, "spec_analyst");
+            let cfg_json = serde_json::to_value(&spec_trace.config).unwrap_or(serde_json::Value::Null);
+            collector.emit_object("config", cfg_json, 0);
+            collector.emit_object("output", spec_trace.output_snapshot.clone(), 0);
+            let quality = spec_trace.output_quality_score.unwrap_or(if criteria.is_empty() { 0.0 } else { 1.0 });
+            collector.emit_reward(quality, "quality", 0);
+            let events = collector.finalize();
+            let trace_id = spec_trace.agent_id.clone();
+            let rows: Vec<SpanEventRow> = events.iter()
+                .map(|e| SpanEventRow::from_event(e, &config.execution_id, &trace_id, "spec_analyst"))
+                .collect();
+            if let Err(e) = self.app_state.pg_db.save_span_events(&rows).await {
+                warn!("Failed to save span events: {}", e);
+            }
+        }
         agent_traces.push(spec_trace);
 
         // Store spec results in pipeline context
@@ -794,10 +812,13 @@ impl LoopController {
                 critical_failure: false,
                 was_stopped: false,
                 unfixable_errors: false,
+                fix_attempts_exhausted: false,
                 iteration_results: vec![],
                 total_tokens: None,
                 total_cost_usd: None,
                 files_modified: Vec::new(),
+                fix_attempts: 0,
+                ci_auto_resumes: 0,
             };
         }
 
@@ -1105,6 +1126,24 @@ Only output the JSON array, nothing else."#,
                 &locator_trace,
             ) {
                 warn!("Failed to persist locator trace: {}", e);
+            }
+            // Span instrumentation: emit object snapshot + reward
+            {
+                use crate::meta_optimizer::span_instrumentation::{SpanCollector, SpanEventRow};
+                let mut collector = SpanCollector::new(&config.execution_id, "locator");
+                let cfg_json = serde_json::to_value(&locator_trace.config).unwrap_or(serde_json::Value::Null);
+                collector.emit_object("config", cfg_json, 0);
+                collector.emit_object("output", locator_trace.output_snapshot.clone(), 0);
+                let quality = locator_trace.output_quality_score.unwrap_or(if parsed.is_empty() { 0.0 } else { 1.0 });
+                collector.emit_reward(quality, "quality", 0);
+                let events = collector.finalize();
+                let trace_id = locator_trace.agent_id.clone();
+                let rows: Vec<SpanEventRow> = events.iter()
+                    .map(|e| SpanEventRow::from_event(e, &config.execution_id, &trace_id, "locator"))
+                    .collect();
+                if let Err(e) = self.app_state.pg_db.save_span_events(&rows).await {
+                    warn!("Failed to save span events: {}", e);
+                }
             }
             agent_traces.push(locator_trace);
 
@@ -2008,6 +2047,25 @@ impl PipelineShared {
                 ) {
                     warn!("Failed to persist implementer trace: {}", e);
                 }
+                // Span instrumentation: emit object snapshot + reward
+                {
+                    use crate::meta_optimizer::span_instrumentation::{SpanCollector, SpanEventRow};
+                    let mut collector = SpanCollector::new(&config.execution_id, "implementer");
+                    let cfg_json = serde_json::to_value(&implementer_trace.config).unwrap_or(serde_json::Value::Null);
+                    collector.emit_object("config", cfg_json, 0);
+                    collector.emit_object("input", implementer_trace.input_snapshot.clone(), 0);
+                    collector.emit_object("output", implementer_trace.output_snapshot.clone(), 0);
+                    let quality = implementer_trace.output_quality_score.unwrap_or(if agentic_outcome.is_success() { 1.0 } else { 0.0 });
+                    collector.emit_reward(quality, "quality", 0);
+                    let events = collector.finalize();
+                    let trace_id = implementer_trace.agent_id.clone();
+                    let rows: Vec<SpanEventRow> = events.iter()
+                        .map(|e| SpanEventRow::from_event(e, &config.execution_id, &trace_id, "implementer"))
+                        .collect();
+                    if let Err(e) = self.pg_db.save_span_events(&rows).await {
+                        warn!("Failed to save span events: {}", e);
+                    }
+                }
                 local_traces.push(implementer_trace.clone());
                 last_implementer_trace = Some(implementer_trace);
 
@@ -2170,6 +2228,24 @@ impl PipelineShared {
                     &verifier_trace,
                 ) {
                     warn!("Failed to persist verifier trace: {}", e);
+                }
+                // Span instrumentation: emit object snapshot + reward
+                {
+                    use crate::meta_optimizer::span_instrumentation::{SpanCollector, SpanEventRow};
+                    let mut collector = SpanCollector::new(&config.execution_id, "verifier");
+                    let cfg_json = serde_json::to_value(&verifier_trace.config).unwrap_or(serde_json::Value::Null);
+                    collector.emit_object("config", cfg_json, 0);
+                    collector.emit_object("output", verifier_trace.output_snapshot.clone(), 0);
+                    let quality = verifier_trace.output_quality_score.unwrap_or(if level_passed { 1.0 } else { 0.0 });
+                    collector.emit_reward(quality, "quality", 0);
+                    let events = collector.finalize();
+                    let trace_id = verifier_trace.agent_id.clone();
+                    let rows: Vec<SpanEventRow> = events.iter()
+                        .map(|e| SpanEventRow::from_event(e, &config.execution_id, &trace_id, "verifier"))
+                        .collect();
+                    if let Err(e) = self.pg_db.save_span_events(&rows).await {
+                        warn!("Failed to save span events: {}", e);
+                    }
                 }
                 local_traces.push(verifier_trace.clone());
                 last_verifier_trace = Some(verifier_trace);

@@ -180,7 +180,7 @@ pub fn export_training_data(
     Err("SQLite removed".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
@@ -386,7 +386,7 @@ mod tests {
     // ========================================================================
 
     /// Create all required tables in an in-memory SQLite database.
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

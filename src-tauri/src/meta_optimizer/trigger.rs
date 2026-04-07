@@ -133,6 +133,7 @@ pub fn check_and_launch_optimizers(
     let mut launched = Vec::new();
 
     let pg_db = &deps.app_state.pg_db;
+    let mut meta_prompt_pipeline_should_run = false;
     for optimizer_type in OptimizerType::all() {
         match should_launch_optimizer(pg_db, *optimizer_type, &source_task_run_id) {
             Ok(true) => {
@@ -143,6 +144,9 @@ pub fn check_and_launch_optimizers(
                     debug!("Skipping MetaPrompt — additional guards not met");
                     continue;
                 }
+                if *optimizer_type == OptimizerType::MetaPrompt {
+                    meta_prompt_pipeline_should_run = true;
+                }
                 match launch_optimizer(&deps, *optimizer_type) {
                     Ok(id) => launched.push(id),
                     Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
@@ -151,6 +155,32 @@ pub fn check_and_launch_optimizers(
             Ok(false) => {}
             Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
         }
+    }
+
+    // Launch the new optimization pipeline (beam search → duel → canary) as a
+    // fire-and-forget tokio task. This runs alongside the legacy meta-prompt
+    // optimizer workflow and exercises the agent-lightning + prompt-ops integration.
+    if meta_prompt_pipeline_should_run {
+        let pg_clone = pg_db.clone();
+        tokio::spawn(async move {
+            use super::optimization_pipeline::{OptimizationPipeline, PipelineConfig};
+            let pipeline = OptimizationPipeline::new(pg_clone, PipelineConfig::default());
+            match pipeline.run_cycle().await {
+                Ok(result) => {
+                    if let Some(reason) = result.skipped_reason {
+                        debug!("OptimizationPipeline skipped: {}", reason);
+                    } else {
+                        info!(
+                            agent_type = %result.agent_type,
+                            candidates = result.candidates_generated,
+                            duels = result.duels_conducted,
+                            "OptimizationPipeline run_cycle completed"
+                        );
+                    }
+                }
+                Err(e) => warn!("OptimizationPipeline run_cycle failed: {}", e),
+            }
+        });
     }
 
     // Capture periodic performance snapshot for progress tracking
@@ -208,7 +238,49 @@ pub fn check_and_launch_optimizers(
     // Compares pre/post-apply score averages to measure recommendation effectiveness.
     super::recommendations::auto_evaluate_with_agentic_scores(pg_db);
 
+    // Phase 5A: Pattern Distillation (fires every 5th successful run).
+    // Mines recurring Finding→Fix pairs from the knowledge graph and stores
+    // them as LearnedPattern entries for future prompt injection.
+    if should_run_pattern_distiller(pg_db, &source_task_run_id) {
+        let pg = pg_db.clone();
+        let trid = source_task_run_id.clone();
+        tokio::spawn(async move {
+            // Resolve workflow name from the source task run
+            let workflow_name = match pg.get_task_run(&trid).await.ok().flatten() {
+                Some(tr) => tr.workflow_name,
+                None => None,
+            };
+            let Some(wf) = workflow_name else {
+                debug!("Pattern distiller: no workflow name for source run {}", trid);
+                return;
+            };
+            use crate::online_learning::pattern_distiller::PatternDistiller;
+            let distiller = PatternDistiller::new(pg);
+            if let Err(e) = distiller.distill_for_workflow(&wf).await {
+                warn!("Pattern distiller failed: {}", e);
+            }
+        });
+    }
+
     Ok(launched)
+}
+
+/// Decide whether to run the pattern distiller for the current source run.
+///
+/// Cheap, deterministic heuristic: sum the bytes of the task run ID modulo 5.
+/// `DefaultHasher` is intentionally non-deterministic across processes, so we
+/// avoid it here — otherwise the trigger rate would be unstable across restarts
+/// and impossible to reason about in tests.
+fn should_run_pattern_distiller(
+    _pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
+    source_task_run_id: &str,
+) -> bool {
+    let bytes = source_task_run_id.as_bytes();
+    if bytes.len() < 4 {
+        return false;
+    }
+    let sum: u32 = bytes.iter().map(|b| *b as u32).sum();
+    sum % 5 == 0
 }
 
 /// Re-evaluate applied recommendations whose outcome is still "insufficient_data"
@@ -655,11 +727,11 @@ pub fn check_and_launch_optimizers_with_pg(
     Ok(launched)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

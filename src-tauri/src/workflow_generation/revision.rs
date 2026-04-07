@@ -806,6 +806,8 @@ mod tests {
             agentic_steps: vec![],
             completion_steps: vec![],
             max_iterations: 10,
+            max_fix_attempts: 3,
+            max_ci_auto_resumes: 10,
             timeout_seconds: None,
             provider: None,
             model: None,

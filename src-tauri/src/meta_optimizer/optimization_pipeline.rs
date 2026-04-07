@@ -149,11 +149,13 @@ impl OptimizationPipeline {
         // Gather failure evidence for critique context
         let evidence = self.gather_failure_evidence(&target);
 
-        // Rejected prompts to avoid repeating (empty for now; could be populated
-        // from prompt_evolution entries with canary_verdict = 'reject')
-        let rejected_refs: Vec<(String, String)> = Vec::new();
+        // Rejected prompts to avoid repeating: variants from prior evolution
+        // entries whose canary verdict was 'reject'. Limited to recent history.
+        let rejected_refs: Vec<(String, String)> =
+            super::prompt_evolution::get_rejected_prompt_contents(&self.pg_db, agent_type)
+                .unwrap_or_default();
 
-        // Generate candidates across beam search generations
+        // Generate candidates across beam search generations via real LLM calls
         let mut total_candidates = 1; // seed
         while !beam.is_complete() {
             let scores = if beam.current_generation == 0 {
@@ -172,21 +174,47 @@ impl OptimizationPipeline {
                 break;
             }
 
-            // Simulate LLM responses — in production this would call the AI provider.
-            // For now, the pipeline produces GenerationRequests that the caller
-            // (trigger.rs or a workflow step) would execute via the LLM.
-            // Here we record the requests and let the caller handle execution.
             info!(
                 generation = beam.current_generation + 1,
                 requests = requests.len(),
-                "Beam search: generation requests prepared"
+                "Beam search: executing LLM rewrite calls"
             );
 
-            // The actual LLM calls happen externally. The pipeline stores the
-            // beam state and duel pool for the orchestrator to drive.
-            // For a synchronous demo, we break after preparing requests.
-            total_candidates += requests.len();
-            break; // Caller must drive LLM execution and feed responses back
+            // Execute each generation request via the LLM (sync, blocking)
+            let responses = tokio::task::block_in_place(|| {
+                let mut out: Vec<(String, String, String)> =
+                    Vec::with_capacity(requests.len());
+                for req in &requests {
+                    let context = crate::ai_router::TaskContext::from_prompt(&req.llm_prompt);
+                    let resp = crate::ai_provider::routing::run_prompt_with_routing(
+                        &req.llm_prompt,
+                        &context,
+                        None,
+                    );
+                    if resp.success {
+                        out.push((
+                            req.parent_id.clone(),
+                            resp.output,
+                            req.thinking_style.clone(),
+                        ));
+                    } else {
+                        warn!(
+                            parent_id = %req.parent_id,
+                            err = ?resp.error,
+                            "Beam rewrite LLM call failed — skipping"
+                        );
+                    }
+                }
+                out
+            });
+
+            let new_candidates = beam.process_generation_responses(responses);
+            total_candidates += new_candidates.len();
+
+            if new_candidates.is_empty() {
+                warn!("No valid candidates produced this generation — stopping early");
+                break;
+            }
         }
 
         // ── Step 5: Create duel pool ─────────────────────────────────
@@ -326,23 +354,70 @@ impl OptimizationPipeline {
                 ],
             };
 
-            // Build the judge prompt (caller would send to LLM)
-            let _judge_prompt = pairwise_judge::build_pairwise_prompt(&judge_input, swap);
+            // Build the judge prompt and call the LLM judge
+            let judge_prompt = pairwise_judge::build_pairwise_prompt(&judge_input, swap);
+            let judge_result = tokio::task::block_in_place(|| {
+                let context = crate::ai_router::TaskContext::from_prompt(&judge_prompt);
+                let resp = crate::ai_provider::routing::run_prompt_with_routing(
+                    &judge_prompt,
+                    &context,
+                    None,
+                );
+                if resp.success {
+                    pairwise_judge::parse_pairwise_response(&resp.output, swap)
+                } else {
+                    warn!(err = ?resp.error, "Pairwise judge LLM call failed");
+                    pairwise_judge::PairwiseJudgeResult {
+                        winner: pairwise_judge::PairwiseWinner::Tie,
+                        rationale: String::new(),
+                        confidence: 0.0,
+                        scores_a: None,
+                        scores_b: None,
+                    }
+                }
+            });
 
-            // For now, record that we prepared the duel.
-            // In production, the LLM response would be parsed and recorded:
-            // let judge_result = pairwise_judge::parse_pairwise_response(&llm_response, swap);
-            // let winner_id = match judge_result.winner { A => pair.0, B => pair.1, Tie => pair.0 };
+            // Map judge winner to candidate ID
+            let winner_id = match judge_result.winner {
+                pairwise_judge::PairwiseWinner::A => pair.0.clone(),
+                pairwise_judge::PairwiseWinner::B => pair.1.clone(),
+                pairwise_judge::PairwiseWinner::Tie => {
+                    // On ties, treat as no-op for the win matrix but still increment count
+                    debug!("Duel ended in tie — not recording win");
+                    duels_conducted += 1;
+                    continue;
+                }
+            };
 
-            // Record a placeholder duel result (in production, filled from LLM judge)
-            let duel_id = format!("dr-{}", uuid::Uuid::new_v4());
-            debug!(
-                duel_id,
-                candidate_a = pair.0,
-                candidate_b = pair.1,
-                swap,
-                "Duel prepared (awaiting LLM judge response)"
-            );
+            // Record duel result in pool memory (updates win matrix + posteriors)
+            let duel_result = DuelResult {
+                duel_id: format!("dr-{}", uuid::Uuid::new_v4()),
+                candidate_a_id: pair.0.clone(),
+                candidate_b_id: pair.1.clone(),
+                winner_id: winner_id.clone(),
+                judge_rationale: judge_result.rationale.clone(),
+                position_swapped: swap,
+                confidence: judge_result.confidence,
+            };
+            pool.record_duel_result(&duel_result);
+
+            // Persist duel result
+            if let Err(e) = self
+                .pg_db
+                .record_duel_result(
+                    &duel_result.duel_id,
+                    pool_id,
+                    &duel_result.candidate_a_id,
+                    &duel_result.candidate_b_id,
+                    &duel_result.winner_id,
+                    Some(&duel_result.judge_rationale),
+                    duel_result.position_swapped,
+                    duel_result.confidence,
+                )
+                .await
+            {
+                warn!(err = %e, "Failed to persist duel result");
+            }
 
             duels_conducted += 1;
 
@@ -548,12 +623,26 @@ impl OptimizationPipeline {
     }
 }
 
-/// Helper to get a rough failure rate for an agent_type.
-/// Used as `score_before` in evolution tracking.
-fn target_failure_rate_for(_agent_type: &str) -> f64 {
-    // In production, this would query recent outcomes.
-    // For now, use the threshold as a conservative estimate.
-    0.30
+/// Helper to get the current failure rate for an agent_type by querying
+/// recent learning outcomes. Used as `score_before` in evolution tracking.
+///
+/// Returns the maximum failure rate across all (phase, agent_type) groups
+/// matching the requested agent. Falls back to 0.30 (the optimization
+/// threshold) if no samples are available.
+fn target_failure_rate_for(agent_type: &str) -> f64 {
+    let samples = match super::prompt_extractor::extract_prompt_samples(500) {
+        Ok(s) => s,
+        Err(_) => return 0.30,
+    };
+    let groups = super::prompt_extractor::compute_group_metrics_with_db(&samples);
+    groups
+        .into_iter()
+        .filter(|g| g.agent_type == agent_type)
+        .map(|g| g.failure_rate)
+        .fold(None, |acc: Option<f64>, r| {
+            Some(acc.map_or(r, |a| a.max(r)))
+        })
+        .unwrap_or(0.30)
 }
 
 #[cfg(test)]
@@ -591,18 +680,119 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_failure_evidence() {
-        let pipeline = OptimizationPipeline {
-            pg_db: Arc::new(unsafe { std::mem::zeroed() }), // Not used in this test
-            config: PipelineConfig::default(),
-        };
-        // Can't safely call gather_failure_evidence with zeroed PgDb,
-        // but we can test the format string logic indirectly
+    fn test_gather_failure_evidence_format() {
+        // Verify the format string logic without instantiating an OptimizationPipeline
         let evidence = format!(
             "Agent: {} | Phase: {} | Failure rate: {:.1}%",
             "verifier", "verification", 45.2
         );
         assert!(evidence.contains("verifier"));
         assert!(evidence.contains("45.2%"));
+    }
+
+    /// Integration-style test that exercises the full beam → duel → ranking
+    /// flow in memory without any DB calls.
+    ///
+    /// This validates that the orchestration logic — beam search candidate
+    /// generation, duel pair selection, win matrix updates, and Copeland
+    /// ranking — composes correctly when all pieces are wired together.
+    #[test]
+    fn test_beam_to_duel_to_ranking_integration() {
+        use crate::meta_optimizer::beam_search::{
+            BeamSearchConfig, BeamSearchState,
+        };
+        use crate::meta_optimizer::duel_engine::{
+            CandidatePool, DuelCandidate, DuelResult,
+        };
+        use rand::SeedableRng;
+
+        // ── Step 1: Beam search produces candidates ──────────────
+        let config = BeamSearchConfig {
+            beam_width: 3,
+            branch_factor: 2,
+            max_generations: 1,
+            ..Default::default()
+        };
+        let mut beam = BeamSearchState::new(
+            config,
+            "verifier",
+            "You are a verifier. Check the output.",
+        );
+
+        // Simulate generation by injecting "LLM responses" as if they came
+        // from real LLM calls. Each response contains a [BEAM_REWRITE] block.
+        let parent_id = beam.candidates[0].id.clone();
+        let responses = vec![
+            (
+                parent_id.clone(),
+                "[BEAM_REWRITE]\ncritique: |\n  Lacks specificity\nchanges_summary: |\n  Added detail\nrewritten_prompt: |\n  You are a strict verifier. Check that the output matches the spec exactly.\n[/BEAM_REWRITE]".to_string(),
+                "Specificity".to_string(),
+            ),
+            (
+                parent_id.clone(),
+                "[BEAM_REWRITE]\ncritique: |\n  Missing examples\nchanges_summary: |\n  Added few-shot\nrewritten_prompt: |\n  You are a verifier. For example, if the output is X, return Y.\n[/BEAM_REWRITE]".to_string(),
+                "Examples".to_string(),
+            ),
+        ];
+        let new_candidates = beam.process_generation_responses(responses);
+        assert_eq!(new_candidates.len(), 2, "should produce 2 children");
+        assert_eq!(beam.candidates.len(), 3, "seed + 2 children");
+
+        // ── Step 2: Register all candidates in the duel pool ─────
+        let mut pool = CandidatePool::new();
+        for c in &beam.candidates {
+            pool.add_candidate(DuelCandidate {
+                id: c.id.clone(),
+                prompt_content: c.prompt_content.clone(),
+                variant_id: None,
+                generation: c.generation,
+                parent_id: c.parent_id.clone(),
+            });
+        }
+        assert_eq!(pool.candidate_count(), 3);
+
+        // ── Step 3: Run pairwise duels (simulated outcomes) ──────
+        // Simulate a clear winner: candidate at index 1 always wins.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let winner_target = beam.candidates[1].id.clone();
+
+        for i in 0..15 {
+            let pair = pool.select_duel_pair(&mut rng).unwrap();
+            // Determine winner: if winner_target is in the pair, it wins;
+            // otherwise pick the first one deterministically.
+            let winner_id = if pair.0 == winner_target || pair.1 == winner_target {
+                winner_target.clone()
+            } else {
+                pair.0.clone()
+            };
+            let result = DuelResult {
+                duel_id: format!("test-duel-{}", i),
+                candidate_a_id: pair.0,
+                candidate_b_id: pair.1,
+                winner_id,
+                judge_rationale: "test".to_string(),
+                position_swapped: false,
+                confidence: 0.9,
+            };
+            pool.record_duel_result(&result);
+        }
+
+        // ── Step 4: Verify ranking puts winner_target on top ─────
+        let rankings = pool.rankings();
+        assert_eq!(rankings.len(), 3);
+        assert_eq!(
+            rankings[0].0, winner_target,
+            "expected winner_target to top rankings, got {:?}",
+            rankings
+        );
+        assert!(
+            rankings[0].1 > rankings[1].1,
+            "winner Copeland score must exceed runner-up"
+        );
+
+        // ── Step 5: Verify the top candidate exists and has content ──
+        let top = pool.top_candidate().unwrap();
+        assert_eq!(top.id, winner_target);
+        assert!(!top.prompt_content.is_empty());
     }
 }

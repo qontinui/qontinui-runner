@@ -422,11 +422,11 @@ pub fn launch_fixer(deps: FixerDeps, source_task_run_id: String) -> Result<Strin
     Ok(fixer_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

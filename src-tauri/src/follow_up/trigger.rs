@@ -343,11 +343,11 @@ pub fn launch_follow_up(deps: FollowUpDeps, source_task_run_id: String) -> Resul
     Ok(follow_up_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

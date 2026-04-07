@@ -283,7 +283,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -304,7 +303,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -313,7 +311,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -330,7 +327,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -345,7 +341,6 @@ mod tests {
                     "http://localhost:3001/api/ui-bridge",
                     "task-2",
                     "Workflow B",
-                    None,
                 )
                 .await;
             acquired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -387,14 +382,12 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
         mgr.acquire(
             "http://localhost:9876/ui-bridge",
             "task-2",
             "Workflow B",
-            None,
         )
         .await;
 
@@ -411,19 +404,17 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
         mgr.acquire(
             "http://localhost:9876/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
         // Task 2 holds one URL
-        mgr.acquire("http://example.com/ui-bridge", "task-2", "Workflow B", None)
+        mgr.acquire("http://example.com/ui-bridge", "task-2", "Workflow B")
             .await;
 
         assert_eq!(mgr.info().await.len(), 3);
@@ -444,7 +435,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -458,7 +448,6 @@ mod tests {
                     "http://localhost:3001/api/ui-bridge",
                     "task-2",
                     "Workflow B",
-                    None,
                 )
                 .await;
             acquired_clone.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -486,7 +475,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -512,7 +500,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -535,7 +522,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge/sdk/execute",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -559,7 +545,6 @@ mod tests {
             "http://localhost:3001/api/ui-bridge",
             "task-1",
             "Workflow A",
-            None,
         )
         .await;
 
@@ -583,7 +568,6 @@ mod tests {
                 "http://localhost:3001/api/ui-bridge",
                 "task-1",
                 "Workflow A",
-                None,
             )
             .await;
         });

@@ -232,11 +232,11 @@ pub fn infer_step_type_from_fix(description: &str) -> Option<String> {
 // Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
-    fn create_test_db() -> Connection {
+    fn create_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

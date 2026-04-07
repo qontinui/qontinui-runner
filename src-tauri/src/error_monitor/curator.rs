@@ -660,7 +660,7 @@ impl Default for DebugContextCurator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
     use crate::error_monitor::types::ErrorLocation;
@@ -763,7 +763,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// Create a minimal in-memory database with the error_events table for embedding tests.
-    fn create_embedding_test_db() -> crate::database::Connection {
+    fn create_embedding_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

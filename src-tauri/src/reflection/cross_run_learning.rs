@@ -124,12 +124,12 @@ pub fn extract_procedural_skills_detailed(
     Err("SQLite removed".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
     /// Create an in-memory SQLite database with all tables needed by cross_run_learning.
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

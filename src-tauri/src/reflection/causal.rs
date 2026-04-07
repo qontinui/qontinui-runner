@@ -132,7 +132,7 @@ pub fn get_causal_summary(workflow_name: &str) -> Result<CausalSummary, String> 
     Err("SQLite removed".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 

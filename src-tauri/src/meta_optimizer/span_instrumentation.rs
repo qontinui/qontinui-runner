@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single span event emitted during agent execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event_type")]
+#[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum SpanEvent {
     /// Scalar reward signal at a specific step.
     Reward {

@@ -127,13 +127,13 @@ fn compute_diff_summary(old_json: &str, new_json: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
     use serde_json::json;
 
     /// Create an in-memory SQLite database with all tables needed by instrumentation.
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

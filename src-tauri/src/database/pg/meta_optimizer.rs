@@ -4127,4 +4127,315 @@ impl PgDb {
             created_at: r.get::<_, Option<String>>(7).unwrap_or_default(),
         }))
     }
+
+    // ========================================================================
+    // Read-only listing helpers for HTTP API (duel pools, beam runs, spans)
+    // ========================================================================
+
+    /// List duel pools, optionally filtered by agent_type / status.
+    /// Returns rows shaped as JSON-friendly tuples:
+    /// (id, agent_type, status, generation, config_json, created_at, completed_at)
+    pub async fn list_duel_pools(
+        &self,
+        agent_type: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let mut sql = String::from(
+            "SELECT id, agent_type, status, generation, config_json, \
+             created_at::text, completed_at::text \
+             FROM duel_pools WHERE 1=1",
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let agent_owned;
+        let status_owned;
+        if let Some(a) = agent_type {
+            agent_owned = a.to_string();
+            sql.push_str(&format!(" AND agent_type = ${}", params.len() + 1));
+            params.push(&agent_owned);
+        }
+        if let Some(s) = status {
+            status_owned = s.to_string();
+            sql.push_str(&format!(" AND status = ${}", params.len() + 1));
+            params.push(&status_owned);
+        }
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", params.len() + 1));
+        params.push(&limit);
+        let rows = conn
+            .query(sql.as_str(), &params[..])
+            .await
+            .map_err(|e| format!("PG list_duel_pools: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "agent_type": r.get::<_, String>(1),
+                    "status": r.get::<_, String>(2),
+                    "generation": r.get::<_, i32>(3),
+                    "config_json": r.get::<_, String>(4),
+                    "created_at": r.get::<_, Option<String>>(5).unwrap_or_default(),
+                    "completed_at": r.get::<_, Option<String>>(6).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// Get a single duel pool by id.
+    pub async fn get_duel_pool(&self, pool_id: &str) -> Result<Option<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, agent_type, status, generation, config_json, \
+                 created_at::text, completed_at::text \
+                 FROM duel_pools WHERE id = $1",
+                &[&pool_id],
+            )
+            .await
+            .map_err(|e| format!("PG get_duel_pool: {}", e))?;
+        Ok(rows.first().map(|r| {
+            serde_json::json!({
+                "id": r.get::<_, String>(0),
+                "agent_type": r.get::<_, String>(1),
+                "status": r.get::<_, String>(2),
+                "generation": r.get::<_, i32>(3),
+                "config_json": r.get::<_, String>(4),
+                "created_at": r.get::<_, Option<String>>(5).unwrap_or_default(),
+                "completed_at": r.get::<_, Option<String>>(6).unwrap_or_default(),
+            })
+        }))
+    }
+
+    /// List all candidates for a duel pool (any status).
+    pub async fn list_pool_candidates_full(
+        &self,
+        pool_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, pool_id, prompt_content, variant_id, generation, parent_id, \
+                 copeland_score, alpha, beta, status, created_at::text \
+                 FROM duel_candidates WHERE pool_id = $1 \
+                 ORDER BY copeland_score DESC NULLS LAST, created_at ASC",
+                &[&pool_id],
+            )
+            .await
+            .map_err(|e| format!("PG list_pool_candidates_full: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "pool_id": r.get::<_, String>(1),
+                    "prompt_content": r.get::<_, String>(2),
+                    "variant_id": r.get::<_, Option<String>>(3),
+                    "generation": r.get::<_, i32>(4),
+                    "parent_id": r.get::<_, Option<String>>(5),
+                    "copeland_score": r.get::<_, f64>(6),
+                    "alpha": r.get::<_, f64>(7),
+                    "beta": r.get::<_, f64>(8),
+                    "status": r.get::<_, String>(9),
+                    "created_at": r.get::<_, Option<String>>(10).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// List duel results for a pool.
+    pub async fn list_duel_results(
+        &self,
+        pool_id: &str,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, pool_id, candidate_a_id, candidate_b_id, winner_id, \
+                 judge_rationale, position_swapped, confidence, created_at::text \
+                 FROM duel_results WHERE pool_id = $1 \
+                 ORDER BY created_at DESC LIMIT $2",
+                &[&pool_id, &limit],
+            )
+            .await
+            .map_err(|e| format!("PG list_duel_results: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "pool_id": r.get::<_, String>(1),
+                    "candidate_a_id": r.get::<_, String>(2),
+                    "candidate_b_id": r.get::<_, String>(3),
+                    "winner_id": r.get::<_, String>(4),
+                    "judge_rationale": r.get::<_, Option<String>>(5),
+                    "position_swapped": r.get::<_, bool>(6),
+                    "confidence": r.get::<_, f64>(7),
+                    "created_at": r.get::<_, Option<String>>(8).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// List beam search runs.
+    pub async fn list_beam_search_runs(
+        &self,
+        agent_type: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let mut sql = String::from(
+            "SELECT id, agent_type, pool_id, config_json, generation, status, \
+             created_at::text, completed_at::text FROM beam_search_runs WHERE 1=1",
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let agent_owned;
+        if let Some(a) = agent_type {
+            agent_owned = a.to_string();
+            sql.push_str(&format!(" AND agent_type = ${}", params.len() + 1));
+            params.push(&agent_owned);
+        }
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${}", params.len() + 1));
+        params.push(&limit);
+        let rows = conn
+            .query(sql.as_str(), &params[..])
+            .await
+            .map_err(|e| format!("PG list_beam_search_runs: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "agent_type": r.get::<_, String>(1),
+                    "pool_id": r.get::<_, Option<String>>(2),
+                    "config_json": r.get::<_, String>(3),
+                    "generation": r.get::<_, i32>(4),
+                    "status": r.get::<_, String>(5),
+                    "created_at": r.get::<_, Option<String>>(6).unwrap_or_default(),
+                    "completed_at": r.get::<_, Option<String>>(7).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// List beam candidates for a run.
+    pub async fn list_beam_candidates(
+        &self,
+        beam_run_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows = conn
+            .query(
+                "SELECT id, beam_run_id, parent_id, prompt_content, critique, \
+                 changes_summary, generation, thinking_style, status, created_at::text \
+                 FROM beam_candidates WHERE beam_run_id = $1 \
+                 ORDER BY generation ASC, created_at ASC",
+                &[&beam_run_id],
+            )
+            .await
+            .map_err(|e| format!("PG list_beam_candidates: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "beam_run_id": r.get::<_, String>(1),
+                    "parent_id": r.get::<_, Option<String>>(2),
+                    "prompt_content": r.get::<_, String>(3),
+                    "critique": r.get::<_, Option<String>>(4),
+                    "changes_summary": r.get::<_, Option<String>>(5),
+                    "generation": r.get::<_, i32>(6),
+                    "thinking_style": r.get::<_, Option<String>>(7),
+                    "status": r.get::<_, String>(8),
+                    "created_at": r.get::<_, Option<String>>(9).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// List span events, filtered by execution_id and/or trace_id.
+    pub async fn list_span_events(
+        &self,
+        execution_id: Option<&str>,
+        trace_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let mut sql = String::from(
+            "SELECT id, execution_id, trace_id, agent_type, event_type, step_index, \
+             metric_name, reward_value, data_key, data_json, role, content, created_at::text \
+             FROM span_events WHERE 1=1",
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+        let exec_owned;
+        let trace_owned;
+        if let Some(e) = execution_id {
+            exec_owned = e.to_string();
+            sql.push_str(&format!(" AND execution_id = ${}", params.len() + 1));
+            params.push(&exec_owned);
+        }
+        if let Some(t) = trace_id {
+            trace_owned = t.to_string();
+            sql.push_str(&format!(" AND trace_id = ${}", params.len() + 1));
+            params.push(&trace_owned);
+        }
+        sql.push_str(&format!(
+            " ORDER BY created_at ASC, step_index ASC LIMIT ${}",
+            params.len() + 1
+        ));
+        params.push(&limit);
+        let rows = conn
+            .query(sql.as_str(), &params[..])
+            .await
+            .map_err(|e| format!("PG list_span_events: {}", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "execution_id": r.get::<_, String>(1),
+                    "trace_id": r.get::<_, String>(2),
+                    "agent_type": r.get::<_, String>(3),
+                    "event_type": r.get::<_, String>(4),
+                    "step_index": r.get::<_, i32>(5),
+                    "metric_name": r.get::<_, Option<String>>(6),
+                    "reward_value": r.get::<_, Option<f64>>(7),
+                    "data_key": r.get::<_, Option<String>>(8),
+                    "data_json": r.get::<_, Option<String>>(9),
+                    "role": r.get::<_, Option<String>>(10),
+                    "content": r.get::<_, Option<String>>(11),
+                    "created_at": r.get::<_, Option<String>>(12).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
 }

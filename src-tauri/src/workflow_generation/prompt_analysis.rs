@@ -68,11 +68,11 @@ pub fn analyze_all() -> Result<Vec<PromptInsight>, String> {
     Err("SQLite removed".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite_tests"))]
 mod tests {
     use super::*;
 
-    fn setup_test_db() -> Connection {
+    fn setup_test_db() {
         panic!("SQLite tests disabled — use PG-based tests instead")
     }
 

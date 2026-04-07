@@ -380,8 +380,10 @@ mod tests {
         // a should be first (highest), c should be last
         assert_eq!(scores[0].0, "a");
         assert_eq!(scores[2].0, "c");
-        // a: (3 - 0) / 2 = 1.5
-        assert!((scores[0].1 - 1.5).abs() < 1e-9);
+        // Pairwise Copeland: a wins vs b (+1), a wins vs c (+1) → 2/(K-1=2) = 1.0
+        assert!((scores[0].1 - 1.0).abs() < 1e-9);
+        // c loses to a (-1), c loses to b (-1) → -2/2 = -1.0
+        assert!((scores[2].1 - -1.0).abs() < 1e-9);
     }
 
     #[test]
