@@ -30,6 +30,7 @@ pub mod graph_ops;
 pub mod hooks;
 pub mod knowledge;
 pub mod known_issues;
+pub mod learned_patterns_ops;
 pub mod learning;
 pub mod log_sources;
 pub mod meta_optimizer;
@@ -44,6 +45,7 @@ pub mod prompt_evolution;
 pub mod prompt_registry;
 pub mod q_routing;
 pub mod queued_workflows;
+pub mod reasoning_traces;
 pub mod recordings;
 pub mod reflection;
 pub mod restate;
@@ -64,6 +66,7 @@ pub mod ui_bridge;
 pub mod watchers;
 pub mod workflow_state;
 pub mod workflows;
+pub mod working_representations;
 pub mod worktrees;
 
 use std::sync::{Arc, OnceLock};
@@ -162,6 +165,45 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_ep_topic_key ON entity_profiles(topic_key) WHERE NOT is_deleted;
             CREATE INDEX IF NOT EXISTS idx_ep_importance ON entity_profiles(importance) WHERE NOT is_deleted;
             CREATE INDEX IF NOT EXISTS idx_ep_fts ON entity_profiles USING GIN (to_tsvector('english', entity_label || ' ' || profile_summary)) WHERE NOT is_deleted;
+        "#,
+    },
+    Migration {
+        version: 5,
+        description: "Add reasoning_traces table and dreamer columns to memory_consolidation_log",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS reasoning_traces (
+                id BIGSERIAL PRIMARY KEY,
+                reasoning_type TEXT NOT NULL,
+                premise_ids BIGINT[] NOT NULL,
+                conclusion TEXT NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                evidence_json TEXT,
+                created_observation_id BIGINT REFERENCES observations(id),
+                dreamer_run_id BIGINT,
+                is_valid BOOLEAN NOT NULL DEFAULT true,
+                invalidated_by BIGINT REFERENCES reasoning_traces(id),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_rt_type ON reasoning_traces(reasoning_type);
+            CREATE INDEX IF NOT EXISTS idx_rt_run ON reasoning_traces(dreamer_run_id);
+            CREATE INDEX IF NOT EXISTS idx_rt_created ON reasoning_traces(created_at);
+            CREATE INDEX IF NOT EXISTS idx_rt_valid ON reasoning_traces(is_valid) WHERE is_valid;
+
+            ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS is_dreamer BOOLEAN NOT NULL DEFAULT false;
+            ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS inductive_traces INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS deductive_traces INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS abductive_traces INTEGER NOT NULL DEFAULT 0;
+        "#,
+    },
+    Migration {
+        version: 6,
+        description: "Add is_review and blocks_parent columns to task_runs",
+        sql: r#"
+            ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS is_review BOOLEAN DEFAULT FALSE;
+            ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS blocks_parent BOOLEAN DEFAULT FALSE;
+            CREATE INDEX IF NOT EXISTS idx_task_runs_blocking_children
+                ON task_runs(parent_task_run_id, blocks_parent)
+                WHERE blocks_parent = true AND status NOT IN ('complete', 'failed', 'stopped');
         "#,
     },
 ];
@@ -1424,6 +1466,8 @@ impl PgDb {
                 last_review_status  TEXT NOT NULL DEFAULT 'pending',
                 auto_resume_count   INTEGER NOT NULL DEFAULT 0,
                 max_auto_resumes    INTEGER NOT NULL DEFAULT 10,
+                github_token        TEXT NOT NULL DEFAULT '',
+                auto_resume_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                 completed_at        TIMESTAMPTZ,
                 completion_reason   TEXT,
                 last_polled_at      TIMESTAMPTZ,
@@ -1433,6 +1477,22 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_prw_active ON pr_watch_state(completed_at) WHERE completed_at IS NULL",
             "CREATE INDEX IF NOT EXISTS idx_prw_task_run ON pr_watch_state(task_run_id)",
+            // Learned Patterns (Phase 5A: Pattern Distillation from knowledge graph)
+            "CREATE TABLE IF NOT EXISTS learned_patterns (
+                id TEXT PRIMARY KEY,
+                problem_hash TEXT NOT NULL UNIQUE,
+                trigger_keywords TEXT NOT NULL,
+                problem_description TEXT NOT NULL,
+                solution_description TEXT NOT NULL,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                project_path TEXT,
+                workflow_name TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_learned_patterns_workflow ON learned_patterns(workflow_name)",
         ];
 
         for sql in &ddl {
