@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::database::CreateTaskRunEventInput;
 use crate::event_system::EventBroadcaster;
-use crate::orchestrator::integration::StageTransition;
+use crate::orchestrator::types::StageTransition;
 use crate::orchestrator::knowledge::{parse_findings_from_output, AgentType};
 use crate::step_executor::{ExecutionStepConfig, StepExecutionResult, VerificationPhaseResult};
 use crate::step_registry::StepEventLogger;

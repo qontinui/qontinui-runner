@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! EnhancedOrchestratorConfig
-//! ├── base: OrchestratorConfig          // Existing base config
+//! ├── base: BaseConfig                  // Base orchestrator config
 //! ├── context: ContextConfig            // Context window management (#3)
 //! ├── ledger: LedgerConfig              // Task ledger pattern (#2)
 //! ├── layers: LayersConfig              // Middleware layers (#4)
@@ -286,7 +286,7 @@ impl EnhancedOrchestratorConfig {
 // Base Configuration
 // ============================================================================
 
-/// Base orchestrator configuration (mirrors existing OrchestratorConfig).
+/// Base orchestrator configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaseConfig {
     /// Maximum iterations before stopping

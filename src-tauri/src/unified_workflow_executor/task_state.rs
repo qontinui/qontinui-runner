@@ -5,7 +5,7 @@
 use tracing::{debug, info, warn};
 
 use crate::event_system::EventBroadcaster;
-use crate::orchestrator::integration::StageTransition;
+use crate::orchestrator::types::StageTransition;
 use crate::workflow_state::{StateMachine, WorkflowState};
 
 use super::loop_controller::LoopController;

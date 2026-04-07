@@ -1092,3 +1092,17 @@ pub enum TaskCompletionResult {
         findings: Vec<Finding>,
     },
 }
+
+/// A record of a stage transition during task execution.
+/// Used for building the stage-based timeline in the recap page.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StageTransition {
+    /// Previous stage
+    pub from: String,
+    /// New stage
+    pub to: String,
+    /// When the transition occurred (ISO 8601)
+    pub timestamp: String,
+    /// Iteration number at time of transition
+    pub iteration: u32,
+}

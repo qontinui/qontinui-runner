@@ -68,7 +68,6 @@ pub mod event_bus;
 pub mod flow;
 pub mod flow_executor;
 pub mod hooks;
-pub mod integration;
 pub mod interrupt;
 pub mod knowledge;
 pub mod layers;

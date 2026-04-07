@@ -18,7 +18,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
-use crate::orchestrator::integration::StageTransition;
+use crate::orchestrator::types::StageTransition;
 use crate::orchestrator::knowledge::KnowledgeBase;
 use crate::step_executor::ExecutionStepConfig;
 use crate::step_registry::StepEventLogger;
