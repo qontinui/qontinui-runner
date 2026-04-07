@@ -297,7 +297,7 @@ impl PgDb {
             .map(|c| serde_json::to_string(c).unwrap_or_default());
         let enabled = input.enabled.unwrap_or(true);
         let auto_start = input.auto_start.unwrap_or(false);
-        let timeout_seconds = input.timeout_seconds.unwrap_or(30) as i64;
+        let timeout_seconds = input.timeout_seconds.unwrap_or(30) as i32;
 
         conn.execute(
             r#"INSERT INTO mcp_servers
@@ -322,6 +322,166 @@ impl PgDb {
         self.get_mcp_server(&id)
             .await?
             .ok_or_else(|| "Failed to retrieve created MCP server".to_string())
+    }
+
+    /// Update an existing MCP server configuration.
+    ///
+    /// When `transport` is changed, the config for the *old* transport is explicitly
+    /// cleared to NULL so the row doesn't retain stale config from the previous
+    /// transport type.  When `transport` is `None` (unchanged), the existing
+    /// COALESCE pattern keeps the current value unless a new one is supplied.
+    pub async fn update_mcp_server(
+        &self,
+        id: &str,
+        input: crate::mcp_client::UpdateMcpServerInput,
+    ) -> Result<crate::mcp_client::McpServerConfig, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let transport_str = input.transport.as_ref().map(|t| match t {
+            crate::mcp_client::McpTransport::Http => "http".to_string(),
+            crate::mcp_client::McpTransport::Stdio => "stdio".to_string(),
+        });
+        let timeout_seconds = input.timeout_seconds.map(|t| t as i32);
+
+        // When transport is being changed, clear the opposing config to NULL.
+        // When transport is unchanged, use normal COALESCE (None = keep current).
+        let (stdio_config_json, http_config_json, clear_stdio, clear_http) =
+            if let Some(ref transport) = input.transport {
+                match transport {
+                    crate::mcp_client::McpTransport::Stdio => {
+                        // Switching to stdio: update stdio_config if provided, clear http_config
+                        (
+                            input.stdio_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                            None::<String>,
+                            false,
+                            true, // clear http_config
+                        )
+                    }
+                    crate::mcp_client::McpTransport::Http => {
+                        // Switching to http: update http_config if provided, clear stdio_config
+                        (
+                            None::<String>,
+                            input.http_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                            true, // clear stdio_config
+                            false,
+                        )
+                    }
+                }
+            } else {
+                // No transport change — normal COALESCE behavior
+                (
+                    input.stdio_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                    input.http_config.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                    false,
+                    false,
+                )
+            };
+
+        // Use CASE expressions for stdio_config/http_config so we can express
+        // three states: update (param is non-null), clear to NULL (flag param is true),
+        // or keep current (COALESCE fallback).
+        let rows_affected = conn
+            .execute(
+                r#"UPDATE mcp_servers SET
+                    name = COALESCE($2, name),
+                    description = COALESCE($3, description),
+                    transport = COALESCE($4, transport),
+                    stdio_config = CASE
+                        WHEN $10 THEN NULL
+                        WHEN $5 IS NOT NULL THEN $5
+                        ELSE stdio_config
+                    END,
+                    http_config = CASE
+                        WHEN $11 THEN NULL
+                        WHEN $6 IS NOT NULL THEN $6
+                        ELSE http_config
+                    END,
+                    enabled = COALESCE($7, enabled),
+                    auto_start = COALESCE($8, auto_start),
+                    timeout_seconds = COALESCE($9, timeout_seconds),
+                    updated_at = NOW()
+                WHERE id = $1"#,
+                &[
+                    &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &input.name as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &input.description as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &transport_str as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &stdio_config_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &http_config_json as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &input.enabled as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &input.auto_start as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &timeout_seconds as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &clear_stdio as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &clear_http as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_mcp_server: {}", e))?;
+
+        if rows_affected == 0 {
+            return Err(format!("MCP server not found: {}", id));
+        }
+
+        self.get_mcp_server(id)
+            .await?
+            .ok_or_else(|| "Failed to retrieve updated MCP server".to_string())
+    }
+
+    /// Delete an MCP server by ID.
+    pub async fn delete_mcp_server(&self, id: &str) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows_affected = conn
+            .execute("DELETE FROM mcp_servers WHERE id = $1", &[&id])
+            .await
+            .map_err(|e| format!("PG delete_mcp_server: {}", e))?;
+        Ok(rows_affected > 0)
+    }
+
+    /// List MCP servers marked for auto-start.
+    /// Reuses `list_mcp_servers` with a filter to avoid fragile positional column indexing.
+    pub async fn list_auto_start_mcp_servers(
+        &self,
+    ) -> Result<Vec<crate::mcp_client::McpServerConfig>, String> {
+        let all = self.list_mcp_servers().await?;
+        Ok(all.into_iter().filter(|s| s.auto_start && s.enabled).collect())
+    }
+
+    /// Update cached tools for an MCP server.
+    pub async fn update_mcp_server_cached_tools(
+        &self,
+        id: &str,
+        cached_tools: Option<&str>,
+        tools_cached_at: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let rows_affected = conn
+            .execute(
+                r#"UPDATE mcp_servers SET
+                    cached_tools = $2,
+                    tools_cached_at = $3::TIMESTAMPTZ,
+                    updated_at = NOW()
+                WHERE id = $1"#,
+                &[
+                    &id as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &cached_tools as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &tools_cached_at as &(dyn tokio_postgres::types::ToSql + Sync),
+                ],
+            )
+            .await
+            .map_err(|e| format!("PG update_mcp_server_cached_tools: {}", e))?;
+        Ok(rows_affected > 0)
     }
 
     /// Create a new mobile log entry.

@@ -53,3 +53,36 @@ SELECT id, name, COALESCE(description, '') as description, transport,
        COALESCE(cached_tools, '[]') as cached_tools, COALESCE(tools_cached_at::TEXT, '') as tools_cached_at,
        created_at, updated_at
 FROM mcp_servers WHERE id = :id;
+
+--! update_mcp_server (name?, description?, transport?, stdio_config?, http_config?, enabled?, auto_start?, timeout_seconds?)
+UPDATE mcp_servers SET
+    name = COALESCE(:name, name),
+    description = COALESCE(:description, description),
+    transport = COALESCE(:transport, transport),
+    stdio_config = COALESCE(:stdio_config, stdio_config),
+    http_config = COALESCE(:http_config, http_config),
+    enabled = COALESCE(:enabled, enabled),
+    auto_start = COALESCE(:auto_start, auto_start),
+    timeout_seconds = COALESCE(:timeout_seconds, timeout_seconds),
+    updated_at = NOW()
+WHERE id = :id
+RETURNING id;
+
+--! delete_mcp_server
+DELETE FROM mcp_servers WHERE id = :id RETURNING id;
+
+--! list_auto_start_mcp_servers
+SELECT id, name, COALESCE(description, '') as description, transport,
+       COALESCE(stdio_config, '{}') as stdio_config, COALESCE(http_config, '{}') as http_config, enabled,
+       auto_start, COALESCE(timeout_seconds, 30) as timeout_seconds,
+       COALESCE(cached_tools, '[]') as cached_tools, COALESCE(tools_cached_at::TEXT, '') as tools_cached_at,
+       created_at, updated_at
+FROM mcp_servers WHERE auto_start = true AND enabled = true ORDER BY name ASC;
+
+--! update_mcp_server_cached_tools (cached_tools?, tools_cached_at?)
+UPDATE mcp_servers SET
+    cached_tools = :cached_tools,
+    tools_cached_at = :tools_cached_at::TIMESTAMPTZ,
+    updated_at = NOW()
+WHERE id = :id
+RETURNING id;

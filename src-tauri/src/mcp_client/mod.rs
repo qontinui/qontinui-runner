@@ -77,46 +77,93 @@ impl McpClientManager {
         }
     }
 
-    // SQLite database removed — MCP server CRUD methods return Err.
+    /// Helper to get the PgDb global instance.
+    fn pg_db() -> Result<std::sync::Arc<crate::database::pg::PgDb>, String> {
+        crate::database::pg::PgDb::try_global()
+            .ok_or_else(|| "PgDb not initialized".to_string())
+    }
 
     /// Get all configured MCP servers
     pub async fn list_servers(&self) -> Result<Vec<McpServerConfig>, String> {
-        Err("SQLite removed".into())
+        Self::pg_db()?.list_mcp_servers().await
     }
 
     /// Get a specific MCP server by ID
-    pub async fn get_server(&self, _server_id: &str) -> Result<Option<McpServerConfig>, String> {
-        Err("SQLite removed".into())
+    pub async fn get_server(&self, server_id: &str) -> Result<Option<McpServerConfig>, String> {
+        Self::pg_db()?.get_mcp_server(server_id).await
     }
 
     /// Create a new MCP server configuration
     pub async fn create_server(
         &self,
-        _input: CreateMcpServerInput,
+        input: CreateMcpServerInput,
     ) -> Result<McpServerConfig, String> {
-        Err("SQLite removed".into())
+        Self::pg_db()?.create_mcp_server(input).await
     }
 
-    /// Update an MCP server configuration
+    /// Update an MCP server configuration.
+    /// Disconnects any active connection before updating.
     pub async fn update_server(
         &self,
         server_id: &str,
-        _input: UpdateMcpServerInput,
+        input: UpdateMcpServerInput,
     ) -> Result<McpServerConfig, String> {
-        self.disconnect(server_id).await?;
-        Err("SQLite removed".into())
+        // Disconnect first to kill any active stdio subprocess
+        let _ = self.disconnect(server_id).await;
+        Self::pg_db()?.update_mcp_server(server_id, input).await
     }
 
-    /// Delete an MCP server configuration
+    /// Delete an MCP server configuration.
+    /// Disconnects any active connection before deleting.
     pub async fn delete_server(&self, server_id: &str) -> Result<(), String> {
-        self.disconnect(server_id).await?;
-        Err("SQLite removed".into())
+        // Disconnect first to kill any active stdio subprocess
+        let _ = self.disconnect(server_id).await;
+        let deleted = Self::pg_db()?.delete_mcp_server(server_id).await?;
+        if !deleted {
+            return Err(format!("MCP server not found: {}", server_id));
+        }
+        Ok(())
     }
 
-    /// Get the status of all servers
+    /// Get the status of all servers.
+    /// Merges PgDb server configs with in-memory connection state.
     pub async fn get_all_status(&self) -> Vec<McpServerStatus> {
-        // SQLite removed — return status for currently-connected servers only
         let connections = self.connections.read().await;
+
+        // If PgDb is available, fetch all servers and merge with connection state
+        if let Ok(db) = Self::pg_db() {
+            if let Ok(servers) = db.list_mcp_servers().await {
+                let mut statuses = Vec::with_capacity(servers.len());
+                for server in servers {
+                    if let Some(conn) = connections.get(&server.id) {
+                        statuses.push(McpServerStatus {
+                            server_id: server.id,
+                            connected: conn.connected,
+                            error: conn.last_error.clone(),
+                            tools: if conn.connected {
+                                Some(conn.tools.clone())
+                            } else {
+                                None
+                            },
+                            last_connect_attempt: conn.last_connect_attempt.clone(),
+                            last_connected: conn.last_connected.clone(),
+                        });
+                    } else {
+                        statuses.push(McpServerStatus {
+                            server_id: server.id,
+                            connected: false,
+                            error: None,
+                            tools: None,
+                            last_connect_attempt: None,
+                            last_connected: None,
+                        });
+                    }
+                }
+                return statuses;
+            }
+        }
+
+        // Fallback: return status for currently-connected servers only
         connections
             .iter()
             .map(|(id, conn)| McpServerStatus {
@@ -134,7 +181,9 @@ impl McpClientManager {
             .collect()
     }
 
-    /// Get the status of a specific server
+    /// Get the status of a specific server.
+    /// Returns connection state if connected, or a disconnected status if the
+    /// server exists in PgDb but hasn't been connected yet.
     pub async fn get_server_status(&self, server_id: &str) -> Result<McpServerStatus, String> {
         let connections = self.connections.read().await;
 
@@ -152,14 +201,86 @@ impl McpClientManager {
                 last_connected: conn.last_connected.clone(),
             })
         } else {
+            // Check PgDb — server may exist but never been connected
+            drop(connections);
+            if let Ok(db) = Self::pg_db() {
+                if let Ok(Some(_)) = db.get_mcp_server(server_id).await {
+                    return Ok(McpServerStatus {
+                        server_id: server_id.to_string(),
+                        connected: false,
+                        error: None,
+                        tools: None,
+                        last_connect_attempt: None,
+                        last_connected: None,
+                    });
+                }
+            }
             Err(format!("MCP server not found: {}", server_id))
         }
     }
 
-    /// Connect to an MCP server.
-    /// SQLite removed — server config not available via this path.
-    pub async fn connect(&self, _server_id: &str) -> Result<Vec<McpToolInfo>, String> {
-        Err("SQLite removed — MCP server config not available".into())
+    /// Connect to an MCP server by loading its config from PgDb.
+    pub async fn connect(&self, server_id: &str) -> Result<Vec<McpToolInfo>, String> {
+        let config = Self::pg_db()?
+            .get_mcp_server(server_id)
+            .await?
+            .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
+
+        if !config.enabled {
+            return Err(format!("MCP server is disabled: {}", server_id));
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let (tools, stdio_handle) = match config.transport {
+            McpTransport::Http => {
+                let tools = self.connect_http(&config).await?;
+                (tools, None)
+            }
+            McpTransport::Stdio => self.connect_stdio(&config).await?,
+        };
+
+        // Cache the tool list in the database
+        if let Ok(tools_json) = serde_json::to_string(&tools) {
+            let _ = Self::pg_db()
+                .ok()
+                .map(|db| {
+                    let server_id = server_id.to_string();
+                    let now_clone = now.clone();
+                    tokio::spawn(async move {
+                        let _ = db
+                            .update_mcp_server_cached_tools(
+                                &server_id,
+                                Some(&tools_json),
+                                Some(&now_clone),
+                            )
+                            .await;
+                    });
+                });
+        }
+
+        // Store the connection state
+        let mut connections = self.connections.write().await;
+        connections.insert(
+            server_id.to_string(),
+            McpConnection {
+                config,
+                connected: true,
+                tools: tools.clone(),
+                last_connect_attempt: Some(now.clone()),
+                last_connected: Some(now),
+                last_error: None,
+                stdio_handle,
+            },
+        );
+
+        info!(
+            "Connected to MCP server {} with {} tools",
+            server_id,
+            tools.len()
+        );
+
+        Ok(tools)
     }
 
     /// Disconnect from an MCP server
@@ -808,9 +929,46 @@ impl McpClientManager {
     // =========================================================================
 
     /// Start all servers marked for auto-start.
-    /// SQLite removed — no-op (PG-based auto-start not yet wired).
     pub async fn start_auto_start_servers(&self) {
-        // SQLite removed — MCP server list not available
+        let servers = match Self::pg_db() {
+            Ok(db) => match db.list_auto_start_mcp_servers().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to list auto-start MCP servers: {}", e);
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!("Cannot auto-start MCP servers — {}", e);
+                return;
+            }
+        };
+
+        if servers.is_empty() {
+            debug!("No MCP servers configured for auto-start");
+            return;
+        }
+
+        info!(
+            "Auto-starting {} MCP server(s): {}",
+            servers.len(),
+            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+
+        for server in &servers {
+            match self.connect(&server.id).await {
+                Ok(tools) => {
+                    info!(
+                        "Auto-started MCP server '{}' with {} tools",
+                        server.name,
+                        tools.len()
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to auto-start MCP server '{}': {}", server.name, e);
+                }
+            }
+        }
     }
 }
 
