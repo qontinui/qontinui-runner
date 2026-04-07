@@ -103,11 +103,11 @@ async fn build_compressed_iteration_history(
     // originals are archived (archived_at IS NULL filter excludes them from
     // every read below). This is the live entry point for CompressionService.
     //
-    // Threshold defaults to 80k tokens; override via the
-    // QONTINUI_COMPRESSION_THRESHOLD env var for testing.
+    // Config is loaded from AiSettings.compression (settings.json); the
+    // QONTINUI_COMPRESSION_THRESHOLD env var overrides threshold_tokens for
+    // probes/testing without touching settings.
     {
-        let mut compression_config =
-            crate::orchestrator::compression::CompressionConfig::default();
+        let mut compression_config = crate::settings::get_ai_settings().compression;
         if let Ok(raw) = std::env::var("QONTINUI_COMPRESSION_THRESHOLD") {
             if let Ok(parsed) = raw.parse::<usize>() {
                 compression_config.threshold_tokens = parsed;
