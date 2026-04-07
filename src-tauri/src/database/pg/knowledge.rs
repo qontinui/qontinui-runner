@@ -120,7 +120,9 @@ impl PgDb {
                 r#"SELECT id, task_run_id, category, content, confidence,
                           is_resolved, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content_embedding
                    FROM task_knowledge
-                   WHERE content_embedding IS NOT NULL AND category = $1
+                   WHERE content_embedding IS NOT NULL
+                     AND archived_at IS NULL
+                     AND category = $1
                    ORDER BY created_at DESC
                    LIMIT $2"#,
                 &[&cat, &candidate_limit],
@@ -132,6 +134,7 @@ impl PgDb {
                           is_resolved, to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), content_embedding
                    FROM task_knowledge
                    WHERE content_embedding IS NOT NULL
+                     AND archived_at IS NULL
                    ORDER BY created_at DESC
                    LIMIT $1"#,
                 &[&candidate_limit],
@@ -167,11 +170,16 @@ impl PgDb {
     }
 
     /// List task knowledge entries for a specific task run.
+    ///
+    /// `include_archived` controls whether rows whose `archived_at` is set
+    /// (i.e. compressed into a summary) are included. Pass `false` from any
+    /// non-admin reader.
     pub async fn list_task_knowledge(
         &self,
         task_run_id: &str,
         category: Option<&str>,
         unresolved_only: bool,
+        include_archived: bool,
     ) -> Result<Vec<crate::database::types::StoredTaskKnowledge>, String> {
         let conn = self
             .pool()
@@ -192,6 +200,10 @@ impl PgDb {
 
         if unresolved_only {
             sql.push_str(" AND NOT is_resolved");
+        }
+
+        if !include_archived {
+            sql.push_str(" AND archived_at IS NULL");
         }
 
         let rows = if let Some(cat) = category {
@@ -246,6 +258,7 @@ impl PgDb {
                WHERE tr.workflow_name = $1
                  AND tk.task_run_id != $2
                  AND tk.agent_type = 'reflection'
+                 AND tk.archived_at IS NULL
                  AND tk.category IN ({})
                ORDER BY tk.created_at DESC
                LIMIT {}"#,
@@ -294,6 +307,7 @@ impl PgDb {
                    WHERE tk.project_path = $1
                      AND tk.task_run_id != $2
                      AND tk.agent_type = 'reflection'
+                     AND tk.archived_at IS NULL
                      AND tk.category IN (
                          'project_environment', 'project_architecture',
                          'project_test_pattern', 'project_recurring_issue'
@@ -347,6 +361,7 @@ impl PgDb {
                WHERE ({})
                  AND tk.task_run_id != $1
                  AND tr.workflow_name != $2
+                 AND tk.archived_at IS NULL
                  AND tk.category IN ('recurring_pattern', 'context', 'solution', 'root_cause')
                  AND tk.confidence IN ('high', 'medium')
                ORDER BY tk.created_at DESC
@@ -414,7 +429,7 @@ impl PgDb {
         let sql = format!(
             r#"SELECT id, category, content, confidence, created_at::text
                FROM task_knowledge
-               WHERE {}
+               WHERE archived_at IS NULL AND {}
                ORDER BY created_at DESC
                LIMIT ${}"#,
             where_clause, limit_idx
@@ -476,11 +491,16 @@ impl PgDb {
     }
 
     /// Get task knowledge entries filtered by multiple categories.
+    ///
+    /// `include_archived` controls whether rows whose `archived_at` is set
+    /// (i.e. compressed into a summary) are included. Pass `false` from any
+    /// non-admin reader.
     pub async fn get_task_knowledge_by_categories(
         &self,
         task_run_id: &str,
         categories: &[&str],
         limit: i64,
+        include_archived: bool,
     ) -> Result<Vec<(String, String)>, String> {
         let conn = self
             .pool()
@@ -494,11 +514,17 @@ impl PgDb {
             .enumerate()
             .map(|(i, _)| format!("${}", i + 2))
             .collect();
+        let archived_clause = if include_archived {
+            ""
+        } else {
+            "AND archived_at IS NULL "
+        };
         let sql = format!(
             "SELECT category, content FROM task_knowledge \
-             WHERE task_run_id = $1 AND category IN ({}) \
+             WHERE task_run_id = $1 AND category IN ({}) {}\
              ORDER BY created_at DESC LIMIT {}",
             placeholders.join(", "),
+            archived_clause,
             limit
         );
 
@@ -523,5 +549,43 @@ impl PgDb {
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
             .collect())
+    }
+
+    /// Archive a set of knowledge entries by rolling them into a summary entry.
+    ///
+    /// Sets `archived_at = NOW()` and `summary_entry_id = summary_id` for every
+    /// row in `ids` whose `archived_at` is currently NULL. Already-archived rows
+    /// are skipped (no-op). Returns the number of rows actually updated.
+    ///
+    /// `summary_id` must be the id of an existing `task_knowledge` row — the
+    /// foreign key on `summary_entry_id` enforces this.
+    pub async fn archive_task_knowledge(
+        &self,
+        ids: &[String],
+        summary_id: &str,
+    ) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
+
+        let updated = conn
+            .execute(
+                r#"UPDATE task_knowledge
+                   SET archived_at = NOW(),
+                       summary_entry_id = $1
+                   WHERE id = ANY($2::text[])
+                     AND archived_at IS NULL"#,
+                &[&summary_id, &ids],
+            )
+            .await
+            .map_err(|e| format!("PG archive_task_knowledge: {e}"))?;
+
+        Ok(updated as usize)
     }
 }

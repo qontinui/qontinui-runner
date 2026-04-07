@@ -207,13 +207,14 @@ impl KnowledgeBase {
     /// the context doesn't exceed token limits.
     ///
     /// Returns Some(result) if compression was performed, None if not needed.
-    pub fn compress_if_needed(
+    pub async fn compress_if_needed(
         &self,
         task_run_id: &str,
         config: &CompressionConfig,
+        pg: Arc<crate::database::pg::PgDb>,
     ) -> Result<Option<CompressionResult>, String> {
-        let service = CompressionService::new(config.clone());
-        service.compress_if_needed(task_run_id)
+        let service = CompressionService::new(config.clone(), pg);
+        service.compress_if_needed(task_run_id).await
     }
 
     /// Record a finding from a worker.
@@ -1103,27 +1104,32 @@ pub fn build_structured_failure_summary(
 ///
 /// If a compression config is provided, compression will be attempted before
 /// building context to prevent token overflow.
-pub fn build_iteration_context(
+pub async fn build_iteration_context(
     kb: &KnowledgeBase,
     task_run_id: &str,
     current_iteration: u32,
+    pg: Arc<crate::database::pg::PgDb>,
 ) -> Result<String, String> {
-    build_iteration_context_with_compression(kb, task_run_id, current_iteration, None)
+    build_iteration_context_with_compression(kb, task_run_id, current_iteration, None, pg).await
 }
 
 /// Build context with optional compression.
 ///
 /// If compression_config is Some, runs compression before building context.
-pub fn build_iteration_context_with_compression(
+pub async fn build_iteration_context_with_compression(
     kb: &KnowledgeBase,
     task_run_id: &str,
     current_iteration: u32,
     compression_config: Option<&CompressionConfig>,
+    pg: Arc<crate::database::pg::PgDb>,
 ) -> Result<String, String> {
     // Run compression if configured and past first iteration
     if let Some(config) = compression_config {
         if current_iteration > 1 {
-            if let Some(result) = kb.compress_if_needed(task_run_id, config)? {
+            if let Some(result) = kb
+                .compress_if_needed(task_run_id, config, pg.clone())
+                .await?
+            {
                 info!(
                     "Compressed knowledge for task {}: {} -> {} tokens ({} items summarized)",
                     task_run_id,

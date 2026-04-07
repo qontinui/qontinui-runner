@@ -587,7 +587,7 @@ pub async fn get_task_run_knowledge(
     let knowledge = state
         .app_state
         .pg_db
-        .list_task_knowledge(&id, query.category.as_deref(), query.unresolved_only)
+        .list_task_knowledge(&id, query.category.as_deref(), query.unresolved_only, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

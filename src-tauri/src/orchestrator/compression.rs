@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::database::pg::PgDb;
 use crate::database::StoredTaskKnowledge;
 
 // ============================================================================
@@ -213,21 +214,31 @@ pub struct KnowledgeSummary {
 // ============================================================================
 
 /// Service for managing context compression.
-/// SQLite removed — all methods are stubs.
+///
+/// Reads live (non-archived) `task_knowledge` rows from PG, summarizes oldest
+/// entries per category once the configured threshold is exceeded, persists
+/// the summary as a new knowledge row, and archives the originals via
+/// `PgDb::archive_task_knowledge`.
 pub struct CompressionService {
     config: CompressionConfig,
+    pg: Arc<PgDb>,
 }
 
 impl CompressionService {
-    /// Create a new compression service.
-    /// SQLite removed — stub.
-    pub fn new(_config: CompressionConfig) -> Self {
-        Self { config: _config }
+    /// Create a new compression service backed by a PG handle.
+    pub fn new(config: CompressionConfig, pg: Arc<PgDb>) -> Self {
+        Self { config, pg }
     }
 
     /// Estimate the token count for a task's current context.
-    pub fn estimate_context_tokens(&self, task_run_id: &str) -> Result<TokenCount, String> {
-        let all_knowledge: Vec<StoredTaskKnowledge> = Vec::new(); // SQLite removed
+    pub async fn estimate_context_tokens(
+        &self,
+        task_run_id: &str,
+    ) -> Result<TokenCount, String> {
+        let all_knowledge = self
+            .pg
+            .list_task_knowledge(task_run_id, None, false, false)
+            .await?;
 
         let mut count = TokenCount::empty();
         count.entry_count = all_knowledge.len();
@@ -257,7 +268,7 @@ impl CompressionService {
     /// Check if compression is needed and perform it if so.
     ///
     /// Returns Some(result) if compression was performed, None if not needed.
-    pub fn compress_if_needed(
+    pub async fn compress_if_needed(
         &self,
         task_run_id: &str,
     ) -> Result<Option<CompressionResult>, String> {
@@ -266,7 +277,7 @@ impl CompressionService {
             return Ok(None);
         }
 
-        let token_count = self.estimate_context_tokens(task_run_id)?;
+        let token_count = self.estimate_context_tokens(task_run_id).await?;
 
         if !token_count.exceeds_threshold(self.config.threshold_tokens) {
             debug!(
@@ -281,12 +292,12 @@ impl CompressionService {
             token_count.total, self.config.threshold_tokens, task_run_id
         );
 
-        let result = self.compress_knowledge(task_run_id, &token_count)?;
+        let result = self.compress_knowledge(task_run_id, &token_count).await?;
         Ok(Some(result))
     }
 
     /// Perform compression on task knowledge.
-    fn compress_knowledge(
+    async fn compress_knowledge(
         &self,
         task_run_id: &str,
         original_count: &TokenCount,
@@ -305,7 +316,8 @@ impl CompressionService {
         ] {
             // Only compress if this category has significant tokens
             if tokens > 1000 {
-                let (summarized, summaries) = self.compress_category(task_run_id, category)?;
+                let (summarized, summaries) =
+                    self.compress_category(task_run_id, category).await?;
                 items_summarized += summarized;
                 summary_entries_created += summaries;
                 if summarized > 0 {
@@ -315,7 +327,7 @@ impl CompressionService {
         }
 
         // Re-estimate tokens after compression
-        let new_count = self.estimate_context_tokens(task_run_id)?;
+        let new_count = self.estimate_context_tokens(task_run_id).await?;
 
         let result = CompressionResult {
             original_tokens: original_count.total,
@@ -339,12 +351,15 @@ impl CompressionService {
     /// Compress a specific category of knowledge.
     ///
     /// Returns (items_summarized, summaries_created).
-    fn compress_category(
+    async fn compress_category(
         &self,
         task_run_id: &str,
         category: &str,
     ) -> Result<(usize, usize), String> {
-        let entries: Vec<StoredTaskKnowledge> = Vec::new(); // SQLite removed
+        let entries = self
+            .pg
+            .list_task_knowledge(task_run_id, Some(category), false, false)
+            .await?;
 
         if entries.len() <= self.config.keep_recent_items {
             debug!(
@@ -373,27 +388,51 @@ impl CompressionService {
         // Create summary for the batch
         let summary = self.create_summary(task_run_id, category, to_compress)?;
 
-        // Store the summary as a new knowledge entry
+        // Build the persisted summary content
         let summary_content = format!(
             "[COMPRESSED SUMMARY - {} items from iterations {:?}]\n{}",
             summary.item_count, summary.covered_iterations, summary.summary
         );
 
-        // Mark old entries as resolved (effectively archiving them)
-        let mut archived_count = 0;
-        for entry in to_compress {
-            if let Err(e) = Err::<(), String>("SQLite removed".into()) {
-                warn!("Failed to archive knowledge entry {}: {}", entry.id, e);
-            } else {
-                archived_count += 1;
-            }
-        }
+        // Persist the summary as a new task_knowledge row BEFORE archiving
+        // (the FK on summary_entry_id requires the summary row to exist first).
+        let summary_id = uuid::Uuid::new_v4().to_string();
+        let archived_ids: Vec<&str> = to_compress.iter().map(|e| e.id.as_str()).collect();
+        let evidence_json = serde_json::json!({
+            "archived_ids": archived_ids,
+            "covered_iterations": summary.covered_iterations,
+            "item_count": summary.item_count,
+        })
+        .to_string();
+        let summary_iteration = to_compress
+            .last()
+            .map(|e| e.iteration as i32)
+            .unwrap_or(0);
 
-        // SQLite removed — summary entry not persisted
+        self.pg
+            .create_task_knowledge(
+                &summary_id,
+                task_run_id,
+                &format!("{category}_compressed_summary"),
+                "system",
+                summary_iteration,
+                &summary_content,
+                Some(&evidence_json),
+                "high",
+                "[]",
+            )
+            .await?;
+
+        // Archive the originals — single round-trip via ANY($::text[])
+        let id_strings: Vec<String> = to_compress.iter().map(|e| e.id.clone()).collect();
+        let archived_count = self
+            .pg
+            .archive_task_knowledge(&id_strings, &summary_id)
+            .await?;
 
         info!(
-            "Compressed {} {} entries into summary for task {}",
-            archived_count, category, task_run_id
+            "Compressed {} {} entries into summary {} for task {}",
+            archived_count, category, summary_id, task_run_id
         );
 
         Ok((archived_count, 1))

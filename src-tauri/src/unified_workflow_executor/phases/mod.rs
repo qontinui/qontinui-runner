@@ -97,6 +97,48 @@ async fn build_compressed_iteration_history(
     project_path: Option<&str>,
     pg_db: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> Option<String> {
+    // Run knowledge compression before assembling context. When the accumulated
+    // task_knowledge for this run exceeds the threshold, oldest entries per
+    // category are summarized into a `*_compressed_summary` row and the
+    // originals are archived (archived_at IS NULL filter excludes them from
+    // every read below). This is the live entry point for CompressionService.
+    //
+    // Threshold defaults to 80k tokens; override via the
+    // QONTINUI_COMPRESSION_THRESHOLD env var for testing.
+    {
+        let mut compression_config =
+            crate::orchestrator::compression::CompressionConfig::default();
+        if let Ok(raw) = std::env::var("QONTINUI_COMPRESSION_THRESHOLD") {
+            if let Ok(parsed) = raw.parse::<usize>() {
+                compression_config.threshold_tokens = parsed;
+            }
+        }
+        let service = crate::orchestrator::compression::CompressionService::new(
+            compression_config,
+            pg_db.clone(),
+        );
+        match service.compress_if_needed(execution_id).await {
+            Ok(Some(result)) => {
+                info!(
+                    "Knowledge compression fired for {}: {} -> {} tokens ({} items summarized, categories: {:?})",
+                    execution_id,
+                    result.original_tokens,
+                    result.compressed_tokens,
+                    result.items_summarized,
+                    result.compressed_categories
+                );
+            }
+            Ok(None) => {} // below threshold or disabled — no log spam
+            Err(e) => {
+                tracing::warn!(
+                    "Knowledge compression failed for {}: {} (continuing without compression)",
+                    execution_id,
+                    e
+                );
+            }
+        }
+    }
+
     let mut sections = Vec::new();
     let mut budget_remaining = max_context_tokens;
     let mut sections_included: usize = 0;
@@ -112,7 +154,7 @@ async fn build_compressed_iteration_history(
     // 1. Latest verification feedback from knowledge base (most actionable -- show first)
     // Priority: CRITICAL -- always included regardless of budget
     if let Ok(feedback) = pg_db
-        .list_task_knowledge(execution_id, Some("verification_feedback"), false)
+        .list_task_knowledge(execution_id, Some("verification_feedback"), false, false)
         .await
     {
         if let Some(latest) = feedback.last() {
@@ -174,13 +216,13 @@ async fn build_compressed_iteration_history(
 
     // Load all observations once for efficient per-iteration lookup
     let all_observations = pg_db
-        .list_task_knowledge(execution_id, Some("observation"), false)
+        .list_task_knowledge(execution_id, Some("observation"), false, false)
         .await
         .unwrap_or_default();
 
     // Load all solutions for fix descriptions
     let all_solutions = pg_db
-        .list_task_knowledge(execution_id, Some("solution"), false)
+        .list_task_knowledge(execution_id, Some("solution"), false, false)
         .await
         .unwrap_or_default();
 
@@ -431,7 +473,7 @@ async fn build_compressed_iteration_history(
     // 4. Accumulated knowledge (unresolved only -- deduped against iteration history above)
     // Priority: MEDIUM
     if budget_remaining > 200 {
-        if let Ok(all_knowledge) = pg_db.list_task_knowledge(execution_id, None, false).await {
+        if let Ok(all_knowledge) = pg_db.list_task_knowledge(execution_id, None, false, false).await {
             if !all_knowledge.is_empty() {
                 let unresolved: Vec<_> = all_knowledge
                     .iter()

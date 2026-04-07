@@ -561,7 +561,7 @@ async fn auto_capture_observations(pg: &crate::database::pg::PgDb, execution_id:
 
     // Extract findings from task knowledge (PG)
     let findings = pg
-        .get_task_knowledge_by_categories(execution_id, &["Finding", "RootCause", "Solution"], 10)
+        .get_task_knowledge_by_categories(execution_id, &["Finding", "RootCause", "Solution"], 10, false)
         .await
         .unwrap_or_default();
 

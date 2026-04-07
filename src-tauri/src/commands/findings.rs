@@ -125,6 +125,6 @@ pub async fn list_task_knowledge_cmd(
 ) -> Result<Vec<StoredTaskKnowledge>, String> {
     app_state
         .pg_db
-        .list_task_knowledge(&task_run_id, category.as_deref(), false)
+        .list_task_knowledge(&task_run_id, category.as_deref(), false, false)
         .await
 }
