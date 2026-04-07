@@ -518,6 +518,18 @@ async fn run_consolidation_inner(
         }
     }
 
+    // Phase A.5: Contradiction Resolution
+    info!("Memory consolidation: Phase A.5 — Contradiction resolution");
+    match crate::memory::contradiction::run_contradiction_scan(pg, 50).await {
+        Ok(cr_stats) => {
+            info!(
+                "Contradiction resolution: detected={}, auto_resolved={}, failed={}",
+                cr_stats.detected, cr_stats.auto_resolved, cr_stats.failed
+            );
+        }
+        Err(e) => warn!("Contradiction resolution failed (non-fatal): {}", e),
+    }
+
     let groups = group_observations(&observations, config.min_group_size);
     stats.groups_found = groups.len() as i32;
 
@@ -669,6 +681,454 @@ async fn run_consolidation_inner(
     );
 
     Ok(())
+}
+
+// =============================================================================
+// Phase E: Inductive Reasoning — detect patterns across multiple observations
+// =============================================================================
+
+/// Phase E: Inductive reasoning — detect patterns across multiple observations.
+pub(crate) async fn phase_inductive(
+    _pg: &Arc<PgDb>,
+    observations: &[ConsolidationObservation],
+    _config: &ConsolidationConfig,
+) -> Result<Vec<crate::database::types::CreateReasoningTraceInput>, String> {
+    use crate::database::types::CreateReasoningTraceInput;
+
+    let mut traces = Vec::new();
+
+    // Group observations by observation_type
+    let mut by_type: HashMap<String, Vec<&ConsolidationObservation>> = HashMap::new();
+    for obs in observations {
+        by_type
+            .entry(obs.observation_type.clone())
+            .or_default()
+            .push(obs);
+    }
+
+    // For groups with 3+ members, create inductive trace
+    for (obs_type, group) in &by_type {
+        if group.len() >= 3 {
+            let premise_ids: Vec<i64> = group.iter().map(|o| o.id).collect();
+            let titles: Vec<&str> = group.iter().take(5).map(|o| o.title.as_str()).collect();
+
+            let conclusion = format!(
+                "Recurring {} pattern detected across {} observations: {}",
+                obs_type,
+                group.len(),
+                titles.join(", ")
+            );
+
+            traces.push(CreateReasoningTraceInput {
+                reasoning_type: "inductive".to_string(),
+                premise_ids,
+                conclusion,
+                confidence: (group.len() as f64 / 10.0).min(0.9),
+                evidence_json: Some(
+                    serde_json::json!({
+                        "pattern_type": obs_type,
+                        "observation_count": group.len(),
+                        "sample_titles": titles,
+                    })
+                    .to_string(),
+                ),
+                created_observation_id: None,
+                dreamer_run_id: None,
+            });
+        }
+    }
+
+    // Also group by topic_key prefix
+    let mut by_prefix: HashMap<String, Vec<&ConsolidationObservation>> = HashMap::new();
+    for obs in observations {
+        if let Some(ref tk) = obs.topic_key {
+            if let Some(prefix) = tk.split('/').next() {
+                by_prefix
+                    .entry(prefix.to_string())
+                    .or_default()
+                    .push(obs);
+            }
+        }
+    }
+
+    for (prefix, group) in &by_prefix {
+        if group.len() >= 3 {
+            let premise_ids: Vec<i64> = group.iter().map(|o| o.id).collect();
+            let conclusion = format!(
+                "Topic area '{}' has {} related observations, suggesting concentrated activity or recurring issues in this domain",
+                prefix, group.len()
+            );
+
+            traces.push(CreateReasoningTraceInput {
+                reasoning_type: "inductive".to_string(),
+                premise_ids,
+                conclusion,
+                confidence: 0.6,
+                evidence_json: Some(
+                    serde_json::json!({
+                        "topic_prefix": prefix,
+                        "observation_count": group.len(),
+                    })
+                    .to_string(),
+                ),
+                created_observation_id: None,
+                dreamer_run_id: None,
+            });
+        }
+    }
+
+    Ok(traces)
+}
+
+// =============================================================================
+// Phase F: Deductive Reasoning — apply logical rules to existing knowledge
+// =============================================================================
+
+/// Phase F: Deductive reasoning — apply logical rules to existing knowledge.
+pub(crate) async fn phase_deductive(
+    pg: &Arc<PgDb>,
+    _config: &ConsolidationConfig,
+) -> Result<Vec<crate::database::types::CreateReasoningTraceInput>, String> {
+    use crate::database::types::CreateReasoningTraceInput;
+
+    let mut traces = Vec::new();
+
+    // Query: find fixes that resolved findings which later recurred
+    let conn = pg
+        .pool()
+        .get()
+        .await
+        .map_err(|e| format!("PG pool error: {}", e))?;
+
+    let rows = conn
+        .query(
+            "SELECT DISTINCT crp.id, crp.pattern_type, crp.signature_hash,
+                    crp.occurrence_count, crp.resolved_by_fix_id, crp.pattern_data
+             FROM cross_run_patterns crp
+             WHERE crp.status = 'active'
+               AND crp.resolved_by_fix_id IS NOT NULL
+               AND crp.occurrence_count >= 2
+             LIMIT 20",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("PG deductive query: {}", e))?;
+
+    for row in &rows {
+        let pattern_id: String = row.get("id");
+        let fix_id: Option<String> = row.get("resolved_by_fix_id");
+        let occurrence_count: i32 = row.get("occurrence_count");
+        let pattern_type: String = row.get("pattern_type");
+
+        if let Some(ref fix) = fix_id {
+            let conclusion = format!(
+                "Fix '{}' was applied to resolve pattern '{}', but the pattern recurred {} times. \
+                 Deduction: the fix is insufficient and the root cause remains unaddressed.",
+                fix, pattern_id, occurrence_count
+            );
+
+            traces.push(CreateReasoningTraceInput {
+                reasoning_type: "deductive".to_string(),
+                premise_ids: vec![], // cross_run_patterns don't have observation IDs
+                conclusion,
+                confidence: 0.8,
+                evidence_json: Some(
+                    serde_json::json!({
+                        "pattern_id": pattern_id,
+                        "pattern_type": pattern_type,
+                        "fix_id": fix,
+                        "recurrence_count": occurrence_count,
+                        "rule": "If fix F resolved pattern P, but P recurred, then F is insufficient"
+                    })
+                    .to_string(),
+                ),
+                created_observation_id: None,
+                dreamer_run_id: None,
+            });
+        }
+    }
+
+    // Also check mental models that contradict recent observations
+    let mental_models = conn
+        .query(
+            "SELECT id, title, content FROM observations
+             WHERE is_mental_model = true AND NOT is_deleted
+             ORDER BY importance DESC LIMIT 10",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("PG deductive mental models: {}", e))?;
+
+    for model in &mental_models {
+        let model_id: i64 = model.get("id");
+        let model_title: String = model.get("title");
+
+        // Check if there are recent observations that contradict this model
+        let contradictions = conn
+            .query(
+                "SELECT id, title FROM observations
+                 WHERE NOT is_deleted AND NOT is_mental_model
+                   AND superseded_by IS NULL
+                   AND created_at > NOW() - INTERVAL '7 days'
+                   AND topic_key IS NOT NULL
+                   AND topic_key IN (SELECT topic_key FROM observations WHERE id = $1)
+                   AND content_hash != (SELECT content_hash FROM observations WHERE id = $1)
+                 LIMIT 5",
+                &[&model_id],
+            )
+            .await
+            .map_err(|e| format!("PG deductive contradiction check: {}", e))?;
+
+        if !contradictions.is_empty() {
+            let contra_ids: Vec<i64> = contradictions
+                .iter()
+                .map(|r| r.get::<_, i64>("id"))
+                .collect();
+            let conclusion = format!(
+                "Mental model '{}' may be outdated: {} recent observations contradict it. \
+                 The model should be reviewed and potentially regenerated.",
+                model_title,
+                contradictions.len()
+            );
+
+            let mut premise_ids = vec![model_id];
+            premise_ids.extend(&contra_ids);
+
+            traces.push(CreateReasoningTraceInput {
+                reasoning_type: "deductive".to_string(),
+                premise_ids,
+                conclusion,
+                confidence: 0.7,
+                evidence_json: Some(
+                    serde_json::json!({
+                        "mental_model_id": model_id,
+                        "contradicting_observation_ids": contra_ids,
+                        "rule": "If recent observations contradict a mental model, the model is stale"
+                    })
+                    .to_string(),
+                ),
+                created_observation_id: None,
+                dreamer_run_id: None,
+            });
+        }
+    }
+
+    Ok(traces)
+}
+
+// =============================================================================
+// Phase G: Abductive Reasoning — infer simplest explanations
+// =============================================================================
+
+/// Phase G: Abductive reasoning — infer simplest explanations for unexplained phenomena.
+pub(crate) async fn phase_abductive(
+    _pg: &Arc<PgDb>,
+    observations: &[ConsolidationObservation],
+    _config: &ConsolidationConfig,
+) -> Result<Vec<crate::database::types::CreateReasoningTraceInput>, String> {
+    use crate::database::types::CreateReasoningTraceInput;
+
+    let mut traces = Vec::new();
+
+    // Find error/bugfix observations that have no linked fixes or resolutions
+    let unresolved: Vec<&ConsolidationObservation> = observations
+        .iter()
+        .filter(|o| {
+            (o.observation_type == "bugfix" || o.observation_type == "pattern")
+                && o.importance >= 0.3
+        })
+        .take(20)
+        .collect();
+
+    if unresolved.len() >= 2 {
+        // Group unresolved by topic_key prefix to find clusters
+        let mut clusters: HashMap<String, Vec<&ConsolidationObservation>> = HashMap::new();
+        for obs in &unresolved {
+            let key = obs
+                .topic_key
+                .as_deref()
+                .and_then(|tk| tk.split('/').next())
+                .unwrap_or("unknown")
+                .to_string();
+            clusters.entry(key).or_default().push(obs);
+        }
+
+        for (area, cluster) in &clusters {
+            if cluster.len() >= 2 {
+                let premise_ids: Vec<i64> = cluster.iter().map(|o| o.id).collect();
+                let titles: Vec<&str> =
+                    cluster.iter().take(4).map(|o| o.title.as_str()).collect();
+
+                let conclusion = format!(
+                    "Multiple unresolved issues in area '{}' ({} observations: {}) suggest a common \
+                     underlying cause. Hypothesis: there may be a systemic issue in the '{}' domain \
+                     that individual fixes are not addressing.",
+                    area,
+                    cluster.len(),
+                    titles.join("; "),
+                    area
+                );
+
+                traces.push(CreateReasoningTraceInput {
+                    reasoning_type: "abductive".to_string(),
+                    premise_ids,
+                    conclusion,
+                    confidence: 0.5 + (cluster.len() as f64 * 0.05).min(0.3),
+                    evidence_json: Some(
+                        serde_json::json!({
+                            "area": area,
+                            "unresolved_count": cluster.len(),
+                            "sample_titles": titles,
+                            "reasoning": "Multiple unresolved issues in same area => common root cause"
+                        })
+                        .to_string(),
+                    ),
+                    created_observation_id: None,
+                    dreamer_run_id: None,
+                });
+            }
+        }
+    }
+
+    Ok(traces)
+}
+
+// =============================================================================
+// Dreamer Orchestrator — standard consolidation + formal reasoning phases
+// =============================================================================
+
+/// Run the full dreamer cycle: standard consolidation + formal reasoning phases.
+pub async fn run_dreamer(
+    pg: &Arc<PgDb>,
+    config: &ConsolidationConfig,
+) -> Result<crate::database::types::DreamerStats, String> {
+    use crate::database::types::DreamerStats;
+
+    let mut stats = DreamerStats::default();
+
+    // Insert dreamer log entry
+    let log_id = pg.insert_dreamer_log().await?;
+
+    info!(
+        "Dreamer: starting formal reasoning cycle (log_id={})",
+        log_id
+    );
+
+    // First, run standard consolidation
+    match run_consolidation(pg, config).await {
+        Ok(cs) => info!(
+            "Dreamer: consolidation complete (models={}, merged={})",
+            cs.models_created, cs.observations_merged
+        ),
+        Err(e) => warn!("Dreamer: consolidation failed (non-fatal): {}", e),
+    }
+
+    // Run all reasoning phases, ensuring we always complete the dreamer log
+    let result: Result<DreamerStats, String> = async {
+        // Fetch observations for reasoning
+        let observations = pg
+            .get_observations_for_consolidation(config.max_observations)
+            .await?;
+
+        // Phase E: Inductive reasoning
+        info!("Dreamer: Phase E — Inductive reasoning");
+        match phase_inductive(pg, &observations, config).await {
+            Ok(traces) => {
+                stats.inductive_traces = traces.len() as i32;
+                for mut trace in traces {
+                    trace.dreamer_run_id = Some(log_id);
+                    if let Err(e) = pg.save_reasoning_trace(&trace).await {
+                        warn!("Dreamer: failed to save inductive trace: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("Dreamer: inductive reasoning failed (non-fatal): {}", e),
+        }
+
+        // Phase F: Deductive reasoning
+        info!("Dreamer: Phase F — Deductive reasoning");
+        match phase_deductive(pg, config).await {
+            Ok(traces) => {
+                stats.deductive_traces = traces.len() as i32;
+                for mut trace in traces {
+                    trace.dreamer_run_id = Some(log_id);
+                    if let Err(e) = pg.save_reasoning_trace(&trace).await {
+                        warn!("Dreamer: failed to save deductive trace: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("Dreamer: deductive reasoning failed (non-fatal): {}", e),
+        }
+
+        // Phase G: Abductive reasoning
+        info!("Dreamer: Phase G — Abductive reasoning");
+        match phase_abductive(pg, &observations, config).await {
+            Ok(traces) => {
+                stats.abductive_traces = traces.len() as i32;
+                for mut trace in traces {
+                    trace.dreamer_run_id = Some(log_id);
+                    // Create observation for high-confidence abductive hypotheses
+                    if trace.confidence > 0.7 {
+                        let obs_input = crate::database::types::CreateObservationInput {
+                            title: format!(
+                                "Hypothesis: {}",
+                                &trace.conclusion[..trace.conclusion.len().min(80)]
+                            ),
+                            content: trace.conclusion.clone(),
+                            observation_type: "hypothesis".to_string(),
+                            scope: "project".to_string(),
+                            topic_key: None,
+                            project_id: None,
+                            workflow_id: None,
+                            task_run_id: None,
+                            session_id: None,
+                        };
+                        match pg.save_observation(&obs_input).await {
+                            Ok(obs_id) => {
+                                trace.created_observation_id = Some(obs_id);
+                                stats.observations_created += 1;
+                            }
+                            Err(e) => {
+                                warn!("Dreamer: failed to save hypothesis observation: {}", e)
+                            }
+                        }
+                    }
+                    if let Err(e) = pg.save_reasoning_trace(&trace).await {
+                        warn!("Dreamer: failed to save abductive trace: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("Dreamer: abductive reasoning failed (non-fatal): {}", e),
+        }
+
+        Ok(stats.clone())
+    }
+    .await;
+
+    // Always complete the dreamer log, even on error
+    match &result {
+        Ok(s) => {
+            let _ = pg.complete_dreamer_log(log_id, s, None).await;
+        }
+        Err(e) => {
+            let empty = DreamerStats::default();
+            let _ = pg
+                .complete_dreamer_log(log_id, &empty, Some(e.as_str()))
+                .await;
+        }
+    }
+
+    let stats = result?;
+
+    info!(
+        "Dreamer complete: inductive={}, deductive={}, abductive={}, observations_created={}",
+        stats.inductive_traces,
+        stats.deductive_traces,
+        stats.abductive_traces,
+        stats.observations_created
+    );
+
+    Ok(stats)
 }
 
 /// Check if consolidation is allowed (cooldown enforcement).

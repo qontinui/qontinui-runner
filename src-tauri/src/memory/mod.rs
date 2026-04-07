@@ -11,7 +11,10 @@
 //! - `consolidation` — 4-phase periodic consolidation: orient → gather → consolidate → prune
 
 pub mod consolidation;
+pub mod contradiction;
 pub mod decay;
+pub mod entity_profiles;
 pub mod importance;
 pub mod scheduler;
 pub mod unified_query;
+pub mod working_representation;

@@ -289,6 +289,16 @@ pub struct TaskRun {
     #[serde(default)]
     pub is_meta_optimizer: bool,
 
+    // ========================================================================
+    // Review Fields
+    // ========================================================================
+    /// Whether this task run is a review subtask (code review of a PR).
+    #[serde(default)]
+    pub is_review: bool,
+    /// Whether this task blocks its parent from completing.
+    #[serde(default)]
+    pub blocks_parent: bool,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -341,6 +351,8 @@ pub struct CreateTaskRunInput {
     pub is_fixer: bool,
     pub fixer_source_task_run_id: Option<String>,
     pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
     pub runner_port: Option<u16>,
 }
 
@@ -373,6 +385,8 @@ impl CreateTaskRunInput {
             is_fixer: false,
             fixer_source_task_run_id: None,
             is_meta_optimizer: false,
+            is_review: false,
+            blocks_parent: false,
             runner_port: None,
         }
     }
@@ -512,6 +526,18 @@ impl CreateTaskRunInput {
     /// Mark this task run as a meta-optimizer run.
     pub fn with_is_meta_optimizer(mut self, is_meta_optimizer: bool) -> Self {
         self.is_meta_optimizer = is_meta_optimizer;
+        self
+    }
+
+    /// Mark this task run as a review subtask.
+    pub fn with_is_review(mut self, is_review: bool) -> Self {
+        self.is_review = is_review;
+        self
+    }
+
+    /// Mark this task as blocking its parent from completing.
+    pub fn with_blocks_parent(mut self, blocks_parent: bool) -> Self {
+        self.blocks_parent = blocks_parent;
         self
     }
 
@@ -2155,6 +2181,79 @@ pub struct ObservationTypeStat {
 }
 
 // ============================================================================
+// Entity Profile types (Honcho-inspired evolving representations)
+// ============================================================================
+
+/// A persistent entity profile that evolves over time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityProfile {
+    pub id: i64,
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub entity_label: String,
+    pub profile_summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_detail: Option<String>,
+    pub topic_key: String,
+    pub content_hash: String,
+    pub importance: f64,
+    pub decay_rate: f64,
+    pub access_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    pub revision_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_observation_ids: Option<Vec<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_finding_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_fix_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_cross_run_pattern_ids: Option<Vec<String>>,
+    pub valid_from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<i64>,
+    pub is_deleted: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input for creating or updating an entity profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateEntityProfileInput {
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub entity_label: String,
+    pub profile_summary: String,
+    pub profile_detail: Option<String>,
+    pub source_observation_ids: Option<Vec<i64>>,
+    pub source_finding_ids: Option<Vec<String>>,
+    pub source_fix_ids: Option<Vec<String>>,
+    pub source_cross_run_pattern_ids: Option<Vec<String>>,
+}
+
+/// Truncated entity profile search result with relevance rank.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityProfileSearchResult {
+    pub id: i64,
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub entity_label: String,
+    pub profile_summary: String,
+    pub importance: f64,
+    pub revision_count: i32,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<f32>,
+}
+
+// ============================================================================
 // Memory Consolidation types
 // ============================================================================
 
@@ -2199,6 +2298,197 @@ pub struct DecayPreviewEntry {
     pub is_mental_model: bool,
     pub last_activity: String,
     pub current_retention: f64,
+}
+
+// ============================================================================
+// Contradiction Resolutions (Honcho-inspired contradiction handling)
+// ============================================================================
+
+/// A pair of observations that may contradict each other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContradictionCandidate {
+    pub obs_a_id: i64,
+    pub obs_a_title: String,
+    pub obs_a_content: String,
+    pub obs_a_topic_key: Option<String>,
+    pub obs_a_importance: f64,
+    pub obs_a_valid_from: String,
+    pub obs_a_access_count: i32,
+    pub obs_b_id: i64,
+    pub obs_b_title: String,
+    pub obs_b_content: String,
+    pub obs_b_topic_key: Option<String>,
+    pub obs_b_importance: f64,
+    pub obs_b_valid_from: String,
+    pub obs_b_access_count: i32,
+}
+
+/// A resolved contradiction between two observations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContradictionResolution {
+    pub id: i64,
+    pub observation_a_id: i64,
+    pub observation_b_id: i64,
+    pub resolution_type: String,
+    pub winner_id: Option<i64>,
+    pub loser_id: Option<i64>,
+    pub confidence: f64,
+    pub rationale: String,
+    pub evidence_json: Option<String>,
+    pub resolved_at: String,
+    pub resolved_by: String,
+    pub created_at: String,
+}
+
+/// Statistics from a contradiction resolution scan.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ContradictionStats {
+    pub detected: u32,
+    pub auto_resolved: u32,
+    pub llm_resolved: u32,
+    pub failed: u32,
+}
+
+// ============================================================================
+// Reasoning Traces (Honcho-inspired formal reasoning)
+// ============================================================================
+
+/// A single reasoning trace produced by the dreamer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningTrace {
+    pub id: i64,
+    pub reasoning_type: String,
+    pub premise_ids: Vec<i64>,
+    pub conclusion: String,
+    pub confidence: f64,
+    pub evidence_json: Option<String>,
+    pub created_observation_id: Option<i64>,
+    pub dreamer_run_id: Option<i64>,
+    pub is_valid: bool,
+    pub invalidated_by: Option<i64>,
+    pub created_at: String,
+}
+
+/// Input for creating a new reasoning trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateReasoningTraceInput {
+    pub reasoning_type: String,
+    pub premise_ids: Vec<i64>,
+    pub conclusion: String,
+    pub confidence: f64,
+    pub evidence_json: Option<String>,
+    pub created_observation_id: Option<i64>,
+    pub dreamer_run_id: Option<i64>,
+}
+
+/// Statistics from a single dreamer run.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DreamerStats {
+    pub inductive_traces: i32,
+    pub deductive_traces: i32,
+    pub abductive_traces: i32,
+    pub observations_created: i32,
+}
+
+/// A dreamer log entry from memory_consolidation_log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DreamerLogEntry {
+    pub id: i64,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub is_dreamer: bool,
+    pub inductive_traces: i32,
+    pub deductive_traces: i32,
+    pub abductive_traces: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// Working Representations (pre-computed context snapshots)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationSnapshot {
+    pub id: i64,
+    pub title: String,
+    pub summary: String,
+    pub observation_type: String,
+    pub importance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossRunPatternSnapshot {
+    pub id: String,
+    pub pattern_type: String,
+    pub description: String,
+    pub occurrence_count: i32,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityProfileSnapshot {
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub entity_label: String,
+    pub profile_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingSnapshot {
+    pub id: String,
+    pub title: String,
+    pub severity: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixSnapshot {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSnapshot {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub usage_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingRepresentation {
+    pub id: i64,
+    pub task_run_id: String,
+    pub observations: Vec<ObservationSnapshot>,
+    pub cross_run_patterns: Vec<CrossRunPatternSnapshot>,
+    pub entity_profiles: Vec<EntityProfileSnapshot>,
+    pub recent_findings: Vec<FindingSnapshot>,
+    pub recent_fixes: Vec<FixSnapshot>,
+    pub applicable_skills: Vec<SkillSnapshot>,
+    pub workflow_id: Option<String>,
+    pub workflow_name: Option<String>,
+    pub total_items: i32,
+    pub build_duration_ms: Option<i64>,
+    pub built_at: String,
+    pub expires_at: String,
+    pub is_stale: bool,
 }
 
 // ============================================================================

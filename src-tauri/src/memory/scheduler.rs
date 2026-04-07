@@ -20,14 +20,20 @@ pub struct MemorySchedulerConfig {
     pub initial_delay_secs: u64,
     /// Consolidation pipeline configuration.
     pub consolidation: ConsolidationConfig,
+    /// How often to run the dreamer (default: 8 hours).
+    pub dreamer_interval_secs: u64,
+    /// Initial delay before first dreamer run (default: 30 minutes).
+    pub dreamer_initial_delay_secs: u64,
 }
 
 impl Default for MemorySchedulerConfig {
     fn default() -> Self {
         Self {
-            interval_secs: 600, // 10 minutes
+            interval_secs: 600,            // 10 minutes
             initial_delay_secs: 60,
             consolidation: ConsolidationConfig::default(),
+            dreamer_interval_secs: 28800,  // 8 hours
+            dreamer_initial_delay_secs: 1800, // 30 minutes
         }
     }
 }
@@ -73,6 +79,63 @@ pub fn start_memory_scheduler(
                     );
                 }
                 Err(e) => warn!("Memory consolidation failed: {}", e),
+            }
+        }
+    })
+}
+
+/// Start the dreamer scheduler as a background task.
+///
+/// Runs the formal reasoning cycle (inductive, deductive, abductive) on a
+/// longer interval than standard consolidation. Includes its own cooldown check.
+pub fn start_dreamer_scheduler(
+    pg: Arc<PgDb>,
+    config: MemorySchedulerConfig,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(config.dreamer_initial_delay_secs)).await;
+        info!(
+            "Dreamer scheduler started (interval: {}s)",
+            config.dreamer_interval_secs
+        );
+
+        let mut tick = interval(Duration::from_secs(config.dreamer_interval_secs));
+
+        loop {
+            tick.tick().await;
+
+            // Check cooldown (dreamer-specific)
+            match pg.get_last_dreamer_time().await {
+                Ok(Some(last)) => {
+                    let hours_since =
+                        (chrono::Utc::now() - last).num_seconds() as f64 / 3600.0;
+                    if hours_since < (config.dreamer_interval_secs as f64 / 3600.0) * 0.9 {
+                        debug!(
+                            "Dreamer: cooldown active ({:.1}h since last run), skipping",
+                            hours_since
+                        );
+                        continue;
+                    }
+                }
+                Ok(None) => {} // First run ever
+                Err(e) => {
+                    warn!("Dreamer: failed to check last run time: {}", e);
+                    continue;
+                }
+            }
+
+            debug!("Running dreamer cycle");
+            match consolidation::run_dreamer(&pg, &config.consolidation).await {
+                Ok(stats) => {
+                    info!(
+                        "Dreamer complete: inductive={}, deductive={}, abductive={}, observations={}",
+                        stats.inductive_traces,
+                        stats.deductive_traces,
+                        stats.abductive_traces,
+                        stats.observations_created,
+                    );
+                }
+                Err(e) => warn!("Dreamer failed: {}", e),
             }
         }
     })

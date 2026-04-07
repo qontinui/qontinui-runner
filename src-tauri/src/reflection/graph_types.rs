@@ -33,6 +33,8 @@ pub enum GraphNodeKind {
     Observation,
     /// A reusable procedural skill (hermes-agent-inspired self-improving memory)
     Skill,
+    /// An evolving entity profile (Honcho-inspired representation)
+    EntityProfile,
 }
 
 impl GraphNodeKind {
@@ -53,6 +55,7 @@ impl GraphNodeKind {
             Self::UIElement => "ui_element",
             Self::Observation => "observation",
             Self::Skill => "skill",
+            Self::EntityProfile => "entity_profile",
         }
     }
 }
@@ -142,6 +145,8 @@ pub enum GraphEdgeKind {
     DerivedFrom,
     /// Skill supersedes an older, less effective skill
     Supersedes,
+    /// Entity profile describes/summarizes an entity
+    ProfileDescribes,
 }
 
 impl GraphEdgeKind {
@@ -167,6 +172,7 @@ impl GraphEdgeKind {
             Self::UsedIn => "used_in",
             Self::DerivedFrom => "derived_from",
             Self::Supersedes => "supersedes",
+            Self::ProfileDescribes => "profile_describes",
         }
     }
 }

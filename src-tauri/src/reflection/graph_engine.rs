@@ -226,6 +226,47 @@ impl KnowledgeGraph {
         }
     }
 
+    /// Load pre-fetched entity profiles from PostgreSQL into the graph.
+    ///
+    /// Each entity profile becomes an EntityProfile node with properties for
+    /// importance, revision_count, access_count, and profile_summary/detail.
+    /// ProfileDescribes edges link profiles to matching nodes (by entity_kind:entity_id).
+    pub fn load_entity_profiles(
+        &mut self,
+        profiles: &[crate::database::types::EntityProfile],
+    ) {
+        for profile in profiles {
+            let id_str = format!("{}:{}", profile.entity_kind, profile.entity_id);
+            let mut node =
+                GraphNode::new(GraphNodeKind::EntityProfile, &id_str, &profile.entity_label)
+                    .with_property("entity_kind", serde_json::json!(profile.entity_kind))
+                    .with_property("entity_id", serde_json::json!(profile.entity_id))
+                    .with_property("profile_summary", serde_json::json!(profile.profile_summary))
+                    .with_property("importance", serde_json::json!(profile.importance))
+                    .with_property("revision_count", serde_json::json!(profile.revision_count))
+                    .with_property("access_count", serde_json::json!(profile.access_count));
+
+            if let Some(ref detail) = profile.profile_detail {
+                node = node.with_property("profile_detail", serde_json::json!(detail));
+            }
+            if let Some(ref last) = profile.last_accessed_at {
+                node = node.with_property("last_accessed_at", serde_json::json!(last));
+            }
+            node = node.with_created_at(&profile.created_at);
+            let profile_key = format!("entity_profile:{}", id_str);
+            self.get_or_insert_node(node);
+
+            // Link to the target entity node if it exists (e.g., workflow:my-wf, component:foo)
+            let target_key = format!("{}:{}", profile.entity_kind, profile.entity_id);
+            self.add_edge_by_key(
+                &profile_key,
+                &target_key,
+                GraphEdge::new(GraphEdgeKind::ProfileDescribes)
+                    .with_label(&profile.entity_label),
+            );
+        }
+    }
+
     /// Link task runs to UI elements via InteractedWith edges.
     fn link_ui_interactions(&mut self, _workflow_name: Option<&str>) -> Result<(), String> {
         Err("SQLite removed".to_string())

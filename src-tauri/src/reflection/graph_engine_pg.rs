@@ -33,6 +33,7 @@ impl KnowledgeGraph {
         kg.pg_load_step_defs(pg, workflow_name).await?;
         kg.pg_load_ui_elements(pg).await?;
         kg.pg_load_skills(pg).await?;
+        kg.pg_load_entity_profiles(pg).await?;
 
         // --- Edges ---
         kg.pg_link_task_runs_to_workflows(pg, workflow_name).await?;
@@ -1370,4 +1371,68 @@ fn causal_event_to_node_key(event_type: &str, event_id: &str) -> String {
         _ => event_type,
     };
     format!("{}:{}", prefix, event_id)
+}
+
+impl KnowledgeGraph {
+    /// Load entity profiles from PostgreSQL and insert as EntityProfile nodes.
+    ///
+    /// Also creates ProfileDescribes edges linking each profile to its target
+    /// entity node (if that node exists in the graph).
+    async fn pg_load_entity_profiles(&mut self, pg: &PgDb) -> Result<(), String> {
+        let conn = pg
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                "SELECT id, entity_kind, entity_id, entity_label, profile_summary, profile_detail,
+                        topic_key, content_hash, importance, decay_rate, access_count,
+                        last_accessed_at::TEXT, revision_count,
+                        source_observation_ids, source_finding_ids, source_fix_ids,
+                        source_cross_run_pattern_ids,
+                        valid_from::TEXT, valid_until::TEXT, superseded_by,
+                        is_deleted, created_at::TEXT, updated_at::TEXT
+                 FROM entity_profiles
+                 WHERE NOT is_deleted
+                 ORDER BY importance DESC
+                 LIMIT 500",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG load entity_profiles: {}", e))?;
+
+        let profiles: Vec<crate::database::types::EntityProfile> = rows
+            .iter()
+            .map(|r| crate::database::types::EntityProfile {
+                id: r.get(0),
+                entity_kind: r.get(1),
+                entity_id: r.get(2),
+                entity_label: r.get(3),
+                profile_summary: r.get(4),
+                profile_detail: r.get(5),
+                topic_key: r.get(6),
+                content_hash: r.get(7),
+                importance: r.get(8),
+                decay_rate: r.get(9),
+                access_count: r.get(10),
+                last_accessed_at: r.get(11),
+                revision_count: r.get(12),
+                source_observation_ids: r.get(13),
+                source_finding_ids: r.get(14),
+                source_fix_ids: r.get(15),
+                source_cross_run_pattern_ids: r.get(16),
+                valid_from: r.get(17),
+                valid_until: r.get(18),
+                superseded_by: r.get(19),
+                is_deleted: r.get(20),
+                created_at: r.get(21),
+                updated_at: r.get(22),
+            })
+            .collect();
+
+        self.load_entity_profiles(&profiles);
+        Ok(())
+    }
 }

@@ -13,7 +13,10 @@ use tracing::{error, info};
 
 use super::graph_api::get_or_build_graph;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::memory::unified_query::{self, MemoryResult, MemorySource, UnifiedMemoryQuery};
+use crate::memory::unified_query::{
+    self, CausalChain, MemoryResult, MemorySource, NeighborhoodSnippet, ReasoningLevel,
+    UnifiedMemoryQuery,
+};
 
 // ============================================================================
 // Request/Response types
@@ -28,6 +31,8 @@ pub struct QueryMemoryRequest {
     pub from: Option<String>,
     pub to: Option<String>,
     pub min_score: Option<f64>,
+    /// Reasoning depth: minimal, low, medium, high, max.
+    pub reasoning_level: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -40,6 +45,14 @@ pub struct QueryMemoryResponse {
     pub total: usize,
     pub query: String,
     pub sources_queried: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_level: Option<ReasoningLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthesis: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub causal_context: Option<Vec<CausalChain>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighborhood_context: Option<Vec<NeighborhoodSnippet>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +112,12 @@ async fn query_handler(
         },
     );
 
+    let reasoning_level = request
+        .reasoning_level
+        .as_deref()
+        .map(ReasoningLevel::from_str_opt)
+        .unwrap_or(ReasoningLevel::Minimal);
+
     let params = UnifiedMemoryQuery {
         query: request.query.clone(),
         limit: request.limit,
@@ -106,15 +125,18 @@ async fn query_handler(
         from,
         to,
         min_score: request.min_score,
+        reasoning_level,
     };
 
     let pg = &state.app_state.pg_db;
 
-    // Optionally build graph (only if graph source enabled or all sources)
+    // Optionally build graph (only if graph source enabled or all sources,
+    // or if reasoning level needs graph enrichment)
     let want_graph = params
         .sources
         .as_ref()
-        .is_none_or(|s| s.contains(&MemorySource::GraphNode));
+        .is_none_or(|s| s.contains(&MemorySource::GraphNode))
+        || reasoning_level != ReasoningLevel::Minimal;
 
     let graph = if want_graph {
         get_or_build_graph(&state, None).await.ok()
@@ -122,22 +144,51 @@ async fn query_handler(
         None
     };
 
-    match unified_query::query_memory(&params, pg, graph.as_deref()).await {
-        Ok(results) => {
-            let total = results.len();
-            Ok(Json(ApiResponse::success(QueryMemoryResponse {
-                results,
-                total,
-                query: request.query,
-                sources_queried,
-            })))
+    if reasoning_level != ReasoningLevel::Minimal {
+        match unified_query::query_memory_reasoned(&params, pg, graph.as_deref()).await {
+            Ok(reasoned) => {
+                let total = reasoned.results.len();
+                Ok(Json(ApiResponse::success(QueryMemoryResponse {
+                    results: reasoned.results,
+                    total,
+                    query: request.query,
+                    sources_queried,
+                    reasoning_level: Some(reasoned.reasoning_level),
+                    synthesis: reasoned.synthesis,
+                    causal_context: reasoned.causal_context,
+                    neighborhood_context: reasoned.neighborhood_context,
+                })))
+            }
+            Err(e) => {
+                error!("MCP memory query (reasoned) failed: {}", e);
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Memory query failed: {}", e))),
+                ))
+            }
         }
-        Err(e) => {
-            error!("MCP memory query failed: {}", e);
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Memory query failed: {}", e))),
-            ))
+    } else {
+        match unified_query::query_memory(&params, pg, graph.as_deref()).await {
+            Ok(results) => {
+                let total = results.len();
+                Ok(Json(ApiResponse::success(QueryMemoryResponse {
+                    results,
+                    total,
+                    query: request.query,
+                    sources_queried,
+                    reasoning_level: None,
+                    synthesis: None,
+                    causal_context: None,
+                    neighborhood_context: None,
+                })))
+            }
+            Err(e) => {
+                error!("MCP memory query failed: {}", e);
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Memory query failed: {}", e))),
+                ))
+            }
         }
     }
 }
@@ -185,6 +236,12 @@ async fn tool_descriptor_handler(
                 "min_score": {
                     "type": "number",
                     "description": "Minimum fused score threshold (0.0-1.0)"
+                },
+                "reasoning_level": {
+                    "type": "string",
+                    "enum": ["minimal", "low", "medium", "high", "max"],
+                    "description": "Reasoning depth: minimal (raw results), low (+graph neighbors), medium (+causal context), high (+LLM synthesis), max (+full research report)",
+                    "default": "minimal"
                 }
             },
             "required": ["query"]

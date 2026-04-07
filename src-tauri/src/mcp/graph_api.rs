@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::database::{cross_run_ops, graph_ops};
 use crate::mcp::types::{api_error, ApiResponse, ApiState, CachedKnowledgeGraph};
-use crate::memory::unified_query::{self, MemorySource, UnifiedMemoryQuery};
+use crate::memory::unified_query::{self, MemorySource, ReasoningLevel, UnifiedMemoryQuery};
 use crate::reflection::{
     fuzzy_matching, graph_engine::KnowledgeGraph, graph_types::GraphSummary, unified_search,
 };
@@ -274,6 +274,8 @@ struct MemorySearchQuery {
     min_score: Option<f64>,
     /// If true, include per-source scores and found_by strategy list.
     explain: Option<bool>,
+    /// Reasoning depth: minimal, low, medium, high, max.
+    reasoning_level: Option<String>,
 }
 
 // ============================================================================
@@ -761,6 +763,14 @@ struct MemorySearchResponse {
     results: Vec<unified_query::MemoryResult>,
     total: usize,
     query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_level: Option<ReasoningLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    synthesis: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    causal_context: Option<Vec<unified_query::CausalChain>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neighborhood_context: Option<Vec<unified_query::NeighborhoodSnippet>>,
 }
 
 /// POST /memory/invalidate-graph-cache — explicitly bump the generation counter
@@ -799,6 +809,12 @@ async fn memory_search_handler(
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc));
 
+    let reasoning_level = query
+        .reasoning_level
+        .as_deref()
+        .map(ReasoningLevel::from_str_opt)
+        .unwrap_or(ReasoningLevel::Minimal);
+
     let params = UnifiedMemoryQuery {
         query: query.q.clone(),
         limit: query.limit.unwrap_or(20),
@@ -806,16 +822,18 @@ async fn memory_search_handler(
         from,
         to,
         min_score: query.min_score,
+        reasoning_level,
     };
 
     let pg = &state.app_state.pg_db;
 
     // Graph is expensive to build — only include if caller asks for graph_node source
-    // or requests all sources (default).
+    // or requests all sources (default), OR if reasoning level needs graph enrichment.
     let want_graph = params
         .sources
         .as_ref()
-        .is_none_or(|s| s.contains(&MemorySource::GraphNode));
+        .is_none_or(|s| s.contains(&MemorySource::GraphNode))
+        || reasoning_level != ReasoningLevel::Minimal;
 
     let graph = if want_graph {
         get_or_build_graph(&state, None).await.ok()
@@ -823,21 +841,50 @@ async fn memory_search_handler(
         None
     };
 
-    let results = unified_query::query_memory(&params, pg, graph.as_deref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Memory search failed: {}", e))),
-            )
-        })?;
+    if reasoning_level != ReasoningLevel::Minimal {
+        // Use reasoned query path
+        let reasoned = unified_query::query_memory_reasoned(&params, pg, graph.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Memory search failed: {}", e))),
+                )
+            })?;
 
-    let total = results.len();
-    let response = MemorySearchResponse {
-        results,
-        total,
-        query: query.q,
-    };
+        let total = reasoned.results.len();
+        let response = MemorySearchResponse {
+            results: reasoned.results,
+            total,
+            query: query.q,
+            reasoning_level: Some(reasoned.reasoning_level),
+            synthesis: reasoned.synthesis,
+            causal_context: reasoned.causal_context,
+            neighborhood_context: reasoned.neighborhood_context,
+        };
 
-    Ok(Json(ApiResponse::success(response)))
+        Ok(Json(ApiResponse::success(response)))
+    } else {
+        let results = unified_query::query_memory(&params, pg, graph.as_deref())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Memory search failed: {}", e))),
+                )
+            })?;
+
+        let total = results.len();
+        let response = MemorySearchResponse {
+            results,
+            total,
+            query: query.q,
+            reasoning_level: None,
+            synthesis: None,
+            causal_context: None,
+            neighborhood_context: None,
+        };
+
+        Ok(Json(ApiResponse::success(response)))
+    }
 }

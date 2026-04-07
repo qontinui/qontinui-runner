@@ -3465,3 +3465,122 @@ CREATE TABLE IF NOT EXISTS restate_awakeables (
 );
 CREATE INDEX IF NOT EXISTS idx_ra_execution ON restate_awakeables(execution_id);
 CREATE INDEX IF NOT EXISTS idx_ra_status ON restate_awakeables(status);
+
+-- ============================================================
+-- Memory query cache (for tiered reasoning results)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS memory_query_cache (
+    id BIGSERIAL PRIMARY KEY,
+    query_hash TEXT NOT NULL,
+    reasoning_level TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mqc_hash_level ON memory_query_cache(query_hash, reasoning_level);
+CREATE INDEX IF NOT EXISTS idx_mqc_expires ON memory_query_cache(expires_at);
+
+-- ============================================================
+-- Contradiction resolutions (Honcho-inspired contradiction handling)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS contradiction_resolutions (
+    id BIGSERIAL PRIMARY KEY,
+    observation_a_id BIGINT NOT NULL REFERENCES observations(id),
+    observation_b_id BIGINT NOT NULL REFERENCES observations(id),
+    resolution_type TEXT NOT NULL,
+    winner_id BIGINT REFERENCES observations(id),
+    loser_id BIGINT REFERENCES observations(id),
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    rationale TEXT NOT NULL,
+    evidence_json TEXT,
+    resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_by TEXT NOT NULL DEFAULT 'system',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_cr_obs_a ON contradiction_resolutions(observation_a_id);
+CREATE INDEX IF NOT EXISTS idx_cr_obs_b ON contradiction_resolutions(observation_b_id);
+CREATE INDEX IF NOT EXISTS idx_cr_resolved ON contradiction_resolutions(resolved_at);
+
+-- ============================================================
+-- Entity profiles (Honcho-inspired evolving representations)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS entity_profiles (
+    id BIGSERIAL PRIMARY KEY,
+    entity_kind TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    entity_label TEXT NOT NULL,
+    profile_summary TEXT NOT NULL,
+    profile_detail TEXT,
+    topic_key TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    importance DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    decay_rate DOUBLE PRECISION NOT NULL DEFAULT 0.02,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at TIMESTAMPTZ,
+    revision_count INTEGER NOT NULL DEFAULT 1,
+    source_observation_ids BIGINT[],
+    source_finding_ids TEXT[],
+    source_fix_ids TEXT[],
+    source_cross_run_pattern_ids TEXT[],
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until TIMESTAMPTZ,
+    superseded_by BIGINT REFERENCES entity_profiles(id),
+    is_deleted BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ep_entity ON entity_profiles(entity_kind, entity_id) WHERE NOT is_deleted;
+CREATE INDEX IF NOT EXISTS idx_ep_topic_key ON entity_profiles(topic_key) WHERE NOT is_deleted;
+CREATE INDEX IF NOT EXISTS idx_ep_importance ON entity_profiles(importance) WHERE NOT is_deleted;
+CREATE INDEX IF NOT EXISTS idx_ep_fts ON entity_profiles USING GIN (to_tsvector('english', entity_label || ' ' || profile_summary)) WHERE NOT is_deleted;
+
+-- ============================================================
+-- Reasoning traces (Honcho-inspired formal reasoning)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS reasoning_traces (
+    id BIGSERIAL PRIMARY KEY,
+    reasoning_type TEXT NOT NULL,
+    premise_ids BIGINT[] NOT NULL,
+    conclusion TEXT NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    evidence_json TEXT,
+    created_observation_id BIGINT REFERENCES observations(id),
+    dreamer_run_id BIGINT,
+    is_valid BOOLEAN NOT NULL DEFAULT true,
+    invalidated_by BIGINT REFERENCES reasoning_traces(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rt_type ON reasoning_traces(reasoning_type);
+CREATE INDEX IF NOT EXISTS idx_rt_run ON reasoning_traces(dreamer_run_id);
+CREATE INDEX IF NOT EXISTS idx_rt_created ON reasoning_traces(created_at);
+CREATE INDEX IF NOT EXISTS idx_rt_valid ON reasoning_traces(is_valid) WHERE is_valid;
+
+ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS is_dreamer BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS inductive_traces INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS deductive_traces INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memory_consolidation_log ADD COLUMN IF NOT EXISTS abductive_traces INTEGER NOT NULL DEFAULT 0;
+
+-- ============================================================
+-- Working representations (pre-computed context snapshots)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS working_representations (
+    id BIGSERIAL PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    observations_json TEXT NOT NULL DEFAULT '[]',
+    cross_run_patterns_json TEXT NOT NULL DEFAULT '[]',
+    entity_profiles_json TEXT NOT NULL DEFAULT '[]',
+    recent_findings_json TEXT NOT NULL DEFAULT '[]',
+    recent_fixes_json TEXT NOT NULL DEFAULT '[]',
+    applicable_skills_json TEXT NOT NULL DEFAULT '[]',
+    workflow_id TEXT,
+    workflow_name TEXT,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    build_duration_ms BIGINT,
+    built_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    is_stale BOOLEAN NOT NULL DEFAULT false,
+    UNIQUE(task_run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wr_task_run ON working_representations(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_wr_expires ON working_representations(expires_at);

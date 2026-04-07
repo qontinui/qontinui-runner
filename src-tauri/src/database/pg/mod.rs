@@ -58,6 +58,7 @@ pub mod state_machine;
 pub mod step_type_knowledge;
 pub mod task_run_events;
 pub mod task_runs;
+pub mod ticket_system_ops;
 pub mod tiered_info;
 pub mod token_analytics;
 pub mod token_usage;
@@ -1493,6 +1494,20 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence DESC)",
             "CREATE INDEX IF NOT EXISTS idx_learned_patterns_workflow ON learned_patterns(workflow_name)",
+            // Phase 5B: Ticket-task mapping (ticket system bidirectional sync)
+            "CREATE TABLE IF NOT EXISTS ticket_task_mapping (
+                id TEXT PRIMARY KEY,
+                ticket_source TEXT NOT NULL,
+                ticket_external_id TEXT NOT NULL,
+                ticket_url TEXT NOT NULL,
+                task_run_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                sync_status TEXT NOT NULL DEFAULT 'synced',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(ticket_source, ticket_external_id)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_ticket_task_mapping_task ON ticket_task_mapping(task_run_id)",
         ];
 
         for sql in &ddl {

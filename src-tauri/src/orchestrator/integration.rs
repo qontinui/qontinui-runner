@@ -1577,6 +1577,43 @@ impl Orchestrator {
             }
         }
 
+        // Inject working representation context (pre-computed snapshot of observations,
+        // patterns, profiles, findings, fixes, and skills) when PgDb is available.
+        if let Some(ref pg) = self.pg_db {
+            use crate::memory::working_representation;
+            let pg = Arc::clone(pg);
+            let task_run_id = state.task_run_id.clone();
+            let wr_result = tokio::runtime::Handle::current().block_on(async {
+                working_representation::build_working_representation(
+                    &task_run_id,
+                    None, // workflow_id not on OrchestratorState
+                    None, // workflow_name not on OrchestratorState
+                    &pg,
+                )
+                .await
+            });
+            match wr_result {
+                Ok(wr) => {
+                    let wr_ctx = working_representation::format_working_representation(&wr);
+                    if !wr_ctx.is_empty() {
+                        info!(
+                            "Injected working representation ({} items, {} chars) for task {}",
+                            wr.total_items,
+                            wr_ctx.len(),
+                            state.task_run_id
+                        );
+                        prompt = format!("{}\n\n{}", prompt, wr_ctx);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to build working representation for task {}: {}",
+                        state.task_run_id, e
+                    );
+                }
+            }
+        }
+
         // Inject relevant procedural skills (hermes-agent-inspired progressive disclosure).
         // Only approved auto-extracted skills are injected. The worker sees skill names
         // and descriptions; full templates are available via the skill registry if needed.
@@ -1698,6 +1735,40 @@ impl Orchestrator {
                 .block_on(async { mem.build_context_unified(20, &task_desc, &pg).await });
             if !mem_ctx.trim().is_empty() {
                 dynamic_blocks.push(mem_ctx);
+            }
+        }
+
+        // Dynamic block 5: Working representation (pre-computed context snapshot)
+        if let Some(ref pg) = self.pg_db {
+            use crate::memory::working_representation;
+            let pg = Arc::clone(pg);
+            let task_run_id = state.task_run_id.clone();
+            let wr_result = tokio::runtime::Handle::current().block_on(async {
+                working_representation::build_working_representation(
+                    &task_run_id,
+                    None,
+                    None,
+                    &pg,
+                )
+                .await
+            });
+            match wr_result {
+                Ok(wr) => {
+                    let wr_ctx = working_representation::format_working_representation(&wr);
+                    if !wr_ctx.is_empty() {
+                        info!(
+                            "Injected working representation ({} items) into structured prompt for task {}",
+                            wr.total_items, state.task_run_id
+                        );
+                        dynamic_blocks.push(wr_ctx);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to build working representation for structured prompt task {}: {}",
+                        state.task_run_id, e
+                    );
+                }
             }
         }
 

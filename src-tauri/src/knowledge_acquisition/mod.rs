@@ -461,6 +461,7 @@ impl KnowledgeAcquisition {
             from: None,
             to: None,
             min_score: Some(0.5),
+            reasoning_level: Default::default(),
         };
 
         match unified_query::query_memory(&params, pg, None).await {

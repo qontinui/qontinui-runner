@@ -872,6 +872,7 @@ impl MemorySystem {
             from: None,
             to: None,
             min_score: Some(0.3),
+            reasoning_level: Default::default(),
         };
 
         match unified_query::query_memory(&params, pg, None).await {

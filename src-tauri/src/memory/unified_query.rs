@@ -83,6 +83,86 @@ pub enum RetrievalStrategy {
     CategoryMatch,
 }
 
+/// Reasoning depth for tiered memory queries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningLevel {
+    /// Raw RRF-fused results, no enrichment.
+    Minimal,
+    /// + graph neighborhood enrichment for top results.
+    Low,
+    /// + causal context from graph traversal.
+    Medium,
+    /// + LLM synthesis of results into a coherent answer.
+    High,
+    /// + full research report via LLM.
+    Max,
+}
+
+impl Default for ReasoningLevel {
+    fn default() -> Self {
+        Self::Minimal
+    }
+}
+
+impl ReasoningLevel {
+    pub fn from_str_opt(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "max" => Self::Max,
+            _ => Self::Minimal,
+        }
+    }
+}
+
+/// Response from a reasoned memory query (higher tiers).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasonedMemoryResponse {
+    /// The fused memory results.
+    pub results: Vec<MemoryResult>,
+    /// Reasoning level that was applied.
+    pub reasoning_level: ReasoningLevel,
+    /// Graph neighborhood context for top results (Low+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neighborhood_context: Option<Vec<NeighborhoodSnippet>>,
+    /// Causal chains traced from top results (Medium+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub causal_context: Option<Vec<CausalChain>>,
+    /// LLM-generated synthesis of the results (High+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthesis: Option<String>,
+}
+
+/// A snippet of graph neighborhood context for a result.
+#[derive(Debug, Clone, Serialize)]
+pub struct NeighborhoodSnippet {
+    pub result_id: String,
+    pub source: MemorySource,
+    pub neighbors: Vec<NeighborSummary>,
+}
+
+/// Summary of a graph neighbor.
+#[derive(Debug, Clone, Serialize)]
+pub struct NeighborSummary {
+    pub label: String,
+    pub kind: String,
+    pub edge_label: String,
+    pub direction: String,
+    pub distance: u32,
+}
+
+/// A causal chain traced from a result node.
+#[derive(Debug, Clone, Serialize)]
+pub struct CausalChain {
+    pub result_id: String,
+    pub source: MemorySource,
+    pub root_causes: Vec<String>,
+    pub path_summary: String,
+}
+
 /// Parameters for a unified memory query.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UnifiedMemoryQuery {
@@ -99,6 +179,9 @@ pub struct UnifiedMemoryQuery {
     pub to: Option<DateTime<Utc>>,
     /// Minimum fused_score threshold.
     pub min_score: Option<f64>,
+    /// Reasoning depth (default: minimal).
+    #[serde(default)]
+    pub reasoning_level: ReasoningLevel,
 }
 
 fn default_limit() -> usize {
@@ -555,13 +638,422 @@ pub fn reciprocal_rank_fusion(result_sets: Vec<Vec<MemoryResult>>, k: f64) -> Ve
 // Unified query entry point
 // =============================================================================
 
+/// Helper: check if a source is enabled in the query params.
+fn source_enabled(sources: &Option<Vec<MemorySource>>, s: MemorySource) -> bool {
+    sources.as_ref().map_or(true, |list| list.contains(&s))
+}
+
 /// Query all memory stores in parallel, fuse with RRF, and return ranked results.
 pub async fn query_memory(
     params: &UnifiedMemoryQuery,
     pg: &PgDb,
     graph: Option<&KnowledgeGraph>,
 ) -> Result<Vec<MemoryResult>, String> {
-    Err("SQLite removed".to_string())
+    let limit = params.limit.max(1);
+    let query = &params.query;
+    let pg_limit = limit as i64;
+
+    // Determine which sources to query
+    let want_observations = source_enabled(&params.sources, MemorySource::Observation);
+    let want_timeline = source_enabled(&params.sources, MemorySource::ActivityTimeline);
+    let want_knowledge = source_enabled(&params.sources, MemorySource::TaskKnowledge);
+    let want_unified = source_enabled(&params.sources, MemorySource::Finding)
+        || source_enabled(&params.sources, MemorySource::Fix)
+        || source_enabled(&params.sources, MemorySource::Error)
+        || source_enabled(&params.sources, MemorySource::Rule)
+        || source_enabled(&params.sources, MemorySource::Workflow)
+        || source_enabled(&params.sources, MemorySource::UiElement);
+    let want_embeddings = source_enabled(&params.sources, MemorySource::TaskKnowledge)
+        || source_enabled(&params.sources, MemorySource::Error);
+    let want_graph = source_enabled(&params.sources, MemorySource::GraphNode) && graph.is_some();
+
+    // Fan out parallel retrievals using tokio::join!
+    let (obs_results, timeline_results, knowledge_results, unified_results, embedding_results) = tokio::join!(
+        async {
+            if want_observations {
+                retrieve_observations(pg, query, pg_limit).await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if want_timeline {
+                retrieve_timeline(pg, query, pg_limit).await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if want_knowledge {
+                retrieve_knowledge(pg, query, pg_limit).await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if want_unified {
+                retrieve_pg_unified(pg, query, limit).await
+            } else {
+                Vec::new()
+            }
+        },
+        async {
+            if want_embeddings {
+                retrieve_embeddings(pg, query, limit).await
+            } else {
+                Vec::new()
+            }
+        },
+    );
+
+    // Graph retrieval is sync, run it directly
+    let graph_results = if want_graph {
+        if let Some(g) = graph {
+            retrieve_graph(g, query, limit)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Collect all non-empty result sets for RRF fusion
+    let mut result_sets: Vec<Vec<MemoryResult>> = Vec::new();
+    if !obs_results.is_empty() {
+        result_sets.push(obs_results);
+    }
+    if !timeline_results.is_empty() {
+        result_sets.push(timeline_results);
+    }
+    if !knowledge_results.is_empty() {
+        result_sets.push(knowledge_results);
+    }
+    if !unified_results.is_empty() {
+        result_sets.push(unified_results);
+    }
+    if !embedding_results.is_empty() {
+        result_sets.push(embedding_results);
+    }
+    if !graph_results.is_empty() {
+        result_sets.push(graph_results);
+    }
+
+    // Fuse with RRF (k=60 standard smoothing constant)
+    let mut fused = reciprocal_rank_fusion(result_sets, 60.0);
+
+    // Apply temporal filters
+    if let Some(from) = params.from {
+        fused.retain(|r| r.timestamp.map_or(true, |t| t >= from));
+    }
+    if let Some(to) = params.to {
+        fused.retain(|r| r.timestamp.map_or(true, |t| t <= to));
+    }
+
+    // Apply min_score filter
+    if let Some(min_score) = params.min_score {
+        fused.retain(|r| r.fused_score >= min_score);
+    }
+
+    // Apply source filter (post-fusion, some results from unified search may
+    // have mapped to sources the caller didn't request)
+    if let Some(ref sources) = params.sources {
+        fused.retain(|r| sources.contains(&r.source));
+    }
+
+    // Truncate to limit
+    fused.truncate(limit);
+
+    Ok(fused)
+}
+
+/// Query memory with tiered reasoning enrichment.
+///
+/// Dispatches by reasoning level:
+/// - Minimal: Just `query_memory()` results
+/// - Low: + graph neighborhood enrichment for top results
+/// - Medium: + causal context from graph traversal
+/// - High: + LLM synthesis
+/// - Max: + full research report via LLM
+pub async fn query_memory_reasoned(
+    params: &UnifiedMemoryQuery,
+    pg: &PgDb,
+    graph: Option<&KnowledgeGraph>,
+) -> Result<ReasonedMemoryResponse, String> {
+    // Always start with base results
+    let results = query_memory(params, pg, graph).await?;
+    let level = params.reasoning_level;
+
+    if level == ReasoningLevel::Minimal {
+        return Ok(ReasonedMemoryResponse {
+            results,
+            reasoning_level: level,
+            neighborhood_context: None,
+            causal_context: None,
+            synthesis: None,
+        });
+    }
+
+    // Low+: Graph neighborhood enrichment for top results
+    let neighborhood_context = if graph.is_some() {
+        let g = graph.unwrap();
+        let top_n = results.iter().take(5);
+        let mut snippets = Vec::new();
+        for result in top_n {
+            // Build graph node key from source and id
+            let node_key = build_node_key(&result.source, &result.id, &result.memory_type);
+            if let Some(neighborhood) = g.neighborhood(&node_key, 1) {
+                let neighbors: Vec<NeighborSummary> = neighborhood
+                    .neighbors
+                    .iter()
+                    .take(8)
+                    .map(|n| NeighborSummary {
+                        label: n.node.label.clone(),
+                        kind: n.node.kind.as_str().to_string(),
+                        edge_label: n.edge.label.clone().unwrap_or_default(),
+                        direction: format!("{:?}", n.direction),
+                        distance: n.distance,
+                    })
+                    .collect();
+                if !neighbors.is_empty() {
+                    snippets.push(NeighborhoodSnippet {
+                        result_id: result.id.clone(),
+                        source: result.source,
+                        neighbors,
+                    });
+                }
+            }
+        }
+        if snippets.is_empty() {
+            None
+        } else {
+            Some(snippets)
+        }
+    } else {
+        None
+    };
+
+    if level == ReasoningLevel::Low {
+        return Ok(ReasonedMemoryResponse {
+            results,
+            reasoning_level: level,
+            neighborhood_context,
+            causal_context: None,
+            synthesis: None,
+        });
+    }
+
+    // Medium+: Causal context from graph traversal
+    let causal_context = if graph.is_some() {
+        let g = graph.unwrap();
+        let top_n = results.iter().take(3);
+        let mut chains = Vec::new();
+        for result in top_n {
+            let node_key = build_node_key(&result.source, &result.id, &result.memory_type);
+            let paths = g.trace_root_causes(&node_key, 3);
+            if !paths.is_empty() {
+                let root_causes: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.nodes.last().map(|n| n.label.clone()))
+                    .collect();
+                let path_summary = paths
+                    .iter()
+                    .take(3)
+                    .map(|p| {
+                        p.nodes
+                            .iter()
+                            .map(|n| n.label.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                chains.push(CausalChain {
+                    result_id: result.id.clone(),
+                    source: result.source,
+                    root_causes,
+                    path_summary,
+                });
+            }
+        }
+        if chains.is_empty() {
+            None
+        } else {
+            Some(chains)
+        }
+    } else {
+        None
+    };
+
+    if level == ReasoningLevel::Medium {
+        return Ok(ReasonedMemoryResponse {
+            results,
+            reasoning_level: level,
+            neighborhood_context,
+            causal_context,
+            synthesis: None,
+        });
+    }
+
+    // High/Max: LLM synthesis
+    let synthesis = synthesize_results(&params.query, &results, &neighborhood_context, &causal_context, level).await;
+
+    Ok(ReasonedMemoryResponse {
+        results,
+        reasoning_level: level,
+        neighborhood_context,
+        causal_context,
+        synthesis,
+    })
+}
+
+/// Build a graph node key from a memory result's source and id.
+/// Graph node keys follow the pattern "kind:entity_id".
+fn build_node_key(source: &MemorySource, id: &str, memory_type: &str) -> String {
+    let kind = match source {
+        MemorySource::Observation => "observation",
+        MemorySource::Finding => "finding",
+        MemorySource::Fix => "fix",
+        MemorySource::Error => "error",
+        MemorySource::Rule => "rule",
+        MemorySource::GraphNode => return id.to_string(), // Already a node key
+        MemorySource::Workflow => "workflow",
+        MemorySource::UiElement => "ui_element",
+        MemorySource::ActivityTimeline => "timeline",
+        MemorySource::TaskKnowledge => memory_type, // e.g. "pattern", "knowledge"
+    };
+    format!("{}:{}", kind, id)
+}
+
+/// Call the LLM to synthesize memory results into a coherent answer.
+/// Returns None if the LLM is unavailable or the call fails.
+async fn synthesize_results(
+    query: &str,
+    results: &[MemoryResult],
+    neighborhood: &Option<Vec<NeighborhoodSnippet>>,
+    causal: &Option<Vec<CausalChain>>,
+    level: ReasoningLevel,
+) -> Option<String> {
+    use crate::ai_provider;
+    use crate::ai_router::TaskContext;
+
+    if results.is_empty() {
+        return None;
+    }
+
+    // Build context from results
+    let mut context_parts: Vec<String> = Vec::new();
+    for (i, r) in results.iter().take(10).enumerate() {
+        context_parts.push(format!(
+            "{}. [{}] {} (score: {:.2})\n   {}",
+            i + 1,
+            format!("{:?}", r.source).to_lowercase(),
+            r.title,
+            r.fused_score,
+            r.snippet
+        ));
+    }
+
+    // Add neighborhood context if available
+    if let Some(ref neighborhoods) = neighborhood {
+        context_parts.push("\n--- Graph Neighborhood Context ---".to_string());
+        for ns in neighborhoods.iter().take(5) {
+            let neighbor_strs: Vec<String> = ns
+                .neighbors
+                .iter()
+                .map(|n| format!("  - {} ({}) via '{}' [{}]", n.label, n.kind, n.edge_label, n.direction))
+                .collect();
+            context_parts.push(format!(
+                "Result '{}': neighbors:\n{}",
+                ns.result_id,
+                neighbor_strs.join("\n")
+            ));
+        }
+    }
+
+    // Add causal context if available
+    if let Some(ref chains) = causal {
+        context_parts.push("\n--- Causal Context ---".to_string());
+        for chain in chains.iter().take(3) {
+            context_parts.push(format!(
+                "Result '{}': root causes: [{}]\n  Path: {}",
+                chain.result_id,
+                chain.root_causes.join(", "),
+                chain.path_summary
+            ));
+        }
+    }
+
+    let result_context = context_parts.join("\n\n");
+
+    let prompt = if level == ReasoningLevel::Max {
+        format!(
+            "You are a memory research assistant. Given the user's query and retrieved memory results \
+             with graph context, write a comprehensive research report that:\n\
+             1. Directly answers the query\n\
+             2. Synthesizes information across all sources\n\
+             3. Identifies patterns and relationships\n\
+             4. Notes any causal chains or root causes\n\
+             5. Highlights contradictions or gaps\n\
+             6. Suggests follow-up investigations\n\n\
+             User query: {}\n\n\
+             Retrieved memories:\n{}\n\n\
+             Write a thorough research report:",
+            query, result_context
+        )
+    } else {
+        format!(
+            "You are a memory synthesis assistant. Given the user's query and retrieved memory results, \
+             write a concise synthesis (2-4 paragraphs) that directly answers the query by combining \
+             information from the results. Focus on the most relevant findings and any causal relationships.\n\n\
+             User query: {}\n\n\
+             Retrieved memories:\n{}\n\n\
+             Synthesis:",
+            query, result_context
+        )
+    };
+
+    let task_context = TaskContext::from_prompt(&prompt);
+
+    let max_tokens = if level == ReasoningLevel::Max {
+        Some(2048u32)
+    } else {
+        Some(1024u32)
+    };
+
+    // Call the LLM via spawn_blocking (same pattern as consolidation.rs)
+    let prompt_clone = prompt.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        ai_provider::run_prompt_with_model_override(
+            &prompt_clone,
+            &task_context,
+            None,  // doctor_handle
+            None,  // model_override (use default)
+            None,  // provider_override
+            Some(0.4), // moderate temperature
+            max_tokens,
+            None,  // fallback_model
+            None,  // fallback_provider
+        )
+    })
+    .await;
+
+    match response {
+        Ok(ai_response) => {
+            if ai_response.success && !ai_response.output.is_empty() {
+                Some(ai_response.output)
+            } else {
+                warn!(
+                    "Memory synthesis LLM call failed: {:?}",
+                    ai_response.error
+                );
+                None
+            }
+        }
+        Err(e) => {
+            warn!("Memory synthesis spawn_blocking failed: {}", e);
+            None
+        }
+    }
 }
 
 // =============================================================================
