@@ -1,18 +1,10 @@
-//! Prediction engine for the cognitive system model.
+//! Prediction engine types for the cognitive system model.
 //!
-//! Computes three knowledge properties and uses them for prediction:
-//! - **Accumulation monotonicity**: Track fix applications → predict fixes for known errors
-//! - **Convergence gradient**: Compute continuous 0.0–1.0 score instead of binary threshold
-//! - **Relevance decay**: Score knowledge by effectiveness × recency × stability
+//! The implementations now live on `PgDb` in `database/pg/reflection.rs`.
+//! This module retains only the shared result types used across the API
+//! surface (mcp/reflection_api.rs, pg/reflection.rs).
 
 use serde::Serialize;
-use tracing::{debug, info};
-
-/// Number of consecutive clean runs at which convergence reaches 1.0 for the clean_ratio component.
-const CONVERGENCE_THRESHOLD: f64 = 5.0;
-
-/// Default sliding window size for change velocity computation.
-const DEFAULT_VELOCITY_WINDOW: u32 = 5;
 
 // =============================================================================
 // Types
@@ -51,123 +43,3 @@ pub struct ScoredKnowledge {
     pub recency_weight: f64,
     pub velocity_factor: f64,
 }
-
-// =============================================================================
-// Fix Prediction (Accumulation Monotonicity)
-// =============================================================================
-
-/// Predict which fix is most likely to resolve an error with the given signature hash.
-///
-/// Queries `fix_applications` for previous fixes applied to the same error signature,
-/// filters to resolved outcomes, and scores candidates by reuse_count × effective_rate × recency.
-pub fn predict_fix_for_error(error_signature_hash: &str) -> Result<Option<PredictedFix>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Convergence Score (Convergence Gradient)
-// =============================================================================
-
-/// Compute a continuous convergence score (0.0–1.0) for a workflow.
-///
-/// Formula: `score = clean_ratio × (1.0 - novelty_score) × effective_fix_rate`
-///
-/// Components:
-/// - `clean_ratio`: min(consecutive_clean_runs / CONVERGENCE_THRESHOLD, 1.0)
-/// - `novelty_score`: ratio of unique new fix content hashes in last 3 runs vs total
-/// - `effective_fix_rate`: effective / (effective + ineffective + regression)
-/// - `change_velocity`: fixes per run in sliding window
-pub fn compute_convergence_score(
-    workflow_name: &str,
-    scope: &str,
-) -> Result<ConvergenceMetrics, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Store a convergence snapshot for time-series analysis.
-pub fn store_convergence_snapshot(
-    workflow_name: &str,
-    project_path: Option<&str>,
-    scope: &str,
-    metrics: &ConvergenceMetrics,
-) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-fn count_consecutive_clean_runs(workflow_name: &str) -> Result<u32, String> {
-    Err("SQLite removed".to_string())
-}
-
-fn compute_novelty_score(workflow_name: &str) -> Result<f64, String> {
-    Err("SQLite removed".to_string())
-}
-
-fn compute_effective_fix_rate(workflow_name: &str, scope: &str) -> Result<(u32, u32, f64), String> {
-    Err("SQLite removed".to_string())
-}
-
-fn compute_change_velocity_for_workflow(
-    workflow_name: &str,
-    window_size: u32,
-) -> Result<f64, String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Change Velocity (per-component)
-// =============================================================================
-
-/// Compute change velocity for a specific component (file/module).
-///
-/// Returns fixes per run targeting `component_path` over the last `window_size` runs.
-/// Higher values indicate more volatile areas whose knowledge decays faster.
-pub fn compute_change_velocity(component_path: &str, window_size: u32) -> Result<f64, String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Knowledge Relevance Scoring (Relevance Decay)
-// =============================================================================
-
-/// Score knowledge entries by relevance for token-budget prioritization.
-///
-/// For each entry computes:
-/// - `effectiveness_weight`: 1.0 (from effective fix), 0.5 (inconclusive), 0.0 (ineffective)
-/// - `recency_weight`: 1.0 / (1.0 + days_since_last_validation × 0.1)
-/// - `velocity_factor`: 1.0 / (1.0 + change_velocity) for the target component
-/// - `relevance_score = effectiveness_weight × recency_weight × velocity_factor`
-///
-/// Returns entries sorted by relevance_score descending.
-pub fn score_knowledge_relevance(
-    workflow_name: &str,
-    limit: u32,
-) -> Result<Vec<ScoredKnowledge>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Fix Application Recording
-// =============================================================================
-
-/// Record that a fix was applied to resolve an error.
-///
-/// Called when the prediction engine's suggested fix is applied, or when
-/// effectiveness evaluation links a fix to a resolved error.
-pub fn record_fix_application(
-    fix_id: &str,
-    task_run_id: &str,
-    error_signature_hash: Option<&str>,
-    outcome: &str,
-) -> Result<String, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Update the outcome of a fix application after evaluation.
-pub fn update_fix_application_outcome(application_id: &str, outcome: &str) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-

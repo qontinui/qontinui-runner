@@ -8,16 +8,10 @@
 
 use serde::Serialize;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::config_storage::ConfigStorage;
 use crate::AppState;
-
-/// Number of consecutive successful runs (zero findings) before suppressing reflection.
-const CONVERGENCE_THRESHOLD: u32 = 5;
-
-/// Number of consecutive reflection runs with identical findings before declaring stall.
-const REPEAT_THRESHOLD: u32 = 3;
 
 /// Dependencies required to launch a reflection workflow.
 ///
@@ -47,13 +41,6 @@ pub fn should_launch_reflection(source_task_run_id: &str) -> Result<bool, String
     })
 }
 
-/// Check whether a workflow has converged.
-/// SQLite implementation removed; returns false (no convergence detection) until PG equivalent.
-fn _has_converged(_source_task_run_id: &str) -> Result<bool, String> {
-    debug!("has_converged stub (SQLite removed, returning false)");
-    Ok(false)
-}
-
 // =============================================================================
 // Convergence Status Analysis
 // =============================================================================
@@ -73,20 +60,6 @@ pub struct ConvergenceStatus {
     pub stall_findings: Vec<String>,
     /// Actionable recommendation for what to try next
     pub recommendation: String,
-}
-
-/// Analyze the convergence status of a workflow.
-/// SQLite implementation removed; returns insufficient_data until PG equivalent.
-pub fn analyze_convergence_status(_workflow_name: &str) -> Result<ConvergenceStatus, String> {
-    debug!("analyze_convergence_status stub (SQLite removed)");
-    Ok(ConvergenceStatus {
-        status: "insufficient_data".to_string(),
-        reason: "Convergence analysis not yet migrated to PG".to_string(),
-        consecutive_clean_runs: 0,
-        convergence_score: 0.0,
-        stall_findings: Vec::new(),
-        recommendation: "Run more workflow iterations to gather convergence data.".to_string(),
-    })
 }
 
 /// Launch a reflection workflow to analyze the given source task run.
@@ -289,14 +262,6 @@ pub fn should_launch_project_reflection(source_task_run_id: &str) -> Result<bool
     })
 }
 
-/// Check if project reflection has converged — last N project reflections
-/// for the same source workflow produced zero reflection fixes.
-/// SQLite implementation removed; returns false (no convergence detection) until PG equivalent.
-fn _has_project_converged(_source_task_run_id: &str) -> Result<bool, String> {
-    debug!("has_project_converged stub (SQLite removed, returning false)");
-    Ok(false)
-}
-
 /// Launch a project reflection workflow to learn about the user's project.
 ///
 /// Similar to `launch_reflection` but uses project-scoped workflow builder
@@ -486,14 +451,6 @@ pub fn should_launch_ui_bridge_reflection(source_task_run_id: &str) -> Result<bo
     })
 }
 
-/// Check if UI Bridge reflection has converged — last N UI Bridge reflections
-/// for the same source workflow produced zero fixes.
-/// SQLite implementation removed; returns false (no convergence detection) until PG equivalent.
-fn _has_ui_bridge_converged(_source_task_run_id: &str) -> Result<bool, String> {
-    debug!("has_ui_bridge_converged stub (SQLite removed, returning false)");
-    Ok(false)
-}
-
 /// Launch a UI Bridge reflection workflow.
 ///
 /// Analyzes UI Bridge usage in the source workflow, identifies improvements,
@@ -662,5 +619,3 @@ pub fn launch_ui_bridge_reflection(
     Ok(reflection_id)
 }
 
-// Tests removed — they relied on SQLite (crate::database::Connection) which has been removed.
-// Convergence functions are now stubbed; tests should be rewritten against PG when migrated.

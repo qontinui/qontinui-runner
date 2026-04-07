@@ -1,15 +1,11 @@
-//! Architecture Model Engine
+//! Architecture Model types.
 //!
 //! Aggregates component-level data from reflection fixes, causal events, and
-//! knowledge into a queryable graph of components and their relationships.
-//! Provides health scoring, impact analysis, and component detail queries.
+//! knowledge into a queryable graph. The storage/query implementation lives
+//! in `database/pg/reflection.rs`; this module only holds the shared types
+//! and path normalization helpers used across the API surface.
 
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::{info, warn};
-use uuid::Uuid;
-
-use crate::reflection::prediction;
 
 // =============================================================================
 // Types
@@ -121,74 +117,3 @@ pub fn infer_component_type(path: &str) -> &str {
     }
     "file"
 }
-
-// =============================================================================
-// Rebuild
-// =============================================================================
-
-/// Full rebuild of the architecture model for a workflow.
-///
-/// Deletes existing data and re-extracts from reflection_fixes, causal_events,
-/// and task_knowledge tables.
-pub fn rebuild_architecture_model(workflow_name: &str) -> Result<RebuildResult, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Internal accumulator for component data during rebuild.
-#[derive(Default)]
-struct ComponentData {
-    fix_count: u32,
-    error_count: u32,
-    causal_involvement_count: u32,
-    effective_fix_count: u32,
-    ineffective_fix_count: u32,
-    last_activity_at: Option<String>,
-}
-
-// =============================================================================
-// Queries
-// =============================================================================
-
-/// Get the full component graph for a workflow.
-pub fn get_component_graph(workflow_name: &str) -> Result<ComponentGraph, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get detailed info for a single component.
-pub fn get_component_details(
-    workflow_name: &str,
-    component_path: &str,
-) -> Result<ComponentDetails, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// BFS impact analysis from a component (max 3 hops).
-pub fn get_impact_analysis(
-    workflow_name: &str,
-    component_path: &str,
-) -> Result<ImpactAnalysis, String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Graph-Enhanced Impact Analysis
-// =============================================================================
-
-/// Extended impact analysis that supplements the BFS-on-component_relationships approach
-/// with additional relationship data from step_finding_links and step_provenance tables.
-pub fn rebuild_architecture_with_graph(workflow_name: &str) -> Result<RebuildResult, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Graph-enhanced impact analysis.
-pub fn get_impact_analysis_with_graph(
-    workflow_name: &str,
-    component_path: &str,
-) -> Result<ImpactAnalysis, String> {
-    Err("SQLite removed".to_string())
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-

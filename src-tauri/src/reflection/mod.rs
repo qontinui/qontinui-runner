@@ -16,7 +16,6 @@ pub mod causal;
 pub mod causal_parser;
 pub mod context;
 pub mod cross_run_learning;
-pub mod effectiveness;
 pub mod fuzzy_matching;
 pub mod graph_engine;
 pub mod graph_engine_pg;

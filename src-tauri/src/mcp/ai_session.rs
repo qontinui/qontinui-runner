@@ -336,12 +336,6 @@ pub async fn has_running_ai_tasks_async() -> bool {
     false
 }
 
-/// Migrate JSONL logs to SQLite for a completed task run.
-/// This should be called after a task completes (success or failure) to persist logs.
-pub async fn migrate_logs_for_task(task_id: &str, workflow_name: Option<String>) {
-    // SQLite removed - no-op
-}
-
 /// Helper function to mark a task run as complete with retry logic.
 /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
 /// Returns true if successfully marked complete, false otherwise.

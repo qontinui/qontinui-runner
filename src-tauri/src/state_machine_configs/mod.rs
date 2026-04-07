@@ -6,7 +6,6 @@
 //! This enables the runner to build and edit state machines locally,
 //! without requiring the web frontend.
 
-pub mod storage;
 pub mod types;
 
 pub use types::*;

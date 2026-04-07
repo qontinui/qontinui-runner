@@ -1,15 +1,12 @@
-//! Reflector-Curator Learning Loop
+//! Reflector-Curator types.
 //!
-//! Implements the ace-playbook-inspired Generator-Reflector-Curator pattern
-//! for learning from workflow execution. The Reflector analyzes completed runs
-//! and extracts lessons (both positive and negative). The Curator manages the
-//! playbook: deduplicating entries, retiring underperformers, and selecting
-//! relevant lessons for prompt injection into future generation runs.
+//! The ace-playbook-inspired Generator-Reflector-Curator pipeline was backed
+//! by SQLite and has not been ported to PG. Only the shared types and the
+//! pure `build_playbook_section` formatter remain. `LearningOrchestrator`
+//! still owns a `PlaybookCurator` configuration struct but never invokes
+//! the (removed) persistence hooks.
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 // ============================================================================
 // Types
@@ -73,20 +70,6 @@ impl std::fmt::Display for LessonCategory {
     }
 }
 
-impl LessonCategory {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "step_construction" => Self::StepConstruction,
-            "selector_choice" => Self::SelectorChoice,
-            "error_handling" => Self::ErrorHandling,
-            "tool_usage" => Self::ToolUsage,
-            "domain_knowledge" => Self::DomainKnowledge,
-            "anti_pattern" => Self::AntiPattern,
-            _ => Self::DomainKnowledge,
-        }
-    }
-}
-
 /// Severity of a playbook lesson.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,16 +89,6 @@ impl std::fmt::Display for LessonSeverity {
     }
 }
 
-impl LessonSeverity {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "critical" => Self::Critical,
-            "important" => Self::Important,
-            _ => Self::Minor,
-        }
-    }
-}
-
 /// Lifecycle status of a playbook entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,17 +104,6 @@ impl std::fmt::Display for EntryStatus {
             Self::Staged => write!(f, "staged"),
             Self::Active => write!(f, "active"),
             Self::Retired => write!(f, "retired"),
-        }
-    }
-}
-
-impl EntryStatus {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "staged" => Self::Staged,
-            "active" => Self::Active,
-            "retired" => Self::Retired,
-            _ => Self::Staged,
         }
     }
 }
@@ -177,143 +139,10 @@ pub struct CurationResult {
 }
 
 // ============================================================================
-// Storage
+// Curator configuration
 // ============================================================================
 
-/// Ensure the playbook_entries table exists.
-fn ensure_table() -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Insert a new playbook entry into the database.
-fn insert_entry(entry: &PlaybookEntry) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-// row_to_entry removed (SQLite dead code)
-
-/// Query active entries, optionally filtered by domain.
-fn query_active_entries(domain: Option<&str>, limit: usize) -> Result<Vec<PlaybookEntry>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Query all non-retired entries (for dedup during curation).
-fn query_non_retired_entries() -> Result<Vec<PlaybookEntry>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Merge a new entry into an existing one: bump `times_applied`, escalate severity if needed.
-fn merge_into_existing(existing_id: &str, new_severity: LessonSeverity) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Retire entries that have been applied 10+ times but helped less than the threshold ratio.
-fn retire_underperforming_entries(threshold: f64) -> Result<usize, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Count the total number of active entries.
-fn count_active_entries() -> Result<usize, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
-// Reflector
-// ============================================================================
-
-/// Reflect on a completed workflow run and extract lessons.
-///
-/// Only reflects on "interesting" runs:
-/// - Failures that were fixed (iterations > 0)
-/// - High-scoring first-attempt successes (iterations == 0 AND overall_score > 0.8)
-///
-/// Returns extracted [`PlaybookEntry`] structs ready for curation.
-pub fn reflect_on_run(
-    run_id: &str,
-    overall_score: f64,
-    iterations: u32,
-    step_evaluations: &[StepEvaluationSummary],
-) -> Result<Vec<PlaybookEntry>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Categorize a failure step into a lesson category and severity.
-fn categorize_failure(step: &StepEvaluationSummary) -> (LessonCategory, LessonSeverity) {
-    let category = match step.weakest_dimension.as_str() {
-        "selector" | "selector_accuracy" | "selector_specificity" => LessonCategory::SelectorChoice,
-        "error_handling" | "resilience" | "retry" => LessonCategory::ErrorHandling,
-        "tool" | "tool_usage" | "tool_selection" => LessonCategory::ToolUsage,
-        "structure" | "step_order" | "decomposition" => LessonCategory::StepConstruction,
-        _ => LessonCategory::AntiPattern,
-    };
-
-    let severity = if step.min_score < 0.2 {
-        LessonSeverity::Critical
-    } else if step.min_score < 0.4 {
-        LessonSeverity::Important
-    } else {
-        LessonSeverity::Minor
-    };
-
-    (category, severity)
-}
-
-/// Categorize a success step into a lesson category and severity.
-fn categorize_success(step: &StepEvaluationSummary) -> (LessonCategory, LessonSeverity) {
-    let category = match step.weakest_dimension.as_str() {
-        "selector" | "selector_accuracy" | "selector_specificity" => LessonCategory::SelectorChoice,
-        "error_handling" | "resilience" | "retry" => LessonCategory::ErrorHandling,
-        "tool" | "tool_usage" | "tool_selection" => LessonCategory::ToolUsage,
-        "structure" | "step_order" | "decomposition" => LessonCategory::StepConstruction,
-        _ => LessonCategory::DomainKnowledge,
-    };
-
-    let severity = if step.composite_score >= 0.95 {
-        LessonSeverity::Important
-    } else {
-        LessonSeverity::Minor
-    };
-
-    (category, severity)
-}
-
-/// Build a human-readable lesson from a failing step evaluation.
-fn build_failure_lesson(step: &StepEvaluationSummary) -> String {
-    let base = format!(
-        "Step '{}' scored {:.2} (weakest: {} at {:.2})",
-        step.step_name, step.composite_score, step.weakest_dimension, step.min_score
-    );
-
-    if let Some(ref explanation) = step.explanation {
-        format!("{base}. {explanation}")
-    } else if let Some(ref criterion) = step.criterion_description {
-        format!("{base}. Failed criterion: {criterion}")
-    } else {
-        base
-    }
-}
-
-/// Build a human-readable lesson from a successful step evaluation.
-fn build_success_lesson(step: &StepEvaluationSummary) -> String {
-    let base = format!(
-        "Step '{}' achieved {:.2} composite score",
-        step.step_name, step.composite_score,
-    );
-
-    if let Some(ref explanation) = step.explanation {
-        format!("{base}. {explanation}")
-    } else if let Some(ref criterion) = step.criterion_description {
-        format!("{base}. Criterion met: {criterion}")
-    } else {
-        base
-    }
-}
-
-// ============================================================================
-// Curator
-// ============================================================================
-
-/// Manages the playbook lifecycle: deduplication, retirement, and selection.
+/// Configuration struct for the playbook lifecycle manager.
 pub struct PlaybookCurator {
     /// Maximum number of active entries before forced retirement.
     pub max_entries: usize,
@@ -328,83 +157,12 @@ impl Default for PlaybookCurator {
 }
 
 impl PlaybookCurator {
-    /// Create a new curator with default settings.
     pub fn new() -> Self {
         Self {
             max_entries: 200,
             retirement_threshold: 0.2,
         }
     }
-
-    /// Add new lessons to the playbook, deduplicating by lesson text similarity.
-    ///
-    /// New entries that are textually similar to existing entries get merged
-    /// (bumping `times_applied` and potentially escalating severity). Truly novel
-    /// entries are inserted and promoted to `Active` status.
-    pub fn curate(&self, new_entries: Vec<PlaybookEntry>) -> Result<CurationResult, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Retire entries that have been applied 10+ times but helped less than
-    /// the `retirement_threshold` ratio.
-    pub fn retire_underperforming(&self) -> Result<usize, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Select relevant lessons for prompt injection.
-    ///
-    /// Returns up to `max_lessons` active entries, optionally filtered by domain,
-    /// ordered by severity (Critical first) then by helpfulness.
-    pub fn select_lessons(
-        &self,
-        domain: Option<&str>,
-        max_lessons: usize,
-    ) -> Result<Vec<PlaybookEntry>, String> {
-        Err("SQLite removed".to_string())
-    }
-}
-
-/// Simple textual similarity check: returns the first existing entry whose
-/// normalized lesson text matches the new lesson closely enough.
-///
-/// Uses a basic Jaccard-like word-overlap metric. Entries with >70% word overlap
-/// are considered duplicates.
-fn find_similar_entry<'a>(
-    existing: &'a [PlaybookEntry],
-    new_lesson: &str,
-) -> Option<&'a PlaybookEntry> {
-    let new_lower = new_lesson.to_lowercase();
-    let new_words: std::collections::HashSet<&str> = new_lower.split_whitespace().collect();
-
-    for entry in existing {
-        let existing_lower = entry.lesson.to_lowercase();
-        let existing_words: std::collections::HashSet<&str> =
-            existing_lower.split_whitespace().collect();
-
-        if existing_words.is_empty() || new_words.is_empty() {
-            continue;
-        }
-
-        let new_lower = new_lesson.to_lowercase();
-        let new_words_set: std::collections::HashSet<&str> = new_lower.split_whitespace().collect();
-
-        let intersection = existing_words.intersection(&new_words_set).count();
-        let union = existing_words.union(&new_words_set).count();
-
-        if union > 0 {
-            let jaccard = intersection as f64 / union as f64;
-            if jaccard > 0.7 {
-                return Some(entry);
-            }
-        }
-    }
-    None
-}
-
-/// Force-retire the lowest-value active entries to bring count under the cap.
-/// Retires entries with the lowest `times_helped` first.
-fn force_retire_lowest(count: usize) -> Result<usize, String> {
-    Err("SQLite removed".to_string())
 }
 
 // ============================================================================
@@ -471,43 +229,7 @@ pub fn build_playbook_section(lessons: &[PlaybookEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_step_eval(
-        name: &str,
-        composite: f64,
-        min: f64,
-        weakest: &str,
-    ) -> StepEvaluationSummary {
-        StepEvaluationSummary {
-            step_id: Uuid::new_v4().to_string(),
-            step_name: name.to_string(),
-            composite_score: composite,
-            min_score: min,
-            weakest_dimension: weakest.to_string(),
-            explanation: None,
-            criterion_description: None,
-        }
-    }
-
-    #[test]
-    fn test_reflect_skips_uninteresting_run() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_reflect_extracts_failure_lessons() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_reflect_extracts_success_lessons() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_curator_curate_and_dedup() {
-        // SQLite removed - no-op
-    }
+    use chrono::Utc;
 
     #[test]
     fn test_build_playbook_section_empty() {
@@ -559,10 +281,5 @@ mod tests {
         assert!(section.contains("**DON'T:**"));
         assert!(section.contains("Use data-testid"));
         assert!(section.contains("Avoid xpath"));
-    }
-
-    #[test]
-    fn test_select_lessons_respects_limit() {
-        // SQLite removed - no-op
     }
 }

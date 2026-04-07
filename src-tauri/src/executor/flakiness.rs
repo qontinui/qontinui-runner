@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use crate::tiered_info::{get_flaky_templates, get_flaky_transitions, FlakyItem};
+use crate::tiered_info::FlakyItem;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;

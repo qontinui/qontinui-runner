@@ -478,104 +478,6 @@ pub struct NextTaskInfo {
 }
 
 // ============================================================================
-// CRUD Operations (backed by CheckpointDb)
-// ============================================================================
-
-/// Get all scheduled tasks
-pub fn get_all_tasks() -> Vec<ScheduledTask> {
-    Vec::new()
-}
-
-/// Get a task by ID
-pub fn get_task(id: &str) -> Option<ScheduledTask> {
-    None
-}
-
-/// Create a new scheduled task
-#[allow(clippy::too_many_arguments)]
-pub fn create_task(
-    name: String,
-    description: Option<String>,
-    schedule: ScheduleExpression,
-    task: ScheduledTaskType,
-    skip_if_completed: bool,
-    auto_fix_on_failure: bool,
-    success_criteria: Option<String>,
-    conditions: Option<ScheduleConditions>,
-) -> Result<ScheduledTask, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Update an existing task
-#[allow(clippy::too_many_arguments)]
-pub fn update_task(
-    id: &str,
-    name: Option<String>,
-    description: Option<Option<String>>,
-    enabled: Option<bool>,
-    schedule: Option<ScheduleExpression>,
-    task: Option<ScheduledTaskType>,
-    skip_if_completed: Option<bool>,
-    auto_fix_on_failure: Option<bool>,
-    success_criteria: Option<Option<String>>,
-    conditions: Option<Option<ScheduleConditions>>,
-) -> Result<ScheduledTask, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Delete a task
-pub fn delete_task(id: &str) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Record an execution
-pub fn record_execution(task_id: &str, record: TaskExecutionRecord) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get execution history for a task
-pub fn get_task_history(task_id: &str) -> Vec<TaskExecutionRecord> {
-    Vec::new()
-}
-
-/// Update the condition status for a task
-pub fn update_task_condition_status(task_id: &str, status: ConditionStatus) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Clear the condition status for a task (after execution or timeout)
-pub fn clear_task_condition_status(task_id: &str) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get scheduler settings
-pub fn get_scheduler_settings() -> SchedulerSettings {
-    // SQLite removed — return defaults
-    SchedulerSettings {
-        enabled: false,
-        max_concurrent: 1,
-        default_auto_fix_on_failure: false,
-        timezone: None,
-    }
-}
-
-/// Update scheduler settings
-pub fn update_scheduler_settings(settings: SchedulerSettings) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get current scheduler status
-pub fn get_scheduler_status() -> SchedulerStatus {
-    // SQLite removed — return empty status
-    SchedulerStatus {
-        enabled: false,
-        running_tasks: 0,
-        pending_tasks: 0,
-        next_task: None,
-    }
-}
-
-// ============================================================================
 // Schedule Computation
 // ============================================================================
 
@@ -614,11 +516,6 @@ pub fn compute_next_run(
         }
         ScheduleExpression::Condition(_) => Some(from),
     }
-}
-
-/// Update next_run for all tasks
-pub fn update_all_next_runs() -> Result<(), String> {
-    Err("SQLite removed".to_string())
 }
 
 // ============================================================================

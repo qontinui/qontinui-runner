@@ -117,11 +117,6 @@ impl LearningOrchestrator {
         LearningActions::default()
     }
 
-    /// Reflect on a run and curate any lessons learned.
-    fn reflect_and_curate(&self, ctx: &RunContext) -> Result<CurationResult, String> {
-        Err("SQLite removed".to_string())
-    }
-
     /// Check if enough time has passed since last GEPA optimization.
     fn gepa_cooldown_elapsed(&self) -> bool {
         match self.last_gepa_time {

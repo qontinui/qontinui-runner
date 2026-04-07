@@ -34,7 +34,6 @@ use crate::workflow_generation::investigator;
 use crate::workflow_generation::pipeline_artifacts::{
     compute_json_diff, PipelineArtifact, PipelineArtifactBuilder,
 };
-use crate::workflow_generation::prompt_analysis;
 use crate::workflow_generation::revision;
 use crate::workflow_generation::rules;
 use crate::workflow_generation::schema_context::{

@@ -1,6 +1,5 @@
 //! ProcessCaptureManager: orchestrator for managed processes.
 
-// CheckpointDb/Connection removed — all persistence is via PG
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -775,8 +774,3 @@ impl ProcessCaptureManager {
     }
 }
 
-/// Attempt to connect to a managed process's UI Bridge SDK and cache its specs.
-/// This runs as a background task — failures are logged but not propagated.
-async fn auto_discover_specs(port: u16, process_name: &str, app_handle: &tauri::AppHandle) {
-    // SQLite removed - no-op
-}

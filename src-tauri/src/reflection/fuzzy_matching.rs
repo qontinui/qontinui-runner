@@ -1,15 +1,12 @@
-//! Fuzzy matching for fix generalization.
+//! Fuzzy matching types and trigram similarity helper.
 //!
-//! Provides trigram similarity and embedding-based matching to find similar errors
-//! and generalize fixes beyond exact signature_hash matching.
-//! This closes feedback loop break point #6 (universal fix underutilization)
-//! and break point #7 (by enabling fuzzy fix prediction).
+//! The actual similar-error search lives on `PgDb::find_similar_errors`
+//! in `database/pg/reflection.rs`. This module keeps only the shared
+//! result types and the pure-Rust trigram similarity scorer, which is
+//! used both by that PG query and by the meta-optimizer parser.
 
 use serde::Serialize;
 use std::collections::HashSet;
-use tracing::info;
-
-use crate::database::embeddings::{blob_to_vector, cosine_similarity};
 
 // ============================================================================
 // Types
@@ -70,44 +67,6 @@ pub fn trigram_similarity(a: &str, b: &str) -> f64 {
     }
 
     (2.0 * intersection as f64) / total as f64
-}
-
-// ============================================================================
-// Similar error search
-// ============================================================================
-
-/// Find errors similar to the given one.
-/// Uses embedding cosine similarity when available, falls back to trigram similarity.
-pub fn find_similar_errors(
-    error_description: &str,
-    error_embedding: Option<&[f32]>,
-    min_similarity: f64,
-    limit: usize,
-) -> Result<Vec<SimilarError>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
-// Fuzzy fix prediction
-// ============================================================================
-
-/// Find fixes that resolved similar errors.
-/// This extends the exact-match predict_fix_for_error with fuzzy matching.
-pub fn predict_fix_fuzzy(
-    error_description: &str,
-    error_embedding: Option<&[f32]>,
-) -> Result<Option<FuzzyPredictedFix>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
-// Fix generalization (break point #6)
-// ============================================================================
-
-/// Broaden an effective fix's applicability_context by analyzing similar errors.
-/// When a fix has been effective 2+ times, look for other error patterns it could help with.
-pub fn generalize_fix(fix_id: &str) -> Result<Option<String>, String> {
-    Err("SQLite removed".to_string())
 }
 
 // ============================================================================

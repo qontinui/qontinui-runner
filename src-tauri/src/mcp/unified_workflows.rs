@@ -1836,6 +1836,8 @@ pub async fn execute_inline_workflow(
         flow_control_json: None,
         phase_timeouts_json: None,
         security_profile: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1984,6 +1986,9 @@ pub async fn execute_inline_workflow(
             active_canary: None,
             is_canary_run: false,
             phase_timeout_ms: None,
+            max_fix_attempts: workflow.max_fix_attempts,
+            max_ci_auto_resumes: workflow.max_ci_auto_resumes,
+            ci_failure_context: None,
         };
 
         // Apply overrides if present (same logic as run_unified_workflow)
@@ -2488,6 +2493,9 @@ pub async fn run_composed_workflow(
                 active_canary: None,
                 is_canary_run: false,
                 phase_timeout_ms: None,
+                max_fix_attempts: 3,
+                max_ci_auto_resumes: 10,
+                ci_failure_context: None,
             };
 
             // Run the LoopController once with all stages
@@ -2598,8 +2606,6 @@ async fn update_example_status_handler(
     Path(id): Path<String>,
     Json(request): Json<UpdateExampleStatusRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use crate::workflow_generation::example_workflows;
-
     let valid_statuses = ["active", "excluded", "pending"];
     if !valid_statuses.contains(&request.status.as_str()) {
         return Err((

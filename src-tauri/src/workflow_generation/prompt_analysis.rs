@@ -1,15 +1,11 @@
-//! Prompt pattern analysis for workflow generation optimization.
+//! Prompt pattern analysis types.
 //!
-//! Analyzes scored examples across generation runs to identify improvement
-//! opportunities. Groups reflection fixes by agent, identifies recurring
-//! patterns, and generates actionable insights for prompt optimization.
+//! The SQLite-backed analyzers were removed and have no PG replacement yet;
+//! this module retains only the `PromptInsight` type which the MCP
+//! generator_eval endpoint still references (it currently returns an empty
+//! list until the PG port lands).
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
-
-// ============================================================================
-// Types
-// ============================================================================
 
 /// An actionable insight derived from analyzing generation data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,44 +23,3 @@ pub struct PromptInsight {
     /// Suggested rule content if this insight should become a rule
     pub suggested_rule: Option<String>,
 }
-
-/// Aggregated fix pattern for an agent.
-#[derive(Debug, Clone)]
-struct FixPattern {
-    fix_type: String,
-    agent: String,
-    count: u32,
-    effective_count: u32,
-    sample_description: String,
-}
-
-// ============================================================================
-// Analysis Functions
-// ============================================================================
-
-/// Analyze reflection fixes attributed to a specific agent to find recurring patterns.
-///
-/// Fixes that recur 3+ times with "effective" status become insights.
-pub fn analyze_reflection_fixes(agent: &str, min_count: u32) -> Result<Vec<PromptInsight>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Analyze specification gaps — criteria that consistently fail to catch real issues.
-///
-/// Compares specification criteria against verification phase results to find
-/// criteria that don't translate to effective verification steps.
-pub fn analyze_specification_gaps() -> Result<Vec<PromptInsight>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Analyze verification blind spots — issues that verification missed
-/// but were caught by reflection or user feedback.
-pub fn analyze_verification_blind_spots() -> Result<Vec<PromptInsight>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Run all analysis functions and return combined insights for all agents.
-pub fn analyze_all() -> Result<Vec<PromptInsight>, String> {
-    Err("SQLite removed".to_string())
-}
-

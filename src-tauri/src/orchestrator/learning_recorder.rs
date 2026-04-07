@@ -1,12 +1,10 @@
-//! Learning outcome and pattern recorder (LEGACY SQLite implementation).
+//! Learning outcome types, tag/complexity helpers, and LLM/RAG judge spawners.
 //!
-//! Records workflow execution outcomes to the `learning_outcomes` and
-//! `learning_patterns` tables for use by the self-improvement analyzer.
-//!
-//! MIGRATION NOTE: PG equivalents exist in `database::pg::learning` and
-//! `database::pg::spec_experimentation` (`record_workflow_learning_from_outcome`).
-//! The only remaining caller of this SQLite path is `autoresearch::engine::record_learning`.
-//! Once autoresearch is migrated to PG, this module can be removed.
+//! The persistence paths now live on `PgDb` (`record_learning_outcome`,
+//! `record_workflow_learning_from_outcome`, `upsert_q_entry`, etc.). This
+//! module keeps the shared `WorkflowOutcome` type, the pure tag/complexity
+//! inference helpers used by the online learning coordinator, and the
+//! async judge spawners that run fire-and-forget after a workflow completes.
 
 use chrono::Utc;
 use tracing::{debug, info, warn};
@@ -253,64 +251,10 @@ pub fn categorize_error(msg: &str) -> String {
     .to_string()
 }
 
-/// Record a learning outcome from a completed workflow execution.
+/// Update the Q-routing table in PostgreSQL.
 ///
-/// Writes to the `learning_outcomes` table with execution metrics and
-/// optionally computes a context embedding for semantic retrieval.
-/// Automatically enriches error_type from error_message if not already set.
-pub fn record_learning_outcome(outcome: &WorkflowOutcome) -> Result<String, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// A pattern extracted from workflow execution analysis.
-pub struct PatternInput {
-    pub pattern_type: String,
-    pub description: String,
-    pub confidence: f32,
-    pub context: Option<serde_json::Value>,
-}
-
-/// Record or update a learning pattern.
-///
-/// If a pattern with the same type and description already exists,
-/// increments its occurrence count. Otherwise creates a new pattern.
-pub fn record_learning_pattern(pattern: &PatternInput) -> Result<String, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Extract and record patterns from a workflow outcome.
-///
-/// Analyzes the outcome to identify common patterns:
-/// - Success/failure by category
-/// - Iteration count patterns
-/// - Common error types
-pub fn extract_and_record_patterns(outcome: &WorkflowOutcome) -> Result<Vec<String>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Record a complete learning observation from a workflow run.
-///
-/// This is the main entry point called from `loop_controller.rs` after
-/// a workflow completes. It records both the outcome, extracted patterns,
-/// and deterministic agentic metric scores.
-pub fn record_workflow_learning(outcome: &WorkflowOutcome) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Update the Q-routing table after a workflow outcome.
-///
-/// Extracts TaskState from the outcome's tags, computes reward from the
-/// composite agentic score, and performs a Q-value update for the
-/// (state, architecture) pair.
-fn update_q_routing_table(outcome: &WorkflowOutcome) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Update the Q-routing table in PostgreSQL (PG-first strategy).
-///
-/// Computes the Q-value update against PG's current state. This is the
-/// authoritative write path — SQLite is updated separately as a fallback.
-/// Supports multi-instance deployments where multiple runners share PG.
+/// Computes the Q-value update against PG's current state using the composite
+/// agentic score as the reward signal.
 pub async fn update_q_routing_table_pg(
     pg: &crate::database::pg::PgDb,
     outcome: &WorkflowOutcome,
@@ -373,14 +317,6 @@ pub async fn update_q_routing_table_pg(
     );
 
     Ok(())
-}
-
-/// Compute deterministic agentic metrics and persist them to the database.
-///
-/// Runs synchronously after recording the learning outcome. Cost: zero LLM
-/// calls, milliseconds of wall time.
-fn score_and_persist_agentic_metrics(outcome: &WorkflowOutcome) -> Result<(), String> {
-    Err("SQLite removed".to_string())
 }
 
 /// Spawn async LLM-as-judge evaluation for a completed workflow run.

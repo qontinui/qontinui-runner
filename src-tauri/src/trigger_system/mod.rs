@@ -30,8 +30,8 @@
 
 pub mod evaluator;
 pub mod executor;
+pub mod github_api;
 pub mod service;
-pub mod storage;
 pub mod types;
 pub mod watchers;
 

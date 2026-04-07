@@ -567,25 +567,6 @@ pub struct PlanCreationResult {
 ///
 /// This function:
 /// 1. Builds the planning prompt from context
-/// 2. Calls the AI provider to generate a plan
-/// 3. Parses the AI response
-/// 4. Stores the plan in the database
-///
-/// # Arguments
-/// * `db` - Database handle for storing the plan
-/// * `task_run_id` - The task run this plan is for
-/// * `context` - Planning context with goal, project hints, etc.
-///
-/// # Returns
-/// `PlanCreationResult` with the plan and storage info, or error string
-pub fn create_verification_plan(
-    task_run_id: &str,
-    context: &PlanningContext,
-    doctor_handle: Option<&DoctorHandle>,
-) -> Result<PlanCreationResult, String> {
-    Err("SQLite removed".to_string())
-}
-
 /// Create a verification plan for replanning.
 ///
 /// Similar to `create_verification_plan` but specifically for when a worker
@@ -702,21 +683,6 @@ pub fn inject_plan_context(prompt: &str, plan: &VerificationPlan) -> String {
 
     let plan_context = build_worker_plan_context(plan);
     format!("{}\n---\n\n{}", plan_context, prompt)
-}
-
-/// Get or create a verification plan for a task.
-///
-/// If a plan already exists for the task, returns it.
-/// Otherwise, creates a new plan using the AI provider.
-///
-/// This is the main entry point for integrating planning into task execution.
-pub fn ensure_verification_plan(
-    task_run_id: &str,
-    goal: &str,
-    workspace_root: &str,
-    doctor_handle: Option<&DoctorHandle>,
-) -> Result<VerificationPlan, String> {
-    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]

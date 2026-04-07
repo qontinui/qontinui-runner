@@ -7,7 +7,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::mcp::types::ApiState;
-use crate::tiered_info::{self, RunDetails};
 
 // ============================================================================
 // Automation Run HTTP API Handlers (for MCP/AI access)
@@ -43,13 +42,6 @@ pub async fn list_automation_runs(
         }))),
     }
 }
-
-/// Helper to get recent runs across all configs from task_run_automation.
-pub fn get_all_recent_runs(limit: u32) -> Result<Vec<RunDetails>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// row_to_run_details_from_automation removed (SQLite dead code)
 
 /// Get a specific automation run by ID from task_run_automation.
 pub async fn get_automation_run(

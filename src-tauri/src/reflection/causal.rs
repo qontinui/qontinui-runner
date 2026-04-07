@@ -1,12 +1,12 @@
-//! Causal Chain Engine for tracking cause→effect relationships between events.
+//! Causal Chain types and legacy insert stub.
 //!
-//! Provides types and functions for building, storing, and querying causal chains
-//! that connect events like findings, fixes, errors, and verifications.
+//! The PG implementations live on `PgDb` in `database/pg/reflection.rs`.
+//! Only the shared types and the still-called `insert_causal_event` stub
+//! remain here; the latter is a no-op pending a proper PG port and is
+//! tracked as deferred work.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::{debug, info};
-use uuid::Uuid;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,85 +50,21 @@ pub struct CausalSummary {
 }
 
 // ---------------------------------------------------------------------------
-// Insert
+// Insert (legacy stub — pending PG port, called from blame engine)
 // ---------------------------------------------------------------------------
 
-/// Insert a new causal event (directed edge) into the database.
-///
-/// Deduplicates by (cause_type, cause_id, effect_type, effect_id) using a UNIQUE
-/// index and `INSERT OR IGNORE`. If a duplicate exists, the existing ID is returned.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_causal_event(
-    cause_type: &str,
-    cause_id: &str,
-    effect_type: &str,
-    effect_id: &str,
-    relationship: &str,
-    confidence: &str,
-    source: &str,
-    task_run_id: Option<&str>,
-    workflow_name: Option<&str>,
-    description: Option<&str>,
+    _cause_type: &str,
+    _cause_id: &str,
+    _effect_type: &str,
+    _effect_id: &str,
+    _relationship: &str,
+    _confidence: &str,
+    _source: &str,
+    _task_run_id: Option<&str>,
+    _workflow_name: Option<&str>,
+    _description: Option<&str>,
 ) -> Result<String, String> {
     Err("SQLite removed".to_string())
 }
-
-// ---------------------------------------------------------------------------
-// Automated link building
-// ---------------------------------------------------------------------------
-
-/// Build automated causal links from existing data in a task run.
-///
-/// Scans for linkable events:
-/// 1. fix_applied → finding_detected (via source_finding_id)
-/// 2. fix_effective → error_occurred (via resolved_by_fix_id)
-/// 3. fix_applied → error_occurred (via fix_applications + error_signature_hash)
-/// 4. error_occurred → finding_detected (via signature_hash matching)
-///
-/// Returns the count of new links created.
-pub fn build_automated_causal_links(task_run_id: &str, workflow_name: &str) -> Result<u32, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Chain tracing
-// ---------------------------------------------------------------------------
-
-/// Trace a causal chain forward from a cause event, following effect links.
-///
-/// BFS traversal with cycle detection and max depth.
-pub fn trace_causal_chain_forward(
-    event_type: &str,
-    event_id: &str,
-    max_depth: u32,
-) -> Result<CausalChain, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Trace a causal chain backward from an effect event to find root causes.
-///
-/// BFS traversal following cause links backward.
-pub fn trace_causal_chain_backward(
-    event_type: &str,
-    event_id: &str,
-    max_depth: u32,
-) -> Result<CausalChain, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Query helpers
-// ---------------------------------------------------------------------------
-
-/// Get all causal events for a workflow, ordered by created_at desc.
-pub fn get_causal_events_for_workflow(
-    workflow_name: &str,
-    limit: u32,
-) -> Result<Vec<CausalEvent>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get aggregate causal statistics for a workflow.
-pub fn get_causal_summary(workflow_name: &str) -> Result<CausalSummary, String> {
-    Err("SQLite removed".to_string())
-}
-

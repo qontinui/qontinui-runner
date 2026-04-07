@@ -10,8 +10,8 @@
 #![allow(dead_code)]
 
 use crate::tiered_info::{
-    update_statistics_after_run, Anomaly, AnomalySeverity, AnomalyType, RunDetails, RunStatus,
-    ScreenshotRecord, TemplateMatchRecord, TransitionRecord,
+    Anomaly, AnomalySeverity, AnomalyType, RunDetails, RunStatus, ScreenshotRecord,
+    TemplateMatchRecord, TransitionRecord,
 };
 use std::collections::HashMap;
 use std::time::Instant;

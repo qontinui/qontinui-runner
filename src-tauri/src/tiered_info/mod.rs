@@ -23,10 +23,8 @@
 
 pub mod event_handler;
 pub mod recording;
-pub mod storage;
 pub mod types;
 
 pub use event_handler::*;
 pub use recording::*;
-pub use storage::*;
 pub use types::*;
