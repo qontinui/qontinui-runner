@@ -134,11 +134,10 @@ impl StepHandler for WorkflowStepHandler {
             .with_auto_continue(true)
             .with_workflow_type("unified");
 
-        // PG-primary: write to PostgreSQL first
+        // Write to PostgreSQL
         if let Err(e) = context.app_state.pg_db.create_task_run(&input).await {
             warn!("PG create_task_run for nested workflow failed: {}", e);
         }
-        // PG write already done above; SQLite fallback removed
 
         // 7. Build LoopConfig with the single stage
         let loop_config = LoopConfig {
@@ -192,6 +191,9 @@ impl StepHandler for WorkflowStepHandler {
             active_canary: None,
             is_canary_run: false,
             phase_timeout_ms: None,
+            max_fix_attempts: workflow.max_fix_attempts,
+            max_ci_auto_resumes: workflow.max_ci_auto_resumes,
+            ci_failure_context: None,
         };
 
         // 8. Create LoopController and get session manager

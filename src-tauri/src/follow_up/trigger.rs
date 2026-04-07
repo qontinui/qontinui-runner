@@ -168,14 +168,6 @@ async fn should_launch_follow_up_pg(
     Ok(true)
 }
 
-/// Scan the last ~20 output chunks for unfixed-issue signal patterns.
-///
-/// Returns true if any of the known signal patterns are found in the
-/// tail of the source run's output.
-fn check_has_unfixed_signal(task_run_id: &str) -> Result<bool, String> {
-    Err("SQLite removed".to_string())
-}
-
 /// Launch a follow-up workflow to fix unfixed issues from the given source task run.
 ///
 /// Creates a new task run with `is_follow_up = true`, builds the follow-up

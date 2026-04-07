@@ -1,14 +1,14 @@
 //! Sync service for pushing discoveries to qontinui-web.
 //!
 //! Handles the HTTP communication with the backend API for submitting
-//! discoveries. Supports offline operation via the queue in storage.rs.
+//! discoveries. The persistent queue lives in PostgreSQL
+//! (`database::pg::tiered_info`); this module contains only the network push
+//! logic plus the `SyncStatus`/`DiscoveryToSync` types shared with the
+//! Tauri command layer.
 
 use crate::auth::AuthManager;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-use super::storage::{
-    get_discoveries_for_retry, get_pending_discoveries, mark_discovery_sent, record_sync_failure,
-};
 use super::types::{DiscoveryPayload, DiscoveryResponse};
 
 use crate::api_config::get_api_base_url;
@@ -143,15 +143,6 @@ pub struct SingleSyncResult {
     pub error: Option<String>,
 }
 
-/// Extract discoveries ready for sync (sync operation, no connection held).
-///
-/// Returns the discoveries that should be synced. Call this first,
-/// then call `sync_discoveries_batch` with the data, then call
-/// `apply_sync_results` to update the database.
-pub fn extract_discoveries_for_sync() -> Result<Vec<DiscoveryToSync>, String> {
-    Err("SQLite removed".to_string())
-}
-
 /// Sync a batch of discoveries (async operation, no connection needed).
 ///
 /// This is the async part that does network operations.
@@ -177,27 +168,6 @@ pub async fn sync_discoveries_batch(discoveries: Vec<DiscoveryToSync>) -> Vec<Si
     results
 }
 
-/// Apply sync results to the database (sync operation).
-///
-/// Updates the database based on what succeeded and failed.
-pub fn apply_sync_results(results: Vec<SingleSyncResult>) -> Result<SyncResult, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Sync all pending discoveries to qontinui-web.
-///
-/// This is a convenience function that combines the three phases:
-/// 1. Extract discoveries from database (sync)
-/// 2. Push to backend (async)
-/// 3. Update database with results (sync)
-///
-/// NOTE: This function cannot be used in Tauri commands due to Send requirements.
-/// Use the phased approach instead (extract -> batch -> apply).
-#[allow(dead_code)]
-pub async fn sync_pending_discoveries() -> Result<SyncResult, String> {
-    Err("SQLite removed".to_string())
-}
-
 /// Get the sync status summary.
 #[derive(Debug, serde::Serialize)]
 pub struct SyncStatus {
@@ -207,11 +177,6 @@ pub struct SyncStatus {
     pub ready_for_retry: u32,
     /// Whether we're authenticated for sync
     pub authenticated: bool,
-}
-
-/// Get current sync status.
-pub fn get_sync_status() -> Result<SyncStatus, String> {
-    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]

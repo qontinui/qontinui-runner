@@ -220,10 +220,6 @@ pub fn check_and_launch_optimizers(
     // Auto-evaluate canary rollouts and promote/rollback when threshold is met.
     auto_evaluate_canaries(pg_db, Some(&deps.app_handle));
 
-    // Run data-driven cost optimization analysis (no AI session needed).
-    // Generates recommendations for high-token agents, cost concentration, etc.
-    run_cost_analysis(pg_db);
-
     // Recompute agentic metric baselines from accumulated successful runs.
     // Fast — only queries learning_outcomes aggregates, no LLM calls.
     if let Err(e) = tokio::task::block_in_place(|| {
@@ -427,12 +423,6 @@ fn auto_evaluate_canaries(
             }
         }
     }
-}
-
-/// Run data-driven cost analysis and generate cost recommendations.
-/// This does not require an AI session — it's purely SQL-based analysis.
-fn run_cost_analysis(pg_db: &std::sync::Arc<crate::database::pg::PgDb>) {
-    // SQLite removed - no-op
 }
 
 /// Launch a specific optimizer workflow.
@@ -715,7 +705,6 @@ pub fn check_and_launch_optimizers_with_pg(
     super::parser::auto_apply_high_confidence(pg_db, None);
     auto_evaluate_outcomes(pg_db);
     auto_evaluate_canaries(pg_db, Some(&deps.app_handle));
-    run_cost_analysis(pg_db);
     if let Err(e) = tokio::task::block_in_place(|| {
         Handle::current().block_on(pg_db.recompute_agentic_baselines())
     })

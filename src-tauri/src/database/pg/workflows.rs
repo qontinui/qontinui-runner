@@ -1,6 +1,6 @@
 //! PostgreSQL unified workflow operations via Clorinde-generated queries.
 //!
-//! Core CRUD module for workflow definitions. PG-primary with SQLite fallback.
+//! Core CRUD module for workflow definitions.
 //! Uses a shared row-mapping helper since all SELECT queries return the same column set.
 
 use std::collections::HashMap;
@@ -105,6 +105,8 @@ macro_rules! row_to_workflow {
             use_worktree: false,
             targeted_error_ids: vec![],
             security_profile: None, // TODO: read from DB once column is added
+            max_fix_attempts: 3,
+            max_ci_auto_resumes: 10,
         }
     }};
 }

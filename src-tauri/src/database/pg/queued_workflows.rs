@@ -1,7 +1,6 @@
 //! PostgreSQL durable workflow queue operations via Clorinde-generated queries.
 //!
-//! PG-primary implementation of the Inngest-inspired durable workflow queue.
-//! Mirrors the SQLite `queue_ops.rs` API for dual-write compatibility.
+//! Inngest-inspired durable workflow queue backed by PostgreSQL.
 
 use super::PgDb;
 use crate::database::queue_ops::{PersistedQueueEntry, QueueEntryStatus};

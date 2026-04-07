@@ -1,6 +1,4 @@
 //! PostgreSQL recordings CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite recording/storage.rs operations.
 
 use super::PgDb;
 use crate::recording::types::{Recording, RecordingStatus};

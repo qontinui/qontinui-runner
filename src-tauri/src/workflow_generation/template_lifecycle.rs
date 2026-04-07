@@ -6,10 +6,7 @@
 //! `template_promotion` (which handles workflow-to-template extraction)
 //! and `verification_templates` (which defines static template types).
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 // ============================================================================
 // Types
@@ -127,15 +124,6 @@ pub struct LifecycleEvent {
 }
 
 // ============================================================================
-// Storage
-// ============================================================================
-
-/// Ensure the template_performance and template_lifecycle_events tables exist.
-fn ensure_tables() -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
 // TemplateLifecycleManager
 // ============================================================================
 
@@ -170,54 +158,6 @@ impl TemplateLifecycleManager {
         }
     }
 
-    /// Track usage of a template after a workflow run.
-    ///
-    /// Updates success/failure counts and quality score. Creates the
-    /// performance row if it does not yet exist.
-    pub fn track_usage(
-        &self,
-        template_id: &str,
-        template_name: &str,
-        passed: bool,
-        quality_score: f64,
-    ) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Check all templates for lifecycle transitions (promote/demote/retire).
-    ///
-    /// Rules:
-    /// - Extracted + confidence >= promotion_threshold → Promoted
-    /// - Promoted + confidence <= demotion_threshold → Demoted
-    /// - Any source + failure_count >= retirement_after_failures + zero successes → Retired
-    pub fn check_lifecycle_transitions(&self) -> Result<LifecycleResult, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Get performance data for all tracked templates.
-    pub fn get_all_performance(&self) -> Result<Vec<TemplatePerformance>, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Get lifecycle history for a specific template.
-    pub fn get_template_history(&self, template_id: &str) -> Result<Vec<LifecycleEvent>, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    // ========================================================================
-    // Internal helpers
-    // ========================================================================
-
-    /// Apply a source transition: update the performance row and record an event.
-    fn transition_template(
-        &self,
-        template_id: &str,
-        old_source: TemplateSource,
-        new_source: TemplateSource,
-        confidence: f64,
-    ) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
 }
 
 // ============================================================================

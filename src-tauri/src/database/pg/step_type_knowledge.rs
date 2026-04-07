@@ -1,6 +1,4 @@
 //! PostgreSQL step_type_knowledge CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite workflow_generation/step_type_knowledge.rs operations.
 
 use super::PgDb;
 use crate::workflow_generation::step_type_knowledge::{

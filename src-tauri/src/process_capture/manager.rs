@@ -36,8 +36,6 @@ impl ProcessCaptureManager {
         }
     }
 
-    // SQLite database handle removed — session tracking is now PG-only.
-
     /// Register a process config without starting it.
     pub async fn register(&self, config: ProcessConfig) {
         let id = config.id.clone();

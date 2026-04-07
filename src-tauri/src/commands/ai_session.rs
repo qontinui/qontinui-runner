@@ -903,10 +903,9 @@ pub async fn resume_ai_sessions(
     session_manager: Arc<SessionManager>,
     app_handle: tauri::AppHandle,
 ) -> u32 {
-    // AI session resume: SQLite removed. This function is now a no-op.
-    // AI sessions will need PG-based resume support in a future PR.
+    // AI session resume is currently a no-op pending PG-based persistence.
     let _ = (session_manager, app_handle);
-    info!("AI session resume: skipped (SQLite removed, PG support pending)");
+    info!("AI session resume: skipped (PG support pending)");
     0
 }
 

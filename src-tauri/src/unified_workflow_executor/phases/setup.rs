@@ -357,7 +357,6 @@ impl SetupExecutor {
                                 {
                                     warn!("PG append_task_output_ex failed: {}", e);
                                 }
-                                // PG write already done above; SQLite fallback removed
                             }
                             // Save completion checkpoint
                             let mut resp_checkpoint = StepCheckpoint::new(

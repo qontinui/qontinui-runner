@@ -1,8 +1,11 @@
 //! In-memory knowledge graph engine backed by petgraph.
 //!
-//! The KnowledgeGraph materializes SQLite data into a traversable directed graph.
+//! The KnowledgeGraph materializes PostgreSQL data into a traversable directed graph.
 //! It queries 16+ tables to build nodes and edges, then provides traversal queries
 //! for causal reasoning, impact analysis, pattern detection, and unified search.
+//!
+//! Construction from PG is in `graph_engine_pg.rs`; this file holds the struct,
+//! node/edge management helpers, and the traversal/query methods.
 
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
@@ -34,18 +37,6 @@ impl KnowledgeGraph {
             built_at: chrono::Utc::now().to_rfc3339(),
             workflow_scope,
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Build from database
-    // -------------------------------------------------------------------------
-
-    /// Build the full knowledge graph from SQLite data.
-    ///
-    /// Queries 16+ tables, creates nodes for each entity type, then wires up
-    /// directed edges representing relationships (causal, structural, temporal).
-    pub fn build_from_db(workflow_name: Option<&str>) -> Result<Self, String> {
-        Err("SQLite removed".to_string())
     }
 
     // -------------------------------------------------------------------------
@@ -81,75 +72,6 @@ impl KnowledgeGraph {
         };
         self.graph.add_edge(from_idx, to_idx, edge);
         true
-    }
-
-    // =========================================================================
-    // Private loaders — Nodes
-    // =========================================================================
-
-    fn load_workflows(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_workflow_versions(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_task_runs(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_findings(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_fixes(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_errors(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_components(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_rules(&mut self) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_patterns(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_knowledge(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    fn load_step_defs(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Load UI Bridge elements that were interacted with during automation.
-    /// Capped at 100 elements per workflow to respect memory budgets.
-    fn load_ui_elements(&mut self, _workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Load skills from user_skills table into the graph as Skill nodes.
-    ///
-    /// Each skill becomes a Skill node with properties for category, source,
-    /// usage_count, version, and approval_status. Skills with source="auto"
-    /// were procedurally generated from cross-run learning.
-    fn load_skills(&mut self) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Link skills to task runs, findings, and components based on skill_origin
-    /// data stored in step provenance and fix applications.
-    fn link_skills(&mut self) -> Result<(), String> {
-        Err("SQLite removed".to_string())
     }
 
     /// Load pre-fetched observations from PostgreSQL into the graph.
@@ -268,9 +190,6 @@ impl KnowledgeGraph {
     }
 
     /// Link task runs to UI elements via InteractedWith edges.
-    fn link_ui_interactions(&mut self, _workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
 
     // =========================================================================
     // UI Bridge failure chain tracing
@@ -382,61 +301,6 @@ impl KnowledgeGraph {
     }
 
     // =========================================================================
-    // Private loaders — Edges
-    // =========================================================================
-
-    /// task_runs.workflow_name → BelongsTo → workflow
-    fn link_task_runs_to_workflows(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// task_run_findings.task_run_id → DetectedDuring → task_run
-    fn link_findings_to_task_runs(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// reflection_fixes.source_finding_id → Caused (finding → fix)
-    /// reflection_fixes where effective → Resolved (fix → finding)
-    fn link_fixes_to_findings(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// causal_events → Caused / Resolved edges based on relationship type
-    fn link_causal_events(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// workflow_versions parent → EvolvedFrom, generation_task_run_id → GeneratedBy
-    fn link_workflow_versions(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// step_provenance → BuiltBy (step → pipeline_agent)
-    fn link_step_provenance(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// step_finding_links → DetectedDuring (step → finding)
-    fn link_step_finding_links(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// rule_influence_log → InfluencedBy (rule → workflow)
-    fn link_rule_influence(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// component_relationships → ImpactsComponent
-    fn link_component_relationships(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// fix_applications → AppliedIn (fix → task_run)
-    fn link_fix_applications(&mut self, workflow_name: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".to_string())
-    }
-
-    // =========================================================================
     // Utility helpers
     // =========================================================================
 
@@ -461,9 +325,6 @@ impl KnowledgeGraph {
 
     /// Ingest a single task run and its related entities into the graph.
     /// Returns the count of new nodes added.
-    pub fn ingest_task_run(&mut self, task_run_id: &str) -> Result<u32, String> {
-        Err("SQLite removed".to_string())
-    }
 
     // =========================================================================
     // Summary
@@ -1047,21 +908,6 @@ mod tests {
         assert_eq!(kg.graph.node_count(), 0);
         assert_eq!(kg.graph.edge_count(), 0);
         assert!(kg.workflow_scope.is_none());
-    }
-
-    #[test]
-    fn test_build_from_empty_db() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_build_from_db_with_workflow() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_build_from_db_with_task_run() {
-        // SQLite removed - no-op
     }
 
     // =========================================================================

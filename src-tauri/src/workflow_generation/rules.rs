@@ -1,13 +1,13 @@
-//! Generation Rules — Externalized workflow generation rules stored in SQLite.
+//! Generation Rules — Externalized workflow generation rules stored in PostgreSQL.
 //!
 //! Rules that govern workflow generation (schema context, hardener, verification)
-//! are stored in the `generation_rules` table. This allows the reflection system
-//! to create/modify rules at runtime without Rust recompilation.
+//! are stored in the `generation_rules` table (see `database/pg/generation.rs`).
+//! This allows the reflection system to create/modify rules at runtime without
+//! Rust recompilation. This module exposes the shared types and prompt-formatting
+//! helpers consumed by both the generator and the HTTP API layer.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-use crate::reflection::types::ReflectionFix;
 use crate::str_utils::truncate_str;
 
 /// Severity tiers for progressive rule loading.
@@ -84,39 +84,6 @@ pub struct ListRulesQuery {
 }
 
 // ============================================================================
-// Loading Functions
-// ============================================================================
-
-/// Load active rules for a specific agent and section, ordered by rule_number.
-pub fn load_rules(agent: &str, section: &str) -> Vec<GenerationRule> {
-    Vec::new()
-}
-
-/// Load active rules filtered by severity tier for progressive loading.
-///
-/// - `Critical` loads only `severity = 'critical'` rules
-/// - `Important` loads `'critical'` and `'important'` rules
-/// - `Full` loads all severities (`'critical'`, `'important'`, `'normal'`, `'hint'`)
-pub fn load_rules_progressive(agent: &str, section: &str, tier: RuleTier) -> Vec<GenerationRule> {
-    Vec::new()
-}
-
-/// Load all active rules for an agent, grouped by section.
-pub fn load_rules_by_agent(agent: &str) -> HashMap<String, Vec<GenerationRule>> {
-    HashMap::new()
-}
-
-/// List rules with optional filters.
-pub fn list_rules(query: &ListRulesQuery) -> Result<Vec<GenerationRule>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get a single rule by ID.
-pub fn get_rule(id: &str) -> Result<Option<GenerationRule>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
 // Formatting Functions
 // ============================================================================
 
@@ -182,47 +149,6 @@ pub fn format_rules_as_markdown_with_examples(
 }
 
 // ============================================================================
-// Write Functions
-// ============================================================================
-
-/// Get the next rule_number for a given agent + section.
-pub fn next_rule_number(agent: &str, section: &str) -> i32 {
-    0
-}
-
-/// Insert a new generation rule.
-/// If `source_fix_id` is provided and a rule with that source already exists, returns the
-/// existing rule instead of creating a duplicate.
-pub fn insert_rule(input: &InsertRuleInput) -> Result<GenerationRule, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Update an existing generation rule.
-pub fn update_rule(id: &str, input: &UpdateRuleInput) -> Result<GenerationRule, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Delete a generation rule (hard delete).
-pub fn delete_rule(id: &str) -> Result<bool, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
-// Rule Application Tracking
-// ============================================================================
-
-/// Record which generation rules were applied during a workflow generation run.
-/// Creates a `rule_applications` row for each active rule, linking it to the
-/// generated workflow and (optionally) the task run that triggered generation.
-pub fn record_rule_applications(
-    rules: &[GenerationRule],
-    workflow_id: Option<&str>,
-    task_run_id: Option<&str>,
-) {
-    // SQLite removed - no-op
-}
-
-// ============================================================================
 // Helper Functions for Auto-Apply
 // ============================================================================
 
@@ -279,106 +205,6 @@ pub fn truncate_to_title(description: &str) -> String {
         first_sentence.to_string()
     } else {
         format!("{}...", truncate_str(first_sentence, 77))
-    }
-}
-
-// ============================================================================
-// Direct Rule Creation from Reflection Fixes
-// ============================================================================
-
-/// Create generation rules directly from reflection fixes — no accumulation
-/// threshold or effectiveness history required.
-///
-/// Every fix with a qualifying fix_type at high or medium confidence becomes a
-/// generation rule immediately. This ensures that reflection insights improve
-/// future workflow generation from the very first occurrence.
-///
-/// Deduplication is by content hash: if a rule with the same content already
-/// exists, it is skipped.
-///
-/// Returns the number of newly created rules.
-pub fn create_rules_from_reflection_fixes(fixes: &[ReflectionFix]) -> Result<u32, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
-// Auto-Rule Generation from Insights
-// ============================================================================
-
-/// Promote prompt insights into auto-generated rules.
-///
-/// An insight is promoted when:
-/// - `confidence > 0.3`
-/// - `evidence_count >= 1`
-/// - No existing rule with similar content (content-hash dedup)
-///
-/// Returns the number of newly created rules.
-pub fn promote_insights_to_rules(
-    insights: &[super::prompt_analysis::PromptInsight],
-) -> Result<u32, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Simple content hash for dedup (first 16 chars of content, normalized).
-fn simple_content_hash(content: &str) -> String {
-    let normalized: String = content
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .take(32)
-        .collect();
-    normalized[..normalized.len().min(16)].to_string()
-}
-
-/// Map an insight's agent + type to the appropriate rule agent + section.
-fn map_insight_to_rule_location(agent: &str, insight_type: &str) -> (String, String) {
-    match (agent, insight_type) {
-        ("specification", _) => ("specification".to_string(), "criteria_rules".to_string()),
-        ("verification", "verification_blind_spot") => {
-            ("verification".to_string(), "check_rules".to_string())
-        }
-        ("verification", _) => ("verification".to_string(), "check_rules".to_string()),
-        ("hardener", _) => ("hardener".to_string(), "conversion_rules".to_string()),
-        ("builder", _) => ("schema_context".to_string(), "important_rules".to_string()),
-        _ => ("schema_context".to_string(), "important_rules".to_string()),
-    }
-}
-
-// ============================================================================
-// Failure Tracking & Auto-Promotion
-// ============================================================================
-
-/// Increment the failure_count of a rule and auto-promote to 'critical' if threshold reached.
-pub fn increment_rule_failure_count(rule_id: &str) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Identify which rules were violated by a generation/verification error.
-/// Returns IDs of rules whose content keywords appear in the error message.
-pub fn identify_violated_rules(error_message: &str, agent: &str) -> Vec<String> {
-    Vec::new()
-}
-
-// ============================================================================
-// Known Issue → Rule Sync
-// ============================================================================
-
-/// Create generation rules from active known issues that have verification templates.
-///
-/// Each known issue with a `verification_step_template` becomes an "important" rule
-/// in the verification agent. Deduplicates by `source_fix_id` (using the known issue ID).
-pub fn sync_rules_from_known_issues() -> Result<u32, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Map a known issue category to the appropriate rule agent.
-fn infer_agent_from_issue(category: &crate::known_issues::types::IssueCategory) -> String {
-    use crate::known_issues::types::IssueCategory;
-    match category {
-        IssueCategory::Timing | IssueCategory::State | IssueCategory::DataIntegrity => {
-            "verification".to_string()
-        }
-        _ => "schema_context".to_string(),
     }
 }
 
@@ -473,128 +299,4 @@ mod tests {
         assert!(md.contains("2. **Rule Two**: Do that thing"));
     }
 
-    // ========================================================================
-    // Database-backed tests for promote_insights_to_rules and helpers
-    // ========================================================================
-
-    use crate::workflow_generation::prompt_analysis::PromptInsight;
-
-    #[test]
-    fn test_promote_high_confidence_insight() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_promote_low_confidence_skipped() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_promote_low_evidence_skipped() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_promote_no_suggested_rule_skipped() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_promote_dedup() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_simple_content_hash_empty() {
-        let result = simple_content_hash("");
-        assert_eq!(result, "", "Hash of empty string should be empty");
-    }
-
-    #[test]
-    fn test_map_insight_to_rule_location() {
-        assert_eq!(
-            map_insight_to_rule_location("specification", "any"),
-            ("specification".to_string(), "criteria_rules".to_string()),
-        );
-        assert_eq!(
-            map_insight_to_rule_location("verification", "verification_blind_spot"),
-            ("verification".to_string(), "check_rules".to_string()),
-        );
-        assert_eq!(
-            map_insight_to_rule_location("hardener", "any"),
-            ("hardener".to_string(), "conversion_rules".to_string()),
-        );
-        assert_eq!(
-            map_insight_to_rule_location("builder", "any"),
-            ("schema_context".to_string(), "important_rules".to_string()),
-        );
-        assert_eq!(
-            map_insight_to_rule_location("unknown", "any"),
-            ("schema_context".to_string(), "important_rules".to_string()),
-        );
-    }
-
-    // ========================================================================
-    // Tests for create_rules_from_reflection_fixes
-    // ========================================================================
-
-    fn make_test_fix(fix_type: &str, confidence: &str, description: &str) -> ReflectionFix {
-        ReflectionFix {
-            id: format!("fix-{}", uuid::Uuid::new_v4()),
-            source_task_run_id: "src-1".into(),
-            reflection_task_run_id: "ref-1".into(),
-            source_finding_id: None,
-            source_knowledge_id: None,
-            fix_type: fix_type.into(),
-            fix_description: description.into(),
-            file_changed: None,
-            old_value: None,
-            new_value: None,
-            confidence: confidence.into(),
-            content_hash: None,
-            status: "applied".into(),
-            effectiveness: None,
-            effectiveness_evidence: None,
-            applied_at: "2026-01-01T00:00:00Z".into(),
-            evaluated_at: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            source_agent: Some("builder".into()),
-            reasoning: None,
-            alternatives_considered: None,
-            reflection_scope: None,
-            project_path: None,
-            applicability_context: None,
-        }
-    }
-
-    #[test]
-    fn test_create_rules_from_reflection_fixes_qualifying() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_create_rules_skips_low_confidence() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_create_rules_skips_non_qualifying_types() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_create_rules_dedup() {
-        // SQLite removed - no-op
-    }
-}
-
-// ============================================================================
-// Seed Rules
-// ============================================================================
-
-/// Ensure seed rules are present in the database.
-/// These are hardcoded quality rules that prevent known anti-patterns.
-/// Deduplicates by matching on provenance='seed' and title — safe to call repeatedly.
-pub fn ensure_seed_rules() {
-    // SQLite removed - no-op
 }

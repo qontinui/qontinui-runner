@@ -1533,7 +1533,7 @@ pub struct TaskRunVerificationResultsDbResult {
     pub failed_iterations: usize,
 }
 
-/// Get verification phase results for a task run from SQLite database.
+/// Get verification phase results for a task run from PostgreSQL.
 ///
 /// Returns all verification results across all iterations, including individual
 /// step results (tests, checks, etc.) from the unified workflow's verification phase.

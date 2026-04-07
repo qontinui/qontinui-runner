@@ -1,6 +1,4 @@
 //! PostgreSQL state_machine_configs CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite state_machine_configs/storage.rs operations.
 
 use super::PgDb;
 use crate::state_machine_configs::types::*;

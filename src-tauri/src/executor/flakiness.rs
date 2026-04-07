@@ -71,20 +71,6 @@ pub struct FlakinessCache {
 }
 
 impl FlakinessCache {
-    /// Load flakiness data for a configuration.
-    ///
-    /// # Arguments
-    /// * `conn` - Database connection
-    /// * `config_id` - Configuration ID to load data for
-    /// * `threshold` - Flakiness threshold (items with success rate between
-    ///   threshold and (1-threshold) are considered flaky)
-    ///
-    /// # Returns
-    /// A new `FlakinessCache` with the loaded data.
-    pub fn load(config_id: &str, threshold: f64) -> Result<Self, String> {
-        Err("SQLite removed".to_string())
-    }
-
     /// Check if the cache is stale (older than 5 minutes).
     pub fn is_stale(&self) -> bool {
         self.loaded_at.elapsed() > std::time::Duration::from_secs(300)

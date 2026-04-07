@@ -1,4 +1,4 @@
-//! Tauri commands for checkpoint/session management via SQLite database.
+//! Tauri commands for checkpoint/session management via PostgreSQL.
 
 use crate::commands::{AppState, CommandResponse};
 use crate::database::{CheckpointData, SessionEvent};

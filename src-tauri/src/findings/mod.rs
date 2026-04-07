@@ -1,12 +1,9 @@
 //! Findings module for AI-detected issues.
 //!
-//! This module provides:
-//! - Types for findings (matching qontinui-schemas)
-//! - Parser for [FINDING:...] markers in AI output
-//! - Storage operations for SQLite persistence
+//! Findings are parsed from `[FINDING:...]` markers in AI output by
+//! [`parser`] and persisted to PostgreSQL via `database::pg::findings`.
 
 pub mod parser;
-pub mod storage;
 pub mod types;
 
 pub use parser::*;

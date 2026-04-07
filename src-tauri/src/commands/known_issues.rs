@@ -1,17 +1,16 @@
 //! Tauri commands for known issue operations.
 //!
 //! Provides commands for querying and managing known issues
-//! stored in the checkpoint database.
+//! stored in PostgreSQL.
 
 use std::sync::Arc;
 use tauri::State;
 use tracing::info;
 
 use crate::commands::AppState;
-use crate::known_issues::{templates, IssuePatternTemplate};
 use crate::known_issues::{
-    CreateKnownIssueRequest, CreatePatternTemplateRequest, KnownIssue, ListKnownIssuesQuery,
-    UpdateKnownIssueRequest,
+    CreateKnownIssueRequest, CreatePatternTemplateRequest, IssuePatternTemplate, KnownIssue,
+    ListKnownIssuesQuery, UpdateKnownIssueRequest,
 };
 
 // ── Export / Import types ──────────────────────────────────────────────
@@ -297,9 +296,3 @@ pub async fn create_pattern_template(
     Ok(template)
 }
 
-/// Seed built-in pattern templates (called on startup).
-pub fn seed_built_in_templates() {
-    if let Err(e) = templates::seed_templates() {
-        tracing::warn!("Failed to seed pattern templates: {}", e);
-    }
-}

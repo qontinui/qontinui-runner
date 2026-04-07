@@ -53,8 +53,7 @@ impl From<PolicyViolation> for LogError {
 pub struct StepEventLogger {
     /// Handle to the execution tracker
     tracker: TrackerHandle,
-    /// Database for persisting events
-    /// PostgreSQL database (PG-primary, SQLite fallback)
+    /// PostgreSQL database for persisting events
     pg_db: Arc<PgDb>,
     /// Workflow name for event context
     workflow_name: String,
@@ -157,7 +156,6 @@ impl StepEventLogger {
                 }
             });
         }
-        // PG write already done above via tokio::spawn; SQLite fallback removed
 
         // Record successful logging
         self.tracker.record_start(&key);
@@ -206,7 +204,6 @@ impl StepEventLogger {
                 }
             });
         }
-        // PG write already done above via tokio::spawn; SQLite fallback removed
 
         // Record successful logging
         self.tracker.record_end(&key);
@@ -256,7 +253,6 @@ impl StepEventLogger {
                 }
             });
         }
-        // PG write already done above via tokio::spawn; SQLite fallback removed
 
         // Record successful logging
         self.tracker.record_end(&key);

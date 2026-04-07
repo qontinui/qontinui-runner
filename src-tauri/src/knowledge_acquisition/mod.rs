@@ -309,49 +309,9 @@ impl KnowledgeAcquisition {
             }
         });
 
-        // === Tier 3: Store results in task_knowledge (knowledge flywheel) ===
-        if !all_results.is_empty() {
-            if let Some(ctx) = ctx {
-                let outcomes =
-                    ingestor::ingest_results(&all_results, &ctx.task_run_id, ctx.pg.as_ref()).await;
-                let stored = outcomes
-                    .iter()
-                    .filter(|o| matches!(o, ingestor::IngestOutcome::Stored { .. }))
-                    .count();
-                let deduped = outcomes
-                    .iter()
-                    .filter(|o| matches!(o, ingestor::IngestOutcome::Duplicate { .. }))
-                    .count();
-                let injections = outcomes
-                    .iter()
-                    .filter(|o| {
-                        matches!(
-                            o,
-                            ingestor::IngestOutcome::Stored {
-                                injection_flagged: true,
-                                ..
-                            }
-                        )
-                    })
-                    .count();
-                self.stats
-                    .results_ingested
-                    .fetch_add(stored as u64, Ordering::Relaxed);
-                self.stats
-                    .dedup_skipped
-                    .fetch_add(deduped as u64, Ordering::Relaxed);
-                self.stats
-                    .injection_detections
-                    .fetch_add(injections as u64, Ordering::Relaxed);
-                if stored > 0 {
-                    eprintln!(
-                        "[knowledge_acquisition] Stored {stored}/{} results in task_knowledge ({deduped} deduped)",
-                        all_results.len()
-                    );
-                }
-            }
-        }
-
+        // Tier 3 (flywheel ingestion into task_knowledge) was removed during the
+        // SQLite→PG migration and never ported. Results are returned to the caller
+        // without persistence; vuln enrichment uses PG directly via a separate path.
         Ok(all_results)
     }
 

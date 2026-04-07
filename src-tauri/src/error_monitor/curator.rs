@@ -8,8 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::error_monitor::storage::{ErrorEventStorage, LogSourceStorage};
-use crate::error_monitor::types::{ErrorQuery, ErrorSeverity, ErrorStatus, StoredErrorEvent};
+use crate::error_monitor::types::{ErrorSeverity, ErrorStatus, StoredErrorEvent};
 
 /// A curated collection of errors ready for debug agent analysis.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -133,26 +132,6 @@ impl DebugContextCurator {
     /// Create a curator with custom configuration.
     pub fn with_config(config: CuratorConfig) -> Self {
         Self { config }
-    }
-
-    /// Build debug context from the database.
-    pub fn build_context(&self, task_run_id: Option<&str>) -> Result<DebugContext, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Build a map of source name -> description from the log_sources table.
-    fn build_source_descriptions(errors: &[StoredErrorEvent]) -> HashMap<String, String> {
-        // SQLite removed — returns empty map
-        HashMap::new()
-    }
-
-    /// Enrich curated errors with past resolution hints from the findings database.
-    ///
-    /// For each critical/error-level error, queries task_run_findings for resolved
-    /// entries with similar messages and appends the resolution approach to
-    /// investigation_hints. Falls back gracefully if no matches are found.
-    fn enrich_with_past_resolutions(errors: &mut [CuratedError]) {
-        // SQLite removed - no-op
     }
 
     /// Curate a single error with additional context.

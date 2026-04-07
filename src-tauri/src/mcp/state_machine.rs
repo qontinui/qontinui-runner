@@ -3,7 +3,7 @@
 //! Provides HTTP handlers for UI Bridge State Machine operations:
 //! loading state machine configs, querying status, executing transitions,
 //! navigating between states via the Python bridge, and CRUD operations
-//! for state machine configs, states, and transitions stored in SQLite.
+//! for state machine configs, states, and transitions stored in PostgreSQL.
 
 use axum::{
     extract::{Path, State},
@@ -363,7 +363,7 @@ pub async fn get_available_transitions(
                 )));
             }
             // Bridge succeeded but returned empty transitions (no active state).
-            // Fall through to SQLite fallback which returns all defined transitions.
+            // Fall through to PG-backed lookup which returns all defined transitions.
         }
     }
 

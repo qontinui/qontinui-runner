@@ -4,7 +4,7 @@
 //! as well as flow execution commands that connect the Flow Designer UI
 //! to actual flow execution.
 //!
-//! Uses SQLite database for persistence with in-memory storage for active
+//! Uses PostgreSQL for persistence with in-memory storage for active
 //! executions.
 
 use crate::commands::AppState;

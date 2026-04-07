@@ -236,7 +236,7 @@ impl LibrarySyncService {
         }
     }
 
-    /// Sync all checks from the runner's SQLite database.
+    /// Sync all checks from the runner's PostgreSQL database.
     pub async fn sync_checks(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "checks".to_string(),
@@ -301,7 +301,7 @@ impl LibrarySyncService {
         result
     }
 
-    /// Sync all check groups from the runner's SQLite database.
+    /// Sync all check groups from the runner's PostgreSQL database.
     pub async fn sync_check_groups(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "check_groups".to_string(),
@@ -367,7 +367,7 @@ impl LibrarySyncService {
         result
     }
 
-    /// Sync all shell commands from the runner's SQLite database.
+    /// Sync all shell commands from the runner's PostgreSQL database.
     pub async fn sync_shell_commands(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "shell_commands".to_string(),
@@ -450,7 +450,7 @@ impl LibrarySyncService {
         result
     }
 
-    /// Sync all saved API requests from the runner's SQLite database.
+    /// Sync all saved API requests from the runner's PostgreSQL database.
     pub async fn sync_saved_api_requests(&self, db: &Arc<PgDb>) -> LibrarySyncResult {
         let mut result = LibrarySyncResult {
             item_type: "saved_api_requests".to_string(),
@@ -728,7 +728,7 @@ impl LibrarySyncService {
 
         let mut results = Vec::new();
 
-        // Sync items stored in SQLite
+        // Sync items stored in PostgreSQL
         results.push(self.sync_checks(db).await);
         results.push(self.sync_check_groups(db).await);
         results.push(self.sync_shell_commands(db).await);

@@ -112,7 +112,7 @@ pub fn get_failure_analysis(
     })?;
 
     analysis.period_days = days;
-    // agentic_metric_summary: SQLite method removed, use default
+    // agentic_metric_summary aggregation is not yet wired to PG
     analysis.agentic_metric_summary = Default::default();
 
     Ok(analysis)
@@ -127,57 +127,4 @@ pub fn get_failure_analysis_with_pg(
     category: WorkflowCategory,
 ) -> Result<FailureAnalysis, String> {
     get_failure_analysis(pg_db, days, category)
-}
-
-// ── Private Query Functions ──────────────────────────────────────────────
-
-fn query_run_totals(since: &str, category: WorkflowCategory) -> (i64, i64) {
-    // SQLite removed — return zero totals
-    (0, 0)
-}
-
-fn query_abort_reasons(since: &str, category: WorkflowCategory) -> Vec<AbortReason> {
-    Vec::new()
-}
-
-fn query_verification_failures(
-    since: &str,
-    category: WorkflowCategory,
-) -> Vec<VerificationFailurePattern> {
-    Vec::new()
-}
-
-fn query_finding_distribution(since: &str, category: WorkflowCategory) -> Vec<CategoryCount> {
-    Vec::new()
-}
-
-fn query_severity_distribution(since: &str, category: WorkflowCategory) -> Vec<CategoryCount> {
-    Vec::new()
-}
-
-fn query_fix_effectiveness(since: &str) -> Vec<FixEffectivenessRecord> {
-    Vec::new()
-}
-
-fn query_generation_quality(since: &str) -> GenerationQualityMetrics {
-    // SQLite removed — return empty metrics
-    GenerationQualityMetrics {
-        total_feedback: 0,
-        edits: 0,
-        deletes: 0,
-        avg_rating: None,
-        most_edited_fields: Vec::new(),
-        delete_reasons: Vec::new(),
-    }
-}
-
-fn query_pipeline_agent_failures(
-    since: &str,
-    category: WorkflowCategory,
-) -> Vec<PipelineAgentFailureRecord> {
-    Vec::new()
-}
-
-fn query_recurring_issues(since: &str, category: WorkflowCategory) -> Vec<RecurringIssue> {
-    Vec::new()
 }

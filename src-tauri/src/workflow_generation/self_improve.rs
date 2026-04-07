@@ -7,9 +7,7 @@
 use crate::database::pg::PgDb;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, warn};
-
-use super::prompt_analysis;
+use tracing::debug;
 
 /// Aggregated self-improvement context for prompt injection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -34,14 +32,6 @@ pub struct SelfImprovementContext {
     pub hardener_patterns: Vec<String>,
     /// Builder construction patterns from prompt analysis.
     pub builder_insights: Vec<String>,
-}
-
-/// Analyze historical generation patterns from the database.
-///
-/// Queries across `task_run_findings`, `learning_outcomes`, `learning_patterns`,
-/// and `workflow_generation_feedback` to build a comprehensive improvement context.
-pub fn analyze_generation_patterns() -> Result<SelfImprovementContext, String> {
-    Err("SQLite removed".to_string())
 }
 
 /// Format the improvement context as markdown for prompt injection.
@@ -120,44 +110,6 @@ impl SelfImprovementContext {
             && self.hardener_patterns.is_empty()
             && self.builder_insights.is_empty()
     }
-}
-
-// ============================================================================
-// Query helpers
-// ============================================================================
-
-fn query_common_verifier_issues() -> Result<Vec<(String, i64)>, String> {
-    Err("SQLite removed".to_string())
-}
-
-fn query_fixer_failures() -> Result<Vec<(String, i64)>, String> {
-    Err("SQLite removed".to_string())
-}
-
-fn query_success_rates() -> Result<Vec<(String, i64, i64)>, String> {
-    Err("SQLite removed".to_string())
-}
-
-fn query_commonly_edited_fields() -> Result<Vec<(String, i64)>, String> {
-    Err("SQLite removed".to_string())
-}
-
-fn query_delete_rate() -> Result<(i64, i64), String> {
-    Err("SQLite removed".to_string())
-}
-
-fn query_avg_rating() -> Result<Option<f64>, String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
-// Per-Agent Insight Loading
-// ============================================================================
-
-/// Load per-agent insights from prompt analysis, returning (spec, verification, hardener, builder).
-fn load_agent_insights() -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    // SQLite removed — return empty insights
-    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
 }
 
 // ============================================================================

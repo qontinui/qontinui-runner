@@ -3,11 +3,7 @@
 //! Automatically promotes high-quality AI-generated workflows into
 //! parameterized templates that can be reused for similar tasks.
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
-use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 // ============================================================================
 // Types
@@ -60,27 +56,8 @@ pub struct PromotionResult {
 }
 
 // ============================================================================
-// Storage
-// ============================================================================
-
-/// Ensure the promoted_templates table exists.
-fn ensure_table() -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
 // Public API
 // ============================================================================
-
-/// Evaluate workflows for template promotion and promote qualifying ones.
-pub fn evaluate_and_promote() -> Result<PromotionResult, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Find promoted templates relevant to a description.
-pub fn find_relevant_templates(description: &str) -> Result<Vec<PromotedTemplate>, String> {
-    Err("SQLite removed".to_string())
-}
 
 /// Format promoted templates for the builder prompt.
 pub fn format_templates_for_prompt(templates: &[PromotedTemplate]) -> String {
@@ -353,11 +330,6 @@ fn extract_tags(workflow_json: &serde_json::Value, description: &str) -> Vec<Str
 
     tags.dedup();
     tags
-}
-
-/// Store a promoted template in the database.
-fn store_template(template: &PromotedTemplate) -> Result<(), String> {
-    Err("SQLite removed".to_string())
 }
 
 // ============================================================================

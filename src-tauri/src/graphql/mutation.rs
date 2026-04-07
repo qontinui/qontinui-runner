@@ -240,12 +240,9 @@ impl MutationRoot {
         let run = 'pg: {
             match state.app_state.pg_db.create_task_run(&db_input).await {
                 Ok(r) => break 'pg r,
-                Err(e) => tracing::warn!(
-                    "PG failed for create_task_run, falling back to SQLite: {}",
-                    e
-                ),
+                Err(e) => tracing::warn!("PG create_task_run failed: {}", e),
             }
-            return Err(Error::new("PG create_task_run failed (no SQLite fallback)"));
+            return Err(Error::new("PG create_task_run failed"));
         };
 
         Ok(GqlTaskRun::from_db(run))
@@ -383,7 +380,6 @@ impl MutationRoot {
         let resolution = input.resolution;
         let finding_id = input.finding_id;
 
-        // PG-primary, SQLite fallback
         state
             .app_state
             .pg_db
@@ -475,13 +471,11 @@ impl MutationRoot {
             match state.app_state.pg_db.create_task_run(&input).await {
                 Ok(r) => break 'pg r,
                 Err(e) => tracing::warn!(
-                    "PG failed for create_task_run in run_workflow, falling back to SQLite: {}",
+                    "PG create_task_run failed in run_workflow: {}",
                     e
                 ),
             }
-            return Err(Error::new(
-                "PG create_task_run failed in run_workflow (no SQLite fallback)",
-            ));
+            return Err(Error::new("PG create_task_run failed in run_workflow"));
         };
 
         // Broadcast task creation (not "running" — actual execution is
@@ -498,14 +492,9 @@ impl MutationRoot {
         'pg: {
             match state.app_state.pg_db.delete_unified_workflow(&id).await {
                 Ok(r) => break 'pg Ok(r),
-                Err(e) => tracing::warn!(
-                    "PG failed for delete_workflow, falling back to SQLite: {}",
-                    e
-                ),
+                Err(e) => tracing::warn!("PG delete_unified_workflow failed: {}", e),
             }
-            return Err(Error::new(
-                "PG delete_unified_workflow failed (no SQLite fallback)",
-            ));
+            return Err(Error::new("PG delete_unified_workflow failed"));
         }
     }
 }

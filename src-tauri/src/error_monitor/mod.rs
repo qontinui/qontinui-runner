@@ -2,9 +2,10 @@
 //!
 //! This module provides:
 //! - Types for log sources and error events
-//! - Storage operations for SQLite persistence
 //! - Parsers for different log formats (Python, JavaScript, Rust, generic)
-//! - (Future) Continuous monitoring service
+//! - Continuous monitoring service
+//!
+//! Persistence is handled by `database::pg::{error_monitor, log_sources}`.
 //!
 //! # Architecture
 //!
@@ -58,12 +59,10 @@ pub mod curator;
 pub mod parsers;
 pub mod pipeline;
 pub mod service;
-pub mod storage;
 pub mod types;
 pub mod workflow;
 
 pub use curator::*;
 pub use service::*;
-pub use storage::*;
 pub use types::*;
 pub use workflow::*;

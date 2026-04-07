@@ -1,6 +1,4 @@
 //! PostgreSQL log_sources CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite LogSourceStorage in error_monitor/storage.rs.
 
 use super::PgDb;
 use crate::error_monitor::types::{LogFormat, LogSourceConfig, ParserType, PathType};

@@ -16,7 +16,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::claude_protocol::request_id::next_request_id;
 use crate::claude_protocol::types::{OutgoingControlRequest, UserInputMessage};
-use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
 use crate::mcp::shared::{emit_ai_output, AiSessionContext, FindingContext, ProgressContext};
 use crate::workflow_state::{ParsedProgress, ProgressParser};

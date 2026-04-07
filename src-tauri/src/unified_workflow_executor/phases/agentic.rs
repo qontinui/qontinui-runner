@@ -916,7 +916,7 @@ impl AgenticExecutor {
         let enhanced_prompt = format!(
             "{}\n\n## Important Constraints\n\n\
             - **STAY FOCUSED**: ONLY work on fixing the failed verification checks listed above. Do NOT investigate, diagnose, or fix unrelated errors, warnings, or issues you find in log files or elsewhere.\n\
-            - Do NOT modify the runner's SQLite database directly. Configuration changes must go through the runner UI or API.\n\
+            - Do NOT modify the runner's database directly. Configuration changes must go through the runner UI or API.\n\
             - Do NOT modify workflow JSON files in the parent directory. Fix the application code instead.\n\
             - Focus exclusively on the source code that the verification checks are testing. When all checks pass, your work is done.",
             enhanced_prompt

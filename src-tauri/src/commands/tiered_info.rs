@@ -5,9 +5,6 @@
 
 use crate::auth::AuthManager;
 use crate::commands::AppState;
-use crate::discoveries::{
-    analyze_run_for_discoveries, queue_discovery, DetectionContext, DetectionThresholds,
-};
 use crate::executor::flakiness::{ExecutionOptions, FlakinessCache};
 use crate::tiered_info::{
     self, ConfigStatistics, DebuggingContext, FlakyItem, RunDetails, RunStatus,

@@ -1,8 +1,7 @@
 //! PostgreSQL-backed knowledge graph builder.
 //!
-//! Mirrors the SQLite `KnowledgeGraph::build_from_db` method but queries
-//! PostgreSQL via `PgDb`. Each loader method performs a raw SQL query
-//! against the PG pool, converting rows into the same graph nodes/edges.
+//! Each loader method performs a raw SQL query against the PG pool,
+//! converting rows into graph nodes/edges.
 //!
 //! All timestamps use `::TEXT` casts since tokio-postgres does not have
 //! the `with-chrono-0_4` feature enabled in this workspace.

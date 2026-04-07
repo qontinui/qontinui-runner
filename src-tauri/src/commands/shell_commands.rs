@@ -135,15 +135,6 @@ fn default_fail_on_error() -> bool {
 }
 
 // ============================================================================
-// Database Operations
-// ============================================================================
-
-/// Ensures the shell_commands and shell_command_results tables exist
-fn ensure_shell_commands_tables() -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-// ============================================================================
 // CRUD Commands
 // ============================================================================
 

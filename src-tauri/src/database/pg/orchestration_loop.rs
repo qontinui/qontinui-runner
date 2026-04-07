@@ -1,6 +1,4 @@
 //! PostgreSQL orchestration_loop_configs CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite orchestration_loop_configs/storage.rs operations.
 
 use super::PgDb;
 use crate::orchestration_loop_configs::types::*;

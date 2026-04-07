@@ -1,13 +1,11 @@
 //! Known issues module for persistent, cross-run issue tracking.
 //!
-//! This module provides:
-//! - Types for known issues and pattern templates
-//! - Storage operations for SQLite persistence
-//! - Built-in pattern templates for common issue categories
+//! Issues and pattern templates are stored in PostgreSQL (see
+//! `database/pg/known_issues.rs`). This module provides the shared
+//! type definitions and in-memory ranking helpers used by both the
+//! PG layer and the workflow generator.
 
-pub mod auto_detect;
 pub mod storage;
-pub mod templates;
 pub mod types;
 
 pub use types::*;

@@ -1,6 +1,4 @@
 //! PostgreSQL process_sessions and process_session_output operations (raw SQL).
-//!
-//! Mirrors the SQLite database/process_sessions.rs operations.
 
 use super::PgDb;
 use crate::database::types::{ProcessLogSearchHit, ProcessSession, ProcessSessionOutputLine};

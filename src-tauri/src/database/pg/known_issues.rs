@@ -1,6 +1,4 @@
 //! PostgreSQL known_issues CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite known_issues/storage.rs operations.
 
 use super::PgDb;
 use crate::known_issues::types::*;

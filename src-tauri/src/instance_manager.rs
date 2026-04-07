@@ -1,8 +1,8 @@
 //! Instance Manager for spawning and tracking secondary runner processes.
 //!
 //! Each instance runs on its own port (via `QONTINUI_PORT` env var) and gets
-//! its own Tauri window. The shared SQLite database (WAL mode) handles
-//! concurrent access from multiple instances.
+//! its own Tauri window. The shared PostgreSQL database handles concurrent
+//! access from multiple instances.
 //!
 //! Active instance IDs are persisted to `active_instances.json` so that
 //! instances can be restored after a rebuild / restart.  The file is written

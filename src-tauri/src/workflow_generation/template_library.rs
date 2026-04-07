@@ -65,30 +65,6 @@ pub enum TemplateSource {
     Demoted,
 }
 
-// === Database Operations ===
-
-/// Ensure the step_templates table exists.
-pub fn ensure_table() -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Save a template to the database.
-pub fn save_template(template: &StepTemplate) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-// row_to_template removed (SQLite dead code)
-
-/// Load all templates for a domain.
-pub fn load_templates_for_domain(domain: VerificationDomain) -> Result<Vec<StepTemplate>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Load all templates from the database.
-pub fn load_all_templates() -> Result<Vec<StepTemplate>, String> {
-    Err("SQLite removed".to_string())
-}
-
 /// Compute updated confidence from success/failure counts using Wilson score lower bound.
 fn compute_confidence(success: u32, failure: u32) -> f64 {
     let n = (success + failure) as f64;
@@ -103,16 +79,6 @@ fn compute_confidence(success: u32, failure: u32) -> f64 {
     let spread = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt();
     let lower = (centre - spread) / denominator;
     lower.clamp(0.0, 1.0)
-}
-
-/// Increment success count and update confidence.
-pub fn record_success(template_id: &str) -> Result<(), String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Increment failure count and update confidence.
-pub fn record_failure(template_id: &str) -> Result<(), String> {
-    Err("SQLite removed".to_string())
 }
 
 // === Template Matching ===
@@ -632,11 +598,6 @@ pub fn seed_templates() -> Vec<StepTemplate> {
     ]
 }
 
-/// Seed the database with initial templates (idempotent -- skips existing).
-pub fn seed_database() -> Result<usize, String> {
-    Err("SQLite removed".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,21 +611,6 @@ mod tests {
             assert!(!t.template_steps.is_empty());
             assert!(t.confidence > 0.0 && t.confidence <= 1.0);
         }
-    }
-
-    #[test]
-    fn test_seed_database_idempotent() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_save_and_load_template() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_record_success_updates_confidence() {
-        // SQLite removed - no-op
     }
 
     #[test]

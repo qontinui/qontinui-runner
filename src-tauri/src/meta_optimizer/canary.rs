@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::database::pg::PgDb;
 
@@ -234,14 +234,6 @@ pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> 
         Handle::current().block_on(pg_db.promote_canary(&canary_id_str))
     })?;
 
-    // Update prompt evolution verdict if this was a meta-prompt rewrite canary
-    if let Err(e) = update_evolution_for_recommendation(pg_db, &rec_id, "adopt", None) {
-        debug!(
-            "No prompt evolution entry for recommendation {}: {}",
-            rec_id, e
-        );
-    }
-
     info!("Promoted canary {} (recommendation {})", canary_id, rec_id);
     Ok(())
 }
@@ -298,32 +290,7 @@ pub fn rollback_canary_with_eval(
         canary_id_str, rec_id
     );
 
-    // Compute canary success rate as score_after for evolution tracking
-    let score_after = eval.map(|e| e.canary_success_rate / 100.0);
-
-    // Update prompt evolution verdict if this was a meta-prompt rewrite canary
-    if let Err(e) = update_evolution_for_recommendation(pg_db, &rec_id, "reject", score_after) {
-        debug!(
-            "No prompt evolution entry for recommendation {}: {}",
-            rec_id, e
-        );
-    }
-
     Ok(())
-}
-
-/// Update the prompt evolution verdict for a recommendation.
-///
-/// Looks up the prompt_evolution entry by recommendation_id and updates its
-/// canary_verdict and score_after. This closes the feedback loop for the
-/// meta-prompt optimizer.
-fn update_evolution_for_recommendation(
-    pg_db: &Arc<PgDb>,
-    recommendation_id: &str,
-    verdict: &str,
-    score_after: Option<f64>,
-) -> Result<(), String> {
-    Err("SQLite removed".to_string())
 }
 
 /// Auto-rollback canary rollouts that have been active for more than 30 days

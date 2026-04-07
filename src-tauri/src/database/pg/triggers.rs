@@ -1,6 +1,4 @@
 //! PostgreSQL trigger system CRUD operations (raw SQL).
-//!
-//! Mirrors the SQLite trigger_system/storage.rs operations.
 
 use super::PgDb;
 use crate::trigger_system::types::{

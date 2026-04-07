@@ -165,7 +165,7 @@ pub fn build_schema_context_partitioned(
 }
 
 // ============================================================================
-// Stub Functions (previously SQLite-backed, now dead)
+// Helper sections (currently no-ops pending PG wiring)
 // ============================================================================
 
 /// Generate phase constraint table from step type metadata.
@@ -202,12 +202,12 @@ fn assemble_prompt(
     parts.join("\n\n")
 }
 
-/// Build a gotchas section from known issues (SQLite removed, returns empty).
+/// Build a gotchas section from known issues. Currently a no-op until wired to PG.
 pub fn build_gotchas_section(_pg_db: Option<&Arc<PgDb>>) -> String {
     String::new()
 }
 
-/// Build rules section for a given tier (SQLite removed, returns empty).
+/// Build rules section for a given tier. Currently a no-op until wired to PG.
 pub fn build_rules_section_for_tier(_pg_db: Option<&Arc<PgDb>>, _tier: rules::RuleTier) -> String {
     String::new()
 }

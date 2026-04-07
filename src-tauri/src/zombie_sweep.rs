@@ -99,42 +99,11 @@ impl OrphanTracker {
     }
 }
 
-/// Run a single sweep cycle: detect potentially stale task runs and notify.
-async fn sweep_once(
-    session_manager: &Arc<SessionManager>,
-    app_handle: &AppHandle,
-    orphan_tracker: &mut OrphanTracker,
-) {
-    // SQLite removed - no-op
-}
-
 /// Start the stale task sweep background task.
 ///
-/// Waits for `STARTUP_GRACE` before the first sweep, then runs
-/// `sweep_once()` every `SWEEP_INTERVAL`.
+/// Currently disabled — the sweep depended on SQLite-backed task run state and
+/// has not yet been ported to PostgreSQL.
 pub fn start_zombie_sweep(session_manager: Arc<SessionManager>, app_handle: AppHandle) {
-    // Zombie sweep: SQLite-dependent. Skipping until PG migration.
     let _ = (session_manager, app_handle);
     info!("Stale task sweep: disabled (pending PG port)");
-    return;
-    #[allow(unreachable_code)]
-    let orphan_tracker = Arc::new(Mutex::new(OrphanTracker::new()));
-
-    tokio::spawn(async move {
-        // Wait for startup resume to complete
-        tokio::time::sleep(STARTUP_GRACE).await;
-        info!(
-            "Stale task sweep: started (interval={}s, orphan_grace={}s)",
-            SWEEP_INTERVAL.as_secs(),
-            ORPHAN_GRACE.as_secs()
-        );
-
-        loop {
-            {
-                let mut tracker = orphan_tracker.lock().await;
-                sweep_once(&session_manager, &app_handle, &mut tracker).await;
-            }
-            tokio::time::sleep(SWEEP_INTERVAL).await;
-        }
-    });
 }

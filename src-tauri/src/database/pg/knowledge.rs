@@ -98,7 +98,6 @@ impl PgDb {
 
     /// Hybrid search task_knowledge: fetch candidates with embeddings, rank in-memory.
     ///
-    /// Mirrors the SQLite `hybrid_search_knowledge` logic:
     /// 1. Fetch recent entries with embeddings (optionally filtered by category)
     /// 2. Compute cosine similarity in-memory
     /// 3. Return ranked results above min_similarity threshold

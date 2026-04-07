@@ -614,7 +614,6 @@ impl LoopController {
                 {
                     warn!("PG append_task_output_ex failed: {}", e);
                 }
-                // PG write already done above; SQLite fallback removed
 
                 Some((verdict, verifier_duration))
             } else {
@@ -1017,7 +1016,6 @@ impl LoopController {
             {
                 warn!("PG append_task_output_ex (session increment) failed: {}", e);
             }
-            // PG write already done above; SQLite fallback removed
         }
     }
 

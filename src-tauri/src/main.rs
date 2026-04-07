@@ -621,7 +621,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_reporting::complete_execution_run,
             // Workflow events (mobile push notifications)
             commands::workflow_events::emit_workflow_event,
-            // Checkpoint/session commands (SQLite database)
+            // Checkpoint/session commands (PostgreSQL)
             commands::checkpoints::checkpoint_get,
             commands::checkpoints::checkpoint_save,
             commands::checkpoints::checkpoint_delete,
@@ -1078,8 +1078,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             error_monitor::commands::get_debug_context_for_ai,
             error_monitor::commands::open_error_in_editor,
             error_monitor::commands::get_error_recurrence_history,
-            error_monitor::workflow::generate_error_fix_workflow,
-            error_monitor::workflow::generate_single_error_fix_workflow,
             error_monitor::workflow::check_fixable_errors,
             // Doctor health monitoring commands
             doctor::commands::doctor_get_status,

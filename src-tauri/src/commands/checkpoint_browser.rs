@@ -3,7 +3,7 @@
 //! Provides access to orchestrator checkpoints for browsing execution history,
 //! comparing states, and initiating replay sessions.
 //!
-//! Uses SQLite database for persistence with in-memory CheckpointManager for
+//! Uses PostgreSQL for persistence with in-memory CheckpointManager for
 //! real-time operations like replay.
 
 use crate::commands::AppState;

@@ -81,7 +81,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Get local IP address
             let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
 
-            // Get running task count from the database (PG-primary, SQLite fallback)
+            // Get running task count from PostgreSQL
             let (task_count, task_ids) = match app_state.pg_db.get_running_task_runs(None).await {
                 Ok(runs) => {
                     let count = runs.len() as u32;

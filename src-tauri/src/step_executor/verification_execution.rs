@@ -610,7 +610,6 @@ impl StepExecutor {
                         }
                     });
                 }
-                // PG write already done above via tokio::spawn; SQLite fallback removed
             }
 
             // Update step checkpoint to reflect completion progressively

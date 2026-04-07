@@ -1,6 +1,4 @@
 //! PostgreSQL canvas_panels operations (raw SQL).
-//!
-//! Mirrors the SQLite database/canvas_ops.rs operations.
 
 use super::PgDb;
 use crate::mcp::canvas::StoredPanel;

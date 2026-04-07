@@ -531,8 +531,6 @@ macro_rules! error_monitor_commands {
             $crate::error_monitor::commands::get_debug_context_for_ai,
             $crate::error_monitor::commands::open_error_in_editor,
             $crate::error_monitor::commands::get_error_recurrence_history,
-            $crate::error_monitor::workflow::generate_error_fix_workflow,
-            $crate::error_monitor::workflow::generate_single_error_fix_workflow,
             $crate::error_monitor::workflow::check_fixable_errors,
         ]
     };

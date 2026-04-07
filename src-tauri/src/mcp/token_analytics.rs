@@ -31,7 +31,7 @@ pub struct TimeRangeParams {
 }
 
 // ============================================================================
-// Handler functions (PG-primary, SQLite fallback via spawn_blocking)
+// Handler functions (PostgreSQL via spawn_blocking)
 // ============================================================================
 
 /// GET /analytics/token-usage/summary

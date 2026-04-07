@@ -11,7 +11,6 @@ use tauri::Emitter;
 use tracing::{debug, info, warn};
 
 use crate::doctor::DoctorHandle;
-use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
 use crate::mcp::shared::{
     emit_ai_output, AiSessionContext, FindingContext, ProgressContext, ReflectionFixContext,

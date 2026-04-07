@@ -422,7 +422,6 @@ impl StepExecutor {
             None => {
                 // If no direct command, check for shell_command_id
                 if let Some(id) = &step.shell_command_id {
-                    // PG-primary, SQLite fallback
                     let shell_cmd_result = self
                         .app_state
                         .pg_db

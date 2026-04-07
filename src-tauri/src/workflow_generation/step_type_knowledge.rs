@@ -4,14 +4,12 @@
 //! - **Universal** — best practices and pitfalls per step type (ships as seed data)
 //! - **System-specific** — environment-specific patterns learned over time
 //!
-//! Knowledge is stored in SQLite, injected into the Builder Agent's prompt
-//! filtered to only the relevant step types.
+//! Knowledge is stored in PostgreSQL (see `database/pg/step_type_knowledge.rs`),
+//! injected into the Builder Agent's prompt filtered to only the relevant
+//! step types. This module provides the shared types and prompt-formatting helpers.
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
-use uuid::Uuid;
 
 /// A single step type knowledge entry stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,13 +69,8 @@ pub struct ListKnowledgeQuery {
 }
 
 // ============================================================================
-// Loading Functions (for prompt injection)
+// Prompt formatting
 // ============================================================================
-
-/// Load active knowledge entries for the given step types, ordered by priority DESC.
-pub fn load_knowledge_for_step_types(step_types: &[&str]) -> Vec<StepTypeKnowledge> {
-    Vec::new()
-}
 
 /// Format knowledge entries as markdown for prompt injection.
 ///
@@ -118,40 +111,6 @@ pub fn format_knowledge_as_markdown(entries: &[StepTypeKnowledge]) -> String {
     }
 
     output
-}
-
-// ============================================================================
-// CRUD Functions
-// ============================================================================
-
-/// List knowledge entries with optional filters.
-pub fn list_knowledge(query: &ListKnowledgeQuery) -> Result<Vec<StepTypeKnowledge>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get a single knowledge entry by ID.
-pub fn get_knowledge(id: &str) -> Result<Option<StepTypeKnowledge>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Insert a new knowledge entry.
-/// If `source_fix_id` is provided and an entry with that source already exists, returns the
-/// existing entry instead of creating a duplicate.
-pub fn insert_knowledge(input: &InsertKnowledgeInput) -> Result<StepTypeKnowledge, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Update an existing knowledge entry.
-pub fn update_knowledge(
-    id: &str,
-    input: &UpdateKnowledgeInput,
-) -> Result<StepTypeKnowledge, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Delete a knowledge entry (hard delete).
-pub fn delete_knowledge(id: &str) -> Result<bool, String> {
-    Err("SQLite removed".to_string())
 }
 
 // ============================================================================

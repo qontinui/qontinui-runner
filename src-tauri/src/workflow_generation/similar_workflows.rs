@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::database::embeddings::{blob_to_vector, cosine_similarity};
 use crate::database::pg::PgDb;
 
 /// A similar workflow found by vector search.
@@ -25,31 +24,6 @@ pub struct SimilarWorkflow {
     pub similarity: f32,
     /// Full workflow JSON — only populated for ground_truth category workflows.
     pub full_json: Option<String>,
-}
-
-/// Find workflows similar to the given description.
-///
-/// Uses the description embedding column for cosine similarity.
-/// Filters by category if provided and excludes meta-workflows.
-pub fn find_similar_workflows(
-    query_embedding: &[f32],
-    category: Option<&str>,
-    limit: usize,
-) -> Result<Vec<SimilarWorkflow>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Find ground truth reference workflows matching the given description.
-///
-/// Uses keyword overlap scoring to find relevant GT workflows. This works
-/// without the embedding service. If embeddings are available, they boost
-/// the score. GT workflows have category = 'ground_truth'.
-pub fn find_gt_reference_workflows(
-    description: &str,
-    query_embedding: Option<&[f32]>,
-    limit: usize,
-) -> Result<Vec<SimilarWorkflow>, String> {
-    Err("SQLite removed".to_string())
 }
 
 /// Format similar workflows as markdown for prompt injection.

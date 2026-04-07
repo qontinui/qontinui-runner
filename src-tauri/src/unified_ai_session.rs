@@ -871,7 +871,6 @@ impl UnifiedAiSessionExecutor {
                             }
                         });
                     }
-                    // PG write already done above via tokio::spawn; SQLite fallback removed
                 }
 
                 AiSessionResult {
@@ -997,7 +996,6 @@ impl UnifiedAiSessionExecutor {
                 }
             });
         }
-        // PG write already done above via tokio::spawn; SQLite fallback removed
     }
 
     /// Build a session ID based on the configuration.

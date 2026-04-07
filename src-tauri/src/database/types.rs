@@ -764,7 +764,7 @@ pub struct CreateTaskRunPlaywrightResultInput {
     pub assertions_failed: i32,
 }
 
-/// Task run API request from SQLite database.
+/// Task run API request stored in PostgreSQL.
 /// Stores API request execution results migrated from JSONL logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRunApiRequest {
@@ -842,7 +842,7 @@ pub struct CreateTaskRunApiRequestInput {
     pub timestamp: String,
 }
 
-/// Task run AWAS step from SQLite database.
+/// Task run AWAS step stored in PostgreSQL.
 /// Stores AWAS (Automated Web Agent System) step execution results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRunAwasStep {

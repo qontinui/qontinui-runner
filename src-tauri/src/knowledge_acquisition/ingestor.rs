@@ -1,16 +1,10 @@
-use std::sync::Arc;
-
-use crate::database::embedding_client::EmbeddingClient;
-use crate::database::embeddings::store_knowledge_embedding;
-use crate::database::hybrid_search::{hybrid_search_knowledge, HybridSearchConfig};
-use crate::database::pg::PgDb;
-use crate::knowledge_acquisition::summarizer;
-use crate::knowledge_acquisition::types::KnowledgeResult;
-use tracing::{info, warn};
-
-const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.85;
-const EXTERNAL_KNOWLEDGE_CATEGORY: &str = "external_knowledge";
-const SYSTEM_AGENT_TYPE: &str = "system";
+//! Prompt-injection scanning for externally-sourced knowledge content.
+//!
+//! The SQLite-backed ingestion pipeline (ingest_results, ingest_single,
+//! build_evidence) was removed during the PG migration. The only live
+//! ingestion path is `claude_session::runner` → `vuln_enrichment` → PG
+//! `create_task_knowledge`, which bypasses this module. What remains here is
+//! the reusable `scan_for_injection` helper used at the tiered-search layer.
 
 // =============================================================================
 // Prompt Injection Detection (hermes-agent-inspired)
@@ -146,101 +140,9 @@ pub fn scan_for_injection(content: &str) -> InjectionScanResult {
     }
 }
 
-/// Result of ingesting a knowledge result
-#[derive(Debug)]
-pub enum IngestOutcome {
-    /// Stored as new knowledge entry
-    Stored { id: String, injection_flagged: bool },
-    /// Skipped due to duplicate detection
-    Duplicate { existing_id: String },
-    /// Skipped — embedding service unavailable
-    EmbeddingUnavailable,
-    /// Failed to ingest
-    Failed { error: String },
-}
-
-/// Ingest search results into task_knowledge with deduplication and embedding.
-///
-/// Pipeline:
-/// 1. Summarize if content > 3000 chars
-/// 2. Compute embedding
-/// 3. Check for duplicates via hybrid_search (cosine > 0.85 = skip)
-/// 4. Insert into task_knowledge
-/// 5. Store embedding blob
-pub async fn ingest_results(
-    results: &[KnowledgeResult],
-    task_run_id: &str,
-    pg: Option<&Arc<PgDb>>,
-) -> Vec<IngestOutcome> {
-    Vec::new()
-}
-
-/// Ingest a single result into PG.
-async fn ingest_single(
-    result: &KnowledgeResult,
-    task_run_id: &str,
-    pg: Option<&Arc<PgDb>>,
-    embedding_client: &EmbeddingClient,
-) -> IngestOutcome {
-    // SQLite removed — this code path should use PG-based ingestion
-    IngestOutcome::Failed {
-        error: "SQLite removed — use PG-based ingestion".to_string(),
-    }
-}
-
-/// Build evidence JSON from a search result
-fn build_evidence(result: &KnowledgeResult) -> String {
-    let mut evidence = serde_json::json!({
-        "provider": result.provider.as_str(),
-        "query": result.query,
-    });
-
-    if let Some(ref url) = result.url {
-        evidence["url"] = serde_json::Value::String(url.clone());
-    }
-
-    if let Some(score) = result.relevance_score {
-        evidence["relevance_score"] = serde_json::json!(score);
-    }
-
-    if let Some(ref cve) = result.metadata.cve_id {
-        evidence["cve_id"] = serde_json::Value::String(cve.clone());
-    }
-
-    if let Some(cvss) = result.metadata.cvss_score {
-        evidence["cvss_score"] = serde_json::json!(cvss);
-    }
-
-    serde_json::to_string(&evidence).unwrap_or_else(|_| "{}".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge_acquisition::types::{KnowledgeMetadata, SearchProvider};
-
-    #[test]
-    fn test_build_evidence_full() {
-        let result = KnowledgeResult {
-            provider: SearchProvider::OsvDev,
-            query: "lodash vulnerability".to_string(),
-            title: "CVE-2021-23337".to_string(),
-            content: "Details...".to_string(),
-            url: Some("https://osv.dev/vulnerability/CVE-2021-23337".to_string()),
-            relevance_score: Some(1.0),
-            metadata: KnowledgeMetadata {
-                cve_id: Some("CVE-2021-23337".to_string()),
-                cvss_score: Some(7.2),
-                ..Default::default()
-            },
-        };
-
-        let evidence = build_evidence(&result);
-        let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
-        assert_eq!(parsed["provider"], "osv_dev");
-        assert_eq!(parsed["cve_id"], "CVE-2021-23337");
-        assert_eq!(parsed["cvss_score"], 7.2);
-    }
 
     #[test]
     fn test_scan_for_injection_clean() {
@@ -307,21 +209,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_evidence_minimal() {
-        let result = KnowledgeResult {
-            provider: SearchProvider::DuckDuckGo,
-            query: "test".to_string(),
-            title: "Test".to_string(),
-            content: "Content".to_string(),
-            url: None,
-            relevance_score: None,
-            metadata: KnowledgeMetadata::default(),
-        };
-
-        let evidence = build_evidence(&result);
-        let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
-        assert_eq!(parsed["provider"], "duckduckgo");
-        assert!(parsed.get("url").is_none());
-    }
 }

@@ -11,13 +11,10 @@
 //! - task_run_automation table (run-level metrics)
 
 use crate::commands::AppState;
-use crate::tiered_info;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::State;
-use tracing::debug;
 
 // =============================================================================
 // Response Types
@@ -354,26 +351,8 @@ pub async fn get_success_rate_trend(
 }
 
 // =============================================================================
-// Aggregation Functions
+// Aggregation Helpers
 // =============================================================================
-
-/// Aggregate summary metrics for the dashboard header.
-fn aggregate_summary(config_id: &str, range: &TimeRange) -> Result<PerformanceSummary, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Count actions within the time range.
-fn count_actions_in_range(config_id: &str, range: &TimeRange) -> Result<u32, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Aggregate action performance metrics from task_run_events.
-fn aggregate_action_performance(
-    config_id: &str,
-    range: &TimeRange,
-) -> Result<Vec<ActionPerformanceMetrics>, String> {
-    Err("SQLite removed".to_string())
-}
 
 /// Calculate percentiles (p50, p95, p99) from a list of durations.
 fn calculate_percentiles(durations: &[u64]) -> (u64, u64, u64) {
@@ -396,32 +375,6 @@ fn calculate_percentiles(durations: &[u64]) -> (u64, u64, u64) {
     let p99 = sorted[p99_idx.min(len - 1)];
 
     (p50, p95, p99)
-}
-
-/// Get transition metrics from config_statistics.
-fn get_transition_metrics(config_id: &str) -> Result<Vec<StateTransitionMetrics>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Get element resolution metrics from config_statistics.
-fn get_element_metrics(config_id: &str) -> Result<Vec<ElementResolutionMetrics>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Aggregate success rate trend over time.
-fn aggregate_success_rate_trend(
-    config_id: &str,
-    range: &TimeRange,
-) -> Result<Vec<TimeSeriesDataPoint>, String> {
-    Err("SQLite removed".to_string())
-}
-
-/// Aggregate duration trend over time.
-fn aggregate_duration_trend(
-    config_id: &str,
-    range: &TimeRange,
-) -> Result<Vec<TimeSeriesDataPoint>, String> {
-    Err("SQLite removed".to_string())
 }
 
 #[cfg(test)]

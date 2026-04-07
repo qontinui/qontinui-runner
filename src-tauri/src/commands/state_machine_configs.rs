@@ -1,7 +1,7 @@
 //! Tauri commands for state machine config CRUD operations.
 //!
 //! These commands allow the runner frontend to create, read, update, and delete
-//! state machine configurations (configs, states, transitions) stored in SQLite.
+//! state machine configurations (configs, states, transitions) stored in PostgreSQL.
 
 use std::sync::Arc;
 use tauri::State;

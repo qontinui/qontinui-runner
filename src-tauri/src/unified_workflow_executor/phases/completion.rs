@@ -873,7 +873,7 @@ impl CompletionExecutor {
             }
         }
 
-        // Fetch and include findings (PG-primary, SQLite fallback)
+        // Fetch and include findings from PostgreSQL
         let findings_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let pg = self.app_state.pg_db.clone();
             let id = execution_id.to_string();

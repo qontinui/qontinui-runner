@@ -260,14 +260,6 @@ impl SkillRegistry {
         }
     }
 
-    /// Create a registry with built-in skills + user skills loaded from DB.
-    ///
-    /// If `conn` is None or the query fails, only built-in skills are loaded.
-    pub fn with_db() -> Self {
-        // SQLite removed — fall back to built-in skills only
-        Self::new()
-    }
-
     /// Create a registry with built-in skills + user skills loaded from PG.
     ///
     /// If `pg_db` is None or the query fails, only built-in skills are loaded.

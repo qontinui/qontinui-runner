@@ -1,7 +1,6 @@
 //! PostgreSQL settings and config storage operations via Clorinde-generated queries.
 //!
-//! PG-primary with SQLite fallback for key-value settings and config storage.
-//! JSON file migration helpers remain SQLite-only (one-time startup operation).
+//! Key-value settings and config storage backed by PostgreSQL.
 
 use super::PgDb;
 use crate::database::types::ConfigStorageEntry;

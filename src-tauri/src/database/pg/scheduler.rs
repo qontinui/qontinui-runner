@@ -1,6 +1,5 @@
 //! PostgreSQL scheduler operations (raw SQL).
 //!
-//! Mirrors the SQLite scheduler operations from database/scheduler.rs.
 //! Covers: scheduled_tasks CRUD, execution helpers, scheduler_history,
 //! and scheduler_settings.
 

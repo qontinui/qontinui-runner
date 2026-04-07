@@ -529,7 +529,7 @@ pub fn detect_regression(
         return None;
     }
 
-    // Retrieve previous iteration result (PG-primary with SQLite fallback)
+    // Retrieve previous iteration result from PostgreSQL
     let prev_result = {
         let prev_iter = current_iteration - 1;
         let pg_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -650,7 +650,6 @@ pub fn build_resume_agentic_context(
 ) -> String {
     // Strategy 1: Try loading the full verification phase result.
     // The result may be stored under the execution_id or a child ID.
-    // PG-primary with SQLite fallback
     let phase_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let pg = pg_db.clone();
         let id = execution_id.to_string();
