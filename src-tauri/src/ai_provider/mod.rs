@@ -10,6 +10,7 @@
 //! Other modules should use this module to interact with AI providers.
 
 pub mod cache_aware_builder;
+pub mod circuit_breaker;
 mod claude_api;
 mod claude_cli;
 pub mod compaction_middleware;

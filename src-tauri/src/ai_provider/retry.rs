@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use super::circuit_breaker;
 use super::types::AiResponse;
 use std::time::Duration;
 use tracing::{debug, error, warn};
@@ -103,6 +104,8 @@ pub(super) fn is_retryable_error(error_msg: &str) -> bool {
 /// On each failed attempt, if the error is retryable, waits with exponential
 /// backoff before the next attempt. Permanent errors return immediately.
 ///
+/// Records success/failure to the circuit breaker for the given provider.
+///
 /// # Arguments
 /// * `operation_name` - Human-readable label for log messages (e.g., "Claude API")
 /// * `operation` - Closure that performs the AI call and returns an `AiResponse`
@@ -110,10 +113,41 @@ pub(super) fn retry_with_backoff<F>(operation_name: &str, operation: F) -> AiRes
 where
     F: Fn() -> AiResponse,
 {
+    retry_with_backoff_tracked(operation_name, None, operation)
+}
+
+/// Like `retry_with_backoff`, but also records results to the circuit breaker
+/// for the specified provider key.
+pub(super) fn retry_with_backoff_tracked<F>(
+    operation_name: &str,
+    provider_key: Option<&str>,
+    operation: F,
+) -> AiResponse
+where
+    F: Fn() -> AiResponse,
+{
+    // Check circuit breaker before first attempt
+    if let Some(key) = provider_key {
+        if !circuit_breaker::is_provider_available(key) {
+            let state = circuit_breaker::provider_state(key);
+            warn!(
+                "{}: circuit breaker is {} for '{}', failing fast",
+                operation_name, state, key
+            );
+            return AiResponse::error(format!(
+                "Provider '{}' circuit breaker is {} — too many recent failures",
+                key, state
+            ));
+        }
+    }
+
     for attempt in 0..=MAX_AI_RETRIES {
         let response = operation();
 
         if response.success {
+            if let Some(key) = provider_key {
+                circuit_breaker::record_provider_success(key);
+            }
             return response;
         }
 
@@ -121,7 +155,8 @@ where
         let error_msg = response.error.as_deref().unwrap_or("");
 
         if !is_retryable_error(error_msg) {
-            // Permanent error — return immediately, no retry
+            // Permanent error — don't count against circuit breaker
+            // (config errors, auth errors are not provider health issues)
             if attempt > 0 {
                 debug!(
                     "{} permanent error after {} retries, not retrying: {}",
@@ -129,6 +164,11 @@ where
                 );
             }
             return response;
+        }
+
+        // Record retryable failure to circuit breaker
+        if let Some(key) = provider_key {
+            circuit_breaker::record_provider_failure(key, error_msg);
         }
 
         if attempt == MAX_AI_RETRIES {
@@ -173,19 +213,74 @@ where
     F: Fn() -> AiResponse,
     G: Fn() -> AiResponse,
 {
+    retry_with_fallback_tracked(operation_name, None, None, primary, fallback)
+}
+
+/// Like `retry_with_fallback`, but also records results to circuit breakers.
+pub(crate) fn retry_with_fallback_tracked<F, G>(
+    operation_name: &str,
+    primary_provider_key: Option<&str>,
+    fallback_provider_key: Option<&str>,
+    primary: F,
+    fallback: Option<G>,
+) -> AiResponse
+where
+    F: Fn() -> AiResponse,
+    G: Fn() -> AiResponse,
+{
+    // Check if primary provider circuit is open — skip directly to fallback
+    if let Some(key) = primary_provider_key {
+        if !circuit_breaker::is_provider_available(key) {
+            let state = circuit_breaker::provider_state(key);
+            warn!(
+                "{}: primary provider '{}' circuit is {}, skipping to fallback",
+                operation_name, key, state
+            );
+            if let Some(fb) = fallback {
+                return fb();
+            }
+            return AiResponse::error(format!(
+                "Provider '{}' circuit breaker is {} and no fallback configured",
+                key, state
+            ));
+        }
+    }
+
     let response = primary();
     if response.success {
+        if let Some(key) = primary_provider_key {
+            circuit_breaker::record_provider_success(key);
+        }
         return response;
     }
 
+    let error_msg = response.error.as_deref().unwrap_or("");
+
+    // Record failure to circuit breaker (only for retryable errors)
+    if is_retryable_error(error_msg) {
+        if let Some(key) = primary_provider_key {
+            circuit_breaker::record_provider_failure(key, error_msg);
+        }
+    }
+
     if let Some(fb) = fallback {
-        let error_msg = response.error.as_deref().unwrap_or("");
         if is_retryable_error(error_msg) {
             warn!(
                 "{}: primary failed with retryable error, trying fallback model",
                 operation_name
             );
-            return fb();
+            let fb_response = fb();
+            if let Some(key) = fallback_provider_key {
+                if fb_response.success {
+                    circuit_breaker::record_provider_success(key);
+                } else {
+                    let fb_err = fb_response.error.as_deref().unwrap_or("");
+                    if is_retryable_error(fb_err) {
+                        circuit_breaker::record_provider_failure(key, fb_err);
+                    }
+                }
+            }
+            return fb_response;
         }
     }
 

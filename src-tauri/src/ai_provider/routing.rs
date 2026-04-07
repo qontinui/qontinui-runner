@@ -12,7 +12,11 @@ use super::gemini_api::{
 };
 use super::gemini_cli::run_gemini_cli;
 use super::multimodal::MultimodalPrompt;
-use super::retry::{retry_with_backoff, retry_with_fallback};
+use super::circuit_breaker;
+use super::retry::{
+    retry_with_backoff, retry_with_backoff_tracked, retry_with_fallback,
+    retry_with_fallback_tracked,
+};
 use super::types::AiResponse;
 use crate::ai_router::{TaskContext, TaskRouter};
 use crate::doctor::DoctorHandle;
@@ -33,6 +37,20 @@ use tracing::{debug, info, warn};
 /// `AiResponse` with success status, output, and any error message
 pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> AiResponse {
     let ai_settings = settings::get_ai_settings();
+    let cb_key = circuit_breaker::provider_key(&ai_settings.provider);
+
+    // Check circuit breaker before attempting the call
+    if !circuit_breaker::is_provider_available(&cb_key) {
+        let state = circuit_breaker::provider_state(&cb_key);
+        warn!(
+            "Provider {:?} circuit breaker is {}, failing fast",
+            ai_settings.provider, state
+        );
+        return AiResponse::error(format!(
+            "Provider {:?} circuit breaker is {} — too many recent failures",
+            ai_settings.provider, state
+        ));
+    }
 
     info!(
         "Running AI prompt via {:?} (prompt length: {} chars)",
@@ -40,7 +58,7 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
         prompt.len()
     );
 
-    match ai_settings.provider {
+    let response = match ai_settings.provider {
         AiProvider::ClaudeCli => {
             run_claude_cli(prompt, &ai_settings.claude_cli, None, doctor_handle)
         }
@@ -53,7 +71,18 @@ pub fn run_prompt_sync(prompt: &str, doctor_handle: Option<&DoctorHandle>) -> Ai
         AiProvider::GeminiApi => {
             run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
         }
+    };
+
+    // Record result to circuit breaker
+    if response.success {
+        circuit_breaker::record_provider_success(&cb_key);
+    } else if let Some(ref err) = response.error {
+        if super::retry::is_retryable_error(err) {
+            circuit_breaker::record_provider_failure(&cb_key, err);
+        }
     }
+
+    response
 }
 
 /// Run an AI prompt with intelligent routing based on task complexity.
@@ -75,7 +104,21 @@ pub fn run_prompt_with_routing(
     doctor_handle: Option<&DoctorHandle>,
 ) -> AiResponse {
     let ai_settings = settings::get_ai_settings();
+    let cb_key = circuit_breaker::provider_key(&ai_settings.provider);
     let routing_config = &ai_settings.routing;
+
+    // Check circuit breaker before attempting the call
+    if !circuit_breaker::is_provider_available(&cb_key) {
+        let state = circuit_breaker::provider_state(&cb_key);
+        warn!(
+            "Provider {:?} circuit breaker is {} for routed prompt, failing fast",
+            ai_settings.provider, state
+        );
+        return AiResponse::error(format!(
+            "Provider {:?} circuit breaker is {} — too many recent failures",
+            ai_settings.provider, state
+        ));
+    }
 
     // Determine the model to use based on routing (bandit + heuristic fallback)
     let model_override = if routing_config.enabled {
@@ -115,7 +158,7 @@ pub fn run_prompt_with_routing(
         model_override.is_some()
     );
 
-    match ai_settings.provider {
+    let response = match ai_settings.provider {
         AiProvider::ClaudeCli => run_claude_cli(
             prompt,
             &ai_settings.claude_cli,
@@ -163,7 +206,18 @@ pub fn run_prompt_with_routing(
                 run_gemini_api(prompt, &ai_settings.gemini_api, None, doctor_handle)
             }
         }
+    };
+
+    // Record result to circuit breaker
+    if response.success {
+        circuit_breaker::record_provider_success(&cb_key);
+    } else if let Some(ref err) = response.error {
+        if super::retry::is_retryable_error(err) {
+            circuit_breaker::record_provider_failure(&cb_key, err);
+        }
     }
+
+    response
 }
 
 /// Run an AI prompt with an explicit model/provider override.
@@ -193,6 +247,11 @@ pub fn run_prompt_with_model_override(
     fallback_model: Option<&str>,
     fallback_provider: Option<&str>,
 ) -> AiResponse {
+    // Resolve provider keys for circuit breaker tracking
+    let ai_settings = settings::get_ai_settings();
+    let primary_key = resolve_provider_key(provider_override, &ai_settings.provider);
+    let fallback_key = fallback_provider.map(|p| resolve_provider_key(Some(p), &ai_settings.provider));
+
     // Build the primary call closure
     let primary = || {
         run_prompt_with_overrides_inner(
@@ -219,13 +278,32 @@ pub fn run_prompt_with_model_override(
                 max_tokens_override,
             )
         };
-        return retry_with_fallback("AI prompt", primary, Some(fallback));
+        return retry_with_fallback_tracked(
+            "AI prompt",
+            Some(&primary_key),
+            fallback_key.as_deref(),
+            primary,
+            Some(fallback),
+        );
     }
 
-    // No fallback configured — still retry on transient errors.
-    // Without this, a single transient failure (e.g., a 2-second timeout from
-    // the specification agent) kills the entire workflow generation pipeline.
-    retry_with_backoff("AI prompt", primary)
+    // No fallback configured — still retry on transient errors with circuit breaker tracking.
+    retry_with_backoff_tracked("AI prompt", Some(&primary_key), primary)
+}
+
+/// Resolve a provider override string to a circuit breaker key.
+fn resolve_provider_key(provider_str: Option<&str>, default: &AiProvider) -> String {
+    if let Some(p) = provider_str {
+        match p {
+            "claude_cli" => "claude_cli".to_string(),
+            "claude_api" => "claude_api".to_string(),
+            "gemini_cli" => "gemini_cli".to_string(),
+            "gemini_api" => "gemini_api".to_string(),
+            _ => circuit_breaker::provider_key(default),
+        }
+    } else {
+        circuit_breaker::provider_key(default)
+    }
 }
 
 /// Run an AI prompt with model override AND a middleware chain.
