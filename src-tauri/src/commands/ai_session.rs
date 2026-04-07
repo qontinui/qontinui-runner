@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tracing::{error, info, warn};
 
 use crate::claude_session::manager::SessionManager;
@@ -25,6 +25,11 @@ pub struct SessionStateEvent {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub state: String,
+    /// Set to true on the first state event emitted for a session that was
+    /// auto-resumed after a runner restart. Used by the frontend to show a
+    /// one-time "resumed" badge/toast.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
 }
 
 /// Emit a session state change event to the frontend.
@@ -34,10 +39,22 @@ pub fn emit_session_state(
     session_id: &str,
     state: SessionState,
 ) {
+    emit_session_state_ex(app_handle, task_run_id, session_id, state, false);
+}
+
+/// Emit a session state change event, optionally flagging it as a resume.
+pub fn emit_session_state_ex(
+    app_handle: &tauri::AppHandle,
+    task_run_id: &str,
+    session_id: &str,
+    state: SessionState,
+    resumed: bool,
+) {
     let event = SessionStateEvent {
         task_run_id: task_run_id.to_string(),
         session_id: session_id.to_string(),
         state: state.as_event_str().to_string(),
+        resumed,
     };
     if let Err(e) = app_handle.emit("claude-session-state", &event) {
         warn!("Failed to emit claude-session-state event: {}", e);
@@ -893,20 +910,218 @@ pub async fn generate_workflow_from_session(
 
 /// Resume interrupted AI sessions on startup.
 ///
-/// Queries for task runs with status='running' and workflow_type='chat',
-/// parses their conversation history from the output_log, spawns new
-/// Claude CLI sessions with a replay prompt, and re-registers them in
-/// the SessionManager.
+/// Queries for task runs with status='running' and workflow_type='chat'
+/// owned by this runner instance, reconstructs the conversation from the
+/// persisted `[USER_MESSAGE]` / `[AI_RESPONSE]` / `[SYSTEM_NOTE]` blocks in
+/// `output_log`, builds a replay prompt, spawns a fresh Claude CLI session
+/// for each, sends the replay prompt as the initial turn, and re-registers
+/// the session in `SessionManager` under the original `task_run_id`.
+///
+/// Each session is handled independently — one failing row never blocks the
+/// others and never panics startup. Rows that cannot be resumed (no output
+/// log, unparseable conversation, spawn failure, `auto_continue=false`) are
+/// marked failed in PG with a `resume_failed:` error message so the sidebar
+/// reflects reality rather than showing a phantom "running" state.
 ///
 /// Returns the number of sessions successfully resumed.
 pub async fn resume_ai_sessions(
     session_manager: Arc<SessionManager>,
     app_handle: tauri::AppHandle,
 ) -> u32 {
-    // AI session resume is currently a no-op pending PG-based persistence.
-    let _ = (session_manager, app_handle);
-    info!("AI session resume: skipped (PG support pending)");
-    0
+    use crate::claude_session::resume::{build_replay_prompt, parse_conversation};
+    use crate::claude_session::ClaudeSession;
+
+    // Grab AppState from Tauri's managed state — same pattern other resume
+    // paths use. If unavailable we're being invoked before setup completes;
+    // there's nothing to resume in that case.
+    let app_state: Arc<AppState> = match app_handle.try_state::<Arc<AppState>>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            warn!("AI session resume: AppState not yet available; skipping");
+            return 0;
+        }
+    };
+
+    let my_port = app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if my_port == 0 {
+        warn!("AI session resume: api_port not set yet; skipping");
+        return 0;
+    }
+
+    let pg = app_state.pg_db.clone();
+
+    let rows = match pg.get_resumable_chat_sessions_for_runner(my_port).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("AI session resume: failed to query resumable chats: {}", e);
+            return 0;
+        }
+    };
+
+    if rows.is_empty() {
+        info!("AI session resume: no resumable chat sessions found");
+        return 0;
+    }
+
+    info!(
+        "AI session resume: found {} candidate chat session(s)",
+        rows.len()
+    );
+
+    let mark_failed = |id: String, reason: String, pg: Arc<crate::database::pg::PgDb>| async move {
+        let msg = format!("resume_failed: {}", reason);
+        if let Err(e) = pg.fail_task_run(&id, &msg).await {
+            warn!("Failed to mark chat session {} as failed: {}", id, e);
+        }
+    };
+
+    let mut resumed: u32 = 0;
+
+    for (task_run_id, task_name, auto_continue) in rows {
+        if !auto_continue {
+            info!(
+                "AI session resume: skipping {} (auto_continue disabled)",
+                task_run_id
+            );
+            continue;
+        }
+
+        // Load the full task run (including output_log — the lightweight
+        // chat-sessions query doesn't carry it).
+        let full = match pg.get_task_run(&task_run_id).await {
+            Ok(Some(tr)) => tr,
+            Ok(None) => {
+                warn!("AI session resume: task run {} vanished", task_run_id);
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    "AI session resume: failed to load task run {}: {}",
+                    task_run_id, e
+                );
+                continue;
+            }
+        };
+
+        if full.output_log.trim().is_empty() {
+            info!(
+                "AI session resume: {} has no conversation history, marking failed",
+                task_run_id
+            );
+            mark_failed(
+                task_run_id.clone(),
+                "no conversation history".to_string(),
+                pg.clone(),
+            )
+            .await;
+            continue;
+        }
+
+        let turns = parse_conversation(&full.output_log);
+        if turns.is_empty() {
+            info!(
+                "AI session resume: {} has no parseable turns, marking failed",
+                task_run_id
+            );
+            mark_failed(
+                task_run_id.clone(),
+                "could not parse conversation".to_string(),
+                pg.clone(),
+            )
+            .await;
+            continue;
+        }
+
+        let replay_prompt = build_replay_prompt(&turns, None);
+        if replay_prompt.is_empty() {
+            mark_failed(
+                task_run_id.clone(),
+                "empty replay prompt".to_string(),
+                pg.clone(),
+            )
+            .await;
+            continue;
+        }
+
+        // Spawn the Claude CLI session on a blocking thread — ClaudeSession::spawn
+        // blocks waiting for the init handshake. This mirrors create_ai_session.
+        let sm = session_manager.clone();
+        let handle = app_handle.clone();
+        let trid = task_run_id.clone();
+        let name_for_ctx = task_name.clone();
+        let replay_for_spawn = replay_prompt;
+
+        let spawn_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let working_dir = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+
+            let session_ctx = AiSessionContext::setup(&trid, &name_for_ctx);
+
+            let session = ClaudeSession::spawn(
+                &working_dir,
+                &trid,
+                &handle,
+                Some(session_ctx),
+                None, // finding_ctx
+                None, // progress_ctx
+                None, // pid_tracker
+                None, // model_override
+            )
+            .map_err(|e| format!("spawn failed: {}", e))?;
+
+            let session = Arc::new(session);
+
+            sm.register(&trid, session.clone())
+                .map_err(|e| format!("register failed: {}", e))?;
+
+            // Send the replay prompt as the initial turn. `send_initial_prompt`
+            // is exactly the right entrypoint: it requires Ready state (which
+            // spawn just established), writes to stdin, transitions to
+            // Processing, and crucially does NOT set `user_has_interacted` —
+            // so the next real user message still triggers the
+            // first-interaction context-switch note in send_user_message.
+            // It also does not append anything to output_log, so the next
+            // restart's replay won't double-count.
+            session
+                .send_initial_prompt(&replay_for_spawn)
+                .map_err(|e| format!("send_initial_prompt failed: {}", e))?;
+
+            // Emit the state event with resumed=true so the frontend can
+            // surface a one-time "resumed" badge/toast.
+            emit_session_state_ex(&handle, &trid, session.session_id(), session.state(), true);
+
+            Ok(())
+        })
+        .await;
+
+        match spawn_result {
+            Ok(Ok(())) => {
+                info!("AI session resume: resumed {}", task_run_id);
+                resumed += 1;
+            }
+            Ok(Err(e)) => {
+                warn!("AI session resume: {} failed: {}", task_run_id, e);
+                mark_failed(task_run_id.clone(), e, pg.clone()).await;
+            }
+            Err(join_err) => {
+                warn!(
+                    "AI session resume: spawn task for {} panicked: {}",
+                    task_run_id, join_err
+                );
+                mark_failed(
+                    task_run_id.clone(),
+                    format!("spawn task panicked: {}", join_err),
+                    pg.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    resumed
 }
 
 /// Tries both the cached external app specs and the runner's own specs.

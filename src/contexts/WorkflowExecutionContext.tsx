@@ -87,10 +87,22 @@ export interface StepProgress {
 }
 
 /**
- * Resume point indicating where execution will continue.
+ * Resume point indicating where execution will continue after a restart.
+ *
+ * Emitted by the backend's `compute_resume_point` from loaded
+ * `workflow_step_checkpoints` + `step_progress_markers`. The three primary
+ * `type` values are:
+ * - `from_start`: no checkpoints exist; execution restarts from the beginning.
+ * - `from_step`: at least one checkpoint exists; resume from `fromStep` in
+ *   the given `iteration`.
+ * - `in_progress_step`: the latest checkpoint was still running and intra-step
+ *   progress markers exist; resume mid-step at `fromStep`.
+ *
+ * Consumers should prefer `description` for display and tolerate unknown
+ * `type` values gracefully.
  */
 export interface ResumePoint {
-  type: "from_start" | "setup_phase" | "verification_phase" | "agentic_phase" | "completion_phase";
+  type: "from_start" | "from_step" | "in_progress_step" | string;
   iteration?: number;
   fromStep?: number;
   description: string;

@@ -479,9 +479,9 @@ pub async fn get_full_workflow_state(
         created_at: p.created_at,
     });
 
-    // Compute resume point using ResumeManager
+    // Compute resume point from the data we've already loaded above.
     let resume_point =
-        compute_resume_point(state.app_state.pg_db.clone(), &id, &orchestrator_state);
+        compute_resume_point(&orchestrator_state, &checkpoints, &current_step_progress);
 
     // Determine defined phases from the workflow definition
     let defined_phases = if task_run.workflow_type.as_deref() == Some("unified") {
@@ -551,20 +551,279 @@ pub async fn get_full_workflow_state(
     }))
 }
 
-/// Compute the resume point for a workflow execution.
+/// Compute the resume point for a workflow execution from already-loaded data.
+///
+/// This is a pure function — it does no DB I/O. The caller
+/// (`get_full_workflow_state`) fetches the checkpoints and progress marker up
+/// front and passes them in.
+///
+/// Returns one of three `resume_type` values:
+/// - `"from_start"` — no checkpoints exist for this execution
+/// - `"in_progress_step"` — the latest checkpoint is still running and has
+///   progress markers (resume continues that step mid-way)
+/// - `"from_step"` — there is at least one checkpoint; resume from after the
+///   last successful step (or retry the last failed/stopped step)
 pub fn compute_resume_point(
-    pg_db: std::sync::Arc<crate::database::pg::PgDb>,
-    execution_id: &str,
     orchestrator_state: &Option<OrchestratorStateData>,
+    checkpoints: &[StepCheckpointData],
+    current_progress: &Option<StepProgressData>,
 ) -> ResumePointData {
-    // checkpoint_db removed — ResumeManager needs updating by other agent
-    // For now, skip resume point calculation
-    let _ = (pg_db, execution_id, orchestrator_state);
+    // Helper: readable label for a step ("step 3 (verification)" / "step 3").
+    fn step_label(cp: &StepCheckpointData) -> String {
+        if let Some(name) = cp.step_name.as_deref().filter(|s| !s.is_empty()) {
+            format!("step {} ({})", cp.step_index + 1, name)
+        } else {
+            format!("step {} ({})", cp.step_index + 1, cp.step_type)
+        }
+    }
+
+    // Orchestrator-reported iteration is the fallback when a checkpoint
+    // doesn't carry one.
+    let fallback_iter = orchestrator_state.as_ref().and_then(|os| os.iteration);
+
+    if checkpoints.is_empty() {
+        return ResumePointData {
+            resume_type: "from_start".to_string(),
+            iteration: fallback_iter,
+            from_step: None,
+            description: "Will restart from the beginning.".to_string(),
+        };
+    }
+
+    // Find the latest checkpoint by (iteration desc, step_index desc).
+    // iteration=None sorts as 0 so rows with iterations win ties.
+    let latest = checkpoints
+        .iter()
+        .max_by_key(|cp| (cp.iteration.unwrap_or(0), cp.step_index))
+        .expect("checkpoints non-empty");
+
+    let latest_iter = latest.iteration.or(fallback_iter);
+    let status = latest.status.as_str();
+
+    // In-progress: the latest checkpoint is still running and we have an
+    // intra-step progress marker — resume mid-step.
+    if status == "running" {
+        if let Some(progress) = current_progress.as_ref() {
+            let progress_blurb = match progress.total_value {
+                Some(total) => format!(
+                    "{}/{} {}",
+                    progress.current_value, total, progress.marker_type
+                ),
+                None => format!("{} {}", progress.current_value, progress.marker_type),
+            };
+            let iter_blurb = match latest_iter {
+                Some(i) => format!(" (iteration {})", i),
+                None => String::new(),
+            };
+            return ResumePointData {
+                resume_type: "in_progress_step".to_string(),
+                iteration: latest_iter,
+                from_step: Some(latest.step_index),
+                description: format!(
+                    "Resume mid-{}{}: {} complete.",
+                    step_label(latest),
+                    iter_blurb,
+                    progress_blurb
+                ),
+            };
+        }
+        // Running but no progress marker — treat like a retry.
+        let iter_blurb = match latest_iter {
+            Some(i) => format!(" in iteration {}", i),
+            None => String::new(),
+        };
+        return ResumePointData {
+            resume_type: "from_step".to_string(),
+            iteration: latest_iter,
+            from_step: Some(latest.step_index),
+            description: format!(
+                "Retry {}{} (previous attempt did not finish).",
+                step_label(latest),
+                iter_blurb
+            ),
+        };
+    }
+
+    // Success / skipped: resume from the step after the latest one.
+    if matches!(status, "success" | "skipped") {
+        let next_step = latest.step_index + 1;
+        let iter_blurb = match latest_iter {
+            Some(i) => format!(" in iteration {}", i),
+            None => String::new(),
+        };
+        return ResumePointData {
+            resume_type: "from_step".to_string(),
+            iteration: latest_iter,
+            from_step: Some(next_step),
+            description: format!(
+                "Resume from step {}{} (after {}).",
+                next_step + 1,
+                iter_blurb,
+                step_label(latest)
+            ),
+        };
+    }
+
+    // Failed / pending / unknown: retry the latest step.
+    let iter_blurb = match latest_iter {
+        Some(i) => format!(" in iteration {}", i),
+        None => String::new(),
+    };
+    let reason = if status == "failed" {
+        " (previous attempt failed)"
+    } else {
+        ""
+    };
     ResumePointData {
-        resume_type: "from_start".to_string(),
-        iteration: None,
-        from_step: None,
-        description: "Resume calculation unavailable (SQLite removed)".to_string(),
+        resume_type: "from_step".to_string(),
+        iteration: latest_iter,
+        from_step: Some(latest.step_index),
+        description: format!("Retry {}{}{}.", step_label(latest), iter_blurb, reason),
+    }
+}
+
+#[cfg(test)]
+mod resume_point_tests {
+    use super::*;
+
+    fn cp(
+        step_index: usize,
+        iteration: Option<u32>,
+        status: &str,
+        step_type: &str,
+        step_name: Option<&str>,
+    ) -> StepCheckpointData {
+        StepCheckpointData {
+            id: format!("cp-{}", step_index),
+            execution_id: "exec".to_string(),
+            phase: "agentic".to_string(),
+            iteration,
+            step_index,
+            stage_index: None,
+            step_type: step_type.to_string(),
+            step_name: step_name.map(String::from),
+            status: status.to_string(),
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            error: None,
+        }
+    }
+
+    fn orch_state(iteration: Option<u32>) -> Option<OrchestratorStateData> {
+        Some(OrchestratorStateData {
+            state_name: "agentic_running".to_string(),
+            state_data: None,
+            phase: Some("agentic".to_string()),
+            iteration,
+            updated_at: "2026-04-07T00:00:00Z".to_string(),
+            workflow_stage: Some("agentic".to_string()),
+            workflow_stage_display: Some("Agentic".to_string()),
+            stage_index: None,
+        })
+    }
+
+    #[test]
+    fn empty_checkpoints_is_from_start() {
+        let rp = compute_resume_point(&None, &[], &None);
+        assert_eq!(rp.resume_type, "from_start");
+        assert!(rp.from_step.is_none());
+        assert!(rp.description.contains("beginning"));
+        // Description must NOT contain the old SQLite leak.
+        assert!(!rp.description.to_lowercase().contains("sqlite"));
+    }
+
+    #[test]
+    fn from_start_uses_orchestrator_iteration_fallback() {
+        let rp = compute_resume_point(&orch_state(Some(3)), &[], &None);
+        assert_eq!(rp.iteration, Some(3));
+    }
+
+    #[test]
+    fn completed_checkpoints_resume_from_next_step() {
+        let cps = vec![
+            cp(0, Some(1), "success", "prompt", Some("Setup")),
+            cp(1, Some(1), "success", "verification", Some("Verify")),
+            cp(2, Some(1), "success", "agentic", Some("Agentic run")),
+        ];
+        let rp = compute_resume_point(&orch_state(Some(1)), &cps, &None);
+        assert_eq!(rp.resume_type, "from_step");
+        assert_eq!(rp.from_step, Some(3));
+        assert_eq!(rp.iteration, Some(1));
+        assert!(rp.description.contains("Resume from step 4"));
+    }
+
+    #[test]
+    fn running_checkpoint_with_progress_is_in_progress_step() {
+        let cps = vec![
+            cp(0, Some(2), "success", "prompt", None),
+            cp(1, Some(2), "running", "verification", Some("Verify")),
+        ];
+        let progress = Some(StepProgressData {
+            checkpoint_id: "cp-1".to_string(),
+            marker_type: "actions".to_string(),
+            current_value: 7,
+            total_value: Some(12),
+            description: None,
+            data_json: None,
+            created_at: "2026-04-07T00:00:00Z".to_string(),
+        });
+        let rp = compute_resume_point(&orch_state(Some(2)), &cps, &progress);
+        assert_eq!(rp.resume_type, "in_progress_step");
+        assert_eq!(rp.from_step, Some(1));
+        assert_eq!(rp.iteration, Some(2));
+        assert!(rp.description.contains("7/12 actions"));
+        assert!(rp.description.contains("step 2"));
+    }
+
+    #[test]
+    fn running_checkpoint_without_progress_is_retry_from_step() {
+        let cps = vec![cp(4, Some(1), "running", "shell_command", None)];
+        let rp = compute_resume_point(&orch_state(Some(1)), &cps, &None);
+        assert_eq!(rp.resume_type, "from_step");
+        assert_eq!(rp.from_step, Some(4));
+        assert!(rp.description.contains("Retry"));
+    }
+
+    #[test]
+    fn failed_checkpoint_retries_from_same_step() {
+        let cps = vec![
+            cp(0, Some(1), "success", "prompt", None),
+            cp(1, Some(1), "failed", "verification", Some("Verify")),
+        ];
+        let rp = compute_resume_point(&orch_state(Some(1)), &cps, &None);
+        assert_eq!(rp.resume_type, "from_step");
+        assert_eq!(rp.from_step, Some(1));
+        assert!(rp.description.contains("Retry"));
+        assert!(rp.description.contains("previous attempt failed"));
+    }
+
+    #[test]
+    fn latest_is_highest_iteration_then_highest_step() {
+        // Iteration 2 step 0 should beat iteration 1 step 9.
+        let cps = vec![
+            cp(9, Some(1), "success", "prompt", None),
+            cp(0, Some(2), "success", "verification", None),
+        ];
+        let rp = compute_resume_point(&orch_state(Some(2)), &cps, &None);
+        assert_eq!(rp.iteration, Some(2));
+        assert_eq!(rp.from_step, Some(1)); // 0 + 1
+    }
+
+    #[test]
+    fn description_never_mentions_sqlite() {
+        // Regression: the old stub leaked "SQLite removed" into the UI.
+        let variants: Vec<Vec<StepCheckpointData>> = vec![
+            vec![],
+            vec![cp(0, Some(1), "success", "prompt", None)],
+            vec![cp(0, Some(1), "failed", "prompt", None)],
+            vec![cp(0, Some(1), "running", "prompt", None)],
+        ];
+        for cps in variants {
+            let rp = compute_resume_point(&orch_state(Some(1)), &cps, &None);
+            assert!(!rp.description.to_lowercase().contains("sqlite"));
+            assert!(!rp.description.to_lowercase().contains("unavailable"));
+        }
     }
 }
 
@@ -798,6 +1057,9 @@ pub async fn resume_task_run(
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: workflow.max_fix_attempts,
+        max_ci_auto_resumes: workflow.max_ci_auto_resumes,
+        ci_failure_context: None,
     };
 
     // Spawn the workflow execution in background with panic protection

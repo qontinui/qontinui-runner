@@ -28,6 +28,8 @@ interface SessionStateEvent {
   taskRunId: string;
   sessionId: string;
   state: string;
+  /** True on the first state event emitted for a session auto-resumed after runner restart. */
+  resumed?: boolean;
 }
 
 /**

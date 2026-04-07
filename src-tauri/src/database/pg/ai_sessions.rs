@@ -127,6 +127,51 @@ impl PgDb {
                 is_fixer: false,
                 fixer_source_task_run_id: None,
                 is_meta_optimizer: false,
+                is_review: false,
+                blocks_parent: false,
+            })
+            .collect())
+    }
+
+    /// Stricter variant of `get_running_ai_sessions` used by the startup
+    /// chat-resume path: requires `runner_port` to match exactly (no NULL
+    /// fallthrough) so multiple runners cannot double-claim the same
+    /// orphaned chat session.
+    ///
+    /// Returns lightweight `(id, task_name, auto_continue)` tuples — the
+    /// caller fetches the full row (including `output_log`) via
+    /// `get_task_run` only for sessions it actually intends to resume.
+    pub async fn get_resumable_chat_sessions_for_runner(
+        &self,
+        runner_port: u16,
+    ) -> Result<Vec<(String, String, bool)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        let port = runner_port as i32;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, task_name, COALESCE(auto_continue, true) as auto_continue
+                   FROM task_runs
+                   WHERE status = 'running'
+                     AND workflow_type = 'chat'
+                     AND runner_port = $1
+                   ORDER BY COALESCE(updated_at, created_at) DESC"#,
+                &[&port],
+            )
+            .await
+            .map_err(|e| format!("PG get_resumable_chat_sessions_for_runner: {}", e))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let id: String = r.get("id");
+                let task_name: String = r.get("task_name");
+                let auto_continue: bool = r.get("auto_continue");
+                (id, task_name, auto_continue)
             })
             .collect())
     }
