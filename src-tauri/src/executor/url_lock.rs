@@ -13,6 +13,11 @@ use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, warn};
 
+/// Maximum age (ms) before a URL lock is considered stale and reaped.
+/// One hour — long enough for any reasonable workflow, short enough that
+/// crashed workflows don't permanently block a URL.
+const STALE_LOCK_AGE_MS: u64 = 60 * 60 * 1000;
+
 /// Entry tracking who holds a URL reservation.
 #[derive(Debug, Clone)]
 struct UrlLockEntry {
@@ -48,13 +53,36 @@ impl UrlLockManager {
     ///
     /// If the same `task_run_id` already holds this URL, returns immediately
     /// (idempotent). If another workflow holds it, blocks until the URL is
-    /// released, then acquires it.
-    ///
-    /// When a `db` reference is provided, periodically checks whether the
-    /// holding task is still running and cleans up stale locks automatically.
-    /// This prevents indefinite hangs when `release_all_sync()` fails.
+    /// released (via `Notify`), then re-attempts. As a safety net against
+    /// stuck holders, runs `cleanup_stale_locks()` on every wakeup so locks
+    /// older than the staleness threshold get reaped instead of hanging
+    /// the caller indefinitely.
     pub async fn acquire(&self, url: &str, task_run_id: &str, holder_name: &str) {
-        // SQLite removed - no-op
+        loop {
+            match self.try_acquire(url, task_run_id, holder_name).await {
+                Ok(()) => {
+                    debug!(
+                        "UI Bridge URL {} acquired by task {}",
+                        normalize_url(url),
+                        task_run_id
+                    );
+                    return;
+                }
+                Err(reason) => {
+                    debug!("URL acquire waiting: {}", reason);
+                }
+            }
+
+            // Wait for any release event, with a periodic timeout so we
+            // can re-check stale locks even if no release notification fires.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.notify.notified(),
+            )
+            .await;
+
+            self.cleanup_stale_locks().await;
+        }
     }
 
     /// Try to acquire a URL lock without waiting.
@@ -204,12 +232,40 @@ impl UrlLockManager {
         );
     }
 
-    /// Clean up stale locks whose holding task runs are no longer running.
+    /// Clean up stale locks based on age.
     ///
-    /// Reads the lock state, checks each holder's task run status in the DB,
-    /// and removes entries whose task run is no longer "running".
+    /// Removes any lock that has been held longer than [`STALE_LOCK_AGE_MS`].
+    /// This is a wall-clock fallback for the case where `release_all_sync()`
+    /// failed (e.g. RwLock contention) or the holding workflow crashed without
+    /// running its drop handler. It does not consult the DB — workflows that
+    /// legitimately need to hold a URL longer than the threshold should
+    /// re-acquire periodically.
     pub async fn cleanup_stale_locks(&self) {
-        // SQLite removed - no-op
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut state = self.state.write().await;
+        let before = state.len();
+
+        state.retain(|url, entry| {
+            let age = now.saturating_sub(entry.acquired_at);
+            if age > STALE_LOCK_AGE_MS {
+                warn!(
+                    "URL lock {} reaped as stale (held {}ms by task {} '{}')",
+                    url, age, entry.holder_task_run_id, entry.holder_name
+                );
+                false
+            } else {
+                true
+            }
+        });
+
+        if state.len() < before {
+            drop(state);
+            self.notify.notify_waiters();
+        }
     }
 
     /// Check if a specific URL is currently locked.

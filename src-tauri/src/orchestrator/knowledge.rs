@@ -1527,26 +1527,6 @@ pub struct TaskKnowledgeExport {
 ///
 /// Uses hybrid search: SQL filter by category + vector re-rank by content_embedding.
 /// Enables questions like "Has this root cause been identified before?"
-pub fn search_similar_knowledge(
-    query_embedding: &[f32],
-    category: Option<&str>,
-    limit: usize,
-) -> Result<
-    Vec<
-        crate::database::hybrid_search::SearchResult<
-            crate::database::hybrid_search::KnowledgeResult,
-        >,
-    >,
-    String,
-> {
-    let config = crate::database::hybrid_search::HybridSearchConfig {
-        limit,
-        ..Default::default()
-    };
-
-    crate::database::hybrid_search::hybrid_search_knowledge(query_embedding, category, &config)
-}
-
 /// Format cross-task knowledge results for injection into AI context.
 pub fn format_cross_task_knowledge(
     results: &[crate::database::hybrid_search::SearchResult<

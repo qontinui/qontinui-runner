@@ -104,22 +104,46 @@ pub struct UniversalFixResult {
     pub created_at: String,
 }
 
-/// Hybrid search knowledge (stub -- SQLite removed).
-pub fn hybrid_search_knowledge(
-    _query_embedding: &[f32],
-    _category: Option<&str>,
-    _config: &HybridSearchConfig,
-) -> Result<Vec<SearchResult<KnowledgeResult>>, String> {
-    Ok(vec![])
-}
-
-/// Rank results by hybrid score (stub -- SQLite removed).
+/// Rank candidate (item, optional embedding) pairs by cosine similarity to a
+/// query embedding. Candidates without embeddings are dropped. Results below
+/// `config.min_similarity` are filtered out, then sorted descending by score
+/// and truncated to `config.limit`.
+///
+/// Note: there is no separate SQL-rank signal here (the SQL filter has already
+/// been applied by the caller), so `hybrid_score == similarity`. The
+/// `sql_weight`/`vector_weight` fields are reserved for future use.
 pub fn rank_results<T>(
-    _candidates: Vec<(T, Option<Vec<f32>>)>,
-    _query_embedding: &[f32],
-    _config: &HybridSearchConfig,
+    candidates: Vec<(T, Option<Vec<f32>>)>,
+    query_embedding: &[f32],
+    config: &HybridSearchConfig,
 ) -> Vec<SearchResult<T>> {
-    vec![]
+    let mut scored: Vec<SearchResult<T>> = candidates
+        .into_iter()
+        .filter_map(|(item, emb)| {
+            let emb = emb?;
+            if emb.len() != query_embedding.len() {
+                return None;
+            }
+            let similarity =
+                crate::database::embeddings::cosine_similarity(query_embedding, &emb);
+            if similarity < config.min_similarity {
+                return None;
+            }
+            Some(SearchResult {
+                item,
+                similarity,
+                hybrid_score: similarity,
+            })
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.hybrid_score
+            .partial_cmp(&a.hybrid_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    scored.truncate(config.limit);
+    scored
 }
 
 impl Default for HybridSearchConfig {
