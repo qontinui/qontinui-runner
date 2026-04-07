@@ -121,6 +121,9 @@ pub async fn get_managed_processes(
 }
 
 /// Get output from a managed process.
+///
+/// For running processes, reads from the in-memory ring buffer (live source of truth).
+/// For stopped processes, falls back to the most recent session in the PG database.
 #[tauri::command]
 pub async fn get_process_output(
     id: String,
@@ -135,7 +138,43 @@ pub async fn get_process_output(
     let manager = manager
         .as_ref()
         .ok_or("Process capture manager not initialized")?;
-    manager.get_output(&id, tail).await
+
+    // Try the in-memory ring buffer first
+    let live = manager.get_output(&id, tail).await?;
+    if !live.is_empty() {
+        return Ok(live);
+    }
+
+    // Process has no live output (likely stopped). Fall back to most recent DB session.
+    let sessions = state
+        .pg_db
+        .get_process_sessions(Some(&id), 1)
+        .await
+        .unwrap_or_default();
+
+    if let Some(session) = sessions.first() {
+        let lines = state
+            .pg_db
+            .get_process_session_output(&session.id, tail as u32, 0)
+            .await
+            .unwrap_or_default();
+
+        // Convert ProcessSessionOutputLine -> OutputLine
+        return Ok(lines
+            .into_iter()
+            .map(|l| OutputLine {
+                timestamp: l.timestamp,
+                stream: if l.stream == "stderr" {
+                    OutputStream::Stderr
+                } else {
+                    OutputStream::Stdout
+                },
+                line: l.line,
+            })
+            .collect());
+    }
+
+    Ok(Vec::new())
 }
 
 /// Get all process configs.
@@ -222,5 +261,43 @@ pub async fn get_process_session_output_from_db(
     state
         .pg_db
         .get_process_session_output(&session_id, limit.unwrap_or(5000), offset.unwrap_or(0))
+        .await
+}
+
+/// Get N lines of context around an error's timestamp from the relevant
+/// process session. Used by the Error Monitor "show context" feature.
+#[tauri::command]
+pub async fn get_process_log_context(
+    process_name: String,
+    around_timestamp: String,
+    before: Option<u32>,
+    after: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::database::ProcessSessionOutputLine>, String> {
+    state
+        .pg_db
+        .get_process_log_context(
+            &process_name,
+            &around_timestamp,
+            before.unwrap_or(20),
+            after.unwrap_or(20),
+        )
+        .await
+}
+
+/// Search across all process logs (current and historical sessions).
+#[tauri::command]
+pub async fn search_process_logs(
+    query: String,
+    config_id: Option<String>,
+    limit: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::database::ProcessLogSearchHit>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    state
+        .pg_db
+        .search_process_logs(&query, config_id.as_deref(), limit.unwrap_or(200))
         .await
 }

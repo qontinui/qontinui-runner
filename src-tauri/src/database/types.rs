@@ -1946,6 +1946,19 @@ pub struct ProcessSessionOutputLine {
     pub line: String,
 }
 
+/// A search hit from `search_process_logs`. Includes parent session metadata
+/// so the UI can render which process the matched line came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessLogSearchHit {
+    pub id: i64,
+    pub session_id: String,
+    pub timestamp: String,
+    pub stream: String,
+    pub line: String,
+    pub process_config_id: String,
+    pub process_name: String,
+}
+
 /// Result of an import operation.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ImportResult {

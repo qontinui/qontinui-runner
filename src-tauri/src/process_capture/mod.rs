@@ -25,6 +25,7 @@
 //! ```
 
 pub mod build_errors;
+pub mod cleanup;
 pub mod commands;
 pub mod health;
 pub mod manager;

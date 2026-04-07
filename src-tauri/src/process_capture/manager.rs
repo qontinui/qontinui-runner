@@ -61,9 +61,21 @@ impl ProcessCaptureManager {
         let output_buffer = process.output_buffer.clone();
         let buffer_size = process.config.buffer_size;
 
-        // Create a database session record (SQLite removed — PG handles this)
+        // Create a database session record in PG (best-effort — DB may not be initialized)
         let session_id = uuid::Uuid::new_v4().to_string();
         process.runtime.session_id = Some(session_id.clone());
+
+        if let Some(pg_db) = crate::database::pg::PgDb::try_global() {
+            if let Err(e) = pg_db
+                .create_process_session(&session_id, &config_id, &process_name)
+                .await
+            {
+                warn!(
+                    "Failed to create process_session row for '{}': {}",
+                    process_name, e
+                );
+            }
+        }
 
         // Clone handles for the event loop
         let processes_ref = self.processes.clone();
@@ -272,10 +284,18 @@ impl ProcessCaptureManager {
     }
 
     /// The event loop for a single process: handles output, errors, health, exit.
+    ///
+    /// Responsibilities:
+    /// - Drain `msg_rx` (output lines, errors, exit notifications from reader tasks)
+    /// - Push output lines to the in-memory ring buffer (live source of truth)
+    /// - Emit Tauri `process-output` events for the frontend
+    /// - Forward errors to the ErrorMonitor
+    /// - Batch-write output lines to PG (`process_session_output`) so logs survive restarts
+    /// - Update the `process_sessions` row on exit with stopped_at, state, exit_code
     async fn process_event_loop(
         process_id: String,
         process_name: String,
-        health_port: Option<u16>,
+        _health_port: Option<u16>,
         output_buffer: Arc<RwLock<std::collections::VecDeque<OutputLine>>>,
         buffer_size: usize,
         mut msg_rx: tokio::sync::mpsc::Receiver<ProcessMessage>,
@@ -284,7 +304,178 @@ impl ProcessCaptureManager {
         app_handle: tauri::AppHandle,
         session_id: String,
     ) {
-        // SQLite removed - no-op
+        // DB write batching configuration
+        const DB_BATCH_SIZE: usize = 50;
+        const DB_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+
+        let pg_db = crate::database::pg::PgDb::try_global();
+        let mut db_batch: Vec<(String, String, String)> = Vec::with_capacity(DB_BATCH_SIZE);
+        let mut error_count: u32 = 0;
+        let mut exit_code: Option<i32> = None;
+        let mut exited = false;
+
+        let mut flush_interval = tokio::time::interval(DB_FLUSH_INTERVAL);
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                // Periodic flush of buffered DB writes
+                _ = flush_interval.tick() => {
+                    if !db_batch.is_empty() {
+                        Self::flush_db_batch(&pg_db, &session_id, &mut db_batch).await;
+                    }
+                    if exited && db_batch.is_empty() {
+                        break;
+                    }
+                }
+
+                // Drain process messages
+                msg = msg_rx.recv() => {
+                    match msg {
+                        Some(ProcessMessage::OutputLine(line)) => {
+                            // 1. Push to ring buffer (live view source of truth)
+                            {
+                                let mut buf = output_buffer.write().await;
+                                if buf.len() >= buffer_size {
+                                    buf.pop_front();
+                                }
+                                buf.push_back(line.clone());
+                            }
+
+                            // 2. Emit Tauri event for live frontend updates
+                            let _ = tauri::Emitter::emit(
+                                &app_handle,
+                                "process-output",
+                                serde_json::json!({
+                                    "id": &process_id,
+                                    "line": &line,
+                                }),
+                            );
+
+                            // 3. Buffer for batched DB write
+                            let stream_str = match line.stream {
+                                OutputStream::Stdout => "stdout",
+                                OutputStream::Stderr => "stderr",
+                            };
+                            db_batch.push((line.timestamp, stream_str.to_string(), line.line));
+
+                            if db_batch.len() >= DB_BATCH_SIZE {
+                                Self::flush_db_batch(&pg_db, &session_id, &mut db_batch).await;
+                            }
+                        }
+
+                        Some(ProcessMessage::Errors(errors)) => {
+                            error_count = error_count.saturating_add(errors.len() as u32);
+
+                            // Update runtime error_count on the process
+                            {
+                                let mut procs = processes.write().await;
+                                if let Some(p) = procs.get_mut(&process_id) {
+                                    p.runtime.error_count = p.runtime.error_count.saturating_add(errors.len() as u32);
+                                }
+                            }
+
+                            // Forward to ErrorMonitor if available
+                            let monitor_guard = error_monitor.read().await;
+                            if let Some(monitor) = monitor_guard.as_ref() {
+                                let _ = monitor
+                                    .ingest_stream_errors(process_name.clone(), errors)
+                                    .await;
+                            }
+                        }
+
+                        Some(ProcessMessage::Exited { code }) => {
+                            info!(
+                                "Process '{}' exited with code {:?}",
+                                process_name, code
+                            );
+                            exit_code = code;
+                            exited = true;
+
+                            // Update process state
+                            {
+                                let mut procs = processes.write().await;
+                                if let Some(p) = procs.get_mut(&process_id) {
+                                    p.runtime.state = ProcessState::Stopped;
+                                    p.runtime.pid = None;
+                                    let status = p.status();
+                                    let _ = tauri::Emitter::emit(
+                                        &app_handle,
+                                        "process-state-changed",
+                                        &status,
+                                    );
+                                }
+                            }
+                            // Don't break yet — drain remaining messages first
+                        }
+
+                        None => {
+                            // Channel closed: all senders dropped (process gone)
+                            exited = true;
+                        }
+                    }
+
+                    if exited && msg_rx.is_empty() && db_batch.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Final flush of any remaining buffered lines
+        if !db_batch.is_empty() {
+            Self::flush_db_batch(&pg_db, &session_id, &mut db_batch).await;
+        }
+
+        // Update the session row with final state
+        if let Some(pg_db_arc) = &pg_db {
+            let final_state = if exit_code.unwrap_or(0) == 0 {
+                "stopped"
+            } else {
+                "failed"
+            };
+            if let Err(e) = pg_db_arc
+                .update_process_session(&session_id, final_state, exit_code, error_count)
+                .await
+            {
+                warn!(
+                    "Failed to update process_session row for '{}': {}",
+                    process_name, e
+                );
+            }
+        }
+
+        // Prune session output to keep DB size bounded
+        if let Some(pg_db_arc) = &pg_db {
+            if let Err(e) = pg_db_arc
+                .prune_session_output_lines(&session_id, MAX_SESSION_OUTPUT_LINES)
+                .await
+            {
+                warn!(
+                    "Failed to prune session output for '{}': {}",
+                    process_name, e
+                );
+            }
+        }
+
+        info!("Event loop ended for process '{}'", process_name);
+    }
+
+    /// Flush a batch of output lines to PG. Best-effort: failures are logged, batch is cleared.
+    async fn flush_db_batch(
+        pg_db: &Option<Arc<crate::database::pg::PgDb>>,
+        session_id: &str,
+        batch: &mut Vec<(String, String, String)>,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        if let Some(db) = pg_db {
+            if let Err(e) = db.insert_process_session_output(session_id, batch).await {
+                warn!("Failed to flush process output batch to PG: {}", e);
+            }
+        }
+        batch.clear();
     }
 
     /// Rebuild and restart a process: stop → run build command → start.

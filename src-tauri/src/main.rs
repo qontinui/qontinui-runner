@@ -1104,6 +1104,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             process_capture::commands::delete_process_config,
             process_capture::commands::get_process_sessions_from_db,
             process_capture::commands::get_process_session_output_from_db,
+            process_capture::commands::get_process_log_context,
+            process_capture::commands::search_process_logs,
             // Orchestration loop commands (runner-side workflow loop)
             orchestration_loop::commands::start_orchestration_loop,
             orchestration_loop::commands::stop_orchestration_loop,
@@ -1809,6 +1811,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                 }
+            }
+
+            // Spawn the process log cleanup loop (deletes old process_sessions and their output)
+            {
+                let pg_for_logs = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    process_capture::cleanup::run_process_log_cleanup_loop(pg_for_logs).await;
+                });
             }
 
             info!("Tauri application setup complete");
