@@ -1076,9 +1076,11 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub async fn get_cloud_relay_settings(
-        _state: tauri::State<'_, Arc<ApiState>>,
-    ) -> Result<serde_json::Value, String> {
+    pub async fn get_cloud_relay_settings() -> Result<serde_json::Value, String> {
+        // ApiState is not a Tauri-managed state (only axum uses it), so this
+        // command reads directly from settings.json like any other Tauri
+        // settings command. Previously declared `State<Arc<ApiState>>` which
+        // caused Tauri to fail with "state not managed for field `state`".
         let settings = settings::load_settings();
         Ok(serde_json::json!({
             "enabled": settings.cloud_relay.enabled,
