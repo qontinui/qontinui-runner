@@ -1508,6 +1508,18 @@ impl PgDb {
                 UNIQUE(ticket_source, ticket_external_id)
             )",
             "CREATE INDEX IF NOT EXISTS idx_ticket_task_mapping_task ON ticket_task_mapping(task_run_id)",
+            // Phase 5B fix: Persist provider configs (with token) per workflow_id so the
+            // on-completion hook can reconstruct a provider after a restart and so the
+            // ticket can actually be closed.
+            "CREATE TABLE IF NOT EXISTS ticket_provider_configs (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL UNIQUE,
+                source TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_ticket_provider_configs_workflow ON ticket_provider_configs(workflow_id)",
         ];
 
         for sql in &ddl {
@@ -1735,5 +1747,170 @@ impl PgDb {
             rt.block_on(Self::new(&url))
                 .expect("PgDb connection for test"),
         )
+    }
+}
+
+// ============================================================================
+// Migration smoke tests
+// ============================================================================
+//
+// Pure-Rust tests that validate the static MIGRATIONS array without requiring
+// a live database connection. These catch common authoring mistakes:
+//   - Version gaps, duplicates, or out-of-order entries
+//   - Empty descriptions
+//   - Missing idempotency markers (`IF NOT EXISTS`) on DDL that supports them
+//   - Obviously malformed SQL fragments
+//
+// For tests that exercise the actual `run_migrations()` flow against a real
+// PostgreSQL instance, see the integration tests gated on DATABASE_URL.
+
+#[cfg(test)]
+mod migration_tests {
+    use super::MIGRATIONS;
+
+    /// Versions must start at 1, be strictly sequential, and never duplicated.
+    #[test]
+    fn migrations_are_sequentially_versioned_starting_at_one() {
+        assert!(
+            !MIGRATIONS.is_empty(),
+            "MIGRATIONS array is empty — at least the v1 baseline should exist"
+        );
+
+        for (idx, migration) in MIGRATIONS.iter().enumerate() {
+            let expected = (idx as i32) + 1;
+            assert_eq!(
+                migration.version, expected,
+                "Migration at index {} has version {}, expected {} (versions must be \
+                 sequential starting from 1 with no gaps or duplicates)",
+                idx, migration.version, expected
+            );
+        }
+    }
+
+    /// Every migration must have a non-empty, human-readable description.
+    #[test]
+    fn migrations_have_non_empty_descriptions() {
+        for migration in MIGRATIONS {
+            assert!(
+                !migration.description.trim().is_empty(),
+                "Migration v{} has an empty description",
+                migration.version
+            );
+        }
+    }
+
+    /// No two migrations may share the same version number. Redundant with the
+    /// sequential check above, but kept as an explicit guard so the failure
+    /// message is clear if someone breaks the invariant in a different way.
+    #[test]
+    fn migrations_have_unique_versions() {
+        let mut seen = std::collections::HashSet::new();
+        for migration in MIGRATIONS {
+            assert!(
+                seen.insert(migration.version),
+                "Duplicate migration version: v{}",
+                migration.version
+            );
+        }
+    }
+
+    /// Each non-empty SQL body should split into statements that look like
+    /// real DDL/DML — i.e. each non-blank statement contains at least one
+    /// recognized SQL keyword. This catches truncated heredocs, accidental
+    /// commenting-out, and similar paste errors.
+    #[test]
+    fn migration_sql_statements_look_parseable() {
+        const KEYWORDS: &[&str] = &[
+            "CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT",
+            "GRANT", "REVOKE", "COMMENT", "WITH", "DO",
+        ];
+
+        for migration in MIGRATIONS {
+            let sql = migration.sql.trim();
+            if sql.is_empty() {
+                // No-op migrations (e.g. baseline v1) are allowed.
+                continue;
+            }
+
+            let statements: Vec<&str> = sql
+                .split(';')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            assert!(
+                !statements.is_empty(),
+                "Migration v{} has non-empty SQL but produced no statements after \
+                 splitting on ';'",
+                migration.version
+            );
+
+            for stmt in statements {
+                let upper = stmt.to_uppercase();
+                let has_keyword = KEYWORDS.iter().any(|kw| upper.contains(kw));
+                assert!(
+                    has_keyword,
+                    "Migration v{} has a statement that contains no recognized SQL \
+                     keyword (looks malformed):\n  {}",
+                    migration.version, stmt
+                );
+            }
+        }
+    }
+
+    /// PostgreSQL supports `IF NOT EXISTS` on `CREATE TABLE`, `CREATE INDEX`,
+    /// and (since 9.6) `ALTER TABLE ... ADD COLUMN`. Migrations may be re-run
+    /// against partially-applied schemas during development, so every such
+    /// statement must be guarded.
+    #[test]
+    fn ddl_statements_use_if_not_exists_guards() {
+        for migration in MIGRATIONS {
+            let sql = migration.sql.trim();
+            if sql.is_empty() {
+                continue;
+            }
+
+            let statements: Vec<String> = sql
+                .split(';')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            for stmt in &statements {
+                let upper = stmt.to_uppercase();
+                // Collapse whitespace so multi-line statements still match.
+                let normalized: String = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+
+                if normalized.starts_with("CREATE TABLE") {
+                    assert!(
+                        normalized.contains("IF NOT EXISTS"),
+                        "Migration v{} has a CREATE TABLE without IF NOT EXISTS:\n  {}",
+                        migration.version,
+                        stmt
+                    );
+                }
+
+                if normalized.starts_with("CREATE INDEX")
+                    || normalized.starts_with("CREATE UNIQUE INDEX")
+                {
+                    assert!(
+                        normalized.contains("IF NOT EXISTS"),
+                        "Migration v{} has a CREATE INDEX without IF NOT EXISTS:\n  {}",
+                        migration.version,
+                        stmt
+                    );
+                }
+
+                if normalized.starts_with("ALTER TABLE") && normalized.contains("ADD COLUMN") {
+                    assert!(
+                        normalized.contains("ADD COLUMN IF NOT EXISTS"),
+                        "Migration v{} has an ALTER TABLE ADD COLUMN without \
+                         IF NOT EXISTS (PG 9.6+ supports this and re-runs require it):\n  {}",
+                        migration.version,
+                        stmt
+                    );
+                }
+            }
+        }
     }
 }
