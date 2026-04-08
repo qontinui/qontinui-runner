@@ -641,8 +641,23 @@ export default function App() {
         <SpecExecutionHandler />
         <BundledSpecsLoader />
         <CtrAutoPopulator />
+        {/*
+          Auto-register every interactive element in the runner app so that
+          GET /ui-bridge/control/elements and snapshot reflect the live DOM,
+          not just elements wired up through explicit useUIElement hooks.
+          This was previously gated on `import.meta.env.DEV`, which silently
+          disabled the registry in production builds (the temp-runner build
+          and the embedded primary-runner build) — making the entire
+          UI Bridge element-discovery API return near-empty results.
+
+          Cost: a debounced MutationObserver scan (100ms debounce). The
+          runner is a power-user tool with a tight UI Bridge automation
+          loop, so the registry has to work in every shipped build, not
+          just dev. Use [data-no-register] on any element you want to opt
+          out individually.
+        */}
         <AutoRegisterProvider
-          enabled={import.meta.env.DEV}
+          enabled
           idStrategy="prefer-existing"
           debounceMs={100}
           excludeSelectors={["[data-no-register]"]}
