@@ -585,6 +585,33 @@ const MIGRATIONS: &[Migration] = &[
             END $$;
         "#,
     },
+    Migration {
+        version: 11,
+        description: "Add columns missing from live that exist in canonical schema.pg.sql: phase_token_usage.cache_{creation,read}_tokens (BIGINT) and step_credit_assignments.cost_efficiency_signal (DOUBLE PRECISION)",
+        sql: r#"
+            -- These columns are declared in the canonical schema.pg.sql but
+            -- are missing from legacy live databases — almost certainly
+            -- because schema.pg.sql was edited without a corresponding
+            -- migration. Both target tables are empty on dev so ADD COLUMN
+            -- is instant and riskless; on any install where they're already
+            -- present this is a no-op via IF NOT EXISTS.
+            --
+            -- phase_token_usage is a schema.pg.sql-only table (not in
+            -- ensure_tables), so it may not exist on a fresh install. The
+            -- DO block skips the ALTER if the table is absent, matching
+            -- the defensive pattern in migration v10.
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.tables
+                           WHERE table_schema = current_schema()
+                             AND table_name = 'phase_token_usage') THEN
+                    ALTER TABLE phase_token_usage ADD COLUMN IF NOT EXISTS cache_creation_tokens BIGINT;
+                    ALTER TABLE phase_token_usage ADD COLUMN IF NOT EXISTS cache_read_tokens BIGINT;
+                END IF;
+            END $$;
+            ALTER TABLE step_credit_assignments ADD COLUMN IF NOT EXISTS cost_efficiency_signal DOUBLE PRECISION;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
@@ -1904,6 +1931,63 @@ impl PgDb {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
             "CREATE INDEX IF NOT EXISTS idx_ticket_provider_configs_workflow ON ticket_provider_configs(workflow_id)",
+            // ── Deferred HITL Questions ────────────────────────────────────
+            // Soft FK to task_runs (see schema.pg.sql for canonical FK).
+            // task_runs itself is not created by ensure_tables(); dropping
+            // the FK here avoids bootstrap-ordering failures.
+            "CREATE TABLE IF NOT EXISTS deferred_questions (
+                id                   TEXT PRIMARY KEY,
+                task_run_id          TEXT NOT NULL,
+                iteration            INTEGER NOT NULL,
+                question             TEXT NOT NULL,
+                context_json         TEXT DEFAULT '{}',
+                auto_decision_type   TEXT NOT NULL,
+                auto_decision_detail TEXT,
+                confidence           DOUBLE PRECISION NOT NULL,
+                risk_level           TEXT NOT NULL,
+                status               TEXT NOT NULL DEFAULT 'pending',
+                git_checkpoint       TEXT,
+                contingent_iterations TEXT DEFAULT '[]',
+                reviewer_comment     TEXT,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reviewed_at          TIMESTAMPTZ
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_dq_task_run_id ON deferred_questions(task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_dq_status ON deferred_questions(status)",
+            // ── Memory Query Cache ─────────────────────────────────────────
+            "CREATE TABLE IF NOT EXISTS memory_query_cache (
+                id                BIGSERIAL PRIMARY KEY,
+                query_hash        TEXT NOT NULL,
+                reasoning_level   TEXT NOT NULL,
+                result_json       TEXT NOT NULL,
+                hit_count         INTEGER NOT NULL DEFAULT 0,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at        TIMESTAMPTZ NOT NULL
+            )",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mqc_hash_level ON memory_query_cache(query_hash, reasoning_level)",
+            "CREATE INDEX IF NOT EXISTS idx_mqc_expires ON memory_query_cache(expires_at)",
+            // ── Working Representations (ephemeral per-task memory snapshot)
+            // Soft FK to task_runs (see schema.pg.sql for canonical FK).
+            "CREATE TABLE IF NOT EXISTS working_representations (
+                id                      BIGSERIAL PRIMARY KEY,
+                task_run_id             TEXT NOT NULL,
+                observations_json       TEXT NOT NULL DEFAULT '[]',
+                cross_run_patterns_json TEXT NOT NULL DEFAULT '[]',
+                entity_profiles_json    TEXT NOT NULL DEFAULT '[]',
+                recent_findings_json    TEXT NOT NULL DEFAULT '[]',
+                recent_fixes_json       TEXT NOT NULL DEFAULT '[]',
+                applicable_skills_json  TEXT NOT NULL DEFAULT '[]',
+                workflow_id             TEXT,
+                workflow_name           TEXT,
+                total_items             INTEGER NOT NULL DEFAULT 0,
+                build_duration_ms       BIGINT,
+                built_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at              TIMESTAMPTZ NOT NULL,
+                is_stale                BOOLEAN NOT NULL DEFAULT FALSE,
+                UNIQUE(task_run_id)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_wr_task_run ON working_representations(task_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_wr_expires ON working_representations(expires_at)",
         ];
 
         for sql in &ddl {

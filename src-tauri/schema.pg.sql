@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- Fixer
     is_fixer BOOLEAN DEFAULT false,
     fixer_source_task_run_id TEXT,
+    fix_attempts INTEGER DEFAULT 0,
+
+    -- Review / CI
+    is_review BOOLEAN DEFAULT false,
+    blocks_parent BOOLEAN DEFAULT false,
+    ci_auto_resumes INTEGER DEFAULT 0,
 
     -- Meta-optimizer
     is_meta_optimizer BOOLEAN DEFAULT false,
@@ -685,6 +691,9 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     timeout_seconds INTEGER NOT NULL DEFAULT 30,
     cached_tools TEXT,
     tools_cached_at TIMESTAMPTZ,
+    connection_state TEXT NOT NULL DEFAULT 'disconnected',
+    last_connected_at TIMESTAMPTZ,
+    last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -1232,6 +1241,8 @@ CREATE TABLE IF NOT EXISTS task_knowledge (
     is_resolved             BOOLEAN NOT NULL DEFAULT false,
     resolution_notes        TEXT,
     resolved_at             TIMESTAMPTZ,
+    archived_at             TIMESTAMPTZ,
+    summary_entry_id        TEXT,
     content_embedding       BYTEA,
     project_path            TEXT,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -1369,6 +1380,8 @@ CREATE TABLE IF NOT EXISTS prompt_evolution (
     score_after DOUBLE PRECISION,
     baseline_prompt_hash TEXT,
     consecutive_rejections INTEGER DEFAULT 0,
+    beam_run_id TEXT,
+    generation INTEGER,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_pe_agent ON prompt_evolution(agent_type);
@@ -2225,6 +2238,10 @@ CREATE TABLE IF NOT EXISTS pipeline_agent_traces (
     span_type TEXT DEFAULT 'agent',
     guardrail_results_json TEXT,
     handoff_context_json TEXT,
+    schema_valid_first_attempt BOOLEAN,
+    validation_retries INTEGER,
+    validation_error_summary TEXT,
+    coercions_applied TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_agent_traces_task_run ON pipeline_agent_traces(task_run_id);
@@ -3021,15 +3038,20 @@ CREATE TABLE IF NOT EXISTS trigger_history (
 CREATE INDEX IF NOT EXISTS idx_trigger_history_trigger_id ON trigger_history(trigger_id);
 CREATE INDEX IF NOT EXISTS idx_trigger_history_triggered_at ON trigger_history(triggered_at);
 
--- Scheduler History (execution log for scheduled tasks)
+-- Scheduler History (execution log for scheduled tasks).
+-- PK is execution_id (not id): runtime code in database/pg/scheduler.rs
+-- and database/pg/mod.rs ensure_tables() both use execution_id. Prior
+-- versions of this file had `id TEXT PRIMARY KEY`, which matched neither
+-- the runtime code nor the live DB — a documentation bug that was
+-- corrected as part of the 2026-04-08 drift audit.
 CREATE TABLE IF NOT EXISTS scheduler_history (
-    id TEXT PRIMARY KEY,
+    execution_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     session_id TEXT,
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ended_at TIMESTAMPTZ,
-    status TEXT NOT NULL DEFAULT 'running',
-    success BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL DEFAULT 'pending',
+    success BOOLEAN,
     error_message TEXT,
     triggered_auto_fix BOOLEAN NOT NULL DEFAULT false,
     auto_fix_session_id TEXT,
@@ -3572,3 +3594,185 @@ CREATE TABLE IF NOT EXISTS working_representations (
 );
 CREATE INDEX IF NOT EXISTS idx_wr_task_run ON working_representations(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_wr_expires ON working_representations(expires_at);
+
+-- ============================================================
+-- Tables previously declared only in database/pg/mod.rs ensure_tables().
+-- Hoisted into schema.pg.sql on 2026-04-08 as part of the drift audit
+-- so Clorinde validation sees the same surface runtime expects. These
+-- have no explicit FOREIGN KEYs (logical references documented in
+-- comments) which matches the mod.rs declarations.
+-- ============================================================
+
+-- Span events (OpenTelemetry-style trace records for generator agents)
+CREATE TABLE IF NOT EXISTS span_events (
+    id              TEXT PRIMARY KEY,
+    execution_id    TEXT NOT NULL,
+    trace_id        TEXT NOT NULL,
+    agent_type      TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    step_index      INTEGER NOT NULL DEFAULT 0,
+    metric_name     TEXT,
+    reward_value    DOUBLE PRECISION,
+    data_key        TEXT,
+    data_json       TEXT,
+    role            TEXT,
+    content         TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_span_events_exec ON span_events(execution_id);
+CREATE INDEX IF NOT EXISTS idx_span_events_trace ON span_events(trace_id);
+CREATE INDEX IF NOT EXISTS idx_span_events_type ON span_events(event_type);
+
+-- Duel pools / candidates / results (Copeland-style tournament evolution)
+CREATE TABLE IF NOT EXISTS duel_pools (
+    id              TEXT PRIMARY KEY,
+    agent_type      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    generation      INTEGER NOT NULL DEFAULT 0,
+    config_json     TEXT NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_dp_agent ON duel_pools(agent_type);
+CREATE INDEX IF NOT EXISTS idx_dp_status ON duel_pools(status);
+
+CREATE TABLE IF NOT EXISTS duel_candidates (
+    id              TEXT PRIMARY KEY,
+    pool_id         TEXT NOT NULL,
+    prompt_content  TEXT NOT NULL,
+    variant_id      TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0,
+    parent_id       TEXT,
+    copeland_score  DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    alpha           DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    beta            DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dc_pool ON duel_candidates(pool_id);
+CREATE INDEX IF NOT EXISTS idx_dc_status ON duel_candidates(pool_id, status);
+
+CREATE TABLE IF NOT EXISTS duel_results (
+    id                  TEXT PRIMARY KEY,
+    pool_id             TEXT NOT NULL,
+    candidate_a_id      TEXT NOT NULL,
+    candidate_b_id      TEXT NOT NULL,
+    winner_id           TEXT NOT NULL,
+    judge_rationale     TEXT,
+    position_swapped    BOOLEAN NOT NULL DEFAULT false,
+    confidence          DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dr_pool ON duel_results(pool_id);
+
+-- Beam search runs / candidates (prompt evolution via beam search)
+CREATE TABLE IF NOT EXISTS beam_search_runs (
+    id              TEXT PRIMARY KEY,
+    agent_type      TEXT NOT NULL,
+    pool_id         TEXT,
+    config_json     TEXT NOT NULL,
+    generation      INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'running',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_bsr_agent ON beam_search_runs(agent_type);
+CREATE INDEX IF NOT EXISTS idx_bsr_pool ON beam_search_runs(pool_id);
+
+CREATE TABLE IF NOT EXISTS beam_candidates (
+    id              TEXT PRIMARY KEY,
+    beam_run_id     TEXT NOT NULL,
+    parent_id       TEXT,
+    prompt_content  TEXT NOT NULL,
+    critique        TEXT,
+    changes_summary TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0,
+    thinking_style  TEXT,
+    variant_id      TEXT,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_bc_run ON beam_candidates(beam_run_id);
+CREATE INDEX IF NOT EXISTS idx_bc_gen ON beam_candidates(beam_run_id, generation);
+
+-- Resource version history (append-only versioned resource snapshots)
+CREATE TABLE IF NOT EXISTS resource_versions (
+    id              TEXT PRIMARY KEY,
+    resource_type   TEXT NOT NULL,
+    resource_key    TEXT NOT NULL,
+    version         BIGINT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    metadata_json   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (resource_type, resource_key, version)
+);
+CREATE INDEX IF NOT EXISTS idx_rv_resource ON resource_versions(resource_type, resource_key);
+CREATE INDEX IF NOT EXISTS idx_rv_latest ON resource_versions(resource_type, resource_key, version DESC);
+CREATE INDEX IF NOT EXISTS idx_rv_hash ON resource_versions(content_hash);
+
+-- PR watcher state (GitHub PR auto-resume tracking)
+CREATE TABLE IF NOT EXISTS pr_watch_state (
+    id                  TEXT PRIMARY KEY,
+    task_run_id         TEXT NOT NULL,
+    pr_number           BIGINT NOT NULL,
+    repo_full_name      TEXT NOT NULL,
+    head_sha            TEXT NOT NULL DEFAULT '',
+    workflow_id         TEXT NOT NULL DEFAULT '',
+    last_checks_status  TEXT NOT NULL DEFAULT 'pending',
+    last_review_status  TEXT NOT NULL DEFAULT 'pending',
+    auto_resume_count   INTEGER NOT NULL DEFAULT 0,
+    max_auto_resumes    INTEGER NOT NULL DEFAULT 10,
+    github_token        TEXT NOT NULL DEFAULT '',
+    auto_resume_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    completed_at        TIMESTAMPTZ,
+    completion_reason   TEXT,
+    last_polled_at      TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(task_run_id, pr_number)
+);
+CREATE INDEX IF NOT EXISTS idx_prw_active ON pr_watch_state(completed_at) WHERE completed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_prw_task_run ON pr_watch_state(task_run_id);
+
+-- Learned patterns (online learning distilled problem/solution pairs)
+CREATE TABLE IF NOT EXISTS learned_patterns (
+    id TEXT PRIMARY KEY,
+    problem_hash TEXT NOT NULL UNIQUE,
+    trigger_keywords TEXT NOT NULL,
+    problem_description TEXT NOT NULL,
+    solution_description TEXT NOT NULL,
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    project_path TEXT,
+    workflow_name TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_learned_patterns_workflow ON learned_patterns(workflow_name);
+
+-- Ticket system integration (external ticket provider mapping)
+CREATE TABLE IF NOT EXISTS ticket_task_mapping (
+    id TEXT PRIMARY KEY,
+    ticket_source TEXT NOT NULL,
+    ticket_external_id TEXT NOT NULL,
+    ticket_url TEXT NOT NULL,
+    task_run_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    sync_status TEXT NOT NULL DEFAULT 'synced',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(ticket_source, ticket_external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_task_mapping_task ON ticket_task_mapping(task_run_id);
+
+CREATE TABLE IF NOT EXISTS ticket_provider_configs (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_provider_configs_workflow ON ticket_provider_configs(workflow_id);

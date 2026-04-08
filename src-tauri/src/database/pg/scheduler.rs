@@ -390,7 +390,7 @@ impl PgDb {
         conn.execute(
             r#"
             INSERT INTO scheduler_history
-                (id, task_id, session_id, started_at, ended_at,
+                (execution_id, task_id, session_id, started_at, ended_at,
                  status, success, error_message,
                  triggered_auto_fix, auto_fix_session_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -429,7 +429,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                SELECT id, session_id, started_at, ended_at,
+                SELECT execution_id, session_id, started_at, ended_at,
                        status, success, error_message,
                        triggered_auto_fix, auto_fix_session_id
                 FROM scheduler_history
@@ -461,8 +461,8 @@ impl PgDb {
             r#"
             DELETE FROM scheduler_history
             WHERE task_id = $1
-              AND id NOT IN (
-                  SELECT id FROM scheduler_history
+              AND execution_id NOT IN (
+                  SELECT execution_id FROM scheduler_history
                   WHERE task_id = $1
                   ORDER BY started_at DESC
                   LIMIT $2
