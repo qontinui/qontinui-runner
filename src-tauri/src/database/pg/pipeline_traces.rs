@@ -3,7 +3,7 @@
 //! Provides save/query for `pipeline_agent_traces` and `span_events` tables.
 
 use super::PgDb;
-use crate::autoresearch::agentic_verification::{
+use crate::agentic_verification::{
     GuardrailResult, HandoffContext, PipelineAgentTrace,
 };
 use crate::meta_optimizer::span_instrumentation::SpanEventRow;

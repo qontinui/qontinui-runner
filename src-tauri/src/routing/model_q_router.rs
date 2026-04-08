@@ -379,7 +379,7 @@ pub struct PhaseModelStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autoresearch::q_router::{ComplexityTier, Domain};
+    use crate::routing::q_router::{ComplexityTier, Domain};
 
     fn make_state(domain: Domain, complexity: ComplexityTier, has_ui: bool) -> TaskState {
         TaskState {

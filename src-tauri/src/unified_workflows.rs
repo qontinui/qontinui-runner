@@ -500,7 +500,7 @@ pub struct UnifiedWorkflow {
     /// the best architecture based on workflow complexity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_architecture:
-        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+        Option<crate::agentic_verification::WorkflowArchitecture>,
 
     /// Whether the AI semantic review actually ran successfully during generation.
     /// When false, the workflow passed through the pipeline without AI verification
@@ -710,7 +710,7 @@ pub struct CreateUnifiedWorkflowRequest {
     /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
     #[serde(default)]
     pub workflow_architecture:
-        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+        Option<crate::agentic_verification::WorkflowArchitecture>,
     /// When true, the pipeline will stop execution if accumulated token usage
     /// exceeds the token budget. Disabled by default.
     #[serde(default)]
@@ -846,7 +846,7 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub ai_reviewed: Option<bool>,
     /// Workflow execution architecture override (e.g., "multi_agent_pipeline").
     pub workflow_architecture:
-        Option<crate::autoresearch::agentic_verification::WorkflowArchitecture>,
+        Option<crate::agentic_verification::WorkflowArchitecture>,
     /// When true, the pipeline will stop execution if accumulated token usage
     /// exceeds the token budget. Disabled by default.
     #[serde(default)]

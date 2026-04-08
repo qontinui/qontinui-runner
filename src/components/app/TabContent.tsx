@@ -69,7 +69,6 @@ import { ReflectionDashboard } from "@/components/reflection-dashboard/Reflectio
 import { ArchitectureView } from "@/components/architecture-view/ArchitectureView";
 import { GeneratorEvalPage } from "@/pages/GeneratorEvalPage";
 import { OrchestrationLoopPanel } from "@/components/orchestration-loop/OrchestrationLoopPanel";
-import { AutoresearchPage } from "@/pages/AutoresearchPage";
 import { MetaOptimizerPage } from "@/pages/MetaOptimizerPage";
 import { OnlineLearningDashboard } from "@/components/online-learning/OnlineLearningDashboard";
 import { SpecsPage } from "@/pages/specs/SpecsPage";
@@ -424,13 +423,6 @@ export function TabContent({
       return (
         <div data-page-id="generator-eval" className="h-full overflow-hidden">
           <GeneratorEvalPage />
-        </div>
-      );
-
-    case "autoresearch":
-      return (
-        <div data-page-id="autoresearch" className="h-full overflow-hidden">
-          <AutoresearchPage />
         </div>
       );
 

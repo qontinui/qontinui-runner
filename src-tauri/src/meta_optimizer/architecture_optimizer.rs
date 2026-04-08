@@ -99,14 +99,6 @@ pub fn build_setup_steps() -> Vec<ExecutionStepConfig> {
             None,
             Some("agent_traces"),
         ),
-        // Step 3: Load autoresearch experiment results
-        build_api_step(
-            "Load autoresearch experiments",
-            "GET",
-            &format!("{}/autoresearch/campaigns?limit=10", base_url),
-            None,
-            Some("autoresearch_campaigns"),
-        ),
         // Step 4: Load current agentic settings
         build_api_step(
             "Load agentic settings",
@@ -187,7 +179,6 @@ The setup phase loaded **L0 summaries** where applicable:
 - `{{optimizer_context}}` — Your performance history: previous recommendations and their outcomes, current metrics vs baseline, per-architecture performance, top failure patterns
 - `{{learning_outcomes}}` — **L0 summary**: status, run_count, avg_duration_secs, avg_iterations (grouped by status)
 - `{{agent_traces}}` — **L0 summary**: agent_type, run_count, success_pct (one row per agent type)
-- `{{autoresearch_campaigns}}` — Autoresearch experiment results (A/B testing data)
 - `{{agentic_settings}}` — Current configuration defaults for each architecture
 - `{{iteration_history}}` — **L0 summary**: approach patterns from agentic verification loops (avg iterations, confidence trends, most common approaches tried, grouped by run status)
 

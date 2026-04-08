@@ -239,7 +239,7 @@ pub async fn extract_compliance(
     Ok(result)
 }
 
-/// Get compliance result for a specific task run (used by autoresearch enrichment).
+/// Get compliance result for a specific task run.
 pub async fn get_compliance_for_run(
     pg: &PgDb,
     task_run_id: &str,

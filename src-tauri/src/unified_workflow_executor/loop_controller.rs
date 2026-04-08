@@ -1401,7 +1401,7 @@ impl LoopController {
 
                 let loop_result = if matches!(
                     stage_loop_config.workflow_architecture,
-                    Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::AgenticVerification)
+                    Some(crate::agentic_verification::WorkflowArchitecture::AgenticVerification)
                 ) {
                     info!(
                         "  Stage {}: Using AGENTIC VERIFICATION architecture",
@@ -1417,7 +1417,7 @@ impl LoopController {
                     .await
                 } else if matches!(
                     stage_loop_config.workflow_architecture,
-                    Some(crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
+                    Some(crate::agentic_verification::WorkflowArchitecture::MultiAgentPipeline)
                 ) {
                     info!(
                         "  Stage {}: Using MULTI-AGENT PIPELINE architecture",

@@ -1,4 +1,4 @@
-//! Agentic Verification Loop — an alternative workflow architecture for autoresearch.
+//! Agentic Verification Loop — an alternative workflow architecture.
 //!
 //! Instead of a fixed workflow with deterministic verification steps and agentic fix steps,
 //! this architecture uses a continuous loop of two agents:
@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 /// The workflow execution architecture to use.
 ///
-/// This is a first-class search dimension in autoresearch, allowing direct comparison
+/// This is a first-class workflow architecture option, allowing direct comparison
 /// between traditional deterministic verification and agentic verification approaches.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
@@ -70,7 +70,7 @@ pub enum WorkflowArchitecture {
     /// 5. **Implementer Agent(s)** — makes code changes for assigned DAG subtrees (parallel)
     /// 6. **Verifier Agent(s)** — verifies criteria after each implementer (1:1, isolated)
     ///
-    /// Each agent is independently configurable and measurable via autoresearch,
+    /// Each agent is independently configurable and measurable via the meta-optimizer,
     /// enabling per-agent optimization instead of whole-loop tuning.
     MultiAgentPipeline,
 }
@@ -383,9 +383,12 @@ impl AgenticVerificationResult {
                     contingent_on: Vec::new(),
                 })
                 .collect(),
+            fix_attempts_exhausted: false,
             total_tokens: self.total_tokens,
             total_cost_usd: self.total_cost_usd,
             files_modified: Vec::new(),
+            fix_attempts: 0,
+            ci_auto_resumes: 0,
         }
     }
 
@@ -992,7 +995,7 @@ pub struct LocatedCriterion {
 }
 
 /// Trace record for any agent invocation in the pipeline.
-/// Enables per-agent autoresearch benchmarking and replay.
+/// Enables per-agent benchmarking and replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineAgentTrace {
     /// Which agent type produced this trace.
@@ -1222,6 +1225,9 @@ impl MultiAgentPipelineResult {
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect(),
+            fix_attempts_exhausted: false,
+            fix_attempts: 0,
+            ci_auto_resumes: 0,
         }
     }
 

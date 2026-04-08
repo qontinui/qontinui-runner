@@ -128,7 +128,7 @@ pub fn infer_domain_tags(
         if lower.contains("/orchestrator/") || lower.contains("/workflow") {
             tags.insert("orchestration".to_string());
         }
-        if lower.contains("/meta_optimizer/") || lower.contains("/autoresearch/") {
+        if lower.contains("/meta_optimizer/") {
             tags.insert("meta-optimizer".to_string());
         }
         if lower.contains("/generation/") || lower.contains("generator") {
@@ -149,12 +149,6 @@ pub fn infer_domain_tags(
     }
     if name_lower.contains("refactor") {
         tags.insert("refactoring".to_string());
-    }
-
-    // Infer from category
-    let cat_lower = category.to_lowercase();
-    if cat_lower.contains("autoresearch") {
-        tags.insert("autoresearch".to_string());
     }
 
     // From UI Bridge flag
@@ -260,7 +254,7 @@ pub async fn update_q_routing_table_pg(
     outcome: &WorkflowOutcome,
     composite_score: f64,
 ) -> Result<(), String> {
-    use crate::autoresearch::q_router::{QRouter, TaskState};
+    use crate::routing::q_router::{QRouter, TaskState};
 
     let architecture = match outcome.workflow_architecture.as_deref() {
         Some(arch) if !arch.is_empty() => arch,

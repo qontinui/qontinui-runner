@@ -21,7 +21,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::autoresearch::agentic_verification::{
+use crate::agentic_verification::{
     CodeLocation, LocatedCriterion, PipelineAcceptanceCriterion,
 };
 use crate::orchestrator::structured_output::ConfidenceLevel;

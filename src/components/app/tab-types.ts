@@ -13,7 +13,6 @@ export type MainTabId =
   | "observations"
   | "architecture"
   | "generator-eval"
-  | "autoresearch"
   | "meta-optimizer"
   | "run-recap"
   | "run-actions"
@@ -107,7 +106,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "observations",
   "architecture",
   "generator-eval",
-  "autoresearch",
   "meta-optimizer",
   "run-recap",
   "run-actions",

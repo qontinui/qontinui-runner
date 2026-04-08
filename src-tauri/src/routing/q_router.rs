@@ -1,4 +1,4 @@
-//! Q-learning-based architecture router for autoresearch.
+//! Q-learning-based WorkflowArchitecture router (state -> architecture policy, persisted in PG `q_routing_table`, updated by `orchestrator::learning_recorder::update_q_routing_table_pg`).
 //!
 //! Learns which `WorkflowArchitecture` (Traditional, AgenticVerification,
 //! MultiAgentPipeline) works best for which type of task, replacing global
@@ -22,7 +22,7 @@
 //! Epsilon-greedy: with probability ε pick randomly; otherwise pick argmax_a Q(s,a).
 //! Epsilon auto-decays per state as visits accumulate.
 
-use super::agentic_verification::WorkflowArchitecture;
+use crate::agentic_verification::WorkflowArchitecture;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

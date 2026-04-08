@@ -777,7 +777,7 @@
       "src-tauri/src/unified_workflow_executor/agentic_verification_loop.rs",
       "src-tauri/src/unified_workflow_executor/health_monitor.rs",
       "src-tauri/src/workflow_generation/schema_context.rs",
-      "src-tauri/src/autoresearch/agentic_verification.rs",
+      "src-tauri/src/agentic_verification.rs",
       "src-tauri/src/commands/step_outputs.rs",
       "src-tauri/src/settings.rs"
     ],

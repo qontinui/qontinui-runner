@@ -1,7 +1,7 @@
 //! Shared statistical tests for evaluation, canary verdicts, and comparisons.
 //!
 //! Pure Rust implementations — no external stats crate needed.
-//! Originally in `autoresearch::metrics`, extracted here so meta_optimizer,
+//! Statistical utilities so meta_optimizer,
 //! canary, comparison, and eval systems can all reuse them.
 
 // =============================================================================

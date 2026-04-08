@@ -1,4 +1,4 @@
-//! Model capability profiling for autoresearch.
+//! Model capability profiling.
 //!
 //! Builds model scorecards from historical `phase_token_usage` and `learning_outcomes`
 //! data, enabling cost-per-quality optimization and model comparison.

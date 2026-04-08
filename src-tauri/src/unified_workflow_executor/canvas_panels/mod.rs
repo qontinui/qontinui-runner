@@ -631,17 +631,17 @@ impl CanvasPanelManager {
     pub async fn on_agentic_verification_iteration(
         &mut self,
         iteration: u32,
-        verdict: &crate::autoresearch::agentic_verification::VerificationVerdict,
+        verdict: &crate::agentic_verification::VerificationVerdict,
         worker_summary: Option<&str>,
         verifier_duration_ms: u64,
         worker_duration_ms: u64,
     ) {
         // Build status emoji/indicator
         let status_indicator = match verdict.status {
-            crate::autoresearch::agentic_verification::VerificationStatus::Pass => "PASS",
-            crate::autoresearch::agentic_verification::VerificationStatus::Partial => "PARTIAL",
-            crate::autoresearch::agentic_verification::VerificationStatus::Fail => "FAIL",
-            crate::autoresearch::agentic_verification::VerificationStatus::Unreachable => {
+            crate::agentic_verification::VerificationStatus::Pass => "PASS",
+            crate::agentic_verification::VerificationStatus::Partial => "PARTIAL",
+            crate::agentic_verification::VerificationStatus::Fail => "FAIL",
+            crate::agentic_verification::VerificationStatus::Unreachable => {
                 "UNREACHABLE"
             }
         };
@@ -718,7 +718,7 @@ impl CanvasPanelManager {
     /// of the agentic verification loop.
     pub async fn on_agentic_verification_tracker(
         &mut self,
-        iteration_results: &[crate::autoresearch::agentic_verification::AgenticVerificationIterationResult],
+        iteration_results: &[crate::agentic_verification::AgenticVerificationIterationResult],
     ) {
         if iteration_results.is_empty() {
             return;
@@ -755,7 +755,7 @@ impl CanvasPanelManager {
     /// Called when the agentic verification loop exits.
     pub async fn on_agentic_verification_exit(
         &mut self,
-        result: &crate::autoresearch::agentic_verification::AgenticVerificationResult,
+        result: &crate::agentic_verification::AgenticVerificationResult,
     ) {
         let reason = if result.goal_achieved {
             "Goal achieved"

@@ -110,7 +110,7 @@ pub fn score(inputs: &[SchemaComplianceInput]) -> MetricResult {
 ///
 /// Returns `None` if the trace has no schema validation data (i.e., `schema_valid_first_attempt` is None).
 pub fn compliance_input_from_trace(
-    trace: &crate::autoresearch::agentic_verification::PipelineAgentTrace,
+    trace: &crate::agentic_verification::PipelineAgentTrace,
 ) -> Option<SchemaComplianceInput> {
     let valid_first = trace.schema_valid_first_attempt?;
     let retries = trace.validation_retries.unwrap_or(0).max(0) as u32;
@@ -132,7 +132,7 @@ pub fn compliance_input_from_trace(
 
 /// Extract `SchemaComplianceInput` from all traces that have schema validation data.
 pub fn compliance_inputs_from_traces(
-    traces: &[crate::autoresearch::agentic_verification::PipelineAgentTrace],
+    traces: &[crate::agentic_verification::PipelineAgentTrace],
 ) -> Vec<SchemaComplianceInput> {
     traces
         .iter()

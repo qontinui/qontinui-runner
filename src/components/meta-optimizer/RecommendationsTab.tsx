@@ -381,14 +381,6 @@ export function RecommendationsTab() {
                     </div>
                   )}
 
-                  {/* Model profile link for architecture/config recs */}
-                  {(rec.optimizer_type === "architecture" ||
-                    rec.recommendation_type === "config_change") && (
-                    <p className="text-xs text-zinc-500 italic">
-                      Check Model Profiles in Autoresearch for cost-efficiency data.
-                    </p>
-                  )}
-
                   {/* Outcome details for applied recs */}
                   {rec.status === "applied" &&
                     rec.outcome_after_apply &&

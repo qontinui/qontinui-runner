@@ -1,7 +1,7 @@
 /**
- * TypeScript types for multi-agent pipeline and autoresearch comparison.
+ * TypeScript types for multi-agent pipeline and workflow comparison.
  *
- * Mirrors Rust types from autoresearch/agentic_verification.rs and comparison.rs.
+ * Mirrors Rust types from agentic_verification.rs and comparison.rs.
  */
 
 // ─── Workflow Architecture ──────────────────────────────────────────────────

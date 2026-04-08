@@ -1153,9 +1153,9 @@ pub struct RunUnifiedWorkflowRequest {
     /// When true, creates a new execution_id instead of resuming.
     #[serde(default)]
     force_fresh_start: bool,
-    /// Optional config overrides for autoresearch experiments.
-    /// Applied to the LoopConfig before execution: model, max_iterations,
-    /// multi_agent_mode, max_context_tokens.
+    /// Optional runtime config overrides applied to the LoopConfig before execution:
+    /// model, max_iterations, multi_agent_mode, max_context_tokens,
+    /// workflow_architecture, agentic_verification_config, multi_agent_pipeline_config.
     #[serde(default)]
     overrides: Option<serde_json::Value>,
     /// Arguments to substitute for $ARGUMENTS in slash command workflows.
@@ -1432,7 +1432,7 @@ pub async fn run_unified_workflow(
             false,
         );
 
-        // Apply autoresearch overrides if present
+        // Apply runtime config overrides if present
         if let Some(ref overrides) = request.overrides {
             if let Some(model) = overrides.get("model").and_then(|v| v.as_str()) {
                 loop_config.model_override = Some(model.to_string());
@@ -1448,7 +1448,7 @@ pub async fn run_unified_workflow(
             }
             if let Some(arch) = overrides.get("workflow_architecture") {
                 if let Ok(parsed) = serde_json::from_value::<
-                    crate::autoresearch::agentic_verification::WorkflowArchitecture,
+                    crate::agentic_verification::WorkflowArchitecture,
                 >(arch.clone())
                 {
                     loop_config.workflow_architecture = Some(parsed);
@@ -1456,7 +1456,7 @@ pub async fn run_unified_workflow(
             }
             if let Some(av_config) = overrides.get("agentic_verification_config") {
                 if let Ok(parsed) = serde_json::from_value::<
-                    crate::autoresearch::agentic_verification::AgenticVerificationConfig,
+                    crate::agentic_verification::AgenticVerificationConfig,
                 >(av_config.clone())
                 {
                     loop_config.agentic_verification_config = Some(parsed);
@@ -1464,7 +1464,7 @@ pub async fn run_unified_workflow(
             }
             if let Some(map_config) = overrides.get("multi_agent_pipeline_config") {
                 if let Ok(parsed) = serde_json::from_value::<
-                    crate::autoresearch::agentic_verification::MultiAgentPipelineConfig,
+                    crate::agentic_verification::MultiAgentPipelineConfig,
                 >(map_config.clone())
                 {
                     loop_config.multi_agent_pipeline_config = Some(parsed);
@@ -1476,10 +1476,7 @@ pub async fn run_unified_workflow(
             if let Some(raf) = overrides.get("run_agentic_first").and_then(|v| v.as_bool()) {
                 loop_config.run_agentic_first = raf;
             }
-            info!(
-                "Applied autoresearch overrides to loop_config: {}",
-                overrides
-            );
+            info!("Applied runtime config overrides to loop_config: {}", overrides);
         }
 
         let execution_id_for_guard = execution_id.clone();
@@ -2007,7 +2004,7 @@ pub async fn execute_inline_workflow(
             }
             if let Some(arch) = overrides.get("workflow_architecture") {
                 if let Ok(parsed) = serde_json::from_value::<
-                    crate::autoresearch::agentic_verification::WorkflowArchitecture,
+                    crate::agentic_verification::WorkflowArchitecture,
                 >(arch.clone())
                 {
                     loop_config.workflow_architecture = Some(parsed);
@@ -2015,7 +2012,7 @@ pub async fn execute_inline_workflow(
             }
             if let Some(av_config) = overrides.get("agentic_verification_config") {
                 if let Ok(parsed) = serde_json::from_value::<
-                    crate::autoresearch::agentic_verification::AgenticVerificationConfig,
+                    crate::agentic_verification::AgenticVerificationConfig,
                 >(av_config.clone())
                 {
                     loop_config.agentic_verification_config = Some(parsed);
@@ -2023,7 +2020,7 @@ pub async fn execute_inline_workflow(
             }
             if let Some(map_config) = overrides.get("multi_agent_pipeline_config") {
                 if let Ok(parsed) = serde_json::from_value::<
-                    crate::autoresearch::agentic_verification::MultiAgentPipelineConfig,
+                    crate::agentic_verification::MultiAgentPipelineConfig,
                 >(map_config.clone())
                 {
                     loop_config.multi_agent_pipeline_config = Some(parsed);

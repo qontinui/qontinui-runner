@@ -65,7 +65,7 @@ pub struct ComparisonRun {
     /// Meta-optimizer recommendation ID (if created from comparison bridge).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommendation_id: Option<String>,
-    /// How this comparison was triggered: "manual", "meta_optimizer", "autoresearch".
+    /// How this comparison was triggered: "manual", "meta_optimizer".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -260,7 +260,7 @@ pub fn build_structured_report(entries: &[ComparisonEntry]) -> Option<Structured
         cost_breakdown,
         winner,
         confidence,
-        p_value: None, // Requires multiple trials per variant (future: aggregate from autoresearch)
+        p_value: None, // Requires multiple trials per variant
     })
 }
 

@@ -228,7 +228,7 @@ pub fn get_default_agent_prompt(agent_type: &str) -> String {
 Output JSON array with: criterion_id, spec_assertion_id, description, target_files, related_files, confidence."#.to_string()
         }
         "verifier" | "verification" => {
-            crate::autoresearch::agentic_verification::AgenticVerificationPrompts::verifier_system_prompt(
+            crate::agentic_verification::AgenticVerificationPrompts::verifier_system_prompt(
                 "{goal}",
                 None,
             )

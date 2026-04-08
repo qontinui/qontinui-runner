@@ -880,7 +880,7 @@ impl AgenticExecutor {
         let is_pipeline = matches!(
             config.workflow_architecture,
             Some(
-                crate::autoresearch::agentic_verification::WorkflowArchitecture::MultiAgentPipeline
+                crate::agentic_verification::WorkflowArchitecture::MultiAgentPipeline
             )
         );
         let enhanced_prompt = if !is_pipeline {

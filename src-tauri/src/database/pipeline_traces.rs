@@ -6,7 +6,7 @@
 
 use tracing::debug;
 
-use crate::autoresearch::agentic_verification::{PipelineAgentTrace, PipelineCheckpoint};
+use crate::agentic_verification::{PipelineAgentTrace, PipelineCheckpoint};
 
 /// Save a batch of pipeline agent traces from a completed pipeline run.
 pub fn save_pipeline_agent_traces(

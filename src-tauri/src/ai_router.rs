@@ -512,15 +512,15 @@ pub fn model_for_tier(tier: crate::orchestrator::agent_roles::ModelTier) -> Stri
 /// Returns the model ID string (e.g., "claude-sonnet-4-20250514").
 pub fn route_with_learning(
     context: &TaskContext,
-    phase_router: Option<&crate::autoresearch::model_q_router::PhaseModelRouter>,
+    phase_router: Option<&crate::routing::model_q_router::PhaseModelRouter>,
     routing_config: &RoutingConfig,
 ) -> String {
     // If we have a phase router and phase context, try Q-table first
     if let (Some(router), Some(phase)) = (phase_router, context.phase.as_deref()) {
         // Build TaskState from context (need domain_tags and complexity_tier)
         // For now, use a simplified state based on prompt characteristics
-        let state = crate::autoresearch::q_router::TaskState {
-            primary_domain: crate::autoresearch::q_router::Domain::Backend, // default
+        let state = crate::routing::q_router::TaskState {
+            primary_domain: crate::routing::q_router::Domain::Backend, // default
             complexity: infer_complexity_tier(context, routing_config),
             has_ui_component: context.prompt.to_lowercase().contains("ui-bridge")
                 || context.prompt.to_lowercase().contains("sdk"),
@@ -547,13 +547,13 @@ pub fn route_with_learning(
 fn infer_complexity_tier(
     context: &TaskContext,
     config: &RoutingConfig,
-) -> crate::autoresearch::q_router::ComplexityTier {
+) -> crate::routing::q_router::ComplexityTier {
     let router = TaskRouter::new(config.clone());
     let assessment = router.assess_and_route(context);
     match assessment.complexity {
-        TaskComplexity::Simple => crate::autoresearch::q_router::ComplexityTier::Simple,
-        TaskComplexity::Medium => crate::autoresearch::q_router::ComplexityTier::Moderate,
-        TaskComplexity::Complex => crate::autoresearch::q_router::ComplexityTier::Complex,
+        TaskComplexity::Simple => crate::routing::q_router::ComplexityTier::Simple,
+        TaskComplexity::Medium => crate::routing::q_router::ComplexityTier::Moderate,
+        TaskComplexity::Complex => crate::routing::q_router::ComplexityTier::Complex,
     }
 }
 

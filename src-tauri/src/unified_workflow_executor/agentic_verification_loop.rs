@@ -258,7 +258,7 @@ impl IterationHistory {
 fn extract_iteration_summary(
     iteration: u32,
     worker_summary: Option<&str>,
-    verdict: &crate::autoresearch::agentic_verification::VerificationVerdict,
+    verdict: &crate::agentic_verification::VerificationVerdict,
     prev_confidence: f64,
 ) -> IterationSummary {
     // Extract approach: first two lines of worker summary, truncated to 100 chars
@@ -347,7 +347,7 @@ impl LoopController {
         _all_step_results: &mut Vec<crate::step_executor::StepExecutionResult>,
         logger: &StepEventLogger,
     ) -> LoopResult {
-        use crate::autoresearch::agentic_verification::*;
+        use crate::agentic_verification::*;
 
         let av_config = config
             .agentic_verification_config
@@ -1368,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_extract_iteration_summary_basic() {
-        use crate::autoresearch::agentic_verification::*;
+        use crate::agentic_verification::*;
         let verdict = VerificationVerdict {
             status: VerificationStatus::Fail,
             confidence: 0.3,
@@ -1392,7 +1392,7 @@ mod tests {
 
     #[test]
     fn test_extract_iteration_summary_no_worker() {
-        use crate::autoresearch::agentic_verification::*;
+        use crate::agentic_verification::*;
         let verdict = VerificationVerdict {
             status: VerificationStatus::Pass,
             confidence: 0.9,
@@ -1409,7 +1409,7 @@ mod tests {
 
     #[test]
     fn test_extract_iteration_summary_truncates_long_approach() {
-        use crate::autoresearch::agentic_verification::*;
+        use crate::agentic_verification::*;
         let verdict = VerificationVerdict {
             status: VerificationStatus::Partial,
             confidence: 0.5,

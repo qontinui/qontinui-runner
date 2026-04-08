@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, info_span, warn};
 
-use crate::autoresearch::agentic_verification::*;
+use crate::agentic_verification::*;
 use crate::orchestrator::contract_validator::ContractValidator;
 use crate::orchestrator::contracts::{
     ImplementerOutput, LocatorOutput, SpecAnalystOutput, VerifierOutput,
@@ -491,7 +491,7 @@ impl LoopController {
     /// 7. Runs integration verification to catch cross-subtree regressions
     ///
     /// Each agent produces a typed, serialized trace (PipelineAgentTrace) that
-    /// enables per-agent autoresearch benchmarking and replay.
+    /// enables per-agent benchmarking and replay.
     pub(super) async fn run_multi_agent_pipeline_loop(
         &self,
         config: &mut LoopConfig,
@@ -1158,7 +1158,7 @@ Only output the JSON array, nothing else."#,
 
         // Guardrail: check locator output quality before proceeding to implementer
         {
-            use crate::autoresearch::agentic_verification::guardrail_locator_output_schema;
+            use crate::agentic_verification::guardrail_locator_output_schema;
             let locator_check = guardrail_locator_output_schema(&serde_json::json!({
                 "located_criteria_count": located_criteria.len(),
             }));
@@ -1175,7 +1175,7 @@ Only output the JSON array, nothing else."#,
 
         // Guardrail: check token budget before entering implementation loop
         {
-            use crate::autoresearch::agentic_verification::guardrail_token_budget;
+            use crate::agentic_verification::guardrail_token_budget;
             let tokens_so_far: u64 = agent_traces
                 .iter()
                 .map(|t| t.tokens_in as u64 + t.tokens_out as u64)
@@ -1895,7 +1895,7 @@ impl PipelineShared {
 
                 // Build structured handoff context: locator -> implementer
                 let mut implementer_handoff =
-                    crate::autoresearch::agentic_verification::HandoffContext {
+                    crate::agentic_verification::HandoffContext {
                         from_agent: "locator".to_string(),
                         to_agent: "implementer".to_string(),
                         payload: serde_json::json!({
@@ -1913,7 +1913,7 @@ impl PipelineShared {
 
                 // Guardrail: validate handoff payload before passing to implementer
                 let handoff_check =
-                    crate::autoresearch::agentic_verification::guardrail_handoff_payload_present(
+                    crate::agentic_verification::guardrail_handoff_payload_present(
                         &implementer_handoff,
                     );
                 implementer_handoff.validated = !handoff_check.tripwire_triggered;
@@ -2127,7 +2127,7 @@ impl PipelineShared {
                 let verifier_duration = verifier_start.elapsed().as_millis() as u64;
 
                 // Build structured handoff context: implementer -> verifier
-                let verifier_handoff = crate::autoresearch::agentic_verification::HandoffContext {
+                let verifier_handoff = crate::agentic_verification::HandoffContext {
                     from_agent: "implementer".to_string(),
                     to_agent: "verifier".to_string(),
                     payload: serde_json::json!({
@@ -2146,7 +2146,7 @@ impl PipelineShared {
                     "results": level_criterion_results.len(),
                 });
                 let verdict_check =
-                    crate::autoresearch::agentic_verification::guardrail_verifier_verdict(
+                    crate::agentic_verification::guardrail_verifier_verdict(
                         &verifier_output_json,
                     );
                 let mut verifier_guardrails = vec![];

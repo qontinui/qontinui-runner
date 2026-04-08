@@ -73,11 +73,6 @@ pub struct GenericLimitQuery {
     pub limit: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AutoresearchQuery {
-    pub limit: Option<u32>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct OptimizerContext {
     pub context: String,
@@ -828,25 +823,6 @@ pub async fn get_prompt_analysis_handler(
     Query(_query): Query<GenericLimitQuery>,
 ) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
     Ok(Json(ApiResponse::success(vec![])))
-}
-
-/// GET /autoresearch/campaigns?limit=N
-///
-/// Returns autoresearch campaign data with their experiments.
-pub async fn get_autoresearch_campaigns_handler(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<AutoresearchQuery>,
-) -> Result<Json<ApiResponse<Vec<serde_json::Value>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let limit = query.limit.unwrap_or(50) as i64;
-
-    let campaigns = state
-        .app_state
-        .pg_db
-        .get_autoresearch_campaigns_with_experiments(limit)
-        .await
-        .unwrap_or_default();
-
-    Ok(Json(ApiResponse::success(campaigns)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1714,10 +1690,6 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
             get(get_generation_feedback_handler),
         )
         .route("/prompt-analysis", get(get_prompt_analysis_handler))
-        .route(
-            "/autoresearch/campaigns",
-            get(get_autoresearch_campaigns_handler),
-        )
         .route(
             "/meta-optimizer/reflection-fixes",
             get(get_reflection_fixes_handler),

@@ -95,11 +95,6 @@ export function RunnerPageContext({ activeTab }: { activeTab: MainTabId }) {
         section: "tools",
         breadcrumb: ["Tools", "Generator Eval"],
       },
-      autoresearch: {
-        name: "Autoresearch",
-        section: "observe",
-        breadcrumb: ["Observe", "Autoresearch"],
-      },
       "meta-optimizer": {
         name: "Meta-Optimizer",
         section: "observe",

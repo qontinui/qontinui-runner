@@ -704,7 +704,7 @@ impl LoopController {
 
         // Emit pipeline agent trace for the verification phase
         {
-            let trace = crate::autoresearch::agentic_verification::PipelineAgentTrace {
+            let trace = crate::agentic_verification::PipelineAgentTrace {
                 agent_type: "verification".to_string(),
                 agent_id: format!("verifier_iter{}", ctx.iteration),
                 run_id: config.execution_id.clone(),
@@ -1915,7 +1915,7 @@ impl LoopController {
         // pipeline_agent_traces for meta-optimizer analysis — works for
         // traditional architecture, not just MultiAgentPipeline).
         {
-            let trace = crate::autoresearch::agentic_verification::PipelineAgentTrace {
+            let trace = crate::agentic_verification::PipelineAgentTrace {
                 agent_type: "agentic_fixer".to_string(),
                 agent_id: format!("fixer_iter{}", ctx.iteration),
                 run_id: config.execution_id.clone(),

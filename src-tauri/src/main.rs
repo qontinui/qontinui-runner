@@ -15,9 +15,9 @@ mod ai_provider;
 pub mod api_config;
 mod ai_router;
 mod ai_workflows;
+mod agentic_verification;
 mod api_request;
 mod auth;
-mod autoresearch;
 mod backup;
 mod check_executor;
 mod check_generation;
@@ -88,6 +88,7 @@ mod recording;
 mod reflection;
 mod restate;
 mod rework;
+mod routing;
 mod runtime_env;
 mod safe_lock;
 mod saved_api_requests;
@@ -392,9 +393,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .manage(instance_manager) // For multi-instance management (dev feature)
         .manage(session_manager) // For interactive AI session commands
         .manage(terminal_manager) // For embedded PTY terminal sessions
-        .manage(std::sync::Arc::new(
-            tokio::sync::Mutex::new(autoresearch::engine::ResearchEngine::new()),
-        ) as autoresearch::commands::SharedResearchEngine) // Autoresearch experiment engine
         .manage(tokio::sync::Mutex::new(
             qontinui_runner_lib::accessibility::AccessibilityManager::default(),
         )) // Native cross-platform accessibility API
@@ -1115,29 +1113,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             orchestration_loop::commands::stop_all_orchestration_loops,
             orchestration_loop::commands::get_multi_orchestration_loop_status,
             orchestration_loop::commands::signal_orchestration_restart_by_id,
-            // Autoresearch commands (autonomous workflow optimization loop)
-            autoresearch::commands::start_autoresearch,
-            autoresearch::commands::stop_autoresearch,
-            autoresearch::commands::get_autoresearch_status,
-            autoresearch::commands::get_autoresearch_results,
-            autoresearch::commands::get_autoresearch_results_tsv,
-            autoresearch::commands::get_autoresearch_campaign_history,
-            autoresearch::commands::get_autoresearch_campaign_experiments,
-            autoresearch::commands::list_unified_workflows,
-            autoresearch::commands::list_worktree_records,
-            autoresearch::commands::get_worktree_diff,
-            autoresearch::commands::merge_worktree_branch,
-            autoresearch::commands::remove_worktree_branch,
-            autoresearch::commands::compare_worktree_branches,
-            autoresearch::commands::rerun_autoresearch_campaign,
-            autoresearch::commands::compare_autoresearch_campaigns,
-            autoresearch::commands::get_q_routing_table,
-            autoresearch::commands::get_q_routing_policy,
-            autoresearch::commands::get_q_routing_stats,
-            autoresearch::commands::get_q_routing_overrides,
-            autoresearch::commands::set_q_routing_override,
-            autoresearch::commands::remove_q_routing_override,
-            autoresearch::commands::reset_q_routing_table,
             // Orchestration loop saved config CRUD
             commands::orchestration_loop_configs::ol_list_configs,
             commands::orchestration_loop_configs::ol_get_config,
