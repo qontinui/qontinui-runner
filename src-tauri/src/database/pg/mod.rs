@@ -612,6 +612,51 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE step_credit_assignments ADD COLUMN IF NOT EXISTS cost_efficiency_signal DOUBLE PRECISION;
         "#,
     },
+    Migration {
+        version: 12,
+        description: "Drop 10 SQLite-era orphan tables that are empty in live and have zero Rust references",
+        sql: r#"
+            -- All 10 tables were created by the original SQLite -> PG one-shot
+            -- migration, became dead code when the features that used them
+            -- were deleted or rewritten, and have survived as empty tables
+            -- because CREATE TABLE IF NOT EXISTS in ensure_tables is additive
+            -- only. Each table was verified individually as:
+            --   (a) 0 rows in the live dev database, and
+            --   (b) 0 references in qontinui-runner/src-tauri/src/** outside
+            --       the v10 TIMESTAMPTZ migration's defensive drift list
+            --       (which is idempotent and skips missing tables).
+            -- The v10 DO block already skips missing tables, so no cleanup
+            -- of v10 is required — re-running v10 after v12 is a no-op for
+            -- these rows.
+            --
+            -- Feature-origin notes (for future archaeology):
+            --   api_credentials, api_request_logs — never-shipped API key
+            --     management UI, superseded by env-var-based settings.
+            --   context_summaries — replaced by task_knowledge_summaries.
+            --   decomposition_plans, decomposition_subtasks — PentAGI-style
+            --     task decomposition that was scoped but never implemented
+            --     (see proj_pentagi_integration memory). Zero code refs.
+            --   generator_benchmarks, generator_benchmark_results — removed
+            --     during the generator eval rewrite (PR 1 in the recent
+            --     spawn-test session deleted /generator-eval/benchmarks).
+            --   rule_applications — dead from an earlier rules engine
+            --     superseded by graph_engine_pg.
+            --   schema_version — SQLite-era migration tracker, replaced by
+            --     schema_migrations (live DB has both; schema_migrations is
+            --     the one currently in use).
+            --   ui_bridge_state_groups — never-shipped state grouping UI.
+            DROP TABLE IF EXISTS api_credentials CASCADE;
+            DROP TABLE IF EXISTS api_request_logs CASCADE;
+            DROP TABLE IF EXISTS context_summaries CASCADE;
+            DROP TABLE IF EXISTS decomposition_subtasks CASCADE;
+            DROP TABLE IF EXISTS decomposition_plans CASCADE;
+            DROP TABLE IF EXISTS generator_benchmark_results CASCADE;
+            DROP TABLE IF EXISTS generator_benchmarks CASCADE;
+            DROP TABLE IF EXISTS rule_applications CASCADE;
+            DROP TABLE IF EXISTS schema_version CASCADE;
+            DROP TABLE IF EXISTS ui_bridge_state_groups CASCADE;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
