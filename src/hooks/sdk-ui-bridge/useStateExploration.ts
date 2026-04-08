@@ -269,8 +269,14 @@ export function useStateExploration(
                     const screenshotEntry = {
                       captureIndex: session.captureScreenshots.length,
                       screenshotBase64: ssJson.data.screenshot,
-                      width: Math.round((ssJson.data.width || 1920) * dpr),
-                      height: Math.round((ssJson.data.height || 1080) * dpr),
+                      // ssJson.data.width/height are already in physical pixels
+                      // (xcap returns image.width()/height()). Element bounds above
+                      // ARE multiplied by dpr because the SDK reports them in CSS
+                      // pixels — but the screenshot dims are not. Multiplying by
+                      // dpr here would store metadata at 1.5x the actual stored
+                      // bytes on HiDPI displays.
+                      width: Math.round(ssJson.data.width || 1920),
+                      height: Math.round(ssJson.data.height || 1080),
                       elementBoundsJson: JSON.stringify(currentPageBounds),
                       fingerprintHashesJson: JSON.stringify([...currentPageHashes]),
                       capturedAt: new Date().toISOString(),

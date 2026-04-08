@@ -265,6 +265,22 @@ pub async fn sm_delete_capture_screenshots(
     app_state.pg_db.delete_capture_screenshots(&config_id).await
 }
 
+/// One-shot backfill that rewrites every `sm_capture_screenshots` row's
+/// `width`/`height` from the actual decoded WebP dimensions. Fixes rows
+/// written before the dimension-fix landed (frontend was multiplying physical
+/// pixel dims by device-pixel-ratio a second time).
+///
+/// Returns `(scanned, rewritten)`.
+#[tauri::command]
+pub async fn sm_backfill_capture_screenshot_dimensions(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<(usize, usize), String> {
+    app_state
+        .pg_db
+        .backfill_capture_screenshot_dimensions()
+        .await
+}
+
 // =============================================================================
 // Static Analysis Generation
 // =============================================================================

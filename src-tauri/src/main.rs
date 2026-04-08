@@ -95,6 +95,7 @@ mod saved_api_requests;
 mod scheduler;
 mod scheduler_service;
 mod schema_registry;
+mod screen;
 mod secure_storage;
 mod security;
 mod semantic_conventions;
@@ -159,6 +160,10 @@ fn main() {
 
     // Initialize lifecycle debugging BEFORE anything else
     debug_lifecycle::init_lifecycle_debug();
+
+    // Per-monitor DPI awareness must be set before any screen capture
+    // (Windows: PROCESS_PER_MONITOR_DPI_AWARE_V2). No-op on macOS/Linux.
+    screen::ensure_dpi_awareness();
 
     let result = std::panic::catch_unwind(run_app);
 
@@ -380,8 +385,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
+    // Skip the window-state plugin for secondary instances. The plugin
+    // persists `window-state.json` to a path derived from the bundle
+    // identifier, which is shared by every spawned instance — so a saved
+    // off-screen / minimized geometry from any prior session would be
+    // restored for fresh test runners. WebView2 throttles JS execution for
+    // off-screen / minimized windows, which is one of the failure modes
+    // that made `spawn-test` produce runners whose UI Bridge snapshot
+    // hung at "Frontend did not become ready within 10s".
+    if !is_secondary_instance {
+        builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+    }
+
     let app = builder
-        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -671,6 +687,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine_configs::sm_get_capture_screenshot_image,
             commands::state_machine_configs::sm_move_pending_screenshots,
             commands::state_machine_configs::sm_delete_capture_screenshots,
+            commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
             commands::state_machine_configs::sm_generate_static,
             // State Explorer commands
             commands::state_explorer::start_exploration,
@@ -1268,6 +1285,49 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
+
+            // Secondary instances (spawned via the supervisor's `spawn-test`)
+            // need their own isolated WebView2 user-data folder so they don't
+            // collide with the primary's locked profile, AND need to be
+            // forced on-screen / unminimized regardless of any window-state
+            // restoration that may have leaked through. The supervisor sets
+            // WEBVIEW2_USER_DATA_FOLDER per spawned runner, but Tauri / wry
+            // does not honor that env var implicitly — we must apply it via
+            // WebviewWindowBuilder::data_directory(). For now we use the
+            // simpler post-create defensive path: rebuild the main window if
+            // an isolated profile is requested.
+            //
+            // The defensive show / unminimize / set_position is unconditional
+            // for secondaries — multi-monitor users can have stale geometry
+            // pointing at a disconnected monitor, and WebView2 throttles JS
+            // execution for windows with zero monitor intersection, which
+            // looks identical to "Frontend never became ready".
+            if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {
+                use tauri::{LogicalPosition, LogicalSize, Manager};
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.unminimize();
+                    let _ = win.set_position(LogicalPosition::new(100.0, 100.0));
+                    let _ = win.set_size(LogicalSize::new(1400.0, 900.0));
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                    info!("Secondary instance: forced main window on-screen at (100,100) 1400x900");
+                }
+                if let Ok(dir) = std::env::var("WEBVIEW2_USER_DATA_FOLDER") {
+                    // Ensure the directory exists so WebView2 can populate it
+                    // on first navigation. Tauri's existing CoreWebView2
+                    // initialization will use the env var on Windows when
+                    // it's set before the first navigation, but we have
+                    // already created the window — log this so we know
+                    // whether the env var actually took effect during
+                    // startup ordering and whether a follow-up patch needs
+                    // to move data_directory() into the builder phase.
+                    let _ = std::fs::create_dir_all(&dir);
+                    info!(
+                        "Secondary instance: WEBVIEW2_USER_DATA_FOLDER={} (ensured exists)",
+                        dir
+                    );
+                }
+            }
 
             // SQLite→PG data migration removed (migration complete, PG is primary)
 

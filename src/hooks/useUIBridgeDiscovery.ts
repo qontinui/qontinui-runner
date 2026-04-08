@@ -424,8 +424,13 @@ async function captureFallbackScreenshot(
     if (!ssJson.success || !ssJson.data?.screenshot) return;
 
     const dpr = ssJson.data.scaleFactor || 1;
-    const imgW = (ssJson.data.width || 1920) * dpr;
-    const imgH = (ssJson.data.height || 1080) * dpr;
+    // ssJson.data.width/height are already in physical pixels (xcap returns
+    // image.width()/height()). The element bounds below ARE multiplied by
+    // dpr because the SDK reports them in CSS pixels — but the screenshot
+    // dims must NOT be multiplied again. Doing so was the source of the
+    // 1.5x metadata-vs-bytes mismatch on HiDPI displays.
+    const imgW = ssJson.data.width || 1920;
+    const imgH = ssJson.data.height || 1080;
 
     // Build a hash→rect map from live snapshot elements (actual bounding boxes)
     const liveBounds = new Map<string, { x: number; y: number; width: number; height: number }>();

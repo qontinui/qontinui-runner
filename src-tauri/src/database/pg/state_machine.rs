@@ -828,20 +828,49 @@ impl PgDb {
             )
             .map_err(|e| format!("Failed to decode screenshot base64: {}", e))?;
 
-            let webp_bytes = match image::load_from_memory(&png_bytes) {
+            // Decode the PNG so we can authoritatively know the captured
+            // dimensions. Frontend callers historically multiplied
+            // ssJson.data.width by the device-pixel-ratio twice, producing
+            // metadata that was 1.5x the actual stored bytes on HiDPI
+            // displays. We always trust the decoded image and log a warning
+            // if the caller's claim disagrees.
+            let (decoded_w, decoded_h, webp_bytes) = match image::load_from_memory(&png_bytes) {
                 Ok(img) => {
+                    let dw = img.width() as i32;
+                    let dh = img.height() as i32;
                     let mut buf = std::io::Cursor::new(Vec::new());
-                    match img.write_to(&mut buf, image::ImageFormat::WebP) {
+                    let bytes = match img.write_to(&mut buf, image::ImageFormat::WebP) {
                         Ok(()) => buf.into_inner(),
                         Err(_) => png_bytes.clone(),
-                    }
+                    };
+                    (dw, dh, bytes)
                 }
-                Err(_) => png_bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        "save_capture_screenshots: failed to decode PNG ({}); falling back to client dims {}x{} for config {}",
+                        e,
+                        ss.width,
+                        ss.height,
+                        config_id
+                    );
+                    (ss.width as i32, ss.height as i32, png_bytes)
+                }
             };
 
+            if ss.width as i32 != decoded_w || ss.height as i32 != decoded_h {
+                tracing::warn!(
+                    "save_capture_screenshots: client-supplied dims {}x{} disagree with decoded {}x{} for config {} (storing decoded dims)",
+                    ss.width,
+                    ss.height,
+                    decoded_w,
+                    decoded_h,
+                    config_id
+                );
+            }
+
             let capture_index = ss.capture_index as i32;
-            let width = ss.width as i32;
-            let height = ss.height as i32;
+            let width = decoded_w;
+            let height = decoded_h;
 
             conn.execute(
                 r#"INSERT INTO sm_capture_screenshots
@@ -869,6 +898,80 @@ impl PgDb {
             config_id
         );
         Ok(count)
+    }
+
+    /// One-shot backfill: walk every row in `sm_capture_screenshots`, decode
+    /// the stored WebP, and rewrite `width`/`height` from the actual image
+    /// dimensions. Pre-fix rows on HiDPI displays were stored at 1.5x the
+    /// actual bytes due to a frontend double-multiply by device-pixel-ratio.
+    ///
+    /// Returns `(scanned, rewritten)`. Safe to run multiple times — rows that
+    /// already match are left untouched.
+    pub async fn backfill_capture_screenshot_dimensions(
+        &self,
+    ) -> Result<(usize, usize), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                "SELECT id, screenshot_webp, width, height FROM sm_capture_screenshots",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG backfill select: {}", e))?;
+
+        let mut scanned = 0usize;
+        let mut rewritten = 0usize;
+
+        for row in &rows {
+            scanned += 1;
+            let id: String = row.get(0);
+            let bytes: Vec<u8> = row.get(1);
+            let old_w: i32 = row.get(2);
+            let old_h: i32 = row.get(3);
+
+            let img = match image::load_from_memory(&bytes) {
+                Ok(img) => img,
+                Err(e) => {
+                    tracing::warn!("backfill: row {} failed to decode: {}", id, e);
+                    continue;
+                }
+            };
+            let new_w = img.width() as i32;
+            let new_h = img.height() as i32;
+
+            if new_w == old_w && new_h == old_h {
+                continue;
+            }
+
+            conn.execute(
+                "UPDATE sm_capture_screenshots SET width = $1, height = $2 WHERE id = $3",
+                &[&new_w, &new_h, &id],
+            )
+            .await
+            .map_err(|e| format!("PG backfill update {}: {}", id, e))?;
+
+            rewritten += 1;
+            tracing::info!(
+                "backfill_capture_screenshot_dimensions: row {} {}x{} -> {}x{}",
+                id,
+                old_w,
+                old_h,
+                new_w,
+                new_h
+            );
+        }
+
+        tracing::info!(
+            "backfill_capture_screenshot_dimensions: scanned={} rewritten={}",
+            scanned,
+            rewritten
+        );
+        Ok((scanned, rewritten))
     }
 
     /// Get capture screenshot metadata (without image data).
