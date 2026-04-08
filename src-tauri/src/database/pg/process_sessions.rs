@@ -370,12 +370,20 @@ impl PgDb {
             .collect())
     }
 
-    /// Mark any sessions still in 'running' state as 'failed'. Called on
-    /// runner startup — sessions in this state can only exist if a previous
-    /// runner died without a clean shutdown (the event_loop normally updates
-    /// state on natural exit). Without this, the UI shows zombie "running"
-    /// sessions from previous runs forever.
-    pub async fn mark_orphaned_running_sessions_as_failed(&self) -> Result<u32, String> {
+    /// Mark any sessions still in 'running' state AND started before
+    /// `started_before` as 'failed'. Called on runner startup — sessions in
+    /// this state can only exist if a previous runner died without a clean
+    /// shutdown (the event_loop normally updates state on natural exit).
+    /// Without this, the UI shows zombie "running" sessions forever.
+    ///
+    /// The `started_before` cutoff protects against a race where new sessions
+    /// are being created by the current runner's event_loop concurrently with
+    /// this cleanup call — those sessions will have `started_at >=` the
+    /// runner's startup time and will be excluded.
+    pub async fn mark_orphaned_running_sessions_as_failed(
+        &self,
+        started_before: &str,
+    ) -> Result<u64, String> {
         let conn = self
             .pool
             .get()
@@ -388,13 +396,14 @@ impl PgDb {
                 "UPDATE process_sessions \
                  SET state = 'failed', \
                      stopped_at = COALESCE(stopped_at, $1::timestamptz) \
-                 WHERE state = 'running'",
-                &[&now],
+                 WHERE state = 'running' \
+                   AND started_at < $2::timestamptz",
+                &[&now, &started_before],
             )
             .await
             .map_err(|e| format!("PG mark_orphaned_running_sessions_as_failed: {}", e))?;
 
-        Ok(affected as u32)
+        Ok(affected)
     }
 
     /// Delete process sessions (and their output via CASCADE) older than the

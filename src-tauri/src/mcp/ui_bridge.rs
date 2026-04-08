@@ -1096,21 +1096,36 @@ pub async fn ui_bridge_discover_handler(
                     let last_pong = state
                         .ui_bridge_last_pong
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    // direct_webview_evaluate_with_result returns the JSON-encoded
-                    // string of the evaluated value.
-                    let body_text_present = direct_webview_evaluate_with_result(
-                        &state,
-                        "document.body && document.body.innerText.length > 100",
+
+                    // direct_webview_evaluate_with_result returns the
+                    // JSON-encoded string of the evaluated value. Wrap each
+                    // call in a short timeout so a broken frontend doesn't
+                    // stall the diagnostics block (which is emitted precisely
+                    // when the frontend may be broken).
+                    let diag_timeout = std::time::Duration::from_millis(500);
+
+                    let body_text_present = tokio::time::timeout(
+                        diag_timeout,
+                        direct_webview_evaluate_with_result(
+                            &state,
+                            "document.body && document.body.innerText.length > 100",
+                        ),
                     )
                     .await
                     .ok()
-                    .map(|s| s == "true")
-                    .unwrap_or(false);
-                    let title = direct_webview_evaluate_with_result(&state, "document.title")
-                        .await
-                        .ok()
-                        .map(|s| s.trim_matches('"').to_string())
-                        .unwrap_or_default();
+                    .and_then(|r| r.ok())
+                    .map(|s| s.trim() == "true");
+
+                    let title = tokio::time::timeout(
+                        diag_timeout,
+                        direct_webview_evaluate_with_result(&state, "document.title"),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    // The result is JSON-encoded (e.g. `"Qontinui Runner"`),
+                    // so parse it as a JSON string to get the raw text.
+                    .and_then(|s| serde_json::from_str::<String>(&s).ok());
 
                     obj.insert(
                         "diagnostics".to_string(),
@@ -2198,10 +2213,8 @@ pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!(
-        "UI Bridge API: Page evaluate ({}...)",
-        &request.expression[..request.expression.len().min(80)]
-    );
+    let preview: String = request.expression.chars().take(80).collect();
+    info!("UI Bridge API: Page evaluate ({}...)", preview);
 
     let payload = serde_json::json!({ "expression": request.expression });
 
@@ -2461,29 +2474,14 @@ pub async fn ui_bridge_page_evaluate_safe_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!(
-        "UI Bridge API: Safe evaluate ({}...)",
-        &request.expression[..request.expression.len().min(80)]
-    );
+    let preview: String = request.expression.chars().take(80).collect();
+    info!("UI Bridge API: Safe evaluate ({}...)", preview);
 
+    // `safe_evaluate` already converts JS errors to Err(String), so there's
+    // no nested `{ success: false }` to unwrap on the Ok branch — any value
+    // returned there is the user's legitimate JS return value.
     match safe_evaluate(&state, &format!("return {}", request.expression)).await {
-        Ok(data) => {
-            // SDK may return success:false for JS errors — surface as HTTP 400
-            // so callers can distinguish "your expression threw" from "the
-            // bridge worked and returned this value".
-            if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
-                let error_msg = data
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "JS evaluation failed".to_string());
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(api_error(format!("JS evaluation error: {}", error_msg))),
-                ));
-            }
-            Ok(Json(ApiResponse::success(data)))
-        }
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(api_error(format!("JS evaluation error: {}", e))),
@@ -4240,7 +4238,8 @@ pub async fn ui_bridge_wait_for_element_handler(
 /// - `caseInsensitive` (bool, default false) — match without regard to case
 ///
 /// Returns 200 with `{ found: true, elapsed_ms, polls }` on success or
-/// 408 Request Timeout with the same fields on failure.
+/// 408 Request Timeout with a descriptive error message on timeout.
+/// Returns 500 if transport errors persist across 3 consecutive polls.
 pub async fn ui_bridge_expect_text_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -4270,28 +4269,38 @@ pub async fn ui_bridge_expect_text_handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Truncate on a char boundary — &text[..60] panics on multi-byte UTF-8.
+    let text_preview: String = text.chars().take(60).collect();
+
     info!(
         "UI Bridge API: expect text=\"{}\" timeout={}ms ci={}",
-        if text.len() > 60 { &text[..60] } else { &text[..] },
-        timeout_ms,
-        case_insensitive
+        text_preview, timeout_ms, case_insensitive
     );
 
-    // Build the JS expression once. We escape backslashes and double quotes
-    // in the search text so it can be embedded as a JS string literal.
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    // Use serde_json::to_string to produce a fully RFC-compliant JS string
+    // literal. This handles every edge case (newlines, U+2028/U+2029,
+    // backticks, backslashes, quotes) correctly — unlike ad-hoc escaping.
+    let js_literal = serde_json::to_string(&text)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to encode search text: {}", e))),
+            )
+        })?;
     let js = if case_insensitive {
         format!(
-            "document.body.innerText.toLowerCase().includes(\"{}\".toLowerCase())",
-            escaped
+            "document.body.innerText.toLowerCase().includes({}.toLowerCase())",
+            js_literal
         )
     } else {
-        format!("document.body.innerText.includes(\"{}\")", escaped)
+        format!("document.body.innerText.includes({})", js_literal)
     };
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let start = std::time::Instant::now();
     let mut polls: u32 = 0;
+    let mut consecutive_errors: u32 = 0;
+    let mut last_error: Option<String> = None;
 
     loop {
         polls += 1;
@@ -4299,13 +4308,18 @@ pub async fn ui_bridge_expect_text_handler(
         let payload = serde_json::json!({ "expression": js });
         match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
             Ok(data) => {
-                // Extract the boolean result. The frontend wraps in
-                // { result: { value: true } } via the SDK protocol.
-                let value = data
+                consecutive_errors = 0;
+                last_error = None;
+                // Extract the boolean result. The SDK stringifies non-string
+                // values, so `result.value` may be either a JSON bool or the
+                // string "true"/"false" depending on the code path.
+                let raw = data
                     .get("result")
                     .and_then(|r| r.get("value"))
-                    .or_else(|| data.get("value"))
+                    .or_else(|| data.get("value"));
+                let value = raw
                     .and_then(|v| v.as_bool())
+                    .or_else(|| raw.and_then(|v| v.as_str()).map(|s| s == "true"))
                     .unwrap_or(false);
                 if value {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -4317,9 +4331,23 @@ pub async fn ui_bridge_expect_text_handler(
                 }
             }
             Err(e) => {
-                // Transport error (frontend not ready, timeout) — log and
-                // continue polling unless it's persistent.
+                // Transport error (frontend not ready, timeout, JS syntax).
+                // Tolerate a few transient failures, but bail out after 3
+                // consecutive errors so callers get a useful message instead
+                // of a misleading 408.
+                consecutive_errors += 1;
                 debug!("expect: poll {} transport error: {}", polls, e);
+                last_error = Some(e);
+                if consecutive_errors >= 3 {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!(
+                            "expect: {} consecutive transport errors, giving up. Last error: {}",
+                            consecutive_errors,
+                            last_error.as_deref().unwrap_or("unknown")
+                        ))),
+                    ));
+                }
             }
         }
 
@@ -4334,11 +4362,7 @@ pub async fn ui_bridge_expect_text_handler(
             info!("UI Bridge API: {}", msg);
             return Err((
                 StatusCode::REQUEST_TIMEOUT,
-                Json(api_error(format!(
-                    "{} \"{}\"",
-                    msg,
-                    if text.len() > 60 { &text[..60] } else { &text[..] }
-                ))),
+                Json(api_error(format!("{} \"{}\"", msg, text_preview))),
             ));
         }
 
