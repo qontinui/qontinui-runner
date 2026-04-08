@@ -1891,17 +1891,6 @@ CREATE TABLE IF NOT EXISTS ui_bridge_integrations (
 CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_status ON ui_bridge_integrations(status);
 CREATE INDEX IF NOT EXISTS idx_ui_bridge_integrations_type ON ui_bridge_integrations(integration_type);
 
--- UI Bridge State Groups (atomic state collections)
-CREATE TABLE IF NOT EXISTS ui_bridge_state_groups (
-    id BIGSERIAL PRIMARY KEY,
-    group_id TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    states TEXT,
-    metadata TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_ui_bridge_state_groups_group_id ON ui_bridge_state_groups(group_id);
-
 -- UI Bridge States (registered UI states for navigation)
 CREATE TABLE IF NOT EXISTS ui_bridge_states (
     id BIGSERIAL PRIMARY KEY,
@@ -2022,20 +2011,6 @@ CREATE TABLE IF NOT EXISTS recording_exports (
 CREATE INDEX IF NOT EXISTS idx_recording_exports_recording_id ON recording_exports(recording_id);
 CREATE INDEX IF NOT EXISTS idx_recording_exports_format ON recording_exports(export_format);
 
--- Context Summaries (compressed iteration context for long-running workflows)
-CREATE TABLE IF NOT EXISTS context_summaries (
-    id TEXT PRIMARY KEY,
-    task_run_id TEXT NOT NULL,
-    iterations_summarized TEXT NOT NULL,
-    summary_text TEXT NOT NULL,
-    key_findings TEXT,
-    successful_fixes TEXT,
-    root_causes TEXT,
-    original_token_count INTEGER,
-    summary_token_count INTEGER,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 -- Convergence Snapshots (workflow convergence tracking over time)
 CREATE TABLE IF NOT EXISTS convergence_snapshots (
     id TEXT PRIMARY KEY,
@@ -2136,43 +2111,6 @@ CREATE TABLE IF NOT EXISTS generation_pipeline_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_workflow ON generation_pipeline_artifacts(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_pipeline_artifacts_created ON generation_pipeline_artifacts(created_at);
-
--- =============================================================================
--- Generator Benchmarks
--- =============================================================================
-CREATE TABLE IF NOT EXISTS generator_benchmarks (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    category TEXT,
-    tags TEXT,
-    expected_structure TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    enabled BOOLEAN NOT NULL DEFAULT true
-);
-
--- =============================================================================
--- Generator Benchmark Results
--- =============================================================================
-CREATE TABLE IF NOT EXISTS generator_benchmark_results (
-    id TEXT PRIMARY KEY,
-    benchmark_id TEXT NOT NULL REFERENCES generator_benchmarks(id),
-    artifact_id TEXT REFERENCES generation_pipeline_artifacts(id),
-    run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    model_used TEXT,
-    structure_score DOUBLE PRECISION,
-    content_score DOUBLE PRECISION,
-    step_type_score DOUBLE PRECISION,
-    overall_score DOUBLE PRECISION,
-    score_breakdown TEXT,
-    generated_json TEXT,
-    duration_ms INTEGER,
-    passed BOOLEAN NOT NULL DEFAULT false,
-    notes TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_benchmark_results_benchmark ON generator_benchmark_results(benchmark_id);
-CREATE INDEX IF NOT EXISTS idx_benchmark_results_run_at ON generator_benchmark_results(run_at);
 
 -- =============================================================================
 -- Golden Datasets
@@ -2348,22 +2286,6 @@ CREATE INDEX IF NOT EXISTS idx_fix_applications_task ON fix_applications(task_ru
 CREATE INDEX IF NOT EXISTS idx_fix_applications_sig ON fix_applications(error_signature_hash);
 
 -- =============================================================================
--- Rule Applications
--- =============================================================================
-CREATE TABLE IF NOT EXISTS rule_applications (
-    id TEXT PRIMARY KEY,
-    rule_id TEXT NOT NULL,
-    workflow_id TEXT,
-    task_run_id TEXT,
-    agent TEXT NOT NULL,
-    section TEXT NOT NULL,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    FOREIGN KEY (rule_id) REFERENCES generation_rules(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_rule_apps_rule ON rule_applications(rule_id);
-CREATE INDEX IF NOT EXISTS idx_rule_apps_workflow ON rule_applications(workflow_id);
-
--- =============================================================================
 -- Workflow Generation Feedback
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS workflow_generation_feedback (
@@ -2506,12 +2428,6 @@ CREATE INDEX IF NOT EXISTS idx_task_knowledge_summaries_category ON task_knowled
 -- =============================================================================
 -- Batch 3: Remaining missing tables (18 of 19; workflow_generation_feedback already exists)
 -- =============================================================================
-
--- Schema Version tracking
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 
 -- GUI Lock (singleton row)
 CREATE TABLE IF NOT EXISTS gui_lock (
@@ -2715,81 +2631,9 @@ CREATE TABLE IF NOT EXISTS robustness_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_robustness_variant ON robustness_reports(prompt_variant_id);
 
--- Decomposition Plans (task decomposition tracking)
-CREATE TABLE IF NOT EXISTS decomposition_plans (
-    id TEXT PRIMARY KEY,
-    task_run_id TEXT NOT NULL,
-    original_goal TEXT NOT NULL,
-    goal_summary TEXT,
-    subtask_count INTEGER NOT NULL,
-    plan_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ
-);
-
--- Decomposition Subtasks (individual subtasks within a plan)
-CREATE TABLE IF NOT EXISTS decomposition_subtasks (
-    id TEXT PRIMARY KEY,
-    plan_id TEXT NOT NULL,
-    subtask_index INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    depends_on TEXT,
-    workflow_id TEXT,
-    task_run_id TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    output_summary TEXT,
-    error TEXT,
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    FOREIGN KEY (plan_id) REFERENCES decomposition_plans(id) ON DELETE CASCADE
-);
-
 -- =============================================================================
 -- Batch: 19 missing tables migrated from SQLite schema
 -- =============================================================================
-
--- API Credentials (metadata only, secrets in secure storage)
-CREATE TABLE IF NOT EXISTS api_credentials (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    credential_type TEXT NOT NULL,
-    storage_type TEXT NOT NULL DEFAULT 'secure',
-    token_endpoint TEXT,
-    client_id TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_api_credentials_name ON api_credentials(name);
-CREATE INDEX IF NOT EXISTS idx_api_credentials_type ON api_credentials(credential_type);
-
--- API Request Logs (persisted for history, supplements JSONL for DB queries)
-CREATE TABLE IF NOT EXISTS api_request_logs (
-    id TEXT PRIMARY KEY,
-    task_run_id TEXT,
-    step_id TEXT NOT NULL,
-    step_name TEXT,
-    method TEXT NOT NULL,
-    url TEXT NOT NULL,
-    resolved_url TEXT NOT NULL,
-    status_code INTEGER NOT NULL,
-    response_time_ms INTEGER NOT NULL,
-    response_body_type TEXT NOT NULL,
-    response_file_path TEXT,
-    response_size_bytes INTEGER,
-    success BOOLEAN NOT NULL,
-    assertion_failures INTEGER DEFAULT 0,
-    extractions_json TEXT,
-    assertions_json TEXT,
-    error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_api_request_logs_task_run_id ON api_request_logs(task_run_id);
-CREATE INDEX IF NOT EXISTS idx_api_request_logs_created_at ON api_request_logs(created_at);
-CREATE INDEX IF NOT EXISTS idx_api_request_logs_step_id ON api_request_logs(step_id);
 
 -- Model Profiles (per-model capability/cost metadata)
 CREATE TABLE IF NOT EXISTS model_profiles (
