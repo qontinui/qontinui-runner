@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Process Manager page — manages spawned child processes with lifecycle controls, log viewing, project scanning, and AI-assisted error diagnosis.",
+  "description": "Process Manager page — manages spawned child processes with lifecycle controls, log viewing (live ring buffer + historical PG sessions), cross-session search, project scanning, and AI-assisted error diagnosis. Processes are managed by the primary runner; secondary runners proxy their actions. Live output streams via Tauri events into a 2000-line virtualized ring buffer; historical sessions are persisted to PostgreSQL (process_sessions + process_session_output) and browseable via a dropdown picker.",
   "groups": [
     {
       "id": "process-manager-overview",
@@ -57,6 +57,24 @@
           },
           "source": "manual",
           "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "proc-overview-proxy-notice",
+          "description": "When the user is viewing the Process Manager from a secondary/test runner (not the primary), a 'Proxied' notice appears explaining that actions are forwarded to the primary runner on a specific port. This sets user expectations that process state is shared across runners.",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Proxied"
+            },
+            "label": "Proxy notice for secondary runners"
+          },
+          "precondition": "The current runner is a secondary instance (QONTINUI_INSTANCE_NAME is set)",
+          "source": "ai-generated",
+          "reviewed": false,
           "enabled": true
         }
       ],
@@ -198,8 +216,7 @@
         }
       ],
       "source": "manual"
-    }
-    ,
+    },
     {
       "id": "process-output-virtualization",
       "name": "Process Output Virtualized Rendering",
@@ -244,7 +261,7 @@
         },
         {
           "id": "proc-output-search-filter",
-          "description": "The search input filters visible output lines by text content. The filtered result set is also virtualized. Clearing the search restores the full buffered output.",
+          "description": "The search input filters visible output lines by text content when 'All sessions' toggle is off. The filtered result set is also virtualized. Clearing the search restores the full buffered output. The placeholder text is 'Search output...' in this mode.",
           "category": "interaction",
           "severity": "warning",
           "target": {
@@ -252,9 +269,10 @@
             "criteria": {
               "placeholder": "Search output..."
             },
-            "label": "Output search input"
+            "label": "Output search input (live mode)"
           },
           "assertionType": "exists",
+          "precondition": "A process is selected and the All sessions toggle is off",
           "source": "ai-generated",
           "reviewed": false,
           "enabled": true
@@ -278,15 +296,484 @@
         }
       ],
       "source": "ai-generated"
+    },
+    {
+      "id": "process-output-session-picker",
+      "name": "Historical Session Picker",
+      "description": "The process output viewer's toolbar includes a session picker dropdown that lets the user switch between the live ring-buffer view and historical sessions persisted in the runner's PostgreSQL database (process_sessions + process_session_output). The runner's event loop writes every output line to PG in batches (50 lines or 500ms), so every process restart creates a new session that can be browsed after the process has stopped. The picker lists 'Live' as the first option followed by up to 20 recent historical sessions (for the currently selected process config), each labeled with a relative time and the session's final exit status. Selecting a historical session swaps the live event stream for a batch fetch of that session's output; selecting 'Live' re-subscribes to the Tauri process-output event. This group specifies that the picker is present and correctly populated for the selected process.",
+      "category": "data-display",
+      "assertions": [
+        {
+          "id": "proc-session-picker-exists",
+          "description": "When a process is selected, a session picker dropdown is present in the output viewer toolbar. It is rendered as a native <select> element with at least one option ('Live').",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "select"
+            },
+            "label": "Session picker dropdown"
+          },
+          "precondition": "A process is selected from the process list",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-session-picker-live-option",
+          "description": "The session picker dropdown has a 'Live' option as its first entry, which is the default selection for a freshly-selected process. This option corresponds to the in-memory ring buffer view that streams new output via Tauri events.",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Live"
+            },
+            "label": "Live option in session picker"
+          },
+          "precondition": "A process is selected from the process list",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-session-picker-historical-entries",
+          "description": "After the selected process has run at least once and then stopped, the session picker should include historical session options populated from GET /api/v1/files/browse (or the equivalent Tauri command). Each historical entry displays a relative timestamp ('2h ago', 'yesterday') and the final state ('exit 0', 'failed 1'). This is how users access logs from prior process runs after a restart.",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "select"
+            },
+            "label": "Session picker dropdown"
+          },
+          "precondition": "The selected process has stopped at least once (has historical sessions in the database)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-session-picker-switches-source",
+          "description": "Selecting a historical session in the picker should swap the output area from the live Tauri event stream to a DB fetch via get_process_session_output_from_db. The line count indicator updates to reflect the historical session's line count. Selecting 'Live' again re-subscribes to the event stream. A verification workflow can check this by comparing the displayed lines before/after switching — historical selections show fixed content, Live shows real-time updates.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "select"
+            },
+            "label": "Session picker dropdown"
+          },
+          "precondition": "The selected process has at least one historical session",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "process-output-cross-session-search",
+      "name": "Cross-Session Search",
+      "description": "The output viewer toolbar includes an 'All sessions' toggle button next to the search input. When active (visually highlighted cyan), the search input's placeholder changes from 'Search output...' to 'Search all sessions...' and typing triggers a backend call to search_process_logs, which runs an ILIKE query across every persisted session's output in the runner's PostgreSQL database. Results appear in a hits panel replacing the normal output view, each row showing the session ID prefix, process name, timestamp, and the matching log line. Clicking a hit jumps to that session in the picker and switches the view to that session's full content. This turns the process manager into a full-history log search tool, not just a live viewer. Toggling the button off restores the regular in-buffer filter.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "proc-search-all-sessions-toggle",
+          "description": "An 'All sessions' toggle button is present in the output viewer toolbar when a process is selected. Clicking it switches the search mode from in-buffer filtering to cross-session DB search.",
+          "category": "element-presence",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "All sessions"
+            },
+            "label": "All sessions toggle button"
+          },
+          "precondition": "A process is selected from the process list",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-search-placeholder-changes",
+          "description": "When the 'All sessions' toggle is off, the search input's placeholder is 'Search output...'. When the toggle is on, the placeholder changes to 'Search all sessions...'. This is the visual cue that search scope has changed from the live buffer to the cross-session DB query.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "All sessions"
+            },
+            "label": "All sessions toggle button"
+          },
+          "precondition": "A process is selected from the process list",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-search-empty-hits-message",
+          "description": "When the 'All sessions' toggle is on and the search query returns no matches, the output area displays the message 'No matches across sessions.' in the zinc-600 text color. This distinguishes 'no hits' from 'no output' (the empty-state message for live mode is 'No output yet').",
+          "category": "data-display",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No matches across sessions."
+            },
+            "label": "No matches across sessions message"
+          },
+          "precondition": "All sessions toggle is on, search query returns no hits",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-search-hits-display",
+          "description": "When the cross-session search returns matches, the output area renders one row per hit. Each row shows: the row timestamp (dimmed, text-zinc-600), the process name, the first 8 characters of the session_id, and the matching line (stderr hits in red). A 'N hits across sessions' header is shown above the list. Clicking a hit should switch to that session in the session picker (setSelectedSessionId) and clear the toggle.",
+          "category": "data-display",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "hits across sessions"
+            },
+            "label": "Hits count header"
+          },
+          "precondition": "All sessions toggle is on, search query returns at least one hit",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-search-backend-shape",
+          "description": "Cross-session search hits must contain a session_id that exists in the session picker's dropdown for the current process. Clicking a hit should navigate to a session that exists — dead links (pointing to a session not present in the picker) indicate either a config_id mismatch between the picker query and the search query, or that the session has been cleaned up. A verification workflow can cross-check this by comparing the session_ids in the hits against the options in the dropdown.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "hits across sessions"
+            },
+            "label": "Hits list with session references"
+          },
+          "precondition": "All sessions toggle is on, search query returns hits for the selected process",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "process-log-persistence-correctness",
+      "name": "Process Log Persistence — Algorithm Correctness",
+      "description": "The process log DB persistence feature writes every stdout/stderr line to PostgreSQL tables (process_sessions + process_session_output) via a batched writer task in the ManagedProcess event loop. This group defines what CORRECT output looks like from that persistence algorithm, verifiable from the page: the session picker reflects every process run, the historical session content matches what was previously shown live, the line counts are consistent between live and historical views, and zombie 'running' sessions from previous runner crashes are cleaned up on startup so the picker doesn't show stale entries.",
+      "category": "state-consistency",
+      "assertions": [
+        {
+          "id": "proc-persistence-session-count-matches-runs",
+          "description": "Each time a process starts, a new session row is created; when it stops, the row's state becomes 'stopped' (clean exit) or 'failed' (non-zero exit code). The session picker shows exactly one historical entry per past run of the currently selected process. If a user starts-stops a process 3 times, the picker should show 3 historical entries (plus 'Live' if currently running) — not 2 (missing write) or 4 (duplicate create).",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "select"
+            },
+            "label": "Session picker reflecting run history"
+          },
+          "precondition": "User has run the selected process multiple times",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-persistence-historical-matches-live",
+          "description": "When a running process is selected in Live mode and the user observes some specific output lines, then the process stops and the user selects the just-ended historical session from the picker, the displayed lines in the historical view should be a superset of what was shown in Live mode (Live is capped at 2000 lines; historical includes all 50K persisted lines). Content MUST match for the overlapping range — if Live showed 'ERROR foo' at 14:30:05, the historical session must also show 'ERROR foo' at 14:30:05. A mismatch indicates the batched writer dropped or reordered lines.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "lines"
+            },
+            "label": "Line count indicator (compare live vs historical)"
+          },
+          "precondition": "A process has been observed in Live mode and then stopped",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-persistence-no-zombie-running",
+          "description": "After a runner restart, the session picker should not show any historical entries labeled 'running' — those would be zombie sessions from the previous runner instance that died without a clean shutdown. The orphaned-session cleanup task in main.rs runs at startup and marks any such sessions as 'failed' with a stopped_at timestamp. If the picker shows 'running' entries for the currently-selected process but the process itself is in 'stopped' or 'failed' state, the cleanup failed to run.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "select"
+            },
+            "label": "Session picker (no zombie running entries)"
+          },
+          "precondition": "The runner has been restarted since the process last ran and the selected process is currently stopped",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-persistence-session-state-transitions",
+          "description": "Session state labels in the picker should match the corresponding run outcome: a clean exit ('exit 0') appears as 'exit 0' in the label, a non-zero exit appears as 'failed N', and sessions marked failed by the orphan cleanup appear as 'failed ?' (unknown exit code). Invariant: a session in the picker labeled 'exit 0' MUST have exit_code=0 in the DB; 'failed N' MUST have exit_code=N>0.",
+          "category": "state-consistency",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "tagName": "select"
+            },
+            "label": "Session picker state labels"
+          },
+          "precondition": "The selected process has historical sessions with various exit codes",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "process-manager-visual-design",
+      "name": "Visual Design and Text Legibility",
+      "description": "The Process Manager uses the runner's standard dark theme with zinc grays, cyan accents for primary actions, and red/yellow/green for status indication. Text must be legible against the panel backgrounds — muted text uses zinc-500, primary text uses zinc-200, headings use zinc-200. The toolbar uses zinc-900 backgrounds with white/10 borders. Buttons in the toolbar follow the existing runner style: small xs text, bg-zinc-800 for secondary, bg-cyan-900/40 with border-cyan-700/50 for primary (Add Process), and the 'All sessions' toggle uses bg-cyan-900/30 with text-cyan-300 when active.",
+      "category": "design",
+      "assertions": [
+        {
+          "id": "proc-design-heading-legible",
+          "description": "The 'Process Manager' heading uses the text-zinc-200 color token and is clearly legible against the zinc-900/bg-card background. The cyan icon next to it provides a visual anchor.",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Process Manager"
+            },
+            "label": "Process Manager heading"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-design-all-sessions-toggle-active-state",
+          "description": "When the 'All sessions' toggle is active, the button has a visible cyan highlight (text-cyan-300, border-cyan-700/50, bg-cyan-900/30). When inactive, it uses text-zinc-500 with border-white/10. This visual state change is the primary indicator of which search scope is active.",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "cssPropertyInSet",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "All sessions"
+            },
+            "label": "All sessions toggle button"
+          },
+          "propertyName": "border-color",
+          "expected": "cyan-700/50 when active, white/10 when inactive",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-design-search-input-placeholder-legible",
+          "description": "The search input's placeholder text (zinc-600) is visible against the bg-zinc-900 background but clearly distinct from the actual input text color (zinc-300 when typed). This ensures users can distinguish 'placeholder hint' from 'my typed query' at a glance.",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "placeholder": "Search output..."
+            },
+            "label": "Search input"
+          },
+          "precondition": "A process is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "proc-design-stderr-red",
+          "description": "Output lines from stderr streams are rendered in red (text-red-400/80), distinguishing them from stdout lines (text-zinc-300). This applies both in Live mode and in historical session views, and in the cross-session search hits panel where red highlights stderr matches.",
+          "category": "design",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "lines"
+            },
+            "label": "Output viewer with stderr styling"
+          },
+          "precondition": "Selected process has produced stderr lines",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "pm-no-selection",
+        "name": "Process List — No Selection",
+        "description": "The Process Manager is open but no process is selected. The right panel shows the 'Select a process to view its output' placeholder.",
+        "elements": [
+          { "textContent": "Select a process to view its output" },
+          { "textContent": "Process Manager" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "pm-select-first-process",
+            "name": "Select a process",
+            "description": "Click a process row in the list to load its output viewer",
+            "activateStates": ["pm-live-view"],
+            "deactivateStates": ["pm-no-selection"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "(FastAPI)" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-live-view",
+        "name": "Live Output View",
+        "description": "A process is selected and the output viewer is showing the live ring buffer. The session picker shows 'Live' as the selected value. The 'All sessions' toggle is off; search input placeholder is 'Search output...'.",
+        "elements": [
+          { "placeholder": "Search output..." },
+          { "textContent": "All sessions" },
+          { "tagName": "select" }
+        ],
+        "transitions": [
+          {
+            "id": "pm-live-to-search-all",
+            "name": "Enable cross-session search",
+            "description": "Click the 'All sessions' toggle to switch to cross-session DB search",
+            "activateStates": ["pm-search-all-view"],
+            "deactivateStates": ["pm-live-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "All sessions" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "pm-live-to-historical",
+            "name": "Select a historical session",
+            "description": "Change the session picker dropdown to a historical entry",
+            "activateStates": ["pm-historical-view"],
+            "deactivateStates": ["pm-live-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "select",
+                "target": { "tagName": "select" },
+                "params": { "byIndex": 1 },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-search-all-view",
+        "name": "Cross-Session Search View",
+        "description": "The 'All sessions' toggle is active (cyan highlight). The search input placeholder is 'Search all sessions...'. Typing triggers search_process_logs; results appear as a hits panel. The normal virtualized output list is hidden.",
+        "elements": [
+          { "placeholder": "Search all sessions..." },
+          { "textContains": "hits across sessions" }
+        ],
+        "transitions": [
+          {
+            "id": "pm-search-all-to-live",
+            "name": "Toggle off All sessions",
+            "description": "Click the 'All sessions' button again to return to live view",
+            "activateStates": ["pm-live-view"],
+            "deactivateStates": ["pm-search-all-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "All sessions" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "pm-historical-view",
+        "name": "Historical Session View",
+        "description": "A historical session is selected in the picker. The output area shows the persisted lines from that session (batch fetch, not live stream). The Tauri process-output event subscription is paused for this process ID.",
+        "elements": [
+          { "placeholder": "Search output..." },
+          { "tagName": "select" }
+        ],
+        "transitions": [
+          {
+            "id": "pm-historical-to-live",
+            "name": "Return to Live",
+            "description": "Select 'Live' in the session picker to re-subscribe to the live stream",
+            "activateStates": ["pm-live-view"],
+            "deactivateStates": ["pm-historical-view"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "select",
+                "target": { "tagName": "select" },
+                "params": { "value": "__live__" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ProcessManagerTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-08T00:00:00.000Z",
     "pageUrl": "/processes",
     "elementSource": "sdk",
-    "tags": ["process-manager", "lifecycle", "diagnostics", "runner-only"]
+    "tags": ["process-manager", "lifecycle", "diagnostics", "runner-only", "log-persistence", "historical-sessions"]
   }
 }

@@ -42,6 +42,8 @@ import type {
 } from "../../types/errorMonitor";
 import { FixErrorsButton } from "./FixErrorsButton";
 import { BrowserErrorsPanel } from "./BrowserErrorsPanel";
+import { ErrorContextPanel } from "./ErrorContextPanel";
+import { FileText } from "lucide-react";
 // Log source management is now in Settings > Log Sources (LogSourcesSettings.tsx)
 
 // =============================================================================
@@ -201,6 +203,7 @@ function ErrorItem({
   isExpanded: boolean;
   onToggleExpand: () => void;
 }) {
+  const [showContext, setShowContext] = useState(false);
   return (
     <div
       className={cn(
@@ -339,6 +342,20 @@ function ErrorItem({
             </div>
           )}
 
+          {/* Show context (log lines around error) */}
+          <div className="flex gap-2 pt-2">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowContext(true);
+              }}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs bg-blue-500/20 text-blue-600 rounded hover:bg-blue-500/30 transition-colors"
+            >
+              <FileText className="w-3 h-3" />
+              Show context
+            </button>
+          </div>
+
           {/* Actions */}
           {error.status !== "resolved" && error.status !== "ignored" && (
             <div className="flex gap-2 pt-2">
@@ -377,6 +394,13 @@ function ErrorItem({
             </div>
           )}
         </div>
+      )}
+      {showContext && (
+        <ErrorContextPanel
+          processName={error.logSourceName}
+          timestamp={error.logTimestamp ?? error.capturedAt}
+          onClose={() => setShowContext(false)}
+        />
       )}
     </div>
   );
