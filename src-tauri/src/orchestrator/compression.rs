@@ -409,8 +409,13 @@ impl CompressionService {
             .map(|e| e.iteration as i32)
             .unwrap_or(0);
 
-        self.pg
-            .create_task_knowledge(
+        // Atomic insert-summary + archive-originals. A crash between the two
+        // used to leave orphan rows; compress_and_archive wraps both in one
+        // PG transaction.
+        let id_strings: Vec<String> = to_compress.iter().map(|e| e.id.clone()).collect();
+        let archived_count = self
+            .pg
+            .compress_and_archive(
                 &summary_id,
                 task_run_id,
                 &format!("{category}_compressed_summary"),
@@ -420,21 +425,17 @@ impl CompressionService {
                 Some(&evidence_json),
                 "high",
                 "[]",
+                &id_strings,
             )
             .await?;
 
         // Best-effort embed so the summary itself is searchable via Tier 0.
+        // Runs outside the transaction — holding a PG txn across a 30s HTTP
+        // embed call would be a bad trade.
         let _ = self
             .pg
             .embed_knowledge_content(&summary_id, &summary_content)
             .await;
-
-        // Archive the originals — single round-trip via ANY($::text[])
-        let id_strings: Vec<String> = to_compress.iter().map(|e| e.id.clone()).collect();
-        let archived_count = self
-            .pg
-            .archive_task_knowledge(&id_strings, &summary_id)
-            .await?;
 
         info!(
             "Compressed {} {} entries into summary {} for task {}",

@@ -591,6 +591,86 @@ impl PgDb {
             .collect())
     }
 
+    /// Atomically insert a compressed-summary row AND archive its source rows.
+    ///
+    /// Wraps the summary INSERT and the source UPDATE in a single PG
+    /// transaction so a crash (or connection loss) between the two can no
+    /// longer leave an orphan summary pointing at un-archived originals or
+    /// archived originals whose `summary_entry_id` targets a row that was
+    /// never inserted.
+    ///
+    /// Returns the number of source rows actually archived.
+    ///
+    /// Embedding the summary content is intentionally NOT done here — that's
+    /// a best-effort HTTP call and has no business holding a PG transaction
+    /// open. Call `embed_knowledge_content` immediately after this returns.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compress_and_archive(
+        &self,
+        summary_id: &str,
+        task_run_id: &str,
+        category: &str,
+        agent_type: &str,
+        iteration: i32,
+        content: &str,
+        evidence: Option<&str>,
+        confidence: &str,
+        related_files: &str,
+        archive_ids: &[String],
+    ) -> Result<usize, String> {
+        let mut conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
+
+        let txn = conn
+            .transaction()
+            .await
+            .map_err(|e| format!("PG begin compress_and_archive txn: {e}"))?;
+
+        txn.execute(
+            r#"INSERT INTO task_knowledge
+               (id, task_run_id, category, agent_type, iteration,
+                content, evidence, confidence, related_files)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+            &[
+                &summary_id,
+                &task_run_id,
+                &category,
+                &agent_type,
+                &iteration,
+                &content,
+                &evidence,
+                &confidence,
+                &related_files,
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG compress_and_archive insert: {e}"))?;
+
+        let archived = if archive_ids.is_empty() {
+            0
+        } else {
+            txn.execute(
+                r#"UPDATE task_knowledge
+                   SET archived_at = NOW(),
+                       summary_entry_id = $1
+                   WHERE id = ANY($2::text[])
+                     AND archived_at IS NULL"#,
+                &[&summary_id, &archive_ids],
+            )
+            .await
+            .map_err(|e| format!("PG compress_and_archive update: {e}"))?
+        };
+
+        txn.commit()
+            .await
+            .map_err(|e| format!("PG commit compress_and_archive txn: {e}"))?;
+
+        Ok(archived as usize)
+    }
+
     /// Archive a set of knowledge entries by rolling them into a summary entry.
     ///
     /// Sets `archived_at = NOW()` and `summary_entry_id = summary_id` for every
