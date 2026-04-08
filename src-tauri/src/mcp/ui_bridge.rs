@@ -4351,9 +4351,12 @@ pub async fn ui_bridge_expect_text_handler(
             }
         }
 
-        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms)
-            > deadline
-        {
+        // Deadline check: if we're already past the deadline, give up.
+        // Otherwise sleep, but clamp the sleep to (deadline - now) so the
+        // next poll fires right at the deadline rather than one full poll
+        // interval early.
+        let now = std::time::Instant::now();
+        if now >= deadline {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let msg = format!(
                 "expect: timeout after {}ms ({} polls) waiting for text",
@@ -4366,7 +4369,9 @@ pub async fn ui_bridge_expect_text_handler(
             ));
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+        let poll_sleep = std::time::Duration::from_millis(poll_interval_ms);
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(poll_sleep.min(remaining)).await;
     }
 }
 

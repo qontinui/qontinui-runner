@@ -370,11 +370,16 @@ impl PgDb {
             .collect())
     }
 
-    /// Mark any sessions still in 'running' state AND started before
+    /// Mark any sessions in a non-terminal state AND started before
     /// `started_before` as 'failed'. Called on runner startup — sessions in
-    /// this state can only exist if a previous runner died without a clean
-    /// shutdown (the event_loop normally updates state on natural exit).
-    /// Without this, the UI shows zombie "running" sessions forever.
+    /// a non-terminal state can only exist if a previous runner died without
+    /// a clean shutdown (the event_loop normally updates state on natural
+    /// exit). Without this, the UI shows zombie sessions forever.
+    ///
+    /// Uses a NOT IN filter against the known terminal states ('stopped',
+    /// 'failed') so that any intermediate state currently written to the DB
+    /// (today that's just 'running', but 'starting'/'building' etc. could be
+    /// added in the future without needing to update this cleanup).
     ///
     /// The `started_before` cutoff protects against a race where new sessions
     /// are being created by the current runner's event_loop concurrently with
@@ -396,7 +401,7 @@ impl PgDb {
                 "UPDATE process_sessions \
                  SET state = 'failed', \
                      stopped_at = COALESCE(stopped_at, $1::timestamptz) \
-                 WHERE state = 'running' \
+                 WHERE state NOT IN ('stopped', 'failed') \
                    AND started_at < $2::timestamptz",
                 &[&now, &started_before],
             )
