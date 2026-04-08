@@ -252,18 +252,14 @@ impl PgDb {
         // `days` is a validated i32 (clamped to >= 0), so there is no
         // injection risk in interpolating it directly.
         let days = days.max(0);
-        // `created_at` is declared TIMESTAMPTZ in the canonical schema but
-        // some existing databases (surviving SQLite-era migrations) still
-        // hold it as TEXT. Cast explicitly so both shapes work and so
-        // `date_trunc`/interval comparison don't trip on type inference.
         let sql = format!(
             r#"SELECT
-                to_char(date_trunc('day', created_at::timestamptz), 'YYYY-MM-DD') AS day,
+                to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
                 COUNT(*)::BIGINT AS total,
                 COUNT(*) FILTER (WHERE success)::BIGINT AS successful,
                 AVG(total_duration_ms)::FLOAT8 AS avg_duration_ms
                FROM generation_pipeline_artifacts
-               WHERE created_at::timestamptz >= NOW() - INTERVAL '{} days'
+               WHERE created_at >= NOW() - INTERVAL '{} days'
                GROUP BY day
                ORDER BY day"#,
             days
