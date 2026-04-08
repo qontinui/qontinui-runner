@@ -370,6 +370,33 @@ impl PgDb {
             .collect())
     }
 
+    /// Mark any sessions still in 'running' state as 'failed'. Called on
+    /// runner startup — sessions in this state can only exist if a previous
+    /// runner died without a clean shutdown (the event_loop normally updates
+    /// state on natural exit). Without this, the UI shows zombie "running"
+    /// sessions from previous runs forever.
+    pub async fn mark_orphaned_running_sessions_as_failed(&self) -> Result<u32, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let now = Utc::now().to_rfc3339();
+        let affected = conn
+            .execute(
+                "UPDATE process_sessions \
+                 SET state = 'failed', \
+                     stopped_at = COALESCE(stopped_at, $1::timestamptz) \
+                 WHERE state = 'running'",
+                &[&now],
+            )
+            .await
+            .map_err(|e| format!("PG mark_orphaned_running_sessions_as_failed: {}", e))?;
+
+        Ok(affected as u32)
+    }
+
     /// Delete process sessions (and their output via CASCADE) older than the
     /// retention period. Returns the number of sessions deleted.
     pub async fn cleanup_old_process_sessions(

@@ -1789,6 +1789,29 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Spawn the process log cleanup loop (deletes old process_sessions and their output)
             {
                 let pg_for_logs = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                let pg_for_orphans = pg_for_logs.clone();
+
+                // Mark orphaned 'running' sessions as 'failed' on startup.
+                // These can only exist if a previous runner died unexpectedly
+                // (the event_loop normally updates state on natural exit).
+                tauri::async_runtime::spawn(async move {
+                    match pg_for_orphans
+                        .mark_orphaned_running_sessions_as_failed()
+                        .await
+                    {
+                        Ok(n) if n > 0 => {
+                            info!(
+                                "Marked {} orphaned 'running' process sessions as 'failed'",
+                                n
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("Failed to clean up orphaned process sessions: {}", e);
+                        }
+                    }
+                });
+
                 tauri::async_runtime::spawn(async move {
                     process_capture::cleanup::run_process_log_cleanup_loop(pg_for_logs).await;
                 });

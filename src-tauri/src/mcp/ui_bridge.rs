@@ -1073,7 +1073,7 @@ pub async fn ui_bridge_discover_handler(
     });
 
     match ui_bridge_request_sync(&state, "discover", payload).await {
-        Ok(data) => {
+        Ok(mut data) => {
             // Populate the last-discovered cache. Best-effort — never
             // block the response on a write lock.
             let element_count = count_elements_in_discover_payload(&data);
@@ -1086,6 +1086,51 @@ pub async fn ui_bridge_discover_handler(
                 let mut guard = state.ui_bridge_last_discovered.write().await;
                 *guard = Some(cache_entry);
             }
+
+            // When discovery returns 0 elements, attach a diagnostic block
+            // so callers (especially manual testers) immediately know WHY.
+            // Common causes: frontend not authenticated, registry not yet
+            // populated, page on a guard/login screen.
+            if element_count == 0 {
+                if let Some(obj) = data.as_object_mut() {
+                    let last_pong = state
+                        .ui_bridge_last_pong
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    // direct_webview_evaluate_with_result returns the JSON-encoded
+                    // string of the evaluated value.
+                    let body_text_present = direct_webview_evaluate_with_result(
+                        &state,
+                        "document.body && document.body.innerText.length > 100",
+                    )
+                    .await
+                    .ok()
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
+                    let title = direct_webview_evaluate_with_result(&state, "document.title")
+                        .await
+                        .ok()
+                        .map(|s| s.trim_matches('"').to_string())
+                        .unwrap_or_default();
+
+                    obj.insert(
+                        "diagnostics".to_string(),
+                        serde_json::json!({
+                            "reason": "registry_empty",
+                            "hint": "The UI Bridge element registry is empty. \
+This usually means the frontend's AutoRegisterProvider has not yet populated \
+the registry. Common causes: (1) the page is on a login/guard screen and the \
+auth-gated providers have not mounted, (2) the React app has just loaded and \
+the MutationObserver scan has not yet completed (try again in 200ms), \
+(3) the page rendered before the UIBridgeProvider mounted. Use \
+control/page/evaluate to inspect the DOM directly as a fallback.",
+                            "frontend_pong_seen": last_pong > 0,
+                            "page_has_content": body_text_present,
+                            "page_title": title,
+                        }),
+                    );
+                }
+            }
+
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
@@ -2162,7 +2207,25 @@ pub async fn ui_bridge_page_evaluate_handler(
 
     // Try IPC path first (fastest, uses SDK event handlers)
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(data) => {
+            // The SDK may return a payload with `success: false` and an `error`
+            // field when the JS expression itself throws (e.g., SyntaxError).
+            // Surface that as a proper HTTP 400 instead of wrapping it in
+            // `ApiResponse::success`, which would make the outer success flag
+            // misleading.
+            if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
+                let error_msg = data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "JS evaluation failed".to_string());
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!("JS evaluation error: {}", error_msg))),
+                ));
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(ipc_err) => {
             // IPC failed — try direct WebView evaluation as fallback
             debug!(
@@ -2404,14 +2467,27 @@ pub async fn ui_bridge_page_evaluate_safe_handler(
     );
 
     match safe_evaluate(&state, &format!("return {}", request.expression)).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
-        Err(e) => {
-            // Return the error as a structured response, not an HTTP error
-            Ok(Json(ApiResponse::success(serde_json::json!({
-                "success": false,
-                "error": e,
-            }))))
+        Ok(data) => {
+            // SDK may return success:false for JS errors — surface as HTTP 400
+            // so callers can distinguish "your expression threw" from "the
+            // bridge worked and returned this value".
+            if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
+                let error_msg = data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "JS evaluation failed".to_string());
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!("JS evaluation error: {}", error_msg))),
+                ));
+            }
+            Ok(Json(ApiResponse::success(data)))
         }
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("JS evaluation error: {}", e))),
+        )),
     }
 }
 
@@ -4143,6 +4219,127 @@ pub async fn ui_bridge_wait_for_element_handler(
             );
             info!("UI Bridge API: {}", msg);
             return Err((StatusCode::REQUEST_TIMEOUT, Json(api_error(msg))));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+    }
+}
+
+/// POST /ui-bridge/ai/expect
+///
+/// Wait for a substring to appear anywhere in the page text. Polls
+/// `document.body.innerText` via page_evaluate until the text is found
+/// or the timeout elapses. Useful for assertions during manual/auto
+/// testing without writing custom JS expressions.
+///
+/// Body fields:
+/// - `text` (string, required) — substring to wait for (case-sensitive
+///   unless `caseInsensitive: true`)
+/// - `timeout` (number, default 5000) — max wait in ms
+/// - `pollIntervalMs` (number, default 250) — ms between polls (min 50)
+/// - `caseInsensitive` (bool, default false) — match without regard to case
+///
+/// Returns 200 with `{ found: true, elapsed_ms, polls }` on success or
+/// 408 Request Timeout with the same fields on failure.
+pub async fn ui_bridge_expect_text_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let text = match body.get("text").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error("expect: 'text' is required")),
+            ));
+        }
+    };
+    let timeout_ms = body
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+    let poll_interval_ms = body
+        .get("pollIntervalMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(250)
+        .max(50);
+    let case_insensitive = body
+        .get("caseInsensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    info!(
+        "UI Bridge API: expect text=\"{}\" timeout={}ms ci={}",
+        if text.len() > 60 { &text[..60] } else { &text[..] },
+        timeout_ms,
+        case_insensitive
+    );
+
+    // Build the JS expression once. We escape backslashes and double quotes
+    // in the search text so it can be embedded as a JS string literal.
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let js = if case_insensitive {
+        format!(
+            "document.body.innerText.toLowerCase().includes(\"{}\".toLowerCase())",
+            escaped
+        )
+    } else {
+        format!("document.body.innerText.includes(\"{}\")", escaped)
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let start = std::time::Instant::now();
+    let mut polls: u32 = 0;
+
+    loop {
+        polls += 1;
+
+        let payload = serde_json::json!({ "expression": js });
+        match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
+            Ok(data) => {
+                // Extract the boolean result. The frontend wraps in
+                // { result: { value: true } } via the SDK protocol.
+                let value = data
+                    .get("result")
+                    .and_then(|r| r.get("value"))
+                    .or_else(|| data.get("value"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if value {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    return Ok(Json(ApiResponse::success(serde_json::json!({
+                        "found": true,
+                        "elapsed_ms": elapsed_ms,
+                        "polls": polls,
+                    }))));
+                }
+            }
+            Err(e) => {
+                // Transport error (frontend not ready, timeout) — log and
+                // continue polling unless it's persistent.
+                debug!("expect: poll {} transport error: {}", polls, e);
+            }
+        }
+
+        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms)
+            > deadline
+        {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let msg = format!(
+                "expect: timeout after {}ms ({} polls) waiting for text",
+                elapsed_ms, polls
+            );
+            info!("UI Bridge API: {}", msg);
+            return Err((
+                StatusCode::REQUEST_TIMEOUT,
+                Json(api_error(format!(
+                    "{} \"{}\"",
+                    msg,
+                    if text.len() > 60 { &text[..60] } else { &text[..] }
+                ))),
+            ));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
@@ -7944,6 +8141,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/ai/wait-for-element",
             post(ui_bridge_wait_for_element_handler),
+        )
+        // Wait for a substring to appear in the page text
+        .route(
+            "/ui-bridge/ai/expect",
+            post(ui_bridge_expect_text_handler),
         )
         .route(
             "/ui-bridge/control/diagnose-stuck",
