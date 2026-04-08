@@ -259,7 +259,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             options?: {
               pixelThreshold?: number;
               failureThreshold?: number;
-              failureThresholdType?: "percent" | "pixels";
+              failureThresholdType?: "percent" | "pixel";
               blur?: number;
             };
           };
@@ -282,7 +282,7 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             data: data.startsWith("data:") ? data : `data:image/png;base64,${data}`,
             width: 0,
             height: 0,
-            mediaType: "image" as const,
+            mediaType: "image/png" as const,
             elementId: "",
             timestamp: Date.now(),
           });
