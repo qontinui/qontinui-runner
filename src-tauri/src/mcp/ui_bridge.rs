@@ -861,8 +861,36 @@ fn wrap_ipc_result(
 /// Get all registered UI elements from the React UI Bridge.
 pub async fn ui_bridge_get_elements_handler(
     State(state): State<Arc<ApiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Getting all elements");
+    let refresh = query
+        .get("refresh")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    info!("UI Bridge API: Getting all elements (refresh={})", refresh);
+
+    // Optional pre-fetch discover to defeat the well-known
+    // "stale registry after navigation" gotcha. Without `?refresh=true`,
+    // this endpoint returns whatever the SDK registry has cached, which
+    // can be a 1-element list if the user just switched tabs and the
+    // current page hasn't auto-rediscovered. With `?refresh=true`, we
+    // force a fresh discover before reading the registry. Defaults to
+    // false to preserve the existing fast-path semantics.
+    if refresh {
+        if let Err(e) = ui_bridge_request_sync(
+            &state,
+            "discover",
+            serde_json::json!({ "params": { "interactive_only": false } }),
+        )
+        .await
+        {
+            warn!(
+                "UI Bridge API: get_elements refresh discover failed ({}); returning stale registry",
+                e
+            );
+        }
+    }
 
     match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
         Ok(data) => Ok(Json(ApiResponse::success(data))),
@@ -2356,10 +2384,43 @@ pub async fn ui_bridge_page_evaluate_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<PageEvaluateRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let preview: String = request.expression.chars().take(80).collect();
+    page_evaluate_inner(state, request.expression).await
+}
+
+/// `POST /ui-bridge/control/page/evaluate-raw`
+///
+/// Same as `page/evaluate` but accepts the JavaScript expression as the
+/// raw request body (any content-type) instead of a JSON-wrapped string.
+/// This avoids the JSON-escape gauntlet for multi-line expressions with
+/// regex / backslashes — the test report flagged this as a real
+/// ergonomics problem (`Failed to parse the request body as JSON:
+/// invalid escape`).
+///
+/// Body: a JavaScript expression, e.g.
+/// ```text
+/// (() => document.querySelectorAll('.foo').length)()
+/// ```
+pub async fn ui_bridge_page_evaluate_raw_handler(
+    State(state): State<Arc<ApiState>>,
+    body: String,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if body.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("page/evaluate-raw: body is empty".to_string())),
+        ));
+    }
+    page_evaluate_inner(state, body).await
+}
+
+async fn page_evaluate_inner(
+    state: Arc<ApiState>,
+    expression: String,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let preview: String = expression.chars().take(80).collect();
     info!("UI Bridge API: Page evaluate ({}...)", preview);
 
-    let payload = serde_json::json!({ "expression": request.expression });
+    let payload = serde_json::json!({ "expression": expression });
 
     // Try IPC path first (fastest, uses SDK event handlers)
     match ui_bridge_request_sync(&state, "page_evaluate", payload).await {
@@ -2389,7 +2450,7 @@ pub async fn ui_bridge_page_evaluate_handler(
                 ipc_err
             );
 
-            match direct_webview_evaluate_with_result(&state, &request.expression).await {
+            match direct_webview_evaluate_with_result(&state, &expression).await {
                 Ok(result) => Ok(Json(ApiResponse::success(serde_json::json!({
                     "result": { "value": result },
                     "source": "direct_eval"
@@ -8415,6 +8476,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/page/evaluate",
             post(ui_bridge_page_evaluate_handler),
+        )
+        .route(
+            "/ui-bridge/control/page/evaluate-raw",
+            post(ui_bridge_page_evaluate_raw_handler),
         )
         .route(
             "/ui-bridge/control/page/evaluate-safe",
