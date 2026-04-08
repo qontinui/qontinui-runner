@@ -280,6 +280,11 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
           try {
             // SECURITY: Block dangerous patterns while allowing diagnostic expressions.
             // Uses new Function() which does not have access to local scope.
+            //
+            // Note: `window.location` read access (pathname, host, port, href,
+            // origin, protocol, search, hash, hostname) is allowed for test
+            // probes. Only mutating methods (assign/replace/reload) and
+            // assignment to window.location are blocked.
             const dangerousPatterns = [
               /\bimport\s*\(/, // dynamic import
               /\brequire\s*\(/, // require
@@ -298,7 +303,10 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               /\bProxy\b/, // metaprogramming
               /\bWebSocket\b/, // network access
               /\bwindow\.open\b/, // popup/navigation
-              /\bwindow\.location\b/, // navigation/redirect
+              /\bwindow\.location\.(assign|replace|reload)\b/, // navigation methods
+              /\bwindow\.location\s*=/, // assignment to window.location
+              /\blocation\.(assign|replace|reload)\b/, // bare location navigation
+              /\blocation\s*=\s*["'`]/, // assignment to bare location (string literal)
               /\bdocument\.cookie\b/, // cookie access
               /\bWorker\b/, // web workers
               /\bSharedWorker\b/, // shared workers
