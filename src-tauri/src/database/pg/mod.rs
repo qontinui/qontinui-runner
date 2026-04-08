@@ -323,6 +323,150 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS idx_recording_exports_format ON recording_exports(export_format);
         "#,
     },
+    Migration {
+        version: 9,
+        description: "Repair SQLite-era schema drift: 36 TIMESTAMPTZ columns and 7 BIGINT columns currently stored as TEXT/INTEGER",
+        sql: r#"
+            -- TIMESTAMPTZ columns that drifted to TEXT during the SQLite -> PG
+            -- migration. The canonical schema (CREATE TABLE in this file) has
+            -- always declared these as TIMESTAMPTZ, but the live tables on
+            -- already-running installs were created when the runner still
+            -- spoke SQLite and TEXT was the only timestamp type. CREATE TABLE
+            -- IF NOT EXISTS is a no-op once the table exists, so the drift
+            -- has been silently reproducing across builds. Queries that use
+            -- date_trunc / interval arithmetic / timestamptz comparison fail
+            -- against TEXT columns with confusing 'function date_trunc(unknown,
+            -- text) does not exist' errors. Cast each column to TIMESTAMPTZ;
+            -- empty strings (legacy SQLite default) become NULL via NULLIF
+            -- and only nullable columns retain them. PostgreSQL automatically
+            -- rebuilds dependent indexes during ALTER COLUMN TYPE.
+            --
+            -- All 36 columns were verified individually as 100% castable
+            -- against the production database before this migration was
+            -- written: empty/null values exist only in nullable columns,
+            -- and no value fails ::timestamptz parsing.
+
+            ALTER TABLE active_workflows
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
+                ALTER COLUMN updated_at SET DEFAULT NOW();
+
+            ALTER TABLE exploration_stats
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE fix_applications
+                ALTER COLUMN applied_at TYPE TIMESTAMPTZ USING NULLIF(applied_at, '')::timestamptz,
+                ALTER COLUMN applied_at SET DEFAULT NOW(),
+                ALTER COLUMN evaluated_at TYPE TIMESTAMPTZ USING NULLIF(evaluated_at, '')::timestamptz;
+
+            ALTER TABLE flow_executions
+                ALTER COLUMN started_at TYPE TIMESTAMPTZ USING NULLIF(started_at, '')::timestamptz,
+                ALTER COLUMN started_at SET DEFAULT NOW(),
+                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
+
+            ALTER TABLE flow_versions
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE generation_pipeline_artifacts
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE generation_rules
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
+                ALTER COLUMN updated_at SET DEFAULT NOW(),
+                ALTER COLUMN auto_generated_at TYPE TIMESTAMPTZ USING NULLIF(auto_generated_at, '')::timestamptz;
+
+            ALTER TABLE iteration_logs
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE meta_optimizer_runs
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
+
+            ALTER TABLE meta_optimizer_snapshots
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE orchestrator_checkpoints
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE orchestrator_flows
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
+                ALTER COLUMN updated_at SET DEFAULT NOW();
+
+            ALTER TABLE pipeline_agent_traces
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW();
+
+            ALTER TABLE recordings
+                ALTER COLUMN started_at TYPE TIMESTAMPTZ USING NULLIF(started_at, '')::timestamptz,
+                ALTER COLUMN started_at SET DEFAULT NOW(),
+                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
+
+            ALTER TABLE reflection_fixes
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN applied_at TYPE TIMESTAMPTZ USING NULLIF(applied_at, '')::timestamptz,
+                ALTER COLUMN applied_at SET DEFAULT NOW(),
+                ALTER COLUMN evaluated_at TYPE TIMESTAMPTZ USING NULLIF(evaluated_at, '')::timestamptz;
+
+            ALTER TABLE sm_capture_screenshots
+                ALTER COLUMN captured_at TYPE TIMESTAMPTZ USING NULLIF(captured_at, '')::timestamptz,
+                ALTER COLUMN captured_at SET DEFAULT NOW();
+
+            ALTER TABLE step_templates
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
+                ALTER COLUMN updated_at SET DEFAULT NOW();
+
+            ALTER TABLE template_performance
+                ALTER COLUMN last_used_at TYPE TIMESTAMPTZ USING NULLIF(last_used_at, '')::timestamptz;
+
+            ALTER TABLE test_results
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN started_at TYPE TIMESTAMPTZ USING NULLIF(started_at, '')::timestamptz,
+                ALTER COLUMN completed_at TYPE TIMESTAMPTZ USING NULLIF(completed_at, '')::timestamptz;
+
+            ALTER TABLE trigger_history
+                ALTER COLUMN triggered_at TYPE TIMESTAMPTZ USING NULLIF(triggered_at, '')::timestamptz,
+                ALTER COLUMN triggered_at SET DEFAULT NOW();
+
+            ALTER TABLE workflow_triggers
+                ALTER COLUMN created_at TYPE TIMESTAMPTZ USING NULLIF(created_at, '')::timestamptz,
+                ALTER COLUMN created_at SET DEFAULT NOW(),
+                ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING NULLIF(updated_at, '')::timestamptz,
+                ALTER COLUMN updated_at SET DEFAULT NOW(),
+                ALTER COLUMN last_triggered_at TYPE TIMESTAMPTZ USING NULLIF(last_triggered_at, '')::timestamptz;
+
+            -- BIGINT columns that drifted to INTEGER. Same root cause: the
+            -- canonical CREATE TABLE has always declared BIGINT but the live
+            -- tables were created when only INTEGER was used. INTEGER is
+            -- forward-compatible with BIGINT (every INTEGER fits a BIGINT),
+            -- so the cast is lossless. Indexes rebuild automatically.
+            ALTER TABLE canary_rollouts
+                ALTER COLUMN percentage TYPE BIGINT USING percentage::bigint,
+                ALTER COLUMN baseline_run_count TYPE BIGINT USING baseline_run_count::bigint,
+                ALTER COLUMN canary_run_count TYPE BIGINT USING canary_run_count::bigint;
+
+            ALTER TABLE workflow_triggers
+                ALTER COLUMN debounce_ms TYPE BIGINT USING debounce_ms::bigint,
+                ALTER COLUMN cooldown_seconds TYPE BIGINT USING cooldown_seconds::bigint,
+                ALTER COLUMN retry_delay_seconds TYPE BIGINT USING retry_delay_seconds::bigint,
+                ALTER COLUMN trigger_count TYPE BIGINT USING trigger_count::bigint;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
