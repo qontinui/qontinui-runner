@@ -18,6 +18,24 @@ use crate::config_storage::ConfigStorage;
 use crate::doctor::DoctorHandle;
 use crate::reflection::graph_engine::KnowledgeGraph;
 
+/// Cached result of the last successful UI Bridge discover call.
+///
+/// The React-side element registry does not persist the discover result
+/// across subsequent `get_elements` / `get_snapshot` calls: elements that
+/// existed at discover time may have unmounted or been pruned from the
+/// registry by the time the next HTTP call arrives. This cache lets agents
+/// retrieve the raw discover payload via
+/// `GET /ui-bridge/control/elements/last-discovered` so they can act on the
+/// element set they just observed.
+pub struct CachedDiscoverResult {
+    /// Raw JSON payload returned by the frontend for the discover request.
+    pub data: serde_json::Value,
+    /// When the discover completed.
+    pub captured_at: std::time::Instant,
+    /// Number of elements in the discover result at capture time (for convenience).
+    pub element_count: usize,
+}
+
 /// Cached knowledge graph with TTL + generation-based invalidation.
 /// The graph is wrapped in `Arc` so it can be shared without cloning the
 /// entire petgraph structure. The `generation` field tracks the cache
@@ -109,6 +127,12 @@ pub struct ApiState {
     pub instance_manager: Arc<crate::instance_manager::InstanceManager>,
     /// UI Bridge event sequence counter (monotonically increasing per runner lifetime)
     pub ui_bridge_event_sequence: std::sync::atomic::AtomicI64,
+    /// Last successful UI Bridge discover result, cached in-process so
+    /// agents can fetch the element set they just observed without racing
+    /// the React registry. See `CachedDiscoverResult` for rationale.
+    /// Populated by `ui_bridge_discover_handler`, read by
+    /// `ui_bridge_get_last_discovered_handler`.
+    pub ui_bridge_last_discovered: Arc<tokio::sync::RwLock<Option<CachedDiscoverResult>>>,
     /// Cached knowledge graph with TTL-based invalidation (60s).
     /// Avoids rebuilding the expensive petgraph on every request.
     pub knowledge_graph_cache: Arc<tokio::sync::RwLock<Option<CachedKnowledgeGraph>>>,

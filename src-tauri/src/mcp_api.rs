@@ -198,6 +198,7 @@ pub fn create_router(
         ui_bridge_dedup: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         ui_bridge_console_error_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ui_bridge_render_log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        ui_bridge_last_discovered: Arc::new(tokio::sync::RwLock::new(None)),
         doctor_handle: None, // Doctor handle accessed via app_state.doctor_handle when needed
         started_at: std::time::Instant::now(),
         instance_manager,

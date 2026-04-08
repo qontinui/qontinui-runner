@@ -1050,6 +1050,11 @@ pub async fn ui_bridge_execute_component_action_handler(
 }
 
 /// Discover controllable elements in the UI.
+///
+/// On success the result is cached on `ApiState::ui_bridge_last_discovered`
+/// so agents can retrieve the same element set via
+/// `GET /ui-bridge/control/elements/last-discovered`. This works around the
+/// React registry occasionally pruning elements between calls.
 pub async fn ui_bridge_discover_handler(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<UIBridgeDiscoveryRequest>,
@@ -1068,12 +1073,108 @@ pub async fn ui_bridge_discover_handler(
     });
 
     match ui_bridge_request_sync(&state, "discover", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(data) => {
+            // Populate the last-discovered cache. Best-effort — never
+            // block the response on a write lock.
+            let element_count = count_elements_in_discover_payload(&data);
+            let cache_entry = crate::mcp::types::CachedDiscoverResult {
+                data: data.clone(),
+                captured_at: std::time::Instant::now(),
+                element_count,
+            };
+            {
+                let mut guard = state.ui_bridge_last_discovered.write().await;
+                *guard = Some(cache_entry);
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
+}
+
+/// Maximum age of the last-discovered cache served to callers, in seconds.
+/// Past this age the endpoint reports the entry as stale but still returns
+/// it (callers can decide what to do based on `age_ms`).
+const LAST_DISCOVERED_FRESH_SECS: u64 = 60;
+
+/// Count elements in a discover payload, handling the common shapes
+/// `{"elements": [...]}` and `[...]`. Returns 0 if the shape is unfamiliar.
+fn count_elements_in_discover_payload(data: &serde_json::Value) -> usize {
+    if let Some(arr) = data.as_array() {
+        return arr.len();
+    }
+    if let Some(arr) = data.get("elements").and_then(|v| v.as_array()) {
+        return arr.len();
+    }
+    if let Some(arr) = data
+        .get("data")
+        .and_then(|d| d.get("elements"))
+        .and_then(|v| v.as_array())
+    {
+        return arr.len();
+    }
+    0
+}
+
+/// Return the last discovered element set (cached from the most recent
+/// `POST /ui-bridge/control/discover` call on this runner instance).
+///
+/// Unlike `/control/elements`, this endpoint does NOT round-trip to the
+/// React frontend — it serves the exact payload captured at discover time,
+/// so elements that the React registry has since pruned are still
+/// available to the caller. Returns 404 if no discover has ever run on
+/// this runner instance.
+///
+/// The response adds two diagnostic fields alongside the original payload:
+/// - `cache_age_ms`: how long ago the cache was populated
+/// - `stale`: true if the cache is older than the freshness window
+pub async fn ui_bridge_get_last_discovered_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let guard = state.ui_bridge_last_discovered.read().await;
+    let entry = match guard.as_ref() {
+        Some(e) => e,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(
+                    "No discover result cached yet — call POST /ui-bridge/control/discover first",
+                )),
+            ));
+        }
+    };
+
+    let age_ms = entry.captured_at.elapsed().as_millis() as u64;
+    let stale = entry.captured_at.elapsed().as_secs() > LAST_DISCOVERED_FRESH_SECS;
+
+    // Wrap the cached payload with diagnostic metadata without mutating
+    // the original. If the payload is already an object, merge in the
+    // cache_* fields; otherwise wrap it under `data`.
+    let response = match entry.data.clone() {
+        serde_json::Value::Object(mut map) => {
+            map.insert(
+                "cache_age_ms".to_string(),
+                serde_json::Value::from(age_ms),
+            );
+            map.insert(
+                "cache_element_count".to_string(),
+                serde_json::Value::from(entry.element_count),
+            );
+            map.insert("cache_stale".to_string(), serde_json::Value::from(stale));
+            serde_json::Value::Object(map)
+        }
+        other => serde_json::json!({
+            "data": other,
+            "cache_age_ms": age_ms,
+            "cache_element_count": entry.element_count,
+            "cache_stale": stale,
+        }),
+    };
+
+    Ok(Json(ApiResponse::success(response)))
 }
 
 /// Get a full snapshot of the UI Bridge state.
@@ -7236,9 +7337,14 @@ pub async fn ui_bridge_type_into_handler(
 
 /// Get a summary of the current page state.
 /// POST /ui-bridge/control/page/summary
+///
+/// Body is optional — callers may POST with no body at all, an empty body,
+/// or `{}`. The body is not currently read by this handler; the argument is
+/// `Option<Json<Value>>` solely so that Axum tolerates a missing or malformed
+/// body instead of returning "EOF while parsing a value".
 pub async fn ui_bridge_page_summary_handler(
     State(state): State<Arc<ApiState>>,
-    Json(_body): Json<serde_json::Value>,
+    _body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let js = r#"(() => {
         var vis = function(sel) { return Array.from(document.querySelectorAll(sel)).filter(function(el) { return el.offsetParent !== null; }); };
@@ -7278,6 +7384,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/control/elements",
             get(ui_bridge_get_elements_handler),
+        )
+        .route(
+            "/ui-bridge/control/elements/last-discovered",
+            get(ui_bridge_get_last_discovered_handler),
+        )
+        .route(
+            "/ui-bridge/ai/elements/last-discovered",
+            get(ui_bridge_get_last_discovered_handler),
         )
         .route(
             "/ui-bridge/control/element/{id}",
@@ -7584,6 +7698,18 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route(
             "/ui-bridge/control/wait-for-idle",
+            post(ui_bridge_wait_for_idle_handler),
+        )
+        // Aliases under /ui-bridge/ai/* for namespace consistency with
+        // ai/page-summary, ai/find, ai/execute, etc. Hitting ai/idle-status
+        // used to 404 silently (empty body) which misled callers into
+        // thinking the endpoint was broken.
+        .route(
+            "/ui-bridge/ai/idle-status",
+            get(ui_bridge_get_idle_status_handler),
+        )
+        .route(
+            "/ui-bridge/ai/wait-for-idle",
             post(ui_bridge_wait_for_idle_handler),
         )
         .route(
