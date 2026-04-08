@@ -244,23 +244,47 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        // Build the interval string in Rust to avoid PG parameter-typing ambiguity.
-        let interval = format!("{} days", days.max(0));
+        // Inline the interval as an integer literal in the SQL rather than
+        // binding it as $1::interval. tokio-postgres infers unknown-typed
+        // parameters as TEXT, and Postgres can't always cast a text-typed
+        // prepared-statement parameter directly to `interval` — the resolver
+        // errors out with "could not determine data type of parameter $1".
+        // `days` is a validated i32 (clamped to >= 0), so there is no
+        // injection risk in interpolating it directly.
+        let days = days.max(0);
+        // `created_at` is declared TIMESTAMPTZ in the canonical schema but
+        // some existing databases (surviving SQLite-era migrations) still
+        // hold it as TEXT. Cast explicitly so both shapes work and so
+        // `date_trunc`/interval comparison don't trip on type inference.
+        let sql = format!(
+            r#"SELECT
+                to_char(date_trunc('day', created_at::timestamptz), 'YYYY-MM-DD') AS day,
+                COUNT(*)::BIGINT AS total,
+                COUNT(*) FILTER (WHERE success)::BIGINT AS successful,
+                AVG(total_duration_ms)::FLOAT8 AS avg_duration_ms
+               FROM generation_pipeline_artifacts
+               WHERE created_at::timestamptz >= NOW() - INTERVAL '{} days'
+               GROUP BY day
+               ORDER BY day"#,
+            days
+        );
         let rows = conn
-            .query(
-                r#"SELECT
-                    to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
-                    COUNT(*)::BIGINT AS total,
-                    COUNT(*) FILTER (WHERE success)::BIGINT AS successful,
-                    AVG(total_duration_ms)::FLOAT8 AS avg_duration_ms
-                   FROM generation_pipeline_artifacts
-                   WHERE created_at >= NOW() - $1::interval
-                   GROUP BY day
-                   ORDER BY day"#,
-                &[&interval],
-            )
+            .query(sql.as_str(), &[])
             .await
-            .map_err(|e| format!("PG get_generator_trends: {}", e))?;
+            .map_err(|e| {
+                // Include the error source chain — tokio_postgres::Error's
+                // top-level Display can collapse to "db error" and hide the
+                // actual SQLSTATE/column/message from Postgres.
+                let mut detail = format!("{}", e);
+                let mut src: Option<&(dyn std::error::Error + 'static)> =
+                    std::error::Error::source(&e);
+                while let Some(s) = src {
+                    detail.push_str(" | ");
+                    detail.push_str(&s.to_string());
+                    src = std::error::Error::source(s);
+                }
+                format!("PG get_generator_trends: {}", detail)
+            })?;
 
         Ok(rows
             .iter()
