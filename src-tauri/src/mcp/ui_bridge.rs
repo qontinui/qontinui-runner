@@ -3990,6 +3990,230 @@ pub async fn ui_bridge_get_idle_status_handler(
     }
 }
 
+/// Wait for an element to appear in the UI.
+///
+/// Polls via one of two backends until an element matches:
+/// - `query` → polls `ai_find` (natural language + optional type filter)
+/// - `elementId` → polls `get_element` (direct id lookup)
+///
+/// Exactly one of `query` or `elementId` must be provided. On match, returns
+/// `{found: true, element, elapsed_ms, polls}`. On timeout, returns
+/// `408 Request Timeout` with a descriptive error and the poll count.
+///
+/// Body fields (all optional unless noted):
+/// - `query` (string) — natural language query for `ai_find`
+/// - `type` (string) — element type filter passed to `ai_find`
+/// - `elementId` (string) — direct element id to look up
+/// - `timeout` (number, default 5000) — max wait in ms
+/// - `pollIntervalMs` (number, default 200) — ms between polls
+/// - `minConfidence` (number, default 0.5) — only for query mode;
+///   ai_find results below this confidence are treated as "not found"
+pub async fn ui_bridge_wait_for_element_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| serde_json::json!({}));
+
+    let query = body.get("query").and_then(|v| v.as_str()).map(String::from);
+    let element_id = body
+        .get("elementId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let element_type = body.get("type").and_then(|v| v.as_str()).map(String::from);
+    let timeout_ms = body
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+    let poll_interval_ms = body
+        .get("pollIntervalMs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200)
+        .max(50); // floor at 50ms to avoid hammering the frontend
+    let min_confidence = body
+        .get("minConfidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+
+    // Exactly one of query / elementId must be provided.
+    match (query.as_deref(), element_id.as_deref()) {
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "wait-for-element: provide either 'query' or 'elementId'",
+                )),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "wait-for-element: 'query' and 'elementId' are mutually exclusive",
+                )),
+            ));
+        }
+        _ => {}
+    }
+
+    info!(
+        "UI Bridge API: wait-for-element query={:?} elementId={:?} timeout={}ms",
+        query, element_id, timeout_ms
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let start = std::time::Instant::now();
+    let mut polls: u32 = 0;
+
+    loop {
+        polls += 1;
+
+        // Attempt a single match.
+        let match_result: Result<Option<serde_json::Value>, String> = if let Some(q) = &query {
+            // Natural-language query via ai_find.
+            let mut params = serde_json::json!({ "query": q });
+            if let Some(t) = &element_type {
+                params["type"] = serde_json::Value::from(t.clone());
+            }
+            let payload = serde_json::json!({ "params": params });
+            match ui_bridge_request_sync(&state, "ai_find", payload).await {
+                Ok(data) => Ok(extract_ai_find_match(&data, min_confidence)),
+                Err(e) => Err(e),
+            }
+        } else {
+            // Direct id lookup via get_element. A successful lookup with a
+            // non-null `element` field counts as a match.
+            let id = element_id.as_deref().unwrap_or("");
+            match ui_bridge_request_sync(
+                &state,
+                "get_element",
+                serde_json::json!({ "elementId": id }),
+            )
+            .await
+            {
+                Ok(data) => Ok(extract_get_element_match(&data)),
+                Err(e) => {
+                    // Treat "element not found" as a miss rather than a
+                    // transport error: the frontend may return an error
+                    // payload when the element doesn't exist yet.
+                    let msg = e.to_lowercase();
+                    if msg.contains("not found") || msg.contains("does not exist") {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        };
+
+        match match_result {
+            Ok(Some(element)) => {
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                return Ok(Json(ApiResponse::success(serde_json::json!({
+                    "found": true,
+                    "element": element,
+                    "elapsed_ms": elapsed_ms,
+                    "polls": polls,
+                }))));
+            }
+            Ok(None) => {
+                // Not found yet — fall through to timeout check + sleep.
+            }
+            Err(e) => {
+                error!("UI Bridge API: wait-for-element transport error: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+            }
+        }
+
+        // Timeout check: if the next poll would overshoot the deadline,
+        // give up now rather than sleep-then-check.
+        if std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms)
+            > deadline
+        {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let descriptor = if let Some(q) = &query {
+                format!("query='{}'", q)
+            } else if let Some(id) = &element_id {
+                format!("elementId='{}'", id)
+            } else {
+                String::from("(no selector)")
+            };
+            let msg = format!(
+                "wait-for-element: timeout after {}ms ({} polls, {})",
+                elapsed_ms, polls, descriptor
+            );
+            info!("UI Bridge API: {}", msg);
+            return Err((StatusCode::REQUEST_TIMEOUT, Json(api_error(msg))));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+    }
+}
+
+/// Extract the matched element from an `ai_find` response, if any.
+///
+/// The frontend's ai_find shape is `{ element: {...}, confidence: 0.x,
+/// alternatives: [...] }` wrapped in the usual `data` envelope. Returns
+/// the element only if confidence >= min_confidence.
+fn extract_ai_find_match(data: &serde_json::Value, min_confidence: f64) -> Option<serde_json::Value> {
+    // Walk into the response trying both {elem, conf} at top level and
+    // nested under `data`, matching other ai_find callers.
+    let find_match = |v: &serde_json::Value| -> Option<serde_json::Value> {
+        let element = v.get("element")?;
+        if element.is_null() {
+            return None;
+        }
+        let conf = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
+        if conf >= min_confidence {
+            Some(element.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(e) = find_match(data) {
+        return Some(e);
+    }
+    if let Some(inner) = data.get("data") {
+        if let Some(e) = find_match(inner) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+/// Extract the element from a `get_element` response, if it represents a
+/// real element (not a null / not-found placeholder).
+fn extract_get_element_match(data: &serde_json::Value) -> Option<serde_json::Value> {
+    let check = |v: &serde_json::Value| -> Option<serde_json::Value> {
+        if v.is_null() {
+            return None;
+        }
+        // Some frontends return {found: false} — respect it.
+        if v.get("found").and_then(|f| f.as_bool()) == Some(false) {
+            return None;
+        }
+        // Require at least an id field to count as a real match.
+        if v.get("id").is_some() || v.get("elementId").is_some() {
+            return Some(v.clone());
+        }
+        // Or a nested `element` field.
+        if let Some(el) = v.get("element") {
+            if !el.is_null() && (el.get("id").is_some() || el.get("elementId").is_some()) {
+                return Some(el.clone());
+            }
+        }
+        None
+    };
+    if let Some(e) = check(data) {
+        return Some(e);
+    }
+    if let Some(inner) = data.get("data") {
+        if let Some(e) = check(inner) {
+            return Some(e);
+        }
+    }
+    None
+}
+
 /// Wait for composite idle state.
 pub async fn ui_bridge_wait_for_idle_handler(
     State(state): State<Arc<ApiState>>,
@@ -7711,6 +7935,15 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/ai/wait-for-idle",
             post(ui_bridge_wait_for_idle_handler),
+        )
+        // Wait for an element to appear (polls ai_find or get_element)
+        .route(
+            "/ui-bridge/control/wait-for-element",
+            post(ui_bridge_wait_for_element_handler),
+        )
+        .route(
+            "/ui-bridge/ai/wait-for-element",
+            post(ui_bridge_wait_for_element_handler),
         )
         .route(
             "/ui-bridge/control/diagnose-stuck",
