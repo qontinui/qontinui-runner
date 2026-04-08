@@ -216,9 +216,9 @@ pub struct KnowledgeSummary {
 /// Service for managing context compression.
 ///
 /// Reads live (non-archived) `task_knowledge` rows from PG, summarizes oldest
-/// entries per category once the configured threshold is exceeded, persists
-/// the summary as a new knowledge row, and archives the originals via
-/// `PgDb::archive_task_knowledge`.
+/// entries per category once the configured threshold is exceeded, and
+/// atomically persists the summary + archives the originals via
+/// `PgDb::compress_and_archive`.
 pub struct CompressionService {
     config: CompressionConfig,
     pg: Arc<PgDb>,

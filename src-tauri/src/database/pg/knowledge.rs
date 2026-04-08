@@ -695,41 +695,4 @@ impl PgDb {
         Ok(archived as usize)
     }
 
-    /// Archive a set of knowledge entries by rolling them into a summary entry.
-    ///
-    /// Sets `archived_at = NOW()` and `summary_entry_id = summary_id` for every
-    /// row in `ids` whose `archived_at` is currently NULL. Already-archived rows
-    /// are skipped (no-op). Returns the number of rows actually updated.
-    ///
-    /// `summary_id` must be the id of an existing `task_knowledge` row — the
-    /// foreign key on `summary_entry_id` enforces this.
-    pub async fn archive_task_knowledge(
-        &self,
-        ids: &[String],
-        summary_id: &str,
-    ) -> Result<usize, String> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-
-        let conn = self
-            .pool()
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {e}"))?;
-
-        let updated = conn
-            .execute(
-                r#"UPDATE task_knowledge
-                   SET archived_at = NOW(),
-                       summary_entry_id = $1
-                   WHERE id = ANY($2::text[])
-                     AND archived_at IS NULL"#,
-                &[&summary_id, &ids],
-            )
-            .await
-            .map_err(|e| format!("PG archive_task_knowledge: {e}"))?;
-
-        Ok(updated as usize)
-    }
 }
