@@ -166,6 +166,8 @@ export type UIBridgeRequestType =
   | "design_evaluate_diff"
   // Media compare
   | "media_compare"
+  // Pixel-accurate visual regression diff
+  | "image_diff"
   // Annotations import
   | "annotations_import"
   // Intents NL

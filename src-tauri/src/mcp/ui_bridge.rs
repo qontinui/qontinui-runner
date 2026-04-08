@@ -32,6 +32,16 @@ pub struct UIBridgeActionRequest {
     params: Option<serde_json::Value>,
     #[serde(default)]
     wait_options: Option<serde_json::Value>,
+    /// Optional opt-in detector: when set, the handler takes a discover
+    /// snapshot before and after the action and reports whether the DOM
+    /// element graph changed. Lets callers detect "click had no effect"
+    /// silent no-ops (e.g. clicking a disabled-but-hit-testable button).
+    ///
+    /// Accepts either a bool (`expectChange: true`, uses defaults) or an
+    /// object: `{ "settleMs": 250 }` to control the post-action settle
+    /// delay before the second snapshot.
+    #[serde(default)]
+    expect_change: Option<serde_json::Value>,
     /// Capture any extra top-level fields (e.g., targetPosition, text, clear)
     /// so they can be merged into params for actions that accept flat format.
     #[serde(flatten)]
@@ -889,6 +899,45 @@ pub struct ActionQueryParams {
     pub task_run_id: Option<i64>,
 }
 
+/// Cheap fingerprint of a discover snapshot for click-had-no-effect
+/// detection. Returns `(element_count, hash)` where `hash` is a stable
+/// hash over each element's `id`, `category`, and `state.textContent`.
+/// Two equal signatures = no observable DOM mutation between snapshots.
+fn snapshot_signature(snapshot: &serde_json::Value) -> (usize, u64) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let elements = snapshot
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    for el in &elements {
+        if let Some(s) = el.get("id").and_then(|v| v.as_str()) {
+            s.hash(&mut hasher);
+        }
+        if let Some(s) = el.get("category").and_then(|v| v.as_str()) {
+            s.hash(&mut hasher);
+        }
+        if let Some(s) = el
+            .get("state")
+            .and_then(|v| v.get("textContent"))
+            .and_then(|v| v.as_str())
+        {
+            s.hash(&mut hasher);
+        }
+        if let Some(s) = el
+            .get("state")
+            .and_then(|v| v.get("ariaPressed"))
+            .and_then(|v| v.as_bool())
+        {
+            s.hash(&mut hasher);
+        }
+    }
+    (elements.len(), hasher.finish())
+}
+
 pub async fn ui_bridge_execute_action_handler(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
@@ -902,7 +951,34 @@ pub async fn ui_bridge_execute_action_handler(
 
     let action_name = request.action.clone();
     let task_run_id = query.task_run_id;
+    let expect_change = request.expect_change.clone();
     let start = Instant::now();
+
+    // Optional pre-action snapshot for the click-had-no-effect detector.
+    // We take it BEFORE the action so the timing is fair (vs. counting
+    // mutations the action itself produces in flight). The snapshot is a
+    // discover call with `interactive_only: false` to catch every element
+    // that could have changed.
+    let pre_snapshot_signature: Option<(usize, u64)> = if expect_change.is_some() {
+        match ui_bridge_request_sync(
+            &state,
+            "discover",
+            serde_json::json!({ "params": { "interactive_only": false } }),
+        )
+        .await
+        {
+            Ok(data) => Some(snapshot_signature(&data)),
+            Err(e) => {
+                warn!(
+                    "execute_action: pre-snapshot failed for expectChange ({}); skipping detector",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Merge flat top-level fields into params so actions like drag work with
     // both {"action":"drag","params":{"targetPosition":{...}}} and
@@ -929,7 +1005,74 @@ pub async fn ui_bridge_execute_action_handler(
         }
     });
 
-    let result = wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await);
+    let mut result =
+        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await);
+
+    // Click-had-no-effect detector. Re-snapshot after a short settle delay
+    // and compare against the pre-snapshot signature. If the element graph
+    // is byte-identical, the click was a silent no-op.
+    if let Some(pre_sig) = pre_snapshot_signature {
+        let settle_ms = expect_change
+            .as_ref()
+            .and_then(|v| v.get("settleMs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(250);
+        tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+
+        let post_sig = match ui_bridge_request_sync(
+            &state,
+            "discover",
+            serde_json::json!({ "params": { "interactive_only": false } }),
+        )
+        .await
+        {
+            Ok(data) => Some(snapshot_signature(&data)),
+            Err(e) => {
+                warn!(
+                    "execute_action: post-snapshot failed for expectChange ({})",
+                    e
+                );
+                None
+            }
+        };
+
+        let detector = match post_sig {
+            Some(post) => {
+                let changed = post != pre_sig;
+                serde_json::json!({
+                    "supported": true,
+                    "effectChanged": changed,
+                    "preElementCount": pre_sig.0,
+                    "postElementCount": post.0,
+                    "preSignature": pre_sig.1.to_string(),
+                    "postSignature": post.1.to_string(),
+                    "settleMs": settle_ms,
+                })
+            }
+            None => serde_json::json!({
+                "supported": false,
+                "effectChanged": null,
+                "reason": "post-snapshot failed",
+            }),
+        };
+
+        // Merge the detector report into the result data without
+        // disturbing the existing fields.
+        if let Ok(ref mut json_resp) = result {
+            let merged = match json_resp.data.take() {
+                Some(serde_json::Value::Object(mut m)) => {
+                    m.insert("expectChange".to_string(), detector);
+                    serde_json::Value::Object(m)
+                }
+                Some(other) => serde_json::json!({
+                    "result": other,
+                    "expectChange": detector,
+                }),
+                None => serde_json::json!({ "expectChange": detector }),
+            };
+            json_resp.data = Some(merged);
+        }
+    }
 
     // Persist the action event when task_run_id is provided (non-blocking)
     if let Some(tr_id) = task_run_id {
@@ -4082,6 +4225,18 @@ pub async fn ui_bridge_get_idle_status_handler(
 /// - `pollIntervalMs` (number, default 200) — ms between polls
 /// - `minConfidence` (number, default 0.5) — only for query mode;
 ///   ai_find results below this confidence are treated as "not found"
+/// - `assertions` (array, optional) — additional conditions the element
+///   must satisfy after it has been found. Each assertion is evaluated on
+///   every poll; if any fail, the find is treated as a miss and polling
+///   continues until the timeout expires. On timeout the last failing
+///   assertion is reported, distinguishing "element never appeared" from
+///   "element appeared but assertion failed".
+///
+///   Supported assertion `kind`s:
+///   - `{"kind":"visible"}` — element bounds have non-zero area.
+///   - `{"kind":"text_contains","value":"...","caseInsensitive":bool}`
+///   - `{"kind":"text_equals","value":"...","caseInsensitive":bool}`
+///   - `{"kind":"attribute_equals","name":"aria-pressed","value":"true"}`
 pub async fn ui_bridge_wait_for_element_handler(
     State(state): State<Arc<ApiState>>,
     body: Option<Json<serde_json::Value>>,
@@ -4107,6 +4262,11 @@ pub async fn ui_bridge_wait_for_element_handler(
         .get("minConfidence")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.5);
+    let assertions: Vec<serde_json::Value> = body
+        .get("assertions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
 
     // Exactly one of query / elementId must be provided.
     match (query.as_deref(), element_id.as_deref()) {
@@ -4137,6 +4297,9 @@ pub async fn ui_bridge_wait_for_element_handler(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let start = std::time::Instant::now();
     let mut polls: u32 = 0;
+    // Track the most recent assertion failure so we can surface it on timeout.
+    // None = no assertions evaluated yet OR last poll's element was missing.
+    let mut last_assertion_failure: Option<String> = None;
 
     loop {
         polls += 1;
@@ -4181,16 +4344,39 @@ pub async fn ui_bridge_wait_for_element_handler(
 
         match match_result {
             Ok(Some(element)) => {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                return Ok(Json(ApiResponse::success(serde_json::json!({
-                    "found": true,
-                    "element": element,
-                    "elapsed_ms": elapsed_ms,
-                    "polls": polls,
-                }))));
+                // Element exists. If the caller supplied assertions,
+                // evaluate them now and treat any failure as a continuing
+                // miss (so we keep polling until timeout).
+                if !assertions.is_empty() {
+                    match evaluate_wait_for_element_assertions(&element, &assertions) {
+                        Ok(()) => {
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            return Ok(Json(ApiResponse::success(serde_json::json!({
+                                "found": true,
+                                "element": element,
+                                "elapsed_ms": elapsed_ms,
+                                "polls": polls,
+                                "assertions_passed": assertions.len(),
+                            }))));
+                        }
+                        Err(reason) => {
+                            last_assertion_failure = Some(reason);
+                            // Fall through to timeout check + sleep.
+                        }
+                    }
+                } else {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    return Ok(Json(ApiResponse::success(serde_json::json!({
+                        "found": true,
+                        "element": element,
+                        "elapsed_ms": elapsed_ms,
+                        "polls": polls,
+                    }))));
+                }
             }
             Ok(None) => {
                 // Not found yet — fall through to timeout check + sleep.
+                last_assertion_failure = None;
             }
             Err(e) => {
                 error!("UI Bridge API: wait-for-element transport error: {}", e);
@@ -4211,16 +4397,164 @@ pub async fn ui_bridge_wait_for_element_handler(
             } else {
                 String::from("(no selector)")
             };
-            let msg = format!(
-                "wait-for-element: timeout after {}ms ({} polls, {})",
-                elapsed_ms, polls, descriptor
-            );
+            let msg = if let Some(reason) = &last_assertion_failure {
+                format!(
+                    "wait-for-element: timeout after {}ms ({} polls, {}) — element appeared but assertion failed: {}",
+                    elapsed_ms, polls, descriptor, reason
+                )
+            } else {
+                format!(
+                    "wait-for-element: timeout after {}ms ({} polls, {})",
+                    elapsed_ms, polls, descriptor
+                )
+            };
             info!("UI Bridge API: {}", msg);
             return Err((StatusCode::REQUEST_TIMEOUT, Json(api_error(msg))));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
     }
+}
+
+/// Evaluate the `assertions[]` array for the wait-for-element handler.
+///
+/// Returns `Ok(())` if all assertions pass; `Err(reason)` with a
+/// human-readable message describing the first failing assertion. Used by
+/// `ui_bridge_wait_for_element_handler` to keep polling until either the
+/// element matches every assertion or the deadline expires.
+///
+/// Each assertion entry is a JSON object with a required `kind` field.
+/// See the wait-for-element handler doc-comment for the supported kinds.
+fn evaluate_wait_for_element_assertions(
+    element: &serde_json::Value,
+    assertions: &[serde_json::Value],
+) -> Result<(), String> {
+    fn text_of(element: &serde_json::Value) -> String {
+        // ai_find / get_element results both expose text via several
+        // possible fields depending on which path produced them. Coalesce.
+        for key in [
+            "text",
+            "label",
+            "accessibleName",
+            "innerText",
+            "textContent",
+        ] {
+            if let Some(s) = element.get(key).and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        // Fall back to a nested `state.textContent`, which is what the
+        // discover endpoint produces for many element types.
+        if let Some(s) = element
+            .get("state")
+            .and_then(|v| v.get("textContent"))
+            .and_then(|v| v.as_str())
+        {
+            return s.to_string();
+        }
+        String::new()
+    }
+
+    fn attr_of(element: &serde_json::Value, name: &str) -> Option<String> {
+        // Try multiple shapes — different IPC results expose attributes
+        // differently. We accept either a flat `attributes` map or a
+        // nested `state.attributes` object.
+        for prefix in ["attributes", "state.attributes"] {
+            let mut node = element;
+            for key in prefix.split('.') {
+                node = match node.get(key) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+            if let Some(v) = node.get(name).and_then(|v| v.as_str()) {
+                return Some(v.to_string());
+            }
+        }
+        None
+    }
+
+    for (idx, assertion) in assertions.iter().enumerate() {
+        let kind = assertion
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("assertion #{idx} missing 'kind'"))?;
+
+        match kind {
+            "visible" => {
+                // Look for a non-zero bounding rect anywhere in the element.
+                let bounds = element
+                    .get("bounds")
+                    .or_else(|| element.get("rect"))
+                    .or_else(|| {
+                        element.get("state").and_then(|s| s.get("rect"))
+                    });
+                let (w, h) = match bounds {
+                    Some(b) => (
+                        b.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                        b.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    ),
+                    None => (0.0, 0.0),
+                };
+                if w <= 0.0 || h <= 0.0 {
+                    return Err(format!(
+                        "visible: element bounds are {}x{}",
+                        w, h
+                    ));
+                }
+            }
+            "text_contains" | "text_equals" => {
+                let needle = assertion
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("{kind}: 'value' is required"))?;
+                let case_insensitive = assertion
+                    .get("caseInsensitive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let actual = text_of(element);
+                let (actual_cmp, needle_cmp) = if case_insensitive {
+                    (actual.to_lowercase(), needle.to_lowercase())
+                } else {
+                    (actual.clone(), needle.to_string())
+                };
+                let pass = if kind == "text_contains" {
+                    actual_cmp.contains(&needle_cmp)
+                } else {
+                    actual_cmp == needle_cmp
+                };
+                if !pass {
+                    return Err(format!(
+                        "{kind}: expected '{needle}' got '{}' (caseInsensitive={case_insensitive})",
+                        actual
+                    ));
+                }
+            }
+            "attribute_equals" => {
+                let name = assertion
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("attribute_equals: 'name' is required"))?;
+                let expected = assertion
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("attribute_equals: 'value' is required"))?;
+                let actual = attr_of(element, name);
+                if actual.as_deref() != Some(expected) {
+                    return Err(format!(
+                        "attribute_equals: {name}='{expected}' but actual='{}'",
+                        actual.unwrap_or_else(|| "<missing>".to_string())
+                    ));
+                }
+            }
+            other => {
+                return Err(format!("unsupported assertion kind '{other}'"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// POST /ui-bridge/ai/expect
@@ -5415,7 +5749,8 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
             "media": {
                 "description": "Media element discovery, audits, and analysis",
                 "endpoints": ["media/find", "media/audit/accessibility", "media/audit/performance",
-                    "media/snapshot", "media/analyze", "media/analyze/batch", "media/analyze/page", "media/compare"]
+                    "media/snapshot", "media/analyze", "media/analyze/batch", "media/analyze/page", "media/compare",
+                    "image-diff"]
             },
             "stateMachine": {
                 "description": "State discovery, activation, transitions, navigation",
@@ -5896,6 +6231,79 @@ ipc_handler_post!(
 
 // Media compare
 ipc_handler_post!(ui_bridge_media_compare_handler, "media_compare");
+
+// Pixel-accurate image diff (compareVisualRegression alias)
+ipc_handler_post!(ui_bridge_image_diff_handler, "image_diff");
+
+/// `GET /ui-bridge/control/element-screenshot?id=...`
+///
+/// Returns a single element's PNG capture. Wraps the existing
+/// `capture_element_images` batch IPC type — we ask the webview to capture
+/// just one element and unwrap the single-entry result.
+///
+/// Response shape:
+/// ```json
+/// { "success": true, "data": {
+///     "id": "btn-save",
+///     "base64_png": "iVBOR...",
+///     "width": 80, "height": 30,
+///     "device_pixel_ratio": 1.5
+/// } }
+/// ```
+pub async fn ui_bridge_element_screenshot_handler(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let id = match query.get("id") {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error("element-screenshot requires `id` query param".to_string())),
+            ))
+        }
+    };
+
+    let payload = serde_json::json!({
+        "params": { "element_ids": [id.clone()] }
+    });
+
+    match ui_bridge_request_sync(&state, "capture_element_images", payload).await {
+        Ok(data) => {
+            // The batch endpoint returns
+            //   { captures: { "<id>": { base64_png, width, height } },
+            //     element_count, requested_count, device_pixel_ratio }
+            // Reshape into a single-element response.
+            let dpr = data
+                .get("device_pixel_ratio")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let captures = data.get("captures").and_then(|c| c.as_object());
+            let entry = captures.and_then(|c| c.get(&id));
+            match entry {
+                Some(image) => {
+                    let mut out = image.clone();
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert("id".to_string(), serde_json::Value::String(id));
+                        obj.insert(
+                            "device_pixel_ratio".to_string(),
+                            serde_json::json!(dpr),
+                        );
+                    }
+                    Ok(Json(ApiResponse::success(out)))
+                }
+                None => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!(
+                        "element '{}' not found or not capturable",
+                        id
+                    ))),
+                )),
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
 
 // Annotations import
 ipc_handler_post!(ui_bridge_annotations_import_handler, "annotations_import");
@@ -8543,6 +8951,24 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route(
             "/ui-bridge/ai/media/compare",
             post(ui_bridge_media_compare_handler),
+        )
+        // Pixel-accurate image diff (canonical visual regression)
+        .route(
+            "/ui-bridge/ai/image-diff",
+            post(ui_bridge_image_diff_handler),
+        )
+        .route(
+            "/ui-bridge/control/ai/image-diff",
+            post(ui_bridge_image_diff_handler),
+        )
+        // Single-element screenshot (thin wrapper over capture_element_images)
+        .route(
+            "/ui-bridge/control/element-screenshot",
+            get(ui_bridge_element_screenshot_handler),
+        )
+        .route(
+            "/ui-bridge/ai/element-screenshot",
+            get(ui_bridge_element_screenshot_handler),
         )
         // Annotations import
         .route(

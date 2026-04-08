@@ -1,9 +1,11 @@
 import { useCallback } from "react";
+import { compareVisualRegression } from "@qontinui/ui-bridge/ai";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
 
 /**
  * Handles: find_media, media_audit, capture_media_snapshot, analyze_media,
- *          capture_element_images, get_element_images, media_compare
+ *          capture_element_images, get_element_images, media_compare,
+ *          image_diff
  */
 export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">) {
   const { bridgeRef, sendResponse } = context;
@@ -238,6 +240,75 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             data: { images: results, total: results.length },
             timestamp: Date.now(),
           });
+          return true;
+        }
+
+        case "image_diff": {
+          // Pixel-accurate visual regression diff between two arbitrary
+          // base64 PNGs (NOT a DOM media-element diff like media_compare).
+          // Wraps `compareVisualRegression` from @qontinui/ui-bridge.
+          //
+          // Body shape:
+          //   { a: "data:image/png;base64,..." | "<base64>",
+          //     b: "data:image/png;base64,..." | "<base64>",
+          //     options?: { pixelThreshold?, failureThreshold?,
+          //                 failureThresholdType?, blur? } }
+          const diffParams = (payload.params ?? payload.body ?? {}) as {
+            a?: string;
+            b?: string;
+            options?: {
+              pixelThreshold?: number;
+              failureThreshold?: number;
+              failureThresholdType?: "percent" | "pixels";
+              blur?: number;
+            };
+          };
+
+          if (!diffParams.a || !diffParams.b) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "image_diff requires both `a` and `b` base64 image strings",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // compareVisualRegression accepts MediaSnapshotData. We only need
+          // the `data` field; the rest is metadata for callers that already
+          // have a captured snapshot.
+          const wrap = (data: string) => ({
+            data: data.startsWith("data:") ? data : `data:image/png;base64,${data}`,
+            width: 0,
+            height: 0,
+            mediaType: "image" as const,
+            elementId: "",
+            timestamp: Date.now(),
+          });
+
+          try {
+            const result = await compareVisualRegression(
+              wrap(diffParams.a),
+              wrap(diffParams.b),
+              diffParams.options ?? {},
+            );
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: result,
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: e instanceof Error ? e.message : String(e),
+              timestamp: Date.now(),
+            });
+          }
           return true;
         }
 
