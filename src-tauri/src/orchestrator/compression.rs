@@ -423,6 +423,12 @@ impl CompressionService {
             )
             .await?;
 
+        // Best-effort embed so the summary itself is searchable via Tier 0.
+        let _ = self
+            .pg
+            .embed_knowledge_content(&summary_id, &summary_content)
+            .await;
+
         // Archive the originals — single round-trip via ANY($::text[])
         let id_strings: Vec<String> = to_compress.iter().map(|e| e.id.clone()).collect();
         let archived_count = self

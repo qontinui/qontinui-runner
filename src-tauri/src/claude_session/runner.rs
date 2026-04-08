@@ -903,6 +903,11 @@ fn run_claude_session_inline(
                                                 "[]",
                                             ).await {
                                                 tracing::warn!("[knowledge_acquisition] Failed to store enrichment: {}", e);
+                                            } else {
+                                                // Best-effort embed so the row is searchable via Tier 0.
+                                                let _ = pg
+                                                    .embed_knowledge_content(&knowledge_id, &content)
+                                                    .await;
                                             }
                                         }
                                     }
@@ -1298,6 +1303,17 @@ fn run_claude_session_inline(
                                                     "Auto-applied project fix as knowledge: {} (category={}, project={:?})",
                                                     knowledge_id, category, ctx.project_path
                                                 );
+                                                // Best-effort embed so the row is searchable via Tier 0.
+                                                if let Some(ref rt) = pg_rt {
+                                                    let pg =
+                                                        crate::database::pg::PgDb::global();
+                                                    let _ = rt.block_on(
+                                                        pg.embed_knowledge_content(
+                                                            &knowledge_id,
+                                                            &fix.fix_description,
+                                                        ),
+                                                    );
+                                                }
                                                 let auto_msg = format!(
                                                     "Auto-applied project fix as {} knowledge: {}",
                                                     category, fix.fix_description
@@ -1354,6 +1370,17 @@ fn run_claude_session_inline(
                                         match kb_result {
                                             Ok(knowledge_id) => {
                                                 info!("Auto-applied reflection fix as knowledge entry: {}", knowledge_id);
+                                                // Best-effort embed so the row is searchable via Tier 0.
+                                                if let Some(ref rt) = pg_rt {
+                                                    let pg =
+                                                        crate::database::pg::PgDb::global();
+                                                    let _ = rt.block_on(
+                                                        pg.embed_knowledge_content(
+                                                            &knowledge_id,
+                                                            &fix.fix_description,
+                                                        ),
+                                                    );
+                                                }
                                                 let auto_msg = format!(
                                                     "Auto-applied fix as {} knowledge: {}",
                                                     category, fix.fix_description

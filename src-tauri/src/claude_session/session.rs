@@ -570,6 +570,11 @@ impl ClaudeSession {
                                                     "[]",
                                                 ).await {
                                                     tracing::warn!("[knowledge_acquisition] Failed to store enrichment: {}", e);
+                                                } else {
+                                                    // Best-effort embed so the row is searchable via Tier 0.
+                                                    let _ = pg
+                                                        .embed_knowledge_content(&knowledge_id, &content)
+                                                        .await;
                                                 }
                                             }
                                         }

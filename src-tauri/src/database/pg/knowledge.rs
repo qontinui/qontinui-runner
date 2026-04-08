@@ -96,6 +96,46 @@ impl PgDb {
         Ok(())
     }
 
+    /// Best-effort: compute an embedding for the given knowledge content and
+    /// persist it via `store_knowledge_embedding`.
+    ///
+    /// This is the write-side counterpart to `hybrid_search_knowledge`. Every
+    /// live `create_task_knowledge` call site should invoke this immediately
+    /// after a successful insert so that the row becomes searchable via the
+    /// Tier 0 vector path.
+    ///
+    /// **Best-effort contract**: embedding failures (service down, network
+    /// hiccup, storage error) MUST NOT fail the primary knowledge write.
+    /// They are logged at warn level and this method returns `Ok(())`. Rows
+    /// that fail to embed simply remain unsearchable via the vector path
+    /// until the next time the content is re-embedded.
+    pub async fn embed_knowledge_content(
+        &self,
+        knowledge_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let client = crate::database::embedding_client::EmbeddingClient::new();
+        let embedding = match client.compute_text_embedding(content).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    "embed_knowledge_content: compute failed for {}: {} (row saved without embedding)",
+                    knowledge_id,
+                    e
+                );
+                return Ok(());
+            }
+        };
+        if let Err(e) = self.store_knowledge_embedding(knowledge_id, &embedding).await {
+            tracing::warn!(
+                "embed_knowledge_content: store failed for {}: {} (row saved without embedding)",
+                knowledge_id,
+                e
+            );
+        }
+        Ok(())
+    }
+
     /// Hybrid search task_knowledge: fetch candidates with embeddings, rank in-memory.
     ///
     /// 1. Fetch recent entries with embeddings (optionally filtered by category)
