@@ -75,53 +75,6 @@ export interface PipelineArtifact {
 }
 
 // ============================================================================
-// Benchmarks
-// ============================================================================
-
-export interface ExpectedStructure {
-  has_setup?: boolean;
-  has_verification?: boolean;
-  has_agentic?: boolean;
-  has_completion?: boolean;
-  min_setup_steps?: number;
-  min_verification_steps?: number;
-  min_agentic_steps?: number;
-  expected_step_types: string[];
-  keywords: string[];
-  expected_check_types: string[];
-  expected_test_types: string[];
-}
-
-export interface Benchmark {
-  id: string;
-  name: string;
-  description: string;
-  category: string | null;
-  tags: string[] | null;
-  expected_structure: ExpectedStructure;
-  created_at: string;
-  updated_at: string;
-  enabled: boolean;
-}
-
-export interface BenchmarkResult {
-  id: string;
-  benchmark_id: string;
-  artifact_id: string | null;
-  run_at: string;
-  model_used: string | null;
-  structure_score: number | null;
-  content_score: number | null;
-  step_type_score: number | null;
-  overall_score: number | null;
-  score_breakdown: unknown;
-  generated_json: unknown;
-  duration_ms: number | null;
-  passed: boolean;
-  notes: string | null;
-}
-
-// ============================================================================
 // Edit Analysis
 // ============================================================================
 
@@ -141,46 +94,6 @@ export interface RecentFeedback {
   new_value: string | null;
   created_at: string;
   workflow_name: string | null;
-}
-
-// ============================================================================
-// Example Library
-// ============================================================================
-
-export interface ExampleWorkflow {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  example_status: string | null;
-  created_at: string;
-}
-
-// ============================================================================
-// Insights
-// ============================================================================
-
-export interface PromptInsight {
-  agent: string;
-  insight_type: string;
-  description: string;
-  evidence_count: number;
-  confidence: number;
-  suggested_rule: string | null;
-}
-
-// ============================================================================
-// Training Data
-// ============================================================================
-
-export interface TrainingExample {
-  agent: string;
-  prompt: string;
-  completion: string;
-  score: number;
-  artifact_id: string;
-  workflow_id: string | null;
-  created_at: string;
 }
 
 // ============================================================================

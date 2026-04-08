@@ -111,6 +111,100 @@ impl PgDb {
             .collect())
     }
 
+    /// Composite edit-analysis view for the Generator Evaluation page.
+    ///
+    /// Returns a JSON object with edited_fields, type_distribution,
+    /// rating_distribution, and recent_feedback arrays built from
+    /// `workflow_generation_feedback`.
+    pub async fn get_edit_analysis(&self) -> Result<serde_json::Value, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let fields_rows = conn
+            .query(
+                r#"SELECT edited_field, COUNT(*)::BIGINT
+                   FROM workflow_generation_feedback
+                   WHERE feedback_type = 'edit' AND edited_field IS NOT NULL
+                   GROUP BY edited_field
+                   ORDER BY COUNT(*) DESC"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_edit_analysis (fields): {}", e))?;
+        let edited_fields: Vec<serde_json::Value> = fields_rows
+            .iter()
+            .map(|r| serde_json::json!([r.get::<_, String>(0), r.get::<_, i64>(1)]))
+            .collect();
+
+        let type_rows = conn
+            .query(
+                r#"SELECT feedback_type, COUNT(*)::BIGINT
+                   FROM workflow_generation_feedback
+                   GROUP BY feedback_type
+                   ORDER BY COUNT(*) DESC"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_edit_analysis (types): {}", e))?;
+        let type_distribution: Vec<serde_json::Value> = type_rows
+            .iter()
+            .map(|r| serde_json::json!([r.get::<_, String>(0), r.get::<_, i64>(1)]))
+            .collect();
+
+        let rating_rows = conn
+            .query(
+                r#"SELECT rating, COUNT(*)::BIGINT
+                   FROM workflow_generation_feedback
+                   WHERE rating IS NOT NULL
+                   GROUP BY rating
+                   ORDER BY rating"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_edit_analysis (ratings): {}", e))?;
+        let rating_distribution: Vec<serde_json::Value> = rating_rows
+            .iter()
+            .map(|r| serde_json::json!([r.get::<_, i32>(0), r.get::<_, i64>(1)]))
+            .collect();
+
+        let recent_rows = conn
+            .query(
+                r#"SELECT id, workflow_id, feedback_type, edited_field, old_value, new_value,
+                          created_at::TEXT, workflow_description
+                   FROM workflow_generation_feedback
+                   ORDER BY created_at DESC
+                   LIMIT 20"#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG get_edit_analysis (recent): {}", e))?;
+        let recent_feedback: Vec<serde_json::Value> = recent_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "workflow_id": r.get::<_, String>(1),
+                    "feedback_type": r.get::<_, String>(2),
+                    "edited_field": r.get::<_, Option<String>>(3),
+                    "old_value": r.get::<_, Option<String>>(4),
+                    "new_value": r.get::<_, Option<String>>(5),
+                    "created_at": r.get::<_, String>(6),
+                    "workflow_name": r.get::<_, Option<String>>(7),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "edited_fields": edited_fields,
+            "type_distribution": type_distribution,
+            "rating_distribution": rating_distribution,
+            "recent_feedback": recent_feedback,
+        }))
+    }
+
     /// Get aggregated feedback summary for a workflow category.
     pub async fn get_feedback_summary(
         &self,
