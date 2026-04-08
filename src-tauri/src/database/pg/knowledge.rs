@@ -50,6 +50,30 @@ impl PgDb {
         Ok(id.to_string())
     }
 
+    /// Mark a task_knowledge entry as resolved.
+    pub async fn resolve_task_knowledge(
+        &self,
+        knowledge_id: &str,
+        notes: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {e}"))?;
+
+        conn.execute(
+            "UPDATE task_knowledge \
+             SET is_resolved = TRUE, resolution_notes = $1, resolved_at = NOW() \
+             WHERE id = $2",
+            &[&notes, &knowledge_id],
+        )
+        .await
+        .map_err(|e| format!("PG resolve_task_knowledge: {e}"))?;
+
+        Ok(())
+    }
+
     /// Update the project_path field on a task_knowledge entry.
     pub async fn update_task_knowledge_project_path(
         &self,

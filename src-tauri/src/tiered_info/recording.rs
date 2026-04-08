@@ -461,62 +461,6 @@ impl RunRecorder {
     }
 
     /// Finish recording with success status and save to database.
-    ///
-    /// # Arguments
-    /// * `conn` - Database connection
-    ///
-    /// # Returns
-    /// The run ID on success
-    pub fn finish_success(self) -> Result<String, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Finish recording with failure status and save to database.
-    ///
-    /// # Arguments
-    /// * `conn` - Database connection
-    /// * `error` - Error message describing the failure
-    ///
-    /// # Returns
-    /// The run ID on success
-    pub fn finish_failure(self, error: &str) -> Result<String, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Finish recording with timeout status and save to database.
-    ///
-    /// # Arguments
-    /// * `conn` - Database connection
-    ///
-    /// # Returns
-    /// The run ID on success
-    pub fn finish_timeout(self) -> Result<String, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Finish recording with cancelled status and save to database.
-    ///
-    /// # Arguments
-    /// * `conn` - Database connection
-    ///
-    /// # Returns
-    /// The run ID on success
-    pub fn finish_cancelled(self) -> Result<String, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    /// Save the run statistics to the database.
-    /// Note: The run_details table has been removed. This method now only updates statistics.
-    /// For full run recording, use the `save_to_task_run_automation` path via `finish_*_with_db`.
-    fn save_run(self, run: RunDetails) -> Result<String, String> {
-        Err("SQLite removed".to_string())
-    }
-
-    // ========================================================================
-    // Methods for unified TaskRun architecture (stubs, pending PG port)
-    // ========================================================================
-
-    /// Finish recording with success status and save to database.
     pub async fn finish_success_with_db(self) -> Result<String, String> {
         let run = self.build_run_details(RunStatus::Completed, None);
         self.persist_run(run).await
@@ -635,32 +579,6 @@ impl RunRecorder {
         Ok(run_id)
     }
 
-    /// Save run without DB (statistics-only logging, no table to write to for non-task-run recordings).
-    fn save_run_stats_only(self, run: RunDetails) -> Result<String, String> {
-        let run_id = run.id.clone();
-        warn!(
-            "Run {} does not have a task_run_id - logging stats only (no task_run_automation record)",
-            run_id
-        );
-        info!(
-            "Run {} stats: states={}, transitions={}, anomalies={}",
-            run_id,
-            run.states_visited.len(),
-            run.transitions_executed.len(),
-            run.anomalies.len()
-        );
-        Ok(run_id)
-    }
-
-    /// Save automation metrics to task_run_automation table.
-    fn save_to_task_run_automation(
-        self,
-        task_run_id: String,
-        success: bool,
-        error_message: Option<String>,
-    ) -> Result<String, String> {
-        Err("SQLite removed".to_string())
-    }
 }
 
 /// Builder pattern for creating transitions from Python events.
@@ -725,28 +643,6 @@ impl TransitionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore] // Deprecated: save_run no longer inserts to run_details table, use finish_*_with_db methods instead
-    fn test_run_recorder_success() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    #[ignore] // Deprecated: save_run no longer inserts to run_details table, use finish_*_with_db methods instead
-    fn test_run_recorder_failure() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_anomaly_detection_timing() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
-    fn test_anomaly_detection_confidence() {
-        // SQLite removed - no-op
-    }
 
     #[test]
     fn test_transition_builder() {

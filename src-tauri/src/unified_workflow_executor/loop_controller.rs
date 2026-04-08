@@ -88,7 +88,7 @@ impl LoopController {
                 app_handle.clone(),
                 pid_tracker.clone(),
             ),
-            knowledge_base: KnowledgeBase::new(),
+            knowledge_base: KnowledgeBase::new(app_state.pg_db.clone()),
             canvas_manager: tokio::sync::Mutex::new(CanvasPanelManager::new(
                 app_state.canvas_state.clone(),
                 app_handle.clone(),

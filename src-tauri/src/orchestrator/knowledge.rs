@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use tracing::{debug, info};
 
+use crate::database::pg::PgDb;
 use crate::database::{StoredTaskKnowledge, StoredVerificationResult};
 use crate::orchestrator::compression::{CompressionConfig, CompressionResult, CompressionService};
 use crate::orchestrator::types::{
@@ -147,58 +148,72 @@ impl AgentType {
 /// Provides methods for storing, querying, and building context from
 /// accumulated knowledge during task execution.
 pub struct KnowledgeBase {
-    db: KnowledgeDbStub,
-}
-
-/// Zero-cost stub that returns errors for all SQLite-era methods.
-struct KnowledgeDbStub;
-
-impl KnowledgeDbStub {
-    #[allow(clippy::too_many_arguments)]
-    fn create_task_knowledge(
-        &self,
-        _task_run_id: &str,
-        _category: &str,
-        _agent: &str,
-        _iteration: u32,
-        _content: &str,
-        _evidence: Option<&str>,
-        _confidence: &str,
-        _related: &[String],
-    ) -> Result<crate::database::types::StoredTaskKnowledge, String> {
-        Err("SQLite removed".into())
-    }
-    fn list_task_knowledge(
-        &self,
-        _task_run_id: &str,
-        _category: Option<&str>,
-        _active_only: bool,
-    ) -> Result<Vec<crate::database::types::StoredTaskKnowledge>, String> {
-        Err("SQLite removed".into())
-    }
-    fn resolve_task_knowledge(&self, _id: &str, _notes: Option<&str>) -> Result<(), String> {
-        Err("SQLite removed".into())
-    }
-    fn get_iteration_verification_results(
-        &self,
-        _task_run_id: &str,
-        _iteration: u32,
-    ) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> {
-        Err("SQLite removed".into())
-    }
-    fn get_latest_verification_results(
-        &self,
-        _task_run_id: &str,
-    ) -> Result<Vec<crate::database::types::StoredVerificationResult>, String> {
-        Err("SQLite removed".into())
-    }
+    pg_db: Arc<PgDb>,
 }
 
 impl KnowledgeBase {
-    pub fn new() -> Self {
-        Self {
-            db: KnowledgeDbStub,
-        }
+    pub fn new(pg_db: Arc<PgDb>) -> Self {
+        Self { pg_db }
+    }
+
+    /// Insert a knowledge entry via PG. Returns the generated row ID.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_task_knowledge(
+        &self,
+        task_run_id: &str,
+        category: &str,
+        agent: &str,
+        iteration: u32,
+        content: &str,
+        evidence: Option<&str>,
+        confidence: &str,
+        related: &[String],
+    ) -> Result<StoredTaskKnowledge, String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let related_files_json = serde_json::to_string(related).unwrap_or_else(|_| "[]".to_string());
+        self.pg_db
+            .create_task_knowledge(
+                &id,
+                task_run_id,
+                category,
+                agent,
+                iteration as i32,
+                content,
+                evidence,
+                confidence,
+                &related_files_json,
+            )
+            .await?;
+        // Best-effort embedding write (failures don't fail the primary write).
+        let _ = self.pg_db.embed_knowledge_content(&id, content).await;
+
+        Ok(StoredTaskKnowledge {
+            id,
+            task_run_id: task_run_id.to_string(),
+            category: category.to_string(),
+            agent_type: agent.to_string(),
+            iteration,
+            content: content.to_string(),
+            evidence: evidence.map(|s| s.to_string()),
+            confidence: confidence.to_string(),
+            related_files: related.to_vec(),
+            related_criterion_id: None,
+            is_resolved: false,
+            resolution_notes: None,
+            resolved_at: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// Adapter: load verification results stored as a JSON array under the
+    /// orchestrator's per-iteration verification record. The PG layer returns
+    /// the raw JSON value; we deserialize it into the typed struct list.
+    async fn load_verification_results(
+        value: Option<serde_json::Value>,
+    ) -> Vec<StoredVerificationResult> {
+        value
+            .and_then(|v| serde_json::from_value::<Vec<StoredVerificationResult>>(v).ok())
+            .unwrap_or_default()
     }
 
     /// Compress knowledge if needed based on the provided configuration.
@@ -218,7 +233,7 @@ impl KnowledgeBase {
     }
 
     /// Record a finding from a worker.
-    pub fn record_finding(
+    pub async fn record_finding(
         &self,
         task_run_id: &str,
         finding: &Finding,
@@ -233,16 +248,18 @@ impl KnowledgeBase {
         let category = KnowledgeCategory::from_str(&finding.finding_type)
             .unwrap_or(KnowledgeCategory::Finding);
 
-        let stored = self.db.create_task_knowledge(
-            task_run_id,
-            category.as_str(),
-            AgentType::Worker.as_str(),
-            iteration,
-            &finding.description,
-            finding.evidence.as_deref(),
-            confidence_str,
-            &finding.related_files,
-        )?;
+        let stored = self
+            .create_task_knowledge(
+                task_run_id,
+                category.as_str(),
+                AgentType::Worker.as_str(),
+                iteration,
+                &finding.description,
+                finding.evidence.as_deref(),
+                confidence_str,
+                &finding.related_files,
+            )
+            .await?;
 
         info!(
             "Recorded finding {} (type: {}) for task {} iteration {}",
@@ -253,26 +270,28 @@ impl KnowledgeBase {
     }
 
     /// Record verification feedback for a failed iteration.
-    pub fn record_verification_feedback(
+    pub async fn record_verification_feedback(
         &self,
         task_run_id: &str,
         iteration: u32,
         feedback: &str,
         failed_criteria: &[String],
     ) -> Result<String, String> {
-        let stored = self.db.create_task_knowledge(
-            task_run_id,
-            KnowledgeCategory::VerificationFeedback.as_str(),
-            AgentType::System.as_str(),
-            iteration,
-            feedback,
-            None,
-            "high", // Verification feedback is authoritative
-            &failed_criteria
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-        )?;
+        let stored = self
+            .create_task_knowledge(
+                task_run_id,
+                KnowledgeCategory::VerificationFeedback.as_str(),
+                AgentType::System.as_str(),
+                iteration,
+                feedback,
+                None,
+                "high", // Verification feedback is authoritative
+                &failed_criteria
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
 
         info!(
             "Recorded verification feedback {} for task {} iteration {}",
@@ -283,7 +302,7 @@ impl KnowledgeBase {
     }
 
     /// Record a general observation or context.
-    pub fn record_observation(
+    pub async fn record_observation(
         &self,
         task_run_id: &str,
         agent_type: AgentType,
@@ -291,16 +310,18 @@ impl KnowledgeBase {
         content: &str,
         related_files: &[String],
     ) -> Result<String, String> {
-        let stored = self.db.create_task_knowledge(
-            task_run_id,
-            KnowledgeCategory::Observation.as_str(),
-            agent_type.as_str(),
-            iteration,
-            content,
-            None,
-            "medium",
-            related_files,
-        )?;
+        let stored = self
+            .create_task_knowledge(
+                task_run_id,
+                KnowledgeCategory::Observation.as_str(),
+                agent_type.as_str(),
+                iteration,
+                content,
+                None,
+                "medium",
+                related_files,
+            )
+            .await?;
 
         Ok(stored.id)
     }
@@ -310,7 +331,7 @@ impl KnowledgeBase {
     /// Environment issues are problems with the execution environment (PATH, disk space,
     /// missing tools, etc.) rather than code issues. These require user intervention
     /// and should NOT trigger automatic retries.
-    pub fn record_environment_issue(
+    pub async fn record_environment_issue(
         &self,
         task_run_id: &str,
         iteration: u32,
@@ -324,16 +345,18 @@ impl KnowledgeBase {
             affected_checks.join(", ")
         );
 
-        let stored = self.db.create_task_knowledge(
-            task_run_id,
-            KnowledgeCategory::Environment.as_str(),
-            AgentType::System.as_str(),
-            iteration,
-            description,
-            Some(&evidence),
-            "high", // Environment issues are definitive
-            affected_checks,
-        )?;
+        let stored = self
+            .create_task_knowledge(
+                task_run_id,
+                KnowledgeCategory::Environment.as_str(),
+                AgentType::System.as_str(),
+                iteration,
+                description,
+                Some(&evidence),
+                "high", // Environment issues are definitive
+                affected_checks,
+            )
+            .await?;
 
         info!(
             "Recorded environment issue {} (type: {}) for task {} iteration {}: {}",
@@ -344,39 +367,49 @@ impl KnowledgeBase {
     }
 
     /// Get all environment issues for a task.
-    pub fn get_environment_issues(
+    pub async fn get_environment_issues(
         &self,
         task_run_id: &str,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        self.db.list_task_knowledge(
-            task_run_id,
-            Some(KnowledgeCategory::Environment.as_str()),
-            false,
-        )
+        self.pg_db
+            .list_task_knowledge(
+                task_run_id,
+                Some(KnowledgeCategory::Environment.as_str()),
+                false,
+                false,
+            )
+            .await
     }
 
     /// Get all unresolved findings for a task.
-    pub fn get_unresolved_findings(
+    pub async fn get_unresolved_findings(
         &self,
         task_run_id: &str,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        self.db
-            .list_task_knowledge(task_run_id, Some("finding"), true)
+        self.pg_db
+            .list_task_knowledge(task_run_id, Some("finding"), true, false)
+            .await
     }
 
     /// Get all knowledge for a task.
-    pub fn get_all_knowledge(&self, task_run_id: &str) -> Result<Vec<StoredTaskKnowledge>, String> {
-        self.db.list_task_knowledge(task_run_id, None, false)
+    pub async fn get_all_knowledge(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<StoredTaskKnowledge>, String> {
+        self.pg_db
+            .list_task_knowledge(task_run_id, None, false, false)
+            .await
     }
 
     /// Get knowledge by category.
-    pub fn get_knowledge_by_category(
+    pub async fn get_knowledge_by_category(
         &self,
         task_run_id: &str,
         category: KnowledgeCategory,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        self.db
-            .list_task_knowledge(task_run_id, Some(category.as_str()), false)
+        self.pg_db
+            .list_task_knowledge(task_run_id, Some(category.as_str()), false, false)
+            .await
     }
 
     // ========================================================================
@@ -384,7 +417,7 @@ impl KnowledgeBase {
     // ========================================================================
 
     /// Record a finding with domain association.
-    pub fn record_domain_finding(
+    pub async fn record_domain_finding(
         &self,
         task_run_id: &str,
         finding: &Finding,
@@ -404,16 +437,18 @@ impl KnowledgeBase {
         let mut related_files = finding.related_files.clone();
         related_files.push(format!("domain:{}", domain_id));
 
-        let stored = self.db.create_task_knowledge(
-            task_run_id,
-            category.as_str(),
-            AgentType::Worker.as_str(),
-            iteration,
-            &finding.description,
-            finding.evidence.as_deref(),
-            confidence_str,
-            &related_files,
-        )?;
+        let stored = self
+            .create_task_knowledge(
+                task_run_id,
+                category.as_str(),
+                AgentType::Worker.as_str(),
+                iteration,
+                &finding.description,
+                finding.evidence.as_deref(),
+                confidence_str,
+                &related_files,
+            )
+            .await?;
 
         info!(
             "Recorded domain finding {} (type: {}, domain: {}) for task {} iteration {}",
@@ -426,12 +461,12 @@ impl KnowledgeBase {
     /// Get all knowledge for a specific domain.
     ///
     /// Filters knowledge entries that have the domain marker in their related_files.
-    pub fn get_domain_knowledge(
+    pub async fn get_domain_knowledge(
         &self,
         task_run_id: &str,
         domain_id: &str,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        let all_knowledge = self.get_all_knowledge(task_run_id)?;
+        let all_knowledge = self.get_all_knowledge(task_run_id).await?;
         let domain_marker = format!("domain:{}", domain_id);
 
         Ok(all_knowledge
@@ -441,13 +476,13 @@ impl KnowledgeBase {
     }
 
     /// Get domain knowledge by category.
-    pub fn get_domain_knowledge_by_category(
+    pub async fn get_domain_knowledge_by_category(
         &self,
         task_run_id: &str,
         domain_id: &str,
         category: KnowledgeCategory,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        let domain_knowledge = self.get_domain_knowledge(task_run_id, domain_id)?;
+        let domain_knowledge = self.get_domain_knowledge(task_run_id, domain_id).await?;
 
         Ok(domain_knowledge
             .into_iter()
@@ -456,12 +491,12 @@ impl KnowledgeBase {
     }
 
     /// Get unresolved findings for a specific domain.
-    pub fn get_domain_unresolved_findings(
+    pub async fn get_domain_unresolved_findings(
         &self,
         task_run_id: &str,
         domain_id: &str,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        let domain_knowledge = self.get_domain_knowledge(task_run_id, domain_id)?;
+        let domain_knowledge = self.get_domain_knowledge(task_run_id, domain_id).await?;
 
         Ok(domain_knowledge
             .into_iter()
@@ -470,7 +505,7 @@ impl KnowledgeBase {
     }
 
     /// Get verification feedback for a specific domain.
-    pub fn get_domain_verification_feedback(
+    pub async fn get_domain_verification_feedback(
         &self,
         task_run_id: &str,
         domain_id: &str,
@@ -480,11 +515,15 @@ impl KnowledgeBase {
             domain_id,
             KnowledgeCategory::VerificationFeedback,
         )
+        .await
     }
 
     /// Get all domains that have knowledge entries.
-    pub fn get_domains_with_knowledge(&self, task_run_id: &str) -> Result<Vec<String>, String> {
-        let all_knowledge = self.get_all_knowledge(task_run_id)?;
+    pub async fn get_domains_with_knowledge(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let all_knowledge = self.get_all_knowledge(task_run_id).await?;
         let mut domains = Vec::new();
 
         for knowledge in all_knowledge {
@@ -503,7 +542,7 @@ impl KnowledgeBase {
     /// Build domain-specific iteration context.
     ///
     /// Similar to build_iteration_context but filtered for a specific domain.
-    pub fn build_domain_iteration_context(
+    pub async fn build_domain_iteration_context(
         &self,
         task_run_id: &str,
         domain_id: &str,
@@ -519,7 +558,9 @@ impl KnowledgeBase {
         context.push_str(&format!("## Domain '{}' Context\n\n", domain_id));
 
         // Add domain-specific verification feedback
-        let feedback = self.get_domain_verification_feedback(task_run_id, domain_id)?;
+        let feedback = self
+            .get_domain_verification_feedback(task_run_id, domain_id)
+            .await?;
         if !feedback.is_empty() {
             if let Some(latest) = feedback.last() {
                 context.push_str("### Last Verification Feedback for This Domain\n\n");
@@ -529,7 +570,9 @@ impl KnowledgeBase {
         }
 
         // Add domain-specific unresolved findings
-        let findings = self.get_domain_unresolved_findings(task_run_id, domain_id)?;
+        let findings = self
+            .get_domain_unresolved_findings(task_run_id, domain_id)
+            .await?;
         if !findings.is_empty() {
             context.push_str("### Unresolved Findings in This Domain\n\n");
             for finding in findings.iter().take(10) {
@@ -546,11 +589,13 @@ impl KnowledgeBase {
         }
 
         // Add domain-specific observations
-        let observations = self.get_domain_knowledge_by_category(
-            task_run_id,
-            domain_id,
-            KnowledgeCategory::Observation,
-        )?;
+        let observations = self
+            .get_domain_knowledge_by_category(
+                task_run_id,
+                domain_id,
+                KnowledgeCategory::Observation,
+            )
+            .await?;
         if !observations.is_empty() {
             let recent_obs: Vec<_> = observations.iter().rev().take(5).collect();
             if !recent_obs.is_empty() {
@@ -573,8 +618,12 @@ impl KnowledgeBase {
     }
 
     /// Mark a finding as resolved.
-    pub fn resolve_finding(&self, finding_id: &str, notes: Option<&str>) -> Result<(), String> {
-        self.db.resolve_task_knowledge(finding_id, notes)?;
+    pub async fn resolve_finding(
+        &self,
+        finding_id: &str,
+        notes: Option<&str>,
+    ) -> Result<(), String> {
+        self.pg_db.resolve_task_knowledge(finding_id, notes).await?;
         info!("Resolved finding {}", finding_id);
         Ok(())
     }
@@ -587,7 +636,7 @@ impl KnowledgeBase {
     ///
     /// Overrides are stored as knowledge entries with structured content that
     /// includes the criterion ID, item, and justification.
-    pub fn record_override(
+    pub async fn record_override(
         &self,
         task_run_id: &str,
         override_: &CriterionOverride,
@@ -604,16 +653,18 @@ impl KnowledgeBase {
             format!("item:{}", override_.item),
         ];
 
-        let stored = self.db.create_task_knowledge(
-            task_run_id,
-            KnowledgeCategory::CriterionOverride.as_str(),
-            AgentType::Worker.as_str(),
-            override_.iteration,
-            &content,
-            Some(&override_.justification),
-            "high", // Overrides are explicit decisions
-            &related_files,
-        )?;
+        let stored = self
+            .create_task_knowledge(
+                task_run_id,
+                KnowledgeCategory::CriterionOverride.as_str(),
+                AgentType::Worker.as_str(),
+                override_.iteration,
+                &content,
+                Some(&override_.justification),
+                "high", // Overrides are explicit decisions
+                &related_files,
+            )
+            .await?;
 
         info!(
             "Recorded override {} for criterion '{}' (item: {}) in task {}",
@@ -624,26 +675,33 @@ impl KnowledgeBase {
     }
 
     /// Record multiple overrides from worker output.
-    pub fn record_overrides(
+    pub async fn record_overrides(
         &self,
         task_run_id: &str,
         overrides: &[CriterionOverride],
     ) -> Result<Vec<String>, String> {
         let mut ids = Vec::new();
         for override_ in overrides {
-            let id = self.record_override(task_run_id, override_)?;
+            let id = self.record_override(task_run_id, override_).await?;
             ids.push(id);
         }
         Ok(ids)
     }
 
     /// Get all overrides for a task.
-    pub fn get_all_overrides(&self, task_run_id: &str) -> Result<OverrideCollection, String> {
-        let knowledge = self.db.list_task_knowledge(
-            task_run_id,
-            Some(KnowledgeCategory::CriterionOverride.as_str()),
-            false,
-        )?;
+    pub async fn get_all_overrides(
+        &self,
+        task_run_id: &str,
+    ) -> Result<OverrideCollection, String> {
+        let knowledge = self
+            .pg_db
+            .list_task_knowledge(
+                task_run_id,
+                Some(KnowledgeCategory::CriterionOverride.as_str()),
+                false,
+                false,
+            )
+            .await?;
 
         let mut collection = OverrideCollection::new();
 
@@ -679,12 +737,12 @@ impl KnowledgeBase {
     }
 
     /// Get overrides for a specific criterion.
-    pub fn get_criterion_overrides(
+    pub async fn get_criterion_overrides(
         &self,
         task_run_id: &str,
         criterion_id: &str,
     ) -> Result<Vec<CriterionOverride>, String> {
-        let all_overrides = self.get_all_overrides(task_run_id)?;
+        let all_overrides = self.get_all_overrides(task_run_id).await?;
         Ok(all_overrides
             .overrides
             .into_iter()
@@ -693,27 +751,38 @@ impl KnowledgeBase {
     }
 
     /// Check if a criterion has any overrides.
-    pub fn has_override(&self, task_run_id: &str, criterion_id: &str) -> Result<bool, String> {
-        let overrides = self.get_criterion_overrides(task_run_id, criterion_id)?;
+    pub async fn has_override(
+        &self,
+        task_run_id: &str,
+        criterion_id: &str,
+    ) -> Result<bool, String> {
+        let overrides = self.get_criterion_overrides(task_run_id, criterion_id).await?;
         Ok(!overrides.is_empty())
     }
 
     /// Get verification results for an iteration.
-    pub fn get_verification_results(
+    pub async fn get_verification_results(
         &self,
         task_run_id: &str,
         iteration: u32,
     ) -> Result<Vec<StoredVerificationResult>, String> {
-        self.db
+        let value = self
+            .pg_db
             .get_iteration_verification_results(task_run_id, iteration)
+            .await?;
+        Ok(Self::load_verification_results(value).await)
     }
 
     /// Get the latest verification results.
-    pub fn get_latest_verification_results(
+    pub async fn get_latest_verification_results(
         &self,
         task_run_id: &str,
     ) -> Result<Vec<StoredVerificationResult>, String> {
-        self.db.get_latest_verification_results(task_run_id)
+        let value = self
+            .pg_db
+            .get_latest_verification_results(task_run_id)
+            .await?;
+        Ok(Self::load_verification_results(value).await)
     }
 }
 
@@ -830,8 +899,26 @@ pub fn process_worker_output_full(
 // ============================================================================
 
 /// Query execution spans for a task run from the database.
-fn query_execution_spans(task_run_id: &str) -> Result<Vec<ExecutionSpan>, String> {
-    Err("SQLite removed".to_string())
+async fn query_execution_spans(
+    pg: &PgDb,
+    task_run_id: &str,
+) -> Result<Vec<ExecutionSpan>, String> {
+    let rows = pg.get_execution_spans(task_run_id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|v| ExecutionSpan {
+            name: v
+                .get("span_type")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            duration_ms: v.get("duration_ms").and_then(|d| d.as_u64()),
+            // execution_spans rows in PG don't currently track success/error;
+            // treat presence of the row as success and leave error empty.
+            success: true,
+            error: None,
+        })
+        .collect())
 }
 
 /// Build a timing summary section from execution spans.
@@ -1151,8 +1238,9 @@ pub async fn build_iteration_context_with_compression(
     context.push_str("## Previous Iteration Context\n\n");
 
     // Add latest verification feedback if any
-    let feedback =
-        kb.get_knowledge_by_category(task_run_id, KnowledgeCategory::VerificationFeedback)?;
+    let feedback = kb
+        .get_knowledge_by_category(task_run_id, KnowledgeCategory::VerificationFeedback)
+        .await?;
     if !feedback.is_empty() {
         // Get the most recent feedback
         if let Some(latest) = feedback.last() {
@@ -1164,7 +1252,7 @@ pub async fn build_iteration_context_with_compression(
 
     // Add detailed verification results from the database
     // This ensures AI has access to structured test results even after runner restart
-    let verification_results = kb.get_latest_verification_results(task_run_id)?;
+    let verification_results = kb.get_latest_verification_results(task_run_id).await?;
     if !verification_results.is_empty() {
         context.push_str("### Detailed Verification Test Results\n\n");
 
@@ -1372,7 +1460,7 @@ pub async fn build_iteration_context_with_compression(
     }
 
     // Add unresolved findings
-    let findings = kb.get_unresolved_findings(task_run_id)?;
+    let findings = kb.get_unresolved_findings(task_run_id).await?;
     if !findings.is_empty() {
         context.push_str("### Unresolved Findings\n\n");
         for finding in findings.iter().take(10) {
@@ -1390,7 +1478,9 @@ pub async fn build_iteration_context_with_compression(
     }
 
     // Add key observations (limit to recent ones)
-    let observations = kb.get_knowledge_by_category(task_run_id, KnowledgeCategory::Observation)?;
+    let observations = kb
+        .get_knowledge_by_category(task_run_id, KnowledgeCategory::Observation)
+        .await?;
     if !observations.is_empty() {
         let recent_obs: Vec<_> = observations.iter().rev().take(5).collect();
 
@@ -1404,7 +1494,9 @@ pub async fn build_iteration_context_with_compression(
     }
 
     // Add solution attempts if any
-    let solutions = kb.get_knowledge_by_category(task_run_id, KnowledgeCategory::Solution)?;
+    let solutions = kb
+        .get_knowledge_by_category(task_run_id, KnowledgeCategory::Solution)
+        .await?;
     if !solutions.is_empty() {
         context.push_str("### Previous Solution Attempts\n\n");
         for sol in solutions.iter().take(5) {
@@ -1415,7 +1507,7 @@ pub async fn build_iteration_context_with_compression(
     }
 
     // Add execution timing information if spans exist
-    if let Ok(spans) = query_execution_spans(task_run_id) {
+    if let Ok(spans) = query_execution_spans(&pg, task_run_id).await {
         if let Some(timing_section) = build_timing_section(&spans) {
             context.push_str(&timing_section);
         }
@@ -1432,97 +1524,6 @@ pub async fn build_iteration_context_with_compression(
     }
 
     Ok(context)
-}
-
-/// Build a summary of task progress for status updates.
-pub fn build_progress_summary(
-    kb: &KnowledgeBase,
-    task_run_id: &str,
-    current_iteration: u32,
-) -> Result<String, String> {
-    let all_knowledge = kb.get_all_knowledge(task_run_id)?;
-    let latest_results = kb.get_latest_verification_results(task_run_id)?;
-
-    let findings_count = all_knowledge
-        .iter()
-        .filter(|k| k.category == "finding")
-        .count();
-
-    let resolved_count = all_knowledge.iter().filter(|k| k.is_resolved).count();
-
-    let verification_status = if latest_results.is_empty() {
-        "Not yet verified".to_string()
-    } else {
-        let passed = latest_results.iter().filter(|r| r.passed).count();
-        let total = latest_results.len();
-        format!("{}/{} checks passed", passed, total)
-    };
-
-    Ok(format!(
-        "Iteration {}: {} findings ({} resolved), {}",
-        current_iteration, findings_count, resolved_count, verification_status
-    ))
-}
-
-// ============================================================================
-// Knowledge Export
-// ============================================================================
-
-/// Export all knowledge for a task as structured data.
-///
-/// Useful for debugging, reporting, or external processing.
-pub fn export_task_knowledge(
-    kb: &KnowledgeBase,
-    task_run_id: &str,
-) -> Result<TaskKnowledgeExport, String> {
-    let all_knowledge = kb.get_all_knowledge(task_run_id)?;
-    let latest_results = kb.get_latest_verification_results(task_run_id)?;
-
-    let findings: Vec<_> = all_knowledge
-        .iter()
-        .filter(|k| k.category == "finding" || k.category == "root_cause")
-        .cloned()
-        .collect();
-
-    let observations: Vec<_> = all_knowledge
-        .iter()
-        .filter(|k| k.category == "observation")
-        .cloned()
-        .collect();
-
-    let solutions: Vec<_> = all_knowledge
-        .iter()
-        .filter(|k| k.category == "solution")
-        .cloned()
-        .collect();
-
-    let feedback: Vec<_> = all_knowledge
-        .iter()
-        .filter(|k| k.category == "verification_feedback")
-        .cloned()
-        .collect();
-
-    Ok(TaskKnowledgeExport {
-        task_run_id: task_run_id.to_string(),
-        total_entries: all_knowledge.len(),
-        findings,
-        observations,
-        solutions,
-        verification_feedback: feedback,
-        latest_verification_results: latest_results,
-    })
-}
-
-/// Exported knowledge for a task.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TaskKnowledgeExport {
-    pub task_run_id: String,
-    pub total_entries: usize,
-    pub findings: Vec<StoredTaskKnowledge>,
-    pub observations: Vec<StoredTaskKnowledge>,
-    pub solutions: Vec<StoredTaskKnowledge>,
-    pub verification_feedback: Vec<StoredTaskKnowledge>,
-    pub latest_verification_results: Vec<StoredVerificationResult>,
 }
 
 // ============================================================================

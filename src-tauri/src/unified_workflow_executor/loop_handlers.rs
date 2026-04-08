@@ -1028,7 +1028,7 @@ impl LoopController {
             // have been addressed since verification now passes.
             {
                 let parent_id = get_parent_task_id(&config.execution_id);
-                match self.knowledge_base.get_all_knowledge(&parent_id) {
+                match self.knowledge_base.get_all_knowledge(&parent_id).await {
                     Ok(entries) => {
                         let unresolved: Vec<_> =
                             entries.iter().filter(|k| !k.is_resolved).collect();
@@ -1038,10 +1038,14 @@ impl LoopController {
                                 unresolved.len()
                             );
                             for entry in &unresolved {
-                                if let Err(e) = self.knowledge_base.resolve_finding(
-                                    &entry.id,
-                                    Some("Resolved: verification passed"),
-                                ) {
+                                if let Err(e) = self
+                                    .knowledge_base
+                                    .resolve_finding(
+                                        &entry.id,
+                                        Some("Resolved: verification passed"),
+                                    )
+                                    .await
+                                {
                                     warn!("Failed to resolve knowledge entry {}: {}", entry.id, e);
                                 }
                             }
@@ -1163,12 +1167,16 @@ impl LoopController {
                 .collect();
 
             let parent_id = get_parent_task_id(&config.execution_id);
-            if let Err(e) = self.knowledge_base.record_verification_feedback(
-                &parent_id,
-                ctx.iteration,
-                &failure_context,
-                &failed_criteria,
-            ) {
+            if let Err(e) = self
+                .knowledge_base
+                .record_verification_feedback(
+                    &parent_id,
+                    ctx.iteration,
+                    &failure_context,
+                    &failed_criteria,
+                )
+                .await
+            {
                 warn!(
                     "Failed to record verification feedback as knowledge (iteration {}): {}",
                     ctx.iteration, e
@@ -2023,9 +2031,10 @@ impl LoopController {
                     ctx.iteration
                 );
                 for finding in &findings {
-                    if let Err(e) =
-                        self.knowledge_base
-                            .record_finding(&parent_id, finding, ctx.iteration)
+                    if let Err(e) = self
+                        .knowledge_base
+                        .record_finding(&parent_id, finding, ctx.iteration)
+                        .await
                     {
                         warn!("Failed to record finding as knowledge: {}", e);
                     }
@@ -2063,13 +2072,17 @@ impl LoopController {
                 AgenticOutcome::Skipped => String::new(),
             };
             if !observation.is_empty() {
-                if let Err(e) = self.knowledge_base.record_observation(
-                    &parent_id,
-                    AgentType::Worker,
-                    ctx.iteration,
-                    &observation,
-                    &[],
-                ) {
+                if let Err(e) = self
+                    .knowledge_base
+                    .record_observation(
+                        &parent_id,
+                        AgentType::Worker,
+                        ctx.iteration,
+                        &observation,
+                        &[],
+                    )
+                    .await
+                {
                     warn!("Failed to record agentic observation: {}", e);
                 }
             }
@@ -2871,13 +2884,17 @@ impl LoopController {
                             "Git changes after iteration {}:\n{}\n\n{}",
                             ctx.iteration, diff_stat, full_diff
                         );
-                        if let Err(e) = self.knowledge_base.record_observation(
-                            &parent_id,
-                            AgentType::Worker,
-                            ctx.iteration,
-                            &observation,
-                            &[],
-                        ) {
+                        if let Err(e) = self
+                            .knowledge_base
+                            .record_observation(
+                                &parent_id,
+                                AgentType::Worker,
+                                ctx.iteration,
+                                &observation,
+                                &[],
+                            )
+                            .await
+                        {
                             warn!(
                                 "Failed to record git diff observation (iteration {}): {}",
                                 ctx.iteration, e
