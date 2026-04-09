@@ -28,6 +28,7 @@ pub mod generation_artifacts;
 pub mod generation_feedback;
 pub mod graph_ops;
 pub mod hooks;
+pub mod instances;
 pub mod knowledge;
 pub mod known_issues;
 pub mod learned_patterns_ops;
@@ -731,6 +732,27 @@ const MIGRATIONS: &[Migration] = &[
                     ALTER TABLE scheduler_history ALTER COLUMN success SET DEFAULT FALSE;
                 END IF;
             END $$;
+        "#,
+    },
+    Migration {
+        version: 15,
+        description: "Add runner_instances table for multi-instance coordination",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS runner_instances (
+                id             TEXT PRIMARY KEY,
+                name           TEXT NOT NULL,
+                port           INTEGER NOT NULL UNIQUE,
+                hostname       TEXT NOT NULL DEFAULT 'localhost',
+                is_primary     BOOLEAN NOT NULL DEFAULT FALSE,
+                pid            INTEGER,
+                status         TEXT NOT NULL DEFAULT 'starting',
+                last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                running_tasks  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_ri_port ON runner_instances(port);
+            CREATE INDEX IF NOT EXISTS idx_ri_status ON runner_instances(status);
+            CREATE INDEX IF NOT EXISTS idx_ri_heartbeat ON runner_instances(last_heartbeat);
         "#,
     },
 ];
@@ -2014,7 +2036,7 @@ impl PgDb {
             "CREATE TABLE IF NOT EXISTS learned_patterns (
                 id TEXT PRIMARY KEY,
                 problem_hash TEXT NOT NULL UNIQUE,
-                trigger_keywords TEXT NOT NULL,
+                trigger_keywords JSONB NOT NULL,
                 problem_description TEXT NOT NULL,
                 solution_description TEXT NOT NULL,
                 confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,
@@ -2026,6 +2048,7 @@ impl PgDb {
             )",
             "CREATE INDEX IF NOT EXISTS idx_learned_patterns_confidence ON learned_patterns(confidence DESC)",
             "CREATE INDEX IF NOT EXISTS idx_learned_patterns_workflow ON learned_patterns(workflow_name)",
+            "CREATE INDEX IF NOT EXISTS idx_learned_patterns_keywords_gin ON learned_patterns USING GIN(trigger_keywords)",
             // Phase 5B: Ticket-task mapping (ticket system bidirectional sync)
             "CREATE TABLE IF NOT EXISTS ticket_task_mapping (
                 id TEXT PRIMARY KEY,
@@ -2507,5 +2530,57 @@ mod migration_tests {
                 }
             }
         }
+    }
+
+    /// Every table in ensure_tables() must also be declared in schema.pg.sql
+    /// (the Clorinde source of truth). If a table is added to ensure_tables
+    /// but not to schema.pg.sql, the drift checker won't catch column-type
+    /// mismatches and `clorinde fresh` can't validate queries against it.
+    /// Exception: `schema_migrations` is infrastructure — it's in both but
+    /// its presence in schema.pg.sql is optional.
+    #[test]
+    fn ensure_tables_subset_of_schema_pg_sql() {
+        let schema_sql = include_str!("../../../schema.pg.sql");
+        let re = regex::Regex::new(
+            r"(?i)CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)",
+        )
+        .unwrap();
+
+        let schema_tables: std::collections::HashSet<String> = re
+            .captures_iter(schema_sql)
+            .map(|c| c[1].to_lowercase())
+            .collect();
+
+        // Parse ensure_tables DDL from the source itself: we look at the
+        // static DDL array in ensure_tables(). Since we can't run async code
+        // in a unit test, we'll parse mod.rs source as a string. A simpler
+        // approach: just require that every table we create at runtime is
+        // also in schema.pg.sql.
+        let mod_rs = include_str!("mod.rs");
+        let ensure_tables: std::collections::HashSet<String> = re
+            .captures_iter(mod_rs)
+            .map(|c| c[1].to_lowercase())
+            .collect();
+
+        // Remove MIGRATION-only tables (created by migrations, not ensure_tables)
+        // and temp/renamed tables
+        let migration_only: std::collections::HashSet<String> = [
+            "checks_new",
+            "verification_tests_new",
+            "workflow_step_checkpoints_new",
+            "run_details",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let diff = &ensure_tables - &schema_tables;
+        let ensure_only = &diff - &migration_only;
+        assert!(
+            ensure_only.is_empty(),
+            "Tables in ensure_tables/migrations but NOT in schema.pg.sql \
+             (add them to schema.pg.sql so Clorinde can validate queries): {:?}",
+            ensure_only
+        );
     }
 }
