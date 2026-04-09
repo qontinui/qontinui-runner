@@ -25,6 +25,7 @@ use crate::meta_optimizer::beam_search::{BeamSearchConfig, BeamSearchState};
 use crate::meta_optimizer::duel_engine::{CandidatePool, DuelCandidate, DuelResult};
 use crate::meta_optimizer::pairwise_judge;
 use crate::meta_optimizer::prompt_extractor::PromptGroupMetrics;
+use crate::meta_optimizer::trace_adapter::{ContrastiveTriplet, TraceToMessages, TraceToTriplet};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -146,14 +147,26 @@ impl OptimizationPipeline {
             &seed_prompt,
         );
 
-        // Gather failure evidence for critique context
-        let evidence = self.gather_failure_evidence(&target);
+        // Gather failure evidence for critique context (includes concrete span examples)
+        let evidence = self.gather_failure_evidence(&target).await;
+
+        // Gather contrastive good/bad output pairs for richer beam search context
+        let contrastive = self.gather_contrastive_examples(agent_type).await;
 
         // Rejected prompts to avoid repeating: variants from prior evolution
         // entries whose canary verdict was 'reject'. Limited to recent history.
-        let rejected_refs: Vec<(String, String)> =
+        let mut rejected_refs: Vec<(String, String)> =
             super::prompt_evolution::get_rejected_prompt_contents(&self.pg_db, agent_type)
                 .unwrap_or_default();
+
+        // Append contrastive bad outputs as additional rejected examples so
+        // the beam search avoids repeating known failure patterns.
+        for ct in &contrastive {
+            rejected_refs.push((
+                format!("contrastive-bad (delta={:.2})", ct.reward_delta),
+                ct.bad_output.clone(),
+            ));
+        }
 
         // Generate candidates across beam search generations via real LLM calls
         let mut total_candidates = 1; // seed
@@ -581,8 +594,11 @@ impl OptimizationPipeline {
     }
 
     /// Gather failure evidence string for beam search critique context.
-    fn gather_failure_evidence(&self, target: &PromptGroupMetrics) -> String {
-        format!(
+    ///
+    /// Starts with aggregate metrics, then appends concrete low-reward input/output
+    /// examples from span events so the rewrite LLM sees *what actually failed*.
+    async fn gather_failure_evidence(&self, target: &PromptGroupMetrics) -> String {
+        let mut evidence = format!(
             "Agent: {} | Phase: {} | Failure rate: {:.1}% | Samples: {} | Mean score: {:.2} | Mean iterations: {:.1} | Mean cost: ${:.4}",
             target.agent_type,
             target.phase,
@@ -591,7 +607,92 @@ impl OptimizationPipeline {
             target.mean_score,
             target.mean_iterations,
             target.mean_cost,
-        )
+        );
+
+        // Fetch recent span events grouped by execution and extract low-reward examples
+        let exec_events = self
+            .pg_db
+            .get_span_events_for_agent(&target.agent_type, 20)
+            .await
+            .unwrap_or_default();
+
+        let mut failure_examples: Vec<String> = Vec::new();
+        const MAX_FAILURE_EXAMPLES: usize = 5;
+        const LOW_REWARD_THRESHOLD: f64 = 0.5;
+        // Truncate long content in evidence to avoid blowing up the prompt
+        const CONTENT_TRUNCATE: usize = 300;
+
+        for (_exec_id, rows) in &exec_events {
+            if failure_examples.len() >= MAX_FAILURE_EXAMPLES {
+                break;
+            }
+            let span_events: Vec<_> = rows.iter().filter_map(|r| r.to_span_event()).collect();
+            let triplets = TraceToMessages::convert(&span_events);
+
+            for triplet in &triplets {
+                if triplet.reward < LOW_REWARD_THRESHOLD && failure_examples.len() < MAX_FAILURE_EXAMPLES {
+                    let inp = if triplet.input.len() > CONTENT_TRUNCATE {
+                        format!("{}...", &triplet.input[..CONTENT_TRUNCATE])
+                    } else {
+                        triplet.input.clone()
+                    };
+                    let out = if triplet.output.len() > CONTENT_TRUNCATE {
+                        format!("{}...", &triplet.output[..CONTENT_TRUNCATE])
+                    } else {
+                        triplet.output.clone()
+                    };
+                    failure_examples.push(format!(
+                        "  [reward={:.2}] Input: {}\n    Output: {}",
+                        triplet.reward, inp, out
+                    ));
+                }
+            }
+        }
+
+        if !failure_examples.is_empty() {
+            evidence.push_str(&format!(
+                "\n\nConcrete failure examples ({} of {} executions inspected):",
+                failure_examples.len(),
+                exec_events.len()
+            ));
+            for ex in &failure_examples {
+                evidence.push('\n');
+                evidence.push_str(ex);
+            }
+        }
+
+        evidence
+    }
+
+    /// Gather contrastive good/bad output pairs from recent span data.
+    ///
+    /// Uses `TraceToTriplet::convert` to pair high-reward and low-reward outputs.
+    /// The caller can feed these into the beam search as rejected_prompts or
+    /// additional context for the rewrite LLM.
+    async fn gather_contrastive_examples(&self, agent_type: &str) -> Vec<ContrastiveTriplet> {
+        let exec_events = self
+            .pg_db
+            .get_span_events_for_agent(agent_type, 30)
+            .await
+            .unwrap_or_default();
+
+        // Collect all message triplets across executions
+        let mut all_triplets = Vec::new();
+        for (_exec_id, rows) in &exec_events {
+            let span_events: Vec<_> = rows.iter().filter_map(|r| r.to_span_event()).collect();
+            all_triplets.extend(TraceToMessages::convert(&span_events));
+        }
+
+        if all_triplets.len() < 2 {
+            return Vec::new();
+        }
+
+        // Produce contrastive pairs, limited to the most informative ones
+        let mut contrastive = TraceToTriplet::convert(&all_triplets);
+        // Keep only pairs with meaningful reward delta
+        contrastive.retain(|c| c.reward_delta > 0.2);
+        contrastive.truncate(10);
+        contrastive
     }
 
     fn skipped(&self, reason: &str) -> OptimizationCycleResult {

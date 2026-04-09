@@ -266,6 +266,49 @@ impl PgDb {
             .collect())
     }
 
+    /// Get recent span events for a specific agent type, grouped by execution.
+    ///
+    /// Returns `(execution_id, Vec<SpanEventRow>)` pairs for up to `max_executions`
+    /// distinct executions, ordered most-recent first.
+    pub async fn get_span_events_for_agent(
+        &self,
+        agent_type: &str,
+        max_executions: i64,
+    ) -> Result<Vec<(String, Vec<SpanEventRow>)>, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        // Find the most recent execution_ids for this agent
+        let exec_rows = conn
+            .query(
+                r#"SELECT DISTINCT execution_id
+                   FROM span_events
+                   WHERE agent_type = $1
+                   ORDER BY execution_id DESC
+                   LIMIT $2"#,
+                &[&agent_type, &max_executions],
+            )
+            .await
+            .map_err(|e| format!("PG get_span_events_for_agent (exec ids): {}", e))?;
+
+        let exec_ids: Vec<String> = exec_rows.iter().map(|r| r.get(0)).collect();
+        if exec_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::with_capacity(exec_ids.len());
+        for exec_id in &exec_ids {
+            let event_rows = self.get_span_events_for_execution(exec_id).await?;
+            if !event_rows.is_empty() {
+                results.push((exec_id.clone(), event_rows));
+            }
+        }
+        Ok(results)
+    }
+
     /// Get reward events for a specific agent type, ordered by most recent.
     pub async fn get_reward_events_for_agent(
         &self,

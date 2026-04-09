@@ -1710,8 +1710,8 @@ impl PgDb {
         // 2. Recent optimizer runs
         let runs = conn
             .query(
-                r#"SELECT id, optimizer_type, status, improvements_found,
-                          recommendations_count, duration_ms, created_at::TEXT
+                r#"SELECT id, optimizer_type, status, runs_analyzed,
+                          recommendations_produced, created_at::TEXT
                    FROM meta_optimizer_runs
                    ORDER BY created_at DESC LIMIT 5"#,
                 &[],
@@ -1724,12 +1724,12 @@ impl PgDb {
             for row in &runs {
                 let opt_type: String = row.get(1);
                 let status: String = row.get(2);
-                let improvements: i32 = row.get(3);
+                let runs_analyzed: i32 = row.get(3);
                 let recs: i32 = row.get(4);
                 let _ = writeln!(
                     out,
-                    "- {} optimizer: {} ({} improvements, {} recommendations)",
-                    opt_type, status, improvements, recs
+                    "- {} optimizer: {} ({} runs analyzed, {} recommendations)",
+                    opt_type, status, runs_analyzed, recs
                 );
             }
         }

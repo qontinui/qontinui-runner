@@ -135,6 +135,36 @@ pub struct SpanEventRow {
 }
 
 impl SpanEventRow {
+    /// Convert a persisted row back into a SpanEvent.
+    ///
+    /// Returns `None` if the row's event_type is unrecognized or required
+    /// fields are missing (e.g. a reward row without `reward_value`).
+    pub fn to_span_event(&self) -> Option<SpanEvent> {
+        let step = self.step_index as usize;
+        match self.event_type.as_str() {
+            "reward" => Some(SpanEvent::Reward {
+                value: self.reward_value?,
+                metric: self.metric_name.clone().unwrap_or_default(),
+                step_index: step,
+            }),
+            "object" => Some(SpanEvent::Object {
+                key: self.data_key.clone().unwrap_or_default(),
+                data: self
+                    .data_json
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or(serde_json::Value::Null),
+                step_index: step,
+            }),
+            "message" => Some(SpanEvent::Message {
+                role: self.role.clone().unwrap_or_default(),
+                content: self.content.clone().unwrap_or_default(),
+                step_index: step,
+            }),
+            _ => None,
+        }
+    }
+
     /// Convert a SpanEvent into a row for persistence.
     pub fn from_event(
         event: &SpanEvent,

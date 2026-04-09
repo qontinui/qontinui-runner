@@ -14,6 +14,8 @@ import { RunHistoryTab } from "../components/meta-optimizer/RunHistoryTab";
 import { EvalSpecsTab } from "../components/meta-optimizer/EvalSpecsTab";
 import { RobustnessTab } from "../components/meta-optimizer/RobustnessTab";
 import { PromptOptimizationTab } from "../components/meta-optimizer/PromptOptimizationTab";
+import { DuelPoolsTab } from "../components/meta-optimizer/DuelPoolsTab";
+import { BeamRunsTab } from "../components/meta-optimizer/BeamRunsTab";
 import { PlaybookPanel } from "../components/adaptive-learning/PlaybookPanel";
 import { LearningDashboard } from "../components/adaptive-learning/LearningDashboard";
 import { PromptEvolutionPanel } from "../components/adaptive-learning/PromptEvolutionPanel";
@@ -27,6 +29,8 @@ type SubTab =
   | "history"
   | "eval_specs"
   | "robustness"
+  | "duel_pools"
+  | "beam_runs"
   | "learning"
   | "playbook"
   | "prompt_evolution";
@@ -40,6 +44,8 @@ const TABS: { id: SubTab; label: string }[] = [
   { id: "history", label: "Run History" },
   { id: "eval_specs", label: "Eval Specs" },
   { id: "robustness", label: "Robustness" },
+  { id: "duel_pools", label: "Duel Pools" },
+  { id: "beam_runs", label: "Beam Runs" },
   { id: "learning", label: "Adaptive Learning" },
   { id: "playbook", label: "Playbook" },
   { id: "prompt_evolution", label: "Prompt Evolution" },
@@ -78,6 +84,8 @@ export function MetaOptimizerPage() {
         {tab === "history" && <RunHistoryTab />}
         {tab === "eval_specs" && <EvalSpecsTab />}
         {tab === "robustness" && <RobustnessTab />}
+        {tab === "duel_pools" && <DuelPoolsTab />}
+        {tab === "beam_runs" && <BeamRunsTab />}
         {tab === "learning" && <LearningDashboard />}
         {tab === "playbook" && <PlaybookPanel />}
         {tab === "prompt_evolution" && <PromptEvolutionPanel />}

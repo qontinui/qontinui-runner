@@ -390,12 +390,3 @@ pub fn record_evolution_full_with_pg(
     )
 }
 
-// Tests removed during PG migration: all tests relied on SQLite in-memory
-// CheckpointDb which no longer backs these functions. Integration tests
-// covering PG prompt_evolution live in tests/integration/.
-#[cfg(test)]
-mod tests {
-    // Placeholder — SQLite-based tests removed during PG migration.
-    #[test]
-    fn placeholder() {}
-}
