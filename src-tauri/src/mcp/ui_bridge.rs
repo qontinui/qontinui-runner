@@ -2906,6 +2906,12 @@ async fn direct_webview_evaluate_with_result(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // Use the known API port — location.port is empty on tauri.localhost
+    let api_port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     // Build JS that evaluates the expression and POSTs the result back
     // via the IPC response HTTP endpoint
     let callback_js = format!(
@@ -2914,7 +2920,7 @@ async fn direct_webview_evaluate_with_result(
             try {{
                 var result = (function() {{ return {}; }})();
                 var value = (result === undefined) ? null : result;
-                await fetch("http://127.0.0.1:" + location.port + "/ui-bridge/ipc-response", {{
+                await fetch("http://127.0.0.1:{}/ui-bridge/ipc-response", {{
                     method: "POST",
                     headers: {{ "Content-Type": "application/json" }},
                     body: JSON.stringify({{
@@ -2925,7 +2931,7 @@ async fn direct_webview_evaluate_with_result(
                     }})
                 }});
             }} catch(e) {{
-                await fetch("http://127.0.0.1:" + location.port + "/ui-bridge/ipc-response", {{
+                await fetch("http://127.0.0.1:{}/ui-bridge/ipc-response", {{
                     method: "POST",
                     headers: {{ "Content-Type": "application/json" }},
                     body: JSON.stringify({{
@@ -2937,7 +2943,7 @@ async fn direct_webview_evaluate_with_result(
                 }}).catch(function() {{}});
             }}
         }})()"#,
-        request_id, expression
+        request_id, expression, api_port, api_port
     );
 
     window
