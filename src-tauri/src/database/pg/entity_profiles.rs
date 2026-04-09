@@ -247,7 +247,6 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
-        let interval = format!("{} days", stale_days);
         let rows = conn
             .query(
                 "SELECT id, entity_kind, entity_id, entity_label, profile_summary, profile_detail,
@@ -258,10 +257,10 @@ impl PgDb {
                         valid_from::TEXT, valid_until::TEXT, superseded_by,
                         is_deleted, created_at::TEXT, updated_at::TEXT
                  FROM entity_profiles
-                 WHERE NOT is_deleted AND updated_at < NOW() - $1::INTERVAL
+                 WHERE NOT is_deleted AND updated_at < NOW() - ($1 * INTERVAL '1 day')
                  ORDER BY updated_at ASC
                  LIMIT $2",
-                &[&interval, &max_profiles],
+                &[&stale_days, &max_profiles],
             )
             .await
             .map_err(|e| format!("PG get_stale_profiles: {}", e))?;

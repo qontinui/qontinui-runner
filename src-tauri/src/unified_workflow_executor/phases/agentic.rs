@@ -732,6 +732,41 @@ impl AgenticExecutor {
             }
         };
 
+        // Append pre-computed working representation (entity profiles, patterns, findings,
+        // fixes, skills). Uses an in-memory cache so rebuilds only happen on first access
+        // or after consolidation invalidates entries.
+        let enhanced_prompt = {
+            let wr_cache = &self.app_state.working_representation_cache;
+            match wr_cache
+                .get_or_build(
+                    &config.execution_id,
+                    Some(&config.workflow_id),
+                    Some(&config.workflow_name),
+                    &self.app_state.pg_db,
+                )
+                .await
+            {
+                Ok(wr) => {
+                    let wr_ctx =
+                        crate::memory::working_representation::format_working_representation(&wr);
+                    if wr_ctx.is_empty() {
+                        enhanced_prompt
+                    } else {
+                        info!(
+                            "AGENTIC-PHASE: Injecting working representation ({} items, {} chars)",
+                            wr.total_items,
+                            wr_ctx.len()
+                        );
+                        format!("{}\n\n{}", enhanced_prompt, wr_ctx)
+                    }
+                }
+                Err(e) => {
+                    warn!("AGENTIC-PHASE: Failed to build working representation: {}", e);
+                    enhanced_prompt
+                }
+            }
+        };
+
         // Append execution timing context if available (from iteration 2+ or cross-stage)
         let enhanced_prompt = if iteration > 1 || config.stage_index.is_some_and(|idx| idx > 0) {
             match build_execution_timing_context(&config.execution_id) {

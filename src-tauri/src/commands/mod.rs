@@ -224,6 +224,9 @@ pub struct AppState {
     /// Keyed by execution_id. Created at run start, removed on completion.
     pub run_cost_trackers:
         TokioMutex<HashMap<String, Arc<crate::cost_management::RunCostTrackers>>>,
+    /// In-memory cache of pre-computed working representations, keyed by task_run_id.
+    /// Avoids rebuilding expensive parallel PG queries on every prompt construction.
+    pub working_representation_cache: Arc<crate::memory::working_representation::WorkingRepresentationCache>,
 }
 
 impl AppState {

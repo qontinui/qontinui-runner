@@ -11,6 +11,8 @@
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::ai_provider;
+use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::database::types::{ContradictionCandidate, ContradictionStats};
 
@@ -157,7 +159,7 @@ async fn apply_resolution(
         confidence,
         rationale,
         evidence_json,
-        "auto_score",
+        resolution_type, // "auto_score" or "llm_assisted"
     )
     .await?;
 
@@ -167,6 +169,106 @@ async fn apply_resolution(
     );
 
     Ok(())
+}
+
+/// LLM response for contradiction resolution.
+#[derive(serde::Deserialize)]
+struct LlmContradictionVerdict {
+    winner: String,
+    confidence: f64,
+    rationale: String,
+}
+
+/// Resolve an ambiguous contradiction using LLM analysis.
+/// Returns (winner_id, loser_id, confidence, rationale) or an error if LLM is unavailable.
+async fn llm_resolve(
+    candidate: &ContradictionCandidate,
+) -> Result<(i64, i64, f64, String), String> {
+    let prompt = format!(
+        "Two observations about the same topic contradict each other.\n\
+         Determine which is more likely correct.\n\n\
+         Observation A (id: {a_id}, created: {a_date}, importance: {a_imp:.2}):\n\
+         Title: {a_title}\n\
+         Content: {a_content}\n\n\
+         Observation B (id: {b_id}, created: {b_date}, importance: {b_imp:.2}):\n\
+         Title: {b_title}\n\
+         Content: {b_content}\n\n\
+         Respond with ONLY a JSON object (no markdown fences, no extra text):\n\
+         {{\"winner\": \"A\" or \"B\", \"confidence\": 0.0-1.0, \"rationale\": \"...\"}}",
+        a_id = candidate.obs_a_id,
+        a_date = candidate.obs_a_valid_from,
+        a_imp = candidate.obs_a_importance,
+        a_title = candidate.obs_a_title,
+        a_content = candidate.obs_a_content,
+        b_id = candidate.obs_b_id,
+        b_date = candidate.obs_b_valid_from,
+        b_imp = candidate.obs_b_importance,
+        b_title = candidate.obs_b_title,
+        b_content = candidate.obs_b_content,
+    );
+
+    let context = TaskContext::from_prompt(&prompt);
+
+    // Use Haiku-class model for cost efficiency
+    let model_override = Some("claude-haiku-4-5-20251001");
+    let response = tokio::task::spawn_blocking(move || {
+        ai_provider::run_prompt_with_model_override(
+            &prompt,
+            &context,
+            None, // doctor_handle
+            model_override,
+            None, // provider_override — use default
+            Some(0.2), // low temperature for structured output
+            Some(512),
+            None, // fallback_model
+            None, // fallback_provider
+        )
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {}", e))?;
+
+    if !response.success {
+        return Err(format!(
+            "LLM call failed: {}",
+            response.error.unwrap_or_default()
+        ));
+    }
+
+    let output = response.output.trim().to_string();
+
+    // Strip markdown fences if the model wrapped the response
+    let json_str = if output.starts_with("```") {
+        output
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+    } else {
+        &output
+    };
+
+    let verdict: LlmContradictionVerdict = serde_json::from_str(json_str).map_err(|e| {
+        format!(
+            "Failed to parse LLM JSON response: {} — raw output: {}",
+            e,
+            &output[..output.len().min(200)]
+        )
+    })?;
+
+    let confidence = verdict.confidence.clamp(0.0, 1.0);
+
+    let (winner_id, loser_id) = match verdict.winner.to_uppercase().as_str() {
+        "A" => (candidate.obs_a_id, candidate.obs_b_id),
+        "B" => (candidate.obs_b_id, candidate.obs_a_id),
+        other => {
+            return Err(format!(
+                "LLM returned invalid winner '{}', expected 'A' or 'B'",
+                other
+            ));
+        }
+    };
+
+    Ok((winner_id, loser_id, confidence, verdict.rationale))
 }
 
 /// Run a full contradiction scan: detect candidates, score them, and auto-resolve.
@@ -221,18 +323,52 @@ pub async fn run_contradiction_scan(
                 }
             }
             None => {
+                // Ambiguous case — try LLM resolution
                 debug!(
-                    "Skipping ambiguous contradiction: obs_a={}, obs_b={}, topic={:?}",
+                    "Ambiguous contradiction (obs_a={}, obs_b={}, topic={:?}), attempting LLM resolution",
                     candidate.obs_a_id, candidate.obs_b_id, candidate.obs_a_topic_key
                 );
-                // Ambiguous — will be addressed by LLM resolution in a future enhancement
+                match llm_resolve(candidate).await {
+                    Ok((winner_id, loser_id, confidence, rationale)) => {
+                        match apply_resolution(
+                            pg,
+                            candidate,
+                            winner_id,
+                            loser_id,
+                            "llm_assisted",
+                            confidence,
+                            &rationale,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                info!(
+                                    "LLM-resolved contradiction: topic={:?}, winner={}, loser={}, confidence={:.2}",
+                                    candidate.obs_a_topic_key, winner_id, loser_id, confidence
+                                );
+                                stats.llm_resolved += 1;
+                            }
+                            Err(e) => {
+                                warn!("LLM contradiction apply failed: {}", e);
+                                stats.failed += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "LLM resolution unavailable for contradiction {}/{}: {}",
+                            candidate.obs_a_id, candidate.obs_b_id, e
+                        );
+                    }
+                }
             }
         }
     }
 
     info!(
-        "Contradiction scan complete: detected={}, auto_resolved={}, failed={}",
-        stats.detected, stats.auto_resolved, stats.failed
+        "Contradiction scan complete: detected={}, auto_resolved={}, llm_resolved={}, failed={}",
+        stats.detected, stats.auto_resolved, stats.llm_resolved, stats.failed
     );
 
     Ok(stats)

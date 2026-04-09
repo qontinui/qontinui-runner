@@ -5,12 +5,34 @@
 //! is cached in memory (per task-run) and persisted to PG for resume.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::database::pg::PgDb;
 use crate::database::types::*;
+
+// ── Global cache instance ───────────────────────────────────────────────────
+
+/// Global WorkingRepresentationCache instance, set once during app initialization.
+/// Allows code that cannot thread Arc through (e.g. consolidation service) to
+/// access the cache without plumbing it through every call chain.
+static GLOBAL_WR_CACHE: OnceLock<Arc<WorkingRepresentationCache>> = OnceLock::new();
+
+impl WorkingRepresentationCache {
+    /// Set the global cache instance. Call once during app initialization.
+    pub fn set_global(cache: Arc<WorkingRepresentationCache>) {
+        GLOBAL_WR_CACHE
+            .set(cache)
+            .unwrap_or_else(|_| warn!("WorkingRepresentationCache::set_global called more than once (ignored)"));
+    }
+
+    /// Get the global cache instance. Returns None if not initialized.
+    pub fn try_global() -> Option<Arc<WorkingRepresentationCache>> {
+        GLOBAL_WR_CACHE.get().cloned()
+    }
+}
 
 // ── In-memory cache ──────────────────────────────────────────────────────────
 

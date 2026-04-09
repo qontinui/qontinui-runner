@@ -470,6 +470,13 @@ pub async fn run_consolidation(
         warn!("Failed to complete consolidation log: {}", e);
     }
 
+    // After consolidation (success or failure), invalidate all cached working
+    // representations so the next prompt build picks up freshly consolidated data.
+    if let Some(wr_cache) = crate::memory::working_representation::WorkingRepresentationCache::try_global() {
+        info!("Invalidating all working representation cache entries after consolidation");
+        wr_cache.invalidate_all().await;
+    }
+
     result.map(|_| stats)
 }
 

@@ -46,6 +46,12 @@ impl LoopController {
             .release_all(execution_id)
             .await;
 
+        // Evict cached working representation for this task run
+        self.app_state
+            .working_representation_cache
+            .evict(execution_id)
+            .await;
+
         if let Err(e) = self.app_state.pg_db.complete_task_run(execution_id).await {
             error!(
                 "Failed to mark task {} as completed (PG): {}",
@@ -301,6 +307,12 @@ impl LoopController {
         self.app_state
             .file_registry_manager
             .release_all(execution_id)
+            .await;
+
+        // Evict cached working representation for this task run
+        self.app_state
+            .working_representation_cache
+            .evict(execution_id)
             .await;
 
         if let Err(e) = self
