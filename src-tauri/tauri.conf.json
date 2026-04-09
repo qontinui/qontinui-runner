@@ -4,9 +4,7 @@
   "version": "1.0.0",
   "identifier": "com.qontinui.runner",
   "build": {
-    "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
-    "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
   "app": {
