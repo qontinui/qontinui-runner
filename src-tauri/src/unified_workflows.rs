@@ -299,6 +299,17 @@ pub struct UnifiedWorkflow {
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
 
+    /// Maximum consecutive non-improving fix attempts before escalating.
+    /// When the verification check count does not improve across this many iterations,
+    /// the loop exits with fix_attempts_exhausted. 0 = disabled. Default: 3.
+    #[serde(default = "default_max_fix_attempts")]
+    pub max_fix_attempts: u32,
+
+    /// Maximum number of CI-triggered auto-resumes before requiring human intervention.
+    /// Used by Phase 2 PR watcher integration. 0 = disabled. Default: 10.
+    #[serde(default = "default_max_ci_auto_resumes")]
+    pub max_ci_auto_resumes: u32,
+
     /// Optional inactivity timeout in seconds for AI sessions.
     ///   - None (default): No timeout, runs until completion or manual stop
     ///   - Some(N): Kill AI session after N seconds of no output
@@ -592,6 +603,14 @@ fn default_category() -> String {
 }
 
 fn default_max_iterations() -> u32 {
+    10
+}
+
+fn default_max_fix_attempts() -> u32 {
+    3
+}
+
+fn default_max_ci_auto_resumes() -> u32 {
     10
 }
 

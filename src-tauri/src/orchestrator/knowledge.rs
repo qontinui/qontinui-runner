@@ -1683,11 +1683,6 @@ Continuing with other fixes.
     }
 
     #[test]
-    fn test_parse_criterion_override_multiple() {
-        // SQLite removed - no-op
-    }
-
-    #[test]
     fn test_parse_criterion_override_no_overrides() {
         let output = "Just some regular output without any overrides.";
         let overrides = CriterionOverride::parse_from_output(output, 1);

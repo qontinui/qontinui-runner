@@ -144,9 +144,18 @@ pub struct LoopResult {
     /// Total cost in USD (populated by multi-agent pipeline and agentic verification).
     #[serde(default)]
     pub total_cost_usd: Option<f64>,
+    /// Whether the loop exited because fix attempts were exhausted without progress.
+    #[serde(default)]
+    pub fix_attempts_exhausted: bool,
     /// All unique file paths modified across all iterations (from resource tracker).
     #[serde(default)]
     pub files_modified: Vec<String>,
+    /// Number of consecutive non-improving fix attempts at loop exit.
+    #[serde(default)]
+    pub fix_attempts: u32,
+    /// Number of CI auto-resumes consumed at loop exit.
+    #[serde(default)]
+    pub ci_auto_resumes: u32,
 }
 
 impl LoopResult {
@@ -176,6 +185,11 @@ impl LoopResult {
         } else if self.unfixable_errors {
             format!(
                 "AI determined errors UNFIXABLE after {} iteration(s) - proceeding to completion",
+                self.iterations_run
+            )
+        } else if self.fix_attempts_exhausted {
+            format!(
+                "Fix attempts EXHAUSTED after {} iteration(s) - no progress detected",
                 self.iterations_run
             )
         } else if self.critical_failure {
@@ -242,6 +256,20 @@ pub struct StageConfig {
     /// This is used by meta-workflows to ensure the AI hardener runs
     /// before save_workflow_artifact persists the final result.
     pub completion_prompts_first: bool,
+}
+
+/// Context from a CI failure that triggered an auto-resume.
+/// Populated by the PR watcher and consumed by the failure context builder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CiFailureContext {
+    /// Names of CI checks that failed (e.g., "build", "test", "lint").
+    pub failed_check_names: Vec<String>,
+    /// Truncated log output per check (check_name -> log excerpt).
+    pub check_logs: HashMap<String, String>,
+    /// PR number that triggered this resume (if applicable).
+    pub pr_number: Option<u64>,
+    /// Whether the PR has a merge conflict.
+    pub merge_conflict: bool,
 }
 
 /// Configuration for the verification-agentic loop.
@@ -380,7 +408,7 @@ pub struct LoopConfig {
     pub worktree_path: Option<String>,
     /// Worktree branch name (set at runtime).
     pub worktree_branch: Option<String>,
-    /// Workflow execution architecture override (from autoresearch).
+    /// Workflow execution architecture override.
     /// When set to "agentic_verification", the loop controller uses the agentic
     /// verification loop instead of the traditional verification-agentic loop.
     pub workflow_architecture:
@@ -401,6 +429,15 @@ pub struct LoopConfig {
     /// Optional per-phase timeout in milliseconds.
     /// When set, each phase (setup/verification/agentic/completion) is capped at this duration.
     pub phase_timeout_ms: Option<u64>,
+    /// Maximum consecutive non-improving iterations before escalating to HITL.
+    /// Default: 3. Set to 0 to disable fix-attempt tracking (preserves existing behavior).
+    pub max_fix_attempts: u32,
+    /// Maximum number of CI-triggered auto-resumes before requiring manual intervention.
+    /// Used by the PR watcher (Phase 2). Default: 10.
+    pub max_ci_auto_resumes: u32,
+    /// CI failure context injected by the PR watcher when auto-resuming after CI failure.
+    /// When present, failed check names and logs are prepended to the failure context.
+    pub ci_failure_context: Option<CiFailureContext>,
 }
 
 impl LoopConfig {
@@ -473,6 +510,9 @@ impl LoopConfig {
                     .ok()
                     .and_then(|pt| pt.execution_ms)
             }),
+            max_fix_attempts: workflow.max_fix_attempts,
+            max_ci_auto_resumes: workflow.max_ci_auto_resumes,
+            ci_failure_context: None,
         }
     }
 
@@ -542,10 +582,18 @@ impl LoopConfig {
 
     /// Update the routing context with current loop state.
     pub fn set_routing_context(&mut self, iteration: u32, verification_failures: u32) {
+        // Preserve signal enrichment fields from prior iterations
+        let prev = &self.routing_context;
         self.routing_context = RoutingContext {
             iteration,
             verification_failures,
             stage_index: self.stage_index,
+            word_count: prev.word_count,
+            code_block_count: prev.code_block_count,
+            cross_file_dep_count: prev.cross_file_dep_count,
+            has_error_context: prev.has_error_context,
+            iteration_number: iteration,
+            previous_fix_failed: prev.previous_fix_failed,
         };
     }
 

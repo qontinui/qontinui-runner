@@ -17,6 +17,18 @@ pub struct RoutingContext {
     pub verification_failures: u32,
     /// Current stage index (0-indexed), if running a multi-stage workflow.
     pub stage_index: Option<u32>,
+    /// Word count of the prompt (signal enrichment, Phase 4).
+    pub word_count: usize,
+    /// Number of code blocks in the prompt.
+    pub code_block_count: usize,
+    /// Number of distinct file paths mentioned.
+    pub cross_file_dep_count: usize,
+    /// Whether the prompt contains error traces.
+    pub has_error_context: bool,
+    /// Current iteration number for signal routing (matches iteration field).
+    pub iteration_number: u32,
+    /// Whether the previous fix attempt failed.
+    pub previous_fix_failed: bool,
 }
 
 /// Resolved model configuration after evaluating routing rules.
@@ -132,6 +144,7 @@ mod tests {
             iteration: 3,
             verification_failures: 2,
             stage_index: Some(1),
+            ..Default::default()
         };
 
         assert!(evaluate_condition("verification_failures >= 2", &ctx));

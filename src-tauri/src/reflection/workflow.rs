@@ -496,6 +496,9 @@ pub fn build_reflection_config(
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
+        ci_failure_context: None,
     }
 }
 
@@ -1115,6 +1118,9 @@ pub fn build_project_reflection_config(
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
+        ci_failure_context: None,
     }
 }
 
@@ -1525,6 +1531,9 @@ pub fn build_ui_bridge_reflection_config(
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
+        ci_failure_context: None,
     }
 }
 

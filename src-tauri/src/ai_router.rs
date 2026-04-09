@@ -472,6 +472,12 @@ impl TaskRouter {
             domain: "unknown".to_string(), // Domain not available at routing time
             has_ui: false,                 // Not reliably available at routing time
             step_type: context.phase.clone(),
+            word_count: 0,
+            code_block_count: 0,
+            cross_file_dep_count: 0,
+            has_error_context: false,
+            iteration_number: 0,
+            previous_fix_failed: false,
         };
 
         // Get the static fallback model

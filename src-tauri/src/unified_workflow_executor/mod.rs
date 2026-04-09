@@ -78,6 +78,7 @@ mod phase_helpers;
 mod phases;
 pub mod replay;
 mod resume;
+pub mod review_subtask;
 mod startup_resume;
 pub mod states;
 mod step_conversion;
@@ -104,7 +105,9 @@ pub use loop_controller::{
 pub use startup_resume::{
     extract_workflow_id_from_task_id, resume_interrupted_workflows, ResumeConfig,
 };
-pub use types::{get_parent_task_id, LoopConfig, LoopResult, StageConfig, WorkflowPhase};
+pub use types::{
+    get_parent_task_id, CiFailureContext, LoopConfig, LoopResult, StageConfig, WorkflowPhase,
+};
 
 // Types exposed for API consumers and advanced usage
 // These may not be directly used in this crate but are part of the public API

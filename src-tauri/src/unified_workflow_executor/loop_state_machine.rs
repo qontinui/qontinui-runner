@@ -72,6 +72,13 @@ pub(crate) enum LoopState {
     /// Approval gate (if enabled and agentic succeeded)
     ApprovalGate { outcome: AgenticOutcome },
 
+    /// Fix attempts exhausted — try HITL escalation before giving up.
+    /// Inserted between EvaluateVerification and Complete when fix_attempts >= max.
+    FixEscalation {
+        verification_result: VerificationPhaseResult,
+        convergence_report: ConvergenceReport,
+    },
+
     /// Capture git diffs and advance to next iteration
     AdvanceIteration,
 
@@ -98,6 +105,8 @@ pub(crate) enum CompletionReason {
     ApprovalAborted,
     /// A phase exceeded its configured timeout
     PhaseTimeout { phase: String, elapsed_ms: u64 },
+    /// Fix attempts exhausted without progress — escalation to HITL was declined or non-blocking.
+    FixAttemptsExhausted { fix_attempts: u32 },
 }
 
 // =============================================================================
@@ -152,6 +161,19 @@ pub(crate) struct LoopContext {
     // affect the current and future iterations. Accumulated as deferred
     // questions are created; propagated into each IterationResult.
     pub active_contingencies: Vec<String>,
+
+    // --- Fix attempt tracking (Phase 1: Bounded Fix Loop) ---
+
+    /// Consecutive non-improving iterations (separate from iteration counter).
+    /// Resets to 0 when verification shows progress (more checks pass than previous best).
+    pub fix_attempts: u32,
+    /// High water mark of passed verification checks. Used to detect progress.
+    pub best_passed_checks: usize,
+    /// Last iteration where passed_checks improved over the previous best.
+    pub last_progress_iteration: u32,
+    /// Number of times this task was auto-resumed by the PR watcher after CI failure.
+    /// Tracked here for Phase 2 integration.
+    pub ci_auto_resumes: u32,
 }
 
 impl LoopContext {
@@ -226,6 +248,10 @@ impl LoopContext {
             blame_json: None,
             loop_start_time: Instant::now(),
             active_contingencies: Vec::new(),
+            fix_attempts: 0,
+            best_passed_checks: 0,
+            last_progress_iteration: 0,
+            ci_auto_resumes: 0,
         }
     }
 
@@ -262,7 +288,10 @@ impl CompletionReason {
             CompletionReason::UnfixableErrors => (false, false, false, false, true),
             CompletionReason::ApprovalAborted => (false, true, false, false, false),
             CompletionReason::PhaseTimeout { .. } => (false, false, false, true, false),
+            CompletionReason::FixAttemptsExhausted { .. } => (false, false, false, false, false),
         };
+
+        let fix_attempts_exhausted = matches!(&self, CompletionReason::FixAttemptsExhausted { .. });
 
         LoopResult {
             verification_passed,
@@ -272,9 +301,12 @@ impl CompletionReason {
             max_iterations_reached,
             critical_failure,
             unfixable_errors,
+            fix_attempts_exhausted,
             total_tokens: None,
             total_cost_usd: None,
             files_modified: ctx.resource_tracker.files_modified(),
+            fix_attempts: ctx.fix_attempts,
+            ci_auto_resumes: ctx.ci_auto_resumes,
         }
     }
 }
@@ -391,6 +423,10 @@ mod tests {
             blame_json: None,
             loop_start_time: Instant::now(),
             active_contingencies: Vec::new(),
+            fix_attempts: 0,
+            best_passed_checks: 0,
+            last_progress_iteration: 0,
+            ci_auto_resumes: 0,
         }
     }
 
@@ -736,6 +772,10 @@ mod tests {
         let _ = LoopState::ApprovalGate {
             outcome: AgenticOutcome::Skipped,
         };
+        let _ = LoopState::FixEscalation {
+            verification_result: make_test_verification_result(),
+            convergence_report: make_test_convergence_report(),
+        };
         let _ = LoopState::AdvanceIteration;
         let _ = LoopState::Complete {
             reason: CompletionReason::VerificationPassed,
@@ -776,8 +816,9 @@ mod tests {
                 phase: "verification".to_string(),
                 elapsed_ms: 30000,
             },
+            CompletionReason::FixAttemptsExhausted { fix_attempts: 3 },
         ];
-        assert_eq!(completion_variants.len(), 8);
+        assert_eq!(completion_variants.len(), 9);
 
         // Each completion reason must produce a valid LoopResult
         let ctx = make_test_context(1);

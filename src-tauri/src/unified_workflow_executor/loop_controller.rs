@@ -1259,6 +1259,9 @@ impl LoopController {
                         crate::unified_workflow_executor::blame::EscalationPolicy::default(),
                     iteration_diffs: Vec::new(),
                     phase_timeout_ms: config.phase_timeout_ms,
+                    max_fix_attempts: config.max_fix_attempts,
+                    max_ci_auto_resumes: config.max_ci_auto_resumes,
+                    ci_failure_context: config.ci_failure_context.clone(),
                 };
 
                 // Handle agentic-first: run the agentic phase before the verification loop.
@@ -1638,6 +1641,23 @@ impl LoopController {
                         config.execution_id, e
                     );
                 }
+
+                // Persist fix loop metrics (Phase 1: Bounded Fix Loop)
+                if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .update_task_run_fix_metrics(
+                        &config.execution_id,
+                        lr.fix_attempts as i32,
+                        lr.ci_auto_resumes as i32,
+                    )
+                    .await
+                {
+                    error!(
+                        "Failed to persist fix_attempts for {}: {}",
+                        config.execution_id, e
+                    );
+                }
             }
 
             self.mark_task_completed(&config.execution_id, Some(&config.workflow_id))
@@ -1715,6 +1735,11 @@ impl LoopController {
                         "Critical failure during verification after {} iterations",
                         lr.iterations_run
                     )
+                } else if lr.fix_attempts_exhausted {
+                    format!(
+                        "Fix attempts exhausted after {} iterations (no progress in {} consecutive attempts)",
+                        lr.iterations_run, lr.fix_attempts
+                    )
                 } else {
                     format!(
                         "No stages passed verification after {} iterations",
@@ -1733,6 +1758,26 @@ impl LoopController {
                     last_loop_result.as_ref().map(|r| r.iterations_run),
                 ),
             );
+
+            // Persist fix loop metrics on failure (Phase 1: Bounded Fix Loop)
+            if let Some(ref lr) = last_loop_result {
+                if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .update_task_run_fix_metrics(
+                        &config.execution_id,
+                        lr.fix_attempts as i32,
+                        lr.ci_auto_resumes as i32,
+                    )
+                    .await
+                {
+                    error!(
+                        "Failed to persist fix_attempts for {}: {}",
+                        config.execution_id, e
+                    );
+                }
+            }
+
             self.mark_task_failed(
                 &config.execution_id,
                 &fail_reason,

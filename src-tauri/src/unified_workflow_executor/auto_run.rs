@@ -35,7 +35,7 @@ pub fn launch_generated_workflow(
     deps: AutoRunDeps,
     meta_task_run_id: &str,
 ) -> Result<String, String> {
-    // 1. Get the meta-workflow's task run to read result_data — SQLite removed, use PG
+    // 1. Get the meta-workflow's task run to read result_data
     let pg_db = &deps.app_state.pg_db;
     let task_run = {
         let pg = pg_db.clone();
@@ -184,6 +184,9 @@ pub fn launch_generated_workflow(
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: workflow.max_fix_attempts,
+        max_ci_auto_resumes: workflow.max_ci_auto_resumes,
+        ci_failure_context: None,
     };
 
     // 6. Spawn the workflow

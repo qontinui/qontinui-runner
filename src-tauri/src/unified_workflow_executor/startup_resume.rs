@@ -192,9 +192,28 @@ pub async fn resume_interrupted_workflows(
     pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     config: ResumeConfig,
 ) -> usize {
-    // Get all running unified workflows
-    // Running workflows query removed — all persistence now via PgDb.
-    let running_workflows: Vec<crate::database::types::TaskRun> = Vec::new();
+    // Each runner instance only resumes tasks tagged with its own runner_port.
+    // Different runners bind different ports, so this is the natural per-runner
+    // exclusion: two restarting runners can't double-claim the same task.
+    let my_port = app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let running_workflows: Vec<crate::database::types::TaskRun> = match app_state
+        .pg_db
+        .get_resumable_task_runs_for_runner(my_port)
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            // AI chat sessions are resumed by resume_ai_sessions, not here.
+            .filter(|r| r.workflow_type.as_deref() != Some("chat"))
+            .collect(),
+        Err(e) => {
+            error!("Failed to query resumable task runs: {}", e);
+            Vec::new()
+        }
+    };
 
     if running_workflows.is_empty() {
         info!("No interrupted unified workflows found to resume");
@@ -448,6 +467,9 @@ pub async fn resume_interrupted_workflows(
                                 active_canary: None,
                                 is_canary_run: false,
                                 phase_timeout_ms: None,
+                                max_fix_attempts: 3,
+                                max_ci_auto_resumes: 10,
+                                ci_failure_context: None,
                             };
 
                             controller
@@ -664,6 +686,9 @@ pub async fn resume_interrupted_workflows(
                                 active_canary: None,
                                 is_canary_run: false,
                                 phase_timeout_ms: None,
+                                max_fix_attempts: 3,
+                                max_ci_auto_resumes: 10,
+                                ci_failure_context: None,
                             };
 
                             controller

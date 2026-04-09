@@ -83,6 +83,28 @@ pub enum TriggerConfig {
         #[serde(default = "default_timezone")]
         timezone: String,
     },
+
+    /// Poll a ticket provider for new actionable tickets.
+    TicketSync {
+        /// Provider configuration (source, target, labels, workflow, etc.).
+        config: crate::ticket_system::types::TicketProviderConfig,
+    },
+
+    /// Watch PRs for CI status changes and auto-resume tasks.
+    PrWatch {
+        /// GitHub personal access token (or fine-grained token with repo scope).
+        #[serde(skip_serializing)]
+        github_token: String,
+        /// Poll interval in seconds (default: 30, min: 10).
+        #[serde(default = "default_pr_poll_interval")]
+        poll_interval_seconds: u64,
+        /// Whether to auto-resume tasks on CI failure (default: true).
+        #[serde(default = "default_true")]
+        auto_resume_on_ci_failure: bool,
+        /// Maximum auto-resumes before requiring manual intervention (default: 10).
+        #[serde(default = "default_max_auto_resumes")]
+        max_auto_resumes: u32,
+    },
 }
 
 /// A URL target for health checking.
@@ -124,6 +146,14 @@ fn default_health_timeout() -> u64 {
 
 fn default_timezone() -> String {
     "UTC".to_string()
+}
+
+fn default_pr_poll_interval() -> u64 {
+    30
+}
+
+fn default_max_auto_resumes() -> u32 {
+    10
 }
 
 // ============================================================================

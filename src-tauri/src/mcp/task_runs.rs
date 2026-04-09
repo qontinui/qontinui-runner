@@ -656,6 +656,9 @@ pub async fn resume_task_run(
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: workflow.max_fix_attempts,
+        max_ci_auto_resumes: workflow.max_ci_auto_resumes,
+        ci_failure_context: None,
     };
 
     // Spawn the workflow execution in background with panic protection

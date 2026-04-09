@@ -378,7 +378,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     if !is_secondary_instance {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance is launched, focus the existing window
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
@@ -1293,71 +1293,69 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             info!("Tauri application setup starting");
 
-            // Secondary instances (test runners) need an isolated WebView2
-            // profile or they collide with the primary's locked EBWebView
-            // folder. The declarative window in tauri.conf.json always uses
-            // the default profile, so for secondaries we:
-            //   1. Create a new window ("main") with data_directory() set
-            //      to the supervisor-provided WEBVIEW2_USER_DATA_FOLDER.
-            //   2. Close the broken declarative window.
+            // ── Programmatic window creation ───────────────────────────
             //
-            // We also force the new window on-screen and skip the
-            // window-state plugin (done above) to prevent multi-monitor
-            // geometry issues.
-            if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {
+            // The declarative `windows[]` in tauri.conf.json is empty.
+            // We create the main window here so that:
+            //   - Secondary instances (test runners) get an isolated
+            //     WebView2 user-data folder via `.data_directory()`,
+            //     preventing profile-lock contention with the primary's
+            //     `%LOCALAPPDATA%\com.qontinui.runner\EBWebView`.
+            //   - The primary instance gets the exact same config it had
+            //     declaratively (maximized, 1400×800, min 1200×700).
+            //
+            // This replaces the old "create declarative window then
+            // destroy-and-recreate for secondaries" approach, which
+            // failed because Tauri's declarative window was already
+            // holding the default profile lock before .setup() ran.
+            {
                 use tauri::Manager;
 
-                if let Some(dir) = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok() {
-                    let _ = std::fs::create_dir_all(&dir);
+                let data_dir = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok();
+                let is_secondary = std::env::var("QONTINUI_INSTANCE_NAME").is_ok();
+
+                if let Some(ref dir) = data_dir {
+                    let _ = std::fs::create_dir_all(dir);
                     info!(
-                        "Secondary instance: creating isolated window (WEBVIEW2_USER_DATA_FOLDER={})",
+                        "Creating window with isolated WebView2 profile (WEBVIEW2_USER_DATA_FOLDER={})",
                         dir
                     );
+                }
 
-                    // Create the isolated window FIRST (with a temporary label)
-                    // so the app doesn't exit when we close the declarative one.
-                    let url = tauri::WebviewUrl::App("index.html".into());
-                    match tauri::WebviewWindowBuilder::new(app, "main-isolated", url)
-                        .title("Qontinui Runner")
-                        .inner_size(1400.0, 900.0)
-                        .min_inner_size(1200.0, 700.0)
-                        .position(100.0, 100.0)
-                        .data_directory(std::path::PathBuf::from(&dir))
-                        .build()
-                    {
-                        Ok(win) => {
-                            // Close the declarative window (it has the wrong profile).
-                            if let Some(old) = app.get_webview_window("main") {
-                                let _ = old.destroy();
-                            }
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                            // Tell all callsites to use this label.
-                            qontinui_runner_lib::set_main_window_label("main-isolated");
-                            info!("Secondary instance: isolated window ready (label=main-isolated)");
-                        }
-                        Err(e) => {
-                            error!(
-                                "Secondary instance: failed to create isolated window: {} — falling back to declarative",
-                                e
-                            );
-                            // Leave the declarative window as-is.
-                            if let Some(win) = app.get_webview_window("main") {
-                                let _ = win.unminimize();
-                                let _ = win.set_position(tauri::LogicalPosition::new(100.0, 100.0));
-                                let _ = win.show();
-                            }
-                        }
-                    }
+                let url = tauri::WebviewUrl::App("index.html".into());
+                let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
+                    .title("Qontinui Runner")
+                    .inner_size(1400.0, 800.0)
+                    .min_inner_size(1200.0, 700.0)
+                    .fullscreen(false)
+                    .resizable(true)
+                    .decorations(true);
+
+                if let Some(ref dir) = data_dir {
+                    builder = builder.data_directory(std::path::PathBuf::from(dir));
+                }
+
+                if is_secondary {
+                    // Force secondaries on-screen at a known position
+                    builder = builder.position(100.0, 100.0);
                 } else {
-                    // No custom profile dir — just force on-screen.
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.unminimize();
-                        let _ = win.set_position(tauri::LogicalPosition::new(100.0, 100.0));
-                        let _ = win.set_size(tauri::LogicalSize::new(1400.0, 900.0));
+                    // Primary starts maximized (matches old declarative config)
+                    builder = builder.maximized(true);
+                }
+
+                match builder.build() {
+                    Ok(win) => {
                         let _ = win.show();
                         let _ = win.set_focus();
-                        info!("Secondary instance: forced main window on-screen (no isolated profile)");
+                        info!(
+                            "Main window created programmatically (secondary={}, isolated={})",
+                            is_secondary,
+                            data_dir.is_some()
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to create main window: {}", e);
+                        return Err(Box::new(e));
                     }
                 }
             }
@@ -1393,7 +1391,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Slash command sync and built-in issue pattern seeding removed — all persistence now via PgDb.
             }
 
-            // Window starts maximized via tauri.conf.json
+            // Window starts maximized via programmatic builder above
 
             // Initialize bridge manager for multi-bridge support
             // This replaces the legacy single python_bridge with a manager that can handle
@@ -1465,6 +1463,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
+
+            // Note: secondary registration with the primary is handled by the
+            // heartbeat service (heartbeat.rs) which retries every 15s. No
+            // separate registration spawn needed here.
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)
             if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {

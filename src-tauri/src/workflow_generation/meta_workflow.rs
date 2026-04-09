@@ -360,6 +360,8 @@ pub fn build_meta_workflow_template(
         flow_control_json: None,
         phase_timeouts_json: None,
         security_profile: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
         created_at: now.clone(),
         updated_at: now,
     }

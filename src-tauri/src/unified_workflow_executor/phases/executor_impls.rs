@@ -219,6 +219,9 @@ impl Executor for AgenticExecutor {
             active_canary: None,
             is_canary_run: false,
             phase_timeout_ms: None,
+            max_fix_attempts: 3,
+            max_ci_auto_resumes: 10,
+            ci_failure_context: None,
         };
 
         let (outcome, _injected_steps) = self

@@ -39,6 +39,18 @@ pub struct ModelRoutingContext {
     pub has_ui: bool,
     /// Step type (for per-step model routing, optional).
     pub step_type: Option<String>,
+    /// Word count of the prompt (signal enrichment).
+    pub word_count: usize,
+    /// Number of code blocks in the prompt.
+    pub code_block_count: usize,
+    /// Number of distinct file paths mentioned.
+    pub cross_file_dep_count: usize,
+    /// Whether the prompt contains error traces.
+    pub has_error_context: bool,
+    /// Current iteration number (higher = harder problem).
+    pub iteration_number: u32,
+    /// Whether the previous fix attempt failed.
+    pub previous_fix_failed: bool,
 }
 
 /// Encodes model routing context into a discrete state key.
@@ -65,9 +77,23 @@ impl ContextEncoder for ModelRoutingEncoder {
         let complexity = normalize_complexity(&input.complexity_tier);
         let ui = if input.has_ui { "ui" } else { "no_ui" };
 
+        // Signal enrichment: effort bucket based on code blocks + file deps
+        let effort = if input.code_block_count <= 1 && input.cross_file_dep_count <= 1 {
+            "simple"
+        } else if input.cross_file_dep_count <= 3 {
+            "moderate"
+        } else {
+            "complex"
+        };
+        let retry = if input.previous_fix_failed {
+            "retry"
+        } else {
+            "fresh"
+        };
+
         format!(
-            "{}:{}:{}:{}:{}",
-            prompt_bucket, file_bucket, complexity, domain, ui
+            "{}:{}:{}:{}:{}:{}:{}",
+            prompt_bucket, file_bucket, complexity, domain, ui, effort, retry
         )
     }
 }
@@ -142,8 +168,17 @@ mod tests {
             domain: "backend".to_string(),
             has_ui: false,
             step_type: None,
+            word_count: 0,
+            code_block_count: 0,
+            cross_file_dep_count: 0,
+            has_error_context: false,
+            iteration_number: 0,
+            previous_fix_failed: false,
         };
-        assert_eq!(encoder.encode(&ctx), "short:few:moderate:backend:no_ui");
+        assert_eq!(
+            encoder.encode(&ctx),
+            "short:few:moderate:backend:no_ui:simple:fresh"
+        );
     }
 
     #[test]
@@ -156,8 +191,17 @@ mod tests {
             domain: "frontend".to_string(),
             has_ui: true,
             step_type: None,
+            word_count: 0,
+            code_block_count: 3,
+            cross_file_dep_count: 5,
+            has_error_context: true,
+            iteration_number: 4,
+            previous_fix_failed: true,
         };
-        assert_eq!(encoder.encode(&ctx), "long:many:highly_complex:frontend:ui");
+        assert_eq!(
+            encoder.encode(&ctx),
+            "long:many:highly_complex:frontend:ui:complex:retry"
+        );
     }
 
     #[test]

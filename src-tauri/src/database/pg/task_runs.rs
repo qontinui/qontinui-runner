@@ -1007,10 +1007,7 @@ impl PgDb {
                 blocks_parent: false,
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
-                completed_at: {
-                    let s: String = r.get("completed_at");
-                    if s.is_empty() { None } else { Some(s) }
-                },
+                completed_at: r.get::<_, Option<String>>("completed_at"),
             })
             .collect())
     }

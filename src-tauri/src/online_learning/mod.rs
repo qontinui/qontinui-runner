@@ -23,8 +23,10 @@ pub mod coordinator;
 pub mod credit_assignment;
 pub mod deferred_learning;
 pub mod model_router;
+pub mod pattern_distiller;
 pub mod policies;
 pub mod reflection;
+pub mod signal_extractor;
 pub mod strategy_bank;
 pub mod strategy_evolution;
 

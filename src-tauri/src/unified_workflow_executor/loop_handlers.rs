@@ -165,6 +165,19 @@ impl LoopController {
                     self.handle_approval_gate(&mut ctx, config, &outcome).await
                 }
 
+                LoopState::FixEscalation {
+                    verification_result,
+                    convergence_report,
+                } => {
+                    self.handle_fix_escalation(
+                        &mut ctx,
+                        config,
+                        verification_result,
+                        convergence_report,
+                    )
+                    .await
+                }
+
                 LoopState::AdvanceIteration => {
                     self.handle_advance_iteration(&mut ctx, config).await
                 }
@@ -1104,6 +1117,37 @@ impl LoopController {
             };
         }
 
+        // --- Fix attempt tracking (Phase 1: Bounded Fix Loop) ---
+        let current_passed = verification_result.passed_steps;
+        if current_passed > ctx.best_passed_checks {
+            // Progress detected — reset fix counter
+            ctx.best_passed_checks = current_passed;
+            ctx.fix_attempts = 0;
+            ctx.last_progress_iteration = ctx.iteration;
+            info!(
+                "Fix loop: progress detected (passed {} > previous best), reset fix_attempts",
+                current_passed,
+            );
+        } else {
+            ctx.fix_attempts += 1;
+            info!(
+                "Fix loop: no progress (passed {} <= best {}), fix_attempts = {}/{}",
+                current_passed, ctx.best_passed_checks, ctx.fix_attempts, config.max_fix_attempts
+            );
+        }
+
+        // Check if fix attempts exhausted
+        if config.max_fix_attempts > 0 && ctx.fix_attempts >= config.max_fix_attempts {
+            warn!(
+                "Fix loop: {} consecutive non-improving iterations (max {}), escalating",
+                ctx.fix_attempts, config.max_fix_attempts
+            );
+            return LoopState::FixEscalation {
+                verification_result,
+                convergence_report,
+            };
+        }
+
         // Verification failed (non-critical) — continue to build failure context
         LoopState::BuildFailureContext {
             verification_result,
@@ -1143,6 +1187,26 @@ impl LoopController {
         );
 
         let failure_context = verification_result.build_failure_context();
+
+        // Prepend CI failure context if this is a CI-triggered auto-resume
+        let failure_context = if let Some(ref ci_ctx) = config.ci_failure_context {
+            let mut ci_section = String::from("## CI Failure Context\n\n");
+            if ci_ctx.merge_conflict {
+                ci_section.push_str("**Merge conflict detected** — resolve conflicts before proceeding.\n\n");
+            }
+            if !ci_ctx.failed_check_names.is_empty() {
+                ci_section.push_str(&format!(
+                    "The following CI checks failed: {}\n\n",
+                    ci_ctx.failed_check_names.join(", ")
+                ));
+            }
+            for (check_name, log) in &ci_ctx.check_logs {
+                ci_section.push_str(&format!("### {} (log excerpt)\n```\n{}\n```\n\n", check_name, log));
+            }
+            format!("{}{}", ci_section, failure_context)
+        } else {
+            failure_context
+        };
 
         // Inject convergence analysis into the failure context.
         // The detector's context_injection contains formatted warnings about
@@ -1574,6 +1638,52 @@ impl LoopController {
         } else {
             failure_context
         };
+
+        // Pattern distillation: inject known solutions (Phase 5A).
+        // Match learned patterns against the failure context and append a
+        // "## Known Solutions" section so the AI can leverage prior fixes.
+        let failure_context = {
+            use crate::online_learning::pattern_distiller::PatternDistiller;
+            let distiller = PatternDistiller::new(self.app_state.pg_db.clone());
+            match distiller
+                .match_patterns(&failure_context, config.project_path.as_deref())
+                .await
+            {
+                Ok(patterns) if !patterns.is_empty() => {
+                    let injection = PatternDistiller::format_for_prompt(&patterns);
+                    tracing::info!(
+                        "Injected {} learned patterns into failure context",
+                        patterns.len()
+                    );
+                    format!("{}{}", failure_context, injection)
+                }
+                Ok(_) => failure_context,
+                Err(e) => {
+                    tracing::debug!("Pattern matching failed: {}", e);
+                    failure_context
+                }
+            }
+        };
+
+        // Signal enrichment for model routing (Phase 4)
+        // Extract zero-LLM signals from the failure context to enrich the routing
+        // context used by the UCB1 bandit for model selection.
+        {
+            use crate::online_learning::signal_extractor::RoutingSignals;
+            let previous_failed = ctx.iteration > 1
+                && !ctx
+                    .iteration_results
+                    .last()
+                    .map_or(false, |r| r.verification_passed);
+            let signals =
+                RoutingSignals::extract(&failure_context, ctx.iteration, previous_failed);
+            config.routing_context.word_count = signals.word_count;
+            config.routing_context.code_block_count = signals.code_block_count;
+            config.routing_context.cross_file_dep_count = signals.cross_file_dep_count;
+            config.routing_context.has_error_context = signals.has_error_context;
+            config.routing_context.iteration_number = signals.iteration_number;
+            config.routing_context.previous_fix_failed = signals.previous_fix_failed;
+        }
 
         LoopState::RunAgentic {
             failure_context,
@@ -2303,6 +2413,232 @@ impl LoopController {
 
         LoopState::ApprovalGate {
             outcome: outcome.clone(),
+        }
+    }
+
+    // =========================================================================
+    // Handler: FixEscalation
+    // =========================================================================
+
+    /// Handle fix escalation: try HITL approval before giving up.
+    ///
+    /// When fix_attempts are exhausted (no progress across consecutive iterations),
+    /// this handler attempts to get human approval to continue. In blocking mode,
+    /// it registers an approval request and waits. In non-blocking mode (or when
+    /// no approval registry is available), it completes with FixAttemptsExhausted.
+    async fn handle_fix_escalation(
+        &self,
+        ctx: &mut LoopContext,
+        config: &mut LoopConfig,
+        verification_result: VerificationPhaseResult,
+        convergence_report: ConvergenceReport,
+    ) -> LoopState {
+        warn!(
+            "Fix escalation: {} consecutive non-improving iterations, attempting HITL",
+            ctx.fix_attempts
+        );
+
+        if config.blocking_approval {
+            // Register an approval request and wait for human response
+            let registry = super::approval::get_approval_registry();
+
+            let approval_id = format!(
+                "fix-escalation-{}-iter-{}",
+                config.execution_id, ctx.iteration
+            );
+            let prompt = format!(
+                "The workflow has failed to make progress for {} consecutive iterations.\n\
+                 Best result: {}/{} checks passing.\n\
+                 Current result: {}/{} checks passing.\n\n\
+                 Choose an action:\n\
+                 - **Approve**: Reset fix counter and try {} more iterations\n\
+                 - **Abort**: Stop the workflow",
+                ctx.fix_attempts,
+                ctx.best_passed_checks,
+                verification_result.total_steps,
+                verification_result.passed_steps,
+                verification_result.total_steps,
+                config.max_fix_attempts,
+            );
+
+            let request = super::approval::ApprovalRequest {
+                id: approval_id.clone(),
+                execution_id: config.execution_id.clone(),
+                iteration: ctx.iteration,
+                prompt: prompt.clone(),
+                context: super::approval::ApprovalContext {
+                    summary: format!(
+                        "Fix loop stuck: {}/{} checks passing after {} non-improving iterations",
+                        verification_result.passed_steps,
+                        verification_result.total_steps,
+                        ctx.fix_attempts,
+                    ),
+                    files_modified: Vec::new(),
+                    git_diff_stat: None,
+                    git_diff: None,
+                },
+                options: vec!["Approve".to_string(), "Abort Workflow".to_string()],
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+
+            // Record to database for audit trail
+            let context_json =
+                serde_json::to_string(&request.context).unwrap_or_else(|_| "{}".to_string());
+            let _ = self
+                .app_state
+                .pg_db
+                .insert_approval_gate(
+                    &approval_id,
+                    &config.execution_id,
+                    ctx.iteration as i32,
+                    &prompt,
+                    &context_json,
+                )
+                .await;
+
+            // Persist workflow state: ApprovalPending
+            self.persist_workflow_state(
+                &config.execution_id,
+                &UnifiedWorkflowState::approval_pending(
+                    ctx.iteration,
+                    config.stage_index,
+                    approval_id.clone(),
+                    prompt.clone(),
+                ),
+            );
+
+            let receiver = registry.register(request).await;
+
+            // Emit event to notify the frontend
+            let broadcaster = EventBroadcaster::new(self.app_handle.clone());
+            broadcaster.approval_required(
+                &config.execution_id,
+                &approval_id,
+                ctx.iteration,
+                &format!(
+                    "Fix loop stuck after {} non-improving iterations",
+                    ctx.fix_attempts
+                ),
+            );
+
+            // Log the pause
+            let _ = self
+                .app_state
+                .pg_db
+                .append_task_output_ex(
+                    &config.execution_id,
+                    &format!(
+                        "\n=== FIX ESCALATION (Iteration {}) ===\n\
+                         {} consecutive iterations without progress.\n\
+                         Best: {}/{} checks passing. Current: {}/{} checks passing.\n\
+                         Waiting for human review...\n",
+                        ctx.iteration,
+                        ctx.fix_attempts,
+                        ctx.best_passed_checks,
+                        verification_result.total_steps,
+                        verification_result.passed_steps,
+                        verification_result.total_steps,
+                    ),
+                    false,
+                    false,
+                )
+                .await;
+
+            // Wait for the human response (or stop signal)
+            let approval_response = tokio::select! {
+                resp = receiver => {
+                    match resp {
+                        Ok(r) => r,
+                        Err(_) => {
+                            warn!("Fix escalation approval receiver dropped - treating as abort");
+                            super::approval::ApprovalResponse {
+                                approved: false,
+                                action: "abort".to_string(),
+                                comment: Some("Approval channel closed unexpectedly".to_string()),
+                            }
+                        }
+                    }
+                }
+                _ = async {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        if self.is_task_stopped(&config.execution_id) {
+                            return;
+                        }
+                    }
+                } => {
+                    warn!("Task stopped while waiting for fix escalation approval");
+                    registry.cancel_all_for_execution(&config.execution_id).await;
+                    super::approval::ApprovalResponse {
+                        approved: false,
+                        action: "abort".to_string(),
+                        comment: Some("Task was stopped".to_string()),
+                    }
+                }
+            };
+
+            // Record the response to the database
+            let status = if approval_response.approved {
+                "approved"
+            } else {
+                "aborted"
+            };
+            let _ = self
+                .app_state
+                .pg_db
+                .resolve_approval_gate(
+                    &approval_id,
+                    &approval_response.action,
+                    approval_response.comment.as_deref(),
+                    status,
+                )
+                .await;
+
+            // Emit resolved event
+            broadcaster.approval_resolved(
+                &config.execution_id,
+                &approval_id,
+                approval_response.approved,
+                &approval_response.action,
+            );
+
+            if approval_response.approved {
+                info!("Fix escalation: human approved continuation, resetting fix_attempts");
+                ctx.fix_attempts = 0;
+                ctx.last_progress_iteration = ctx.iteration;
+                return LoopState::BuildFailureContext {
+                    verification_result,
+                    convergence_report,
+                };
+            }
+
+            info!("Fix escalation: human declined, completing");
+        }
+
+        // Non-blocking mode or approval declined: record the final iteration result
+        // before completing. (When the human approves, PostAgentic pushes the result
+        // for the same iteration later, so we only push here on the decline/non-blocking path.)
+        let iter_result = IterationResult {
+            iteration: ctx.iteration,
+            verification_passed: false,
+            critical_failure: false,
+            passed_checks: verification_result.passed_steps,
+            failed_checks: verification_result.failed_steps,
+            failure_context: format!(
+                "Fix attempts exhausted ({} consecutive non-improving iterations)",
+                ctx.fix_attempts
+            ),
+            agentic_phase_ran: false,
+            agentic_phase_success: None,
+            blame_json: None,
+            contingent_on: ctx.active_contingencies.clone(),
+        };
+        ctx.iteration_results.push(iter_result);
+
+        LoopState::Complete {
+            reason: CompletionReason::FixAttemptsExhausted {
+                fix_attempts: ctx.fix_attempts,
+            },
         }
     }
 

@@ -394,6 +394,42 @@ impl TriggerService {
                 // No active watcher needed.
                 info!("Registered webhook endpoint for trigger '{}'", trigger.name);
             }
+
+            super::types::TriggerConfig::TicketSync { config } => {
+                let handle = watchers::ticket_watcher::start_ticket_watcher(
+                    self.deps.app_state.pg_db.clone(),
+                    config.clone(),
+                    watcher_stop,
+                );
+
+                let mut handles = self.watcher_handles.write().await;
+                handles.insert(trigger.id.clone(), WatcherHandle::Task(handle));
+                info!(
+                    "Registered ticket sync watcher for trigger '{}' (source: {:?}, target: {})",
+                    trigger.name, config.source, config.target
+                );
+            }
+
+            super::types::TriggerConfig::PrWatch {
+                github_token,
+                poll_interval_seconds,
+                auto_resume_on_ci_failure: _,
+                max_auto_resumes: _,
+            } => {
+                let handle = watchers::pr_watcher::start_pr_watcher(
+                    self.deps.app_state.pg_db.clone(),
+                    github_token.clone(),
+                    *poll_interval_seconds,
+                    watcher_stop,
+                );
+
+                let mut handles = self.watcher_handles.write().await;
+                handles.insert(trigger.id.clone(), WatcherHandle::Task(handle));
+                info!(
+                    "Registered PR watcher for trigger '{}' ({}s interval)",
+                    trigger.name, poll_interval_seconds
+                );
+            }
         }
 
         Ok(())

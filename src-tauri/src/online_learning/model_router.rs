@@ -246,6 +246,12 @@ mod tests {
             domain: domain.to_string(),
             has_ui: false,
             step_type: None,
+            word_count: 0,
+            code_block_count: 0,
+            cross_file_dep_count: 0,
+            has_error_context: false,
+            iteration_number: 0,
+            previous_fix_failed: false,
         }
     }
 
@@ -292,8 +298,9 @@ mod tests {
         let ctx = make_context("simple", "frontend");
 
         // make_context uses prompt_length=1000 (medium) and file_count=5 (moderate)
+        // Signal fields default to 0/false → effort=simple, retry=fresh
         router.set_override(
-            "medium:moderate:simple:frontend:no_ui",
+            "medium:moderate:simple:frontend:no_ui:simple:fresh",
             DEFAULT_COMPLEX_MODEL,
         );
 

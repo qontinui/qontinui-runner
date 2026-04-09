@@ -79,6 +79,8 @@ async fn create_trigger(
         TriggerConfig::GitEvent { .. } => "git_event",
         TriggerConfig::HealthCheck { .. } => "health_check",
         TriggerConfig::Schedule { .. } => "schedule",
+        TriggerConfig::PrWatch { .. } => "pr_watch",
+        TriggerConfig::TicketSync { .. } => "ticket_sync",
     };
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -165,6 +167,8 @@ async fn update_trigger(
             TriggerConfig::GitEvent { .. } => "git_event".to_string(),
             TriggerConfig::HealthCheck { .. } => "health_check".to_string(),
             TriggerConfig::Schedule { .. } => "schedule".to_string(),
+            TriggerConfig::PrWatch { .. } => "pr_watch".to_string(),
+            TriggerConfig::TicketSync { .. } => "ticket_sync".to_string(),
         };
         trigger.trigger_config = config;
     }

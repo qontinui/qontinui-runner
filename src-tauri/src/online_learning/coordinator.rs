@@ -226,6 +226,12 @@ pub fn post_run_online_learning(
             domain: outcome.domain.clone(),
             has_ui: outcome.has_ui,
             step_type: None,
+            word_count: 0,
+            code_block_count: 0,
+            cross_file_dep_count: 0,
+            has_error_context: false,
+            iteration_number: 0,
+            previous_fix_failed: false,
         };
         model_router.update(&context, model, reward);
         result.model_routing_updated = true;

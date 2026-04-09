@@ -678,6 +678,61 @@ const MIGRATIONS: &[Migration] = &[
                 ON ui_bridge_baselines(target_scope);
         "#,
     },
+    Migration {
+        version: 14,
+        description: "Fix v10 regression: drop wrong DEFAULT NOW() on ended_at/completed_at/resolved_at/expires_at columns, and make scheduler_history.success NOT NULL DEFAULT FALSE",
+        sql: r#"
+            -- v10 set DEFAULT NOW() on ALL 72 TIMESTAMPTZ columns, but 13 of
+            -- them (ended_at, completed_at, resolved_at, expires_at, stopped_at,
+            -- reviewed_at, etc.) should NOT have a default — NULL means "event
+            -- hasn't happened yet". DROP DEFAULT restores the correct semantic.
+            -- Also: scheduler_history.success was nullable, but Rust reads it
+            -- as bool (non-nullable). Make it NOT NULL DEFAULT FALSE. The table
+            -- has 0 rows so the ALTER is instant.
+            DO $$
+            DECLARE
+                r record;
+            BEGIN
+                FOR r IN SELECT * FROM (VALUES
+                    ('check_results','completed_at'),
+                    ('comparison_runs','completed_at'),
+                    ('executions','ended_at'),
+                    ('known_issues','last_checked_at'),
+                    ('known_issues','last_detected_at'),
+                    ('known_issues','resolved_at'),
+                    ('mcp_servers','tools_cached_at'),
+                    ('process_sessions','stopped_at'),
+                    ('scheduler_history','ended_at'),
+                    ('shell_command_results','completed_at'),
+                    ('task_run_automation','ended_at'),
+                    ('task_runs','summary_generated_at'),
+                    ('workflow_step_checkpoints','completed_at')
+                ) AS t(tbl, col) LOOP
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = r.tbl
+                          AND column_name = r.col
+                    ) THEN
+                        EXECUTE format('ALTER TABLE %I ALTER COLUMN %I DROP DEFAULT', r.tbl, r.col);
+                    END IF;
+                END LOOP;
+
+                -- Fix nullable success column on scheduler_history
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'scheduler_history'
+                      AND column_name = 'success'
+                      AND is_nullable = 'YES'
+                ) THEN
+                    UPDATE scheduler_history SET success = FALSE WHERE success IS NULL;
+                    ALTER TABLE scheduler_history ALTER COLUMN success SET NOT NULL;
+                    ALTER TABLE scheduler_history ALTER COLUMN success SET DEFAULT FALSE;
+                END IF;
+            END $$;
+        "#,
+    },
 ];
 
 /// Global PgDb instance, set once during app initialization.
@@ -1790,10 +1845,10 @@ impl PgDb {
                 execution_id        TEXT PRIMARY KEY,
                 task_id             TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
                 session_id          TEXT,
-                started_at          TEXT NOT NULL,
-                ended_at            TEXT,
+                started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                ended_at            TIMESTAMPTZ,
                 status              TEXT NOT NULL DEFAULT 'pending',
-                success             BOOLEAN,
+                success             BOOLEAN NOT NULL DEFAULT FALSE,
                 error_message       TEXT,
                 triggered_auto_fix  BOOLEAN NOT NULL DEFAULT FALSE,
                 auto_fix_session_id TEXT

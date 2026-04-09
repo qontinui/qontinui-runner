@@ -83,6 +83,9 @@ pub fn build_config(execution_id: &str, workflow_name: &str, style_index: u32) -
         active_canary: None,
         is_canary_run: false,
         phase_timeout_ms: None,
+        max_fix_attempts: 3,
+        max_ci_auto_resumes: 10,
+        ci_failure_context: None,
     }
 }
 

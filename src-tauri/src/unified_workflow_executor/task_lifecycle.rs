@@ -16,6 +16,30 @@ impl LoopController {
     /// Mark a task as completed, sync to backend, promote workflow, store convergence snapshot,
     /// parse meta-optimizer recommendations, and check chain triggers.
     pub(crate) async fn mark_task_completed(&self, execution_id: &str, workflow_id: Option<&str>) {
+        // Check for blocking incomplete children before completing
+        match self
+            .app_state
+            .pg_db
+            .has_blocking_incomplete_children(execution_id)
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    "Task {} has blocking incomplete children, deferring completion",
+                    execution_id
+                );
+                // Don't complete yet -- the child completion handler will advance the parent
+                return;
+            }
+            Ok(false) => {} // No blocking children, proceed with completion
+            Err(e) => {
+                warn!(
+                    "Failed to check blocking children for task {}: {}, proceeding with completion",
+                    execution_id, e
+                );
+            }
+        }
+
         // Release advisory file registry entries on completion
         self.app_state
             .file_registry_manager
@@ -204,6 +228,65 @@ impl LoopController {
                     .await;
                 });
             }
+
+            // ── Parent advancement: if this was a blocking child, check if parent can complete ──
+            {
+                let pg = self.app_state.pg_db.clone();
+                let eid = execution_id.to_string();
+                let app_handle = self.app_handle.clone();
+                tokio::spawn(async move {
+                    match pg.get_blocking_parent_info(&eid).await {
+                        Ok(Some((parent_id, true))) => {
+                            // This was a blocking child — check if parent can now complete
+                            match pg.has_blocking_incomplete_children(&parent_id).await {
+                                Ok(false) => {
+                                    info!(
+                                        "All blocking children of {} completed, advancing parent to complete",
+                                        parent_id
+                                    );
+                                    if let Err(e) = pg.complete_task_run(&parent_id).await {
+                                        warn!("Failed to complete parent task {}: {}", parent_id, e);
+                                    } else {
+                                        // Emit task-run-update event for the parent
+                                        let broadcaster = EventBroadcaster::new(app_handle);
+                                        broadcaster.task_run_update(&parent_id, "completed", None, None);
+                                    }
+                                }
+                                Ok(true) => {
+                                    tracing::debug!(
+                                        "Parent {} still has other blocking children, not advancing",
+                                        parent_id
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to check blocking children for parent {}: {}", parent_id, e);
+                                }
+                            }
+                        }
+                        Ok(Some((_, false))) | Ok(None) => {
+                            // Not a blocking child, nothing to do
+                        }
+                        Err(e) => {
+                            warn!("Failed to get blocking parent info for {}: {}", eid, e);
+                        }
+                    }
+                });
+            }
+
+            // ── Ticket system bidirectional sync (Phase 5B) ──
+            {
+                let pg_clone = self.app_state.pg_db.clone();
+                let task_id = execution_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::ticket_system::service::on_task_completed(
+                        &pg_clone, &task_id, true,
+                    )
+                    .await
+                    {
+                        tracing::debug!("Ticket sync on-completion hook failed: {}", e);
+                    }
+                });
+            }
         }
     }
 
@@ -283,6 +366,21 @@ impl LoopController {
                         &ol_task_run_id,
                     )
                     .await;
+                });
+            }
+
+            // ── Ticket system bidirectional sync (Phase 5B) ──
+            {
+                let pg_clone = self.app_state.pg_db.clone();
+                let task_id = execution_id.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::ticket_system::service::on_task_completed(
+                        &pg_clone, &task_id, false,
+                    )
+                    .await
+                    {
+                        tracing::debug!("Ticket sync on-failure hook failed: {}", e);
+                    }
                 });
             }
         }
