@@ -19,7 +19,7 @@ pub async fn get_monitors(
 ) -> Result<Json<ApiResponse<MonitorsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_handle = state.app_handle.clone();
 
-    let window = app_handle.get_webview_window("main").ok_or_else(|| {
+    let window = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label()).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(api_error("Failed to get main window")),

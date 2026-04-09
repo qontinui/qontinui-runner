@@ -1287,46 +1287,72 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .setup(|app| {
             info!("Tauri application setup starting");
 
-            // Secondary instances (spawned via the supervisor's `spawn-test`)
-            // need their own isolated WebView2 user-data folder so they don't
-            // collide with the primary's locked profile, AND need to be
-            // forced on-screen / unminimized regardless of any window-state
-            // restoration that may have leaked through. The supervisor sets
-            // WEBVIEW2_USER_DATA_FOLDER per spawned runner, but Tauri / wry
-            // does not honor that env var implicitly — we must apply it via
-            // WebviewWindowBuilder::data_directory(). For now we use the
-            // simpler post-create defensive path: rebuild the main window if
-            // an isolated profile is requested.
+            // Secondary instances (test runners) need an isolated WebView2
+            // profile or they collide with the primary's locked EBWebView
+            // folder. The declarative window in tauri.conf.json always uses
+            // the default profile, so for secondaries we:
+            //   1. Create a new window ("main") with data_directory() set
+            //      to the supervisor-provided WEBVIEW2_USER_DATA_FOLDER.
+            //   2. Close the broken declarative window.
             //
-            // The defensive show / unminimize / set_position is unconditional
-            // for secondaries — multi-monitor users can have stale geometry
-            // pointing at a disconnected monitor, and WebView2 throttles JS
-            // execution for windows with zero monitor intersection, which
-            // looks identical to "Frontend never became ready".
+            // We also force the new window on-screen and skip the
+            // window-state plugin (done above) to prevent multi-monitor
+            // geometry issues.
             if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {
-                use tauri::{LogicalPosition, LogicalSize, Manager};
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.unminimize();
-                    let _ = win.set_position(LogicalPosition::new(100.0, 100.0));
-                    let _ = win.set_size(LogicalSize::new(1400.0, 900.0));
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                    info!("Secondary instance: forced main window on-screen at (100,100) 1400x900");
-                }
-                if let Ok(dir) = std::env::var("WEBVIEW2_USER_DATA_FOLDER") {
-                    // Ensure the directory exists so WebView2 can populate it
-                    // on first navigation. Tauri's existing CoreWebView2
-                    // initialization will use the env var on Windows when
-                    // it's set before the first navigation, but we have
-                    // already created the window — log this so we know
-                    // whether the env var actually took effect during
-                    // startup ordering and whether a follow-up patch needs
-                    // to move data_directory() into the builder phase.
+                use tauri::Manager;
+
+                if let Some(dir) = std::env::var("WEBVIEW2_USER_DATA_FOLDER").ok() {
                     let _ = std::fs::create_dir_all(&dir);
                     info!(
-                        "Secondary instance: WEBVIEW2_USER_DATA_FOLDER={} (ensured exists)",
+                        "Secondary instance: creating isolated window (WEBVIEW2_USER_DATA_FOLDER={})",
                         dir
                     );
+
+                    // Create the isolated window FIRST (with a temporary label)
+                    // so the app doesn't exit when we close the declarative one.
+                    let url = tauri::WebviewUrl::App("index.html".into());
+                    match tauri::WebviewWindowBuilder::new(app, "main-isolated", url)
+                        .title("Qontinui Runner")
+                        .inner_size(1400.0, 900.0)
+                        .min_inner_size(1200.0, 700.0)
+                        .position(100.0, 100.0)
+                        .data_directory(std::path::PathBuf::from(&dir))
+                        .build()
+                    {
+                        Ok(win) => {
+                            // Close the declarative window (it has the wrong profile).
+                            if let Some(old) = app.get_webview_window("main") {
+                                let _ = old.destroy();
+                            }
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                            // Tell all callsites to use this label.
+                            qontinui_runner_lib::set_main_window_label("main-isolated");
+                            info!("Secondary instance: isolated window ready (label=main-isolated)");
+                        }
+                        Err(e) => {
+                            error!(
+                                "Secondary instance: failed to create isolated window: {} — falling back to declarative",
+                                e
+                            );
+                            // Leave the declarative window as-is.
+                            if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.unminimize();
+                                let _ = win.set_position(tauri::LogicalPosition::new(100.0, 100.0));
+                                let _ = win.show();
+                            }
+                        }
+                    }
+                } else {
+                    // No custom profile dir — just force on-screen.
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.unminimize();
+                        let _ = win.set_position(tauri::LogicalPosition::new(100.0, 100.0));
+                        let _ = win.set_size(tauri::LogicalSize::new(1400.0, 900.0));
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                        info!("Secondary instance: forced main window on-screen (no isolated profile)");
+                    }
                 }
             }
 

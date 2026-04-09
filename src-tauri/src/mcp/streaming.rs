@@ -378,7 +378,7 @@ pub async fn post_focus(
         "runner" => {
             // Get the runner's window handle to tell Sunshine what to capture
             use tauri::Manager;
-            let window = state.app_handle.get_webview_window("main");
+            let window = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
             match window {
                 Some(win) => {
                     let title = win

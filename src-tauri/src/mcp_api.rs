@@ -790,7 +790,7 @@ pub async fn start_server(
                         Some(name) => format!("Qontinui Runner — {} [:{}]", name, try_port),
                         None => format!("Qontinui Runner [:{}]", try_port),
                     };
-                    if let Some(window) = emitter.get_webview_window("main") {
+                    if let Some(window) = emitter.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
                         if let Err(e) = window.set_title(&title) {
                             warn!("Failed to set window title: {}", e);
                         } else {

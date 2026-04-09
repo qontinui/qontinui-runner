@@ -2240,7 +2240,7 @@ pub async fn ui_bridge_page_hard_refresh_handler(
     use tauri::Manager;
     info!("UI Bridge API: Hard refresh (cache bypass)");
 
-    if let Some(window) = state.app_handle.get_webview_window("main") {
+    if let Some(window) = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
         // Use fetch cache-busting + location replacement to bypass browser cache.
         // This is safer than deleting the EBWebView Cache directory.
         let js = r#"
@@ -2486,7 +2486,7 @@ async fn direct_webview_evaluate_with_result(
 
     let window = state
         .app_handle
-        .get_webview_window("main")
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
         .ok_or_else(|| "WebView window 'main' not found".to_string())?;
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -2587,7 +2587,7 @@ async fn direct_webview_evaluate(
     use tauri::Manager;
 
     let window = app_handle
-        .get_webview_window("main")
+        .get_webview_window(qontinui_runner_lib::get_main_window_label())
         .ok_or_else(|| "WebView window 'main' not found".to_string())?;
 
     // Wrap in try/catch with timeout guard to prevent crashes
@@ -3650,52 +3650,63 @@ fn capture_runner_window(
         window_title: Some(title.to_string()),
         window_app_name: Some("Qontinui Runner".to_string()),
         window_id: None,
+        element_index_text: None,
     })
+}
+
+/// Capture the runner's own window as a base64 PNG string.
+///
+/// This is a convenience wrapper used by the snapshot and health fallback paths.
+/// Returns `Some((base64_png, width, height))` on success, `None` on failure.
+/// Does not require the UI Bridge SDK — uses native xcap capture.
+pub async fn capture_runner_window_base64(
+    state: &Arc<ApiState>,
+) -> Option<(String, i32, i32)> {
+    use tauri::Manager;
+
+    let window = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label())?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let pos = window.inner_position().unwrap_or_default();
+    let size = window.inner_size().unwrap_or_default();
+    let x = pos.x;
+    let y = pos.y;
+    let w = size.width;
+    let h = size.height;
+    let title = window
+        .title()
+        .unwrap_or_else(|_| "Qontinui Runner".to_string());
+
+    match tokio::task::spawn_blocking(move || capture_runner_window(x, y, w, h, scale, &title))
+        .await
+    {
+        Ok(Ok(data)) => Some((data.screenshot, data.width, data.height)),
+        Ok(Err(e)) => {
+            warn!("Native capture fallback failed: {}", e);
+            None
+        }
+        Err(e) => {
+            warn!("Native capture task join error: {}", e);
+            None
+        }
+    }
 }
 
 /// Capture a full monitor screenshot.
 fn capture_monitor_screenshot(
     monitor_index: Option<i32>,
 ) -> Result<AnnotatedScreenshotData, String> {
-    use xcap::Monitor;
-
-    let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {}", e))?;
-    if monitors.is_empty() {
-        return Err("No monitors found".to_string());
-    }
-
-    let monitor = if let Some(idx) = monitor_index {
+    if let Some(idx) = monitor_index {
         if idx < 0 {
             return Err(format!("Monitor index must be non-negative, got {}", idx));
         }
-        monitors
-            .into_iter()
-            .nth(idx as usize)
-            .ok_or_else(|| format!("Monitor index {} out of range", idx))?
-    } else {
-        monitors.into_iter().next().unwrap()
-    };
+    }
 
-    let scale = monitor.scale_factor().unwrap_or(1.0) as f64;
-    let image = monitor
-        .capture_image()
-        .map_err(|e| format!("Failed to capture monitor: {}", e))?;
-
-    let width = image.width() as i32;
-    let height = image.height() as i32;
-    let dynamic = image::DynamicImage::ImageRgba8(image);
-    let b64 = encode_image_to_base64(&dynamic)?;
-
-    Ok(AnnotatedScreenshotData {
-        screenshot: b64,
-        width,
-        height,
-        scale_factor: Some(scale),
-        monitor: monitor_index,
-        window_title: None,
-        window_app_name: None,
-        window_id: None,
-    })
+    let mgr = screen::MonitorManager::detect()?;
+    let idx = monitor_index.map(|i| i as usize).unwrap_or_else(|| mgr.primary_index());
+    let captured = screen::CapturedScreenshot::from_monitor(&mgr, idx)?;
+    let mut data = AnnotatedScreenshotData::from_captured(&captured)?;
+    data.monitor = monitor_index;
+    Ok(data)
 }
 
 /// GET /ui-bridge/control/annotated-screenshot — Screenshot with metadata
@@ -3731,7 +3742,7 @@ pub async fn ui_bridge_annotated_screenshot_handler(
         // so we capture the monitor and crop to the window bounds.
         if query.runner.unwrap_or(false) {
             use tauri::Manager;
-            let window = state.app_handle.get_webview_window("main");
+            let window = state.app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
             if let Some(win) = window {
                 let scale = win.scale_factor().unwrap_or(1.0);
                 // Use inner_position/inner_size for the content area (viewport).
@@ -4878,7 +4889,7 @@ fn capture_for_diagnosis(app_handle: &tauri::AppHandle) -> Result<DiagnosisCaptu
     use tauri::Manager;
 
     // Try runner window first
-    if let Some(win) = app_handle.get_webview_window("main") {
+    if let Some(win) = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
         let scale = win.scale_factor().unwrap_or(1.0);
         let pos = win.outer_position().unwrap_or_default();
         let size = win.outer_size().unwrap_or_default();

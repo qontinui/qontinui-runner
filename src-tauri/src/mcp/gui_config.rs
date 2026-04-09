@@ -72,7 +72,7 @@ fn detect_window_geometry(
     override_scale: Option<f64>,
 ) -> (i32, i32, f64) {
     use tauri::Manager;
-    let window = app_handle.get_webview_window("main");
+    let window = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label());
     if let Some(win) = window {
         let detected_scale = win.scale_factor().unwrap_or(1.0);
         let pos = win.inner_position().unwrap_or_default();
@@ -101,7 +101,7 @@ fn detect_window_geometry(
 /// be captured instead of the runner's UI.
 fn focus_runner_window(app_handle: &tauri::AppHandle) {
     use tauri::Manager;
-    if let Some(win) = app_handle.get_webview_window("main") {
+    if let Some(win) = app_handle.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
         if let Err(e) = win.set_focus() {
             error!("GUI Config: Failed to focus runner window: {}", e);
         } else {
