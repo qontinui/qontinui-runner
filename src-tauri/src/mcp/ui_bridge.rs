@@ -552,6 +552,64 @@ impl UiBridgeCircuitBreaker {
     }
 }
 
+/// Gather structured readiness diagnostics when the frontend readiness gate
+/// times out. Returns a JSON object with all available diagnostic fields so
+/// agents can diagnose why the WebView never became ready.
+async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Value {
+    let last_pong = state
+        .ui_bridge_last_pong
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let console_error_count = state
+        .ui_bridge_console_error_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
+    let cb_failures = state.ui_bridge_circuit_breaker.get_failure_count().await;
+    let pending_count = state
+        .ui_bridge_pending_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let available_permits = state.ui_bridge_semaphore.available_permits();
+    let process_uptime_ms = state.started_at.elapsed().as_millis() as u64;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let last_pong_age_ms = if last_pong > 0 {
+        now_ms.saturating_sub(last_pong)
+    } else {
+        0
+    };
+
+    // Build a human-readable hint based on the diagnostic state
+    let hint = if last_pong == 0 && process_uptime_ms < 3000 {
+        "Process just started (<3s uptime). Frontend may still be loading — consider retrying."
+    } else if last_pong == 0 && console_error_count > 0 {
+        "Frontend never sent initial pong and console errors were recorded. Check the runner devtools console — frontend likely crashed during mount."
+    } else if last_pong == 0 {
+        "Frontend never sent initial pong. Check if the WebView loaded successfully."
+    } else if last_pong_age_ms > 30000 {
+        "Frontend was responsive but stopped responding over 30s ago. It may have crashed or frozen."
+    } else {
+        "Frontend was responsive recently but the readiness gate was not notified. Possible race condition."
+    };
+
+    serde_json::json!({
+        "error": "UI Bridge frontend did not become ready within 10000ms",
+        "diagnostics": {
+            "lastPongMs": last_pong,
+            "lastPongAgeMs": last_pong_age_ms,
+            "consoleErrorCount": console_error_count,
+            "circuitBreakerState": format!("{:?}", cb_state),
+            "circuitBreakerFailures": cb_failures,
+            "processUptimeMs": process_uptime_ms,
+            "pendingRequestCount": pending_count,
+            "semaphoreAvailablePermits": available_permits,
+            "hint": hint
+        }
+    })
+}
+
 /// Send a UI Bridge request and wait for the response synchronously.
 ///
 /// This creates a oneshot channel, stores the sender in the pending map,
@@ -581,10 +639,11 @@ pub async fn ui_bridge_request_sync(
                 .await
                 .is_err()
             {
-                return Err(
-                    "UI Bridge: Frontend did not become ready within 10s. Is the WebView running?"
-                        .to_string(),
-                );
+                // Gather structured diagnostics instead of returning a bare string
+                let diag = gather_readiness_diagnostics(state).await;
+                return Err(serde_json::to_string(&diag).unwrap_or_else(|_| {
+                    "UI Bridge: Frontend did not become ready within 10s (diagnostics serialization failed)".to_string()
+                }));
             }
             tracing::info!("UI Bridge: Frontend is now ready");
         }
@@ -917,6 +976,53 @@ pub async fn ui_bridge_get_element_handler(
         )
         .await,
     )
+}
+
+/// Declarative element assertion — check multiple predicates against a registered element.
+///
+/// POST /ui-bridge/control/element/{id}/assert
+/// Body: `{ "visible": true, "enabled": true, "text": "Save", ... }`
+/// Returns: `{ "passed": bool, "checked": N, "passedCount": M, "failures": [...] }`
+pub async fn ui_bridge_assert_element_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(spec): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Assert element {}", id);
+
+    let payload = serde_json::json!({
+        "elementId": id,
+        "spec": spec
+    });
+
+    match ui_bridge_request_sync(&state, "assert_element", payload).await {
+        Ok(data) => {
+            // Check for ELEMENT_NOT_FOUND from the frontend
+            if data.get("error").and_then(|v| v.as_str()) == Some("ELEMENT_NOT_FOUND") {
+                let msg = data
+                    .get("errorMessage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Element not found")
+                    .to_string();
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error_detailed(
+                        msg,
+                        UiBridgeError::element_not_found(&id),
+                    )),
+                ));
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
+        Err(e) => {
+            error!("UI Bridge API: Assert element failed: {}", e);
+            let detail = classify_transport_error(&e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error_detailed(e, detail)),
+            ))
+        }
+    }
 }
 
 /// Execute an action on an element.
@@ -1635,6 +1741,127 @@ pub async fn ui_bridge_get_snapshot_handler(
                 }
             }
         }
+    }
+}
+
+/// Navigate-and-wait: execute an action, wait for the DOM to stabilize, then
+/// return a fresh snapshot.  Replaces the common 4-step manual test pattern:
+///   click → sleep → discover → snapshot
+///
+/// Request body: `{ elementId, action, params?, waitForStableMs?, timeoutMs? }`
+/// Response: the post-navigation snapshot (same shape as GET /control/snapshot).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigateAndWaitRequest {
+    pub element_id: String,
+    #[serde(default = "default_nav_action")]
+    pub action: String,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+    /// How long (ms) the element count must be stable before we consider the
+    /// page settled.  Default: 800ms.
+    #[serde(default = "default_stable_ms")]
+    pub wait_for_stable_ms: u64,
+    /// Overall timeout (ms) for the entire operation.  Default: 8000ms.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+fn default_nav_action() -> String { "click".into() }
+fn default_stable_ms() -> u64 { 800 }
+fn default_timeout_ms() -> u64 { 8000 }
+
+pub async fn ui_bridge_navigate_and_wait_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<NavigateAndWaitRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use tokio::time::{sleep, Instant};
+
+    info!(
+        "UI Bridge API: navigate-and-wait — {} on {}",
+        req.action, req.element_id
+    );
+
+    let deadline = Instant::now() + std::time::Duration::from_millis(req.timeout_ms);
+    let stable_dur = std::time::Duration::from_millis(req.wait_for_stable_ms);
+
+    // 1. Execute the action
+    let action_payload = serde_json::json!({
+        "elementId": req.element_id,
+        "action": {
+            "action": req.action,
+            "params": req.params.unwrap_or(serde_json::json!({})),
+        }
+    });
+    if let Err(e) = ui_bridge_request_sync(&state, "execute_action", action_payload).await {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+    }
+
+    // 2. Brief initial delay for route transition / React render to start
+    sleep(std::time::Duration::from_millis(200)).await;
+
+    // 3. Poll for DOM stability: discover repeatedly, wait until element count
+    //    is unchanged for `waitForStableMs`.
+    let mut last_count: Option<usize> = None;
+    let mut stable_since = Instant::now();
+    let mut timed_out = false;
+
+    loop {
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+
+        let count = match ui_bridge_request_sync(
+            &state,
+            "discover",
+            serde_json::json!({"interactive_only": false}),
+        )
+        .await
+        {
+            Ok(data) => data
+                .get("elements")
+                .and_then(|e| e.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        match last_count {
+            Some(prev) if prev == count => {
+                if stable_since.elapsed() >= stable_dur {
+                    break; // DOM is stable
+                }
+            }
+            _ => {
+                // Count changed — reset stability timer
+                last_count = Some(count);
+                stable_since = Instant::now();
+            }
+        }
+
+        sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // 4. Return fresh snapshot
+    let snapshot = ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await;
+
+    match snapshot {
+        Ok(mut data) => {
+            if timed_out {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert(
+                        "navigateAndWait".to_string(),
+                        serde_json::json!({
+                            "timedOut": true,
+                            "timeoutMs": req.timeout_ms,
+                            "lastElementCount": last_count,
+                        }),
+                    );
+                }
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -7101,6 +7328,29 @@ pub async fn ui_bridge_diagnostics_handler(
     let pending_count = state
         .ui_bridge_pending_count
         .load(std::sync::atomic::Ordering::Relaxed);
+    let console_error_count = state
+        .ui_bridge_console_error_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let process_uptime_ms = state.started_at.elapsed().as_millis() as u64;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let last_pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
+
+    let ready = last_pong > 0;
+    let readiness_hint = if !ready && process_uptime_ms < 3000 {
+        "Process just started — frontend may still be loading"
+    } else if !ready && console_error_count > 0 {
+        "Frontend never sent pong and console errors recorded — likely crashed during mount"
+    } else if !ready {
+        "Frontend never sent initial pong — WebView may not have loaded"
+    } else if last_pong_age_ms > 30000 {
+        "Frontend stopped responding over 30s ago — may have crashed or frozen"
+    } else {
+        "Frontend is responsive"
+    };
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "circuitBreaker": {
@@ -7113,16 +7363,44 @@ pub async fn ui_bridge_diagnostics_handler(
         },
         "frontend": {
             "lastPongTimestamp": last_pong,
-            "lastPongAgeMs": if last_pong > 0 {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                now - last_pong
-            } else { 0 }
+            "lastPongAgeMs": last_pong_age_ms,
+            "ready": ready,
+            "consoleErrorCount": console_error_count
         },
-        "pendingRequestCount": pending_count
+        "pendingRequestCount": pending_count,
+        "processUptimeMs": process_uptime_ms,
+        "readiness": {
+            "ready": ready,
+            "hint": readiness_hint
+        }
     }))))
+}
+
+/// Proactive readiness check endpoint.
+/// Agents can call this before issuing real requests to check if the frontend is ready.
+pub async fn ui_bridge_readiness_handler(
+    State(state): State<Arc<ApiState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let diag = gather_readiness_diagnostics(&state).await;
+    let last_pong = state
+        .ui_bridge_last_pong
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    if last_pong > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let age_ms = now_ms.saturating_sub(last_pong);
+        (StatusCode::OK, Json(serde_json::json!({
+            "ready": true,
+            "lastPongMs": last_pong,
+            "lastPongAgeMs": age_ms,
+            "processUptimeMs": state.started_at.elapsed().as_millis() as u64
+        })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(diag))
+    }
 }
 
 /// Handle UI Bridge pong from frontend.
@@ -8723,6 +9001,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             get(ui_bridge_get_element_handler),
         )
         .route(
+            "/ui-bridge/control/element/{id}/assert",
+            post(ui_bridge_assert_element_handler),
+        )
+        .route(
             "/ui-bridge/control/element/{id}/action",
             post(ui_bridge_execute_action_handler),
         )
@@ -8817,6 +9099,11 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         )
         .route("/ui-bridge/control/undo", post(ui_bridge_undo_handler))
         .route("/ui-bridge/control/redo", post(ui_bridge_redo_handler))
+        // Navigate-and-wait composite: click + wait for stable DOM + snapshot
+        .route(
+            "/ui-bridge/control/navigate-and-wait",
+            post(ui_bridge_navigate_and_wait_handler),
+        )
         // Form state awareness
         .route("/ui-bridge/control/forms", get(ui_bridge_get_forms_handler))
         .route("/ui-bridge/control/fill", post(ui_bridge_fill_form_handler))
@@ -9126,6 +9413,10 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/ui-bridge/batch", post(ui_bridge_batch_handler))
         // Diagnostics & health
         .route("/ui-bridge/diagnostics", get(ui_bridge_diagnostics_handler))
+        .route(
+            "/ui-bridge/diagnostics/readiness",
+            get(ui_bridge_readiness_handler),
+        )
         .route(
             "/ui-bridge/circuit-breaker/reset",
             post(ui_bridge_circuit_breaker_reset_handler),
