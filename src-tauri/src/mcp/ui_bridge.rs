@@ -6744,44 +6744,31 @@ pub async fn ui_bridge_element_screenshot_handler(
         }
     };
 
+    // Use the dedicated capture_single_element IPC type which has
+    // multiple DOM lookup fallbacks (registry → getElementById →
+    // data-ui-bridge-id → title → aria-label). The old batch path
+    // (capture_element_images) only looked in the bridge registry
+    // and returned 0 captures for elements that weren't persistently
+    // registered.
     let payload = serde_json::json!({
-        "params": { "element_ids": [id.clone()] }
+        "params": { "elementId": id.clone() }
     });
 
-    match ui_bridge_request_sync(&state, "capture_element_images", payload).await {
-        Ok(data) => {
-            // The batch endpoint returns
-            //   { captures: { "<id>": { base64_png, width, height } },
-            //     element_count, requested_count, device_pixel_ratio }
-            // Reshape into a single-element response.
-            let dpr = data
-                .get("device_pixel_ratio")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(1.0);
-            let captures = data.get("captures").and_then(|c| c.as_object());
-            let entry = captures.and_then(|c| c.get(&id));
-            match entry {
-                Some(image) => {
-                    let mut out = image.clone();
-                    if let Some(obj) = out.as_object_mut() {
-                        obj.insert("id".to_string(), serde_json::Value::String(id));
-                        obj.insert(
-                            "device_pixel_ratio".to_string(),
-                            serde_json::json!(dpr),
-                        );
-                    }
-                    Ok(Json(ApiResponse::success(out)))
-                }
-                None => Err((
+    match ui_bridge_request_sync(&state, "capture_single_element", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            if e.to_lowercase().contains("not found") {
+                Err((
                     StatusCode::NOT_FOUND,
                     Json(api_error(format!(
                         "element '{}' not found or not capturable",
                         id
                     ))),
-                )),
+                ))
+            } else {
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
             }
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 

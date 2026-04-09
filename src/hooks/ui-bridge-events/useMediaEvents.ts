@@ -243,6 +243,129 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
           return true;
         }
 
+        case "capture_single_element": {
+          // Capture a single element by ID directly from the DOM.
+          // Unlike capture_element_images (which goes through the bridge
+          // registry and fails when elements aren't persistently
+          // registered), this uses querySelector fallbacks to find the
+          // actual DOM node, then renders it via html2canvas.
+          const singleParams = (payload.params ?? payload.body ?? {}) as {
+            elementId?: string;
+          };
+          const elementId = singleParams.elementId;
+          if (!elementId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "capture_single_element requires 'elementId'",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          // Try multiple strategies to find the DOM element
+          let domElement: Element | null = null;
+
+          // 1. Bridge registry (if element happens to be registered)
+          const registered = currentBridge?.getElement(elementId);
+          if (registered?.element) {
+            domElement = registered.element;
+          }
+
+          // 2. Direct DOM ID match
+          if (!domElement) {
+            domElement = document.getElementById(elementId);
+          }
+
+          // 3. data-ui-bridge-id attribute (the SDK sets this during discover)
+          if (!domElement) {
+            domElement = document.querySelector(`[data-ui-bridge-id="${elementId}"]`);
+          }
+
+          // 4. title attribute match (how the test report found buttons)
+          if (!domElement) {
+            // e.g. elementId="button-screenshot-view" might map to title="Screenshot view"
+            const titleGuess = elementId
+              .replace(/^button-/, "")
+              .replace(/-/g, " ")
+              .replace(/\b\w/g, (c) => c.toUpperCase());
+            domElement = document.querySelector(`button[title="${titleGuess}"]`);
+          }
+
+          // 5. aria-label match
+          if (!domElement) {
+            const labelGuess = elementId
+              .replace(/^button-/, "")
+              .replace(/-/g, " ");
+            domElement = document.querySelector(`[aria-label="${labelGuess}" i]`);
+          }
+
+          if (!domElement) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: `Element '${elementId}' not found via any lookup strategy`,
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          try {
+            const { default: html2canvas } = await import("html2canvas");
+
+            // Resolve effective background color
+            let bgColor: string | null = null;
+            let node: Element | null = domElement;
+            while (node) {
+              const bg = getComputedStyle(node).backgroundColor;
+              if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent") {
+                bgColor = bg;
+                break;
+              }
+              node = node.parentElement;
+            }
+
+            const canvas = await html2canvas(domElement as HTMLElement, {
+              backgroundColor: bgColor || "#0a0a0b",
+              scale: 1,
+              logging: false,
+              useCORS: true,
+              x: 0,
+              y: 0,
+              width: (domElement as HTMLElement).scrollWidth,
+              height: (domElement as HTMLElement).scrollHeight,
+            });
+
+            const dataUrl = canvas.toDataURL("image/png");
+            const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
+
+            await sendResponse({
+              requestId,
+              type,
+              success: true,
+              data: {
+                id: elementId,
+                base64_png: base64,
+                width: canvas.width,
+                height: canvas.height,
+                device_pixel_ratio: window.devicePixelRatio || 1,
+              },
+              timestamp: Date.now(),
+            });
+          } catch (e) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: e instanceof Error ? e.message : String(e),
+              timestamp: Date.now(),
+            });
+          }
+          return true;
+        }
+
         case "image_diff": {
           // Pixel-accurate visual regression diff between two arbitrary
           // base64 PNGs (NOT a DOM media-element diff like media_compare).
@@ -275,11 +398,15 @@ export function useMediaEvents(context: Pick<UIBridgeEventContext, "bridgeRef" |
             return true;
           }
 
-          // compareVisualRegression accepts MediaSnapshotData. We only need
-          // the `data` field; the rest is metadata for callers that already
-          // have a captured snapshot.
+          // compareVisualRegression calls loadBase64Image() which ALWAYS
+          // prepends "data:image/png;base64," to the .data field. So we
+          // must strip any existing data-URL prefix to avoid double-
+          // prefixing ("data:...data:...") which produces a 0x0 image.
+          const stripDataUrl = (s: string) =>
+            s.replace(/^data:image\/[^;]+;base64,/, "");
+
           const wrap = (data: string) => ({
-            data: data.startsWith("data:") ? data : `data:image/png;base64,${data}`,
+            data: stripDataUrl(data),
             width: 0,
             height: 0,
             mediaType: "image/png" as const,

@@ -168,6 +168,8 @@ export type UIBridgeRequestType =
   | "media_compare"
   // Pixel-accurate visual regression diff
   | "image_diff"
+  // Single-element screenshot with DOM fallback strategies
+  | "capture_single_element"
   // Annotations import
   | "annotations_import"
   // Intents NL
