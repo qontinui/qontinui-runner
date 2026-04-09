@@ -316,9 +316,9 @@ impl PgDb {
         let findings: Vec<serde_json::Value> = conn
             .query(
                 r#"
-                SELECT id, finding_type, title, description, severity, created_at::TEXT
+                SELECT id, category, title, description, severity, detected_at::TEXT
                 FROM task_run_findings WHERE task_run_id = $1
-                ORDER BY created_at DESC LIMIT 20
+                ORDER BY detected_at DESC LIMIT 20
                 "#,
                 &[&task_run_id],
             )
@@ -327,12 +327,12 @@ impl PgDb {
             .iter()
             .map(|row| {
                 json!({
-                    "id": row.get::<_, i64>(0),
-                    "finding_type": row.get::<_, String>(1),
+                    "id": row.get::<_, String>(0),
+                    "category": row.get::<_, String>(1),
                     "title": row.get::<_, String>(2),
                     "description": row.get::<_, Option<String>>(3),
                     "severity": row.get::<_, String>(4),
-                    "created_at": row.get::<_, String>(5),
+                    "detected_at": row.get::<_, String>(5),
                 })
             })
             .collect();
@@ -1722,28 +1722,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool: {}", e))?;
-        let rows = conn
-            .query(
-                r#"SELECT transition_id, total_attempts, failure_count,
-                      failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT as failure_rate,
-                      avg_duration_ms
-               FROM transition_reliability WHERE config_id = $1 ORDER BY total_attempts DESC"#,
-                &[&config_id],
-            )
-            .await
-            .unwrap_or_default();
-        Ok(rows
-            .iter()
-            .map(|r| {
-                json!({
-                    "transition_id": r.get::<_, String>(0),
-                    "total_attempts": r.get::<_, i64>(1),
-                    "failure_count": r.get::<_, i64>(2),
-                    "failure_rate": r.get::<_, Option<f64>>(3),
-                    "avg_duration_ms": r.get::<_, Option<f64>>(4),
-                })
-            })
-            .collect())
+        // transition_reliability table does not exist in the schema — return empty
+        tracing::debug!(config_id, "get_transition_metrics: transition_reliability table not in schema");
+        let _ = conn; // suppress unused warning
+        Ok(vec![])
     }
 
     /// Get element resolution metrics.
@@ -1756,25 +1738,10 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool: {}", e))?;
-        let rows = conn
-            .query(
-                r#"SELECT element_id, total_attempts, failure_count, avg_resolution_ms
-               FROM element_resolution_metrics WHERE config_id = $1 ORDER BY total_attempts DESC"#,
-                &[&config_id],
-            )
-            .await
-            .unwrap_or_default();
-        Ok(rows
-            .iter()
-            .map(|r| {
-                json!({
-                    "element_id": r.get::<_, String>(0),
-                    "total_attempts": r.get::<_, i64>(1),
-                    "failure_count": r.get::<_, i64>(2),
-                    "avg_resolution_ms": r.get::<_, Option<f64>>(3),
-                })
-            })
-            .collect())
+        // element_resolution_metrics table does not exist in the schema — return empty
+        tracing::debug!(config_id, "get_element_metrics: element_resolution_metrics table not in schema");
+        let _ = conn; // suppress unused warning
+        Ok(vec![])
     }
 
     /// Get success rate trend.

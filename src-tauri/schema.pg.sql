@@ -1807,6 +1807,23 @@ CREATE TABLE IF NOT EXISTS canvas_panels (
 );
 CREATE INDEX IF NOT EXISTS idx_canvas_panels_task_run_id ON canvas_panels(task_run_id);
 
+-- Runner Instances (multi-instance coordination)
+CREATE TABLE IF NOT EXISTS runner_instances (
+    id             TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    port           INTEGER NOT NULL UNIQUE,
+    hostname       TEXT NOT NULL DEFAULT 'localhost',
+    is_primary     BOOLEAN NOT NULL DEFAULT FALSE,
+    pid            INTEGER,
+    status         TEXT NOT NULL DEFAULT 'starting',
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    running_tasks  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ri_port ON runner_instances(port);
+CREATE INDEX IF NOT EXISTS idx_ri_status ON runner_instances(status);
+CREATE INDEX IF NOT EXISTS idx_ri_heartbeat ON runner_instances(last_heartbeat);
+
 -- Process Sessions (managed process lifecycle tracking)
 CREATE TABLE IF NOT EXISTS process_sessions (
     id TEXT PRIMARY KEY,

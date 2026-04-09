@@ -876,7 +876,7 @@ impl PgDb {
                 app_name        TEXT,
                 window_title    TEXT,
                 url             TEXT,
-                task_run_id     TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+                task_run_id     TEXT,  -- soft FK; canonical FK in schema.pg.sql
                 screenshot_path TEXT,
                 element_count   INTEGER,
                 confidence      DOUBLE PRECISION,
@@ -1034,7 +1034,7 @@ impl PgDb {
                 id              BIGSERIAL PRIMARY KEY,
                 log_source_id   BIGINT,
                 log_source_name TEXT NOT NULL,
-                task_run_id     TEXT REFERENCES task_runs(id) ON DELETE SET NULL,
+                task_run_id     TEXT,  -- soft FK; canonical FK in schema.pg.sql
                 workflow_step_id TEXT,
                 log_timestamp   TIMESTAMPTZ,
                 captured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1878,7 +1878,7 @@ impl PgDb {
             "CREATE INDEX IF NOT EXISTS idx_scheduler_history_task ON scheduler_history(task_id)",
             // Restate durable execution tables
             "CREATE TABLE IF NOT EXISTS restate_workflow_executions (
-                execution_id          TEXT PRIMARY KEY REFERENCES task_runs(id) ON DELETE CASCADE,
+                execution_id          TEXT PRIMARY KEY,  -- soft FK to task_runs; canonical FK in schema.pg.sql
                 restate_workflow_id   TEXT NOT NULL,
                 restate_invocation_id TEXT,
                 status                TEXT NOT NULL DEFAULT 'pending',
@@ -1890,7 +1890,7 @@ impl PgDb {
             "CREATE INDEX IF NOT EXISTS idx_rwe_restate_wf ON restate_workflow_executions(restate_workflow_id)",
             "CREATE TABLE IF NOT EXISTS restate_awakeables (
                 awakeable_id   TEXT PRIMARY KEY,
-                execution_id   TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+                execution_id   TEXT NOT NULL,  -- soft FK to task_runs; canonical FK in schema.pg.sql
                 awakeable_type TEXT NOT NULL,
                 type_data      TEXT,
                 status         TEXT NOT NULL DEFAULT 'pending',
@@ -2557,8 +2557,18 @@ mod migration_tests {
         // approach: just require that every table we create at runtime is
         // also in schema.pg.sql.
         let mod_rs = include_str!("mod.rs");
+        // Strip comment lines (SQL `--` and Rust `//`) to avoid false
+        // positives from prose that mentions CREATE TABLE IF NOT EXISTS.
+        let mod_rs_no_comments: String = mod_rs
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("--") && !t.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let ensure_tables: std::collections::HashSet<String> = re
-            .captures_iter(mod_rs)
+            .captures_iter(&mod_rs_no_comments)
             .map(|c| c[1].to_lowercase())
             .collect();
 

@@ -96,7 +96,7 @@ impl PgDb {
             format!("{:x}", hasher.finalize())
         };
 
-        let keywords_json = serde_json::to_string(&pattern.trigger_keywords)
+        let keywords_json: serde_json::Value = serde_json::to_value(&pattern.trigger_keywords)
             .map_err(|e| format!("PG upsert_learned_pattern serialize: {}", e))?;
         let sample_count: i32 = pattern.sample_count as i32;
 
@@ -105,7 +105,7 @@ impl PgDb {
                 id, problem_hash, trigger_keywords, problem_description,
                 solution_description, confidence, sample_count, project_path, workflow_name
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (problem_hash) DO UPDATE SET
                 trigger_keywords     = EXCLUDED.trigger_keywords,
                 solution_description = EXCLUDED.solution_description,
@@ -172,7 +172,7 @@ impl PgDb {
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let id: String = row.get(0);
-            let keywords_json: String = row.get(1);
+            let keywords_value: serde_json::Value = row.get(1);
             let problem_description: String = row.get(2);
             let solution_description: String = row.get(3);
             let confidence: f64 = row.get(4);
@@ -181,7 +181,7 @@ impl PgDb {
             let workflow_name: Option<String> = row.get(7);
 
             let trigger_keywords: Vec<String> =
-                serde_json::from_str(&keywords_json).unwrap_or_default();
+                serde_json::from_value(keywords_value).unwrap_or_default();
 
             out.push(LearnedPattern {
                 id,

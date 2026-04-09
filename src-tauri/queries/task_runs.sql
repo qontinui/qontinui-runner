@@ -43,6 +43,7 @@ SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task'
        COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id,
        COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
        COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
+       COALESCE(is_review, false) as is_review, COALESCE(blocks_parent, false) as blocks_parent,
        COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
 FROM task_runs
 WHERE id = :id;
@@ -114,12 +115,51 @@ SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task'
        COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id,
        COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
        COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
+       COALESCE(is_review, false) as is_review, COALESCE(blocks_parent, false) as blocks_parent,
        COALESCE(runner_port, 0) as runner_port,
        COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
 FROM task_runs
 WHERE status = 'running'
   AND (:runner_port::integer IS NULL OR runner_port IS NULL OR runner_port = :runner_port)
 ORDER BY created_at DESC;
+
+--! get_resumable_task_runs_for_runner (runner_port)
+-- Stricter variant of get_running_task_runs used by the startup-resume path.
+-- Only returns rows whose runner_port matches exactly — does NOT include
+-- runner_port IS NULL rows, so two runners restarting simultaneously cannot
+-- both pick up the same orphan. NULL-port tasks are handled separately by
+-- claim_orphaned_task_runs.
+SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type,
+       COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count,
+       COALESCE(max_sessions, 0) as max_sessions,
+       COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue,
+       COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id,
+       COALESCE(workflow_type, 'task') as workflow_type,
+       COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by,
+       COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id,
+       COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id,
+       COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id,
+       COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id,
+       COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
+       COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
+       COALESCE(is_review, false) as is_review, COALESCE(blocks_parent, false) as blocks_parent,
+       COALESCE(runner_port, 0) as runner_port,
+       COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at
+FROM task_runs
+WHERE status = 'running'
+  AND runner_port = :runner_port
+ORDER BY created_at DESC;
+
+--! lease_task_for_resume (id, expected_updated_at)
+-- Optimistic compare-and-set used to ensure exactly one resumer takes a task.
+-- If two processes for the same runner race, only the one whose updated_at
+-- read matches the current value will succeed; the other gets zero rows.
+UPDATE task_runs
+   SET updated_at = NOW()
+ WHERE id = :id
+   AND status = 'running'
+   AND updated_at = :expected_updated_at
+RETURNING id;
 
 --! append_task_output
 UPDATE task_runs SET output_log = output_log || :output, updated_at = NOW()

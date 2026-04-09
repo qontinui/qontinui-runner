@@ -1563,10 +1563,10 @@ impl PgDb {
 
         let rows = conn
             .query(
-                r#"SELECT component_path, relationship_type, impact_direction
+                r#"SELECT component_path, component_type
                    FROM architecture_components
                    WHERE workflow_name = $1
-                     AND (component_path = $2 OR related_file = $2)
+                     AND component_path = $2
                    LIMIT 20"#,
                 &[&workflow_name, &file_path],
             )
@@ -1577,7 +1577,7 @@ impl PgDb {
             .iter()
             .map(|r| crate::reflection::architecture::ImpactEntry {
                 component_path: r.get(0),
-                relationship_type: r.get(1),
+                relationship_type: r.get::<_, Option<String>>(1).unwrap_or_default(),
                 strength: 1,
             })
             .collect();
@@ -1682,35 +1682,13 @@ impl PgDb {
             .unwrap_or(0);
 
         if success_count >= 3 {
-            // Check if already in example library
-            let existing: bool = conn
-                .query_one(
-                    "SELECT COUNT(*) > 0 FROM example_workflows WHERE source_workflow_id = $1",
-                    &[&workflow_id],
-                )
-                .await
-                .map(|r| r.get(0))
-                .unwrap_or(true);
-
-            if !existing {
-                let id = uuid::Uuid::new_v4().to_string();
-                let now = chrono::Utc::now().to_rfc3339();
-
-                let _ = conn
-                    .execute(
-                        r#"INSERT INTO example_workflows
-                           (id, source_workflow_id, success_count, promoted_at)
-                           VALUES ($1, $2, $3, $4)
-                           ON CONFLICT DO NOTHING"#,
-                        &[
-                            &id as &(dyn tokio_postgres::types::ToSql + Sync),
-                            &workflow_id,
-                            &(success_count as i32),
-                            &now,
-                        ],
-                    )
-                    .await;
-            }
+            // NOTE: example_workflows table does not exist in the schema.
+            // Promotion logic is dead code until the table is created.
+            tracing::debug!(
+                workflow_id,
+                success_count,
+                "Skipping example promotion: example_workflows table not in schema"
+            );
         }
 
         Ok(())

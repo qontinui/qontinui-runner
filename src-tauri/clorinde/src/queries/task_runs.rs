@@ -135,6 +135,8 @@ pub struct GetTaskRun {
     pub is_fixer: bool,
     pub fixer_source_task_run_id: String,
     pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
     pub completed_at: chrono::DateTime<chrono::FixedOffset>,
@@ -175,6 +177,8 @@ pub struct GetTaskRunBorrowed<'a> {
     pub is_fixer: bool,
     pub fixer_source_task_run_id: &'a str,
     pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
     pub completed_at: chrono::DateTime<chrono::FixedOffset>,
@@ -217,6 +221,8 @@ impl<'a> From<GetTaskRunBorrowed<'a>> for GetTaskRun {
             is_fixer,
             fixer_source_task_run_id,
             is_meta_optimizer,
+            is_review,
+            blocks_parent,
             created_at,
             updated_at,
             completed_at,
@@ -258,6 +264,8 @@ impl<'a> From<GetTaskRunBorrowed<'a>> for GetTaskRun {
             is_fixer,
             fixer_source_task_run_id: fixer_source_task_run_id.into(),
             is_meta_optimizer,
+            is_review,
+            blocks_parent,
             created_at,
             updated_at,
             completed_at,
@@ -394,6 +402,8 @@ pub struct GetRunningTaskRuns {
     pub is_fixer: bool,
     pub fixer_source_task_run_id: String,
     pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
     pub runner_port: i32,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
@@ -426,6 +436,8 @@ pub struct GetRunningTaskRunsBorrowed<'a> {
     pub is_fixer: bool,
     pub fixer_source_task_run_id: &'a str,
     pub is_meta_optimizer: bool,
+    pub is_review: bool,
+    pub blocks_parent: bool,
     pub runner_port: i32,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
@@ -460,6 +472,8 @@ impl<'a> From<GetRunningTaskRunsBorrowed<'a>> for GetRunningTaskRuns {
             is_fixer,
             fixer_source_task_run_id,
             is_meta_optimizer,
+            is_review,
+            blocks_parent,
             runner_port,
             created_at,
             updated_at,
@@ -493,6 +507,8 @@ impl<'a> From<GetRunningTaskRunsBorrowed<'a>> for GetRunningTaskRuns {
             is_fixer,
             fixer_source_task_run_id: fixer_source_task_run_id.into(),
             is_meta_optimizer,
+            is_review,
+            blocks_parent,
             runner_port,
             created_at,
             updated_at,
@@ -1154,7 +1170,7 @@ impl<
 pub struct GetTaskRunStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_task_run() -> GetTaskRunStmt {
     GetTaskRunStmt(
-        "SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type, COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count, COALESCE(max_sessions, 0) as max_sessions, COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue, COALESCE(execution_steps_json, '') as execution_steps_json, COALESCE(log_sources_json, '') as log_sources_json, COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id, COALESCE(summary, ai_summary, '') as summary, COALESCE(ai_summary, '') as ai_summary, COALESCE(goal_achieved, false) as goal_achieved, COALESCE(remaining_work, '') as remaining_work, COALESCE(summary_generated_at::TEXT, '') as summary_generated_at, COALESCE(transition_history_json, '') as transition_history_json, COALESCE(workflow_type, 'task') as workflow_type, COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by, COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id, COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id, COALESCE(result_data, '') as result_data, COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id, COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id, COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id, COALESCE(is_meta_optimizer, false) as is_meta_optimizer, COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at FROM task_runs WHERE id = $1",
+        "SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type, COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count, COALESCE(max_sessions, 0) as max_sessions, COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue, COALESCE(execution_steps_json, '') as execution_steps_json, COALESCE(log_sources_json, '') as log_sources_json, COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id, COALESCE(summary, ai_summary, '') as summary, COALESCE(ai_summary, '') as ai_summary, COALESCE(goal_achieved, false) as goal_achieved, COALESCE(remaining_work, '') as remaining_work, COALESCE(summary_generated_at::TEXT, '') as summary_generated_at, COALESCE(transition_history_json, '') as transition_history_json, COALESCE(workflow_type, 'task') as workflow_type, COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by, COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id, COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id, COALESCE(result_data, '') as result_data, COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id, COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id, COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id, COALESCE(is_meta_optimizer, false) as is_meta_optimizer, COALESCE(is_review, false) as is_review, COALESCE(blocks_parent, false) as blocks_parent, COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at FROM task_runs WHERE id = $1",
         None,
     )
 }
@@ -1214,9 +1230,11 @@ impl GetTaskRunStmt {
                         is_fixer: row.try_get(32)?,
                         fixer_source_task_run_id: row.try_get(33)?,
                         is_meta_optimizer: row.try_get(34)?,
-                        created_at: row.try_get(35)?,
-                        updated_at: row.try_get(36)?,
-                        completed_at: row.try_get(37)?,
+                        is_review: row.try_get(35)?,
+                        blocks_parent: row.try_get(36)?,
+                        created_at: row.try_get(37)?,
+                        updated_at: row.try_get(38)?,
+                        completed_at: row.try_get(39)?,
                     })
                 },
             mapper: |it| GetTaskRun::from(it),
@@ -1579,7 +1597,7 @@ impl<'c, 'a, 's, C: GenericClient, T1: crate::StringSql, T2: crate::StringSql, T
 pub struct GetRunningTaskRunsStmt(&'static str, Option<tokio_postgres::Statement>);
 pub fn get_running_task_runs() -> GetRunningTaskRunsStmt {
     GetRunningTaskRunsStmt(
-        "SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type, COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count, COALESCE(max_sessions, 0) as max_sessions, COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue, COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id, COALESCE(workflow_type, 'task') as workflow_type, COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by, COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id, COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id, COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id, COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id, COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id, COALESCE(is_meta_optimizer, false) as is_meta_optimizer, COALESCE(runner_port, 0) as runner_port, COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at FROM task_runs WHERE status = 'running' AND ($1::integer IS NULL OR runner_port IS NULL OR runner_port = $1) ORDER BY created_at DESC",
+        "SELECT id, task_name, COALESCE(prompt, '') as prompt, COALESCE(task_type, 'task') as task_type, COALESCE(status, 'running') as status, COALESCE(sessions_count, 0) as sessions_count, COALESCE(max_sessions, 0) as max_sessions, COALESCE(error_message, '') as error_message, COALESCE(auto_continue, true) as auto_continue, COALESCE(config_id, '') as config_id, COALESCE(workflow_name, '') as workflow_name, COALESCE(workflow_id, '') as workflow_id, COALESCE(workflow_type, 'task') as workflow_type, COALESCE(workspace_id, '') as workspace_id, COALESCE(triggered_by, '') as triggered_by, COALESCE(parent_task_run_id, '') as parent_task_run_id, COALESCE(root_task_run_id, '') as root_task_run_id, COALESCE(depth, 0) as depth, COALESCE(bridge_id, '') as bridge_id, COALESCE(is_reflection, false) as is_reflection, COALESCE(reflection_source_task_run_id, '') as reflection_source_task_run_id, COALESCE(is_follow_up, false) as is_follow_up, COALESCE(follow_up_source_task_run_id, '') as follow_up_source_task_run_id, COALESCE(is_fixer, false) as is_fixer, COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id, COALESCE(is_meta_optimizer, false) as is_meta_optimizer, COALESCE(is_review, false) as is_review, COALESCE(blocks_parent, false) as blocks_parent, COALESCE(runner_port, 0) as runner_port, COALESCE(created_at, NOW()) as created_at, COALESCE(updated_at, NOW()) as updated_at, COALESCE(completed_at, NOW()) as completed_at FROM task_runs WHERE status = 'running' AND ($1::integer IS NULL OR runner_port IS NULL OR runner_port = $1) ORDER BY created_at DESC",
         None,
     )
 }
@@ -1631,10 +1649,12 @@ impl GetRunningTaskRunsStmt {
                     is_fixer: row.try_get(23)?,
                     fixer_source_task_run_id: row.try_get(24)?,
                     is_meta_optimizer: row.try_get(25)?,
-                    runner_port: row.try_get(26)?,
-                    created_at: row.try_get(27)?,
-                    updated_at: row.try_get(28)?,
-                    completed_at: row.try_get(29)?,
+                    is_review: row.try_get(26)?,
+                    blocks_parent: row.try_get(27)?,
+                    runner_port: row.try_get(28)?,
+                    created_at: row.try_get(29)?,
+                    updated_at: row.try_get(30)?,
+                    completed_at: row.try_get(31)?,
                 })
             },
             mapper: |it| GetRunningTaskRuns::from(it),

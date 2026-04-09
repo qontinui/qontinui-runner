@@ -62,8 +62,8 @@ macro_rules! full_task_run {
             is_fixer: $r.is_fixer,
             fixer_source_task_run_id: non_empty($r.fixer_source_task_run_id),
             is_meta_optimizer: $r.is_meta_optimizer,
-            is_review: false,     // Column exists in DB but not in Clorinde-generated struct
-            blocks_parent: false, // Column exists in DB but not in Clorinde-generated struct
+            is_review: $r.is_review,
+            blocks_parent: $r.blocks_parent,
             created_at: $r.created_at.to_rfc3339(),
             updated_at: $r.updated_at.to_rfc3339(),
             completed_at: if $r.completed_at.timestamp() == 0 {
@@ -892,8 +892,8 @@ impl PgDb {
                 is_fixer: r.is_fixer,
                 fixer_source_task_run_id: non_empty(r.fixer_source_task_run_id),
                 is_meta_optimizer: r.is_meta_optimizer,
-                is_review: false,
-                blocks_parent: false,
+                is_review: r.is_review,
+                blocks_parent: r.blocks_parent,
                 created_at: r.created_at.to_rfc3339(),
                 updated_at: r.updated_at.to_rfc3339(),
                 completed_at: if r.completed_at.timestamp() == 0 {
@@ -946,6 +946,8 @@ impl PgDb {
                           COALESCE(is_fixer, false) as is_fixer,
                           COALESCE(fixer_source_task_run_id, '') as fixer_source_task_run_id,
                           COALESCE(is_meta_optimizer, false) as is_meta_optimizer,
+                          COALESCE(is_review, false) as is_review,
+                          COALESCE(blocks_parent, false) as blocks_parent,
                           to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as created_at,
                           to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as updated_at,
                           to_char(completed_at, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') as completed_at
@@ -1003,8 +1005,8 @@ impl PgDb {
                 is_fixer: r.get("is_fixer"),
                 fixer_source_task_run_id: non_empty(r.get::<_, String>("fixer_source_task_run_id")),
                 is_meta_optimizer: r.get("is_meta_optimizer"),
-                is_review: false,
-                blocks_parent: false,
+                is_review: r.get("is_review"),
+                blocks_parent: r.get("blocks_parent"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
                 completed_at: r.get::<_, Option<String>>("completed_at"),
