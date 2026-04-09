@@ -2,6 +2,13 @@
 -- Each table here is validated against all queries in queries/*.sql.
 -- This file is loaded by `clorinde fresh` into a temporary database for validation.
 
+-- Schema migrations (runner migration tracking — infrastructure, not domain)
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    description TEXT NOT NULL,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Task Runs (central execution record — FK target for all event/usage tables)
 CREATE TABLE IF NOT EXISTS task_runs (
     id TEXT PRIMARY KEY,
@@ -2895,7 +2902,7 @@ CREATE TABLE IF NOT EXISTS scheduler_history (
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     ended_at TIMESTAMPTZ,
     status TEXT NOT NULL DEFAULT 'pending',
-    success BOOLEAN,
+    success BOOLEAN NOT NULL DEFAULT false,
     error_message TEXT,
     triggered_auto_fix BOOLEAN NOT NULL DEFAULT false,
     auto_fix_session_id TEXT,

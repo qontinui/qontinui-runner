@@ -4,6 +4,7 @@
 //! and scheduler_settings.
 
 use super::PgDb;
+use chrono::{DateTime, Utc};
 use crate::scheduler::{
     ConditionScheduleConfig, ScheduleExpression, ScheduledTask, ScheduledTaskStatus,
     ScheduledTaskType, SchedulerSettings, TaskExecutionRecord,
@@ -99,6 +100,10 @@ fn schedule_to_parts(schedule: &ScheduleExpression) -> (&'static str, String) {
 }
 
 /// Map a tokio_postgres Row to a TaskExecutionRecord.
+///
+/// `started_at` and `ended_at` are TIMESTAMPTZ in the live DB (migrated
+/// from TEXT by v10). Read as `DateTime<Utc>` and format to ISO 8601 so
+/// the JSON-serialised struct stays backwards-compatible.
 fn row_to_execution_record(row: &tokio_postgres::Row) -> TaskExecutionRecord {
     let status_str: String = row.get(4);
     let status = match status_str.as_str() {
@@ -111,11 +116,14 @@ fn row_to_execution_record(row: &tokio_postgres::Row) -> TaskExecutionRecord {
         _ => ScheduledTaskStatus::Failed,
     };
 
+    let started: DateTime<Utc> = row.get(2);
+    let ended: Option<DateTime<Utc>> = row.get(3);
+
     TaskExecutionRecord {
         execution_id: row.get(0),
         session_id: row.get(1),
-        started_at: row.get(2),
-        ended_at: row.get(3),
+        started_at: started.to_rfc3339(),
+        ended_at: ended.map(|dt| dt.to_rfc3339()),
         status,
         success: row.get(5),
         error_message: row.get(6),
@@ -387,6 +395,18 @@ impl PgDb {
             ScheduledTaskStatus::Cancelled => "cancelled",
         };
 
+        // Parse ISO 8601 strings back to DateTime<Utc> for the TIMESTAMPTZ
+        // columns. The struct stores strings for JSON serialisation but the
+        // DB expects native timestamps after the v10 TEXT → TIMESTAMPTZ migration.
+        let started: DateTime<Utc> = record
+            .started_at
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now());
+        let ended: Option<DateTime<Utc>> = record
+            .ended_at
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+
         conn.execute(
             r#"
             INSERT INTO scheduler_history
@@ -399,8 +419,8 @@ impl PgDb {
                 &record.execution_id as &(dyn tokio_postgres::types::ToSql + Sync),
                 &task_id,
                 &record.session_id,
-                &record.started_at,
-                &record.ended_at,
+                &started,
+                &ended,
                 &status.to_string(),
                 &record.success,
                 &record.error_message,
