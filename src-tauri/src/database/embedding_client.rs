@@ -45,6 +45,11 @@ pub struct EmbeddingClient {
 }
 
 impl EmbeddingClient {
+    /// The default embedding service URL (for health probes, config display, etc.).
+    pub fn default_url() -> &'static str {
+        DEFAULT_EMBEDDING_URL
+    }
+
     /// Create a new embedding client with default URL.
     pub fn new() -> Self {
         Self {

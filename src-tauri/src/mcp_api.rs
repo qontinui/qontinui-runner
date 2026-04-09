@@ -79,6 +79,79 @@ use crate::mcp::awas::{
 use crate::mcp::shared::get_workspace_paths_internal;
 use crate::mcp::types::ApiState;
 
+/// Cached embedding-service health probe.  Calls GET /api/embeddings/status
+/// at most once every 30 seconds.  Returns a JSON value suitable for inlining
+/// into the `/health` response.
+async fn embedding_service_health() -> serde_json::Value {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+    static LAST_REACHABLE: AtomicBool = AtomicBool::new(false);
+    static LAST_ERROR: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+
+    let url = crate::database::embedding_client::EmbeddingClient::default_url();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let prev = LAST_CHECK_MS.load(Ordering::Relaxed);
+    let stale = now_ms.saturating_sub(prev) > 30_000;
+
+    if stale
+        && LAST_CHECK_MS
+            .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        // Status endpoint is at the same base minus the last path segment.
+        let status_url = url.replace("/compute-text", "/status");
+        let ok = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => match c.get(&status_url).send().await {
+                Ok(r) => r.status().is_success(),
+                Err(e) => {
+                    let err_mtx = LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
+                    if let Ok(mut g) = err_mtx.lock() {
+                        *g = Some(e.to_string());
+                    }
+                    false
+                }
+            },
+            Err(e) => {
+                let err_mtx = LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
+                if let Ok(mut g) = err_mtx.lock() {
+                    *g = Some(format!("Failed to build HTTP client: {e}"));
+                }
+                false
+            }
+        };
+        LAST_REACHABLE.store(ok, Ordering::Release);
+        if ok {
+            let err_mtx = LAST_ERROR.get_or_init(|| std::sync::Mutex::new(None));
+            if let Ok(mut g) = err_mtx.lock() {
+                *g = None;
+            }
+        }
+    }
+
+    let reachable = LAST_REACHABLE.load(Ordering::Acquire);
+    let err_msg = LAST_ERROR
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.clone());
+
+    serde_json::json!({
+        "reachable": reachable,
+        "url": url,
+        "lastCheckMs": LAST_CHECK_MS.load(Ordering::Relaxed),
+        "lastErrorMessage": err_msg,
+    })
+}
+
 /// Health check endpoint.
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
 /// Returns rich diagnostics: frontend responsiveness, uptime, circuit breaker state.
@@ -116,20 +189,47 @@ async fn health(
             })
             .collect();
 
+    // When the frontend has not connected after 30s of uptime, auto-attach a
+    // native window screenshot so health consumers (agents, supervisor) can see
+    // what the webview is actually showing (e.g., ERR_CONNECTION_REFUSED).
+    let diagnostic_screenshot = if last_pong == 0 && uptime_secs >= 30 {
+        crate::mcp::ui_bridge::capture_runner_window_base64(&state).await
+    } else {
+        None
+    };
+
+    // Embedding service health probe (cached, refreshed every 30s).
+    let embedding_health = embedding_service_health().await;
+
+    let mut data = serde_json::json!({
+        "status": status,
+        "ready": last_pong > 0,
+        "responsive": responsive,
+        "lastHeartbeat": last_pong,
+        "heartbeatAgeMs": pong_age_ms,
+        "uptimeSeconds": uptime_secs,
+        "pendingRequests": pending_count,
+        "circuitBreaker": format!("{:?}", circuit_breaker_state),
+        "consoleErrorCount": console_errors,
+        "aiProviderCircuitBreakers": ai_provider_states,
+        "embeddingService": embedding_health,
+    });
+
+    if let Some((screenshot, width, height)) = diagnostic_screenshot {
+        data.as_object_mut().unwrap().insert(
+            "diagnosticScreenshot".to_string(),
+            serde_json::json!({
+                "screenshot": screenshot,
+                "width": width,
+                "height": height,
+                "reason": "Frontend SDK has not connected after 30s of uptime"
+            }),
+        );
+    }
+
     Json(serde_json::json!({
         "success": true,
-        "data": {
-            "status": status,
-            "ready": last_pong > 0,
-            "responsive": responsive,
-            "lastHeartbeat": last_pong,
-            "heartbeatAgeMs": pong_age_ms,
-            "uptimeSeconds": uptime_secs,
-            "pendingRequests": pending_count,
-            "circuitBreaker": format!("{:?}", circuit_breaker_state),
-            "consoleErrorCount": console_errors,
-            "aiProviderCircuitBreakers": ai_provider_states,
-        },
+        "data": data,
         "uiBridge": {
             "appId": "qontinui-runner",
             "appName": "Qontinui Runner",
