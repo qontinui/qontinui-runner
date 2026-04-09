@@ -920,3 +920,32 @@ pub fn is_api_ready(app_state: tauri::State<'_, Arc<AppState>>) -> bool {
 pub fn get_api_port(app_state: tauri::State<'_, Arc<AppState>>) -> u16 {
     app_state.api_port.load(Ordering::Relaxed)
 }
+
+/// Credentials for temp-runner auto-login, sourced from process env.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestAutoLoginCreds {
+    pub email: String,
+    pub password: String,
+}
+
+/// Returns test auto-login credentials if this process was launched with
+/// `QONTINUI_TEST_AUTO_LOGIN_EMAIL` + `QONTINUI_TEST_AUTO_LOGIN_PASSWORD` set.
+///
+/// The supervisor forwards these env vars to spawned non-primary test runners
+/// (when the supervisor itself is in dev_mode and has `QONTINUI_TEST_LOGIN_EMAIL`
+/// / `QONTINUI_TEST_LOGIN_PASSWORD` in its environment). The React AuthProvider
+/// invokes this command to auto-authenticate temp test runners so UI Bridge
+/// inspection can reach authenticated pages (Process Manager, settings, etc.).
+///
+/// Returns `None` for normal primary runners where the env vars are absent.
+/// This is safe to expose: it only reveals credentials the process already has
+/// in its own environment — no privilege escalation.
+#[tauri::command]
+pub fn get_test_auto_login() -> Option<TestAutoLoginCreds> {
+    let email = std::env::var("QONTINUI_TEST_AUTO_LOGIN_EMAIL").ok()?;
+    let password = std::env::var("QONTINUI_TEST_AUTO_LOGIN_PASSWORD").ok()?;
+    if email.is_empty() || password.is_empty() {
+        return None;
+    }
+    Some(TestAutoLoginCreds { email, password })
+}

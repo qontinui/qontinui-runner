@@ -38,7 +38,12 @@ interface AuthProviderProps {
 
 const TOKEN_REFRESH_INTERVAL = 14 * 60 * 1000; // 14 minutes (tokens expire in 15 minutes)
 
-// Development auto-login credentials (loaded from environment variables)
+// Development auto-login credentials (loaded from environment variables at
+// Vite build time). For temp test runners spawned by the supervisor, the
+// credentials are instead loaded at runtime from process env via the
+// `get_test_auto_login` Tauri command (see the effect below). This lets a
+// single pre-built runner binary auto-login for UI Bridge testing without
+// rebuilding with VITE_DEV_EMAIL baked in.
 const DEV_AUTO_LOGIN = {
   email: import.meta.env.VITE_DEV_EMAIL || "",
   password: import.meta.env.VITE_DEV_PASSWORD || "",
@@ -51,6 +56,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // Dev auto-login pending flag - starts false, set to true only when auto-login starts
   // This prevents blocking the UI while waiting for auth check to complete
   const [devAutoLoginPending, setDevAutoLoginPending] = useState(false);
+  // Effective auto-login credentials. Starts with Vite-baked VITE_DEV_* values
+  // and is overridden at runtime by `get_test_auto_login` if the process was
+  // spawned by the supervisor with QONTINUI_TEST_AUTO_LOGIN_* env vars.
+  const [autoLoginCreds, setAutoLoginCreds] = useState<{ email: string; password: string }>(
+    DEV_AUTO_LOGIN,
+  );
+  // Tracks whether the runtime test-auto-login probe has completed. We defer
+  // the auto-login effect until this resolves so a temp runner without Vite
+  // creds doesn't flash the LoginScreen before runtime creds arrive.
+  const [testAutoLoginProbed, setTestAutoLoginProbed] = useState(false);
   const mountCountRef = useRef(0);
   const refreshCallCountRef = useRef(0);
   // Timer ID for retrying dev auto-login when backend is temporarily unavailable
@@ -194,13 +209,49 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [checkAuthStatus]);
 
   /**
+   * Probe for runtime test-auto-login credentials (temp test runners spawned
+   * by the supervisor). If `QONTINUI_TEST_AUTO_LOGIN_EMAIL` /
+   * `QONTINUI_TEST_AUTO_LOGIN_PASSWORD` were set on the process env by the
+   * supervisor, the backend `get_test_auto_login` command returns them and
+   * we use them as auto-login credentials — overriding (or filling in for)
+   * the Vite-baked VITE_DEV_* values. This lets a single pre-built runner
+   * binary auto-login for UI Bridge testing of authenticated pages.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ email: string; password: string } | null>("get_test_auto_login")
+      .then((creds) => {
+        if (cancelled) return;
+        if (creds && creds.email && creds.password) {
+          log.debug("Test auto-login: runtime credentials found, enabling auto-login");
+          setAutoLoginCreds(creds);
+        }
+        setTestAutoLoginProbed(true);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        log.debug("Test auto-login probe failed (expected for primary runners):", err);
+        setTestAutoLoginProbed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
    * Auto-login with configured credentials
    * Automatically logs in when VITE_DEV_EMAIL/VITE_DEV_PASSWORD are set in .env
    * Works in both dev mode (Vite) and exe mode (embedded build)
    */
   useEffect(() => {
+    // Wait for the runtime test-auto-login probe to complete so a temp runner
+    // with runtime-only creds doesn't miss its window.
+    if (!testAutoLoginProbed) {
+      return;
+    }
+
     // Skip if no credentials configured (covers both dev and production builds)
-    if (!DEV_AUTO_LOGIN.email || !DEV_AUTO_LOGIN.password) {
+    if (!autoLoginCreds.email || !autoLoginCreds.password) {
       return;
     }
 
@@ -236,7 +287,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     log.debug("Dev mode: Not authenticated, attempting auto-login...");
     // Set pending flag BEFORE starting login so UI shows "Signing in..."
     setDevAutoLoginPending(true);
-    login(DEV_AUTO_LOGIN.email, DEV_AUTO_LOGIN.password)
+    login(autoLoginCreds.email, autoLoginCreds.password)
       .then(() => {
         // Login successful - the authStatus effect will clear devAutoLoginPending
         log.debug("Dev mode auto-login succeeded");
@@ -269,7 +320,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           setDevAutoLoginPending(false);
         }
       });
-  }, [loading, authStatus?.authenticated, login, checkAuthStatus]);
+  }, [loading, authStatus?.authenticated, login, checkAuthStatus, testAutoLoginProbed, autoLoginCreds]);
 
   /**
    * Failsafe timeout for loading state

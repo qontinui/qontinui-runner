@@ -435,6 +435,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::send_device_heartbeat,
             commands::auth::is_api_ready,
             commands::auth::get_api_port,
+            commands::auth::get_test_auto_login,
             // Clipboard sync and file sharing commands
             commands::clipboard::share_to_mobile,
             commands::clipboard::share_file_to_mobile,
