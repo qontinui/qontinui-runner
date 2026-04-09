@@ -689,7 +689,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::state_machine_configs::sm_move_pending_screenshots,
             commands::state_machine_configs::sm_delete_capture_screenshots,
             commands::state_machine_configs::sm_backfill_capture_screenshot_dimensions,
+            commands::state_machine_configs::sm_audit_capture_screenshot_bounds,
             commands::state_machine_configs::sm_generate_static,
+            // UI Bridge Baseline commands (visual regression persistent store)
+            commands::ui_bridge_baselines::sm_save_baseline,
+            commands::ui_bridge_baselines::sm_get_baseline,
+            commands::ui_bridge_baselines::sm_list_baselines,
+            commands::ui_bridge_baselines::sm_delete_baseline,
             // State Explorer commands
             commands::state_explorer::start_exploration,
             commands::state_explorer::get_exploration_strategies,

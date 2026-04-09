@@ -17,6 +17,7 @@ use tauri::Emitter;
 
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
+use crate::screen;
 use crate::timeout_config::Timeouts;
 
 // ============================================================================
@@ -1033,8 +1034,134 @@ pub async fn ui_bridge_execute_action_handler(
         }
     });
 
+    // ── Issue 2: Disabled-state detection ──────────────────────────────
+    // Before dispatching the action, fetch the element state and reject
+    // clicks on disabled elements early so callers get an explicit error
+    // instead of a silent no-op.
+    if let Ok(elem_data) = ui_bridge_request_sync(
+        &state,
+        "get_element",
+        serde_json::json!({ "elementId": id }),
+    )
+    .await
+    {
+        let is_disabled = {
+            let props = elem_data.get("properties").or_else(|| elem_data.get("props"));
+            let aria_disabled = elem_data
+                .get("ariaDisabled")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "true")
+                .unwrap_or(false);
+            let disabled_attr = elem_data
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let data_disabled = props
+                .and_then(|p| p.get("data-disabled"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == "true")
+                .unwrap_or(false);
+            // Also check nested properties for aria-disabled / disabled
+            let prop_aria_disabled = props
+                .and_then(|p| p.get("aria-disabled"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == "true")
+                .unwrap_or(false);
+            let prop_disabled = props
+                .and_then(|p| p.get("disabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            aria_disabled
+                || disabled_attr
+                || data_disabled
+                || prop_aria_disabled
+                || prop_disabled
+        };
+
+        if is_disabled {
+            warn!(
+                "execute_action: element {} is disabled, rejecting {} action early",
+                id, action_name
+            );
+            return Ok(Json(ApiResponse {
+                success: false,
+                data: Some(serde_json::json!({
+                    "error": "element is disabled",
+                    "elementState": elem_data,
+                })),
+                error: Some("element is disabled".to_string()),
+                error_detail: None,
+            }));
+        }
+    }
+
+    // ── Execute the action ─────────────────────────────────────────────
     let mut result =
-        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload).await);
+        wrap_ipc_result(ui_bridge_request_sync(&state, "execute_action", payload.clone()).await);
+
+    // ── Issue 1: Stale registry retry ──────────────────────────────────
+    // When React unmount/remount creates a new DOM node the old registry
+    // entry goes stale.  If the SDK reports "never registered or
+    // discovered" or "not found", refresh via discover and retry once.
+    {
+        let should_retry = match &result {
+            Ok(ref resp) if !resp.success => resp
+                .error
+                .as_deref()
+                .map(|e| {
+                    let lower = e.to_lowercase();
+                    lower.contains("never registered or discovered")
+                        || lower.contains("not found")
+                })
+                .unwrap_or(false),
+            Err((_, ref err_resp)) => err_resp
+                .error
+                .as_deref()
+                .map(|e| {
+                    let lower = e.to_lowercase();
+                    lower.contains("never registered or discovered")
+                        || lower.contains("not found")
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        if should_retry {
+            warn!(
+                "execute_action: element {} not found in registry, refreshing via discover and retrying",
+                id
+            );
+            // Refresh the element registry
+            let _ = ui_bridge_request_sync(
+                &state,
+                "discover",
+                serde_json::json!({ "params": { "interactive_only": false } }),
+            )
+            .await;
+
+            // Retry the original action once
+            let retry_result = wrap_ipc_result(
+                ui_bridge_request_sync(&state, "execute_action", payload).await,
+            );
+
+            match &retry_result {
+                Ok(ref resp) if resp.success => {
+                    info!(
+                        "execute_action: retry succeeded for element {} after discover refresh",
+                        id
+                    );
+                    result = retry_result;
+                }
+                _ => {
+                    warn!(
+                        "execute_action: retry also failed for element {}, returning original error",
+                        id
+                    );
+                    // Keep the original `result` — the caller gets the first error
+                }
+            }
+        }
+    }
 
     // Click-had-no-effect detector. Re-snapshot after a short settle delay
     // and compare against the pre-snapshot signature. If the element graph
@@ -1414,7 +1541,34 @@ pub async fn ui_bridge_get_snapshot_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Getting snapshot");
 
-    match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
+    // Try to get snapshot; if elements are empty, auto-discover once and retry.
+    // This avoids the common cold-start pitfall where the first snapshot call
+    // returns zero elements because the frontend hasn't discovered yet.
+    let snapshot_result =
+        match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
+            Ok(data) => {
+                let elements_empty = data
+                    .get("elements")
+                    .and_then(|e| e.as_array())
+                    .map_or(true, |a| a.is_empty());
+                if elements_empty {
+                    info!("UI Bridge API: snapshot returned 0 elements — auto-discovering");
+                    let _ = ui_bridge_request_sync(
+                        &state,
+                        "discover",
+                        serde_json::json!({"interactive_only": false}),
+                    )
+                    .await;
+                    // Retry snapshot after discovery
+                    ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await
+                } else {
+                    Ok(data)
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+    match snapshot_result {
         Ok(mut data) => {
             // Enrich snapshot with architecture spec summaries from the database
             let arch_result = state.app_state.pg_db.get_all_cached_specs().await;
@@ -1454,8 +1608,32 @@ pub async fn ui_bridge_get_snapshot_handler(
             Ok(Json(ApiResponse::success(data)))
         }
         Err(e) => {
-            error!("UI Bridge API: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            // Fall back to native window capture when the SDK/frontend is not connected.
+            // This gives agents a degraded-but-useful snapshot (screenshot + source tag)
+            // instead of a blind error, which is critical for diagnosing webview issues
+            // like ERR_CONNECTION_REFUSED or blank screens.
+            warn!(
+                "UI Bridge API: snapshot via SDK failed ({}), falling back to native capture",
+                e
+            );
+            match capture_runner_window_base64(&state).await {
+                Some((screenshot, width, height)) => {
+                    let data = serde_json::json!({
+                        "source": "native_capture",
+                        "reason": e,
+                        "screenshot": screenshot,
+                        "width": width,
+                        "height": height,
+                        "elements": [],
+                        "note": "SDK was not connected. This is a native window capture fallback — no element tree is available."
+                    });
+                    Ok(Json(ApiResponse::success(data)))
+                }
+                None => {
+                    error!("UI Bridge API: native capture fallback also failed");
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+                }
+            }
         }
     }
 }
@@ -3382,6 +3560,13 @@ pub struct AnnotatedScreenshotQuery {
     /// Capture the runner's own window
     #[serde(default)]
     runner: Option<bool>,
+    /// When true, overlay numbered element bounding boxes on the screenshot.
+    #[serde(default)]
+    annotate: Option<bool>,
+    /// Maximum image width after resize (only used when annotate=true).
+    /// Default: 1024. Set to 0 to skip resize.
+    #[serde(default)]
+    max_width: Option<u32>,
 }
 
 /// Annotated screenshot response
@@ -3403,6 +3588,28 @@ pub struct AnnotatedScreenshotData {
     window_app_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     window_id: Option<u32>,
+    /// Text index of annotated elements (only present when annotate=true).
+    /// Format: `[1] "Login" button at (0.12, 0.34) size (0.08, 0.04)`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    element_index_text: Option<String>,
+}
+
+impl AnnotatedScreenshotData {
+    /// Create from a `CapturedScreenshot` — width/height always come from the
+    /// decoded image dimensions, preventing the DPI double-multiply bug.
+    fn from_captured(captured: &screen::CapturedScreenshot) -> Result<Self, String> {
+        Ok(Self {
+            screenshot: captured.to_png_base64()?,
+            width: captured.physical_width as i32,
+            height: captured.physical_height as i32,
+            scale_factor: Some(captured.scale_factor),
+            monitor: captured.monitor_index.map(|i| i as i32),
+            window_title: None,
+            window_app_name: None,
+            window_id: None,
+            element_index_text: None,
+        })
+    }
 }
 
 /// Encode a DynamicImage as base64 PNG.
@@ -3509,25 +3716,11 @@ fn capture_window_screenshot(
 
     // Determine the scale factor from the monitor the window is on
     let scale = {
-        use xcap::Monitor;
         let win_x = target.x().unwrap_or(0);
         let win_y = target.y().unwrap_or(0);
-        Monitor::all()
+        screen::MonitorManager::detect()
             .ok()
-            .and_then(|monitors| {
-                monitors.iter().find_map(|m| {
-                    let mx = m.x().unwrap_or(0);
-                    let my = m.y().unwrap_or(0);
-                    let ms = m.scale_factor().unwrap_or(1.0) as f64;
-                    let mw = (m.width().unwrap_or(0) as f64 / ms) as i32;
-                    let mh = (m.height().unwrap_or(0) as f64 / ms) as i32;
-                    if win_x >= mx && win_x < mx + mw && win_y >= my && win_y < my + mh {
-                        Some(ms)
-                    } else {
-                        None
-                    }
-                })
-            })
+            .and_then(|mgr| mgr.at_logical_point(win_x, win_y).map(|m| m.scale_factor))
             .unwrap_or(1.0)
     };
 
@@ -3545,6 +3738,7 @@ fn capture_window_screenshot(
         window_title: Some(title),
         window_app_name: Some(app),
         window_id: Some(id),
+        element_index_text: None,
     })
 }
 
@@ -3567,52 +3761,24 @@ fn capture_runner_window(
     scale: f64,
     title: &str,
 ) -> Result<AnnotatedScreenshotData, String> {
-    use xcap::Monitor;
-
-    let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {}", e))?;
-    if monitors.is_empty() {
-        return Err("No monitors found".to_string());
-    }
+    let mgr = screen::MonitorManager::detect()?;
 
     // Convert Tauri physical position to logical for monitor matching.
-    // xcap monitor x/y are logical (dmPosition), width/height are physical (dmPelsWidth).
+    // Use the window center so partially-off-screen windows still find the right monitor.
     let logical_x = (phys_x as f64 / scale) as i32;
     let logical_y = (phys_y as f64 / scale) as i32;
     let logical_center_x = logical_x + (phys_w as f64 / scale / 2.0) as i32;
     let logical_center_y = logical_y + (phys_h as f64 / scale / 2.0) as i32;
 
-    let (monitor, mon_logical_x, mon_logical_y) = monitors
-        .iter()
-        .find_map(|m| {
-            let mx = m.x().unwrap_or(0);
-            let my = m.y().unwrap_or(0);
-            let mon_scale = m.scale_factor().unwrap_or(1.0) as f64;
-            // Monitor logical dimensions = physical / scale
-            let mw_logical = (m.width().unwrap_or(0) as f64 / mon_scale) as i32;
-            let mh_logical = (m.height().unwrap_or(0) as f64 / mon_scale) as i32;
-            if logical_center_x >= mx
-                && logical_center_x < mx + mw_logical
-                && logical_center_y >= my
-                && logical_center_y < my + mh_logical
-            {
-                Some((m, mx, my))
-            } else {
-                None
-            }
-        })
+    let monitor = mgr
+        .at_logical_point(logical_center_x, logical_center_y)
         .ok_or_else(|| "Runner window not on any monitor".to_string())?;
 
-    let mon_scale = monitor.scale_factor().unwrap_or(1.0) as f64;
-    let full_image = monitor
-        .capture_image()
-        .map_err(|e| format!("Failed to capture monitor: {}", e))?;
+    let captured = screen::CapturedScreenshot::from_monitor(&mgr, monitor.index)?;
 
     // Convert logical window position to physical pixel offset in the captured image.
-    // Offset in logical coords relative to monitor origin, then scale to physical.
-    let rel_logical_x = logical_x - mon_logical_x;
-    let rel_logical_y = logical_y - mon_logical_y;
-    let rel_phys_x = (rel_logical_x as f64 * mon_scale) as i32;
-    let rel_phys_y = (rel_logical_y as f64 * mon_scale) as i32;
+    let (rel_local_x, rel_local_y) = monitor.to_monitor_local(logical_x, logical_y);
+    let (rel_phys_x, rel_phys_y) = monitor.logical_to_physical(rel_local_x, rel_local_y);
 
     // Handle negative offsets (window partially off-screen)
     let crop_x = rel_phys_x.max(0) as u32;
@@ -3622,23 +3788,22 @@ fn capture_runner_window(
     } else {
         phys_w
     }
-    .min(full_image.width().saturating_sub(crop_x));
+    .min(captured.physical_width.saturating_sub(crop_x));
     let crop_h = if rel_phys_y < 0 {
         phys_h.saturating_sub((-rel_phys_y) as u32)
     } else {
         phys_h
     }
-    .min(full_image.height().saturating_sub(crop_y));
+    .min(captured.physical_height.saturating_sub(crop_y));
 
     if crop_w == 0 || crop_h == 0 {
         return Err(format!(
             "Runner window has zero visible area (crop: {}x{} at ({}, {}), image: {}x{}, scale: {})",
-            crop_w, crop_h, crop_x, crop_y, full_image.width(), full_image.height(), mon_scale
+            crop_w, crop_h, crop_x, crop_y, captured.physical_width, captured.physical_height, monitor.scale_factor
         ));
     }
 
-    let full_dynamic = image::DynamicImage::ImageRgba8(full_image);
-    let cropped = full_dynamic.crop_imm(crop_x, crop_y, crop_w, crop_h);
+    let cropped = captured.image.crop_imm(crop_x, crop_y, crop_w, crop_h);
     let b64 = encode_image_to_base64(&cropped)?;
 
     Ok(AnnotatedScreenshotData {
@@ -3724,12 +3889,16 @@ pub async fn ui_bridge_annotated_screenshot_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<AnnotatedScreenshotQuery>,
 ) -> Json<ApiResponse<AnnotatedScreenshotData>> {
+    let want_annotate = query.annotate.unwrap_or(false);
+    let max_width = query.max_width.unwrap_or(1024);
+
     let is_window_capture = query.runner.unwrap_or(false)
         || query.window_title.is_some()
         || query.app_name.is_some()
         || query.window_id.is_some();
 
-    if is_window_capture {
+    // --- Phase 1: Capture the raw screenshot ---
+    let capture_result: Result<AnnotatedScreenshotData, String> = if is_window_capture {
         info!(
             runner = ?query.runner,
             window_title = ?query.window_title,
@@ -3758,7 +3927,7 @@ pub async fn ui_bridge_annotated_screenshot_handler(
                     .title()
                     .unwrap_or_else(|_| "Qontinui Runner".to_string());
 
-                return match tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || {
                     capture_runner_window(x, y, w, h, scale, &title)
                 })
                 .await
@@ -3768,60 +3937,48 @@ pub async fn ui_bridge_annotated_screenshot_handler(
                             "UI Bridge screenshot: Captured runner window ({}x{})",
                             data.width, data.height
                         );
-                        Json(ApiResponse::success(data))
+                        Ok(data)
                     }
                     Ok(Err(e)) => {
                         error!("UI Bridge screenshot: Runner capture failed: {}", e);
-                        Json(ApiResponse::error(format!(
-                            "Runner screenshot failed: {}",
-                            e
-                        )))
+                        Err(format!("Runner screenshot failed: {}", e))
                     }
                     Err(e) => {
                         error!("UI Bridge screenshot: Task join error: {}", e);
-                        Json(ApiResponse::error(format!(
-                            "Screenshot capture task failed: {}",
-                            e
-                        )))
+                        Err(format!("Screenshot capture task failed: {}", e))
                     }
-                };
+                }
             } else {
-                return Json(ApiResponse::error("Runner window not found".to_string()));
+                Err("Runner window not found".to_string())
             }
-        }
+        } else {
+            let window_title = query.window_title;
+            let app_name = query.app_name;
+            let window_id = query.window_id;
 
-        let window_title = query.window_title;
-        let app_name = query.app_name;
-        let window_id = query.window_id;
-
-        match tokio::task::spawn_blocking(move || {
-            capture_window_screenshot(window_title, app_name, window_id)
-        })
-        .await
-        {
-            Ok(Ok(data)) => {
-                info!(
-                    "UI Bridge screenshot: Captured window '{}' ({}x{}, id={})",
-                    data.window_title.as_deref().unwrap_or("?"),
-                    data.width,
-                    data.height,
-                    data.window_id.unwrap_or(0),
-                );
-                Json(ApiResponse::success(data))
-            }
-            Ok(Err(e)) => {
-                error!("UI Bridge screenshot: Window capture failed: {}", e);
-                Json(ApiResponse::error(format!(
-                    "Window screenshot failed: {}",
-                    e
-                )))
-            }
-            Err(e) => {
-                error!("UI Bridge screenshot: Task join error: {}", e);
-                Json(ApiResponse::error(format!(
-                    "Screenshot capture task failed: {}",
-                    e
-                )))
+            match tokio::task::spawn_blocking(move || {
+                capture_window_screenshot(window_title, app_name, window_id)
+            })
+            .await
+            {
+                Ok(Ok(data)) => {
+                    info!(
+                        "UI Bridge screenshot: Captured window '{}' ({}x{}, id={})",
+                        data.window_title.as_deref().unwrap_or("?"),
+                        data.width,
+                        data.height,
+                        data.window_id.unwrap_or(0),
+                    );
+                    Ok(data)
+                }
+                Ok(Err(e)) => {
+                    error!("UI Bridge screenshot: Window capture failed: {}", e);
+                    Err(format!("Window screenshot failed: {}", e))
+                }
+                Err(e) => {
+                    error!("UI Bridge screenshot: Task join error: {}", e);
+                    Err(format!("Screenshot capture task failed: {}", e))
+                }
             }
         }
     } else {
@@ -3838,24 +3995,220 @@ pub async fn ui_bridge_annotated_screenshot_handler(
                     "UI Bridge screenshot: Captured {}x{} from monitor {:?}",
                     data.width, data.height, data.monitor
                 );
-                Json(ApiResponse::success(data))
+                Ok(data)
             }
             Ok(Err(e)) => {
                 error!("UI Bridge screenshot: Monitor capture failed: {}", e);
-                Json(ApiResponse::error(format!(
-                    "Screenshot capture failed: {}",
-                    e
-                )))
+                Err(format!("Screenshot capture failed: {}", e))
             }
             Err(e) => {
                 error!("UI Bridge screenshot: Task join error: {}", e);
-                Json(ApiResponse::error(format!(
-                    "Screenshot capture task failed: {}",
-                    e
-                )))
+                Err(format!("Screenshot capture task failed: {}", e))
+            }
+        }
+    };
+
+    // --- Phase 2: If annotate=true, overlay element bounding boxes ---
+    let mut data = match capture_result {
+        Ok(d) => d,
+        Err(e) => return Json(ApiResponse::error(e)),
+    };
+
+    if want_annotate {
+        match apply_annotation(&state, &mut data, max_width).await {
+            Ok(()) => {
+                info!(
+                    "UI Bridge screenshot: Annotation applied (max_width={})",
+                    max_width
+                );
+            }
+            Err(e) => {
+                warn!("UI Bridge screenshot: Annotation failed, returning raw screenshot: {}", e);
+                // Fall through — return the unannotated screenshot
             }
         }
     }
+
+    Json(ApiResponse::success(data))
+}
+
+/// Apply element annotation overlay to a captured screenshot.
+///
+/// Calls UI Bridge discover to get elements, converts them to `AnnotatedElement`,
+/// and runs the annotation engine to overlay numbered bounding boxes.
+async fn apply_annotation(
+    state: &Arc<ApiState>,
+    data: &mut AnnotatedScreenshotData,
+    max_width: u32,
+) -> Result<(), String> {
+    use crate::vision::annotator::{annotate_screenshot, AnnotatedElement};
+    use crate::vision::types::NormalizedRect;
+
+    // Discover elements from the UI Bridge SDK
+    let discover_payload = serde_json::json!({ "interactive_only": false });
+    let discover_data = ui_bridge_request_sync(state, "discover", discover_payload)
+        .await
+        .map_err(|e| format!("Discover failed: {}", e))?;
+
+    // Extract elements array — may be at top-level or nested under "data"
+    let elements_arr = discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            discover_data
+                .get("data")
+                .and_then(|d| d.get("elements"))
+                .and_then(|v| v.as_array())
+        });
+
+    let elements_arr = match elements_arr {
+        Some(arr) => arr,
+        None => {
+            // No elements found — annotate with empty list (adds "No interactive elements" text)
+            let result = annotate_screenshot(&data.screenshot, &[], max_width)
+                .map_err(|e| format!("Annotation engine failed: {}", e))?;
+            data.screenshot = result.annotated_base64;
+            data.element_index_text = Some(result.element_index_text);
+            return Ok(());
+        }
+    };
+
+    // Convert discover elements to AnnotatedElement
+    let interactive_types = [
+        "button", "input", "select", "textarea", "link", "checkbox", "radio", "a",
+    ];
+
+    let mut annotated_elements = Vec::new();
+    let mut index = 1_u32;
+
+    for el in elements_arr {
+        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Filter to interactive elements only
+        if !interactive_types.contains(&el_type) {
+            continue;
+        }
+
+        // Skip hidden elements
+        if let Some(state_val) = el.get("state") {
+            let visible = state_val
+                .get("visible")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !visible {
+                continue;
+            }
+        }
+
+        // Extract normalized rect — try normalizedRect first, then rect
+        let normalized_rect = extract_normalized_rect_from_element(el);
+        let Some(normalized_rect) = normalized_rect else {
+            continue;
+        };
+
+        let label = el
+            .get("label")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                el.get("state")
+                    .and_then(|s| s.get("textContent"))
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| el.get("accessibleName").and_then(|v| v.as_str()))
+            .unwrap_or("(unlabeled)")
+            .to_string();
+
+        // Truncate long labels
+        let label = if label.chars().count() > 40 {
+            let truncated: String = label.chars().take(37).collect();
+            format!("{}...", truncated)
+        } else {
+            label
+        };
+
+        annotated_elements.push(AnnotatedElement {
+            index,
+            label,
+            element_type: el_type.to_string(),
+            normalized_rect,
+        });
+
+        index += 1;
+        if index > 50 {
+            debug!("Annotated screenshot: capped at 50 elements");
+            break;
+        }
+    }
+
+    info!(
+        "Annotated screenshot: {} elements to overlay",
+        annotated_elements.len()
+    );
+
+    // Run the annotation engine
+    let result = annotate_screenshot(&data.screenshot, &annotated_elements, max_width)
+        .map_err(|e| format!("Annotation engine failed: {}", e))?;
+
+    data.screenshot = result.annotated_base64;
+    data.element_index_text = Some(result.element_index_text);
+
+    Ok(())
+}
+
+/// Extract a NormalizedRect from a discover element JSON value.
+///
+/// Tries normalizedRect first (already 0-1), then falls back to rect
+/// with viewport heuristic normalization.
+fn extract_normalized_rect_from_element(el: &serde_json::Value) -> Option<crate::vision::types::NormalizedRect> {
+    use crate::vision::types::NormalizedRect;
+
+    // Try normalizedRect (UI Bridge provides this directly)
+    if let Some(nr) = el
+        .get("normalizedRect")
+        .or_else(|| el.get("state").and_then(|s| s.get("normalizedRect")))
+    {
+        let x = nr.get("x").and_then(|v| v.as_f64())? as f32;
+        let y = nr.get("y").and_then(|v| v.as_f64())? as f32;
+        let width = nr.get("width").and_then(|v| v.as_f64())? as f32;
+        let height = nr.get("height").and_then(|v| v.as_f64())? as f32;
+        return Some(NormalizedRect {
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+
+    // Fallback: use rect with absolute pixel coords
+    let rect = el
+        .get("rect")
+        .or_else(|| el.get("state").and_then(|s| s.get("rect")))?;
+
+    let x = rect.get("x").and_then(|v| v.as_f64())? as f32;
+    let y = rect.get("y").and_then(|v| v.as_f64())? as f32;
+    let w = rect.get("width").and_then(|v| v.as_f64())? as f32;
+    let h = rect.get("height").and_then(|v| v.as_f64())? as f32;
+
+    if w > 0.0 && h > 0.0 {
+        // If coords look already normalized (all < 1.5), pass through
+        if x < 1.5 && y < 1.5 && w < 1.5 && h < 1.5 {
+            return Some(NormalizedRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+        }
+        // Otherwise assume pixel coords with 1920x1080 default
+        return Some(NormalizedRect {
+            x: x / 1920.0,
+            y: y / 1080.0,
+            width: w / 1920.0,
+            height: h / 1080.0,
+        });
+    }
+
+    None
 }
 
 // ============================================================================
@@ -4942,7 +5295,22 @@ fn capture_for_diagnosis(app_handle: &tauri::AppHandle) -> Result<DiagnosisCaptu
     })
 }
 
-/// Compare two screenshots by sampling pixels. Returns similarity 0.0-1.0.
+/// Compare two screenshots by sampling ~10,000 random pixels. Returns similarity 0.0–1.0.
+///
+/// WHY THIS EXISTS AND WHY IT MUST NOT BE DELETED:
+///
+/// This is the **only** screenshot comparator that works when the WebView hasn't
+/// mounted yet (or has crashed). The browser canvas API is unavailable in exactly
+/// those situations, so any DOM/canvas-based comparison would fail.
+///
+/// The sole caller is `ui_bridge_diagnose_stuck_screen_handler` (diagnose-stuck),
+/// which runs precisely when the frontend is suspected to be frozen or absent —
+/// i.e. when no in-page API is reachable. The 10k-sample pixel comparison is fast
+/// enough for the diagnostic path and does not depend on any browser runtime.
+///
+/// A previous audit recommended deleting this in favour of a canvas-based diff,
+/// but that recommendation was based on the wrong premise that the WebView is
+/// always available when this code runs. It is not — that is the whole point.
 fn compute_screenshot_similarity(img1: &image::DynamicImage, img2: &image::DynamicImage) -> f64 {
     let rgba1 = img1.to_rgba8();
     let rgba2 = img2.to_rgba8();
@@ -5695,7 +6063,47 @@ pub async fn ui_bridge_ai_find_handler(
     let payload = serde_json::json!({ "params": body });
 
     match ui_bridge_request_sync(&state, "ai_find", payload).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(mut data) => {
+            // Confidence gate: if the best match is below threshold, return
+            // element: null so callers don't act on a wrong match.  The raw
+            // confidence and alternatives are preserved for debugging.
+            const MIN_CONFIDENCE: f64 = 0.75;
+            let inner = data.get("data").unwrap_or(&data);
+            let conf = inner
+                .get("confidence")
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.0);
+            if conf < MIN_CONFIDENCE && conf > 0.0 {
+                info!(
+                    "UI Bridge API: ai/find below confidence threshold ({:.2} < {:.2}) — returning null element",
+                    conf, MIN_CONFIDENCE
+                );
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("element".to_string(), serde_json::Value::Null);
+                    obj.insert(
+                        "belowThreshold".to_string(),
+                        serde_json::json!({
+                            "originalConfidence": conf,
+                            "threshold": MIN_CONFIDENCE,
+                        }),
+                    );
+                }
+                if let Some(inner_obj) = data
+                    .get_mut("data")
+                    .and_then(|d| d.as_object_mut())
+                {
+                    inner_obj.insert("element".to_string(), serde_json::Value::Null);
+                    inner_obj.insert(
+                        "belowThreshold".to_string(),
+                        serde_json::json!({
+                            "originalConfidence": conf,
+                            "threshold": MIN_CONFIDENCE,
+                        }),
+                    );
+                }
+            }
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: AI find failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))

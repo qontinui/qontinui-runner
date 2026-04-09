@@ -1089,6 +1089,219 @@ impl PgDb {
         Ok(affected as usize)
     }
 
+    /// Read-only audit of `sm_capture_screenshots` element_bounds_json.
+    ///
+    /// For each row with non-empty bounds, decodes the WebP to get physical
+    /// dimensions and classifies whether the bounds are stored in physical
+    /// pixels or CSS pixels (off by device-pixel-ratio).
+    ///
+    /// Returns a JSON value with per-row details and a summary.
+    pub async fn audit_capture_screenshot_bounds(&self) -> Result<serde_json::Value, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let rows = conn
+            .query(
+                r#"SELECT id, config_id, capture_index, screenshot_webp, width, height,
+                          element_bounds_json
+                   FROM sm_capture_screenshots
+                   WHERE element_bounds_json IS NOT NULL
+                     AND element_bounds_json <> ''
+                     AND element_bounds_json <> '[]'
+                     AND element_bounds_json <> '{}'
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|e| format!("PG audit bounds select: {}", e))?;
+
+        let common_dpr: f64 = 1.5;
+        let tolerance: f64 = 2.0; // allow 2px tolerance for rounding
+
+        let mut details: Vec<serde_json::Value> = Vec::new();
+        let mut count_physical = 0usize;
+        let mut count_css = 0usize;
+        let mut count_unknown = 0usize;
+        let mut count_decode_error = 0usize;
+
+        for row in &rows {
+            let id: String = row.get(0);
+            let config_id: String = row.get(1);
+            let capture_index: i32 = row.get(2);
+            let bytes: Vec<u8> = row.get(3);
+            let stored_w: i32 = row.get(4);
+            let stored_h: i32 = row.get(5);
+            let bounds_json_str: String = row.get(6);
+
+            // Decode image to get actual physical dimensions
+            let img = match image::load_from_memory(&bytes) {
+                Ok(img) => img,
+                Err(e) => {
+                    count_decode_error += 1;
+                    details.push(serde_json::json!({
+                        "id": id,
+                        "config_id": config_id,
+                        "capture_index": capture_index,
+                        "classification": "decode-error",
+                        "error": format!("{}", e),
+                    }));
+                    continue;
+                }
+            };
+            let phys_w = img.width() as f64;
+            let phys_h = img.height() as f64;
+
+            // Parse bounds to find max extents
+            let bounds_val: serde_json::Value = match serde_json::from_str(&bounds_json_str) {
+                Ok(v) => v,
+                Err(_) => {
+                    count_unknown += 1;
+                    details.push(serde_json::json!({
+                        "id": id,
+                        "config_id": config_id,
+                        "capture_index": capture_index,
+                        "classification": "unknown",
+                        "reason": "invalid JSON",
+                    }));
+                    continue;
+                }
+            };
+
+            // Collect all bounds objects — support both array-of-objects and
+            // object-with-nested-bounds patterns
+            let bound_items: Vec<&serde_json::Value> = if let Some(arr) = bounds_val.as_array() {
+                arr.iter().collect()
+            } else if bounds_val.is_object() {
+                vec![&bounds_val]
+            } else {
+                count_unknown += 1;
+                details.push(serde_json::json!({
+                    "id": id,
+                    "config_id": config_id,
+                    "capture_index": capture_index,
+                    "classification": "unknown",
+                    "reason": "bounds is not array or object",
+                }));
+                continue;
+            };
+
+            if bound_items.is_empty() {
+                count_unknown += 1;
+                details.push(serde_json::json!({
+                    "id": id,
+                    "config_id": config_id,
+                    "capture_index": capture_index,
+                    "classification": "unknown",
+                    "reason": "empty bounds",
+                }));
+                continue;
+            }
+
+            // Compute max right-edge and max bottom-edge from all bounds
+            let mut max_right: f64 = 0.0;
+            let mut max_bottom: f64 = 0.0;
+            let mut valid_bounds = 0usize;
+
+            for item in &bound_items {
+                let x = item.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = item.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let w = item.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let h = item.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if w > 0.0 || h > 0.0 {
+                    valid_bounds += 1;
+                    let right = x + w;
+                    let bottom = y + h;
+                    if right > max_right {
+                        max_right = right;
+                    }
+                    if bottom > max_bottom {
+                        max_bottom = bottom;
+                    }
+                }
+            }
+
+            if valid_bounds == 0 {
+                count_unknown += 1;
+                details.push(serde_json::json!({
+                    "id": id,
+                    "config_id": config_id,
+                    "capture_index": capture_index,
+                    "classification": "unknown",
+                    "reason": "no bounds with positive dimensions",
+                }));
+                continue;
+            }
+
+            // Classify: bounds extents vs physical image dimensions
+            // "physical-in-physical": max extents are close to decoded physical dims
+            let phys_match_w = (max_right - phys_w).abs() < tolerance
+                || (max_right > 0.0 && max_right <= phys_w);
+            let phys_match_h = (max_bottom - phys_h).abs() < tolerance
+                || (max_bottom > 0.0 && max_bottom <= phys_h);
+
+            // "css-in-physical": max extents * dpr are close to decoded physical dims
+            let css_right_scaled = max_right * common_dpr;
+            let css_bottom_scaled = max_bottom * common_dpr;
+            let css_match_w = (css_right_scaled - phys_w).abs() < tolerance
+                || (css_right_scaled > 0.0 && css_right_scaled <= phys_w);
+            let css_match_h = (css_bottom_scaled - phys_h).abs() < tolerance
+                || (css_bottom_scaled > 0.0 && css_bottom_scaled <= phys_h);
+
+            // Heuristic: if bounds extents are significantly smaller than physical
+            // and scaling them up matches better, classify as CSS
+            let ratio_w = if phys_w > 0.0 { max_right / phys_w } else { 0.0 };
+
+            let classification = if max_right <= 0.0 && max_bottom <= 0.0 {
+                "unknown"
+            } else if phys_match_w && phys_match_h {
+                "physical-in-physical"
+            } else if (ratio_w - 1.0 / common_dpr).abs() < 0.15 && (css_match_w || css_match_h) {
+                "css-in-physical"
+            } else {
+                "unknown"
+            };
+
+            match classification {
+                "physical-in-physical" => count_physical += 1,
+                "css-in-physical" => count_css += 1,
+                _ => count_unknown += 1,
+            }
+
+            details.push(serde_json::json!({
+                "id": id,
+                "config_id": config_id,
+                "capture_index": capture_index,
+                "classification": classification,
+                "physical_dims": { "width": phys_w, "height": phys_h },
+                "stored_dims": { "width": stored_w, "height": stored_h },
+                "bounds_extent": { "max_right": max_right, "max_bottom": max_bottom },
+                "bounds_count": valid_bounds,
+                "ratio_w": ratio_w,
+            }));
+        }
+
+        let total = details.len();
+        tracing::info!(
+            "audit_capture_screenshot_bounds: total={} physical={} css={} unknown={} decode_error={}",
+            total, count_physical, count_css, count_unknown, count_decode_error
+        );
+
+        Ok(serde_json::json!({
+            "summary": {
+                "total": total,
+                "physical_in_physical": count_physical,
+                "css_in_physical": count_css,
+                "unknown": count_unknown,
+                "decode_error": count_decode_error,
+                "common_dpr_used": common_dpr,
+            },
+            "rows": details,
+        }))
+    }
+
     // -- helpers --
 
     fn sm_row_to_config(row: &tokio_postgres::Row) -> SmConfig {

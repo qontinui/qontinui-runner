@@ -3620,3 +3620,18 @@ CREATE TABLE IF NOT EXISTS ticket_provider_configs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_ticket_provider_configs_workflow ON ticket_provider_configs(workflow_id);
+
+-- UI Bridge visual regression baselines (persistent store for PgBaselineStore)
+CREATE TABLE IF NOT EXISTS ui_bridge_baselines (
+    id              TEXT PRIMARY KEY,
+    target_scope    TEXT NOT NULL,
+    fingerprint     TEXT,
+    png_bytes       BYTEA NOT NULL,
+    width           INTEGER NOT NULL,
+    height          INTEGER NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata_json   TEXT,
+    ttl_days        INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_baselines_target ON ui_bridge_baselines(target_scope);

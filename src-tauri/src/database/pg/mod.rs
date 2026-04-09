@@ -64,6 +64,7 @@ pub mod token_analytics;
 pub mod token_usage;
 pub mod triggers;
 pub mod ui_bridge;
+pub mod ui_bridge_baselines;
 pub mod verification_tests;
 pub mod watchers;
 pub mod workflow_state;
@@ -655,6 +656,26 @@ const MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS rule_applications CASCADE;
             DROP TABLE IF EXISTS schema_version CASCADE;
             DROP TABLE IF EXISTS ui_bridge_state_groups CASCADE;
+        "#,
+    },
+    Migration {
+        version: 13,
+        description: "Add ui_bridge_baselines table for persistent visual regression baselines",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS ui_bridge_baselines (
+                id              TEXT PRIMARY KEY,
+                target_scope    TEXT NOT NULL,
+                fingerprint     TEXT,
+                png_bytes       BYTEA NOT NULL,
+                width           INTEGER NOT NULL,
+                height          INTEGER NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                metadata_json   TEXT,
+                ttl_days        INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_ui_bridge_baselines_target
+                ON ui_bridge_baselines(target_scope);
         "#,
     },
 ];

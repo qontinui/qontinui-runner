@@ -281,6 +281,17 @@ pub async fn sm_backfill_capture_screenshot_dimensions(
         .await
 }
 
+/// Read-only audit of element_bounds_json coordinate spaces across all
+/// `sm_capture_screenshots` rows. Classifies each row as physical-in-physical,
+/// css-in-physical, or unknown by comparing bounds extents against decoded
+/// WebP image dimensions.
+#[tauri::command]
+pub async fn sm_audit_capture_screenshot_bounds(
+    app_state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    app_state.pg_db.audit_capture_screenshot_bounds().await
+}
+
 // =============================================================================
 // Static Analysis Generation
 // =============================================================================

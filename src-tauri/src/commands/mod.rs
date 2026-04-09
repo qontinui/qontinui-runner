@@ -121,6 +121,7 @@ pub mod tiered_info;
 pub mod token_analytics;
 pub mod transcript; // Claude Code transcript import and standalone workflow generation
 pub mod ui_bridge; // UI Bridge for AI-driven UI automation
+pub mod ui_bridge_baselines; // UI Bridge visual regression baseline CRUD
 pub mod verification;
 pub mod video;
 pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::mcp::types::ApiState;
+use crate::screen;
 
 /// Default Sunshine admin API port
 const SUNSHINE_API_PORT: u16 = 47990;
@@ -240,31 +241,14 @@ fn capture_screenshot(
         }
     }
 
-    // Otherwise capture a monitor
-    use xcap::Monitor;
-    let monitors = Monitor::all().map_err(|e| format!("Failed to enumerate monitors: {}", e))?;
+    // Otherwise capture a monitor via the screen module
+    let mgr = screen::MonitorManager::detect()?;
+    let idx = monitor_index.unwrap_or_else(|| mgr.primary_index());
+    let captured = screen::CapturedScreenshot::from_monitor(&mgr, idx)?;
 
-    if monitors.is_empty() {
-        return Err("No monitors found".to_string());
-    }
-
-    let monitor = if let Some(idx) = monitor_index {
-        monitors
-            .get(idx)
-            .ok_or_else(|| format!("Monitor index {} out of range ({})", idx, monitors.len()))?
-    } else {
-        // Find primary monitor, fall back to first
-        monitors
-            .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .unwrap_or(&monitors[0])
-    };
-
-    let image = monitor
-        .capture_image()
-        .map_err(|e| format!("Failed to capture monitor: {}", e))?;
-
-    encode_rgba_to_jpeg(&image, quality)
+    // The streaming path uses JPEG encoding for lower latency
+    let rgb_image = captured.image.to_rgba8();
+    encode_rgba_to_jpeg(&rgb_image, quality)
 }
 
 /// Encode an RGBA image buffer to JPEG bytes.
