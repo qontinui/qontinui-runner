@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 
 /// The raw instance name from the env, if set and non-empty.
 pub fn instance_name() -> Option<String> {
@@ -43,6 +44,65 @@ pub fn scope_path(base: &Path) -> PathBuf {
     match data_subdir() {
         Some(sub) => base.join(sub),
         None => base.to_path_buf(),
+    }
+}
+
+/// The primary runner's port, if this is a secondary instance.
+pub fn primary_port() -> Option<u16> {
+    std::env::var("QONTINUI_PRIMARY_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+}
+
+/// Register this secondary instance with the primary runner.
+///
+/// Called on startup when `QONTINUI_PRIMARY_PORT` is set. Best-effort:
+/// failure is non-fatal (the runner works standalone). Returns the
+/// registration ID on success.
+pub async fn register_with_primary() -> Option<String> {
+    let primary = primary_port()?;
+    let own_name = instance_name()?;
+    let own_port = crate::mcp::types::get_mcp_api_port();
+
+    info!(
+        "Registering with primary runner on port {} (name={}, port={})",
+        primary, own_name, own_port
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let url = format!("http://127.0.0.1:{}/instances/register", primary);
+    let body = serde_json::json!({
+        "name": own_name,
+        "port": own_port,
+        "pid": std::process::id(),
+    });
+
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let data: serde_json::Value = resp.json().await.ok()?;
+            let id = data
+                .get("data")
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            info!("Registered with primary (id={:?})", id);
+            id
+        }
+        Ok(resp) => {
+            debug!(
+                "Registration with primary failed: HTTP {}",
+                resp.status()
+            );
+            None
+        }
+        Err(e) => {
+            debug!("Registration with primary failed: {}", e);
+            None
+        }
     }
 }
 

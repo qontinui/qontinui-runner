@@ -9,11 +9,13 @@
 //! on every launch/stop and **deleted** on intentional close so that a normal
 //! shutdown does not trigger restoration on the next start.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::database::pg::PgDb;
 use crate::settings::RunnerInstanceConfig;
 
 /// Status of a runner instance.
@@ -33,16 +35,196 @@ struct InstanceHandle {
     child: std::process::Child,
 }
 
-/// Manages spawned runner instance processes.
+/// An externally-registered runner instance (not a child process of this runner).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredInstance {
+    pub id: String,
+    pub name: String,
+    pub port: u16,
+    pub pid: Option<u32>,
+    pub registered_at: chrono::DateTime<chrono::Utc>,
+    pub last_heartbeat: chrono::DateTime<chrono::Utc>,
+    pub running_tasks: u32,
+}
+
+/// Manages spawned runner instance processes and externally-registered instances.
 pub struct InstanceManager {
+    /// Child processes spawned by this runner.
     instances: Mutex<HashMap<String, InstanceHandle>>,
+    /// Externally-registered instances (not child processes).
+    registered: Mutex<HashMap<String, RegisteredInstance>>,
+    /// PostgreSQL database for persistent instance registry.
+    pg_db: Arc<PgDb>,
 }
 
 impl InstanceManager {
-    pub fn new() -> Self {
+    pub fn new(pg_db: Arc<PgDb>) -> Self {
         Self {
             instances: Mutex::new(HashMap::new()),
+            registered: Mutex::new(HashMap::new()),
+            pg_db,
         }
+    }
+
+    /// Register the primary runner in the DB on startup.
+    pub async fn register_self_as_primary(&self) {
+        let port = crate::mcp::types::get_mcp_api_port();
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "localhost".to_string());
+        let pid = std::process::id();
+        let id = format!("primary-{}", port);
+
+        if let Err(e) = self
+            .pg_db
+            .upsert_runner_instance(&id, "primary", port, &hostname, true, Some(pid), "healthy")
+            .await
+        {
+            warn!("Failed to register primary in DB: {}", e);
+        } else {
+            info!("Registered primary runner in DB (port={}, pid={})", port, pid);
+        }
+    }
+
+    /// Register an externally-started runner instance.
+    /// Returns the assigned or existing instance ID.
+    pub async fn register_instance(
+        &self,
+        name: String,
+        port: u16,
+        pid: Option<u32>,
+    ) -> String {
+        let mut registered = self.registered.lock().await;
+
+        // Check if already registered by port
+        if let Some(existing) = registered.values_mut().find(|r| r.port == port) {
+            existing.name = name;
+            existing.pid = pid;
+            existing.last_heartbeat = chrono::Utc::now();
+            info!(
+                "Updated registration for instance '{}' on port {}",
+                existing.name, existing.port
+            );
+            return existing.id.clone();
+        }
+
+        let id = format!(
+            "ext-{}-{}",
+            port,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % 100000
+        );
+        let now = chrono::Utc::now();
+        let inst = RegisteredInstance {
+            id: id.clone(),
+            name: name.clone(),
+            port,
+            pid,
+            registered_at: now,
+            last_heartbeat: now,
+            running_tasks: 0,
+        };
+        info!(
+            "Registered external instance '{}' (id={}, port={})",
+            name, id, port
+        );
+        registered.insert(id.clone(), inst);
+        drop(registered); // release lock before async DB call
+
+        // Write-through to PostgreSQL
+        let hostname = "localhost".to_string();
+        if let Err(e) = self
+            .pg_db
+            .upsert_runner_instance(&id, &name, port, &hostname, false, pid, "healthy")
+            .await
+        {
+            warn!("Failed to persist registered instance to DB: {}", e);
+        }
+
+        id
+    }
+
+    /// Update heartbeat for a registered instance.
+    pub async fn update_heartbeat(
+        &self,
+        id: &str,
+        running_tasks: Option<u32>,
+    ) -> bool {
+        let mut registered = self.registered.lock().await;
+        if let Some(inst) = registered.get_mut(id) {
+            inst.last_heartbeat = chrono::Utc::now();
+            if let Some(count) = running_tasks {
+                inst.running_tasks = count;
+            }
+            drop(registered);
+
+            // Write-through to DB
+            let _ = self
+                .pg_db
+                .update_runner_instance_heartbeat(id, running_tasks, "healthy")
+                .await;
+            return true;
+        }
+        drop(registered);
+        false
+    }
+
+    /// Deregister an externally-registered instance.
+    pub async fn deregister_instance(&self, id: &str) -> bool {
+        let mut registered = self.registered.lock().await;
+        let removed = registered.remove(id).is_some();
+        drop(registered);
+
+        // Remove from DB too
+        let _ = self.pg_db.remove_runner_instance(id).await;
+        removed
+    }
+
+    /// Get all registered (external) instances.
+    pub async fn get_registered_instances(&self) -> Vec<RegisteredInstance> {
+        let registered = self.registered.lock().await;
+        registered.values().cloned().collect()
+    }
+
+    /// Allocate the next free port in the 9877-9899 range.
+    ///
+    /// Three-way check: in-memory child processes + DB registry + TCP port probe.
+    pub async fn allocate_port(&self) -> Result<u16, String> {
+        let instances = self.instances.lock().await;
+        let child_ports: std::collections::HashSet<u16> =
+            instances.values().map(|h| h.config.port).collect();
+        drop(instances);
+
+        let registered = self.registered.lock().await;
+        let reg_ports: std::collections::HashSet<u16> =
+            registered.values().map(|r| r.port).collect();
+        drop(registered);
+
+        let db_ports: std::collections::HashSet<u16> = self
+            .pg_db
+            .get_all_runner_instances()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.port as u16)
+            .collect();
+
+        let own_port = crate::mcp::types::get_mcp_api_port();
+
+        (9877..=9899)
+            .find(|p| {
+                *p != own_port
+                    && !child_ports.contains(p)
+                    && !reg_ports.contains(p)
+                    && !db_ports.contains(p)
+                    && !crate::process_capture::health::is_port_in_use(*p)
+            })
+            .ok_or_else(|| {
+                "No available ports in range 9877-9899. Stop some instances first.".to_string()
+            })
     }
 
     /// Get the IDs of all currently running instances.
@@ -91,6 +273,11 @@ impl InstanceManager {
         cmd.env("QONTINUI_PORT", config.port.to_string());
         cmd.env("QONTINUI_INSTANCE_NAME", &config.name);
 
+        // Propagate the primary runner's port so secondaries can proxy
+        // process capture requests back and send heartbeats.
+        let own_port = crate::mcp::types::get_mcp_api_port();
+        cmd.env("QONTINUI_PRIMARY_PORT", own_port.to_string());
+
         // Critical: remove CLAUDECODE env var so Claude CLI can start inside the instance
         cmd.env_remove("CLAUDECODE");
 
@@ -130,6 +317,26 @@ impl InstanceManager {
         drop(instances); // release lock before file I/O
         save_active_instances(&running);
 
+        // Write-through to DB
+        let hostname = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "localhost".to_string());
+        if let Err(e) = self
+            .pg_db
+            .upsert_runner_instance(
+                &config.id,
+                &config.name,
+                config.port,
+                &hostname,
+                false,
+                Some(pid),
+                "starting",
+            )
+            .await
+        {
+            warn!("Failed to persist launched instance to DB: {}", e);
+        }
+
         Ok(pid)
     }
 
@@ -153,6 +360,9 @@ impl InstanceManager {
             let running: Vec<String> = instances.keys().cloned().collect();
             drop(instances);
             save_active_instances(&running);
+
+            // Remove from DB
+            let _ = self.pg_db.remove_runner_instance(id).await;
 
             Ok(())
         } else {

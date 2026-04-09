@@ -56,6 +56,7 @@ mod graphql;
 mod health_monitor;
 mod heartbeat;
 mod instance;
+mod instance_health;
 mod instance_manager;
 mod iteration_bundle;
 #[cfg(windows)]
@@ -315,7 +316,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_client_manager = mcp_client::McpClientManager::new();
 
     // Create instance manager for multi-instance dev workflows
-    let instance_manager = Arc::new(instance_manager::InstanceManager::new());
+    let instance_manager = Arc::new(instance_manager::InstanceManager::new(pg_db.clone()));
 
     // Create session manager for interactive Claude CLI sessions
     let session_manager = Arc::new(claude_session::SessionManager::new());
@@ -361,6 +362,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         )),
         container_executor: TokioMutex::new(None), // Initialized via container settings when enabled
         run_cost_trackers: TokioMutex::new(std::collections::HashMap::new()),
+        working_representation_cache: {
+            let cache = Arc::new(crate::memory::working_representation::WorkingRepresentationCache::new());
+            crate::memory::working_representation::WorkingRepresentationCache::set_global(cache.clone());
+            cache
+        },
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -590,6 +596,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::test_ai_connection,
             commands::ai_settings::check_claude_cli_auth,
             commands::ai_settings::check_accounts_usage,
+            commands::ai_settings::get_claude_accounts,
+            commands::ai_settings::switch_claude_account,
             commands::ai_settings::refresh_claude_cli_auth,
             commands::ai_settings::get_agentic_settings,
             commands::ai_settings::save_agentic_settings,
@@ -1464,9 +1472,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Start heartbeat background task for fleet registration
             heartbeat::start_heartbeat(heartbeat_app_state);
 
-            // Note: secondary registration with the primary is handled by the
-            // heartbeat service (heartbeat.rs) which retries every 15s. No
-            // separate registration spawn needed here.
+            // Register this runner in the PostgreSQL instance registry.
+            // Primary registers itself; secondaries register via heartbeat to the primary.
+            if !instance::is_secondary() {
+                let im = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
+                let startup_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    im.register_self_as_primary().await;
+                    // Clean up stale entries from previous sessions
+                    instance_health::startup_cleanup(&startup_pg).await;
+                });
+
+                // Start background health monitor for secondary instances
+                let health_pg = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                let health_im = app.state::<Arc<instance_manager::InstanceManager>>().inner().clone();
+                instance_health::start_instance_health_monitor(health_pg, health_im);
+            }
 
             // Start scheduler service in background (skip for secondary instances to avoid duplicate executions)
             if std::env::var("QONTINUI_INSTANCE_NAME").is_ok() {

@@ -700,15 +700,19 @@ pub async fn get_instances(
         reachable: true,
     }];
 
-    // Add configured secondary instances (skip any that match our own port)
-    let configs = crate::settings::get_runner_instances();
+    // Collect all known ports to avoid duplicates
+    let mut seen_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    seen_ports.insert(self_port);
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(1))
         .build()
         .ok();
 
+    // Add configured secondary instances (skip any that match our own port)
+    let configs = crate::settings::get_runner_instances();
     for config in &configs {
-        if config.port == 0 || config.port == self_port || config.port < 1024 {
+        if config.port == 0 || config.port < 1024 || !seen_ports.insert(config.port) {
             continue;
         }
         let reachable = if let Some(ref client) = client {
@@ -723,6 +727,48 @@ pub async fn get_instances(
             is_self: false,
             reachable,
         });
+    }
+
+    // Add externally-registered instances (from in-memory register endpoint)
+    let registered = state.instance_manager.get_registered_instances().await;
+    for reg in &registered {
+        if !seen_ports.insert(reg.port) {
+            continue;
+        }
+        let reachable = if let Some(ref client) = client {
+            let url = format!("http://localhost:{}/health", reg.port);
+            client.get(&url).send().await.is_ok()
+        } else {
+            false
+        };
+        instances.push(DiscoveredInstance {
+            name: Some(reg.name.clone()),
+            port: reg.port,
+            is_self: false,
+            reachable,
+        });
+    }
+
+    // Add instances from PostgreSQL (survives restarts, catches externally-registered runners)
+    if let Ok(db_instances) = state.app_state.pg_db.get_all_runner_instances().await {
+        for db_inst in &db_instances {
+            let port = db_inst.port as u16;
+            if !seen_ports.insert(port) {
+                continue; // already listed from another source
+            }
+            let reachable = if let Some(ref client) = client {
+                let url = format!("http://localhost:{}/health", port);
+                client.get(&url).send().await.is_ok()
+            } else {
+                false
+            };
+            instances.push(DiscoveredInstance {
+                name: Some(db_inst.name.clone()),
+                port,
+                is_self: false,
+                reachable,
+            });
+        }
     }
 
     Json(ApiResponse::success(instances))
@@ -1475,13 +1521,23 @@ async fn spawn_instance(
             Json(ApiResponse::error("Instance name must not be empty")),
         ));
     }
-    let port = body.port;
-    if port < 1024 {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error("Port must be >= 1024")),
-        ));
-    }
+
+    // Auto-allocate port if not specified
+    let port = match body.port {
+        Some(p) if p < 1024 => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("Port must be >= 1024")),
+            ));
+        }
+        Some(p) => p,
+        None => state.instance_manager.allocate_port().await.map_err(|e| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiResponse::error(e)),
+            )
+        })?,
+    };
 
     // Generate ID
     let id = format!(
@@ -1520,7 +1576,9 @@ async fn spawn_instance(
             )
         })?;
 
-    // Register with supervisor if reachable
+    // Register with supervisor if reachable (best-effort).
+    // If no supervisor, the primary runner is already the coordinator via
+    // the instance registry (Phase 1-4 of multi-instance awareness).
     let supervisor_port: u16 = std::env::var("QONTINUI_SUPERVISOR_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1531,11 +1589,17 @@ async fn spawn_instance(
         .build()
         .ok();
     if let Some(client) = client {
-        let _ = client
+        match client
             .post(&sup_url)
             .json(&serde_json::json!({ "name": name, "port": port }))
             .send()
-            .await;
+            .await
+        {
+            Ok(_) => tracing::debug!("Registered spawned instance with supervisor"),
+            Err(_) => tracing::debug!(
+                "Supervisor not reachable — primary runner is the coordinator"
+            ),
+        }
     }
 
     tracing::info!(
@@ -1608,7 +1672,189 @@ async fn launch_instance(
 #[derive(serde::Deserialize)]
 struct SpawnInstanceRequest {
     name: String,
+    /// Port for the new instance. If omitted, auto-allocated from 9877-9899.
+    port: Option<u16>,
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterInstanceRequest {
+    name: String,
     port: u16,
+    pid: Option<u32>,
+}
+
+/// POST /instances/register — register an externally-started runner with the primary.
+async fn register_instance(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<RegisterInstanceRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Instance name must not be empty")),
+        ));
+    }
+    if body.port < 1024 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Port must be >= 1024")),
+        ));
+    }
+
+    let self_port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if body.port == self_port {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Cannot register with the same port as the primary")),
+        ));
+    }
+
+    let id = state
+        .instance_manager
+        .register_instance(name.clone(), body.port, body.pid)
+        .await;
+
+    // Note: we intentionally do NOT persist to settings.json here.
+    // Externally-registered instances are transient — they re-register
+    // on startup via heartbeat. Persistent storage is added in Phase 2
+    // via the runner_instances PostgreSQL table.
+
+    tracing::info!(
+        "Registered instance '{}' (id={}, port={}, pid={:?})",
+        name,
+        id,
+        body.port,
+        body.pid
+    );
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "id": id,
+        "primary_port": self_port,
+    }))))
+}
+
+#[derive(serde::Deserialize)]
+struct HeartbeatRequest {
+    running_task_count: Option<u32>,
+    #[allow(dead_code)]
+    running_task_ids: Option<Vec<String>>,
+}
+
+/// POST /instances/{id}/heartbeat — update heartbeat for a registered instance.
+///
+/// Returns 200 if the instance is known, 404 if not (secondary should re-register).
+async fn instance_heartbeat(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<HeartbeatRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (axum::http::StatusCode, Json<ApiResponse<()>>)> {
+    let updated = state
+        .instance_manager
+        .update_heartbeat(&id, body.running_task_count)
+        .await;
+
+    if updated {
+        Ok(Json(ApiResponse::success(serde_json::json!({
+            "acknowledged": true,
+        }))))
+    } else {
+        Err((
+            axum::http::StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Instance not registered — re-register with POST /instances/register")),
+        ))
+    }
+}
+
+/// GET /runners — supervisor-compatible listing of all known runner instances.
+///
+/// Returns the same shape as the supervisor's `GET /runners` endpoint so that
+/// scripts (runner_status.py, runner_lock.py, manual-test) can target either
+/// the supervisor (port 9875) or the primary runner (port 9876).
+async fn list_runners(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    let self_port = state
+        .app_state
+        .api_port
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let self_name = std::env::var("QONTINUI_INSTANCE_NAME")
+        .ok()
+        .unwrap_or_else(|| "primary".to_string());
+    let is_primary = !crate::instance::is_secondary();
+
+    let mut runners = Vec::new();
+
+    // Self
+    runners.push(serde_json::json!({
+        "id": format!("primary-{}", self_port),
+        "name": self_name,
+        "port": self_port,
+        "is_primary": is_primary,
+        "running": true,
+        "pid": std::process::id(),
+        "api_responding": true,
+    }));
+
+    let mut seen_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    seen_ports.insert(self_port);
+
+    // From DB
+    if let Ok(db_instances) = state.app_state.pg_db.get_all_runner_instances().await {
+        for inst in &db_instances {
+            let port = inst.port as u16;
+            if !seen_ports.insert(port) {
+                continue;
+            }
+            runners.push(serde_json::json!({
+                "id": inst.id,
+                "name": inst.name,
+                "port": port,
+                "is_primary": inst.is_primary,
+                "running": inst.status == "healthy" || inst.status == "starting",
+                "pid": inst.pid,
+                "api_responding": inst.status == "healthy",
+            }));
+        }
+    }
+
+    // From in-memory registered
+    let registered = state.instance_manager.get_registered_instances().await;
+    for reg in &registered {
+        if !seen_ports.insert(reg.port) {
+            continue;
+        }
+        runners.push(serde_json::json!({
+            "id": reg.id,
+            "name": reg.name,
+            "port": reg.port,
+            "is_primary": false,
+            "running": true,
+            "pid": reg.pid,
+            "api_responding": true,
+        }));
+    }
+
+    Json(serde_json::json!(runners))
+}
+
+/// POST /instances/purge-stale — immediately clean up stale/dead instances.
+async fn purge_stale_instances(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let (marked, cleaned) = crate::instance_health::purge_stale_instances(
+        &state.app_state.pg_db,
+        &state.instance_manager,
+    )
+    .await;
+
+    Json(ApiResponse::success(serde_json::json!({
+        "marked_unhealthy": marked,
+        "cleaned_up": cleaned,
+    })))
 }
 
 pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
@@ -1629,10 +1875,14 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/findings/summary", get(get_findings_summary))
         .route("/launch-debug-chrome", post(launch_debug_chrome))
         .route("/status", get(get_status))
+        .route("/runners", get(list_runners))
         .route("/instances", get(get_instances))
         .route("/instances/spawn", post(spawn_instance))
+        .route("/instances/register", post(register_instance))
+        .route("/instances/purge-stale", post(purge_stale_instances))
         .route("/instances/{id}/stop", post(stop_instance))
         .route("/instances/{id}/launch", post(launch_instance))
+        .route("/instances/{id}/heartbeat", post(instance_heartbeat))
         .route("/tool-version", get(get_tool_version))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))

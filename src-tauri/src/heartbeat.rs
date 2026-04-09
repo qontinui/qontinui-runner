@@ -27,15 +27,27 @@ struct HeartbeatPayload {
 /// Start the heartbeat background task.
 ///
 /// Spawns a tokio task that sends a heartbeat POST to the web backend
-/// every 30 seconds. The backend URL is configured via `QONTINUI_WEB_BACKEND_URL`
-/// environment variable (default: `http://localhost:8000`).
+/// every 30 seconds. If this is a secondary instance (`QONTINUI_PRIMARY_PORT`
+/// is set), also sends a heartbeat to the primary runner every 15 seconds.
 pub fn start_heartbeat(app_state: Arc<AppState>) {
     let backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL")
         .unwrap_or_else(|_| "http://localhost:8000".to_string());
 
     let heartbeat_url = format!("{}/api/v1/dev-dashboard/heartbeat", backend_url);
 
-    info!("Starting heartbeat service -> {}", heartbeat_url);
+    // If this is a secondary, also heartbeat to the primary runner
+    let primary_port = crate::instance::primary_port();
+    let registration_id: Arc<tokio::sync::Mutex<Option<String>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    if let Some(pp) = primary_port {
+        info!(
+            "Starting heartbeat service -> {} + primary runner on port {}",
+            heartbeat_url, pp
+        );
+    } else {
+        info!("Starting heartbeat service -> {}", heartbeat_url);
+    }
 
     tauri::async_runtime::spawn(async move {
         // Wait 5 seconds for the API to be ready before the first heartbeat
@@ -67,19 +79,20 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         }
         .to_string();
 
-        let mut ticker = interval(Duration::from_secs(30));
+        // Backend heartbeat: every 30s. Primary heartbeat: every 15s.
+        // We tick every 15s and send the backend heartbeat every other tick.
+        let mut ticker = interval(Duration::from_secs(15));
+        let mut tick_count: u64 = 0;
 
         loop {
             ticker.tick().await;
+            tick_count += 1;
 
             let port = app_state.api_port.load(Ordering::Relaxed);
             if port == 0 {
                 debug!("API port not yet assigned, skipping heartbeat");
                 continue;
             }
-
-            // Get local IP address
-            let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
 
             // Get running task count from PostgreSQL
             let (task_count, task_ids) = match app_state.pg_db.get_running_task_runs(None).await {
@@ -91,26 +104,74 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 Err(_) => get_running_tasks_fallback(),
             };
 
-            let payload = HeartbeatPayload {
-                hostname: hostname.clone(),
-                ip,
-                port,
-                instance_name: instance_name.clone(),
-                os: os.clone(),
-                os_version: None,
-                running_task_count: task_count,
-                running_task_ids: task_ids,
-            };
+            // Send to web backend every 30s (every other tick)
+            if tick_count % 2 == 0 {
+                let ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+                let payload = HeartbeatPayload {
+                    hostname: hostname.clone(),
+                    ip,
+                    port,
+                    instance_name: instance_name.clone(),
+                    os: os.clone(),
+                    os_version: None,
+                    running_task_count: task_count,
+                    running_task_ids: task_ids.clone(),
+                };
 
-            match client.post(&heartbeat_url).json(&payload).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    debug!("Heartbeat sent successfully");
+                match client.post(&heartbeat_url).json(&payload).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!("Heartbeat sent to backend");
+                    }
+                    Ok(resp) => {
+                        debug!("Backend heartbeat response: {}", resp.status());
+                    }
+                    Err(e) => {
+                        debug!("Backend heartbeat failed: {}", e);
+                    }
                 }
-                Ok(resp) => {
-                    debug!("Heartbeat response: {}", resp.status());
-                }
-                Err(e) => {
-                    debug!("Heartbeat failed (backend may not be running): {}", e);
+            }
+
+            // Send to primary runner every 15s (every tick) if we're a secondary
+            if let Some(pp) = primary_port {
+                // Resolve our registration ID (cached after first successful registration)
+                let reg_id = {
+                    let guard = registration_id.lock().await;
+                    guard.clone()
+                };
+
+                let id = match reg_id {
+                    Some(id) => id,
+                    None => {
+                        // Try to register first
+                        if let Some(id) = crate::instance::register_with_primary().await {
+                            let mut guard = registration_id.lock().await;
+                            *guard = Some(id.clone());
+                            id
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+
+                let url = format!("http://127.0.0.1:{}/instances/{}/heartbeat", pp, id);
+                let body = serde_json::json!({
+                    "running_task_count": task_count,
+                    "running_task_ids": task_ids,
+                });
+
+                match client.post(&url).json(&body).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        debug!("Heartbeat sent to primary runner");
+                    }
+                    Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                        // Primary doesn't know us — clear cached ID so we re-register
+                        debug!("Primary returned 404 for heartbeat — will re-register");
+                        let mut guard = registration_id.lock().await;
+                        *guard = None;
+                    }
+                    Ok(_) | Err(_) => {
+                        debug!("Primary runner heartbeat failed (primary may be down)");
+                    }
                 }
             }
         }
