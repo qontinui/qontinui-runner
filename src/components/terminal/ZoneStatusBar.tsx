@@ -25,8 +25,16 @@ import {
 } from "lucide-react";
 import type { AnalysisType } from "./TerminalAnalysisPanel";
 import { DocFinderModal } from "./DocFinderModal";
-import type { TerminalTab } from "./useTerminalManager";
-import type { SessionState, ZoneAssignments } from "./useZoneLayout";
+import type { SessionState } from "./useZoneLayout";
+import { instanceStorage } from "@/lib/instance-storage";
+import {
+  useTerminalCore,
+  useSessionState,
+  useZoneMetadata,
+  useTransitionEffects,
+  useAiFeatures,
+  useUIStateCx,
+} from "./contexts";
 
 const ANALYSIS_BUTTONS: { type: AnalysisType; label: string; title: string }[] = [
   { type: "session-summary", label: "Summarize", title: "Summarize active terminal session" },
@@ -50,60 +58,9 @@ const ANALYSIS_BUTTONS: { type: AnalysisType; label: string; title: string }[] =
 ];
 
 interface ZoneStatusBarProps {
-  tabs: TerminalTab[];
-  assignments: ZoneAssignments;
-  sessionStates: Record<string, SessionState>;
-  onJumpToNeedsInput: () => void;
-  onShowShortcuts?: () => void;
-  autoFocus?: boolean;
-  onToggleAutoFocus?: () => void;
-  soundEnabled?: boolean;
-  onToggleSound?: () => void;
-  desktopNotify?: boolean;
-  onToggleDesktopNotify?: () => void;
-  stateDurations?: Record<string, string>;
-  onSelectByState?: (state: SessionState) => void;
-  metrics?: {
-    totalApprovals: number;
-    totalRejections: number;
-    totalBroadcasts: number;
-    sessionsCreated: number;
-  };
-  zoneLabels?: Record<number, string>;
+  /** Callbacks from useZoneActions — kept as props until that hook moves to context */
   onExport?: () => void;
   onSortZones?: () => void;
-  eventHistory?: { time: number; type: string; session: string; zone?: number; color: string }[];
-  labelColorMap?: Record<string, string>;
-  focusMode?: boolean;
-  onToggleFocusMode?: () => void;
-  autoApprovePatterns?: string[];
-  onSetAutoApprovePatterns?: (patterns: string[]) => void;
-  autoApproveCount?: number;
-  stateTimeAccum?: Record<SessionState, number>;
-  autoRestart?: boolean;
-  onToggleAutoRestart?: () => void;
-  autoRestartCount?: number;
-  activeTagFilters?: Set<string>;
-  onSetActiveTagFilters?: (filters: Set<string>) => void;
-  allTags?: string[];
-  lastOutputLines?: Record<string, string[]>;
-  // Session manager
-  frozenSessionCount?: number;
-  // Action bar props (always visible)
-  showSidebar: boolean;
-  onToggleSidebar: () => void;
-  isGenerating: boolean;
-  isAnalyzing: boolean;
-  onAnalyze: (type: AnalysisType) => void;
-  onGenerateFromSession: () => void;
-  planFileName: string | null;
-  isPlanLoading: boolean;
-  onRefreshPlan: () => void;
-  onBuildPlanFromFile?: () => void;
-  onBuildPlanImplementationFromFile?: () => void;
-  onToggleFindings: () => void;
-  findingsActive: boolean;
-  findingsCount: number;
   onOpenDocFile?: (filePath: string) => void;
 }
 
@@ -124,55 +81,77 @@ const STATE_LABELS: Record<SessionState, string> = {
 };
 
 export function ZoneStatusBar({
-  tabs,
-  sessionStates,
-  onJumpToNeedsInput,
-  onShowShortcuts,
-  autoFocus,
-  onToggleAutoFocus,
-  soundEnabled,
-  onToggleSound,
-  desktopNotify,
-  onToggleDesktopNotify,
-  onSelectByState,
-  metrics,
-  zoneLabels,
   onExport,
   onSortZones,
-  eventHistory,
-  labelColorMap,
-  focusMode,
-  onToggleFocusMode,
-  autoApprovePatterns,
-  onSetAutoApprovePatterns,
-  autoApproveCount,
-  stateTimeAccum,
-  autoRestart,
-  onToggleAutoRestart,
-  autoRestartCount,
-  activeTagFilters: externalActiveTagFilters,
-  onSetActiveTagFilters: externalSetActiveTagFilters,
-  allTags: externalAllTags,
-  assignments,
-  stateDurations,
-  lastOutputLines,
-  frozenSessionCount,
-  showSidebar,
-  onToggleSidebar,
-  isGenerating,
-  isAnalyzing,
-  onAnalyze,
-  onGenerateFromSession,
-  planFileName,
-  isPlanLoading,
-  onRefreshPlan,
-  onBuildPlanFromFile,
-  onBuildPlanImplementationFromFile,
-  onToggleFindings,
-  findingsActive,
-  findingsCount,
   onOpenDocFile,
 }: ZoneStatusBarProps) {
+  // Read all data from contexts instead of props
+  const { tabs, zoneLayout } = useTerminalCore();
+  const assignments = zoneLayout.assignments;
+  const { sessionStates, stateDurations, lastOutputLines, stateTimeAccum: stateTimeAccumRef, activeFindings } = useSessionState();
+  const { labelsAndTags, eventHistory, metrics: metricsRef } = useZoneMetadata();
+  const zoneLabels = labelsAndTags.zoneLabels;
+  const labelColorMap = labelsAndTags.labelColorMap;
+  const externalActiveTagFilters = labelsAndTags.activeTagFilters;
+  const externalSetActiveTagFilters = labelsAndTags.setActiveTagFilters;
+  const externalAllTags = labelsAndTags.allTags;
+  const metrics = metricsRef.current;
+  const stateTimeAccum = stateTimeAccumRef.current;
+  const transitionEffects = useTransitionEffects();
+  const autoFocus = transitionEffects.autoFocusNeedsInput;
+  const onToggleAutoFocus = transitionEffects.toggleAutoFocus;
+  const soundEnabled = transitionEffects.soundEnabled;
+  const onToggleSound = transitionEffects.toggleSound;
+  const desktopNotify = transitionEffects.desktopNotify;
+  const autoApprovePatterns = transitionEffects.autoApprovePatterns;
+  const onSetAutoApprovePatterns = transitionEffects.setAutoApprovePatterns;
+  const autoApproveCount = transitionEffects.autoApproveCount;
+  const autoRestart = transitionEffects.autoRestart;
+  const autoRestartCount = transitionEffects.autoRestartCount;
+  const { workflowGen, analysis, findingsActions, sessionManager } = useAiFeatures();
+  const showSidebar = workflowGen.showSidebar;
+  const isGenerating = workflowGen.isGenerating;
+  const isAnalyzing = analysis.isAnalyzing;
+  const onAnalyze = analysis.handleAnalyze;
+  const onGenerateFromSession = workflowGen.handleGenerateFromLatestSession;
+  const planFileName = workflowGen.planFileName;
+  const isPlanLoading = workflowGen.isPlanLoading;
+  const onRefreshPlan = workflowGen.loadPlanContent;
+  const onBuildPlanFromFile = workflowGen.handleBuildPlanFromFile;
+  const onBuildPlanImplementationFromFile = workflowGen.handleBuildPlanImplementationFromFile;
+  const onToggleFindings = findingsActions.handleToggleFindings;
+  const findingsActive = workflowGen.rightPanelMode === "findings";
+  const findingsCount = activeFindings.length;
+  const frozenSessionCount = sessionManager.frozenCount;
+  const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();
+  const focusMode = uiState.focusMode;
+  const onToggleFocusMode = toggleFocusMode;
+  const onToggleSidebar = () => workflowGen.setShowSidebar((v: boolean) => !v);
+  const onJumpToNeedsInput = () => zoneLayout.focusNextNeedsInput(sessionStates);
+  const onShowShortcuts = () => dispatch({ type: "SET_SHOW_SHORTCUTS", payload: true });
+  const onToggleDesktopNotify = () => {
+    transitionEffects.setDesktopNotify((prev: boolean) => {
+      const next = !prev;
+      instanceStorage.setItem("zone-desktop-notify", String(next));
+      return next;
+    });
+  };
+  const onSelectByState = (state: SessionState) => {
+    const zones = new Set<number>();
+    for (const [zoneStr, tabId] of Object.entries(assignments)) {
+      if ((sessionStates[tabId] ?? "idle") === state) {
+        zones.add(Number(zoneStr));
+      }
+    }
+    dispatch({ type: "SET_SELECTED_ZONES", payload: zones });
+  };
+  const onToggleAutoRestart = () => {
+    transitionEffects.setAutoRestart((prev: boolean) => {
+      const next = !prev;
+      instanceStorage.setItem("zone-auto-restart", String(next));
+      return next;
+    });
+  };
   const [showDocFinder, setShowDocFinder] = useState(false);
   const stateCounts = useMemo(() => {
     const counts: Record<SessionState, number> = {

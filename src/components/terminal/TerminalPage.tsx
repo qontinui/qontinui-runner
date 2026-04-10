@@ -470,73 +470,8 @@ function TerminalPageInner({
         fileLockStates={fileLockStates}
       />
       <ZoneStatusBar
-        tabs={tabs}
-        assignments={zoneLayout.assignments}
-        sessionStates={stateTracking.sessionStates}
-        onJumpToNeedsInput={() => zoneLayout.focusNextNeedsInput(stateTracking.sessionStates)}
-        onShowShortcuts={() => dispatch({ type: "SET_SHOW_SHORTCUTS", payload: true })}
-        autoFocus={transitionEffects.autoFocusNeedsInput}
-        onToggleAutoFocus={transitionEffects.toggleAutoFocus}
-        soundEnabled={transitionEffects.soundEnabled}
-        onToggleSound={transitionEffects.toggleSound}
-        desktopNotify={transitionEffects.desktopNotify}
-        onToggleDesktopNotify={() => {
-          transitionEffects.setDesktopNotify((prev) => {
-            const next = !prev;
-            instanceStorage.setItem("zone-desktop-notify", String(next));
-            return next;
-          });
-        }}
-        stateDurations={stateTracking.stateDurations}
-        onSelectByState={(state) => {
-          const zones = new Set<number>();
-          for (const [zoneStr, tabId] of Object.entries(zoneLayout.assignments)) {
-            if ((stateTracking.sessionStates[tabId] ?? "idle") === state) {
-              zones.add(Number(zoneStr));
-            }
-          }
-          dispatch({ type: "SET_SELECTED_ZONES", payload: zones });
-        }}
-        metrics={metrics.current}
-        zoneLabels={labelsAndTags.zoneLabels}
         onExport={handleExportOutput}
         onSortZones={handleSortZones}
-        eventHistory={eventHistory}
-        labelColorMap={labelsAndTags.labelColorMap}
-        focusMode={uiState.focusMode}
-        autoApprovePatterns={transitionEffects.autoApprovePatterns}
-        onSetAutoApprovePatterns={transitionEffects.setAutoApprovePatterns}
-        autoApproveCount={transitionEffects.autoApproveCount}
-        stateTimeAccum={stateTracking.stateTimeAccum.current}
-        autoRestart={transitionEffects.autoRestart}
-        onToggleAutoRestart={() => {
-          transitionEffects.setAutoRestart((prev) => {
-            const next = !prev;
-            instanceStorage.setItem("zone-auto-restart", String(next));
-            return next;
-          });
-        }}
-        autoRestartCount={transitionEffects.autoRestartCount}
-        onToggleFocusMode={toggleFocusMode}
-        activeTagFilters={labelsAndTags.activeTagFilters}
-        onSetActiveTagFilters={labelsAndTags.setActiveTagFilters}
-        allTags={labelsAndTags.allTags}
-        lastOutputLines={stateTracking.lastOutputLines}
-        frozenSessionCount={sessionManager.frozenCount}
-        showSidebar={workflowGen.showSidebar}
-        onToggleSidebar={() => workflowGen.setShowSidebar((v) => !v)}
-        isGenerating={workflowGen.isGenerating}
-        isAnalyzing={analysis.isAnalyzing}
-        onAnalyze={analysis.handleAnalyze}
-        onGenerateFromSession={workflowGen.handleGenerateFromLatestSession}
-        planFileName={workflowGen.planFileName}
-        isPlanLoading={workflowGen.isPlanLoading}
-        onRefreshPlan={workflowGen.loadPlanContent}
-        onBuildPlanFromFile={workflowGen.handleBuildPlanFromFile}
-        onBuildPlanImplementationFromFile={workflowGen.handleBuildPlanImplementationFromFile}
-        onToggleFindings={findingsActions.handleToggleFindings}
-        findingsActive={workflowGen.rightPanelMode === "findings"}
-        findingsCount={activeFindings.length}
         onOpenDocFile={handleOpenDocFile}
       />
       <TerminalNotification
