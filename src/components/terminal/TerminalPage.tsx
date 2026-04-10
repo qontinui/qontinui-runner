@@ -1,13 +1,11 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useEffect, useCallback, useRef, useMemo } from "react";
 import { useUIComponent } from "ui-bridge";
-import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { useFileConflicts } from "./useFileConflicts";
 import { SessionManagerPanel } from "./SessionManagerPanel";
-import { useSessionManager } from "./useSessionManager";
 import { ZoneGrid } from "./ZoneGrid";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { ZoneStatusBar } from "./ZoneStatusBar";
@@ -20,6 +18,7 @@ import {
   SessionStateProvider, useSessionState,
   ZoneMetadataProvider, useZoneMetadata,
   TransitionEffectsProvider, useTransitionEffects,
+  AiFeaturesProvider, useAiFeatures,
 } from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
@@ -28,11 +27,6 @@ import { OutputSearchBar } from "./OutputSearchBar";
 import { TerminalRightPanel } from "./TerminalRightPanel";
 import { TerminalOverlays } from "./TerminalOverlays";
 
-import { useShellIntegration } from "./useShellIntegration";
-import { useWorkflowGeneration } from "./useWorkflowGeneration";
-import { useAnalysis } from "./useAnalysis";
-import { useFindingsActions } from "./useFindingsActions";
-import { useTranscriptSessions } from "./useTranscriptSessions";
 import { useUIState } from "./useUIState";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
@@ -52,7 +46,12 @@ export function TerminalPage(props: TerminalPageProps) {
       <SessionStateProvider>
         <ZoneMetadataProvider>
           <TransitionEffectsProvider>
-            <TerminalPageInner {...props} />
+            <AiFeaturesProvider
+              onNavigateToBuilder={props.onNavigateToBuilder}
+              onNavigateToActive={props.onNavigateToActive}
+            >
+              <TerminalPageInner {...props} />
+            </AiFeaturesProvider>
           </TransitionEffectsProvider>
         </ZoneMetadataProvider>
       </SessionStateProvider>
@@ -130,132 +129,18 @@ function TerminalPageInner({
   const transitionEffects = useTransitionEffects();
   const { handleRestartInZone, handleRestartInZoneRef } = transitionEffects;
 
-  const rightPanelModeSetterRef = useRef<
-    React.Dispatch<React.SetStateAction<"transcript" | "workflow" | "analysis" | "findings" | null>>
-  >(() => {});
-  const selectedSessionSetterRef = useRef<React.Dispatch<React.SetStateAction<string | null>>>(
-    () => {},
-  );
-
-  const shellIntegration = useShellIntegration({
-    tabs,
-    updateTab,
-    renameTab,
-    createTerminal,
-    setSessionStates: stateTracking.setSessionStates,
-    terminalRefs,
-    setRightPanelMode: (v) => rightPanelModeSetterRef.current(v as never),
-    setSelectedTranscriptSessionId: (v) => selectedSessionSetterRef.current(v as never),
-  });
-
-  const getScrollback = useCallback((tabId: string, maxLines = 500): string => {
-    const ref = terminalRefs.current.get(tabId);
-    return ref?.current?.getScrollback?.(maxLines) ?? "";
-  }, []);
-
-  const getActiveSelection = useCallback((): string => {
-    if (!activeId) return "";
-    const ref = terminalRefs.current.get(activeId);
-    return ref?.current?.getSelection?.() ?? "";
-  }, [activeId]);
-
   const {
-    sessions: transcriptSessions,
-    loading: sessionsLoading,
-    refresh: refreshSessions,
-    loadMessages,
-  } = useTranscriptSessions();
-
-  const sessionManager = useSessionManager({
-    tabs,
-    sessionStates: stateTracking.sessionStates,
-    staleTabs: stateTracking.staleTabs,
+    shellIntegration,
+    workflowGen,
+    analysis,
+    findingsActions,
+    sessionManager,
     transcriptSessions,
-    sessionsLoading,
-    desktopNotify: transitionEffects.desktopNotify,
-    onRefreshSessions: refreshSessions,
-    onResumeSession: shellIntegration.handleResumeSession,
-    onSelectSession: (sessionId: string) => {
-      selectedSessionSetterRef.current(sessionId);
-      rightPanelModeSetterRef.current("transcript" as never);
-    },
-  });
-
-  const workflowGen = useWorkflowGeneration({
-    activeId,
-    tabs,
-    loadMessages,
-    onNavigateToBuilder,
-    onNavigateToActive,
-  });
-
-  const analysis = useAnalysis({
-    activeId,
-    tabs,
-    commandHistories: shellIntegration.commandHistories,
+    sessionSummary,
+    sessionSummaryLoading,
+    handleSummarizeSession,
     getScrollback,
-    getActiveSelection,
-    latestPlanContent: workflowGen.latestPlanContent,
-    setRightPanelMode: workflowGen.setRightPanelMode,
-  });
-
-  const findingsActions = useFindingsActions({
-    activeId,
-    tabs,
-    terminalRefs,
-    createTerminal,
-    pendingResumeRef: shellIntegration.pendingResumeRef,
-    runGeneration: workflowGen.runGeneration,
-    setRightPanelMode: workflowGen.setRightPanelMode,
-  });
-
-  // Session summary (AI Tier 2)
-  const [sessionSummary, setSessionSummary] = useState<string | null>(null);
-  const [sessionSummaryLoading, setSessionSummaryLoading] = useState(false);
-
-  const handleSummarizeSession = useCallback(
-    async (messages: Array<{ msg_type: string; text: string }>) => {
-      setSessionSummaryLoading(true);
-      setSessionSummary(null);
-      try {
-        // Build text from transcript messages
-        const text = messages
-          .map((m) => `${m.msg_type === "user" ? "User" : "Assistant"}: ${m.text}`)
-          .join("\n\n");
-        const result = await invoke<{ success: boolean; data?: unknown; message?: string }>(
-          "analyze_session_summary",
-          { input: text },
-        );
-        if (result.success && result.data) {
-          // Extract markdown content from first panel in the response
-          const data = result.data as
-            | Array<{ type?: string; content?: string }>
-            | { panels?: Array<{ content?: string }> };
-          let summaryContent: string | null = null;
-
-          if (Array.isArray(data)) {
-            // Direct array of panels
-            const markdownPanel = data.find((p) => p.type === "markdown" || p.content);
-            summaryContent = markdownPanel?.content ?? null;
-          } else if (data && "panels" in data && Array.isArray(data.panels)) {
-            summaryContent = data.panels[0]?.content ?? null;
-          }
-
-          setSessionSummary(summaryContent || "Summary generated but no content available.");
-        } else {
-          setSessionSummary(result.message || "Unable to generate summary.");
-        }
-      } catch {
-        setSessionSummary("Failed to generate summary.");
-      } finally {
-        setSessionSummaryLoading(false);
-      }
-    },
-    [],
-  );
-
-  rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
-  selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
+  } = useAiFeatures();
 
   const {
     state: uiState,

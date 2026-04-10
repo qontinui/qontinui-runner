@@ -13,3 +13,7 @@ export { useZoneMetadata } from "./useZoneMetadata";
 export { TransitionEffectsProvider } from "./TransitionEffectsContext";
 export type { TransitionEffectsContextValue } from "./TransitionEffectsContext";
 export { useTransitionEffects } from "./useTransitionEffects";
+
+export { AiFeaturesProvider } from "./AiFeaturesContext";
+export type { AiFeaturesContextValue } from "./AiFeaturesContext";
+export { useAiFeatures } from "./useAiFeatures";
