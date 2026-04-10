@@ -127,3 +127,10 @@ storybook-static/
 target-new/
 target-test/
 target-test2/
+target-agent/
+target-pool/
+target-check/
+target-fix-test/
+target-validate/
+target-run/
+.build-state/
