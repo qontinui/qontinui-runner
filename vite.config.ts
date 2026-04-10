@@ -10,8 +10,8 @@ export default defineConfig({
     react(),
     tailwindcss(),
     // Strip `crossorigin` attribute from script/link tags in built HTML.
-    // Tauri's custom-protocol asset handler doesn't send CORS headers,
-    // causing ES module loads to fail on cold WebView2 profiles.
+    // Tauri's custom-protocol asset handler + WebView2's module loader
+    // have issues on cold profiles (fresh EBWebView directories).
     {
       name: "strip-crossorigin",
       enforce: "post" as const,
