@@ -196,22 +196,6 @@ function TerminalPageInner({
     setNotification: workflowGen.setNotification,
   });
 
-  const approveTab = useCallback(
-    (tabId: string) => {
-      terminalRefs.current.get(tabId)?.current?.writeToTerminal("y\r");
-      incrementMetric("totalApprovals");
-    },
-    [incrementMetric],
-  );
-
-  const rejectTab = useCallback(
-    (tabId: string) => {
-      terminalRefs.current.get(tabId)?.current?.writeToTerminal("n\r");
-      incrementMetric("totalRejections");
-    },
-    [incrementMetric],
-  );
-
   useKeyboardShortcuts({
     activeId,
     tabs,
@@ -670,54 +654,8 @@ function TerminalPageInner({
       </div>
 
       <TerminalOverlays
-        showShortcutsOverlay={uiState.showShortcutsOverlay}
-        onCloseShortcuts={() => dispatch({ type: "SET_SHOW_SHORTCUTS", payload: false })}
-        showCommandPalette={uiState.showCommandPalette}
-        onCloseCommandPalette={() => dispatch({ type: "SET_SHOW_COMMAND_PALETTE", payload: false })}
-        tabs={tabs}
-        assignments={zoneLayout.assignments}
-        sessionStates={stateTracking.sessionStates}
-        focusedZone={zoneLayout.focusedZone}
-        onFocusZone={zoneLayout.setFocusedZone}
-        onApproveTab={approveTab}
-        onRejectTab={rejectTab}
-        onRestartZone={handleRestartInZone}
-        onTogglePin={labelsAndTags.togglePin}
-        pinnedZones={labelsAndTags.pinnedZones}
-        onApproveAll={() => {
-          const ni = tabs.filter((t) => stateTracking.sessionStates[t.id] === "needs-input");
-          incrementMetric("totalApprovals", ni.length);
-          addHistoryEvent("Approve all", `${ni.length} sessions`, undefined, "#9ece6a");
-          for (const tab of ni) {
-            terminalRefs.current.get(tab.id)?.current?.writeToTerminal("y\r");
-          }
-        }}
         onSortZones={handleSortZones}
         onExport={handleExportOutput}
-        onToggleFocusMode={toggleFocusMode}
-        focusMode={uiState.focusMode}
-        onToggleAutoFocus={transitionEffects.toggleAutoFocus}
-        autoFocus={transitionEffects.autoFocusNeedsInput}
-        onToggleSound={transitionEffects.toggleSound}
-        soundEnabled={transitionEffects.soundEnabled}
-        zoneLabels={labelsAndTags.zoneLabels}
-        onSetZoneLabel={labelsAndTags.setZoneLabel}
-        zoneCount={zoneLayout.layout.zones.length}
-        onCompareZones={(z1, z2) => {
-          dispatch({ type: "SET_SHOW_COMMAND_PALETTE", payload: false });
-          snapshots.setDiffZones([z1, z2]);
-        }}
-        onSnapshotZone={snapshots.snapshotZone}
-        onCompareSnapshot={(tabId) => {
-          snapshots.compareSnapshot(tabId);
-          dispatch({ type: "SET_SHOW_COMMAND_PALETTE", payload: false });
-        }}
-        snapshotZones={snapshots.snapshotZones}
-        diffZones={snapshots.diffZones}
-        lastOutputLines={stateTracking.lastOutputLines}
-        onCloseDiff={() => snapshots.setDiffZones(null)}
-        snapshotDiff={snapshots.snapshotDiff}
-        onCloseSnapshotDiff={snapshots.clearSnapshotDiff}
       />
     </div>
   );
