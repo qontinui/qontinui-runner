@@ -217,11 +217,246 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "lib-loading",
+        "name": "Loading — Fetching Library Items",
+        "description": "Initial state while the dashboard fetches items from all category endpoints in parallel. A spinner is displayed in the content area.",
+        "elements": [
+          { "role": "status" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-populated",
+            "name": "Items loaded",
+            "description": "All category fetches complete and at least one item exists",
+            "activateStates": ["lib-populated"],
+            "deactivateStates": ["lib-loading"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "loading-to-empty-library",
+            "name": "No items exist",
+            "description": "All category fetches complete but no items were returned",
+            "activateStates": ["lib-empty-library"],
+            "deactivateStates": ["lib-loading"],
+            "staysVisible": false,
+            "process": []
+          }
+        ]
+      },
+      {
+        "id": "lib-populated",
+        "name": "Populated — All Items Displayed",
+        "description": "Items are loaded and displayed sorted by modification time. The All filter pill is active, no search query is entered, and favorites filter is off. Users see the heading, total count, search input, type filter pills, and the item list.",
+        "elements": [
+          { "textContent": "Library Dashboard" },
+          { "textContains": "total items" },
+          { "placeholder": "Search across all categories..." },
+          { "textContains": "Recently modified items across all categories" }
+        ],
+        "transitions": [
+          {
+            "id": "populated-to-type-filtered",
+            "name": "Filter by asset type",
+            "description": "Click a specific type filter pill (e.g., Task, Workflow, Check) to narrow the list to that asset type",
+            "activateStates": ["lib-type-filtered"],
+            "deactivateStates": ["lib-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Workflow" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "populated-to-search-active",
+            "name": "Enter search query",
+            "description": "Type in the search input to filter items across all categories by name, description, category, or tags",
+            "activateStates": ["lib-search-active"],
+            "deactivateStates": ["lib-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search across all categories..." },
+                "params": { "text": "test", "clear": true }
+              }
+            ]
+          },
+          {
+            "id": "populated-to-favorites",
+            "name": "Toggle favorites filter",
+            "description": "Click the Favorites pill to show only favorited workflows",
+            "activateStates": ["lib-favorites-active"],
+            "deactivateStates": ["lib-populated"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Favorites" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "lib-type-filtered",
+        "name": "Type Filtered — Single Category View",
+        "description": "A specific type filter pill is active, showing only items of that asset type. The active pill is visually highlighted. The item list shows only matching items.",
+        "elements": [
+          { "textContent": "Library Dashboard" },
+          { "placeholder": "Search across all categories..." }
+        ],
+        "transitions": [
+          {
+            "id": "type-filtered-to-populated",
+            "name": "Clear type filter",
+            "description": "Click the All filter pill to show items from all categories again",
+            "activateStates": ["lib-populated"],
+            "deactivateStates": ["lib-type-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "All" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "type-filtered-to-search-active",
+            "name": "Enter search query while type-filtered",
+            "description": "Type in the search input to further narrow filtered results",
+            "activateStates": ["lib-search-active"],
+            "deactivateStates": ["lib-type-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search across all categories..." },
+                "params": { "text": "test", "clear": true }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "lib-search-active",
+        "name": "Search Active — Filtering by Query",
+        "description": "A search query has been entered and items are filtered by name, description, category, or tags across all types (or the currently selected type). The search input contains text.",
+        "elements": [
+          { "textContent": "Library Dashboard" },
+          { "placeholder": "Search across all categories..." }
+        ],
+        "transitions": [
+          {
+            "id": "search-to-populated",
+            "name": "Clear search query",
+            "description": "Clear the search input to return to the unfiltered view",
+            "activateStates": ["lib-populated"],
+            "deactivateStates": ["lib-search-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search across all categories..." },
+                "params": { "text": "", "clear": true }
+              }
+            ]
+          },
+          {
+            "id": "search-to-empty-results",
+            "name": "No matching items",
+            "description": "The search query does not match any items, triggering the empty results state",
+            "activateStates": ["lib-empty-results"],
+            "deactivateStates": ["lib-search-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search across all categories..." },
+                "params": { "text": "zzz_nonexistent_item_xyz", "clear": true }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "lib-favorites-active",
+        "name": "Favorites — Showing Favorited Workflows Only",
+        "description": "The Favorites filter pill is active, showing only workflows marked as favorites. The pill is highlighted with amber styling.",
+        "elements": [
+          { "textContent": "Library Dashboard" },
+          { "textContent": "Favorites" }
+        ],
+        "transitions": [
+          {
+            "id": "favorites-to-populated",
+            "name": "Toggle favorites off",
+            "description": "Click the Favorites pill again to deactivate the filter and show all items",
+            "activateStates": ["lib-populated"],
+            "deactivateStates": ["lib-favorites-active"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Favorites" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "lib-empty-results",
+        "name": "Empty Results — No Matching Items",
+        "description": "The current search or filter combination yields no items. Shows an empty state message suggesting the user adjust their search or create items using the Builders menu.",
+        "elements": [
+          { "textContent": "No items found" },
+          { "textContains": "Try adjusting your search or filters" }
+        ],
+        "transitions": [
+          {
+            "id": "empty-results-to-populated",
+            "name": "Clear search to restore items",
+            "description": "Clear the search input to return to the full item list",
+            "activateStates": ["lib-populated"],
+            "deactivateStates": ["lib-empty-results"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "type",
+                "target": { "placeholder": "Search across all categories..." },
+                "params": { "text": "", "clear": true }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "lib-empty-library",
+        "name": "Empty Library — No Items Exist",
+        "description": "The library has no items at all. Shows an empty state message encouraging the user to create items using the Builders menu.",
+        "elements": [
+          { "textContent": "No items found" },
+          { "textContains": "Create items using the Builders menu" }
+        ],
+        "transitions": []
+      }
+    ]
+  },
   "metadata": {
     "component": "LibraryDashboard",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/library",
     "elementSource": "sdk",
     "tags": ["library", "dashboard", "cross-category", "search", "asset-management"],

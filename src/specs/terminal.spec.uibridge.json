@@ -1097,11 +1097,340 @@
       "source": "ai-generated"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "loading",
+        "name": "Loading Terminals",
+        "description": "Transient state shown while the TerminalPage initializes and reconnects to existing PTY sessions. Displays a spinner and 'Loading terminals...' text on a blank background.",
+        "elements": [
+          { "textContains": "Loading terminals" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "Initialize with no terminals",
+            "activateStates": ["empty-state"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [
+              { "action": "wait", "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          },
+          {
+            "id": "loading-to-active",
+            "name": "Initialize with existing terminals",
+            "activateStates": ["active-terminals"],
+            "deactivateStates": ["loading"],
+            "staysVisible": false,
+            "process": [
+              { "action": "wait", "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "empty-state",
+        "name": "No Terminals Open",
+        "description": "Shown when all terminal tabs have been closed. Displays a message guiding users to create a new terminal via Ctrl+Shift+T or the + button. The tab bar, status bar, and page tab bar remain visible.",
+        "elements": [
+          { "textContains": "No terminals open" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "empty-to-active",
+            "name": "Create first terminal",
+            "activateStates": ["active-terminals"],
+            "deactivateStates": ["empty-state"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "+" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "active-terminals",
+        "name": "Active Terminal Workspace",
+        "description": "The primary state of the terminal page. Shows the tab bar with open terminal sessions, a zone grid with one or more terminal instances, the zone status bar with action buttons (Sessions, Generate, Analyze, Findings), the page tab bar, and optional file conflict banner. The right panel and session sidebar are hidden.",
+        "elements": [
+          { "role": "tablist" },
+          { "role": "button", "textContent": "+" },
+          { "role": "button", "textContent": "Sessions" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "active-to-empty",
+            "name": "Close last terminal tab",
+            "activateStates": ["empty-state"],
+            "deactivateStates": ["active-terminals"],
+            "staysVisible": false,
+            "process": [
+              { "action": "keyboard", "target": { "tagName": "body" }, "key": "Ctrl+Shift+W", "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          },
+          {
+            "id": "active-to-sessions-sidebar",
+            "name": "Open sessions sidebar",
+            "activateStates": ["sessions-sidebar"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Sessions" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          },
+          {
+            "id": "active-to-findings-panel",
+            "name": "Open findings panel",
+            "activateStates": ["findings-panel"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Findings" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          },
+          {
+            "id": "active-to-analysis-panel",
+            "name": "Open analysis panel",
+            "activateStates": ["analysis-panel"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Analyze" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          },
+          {
+            "id": "active-to-workflow-preview",
+            "name": "Generate workflow from session",
+            "activateStates": ["workflow-preview"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Generate" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          },
+          {
+            "id": "active-to-shortcuts-overlay",
+            "name": "Open keyboard shortcuts overlay",
+            "activateStates": ["keyboard-shortcuts-overlay"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "keyboard", "target": { "tagName": "body" }, "key": "Shift+?", "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          },
+          {
+            "id": "active-to-command-palette",
+            "name": "Open command palette",
+            "activateStates": ["command-palette"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "keyboard", "target": { "tagName": "body" }, "key": "Ctrl+Shift+P", "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "sessions-sidebar",
+        "name": "Sessions Sidebar Open",
+        "description": "The left sidebar is visible showing the session manager panel with a list of active terminal sessions and Claude Code transcript sessions. Users can browse, resume, and select sessions from this panel. The terminal zone grid shrinks to accommodate the sidebar.",
+        "elements": [
+          { "textContains": "Sessions" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "sessions-sidebar-to-transcript",
+            "name": "Select a transcript session",
+            "activateStates": ["transcript-panel"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              { "action": "click", "target": { "textContains": "session" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          },
+          {
+            "id": "sessions-sidebar-close",
+            "name": "Close sessions sidebar",
+            "activateStates": [],
+            "deactivateStates": ["sessions-sidebar"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Sessions" }, "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "transcript-panel",
+        "name": "Transcript Panel Open",
+        "description": "The right panel shows a Claude Code session transcript with the full conversation history. Footer buttons allow generating a workflow (Generate), generating and running (Run), implementing a plan (Implement), verifying a plan (Verify), or resuming the session in a terminal (Resume).",
+        "elements": [
+          { "textContains": "Transcript" },
+          { "role": "button", "textContent": "Resume" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "transcript-to-workflow",
+            "name": "Generate workflow from transcript",
+            "activateStates": ["workflow-preview"],
+            "deactivateStates": ["transcript-panel"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Generate" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          },
+          {
+            "id": "transcript-close",
+            "name": "Close transcript panel",
+            "activateStates": [],
+            "deactivateStates": ["transcript-panel"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "accessibleName": "Close panel" }, "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "workflow-preview",
+        "name": "Workflow Preview Panel",
+        "description": "The right panel shows a generated workflow with its phases and steps. Users can execute the workflow, save it to the library, edit it in the Workflow Builder, or regenerate it. Shown after generating a workflow from a session transcript, findings, or plan file.",
+        "elements": [
+          { "textContains": "Workflow" },
+          { "role": "button", "textContent": "Execute" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "workflow-execute",
+            "name": "Execute the generated workflow",
+            "activateStates": [],
+            "deactivateStates": ["workflow-preview"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Execute" }, "waitAfter": { "type": "idle", "timeout": 3000 } }
+            ]
+          },
+          {
+            "id": "workflow-close",
+            "name": "Close workflow preview",
+            "activateStates": [],
+            "deactivateStates": ["workflow-preview"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "accessibleName": "Close panel" }, "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "analysis-panel",
+        "name": "Analysis Panel Open",
+        "description": "The right panel shows AI-generated analysis results in structured canvas-style panels. Analysis types include session summary, architecture review, change impact, progress tracking, and cross-tab analysis. Shows a loading indicator during analysis.",
+        "elements": [
+          { "textContains": "Analysis" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "analysis-close",
+            "name": "Close analysis panel",
+            "activateStates": [],
+            "deactivateStates": ["analysis-panel"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "accessibleName": "Close panel" }, "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "findings-panel",
+        "name": "Findings Panel Open",
+        "description": "The right panel shows real-time detected findings (errors, warnings, test failures) from terminal output. Each finding has Fix, Respond, and Generate Workflow actions. The panel shows both active and historical findings.",
+        "elements": [
+          { "textContains": "Findings" },
+          { "role": "button", "textContent": "Fix" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "findings-to-workflow",
+            "name": "Generate workflow from findings",
+            "activateStates": ["workflow-preview"],
+            "deactivateStates": ["findings-panel"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "textContent": "Generate Workflow" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          },
+          {
+            "id": "findings-close",
+            "name": "Close findings panel",
+            "activateStates": [],
+            "deactivateStates": ["findings-panel"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "role": "button", "accessibleName": "Close panel" }, "waitAfter": { "type": "idle", "timeout": 1000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "keyboard-shortcuts-overlay",
+        "name": "Keyboard Shortcuts Overlay",
+        "description": "A modal overlay displaying all available keyboard shortcuts for terminal management, zone navigation, batch operations, and more. Appears on top of the terminal workspace.",
+        "elements": [
+          { "textContains": "Ctrl+Shift+T" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "shortcuts-close",
+            "name": "Close shortcuts overlay",
+            "activateStates": [],
+            "deactivateStates": ["keyboard-shortcuts-overlay"],
+            "staysVisible": false,
+            "process": [
+              { "action": "keyboard", "target": { "tagName": "body" }, "key": "Escape", "waitAfter": { "type": "idle", "timeout": 500 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "command-palette",
+        "name": "Command Palette",
+        "description": "A modal command palette overlay allowing users to search and execute commands for zone management, batch operations, snapshot comparison, and more. Opened via Ctrl+Shift+P.",
+        "elements": [
+          { "role": "textbox", "placeholder": "Search commands" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "command-palette-close",
+            "name": "Close command palette",
+            "activateStates": [],
+            "deactivateStates": ["command-palette"],
+            "staysVisible": false,
+            "process": [
+              { "action": "keyboard", "target": { "tagName": "body" }, "key": "Escape", "waitAfter": { "type": "idle", "timeout": 500 } }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "TerminalPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-04-02T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/terminal",
     "elementSource": "sdk",
     "tags": [

@@ -401,11 +401,254 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "idle",
+        "name": "Idle — No Active Workflow",
+        "description": "No workflow is running. The page shows a centered prompt with the 'No Active Workflow' heading and options to run the last workflow or view the last run recap.",
+        "elements": [
+          { "textContent": "No Active Workflow" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "idle-to-running",
+            "name": "Start a workflow (via Run Last Workflow button or external trigger)",
+            "activateStates": ["running"],
+            "deactivateStates": ["idle"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Run Last Workflow" },
+                "waitAfter": { "type": "idle", "timeout": 5000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "running",
+        "name": "Running — Workflow Executing",
+        "description": "A workflow is actively executing. The control bar shows the task name, phase badges (setup/verification/agentic/completion), and Stop button. The dynamic widget layout displays the active widget at 65% width and summary widgets at 35%. The bottom bar shows 'Running' status with elapsed time.",
+        "elements": [
+          { "role": "button", "textContent": "Stop" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "running-to-paused",
+            "name": "Pause the workflow via play/pause button",
+            "activateStates": ["paused"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Pause" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "running-to-completion-overlay",
+            "name": "Workflow finishes executing (automatic transition)",
+            "activateStates": ["completion-overlay"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": []
+          },
+          {
+            "id": "running-to-approval-dialog",
+            "name": "Workflow pauses for human approval (automatic transition)",
+            "activateStates": ["approval-dialog"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": []
+          },
+          {
+            "id": "running-to-shortcuts-modal",
+            "name": "Open keyboard shortcuts modal",
+            "activateStates": ["shortcuts-modal"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "keyboard",
+                "target": { "textContent": "?" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "running-to-idle",
+            "name": "Stop the workflow via Stop button",
+            "activateStates": ["idle"],
+            "deactivateStates": ["running"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "paused",
+        "name": "Paused — Workflow Paused",
+        "description": "The workflow is temporarily paused. The control bar shows a Play button to resume. All widgets remain visible but execution is halted. The bottom bar reflects paused status.",
+        "elements": [
+          { "role": "button", "accessibleName": "Play" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "paused-to-running",
+            "name": "Resume the workflow via play button",
+            "activateStates": ["running"],
+            "deactivateStates": ["paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "accessibleName": "Play" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          },
+          {
+            "id": "paused-to-idle",
+            "name": "Stop the workflow while paused",
+            "activateStates": ["idle"],
+            "deactivateStates": ["paused"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContent": "Stop" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "completion-overlay",
+        "name": "Completion Summary Overlay",
+        "description": "An overlay dialog appears when a workflow finishes (completed or failed). Shows the final status heading ('Workflow Completed' or 'Workflow Failed'), step statistics (total, passed, failed), success rate percentage with progress bar, and duration. Auto-dismisses after 15 seconds. The dashboard remains visible behind the semi-transparent backdrop.",
+        "elements": [
+          { "role": "dialog", "accessibleName": "Workflow completion summary" },
+          { "textContent": "Dismiss" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "completion-overlay-to-idle",
+            "name": "Dismiss the completion overlay",
+            "activateStates": ["idle"],
+            "deactivateStates": ["completion-overlay"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Dismiss" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "approval-dialog",
+        "name": "Approval Dialog Overlay",
+        "description": "A modal overlay appears when the workflow pauses for human review. Shows 'Approval Required' header, the approval prompt with context (summary, files modified, optional diff), a comment textarea, and action buttons: Reject, Abort Workflow, and Approve. The running dashboard remains visible behind the backdrop. Can be dismissed with Escape to show a floating 'Approval Waiting' indicator.",
+        "elements": [
+          { "textContent": "Approval Required" },
+          { "textContent": "Approve" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "approval-dialog-to-running",
+            "name": "Approve the pending action to resume workflow",
+            "activateStates": ["running"],
+            "deactivateStates": ["approval-dialog"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Approve" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "approval-dialog-reject",
+            "name": "Reject the pending action (workflow continues to next iteration)",
+            "activateStates": ["running"],
+            "deactivateStates": ["approval-dialog"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Reject" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "approval-dialog-abort",
+            "name": "Abort the entire workflow from the approval dialog",
+            "activateStates": ["idle"],
+            "deactivateStates": ["approval-dialog"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Abort Workflow" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "shortcuts-modal",
+        "name": "Keyboard Shortcuts Modal",
+        "description": "A modal overlay listing available keyboard shortcuts: ? to toggle the modal, Ctrl+1-8 to switch widgets, Ctrl+R to refresh, Esc to close. The dashboard remains fully visible behind the semi-transparent backdrop.",
+        "elements": [
+          { "role": "dialog", "accessibleName": "Keyboard shortcuts" },
+          { "textContent": "Keyboard Shortcuts" }
+        ],
+        "isInitial": false,
+        "transitions": [
+          {
+            "id": "shortcuts-modal-to-previous",
+            "name": "Close the shortcuts modal (returns to underlying state)",
+            "activateStates": [],
+            "deactivateStates": ["shortcuts-modal"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Close shortcuts modal" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ActiveDashboardPage",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/runs/active",
     "elementSource": "sdk",
     "tags": [

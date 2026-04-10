@@ -280,11 +280,135 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "gui-no-config",
+        "name": "No Configuration Loaded",
+        "description": "Initial state before any GUI automation config is loaded. The Load Config button is primary, the workflow selector is disabled, and the bottom bar prompts the user to load a configuration. Quick actions in the toolkit sidebar are hidden behind a message requiring a config.",
+        "elements": [
+          { "textContent": "Load Config", "role": "button" },
+          { "textContent": "No config" },
+          { "textContent": "Load a configuration to begin" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "no-config-to-config-loaded",
+            "name": "Load configuration from file",
+            "activateStates": ["gui-config-loaded"],
+            "deactivateStates": ["gui-no-config"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Load Config", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 3000 } },
+              { "action": "click", "target": { "textContent": "Load from File" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          },
+          {
+            "id": "no-config-to-config-loaded-last",
+            "name": "Load last used configuration",
+            "activateStates": ["gui-config-loaded"],
+            "deactivateStates": ["gui-no-config"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Load Config", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 3000 } },
+              { "action": "click", "target": { "textContent": "Load Last Config" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "gui-config-loaded",
+        "name": "Configuration Loaded, No Workflow Selected",
+        "description": "A GUI automation config is loaded and the green status badge is visible. The workflow selector is enabled but nothing is selected yet. The bottom bar prompts the user to select a workflow. The Change button replaces Load Config. Quick actions become available in the toolkit sidebar.",
+        "elements": [
+          { "textContent": "Change", "role": "button" },
+          { "textContent": "Select a workflow to run" },
+          { "textContent": "Select a workflow to run..." }
+        ],
+        "transitions": [
+          {
+            "id": "config-loaded-to-workflow-selected",
+            "name": "Select a workflow",
+            "activateStates": ["gui-workflow-ready"],
+            "deactivateStates": ["gui-config-loaded"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Select a workflow to run..." }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          },
+          {
+            "id": "config-loaded-to-no-config",
+            "name": "Change configuration (opens dropdown)",
+            "activateStates": ["gui-no-config"],
+            "deactivateStates": ["gui-config-loaded"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Change", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "gui-workflow-ready",
+        "name": "Workflow Selected, Ready to Execute",
+        "description": "A workflow is selected and the page is ready to start execution. The bottom bar shows 'Ready: {workflow name}'. The Start button is enabled. The Stop button is disabled. Users can change the workflow, adjust monitors, toggle auto-minimize, or override initial states via Advanced Settings before starting.",
+        "elements": [
+          { "textContent": "Start", "role": "button" },
+          { "textContains": "Ready:" },
+          { "textContent": "Workflow Runner" }
+        ],
+        "transitions": [
+          {
+            "id": "workflow-ready-to-running",
+            "name": "Start execution",
+            "activateStates": ["gui-execution-running"],
+            "deactivateStates": ["gui-workflow-ready"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Start", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          },
+          {
+            "id": "workflow-ready-to-config-loaded",
+            "name": "Deselect workflow (select different or clear)",
+            "activateStates": ["gui-config-loaded"],
+            "deactivateStates": ["gui-workflow-ready"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContains": "Ready:" }, "waitAfter": { "type": "idle", "timeout": 2000 } }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "gui-execution-running",
+        "name": "Execution Active",
+        "description": "GUI automation is currently executing. The bottom bar shows 'Running: {workflow name}' with an animated amber indicator. The Stop button is enabled and the Start button is disabled. Workflow selection controls are locked during execution. The page may auto-minimize depending on the toggle setting.",
+        "elements": [
+          { "textContent": "Stop", "role": "button" },
+          { "textContains": "Running" }
+        ],
+        "transitions": [
+          {
+            "id": "running-to-workflow-ready",
+            "name": "Stop execution",
+            "activateStates": ["gui-workflow-ready"],
+            "deactivateStates": ["gui-execution-running"],
+            "staysVisible": false,
+            "process": [
+              { "action": "click", "target": { "textContent": "Stop", "role": "button" }, "waitAfter": { "type": "idle", "timeout": 5000 } }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ExecuteTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/gui-automation",
     "hiddenInProd": true,
     "elementSource": "sdk",

@@ -243,6 +243,236 @@
       "source": "manual"
     }
   ],
+  "stateMachine": {
+    "states": [
+      {
+        "id": "refl-loading",
+        "name": "Loading State",
+        "description": "Initial loading state while fetching workflow list and reflection data from the backend. A spinner is visible and no report content is rendered yet.",
+        "elements": [
+          { "tagName": "svg", "accessibleName": "Loading indicator" }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "loading-to-empty",
+            "name": "Load completes with no data",
+            "description": "Fetched data returns no reflection fixes for the selected workflow, showing the empty state",
+            "activateStates": ["refl-empty"],
+            "deactivateStates": ["refl-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "No reflection fixes found" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          },
+          {
+            "id": "loading-to-data",
+            "name": "Load completes with data",
+            "description": "Fetched data returns reflection fixes, showing summary cards, run history, and fix list",
+            "activateStates": ["refl-data"],
+            "deactivateStates": ["refl-loading"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "wait",
+                "target": { "textContent": "Total Fixes" },
+                "waitAfter": { "type": "idle", "timeout": 3000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "refl-empty",
+        "name": "Empty State — No Fixes",
+        "description": "No reflection fixes exist for the selected workflow. An informational message is displayed explaining that reflection data will appear after workflow executions.",
+        "elements": [
+          { "textContent": "No reflection fixes found" }
+        ],
+        "transitions": [
+          {
+            "id": "empty-change-workflow",
+            "name": "Select a different workflow",
+            "description": "Change the workflow selector to load data for a different workflow, returning to the loading state",
+            "activateStates": ["refl-loading"],
+            "deactivateStates": ["refl-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Select workflow" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "empty-refresh",
+            "name": "Refresh data",
+            "description": "Click the refresh button to re-fetch reflection data for the current workflow",
+            "activateStates": ["refl-loading"],
+            "deactivateStates": ["refl-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh data" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "refl-data",
+        "name": "Data Loaded — Dashboard View",
+        "description": "Reflection data is loaded and displayed. Summary metric cards (Total Fixes, Effective, Ineffective, Effectiveness Rate) are visible along with recent reflection runs, trend charts (when available), the full fix list with all fixes collapsed, and the Graph Insights sub-tab section.",
+        "elements": [
+          { "textContent": "Total Fixes" },
+          { "textContent": "Effectiveness Rate" },
+          { "textContent": "Recent Reflection Runs" },
+          { "textContent": "All Fixes" },
+          { "textContent": "Graph Insights" }
+        ],
+        "transitions": [
+          {
+            "id": "data-expand-fix",
+            "name": "Expand a fix",
+            "description": "Click on a fix row to expand it and reveal detailed before/after values, file changed, and effectiveness evidence",
+            "activateStates": ["refl-fix-expanded"],
+            "deactivateStates": ["refl-data"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Knowledge Update" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "data-change-workflow",
+            "name": "Select a different workflow",
+            "description": "Change the workflow selector to load data for a different workflow",
+            "activateStates": ["refl-loading"],
+            "deactivateStates": ["refl-data"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Select workflow" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "data-refresh",
+            "name": "Refresh data",
+            "description": "Click the refresh button to re-fetch reflection data",
+            "activateStates": ["refl-loading"],
+            "deactivateStates": ["refl-data"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh data" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "data-switch-graph-tab",
+            "name": "Switch Graph Insights tab",
+            "description": "Click a Graph Insights sub-tab (Cross-Run Patterns, Rule Influence, Pipeline Events, Step Provenance, Versions) to change the displayed insight panel",
+            "activateStates": ["refl-data"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Rule Influence" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "refl-fix-expanded",
+        "name": "Fix Detail Expanded",
+        "description": "One or more fix rows are expanded, revealing detailed information including the file changed, application status, timestamp, old and new values, reasoning, alternatives considered, and effectiveness evidence.",
+        "elements": [
+          { "textContent": "Old value" },
+          { "textContent": "New value" }
+        ],
+        "transitions": [
+          {
+            "id": "expanded-collapse-fix",
+            "name": "Collapse fix detail",
+            "description": "Click the expanded fix row again to collapse it and return to the dashboard view",
+            "activateStates": ["refl-data"],
+            "deactivateStates": ["refl-fix-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Knowledge Update" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-expand-another",
+            "name": "Expand another fix",
+            "description": "Click a different fix row to expand it while keeping the current one expanded",
+            "activateStates": ["refl-fix-expanded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "textContains": "Selector Fix" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-change-workflow",
+            "name": "Select a different workflow",
+            "description": "Change workflow selector to load data for a different workflow, collapsing all fixes",
+            "activateStates": ["refl-loading"],
+            "deactivateStates": ["refl-fix-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Select workflow" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-refresh",
+            "name": "Refresh data",
+            "description": "Click the refresh button to re-fetch data, collapsing all expanded fixes",
+            "activateStates": ["refl-loading"],
+            "deactivateStates": ["refl-fix-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "accessibleName": "Refresh data" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "metadata": {
     "component": "ReflectionDashboard",
     "author": "Joshua Spinak",
