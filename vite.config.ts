@@ -9,14 +9,19 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
-    // Strip `crossorigin` attribute from script/link tags in built HTML.
-    // Tauri's custom-protocol asset handler + WebView2's module loader
-    // have issues on cold profiles (fresh EBWebView directories).
+    // Strip module-related attributes from built HTML. The IIFE bundle
+    // doesn't use ES module syntax, so type="module" and crossorigin are
+    // unnecessary. Removing type="module" is critical: it makes the browser
+    // use the classic script loader, bypassing WebView2's broken module
+    // fetcher on cold custom-protocol profiles.
     {
-      name: "strip-crossorigin",
+      name: "strip-module-attrs",
       enforce: "post" as const,
       transformIndexHtml(html: string) {
-        return html.replace(/ crossorigin/g, "");
+        return html
+          .replace(/ crossorigin/g, "")
+          .replace(/ type="module"/g, "")
+          .replace(/<link rel="modulepreload"[^>]*>/g, "");
       },
     },
   ],
@@ -50,6 +55,18 @@ export default defineConfig({
     minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
     // produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_DEBUG,
+    // Workaround for WebView2 cold-profile module loading failure:
+    // WebView2's ES module loader fails to fetch modules through Tauri's
+    // custom-protocol on fresh profiles. Using IIFE format with inlined
+    // dynamic imports produces a single classic <script> that bypasses the
+    // module loader entirely. All assets are embedded in the binary anyway,
+    // so code-splitting provides no network benefit.
+    rollupOptions: {
+      output: {
+        format: "iife" as const,
+        inlineDynamicImports: true,
+      },
+    },
   },
   resolve: {
     alias: [
