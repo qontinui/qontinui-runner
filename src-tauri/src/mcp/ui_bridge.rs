@@ -556,6 +556,8 @@ impl UiBridgeCircuitBreaker {
 /// times out. Returns a JSON object with all available diagnostic fields so
 /// agents can diagnose why the WebView never became ready.
 async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Value {
+    use tauri::Manager;
+
     let last_pong = state
         .ui_bridge_last_pong
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -581,11 +583,25 @@ async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Valu
         0
     };
 
+    // Check Tauri main window state
+    let main_window = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label());
+    let window_exists = main_window.is_some();
+    let window_visible = main_window
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+
     // Build a human-readable hint based on the diagnostic state
-    let hint = if last_pong == 0 && process_uptime_ms < 3000 {
+    let hint = if !window_exists {
+        "Main WebView window does not exist — window creation may have failed."
+    } else if last_pong == 0 && process_uptime_ms < 3000 {
         "Process just started (<3s uptime). Frontend may still be loading — consider retrying."
     } else if last_pong == 0 && console_error_count > 0 {
         "Frontend never sent initial pong and console errors were recorded. Check the runner devtools console — frontend likely crashed during mount."
+    } else if last_pong == 0 && !window_visible {
+        "Frontend never sent initial pong and main window is not visible — WebView may not have rendered."
     } else if last_pong == 0 {
         "Frontend never sent initial pong. Check if the WebView loaded successfully."
     } else if last_pong_age_ms > 30000 {
@@ -605,6 +621,8 @@ async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Valu
             "processUptimeMs": process_uptime_ms,
             "pendingRequestCount": pending_count,
             "semaphoreAvailablePermits": available_permits,
+            "tauriMainWindowExists": window_exists,
+            "tauriMainWindowVisible": window_visible,
             "hint": hint
         }
     })
@@ -5528,23 +5546,18 @@ fn capture_for_diagnosis(app_handle: &tauri::AppHandle) -> Result<DiagnosisCaptu
     })
 }
 
-/// Compare two screenshots by sampling ~10,000 random pixels. Returns similarity 0.0–1.0.
+/// Native pixel-sampling similarity comparator (no WebView required).
 ///
-/// WHY THIS EXISTS AND WHY IT MUST NOT BE DELETED:
+/// Samples ~10,000 pixels evenly across the image pair and returns a
+/// 0.0–1.0 similarity score. Used exclusively by `diagnose-stuck` which
+/// runs when the React frontend hasn't loaded and the browser-side
+/// `compareVisualRegression` (canvas-based, accurate) is unavailable.
 ///
-/// This is the **only** screenshot comparator that works when the WebView hasn't
-/// mounted yet (or has crashed). The browser canvas API is unavailable in exactly
-/// those situations, so any DOM/canvas-based comparison would fail.
-///
-/// The sole caller is `ui_bridge_diagnose_stuck_screen_handler` (diagnose-stuck),
-/// which runs precisely when the frontend is suspected to be frozen or absent —
-/// i.e. when no in-page API is reachable. The 10k-sample pixel comparison is fast
-/// enough for the diagnostic path and does not depend on any browser runtime.
-///
-/// A previous audit recommended deleting this in favour of a canvas-based diff,
-/// but that recommendation was based on the wrong premise that the WebView is
-/// always available when this code runs. It is not — that is the whole point.
-fn compute_screenshot_similarity(img1: &image::DynamicImage, img2: &image::DynamicImage) -> f64 {
+/// This is intentionally a rough approximation — it exists to detect
+/// "screen is frozen" vs "screen is changing", not for pixel-accurate
+/// regression testing. Do not replace with the IPC-based image-diff
+/// endpoint, which requires a functioning WebView.
+fn sampled_pixel_similarity_native(img1: &image::DynamicImage, img2: &image::DynamicImage) -> f64 {
     let rgba1 = img1.to_rgba8();
     let rgba2 = img2.to_rgba8();
 
@@ -5667,7 +5680,7 @@ pub async fn ui_bridge_diagnose_stuck_screen_handler(
     let img1 = cap1.image;
     let img2 = cap2.image;
     let similarity =
-        tokio::task::spawn_blocking(move || compute_screenshot_similarity(&img1, &img2))
+        tokio::task::spawn_blocking(move || sampled_pixel_similarity_native(&img1, &img2))
             .await
             .unwrap_or(0.5); // Couldn't compare — inconclusive
     let screenshot_changed = similarity < 0.95;
@@ -6523,6 +6536,15 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
                 "description": "AI-powered analysis: data extraction, regions, structured data, cross-app",
                 "endpoints": ["analyze/data", "analyze/regions", "analyze/structured-data",
                     "analyze/cross-app-compare", "recovery/attempt"]
+            },
+            "batch": {
+                "description": "Execute multiple UI Bridge operations in a single HTTP call",
+                "endpoints": ["batch"],
+                "maxBatchSize": 50,
+                "parameters": {
+                    "operations": "Array of { id, operation, params } objects",
+                    "stopOnError": "boolean (default: false) — stop on first failure"
+                }
             }
         }
     })))
@@ -7323,6 +7345,7 @@ pub async fn ui_bridge_circuit_breaker_reset_handler(
 pub async fn ui_bridge_diagnostics_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use tauri::Manager;
     info!("UI Bridge API: Diagnostics");
 
     let cb_state = state.ui_bridge_circuit_breaker.get_state().await;
@@ -7345,11 +7368,25 @@ pub async fn ui_bridge_diagnostics_handler(
         .as_millis() as u64;
     let last_pong_age_ms = if last_pong > 0 { now_ms - last_pong } else { 0 };
 
+    // Check Tauri main window state
+    let main_window = state
+        .app_handle
+        .get_webview_window(qontinui_runner_lib::get_main_window_label());
+    let window_exists = main_window.is_some();
+    let window_visible = main_window
+        .as_ref()
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+
     let ready = last_pong > 0;
-    let readiness_hint = if !ready && process_uptime_ms < 3000 {
+    let readiness_hint = if !window_exists {
+        "Main WebView window does not exist — window creation may have failed"
+    } else if !ready && process_uptime_ms < 3000 {
         "Process just started — frontend may still be loading"
     } else if !ready && console_error_count > 0 {
         "Frontend never sent pong and console errors recorded — likely crashed during mount"
+    } else if !ready && !window_visible {
+        "Frontend never sent pong and main window not visible — WebView may not have rendered"
     } else if !ready {
         "Frontend never sent initial pong — WebView may not have loaded"
     } else if last_pong_age_ms > 30000 {
@@ -7372,6 +7409,10 @@ pub async fn ui_bridge_diagnostics_handler(
             "lastPongAgeMs": last_pong_age_ms,
             "ready": ready,
             "consoleErrorCount": console_error_count
+        },
+        "tauriMainWindow": {
+            "exists": window_exists,
+            "visible": window_visible
         },
         "pendingRequestCount": pending_count,
         "processUptimeMs": process_uptime_ms,
@@ -8056,21 +8097,31 @@ pub struct BatchOperationResult {
 ///
 /// Each operation is executed sequentially via the existing `ui_bridge_request_sync`
 /// path, reusing all existing concurrency, circuit breaker, and timeout logic.
-/// Max 20 operations per batch.
+/// Max 50 operations per batch.
 async fn ui_bridge_batch_handler(
     State(state): State<Arc<ApiState>>,
     Json(batch): Json<BatchRequest>,
-) -> Result<Json<ApiResponse<BatchResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    const MAX_BATCH_SIZE: usize = 20;
+) -> Result<Json<ApiResponse<BatchResponse>>, (StatusCode, Json<ApiResponse<serde_json::Value>>)> {
+    const MAX_BATCH_SIZE: usize = 50;
 
     if batch.operations.len() > MAX_BATCH_SIZE {
+        let error_body = serde_json::json!({
+            "error": "Batch size exceeds maximum",
+            "max": MAX_BATCH_SIZE,
+            "requested": batch.operations.len()
+        });
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(api_error(format!(
-                "Batch size {} exceeds maximum of {}",
-                batch.operations.len(),
-                MAX_BATCH_SIZE
-            ))),
+            Json(ApiResponse {
+                success: false,
+                data: Some(error_body),
+                error: Some(format!(
+                    "Batch size {} exceeds maximum of {}",
+                    batch.operations.len(),
+                    MAX_BATCH_SIZE
+                )),
+                error_detail: None,
+            }),
         ));
     }
 
