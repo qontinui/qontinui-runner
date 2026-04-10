@@ -122,13 +122,10 @@ function TerminalPageInner({
     focusHistory,
   } = useZoneMetadata();
 
-  const sessionState = useSessionState();
-  const { snapshots, activeFindings, allFindings } = sessionState;
-  // Alias for backward compatibility with existing prop-passing code
-  const stateTracking = sessionState;
+  const stateTracking = useSessionState();
 
   const transitionEffects = useTransitionEffects();
-  const { handleRestartInZone, handleRestartInZoneRef } = transitionEffects;
+  const { handleRestartInZone } = transitionEffects;
 
   const {
     shellIntegration,
