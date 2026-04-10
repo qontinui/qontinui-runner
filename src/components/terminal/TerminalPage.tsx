@@ -1,23 +1,21 @@
-import { useState, useEffect, useCallback, useRef, useMemo, createRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useUIComponent } from "ui-bridge";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
-import { type TerminalInstanceHandle } from "./TerminalInstance";
 import { TerminalTabBar } from "./TerminalTabBar";
 import { TerminalNotification } from "./TerminalNotification";
 import { FileConflictBanner } from "./FileConflictBanner";
 import { useFileConflicts } from "./useFileConflicts";
 import { SessionManagerPanel } from "./SessionManagerPanel";
 import { useSessionManager } from "./useSessionManager";
-import { useTerminalManager } from "./useTerminalManager";
-import { useZoneLayout } from "./useZoneLayout";
 import { ZoneGrid } from "./ZoneGrid";
 import { ZoneLayoutPicker } from "./ZoneLayoutPicker";
 import { ZoneStatusBar } from "./ZoneStatusBar";
 import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
-import { ZoneProfilePicker, type ZoneSessionInfo } from "./ZoneProfilePicker";
+import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { useTerminalPageId } from "./TerminalPageContext";
+import { TerminalCoreProvider, useTerminalCore } from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
 import { useSessionPersistence } from "./useSessionPersistence";
@@ -51,13 +49,20 @@ interface TerminalPageProps {
   onSessionCountChange?: (count: number) => void;
 }
 
-export function TerminalPage({
+export function TerminalPage(props: TerminalPageProps) {
+  const pageId = useTerminalPageId();
+  return (
+    <TerminalCoreProvider pageId={pageId}>
+      <TerminalPageInner {...props} />
+    </TerminalCoreProvider>
+  );
+}
+
+function TerminalPageInner({
   onNavigateToBuilder,
   onNavigateToActive,
   onSessionCountChange,
 }: TerminalPageProps) {
-  const pageId = useTerminalPageId();
-
   const {
     tabs,
     activeId,
@@ -71,7 +76,11 @@ export function TerminalPage({
     reconnectToExistingSessions,
     markReconnected,
     createPlanTab,
-  } = useTerminalManager(pageId);
+    pageId,
+    zoneLayout,
+    terminalRefs,
+    pendingProfileSessionsRef,
+  } = useTerminalCore();
 
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
@@ -96,19 +105,6 @@ export function TerminalPage({
     ],
   });
 
-  const tabIds = useMemo(() => tabs.map((t) => t.id), [tabs]);
-  const zoneLayout = useZoneLayout(tabIds, pageId);
-
-  useEffect(() => {
-    if (
-      zoneLayout.focusedTabId &&
-      zoneLayout.focusedTabId !== activeId &&
-      tabs.some((t) => t.id === zoneLayout.focusedTabId)
-    ) {
-      setActiveId(zoneLayout.focusedTabId);
-    }
-  }, [zoneLayout.focusedTabId, activeId, setActiveId, tabs]);
-
   useEffect(() => {
     onSessionCountChange?.(tabs.length);
   }, [tabs.length, onSessionCountChange]);
@@ -120,47 +116,6 @@ export function TerminalPage({
   const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
 
   const processOutputRef = useRef<((tabId: string, text: string) => void) | undefined>(undefined);
-
-  const terminalRefs = useRef<Map<string, React.RefObject<TerminalInstanceHandle | null>>>(
-    new Map(),
-  );
-
-  // Pending Claude sessions to resume after a zone profile load settles
-  const pendingProfileSessionsRef = useRef<ZoneSessionInfo[] | null>(null);
-
-  for (const tab of tabs) {
-    if (!terminalRefs.current.has(tab.id)) {
-      terminalRefs.current.set(tab.id, createRef<TerminalInstanceHandle>());
-    }
-  }
-  for (const key of terminalRefs.current.keys()) {
-    if (!tabs.some((t) => t.id === key)) {
-      terminalRefs.current.delete(key);
-    }
-  }
-
-  // Resume Claude sessions from a loaded zone profile after assignments settle
-  useEffect(() => {
-    const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/;
-    const sessions = pendingProfileSessionsRef.current;
-    if (!sessions) return;
-    pendingProfileSessionsRef.current = null;
-
-    for (const s of sessions) {
-      const tabId = zoneLayout.assignments[s.zoneIndex];
-      if (tabId && SESSION_ID_RE.test(s.claudeSessionId)) {
-        updateTab(tabId, {
-          claudeSessionId: s.claudeSessionId,
-          claudeConfigDir: s.claudeConfigDir,
-        });
-        const ref = terminalRefs.current.get(tabId);
-        const handle = ref?.current;
-        if (handle) {
-          handle.writeToTerminal(`claude --resume ${s.claudeSessionId}\r`);
-        }
-      }
-    }
-  }, [zoneLayout.assignments, updateTab]);
 
   const stateTracking = useSessionStateTracking({
     tabs,
