@@ -9,18 +9,7 @@
   },
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "title": "Qontinui Runner",
-        "fullscreen": false,
-        "maximized": true,
-        "width": 1400,
-        "height": 800,
-        "minWidth": 1200,
-        "minHeight": 700,
-        "devtools": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://api.anthropic.com https://github.com https://*.githubusercontent.com ipc: http://ipc.localhost; media-src 'self' asset: http://asset.localhost blob:",
       "assetProtocol": {

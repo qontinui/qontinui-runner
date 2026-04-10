@@ -1330,58 +1330,42 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                // Only create the window programmatically when an isolated
-                // WebView2 profile is needed (secondary/test runners). The
-                // primary uses the declarative window from tauri.conf.json.
-                if data_dir.is_some() {
-                    // Close the declarative window from tauri.conf.json first —
-                    // we need to recreate it with data_directory() for profile
-                    // isolation, but Tauri doesn't allow duplicate labels.
-                    if let Some(existing) = app.get_webview_window("main") {
-                        let _ = existing.destroy();
-                    }
-                    let url = tauri::WebviewUrl::App("index.html".into());
-                    let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
-                        .title("Qontinui Runner")
-                        .inner_size(1400.0, 800.0)
-                        .min_inner_size(1200.0, 700.0)
-                        .fullscreen(false)
-                        .resizable(true)
-                        .decorations(true);
+                // Always create the window programmatically. tauri.conf.json
+                // has "windows": [] so there's no declarative window.
+                // This lets us set data_directory() for test runners
+                // (isolated WebView2 profiles) using the same code path.
+                let url = tauri::WebviewUrl::App("index.html".into());
+                let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
+                    .title("Qontinui Runner")
+                    .inner_size(1400.0, 800.0)
+                    .min_inner_size(1200.0, 700.0)
+                    .fullscreen(false)
+                    .resizable(true)
+                    .decorations(true);
 
-                    if let Some(ref dir) = data_dir {
-                        builder = builder.data_directory(std::path::PathBuf::from(dir));
-                    }
+                if let Some(ref dir) = data_dir {
+                    builder = builder.data_directory(std::path::PathBuf::from(dir));
+                }
 
-                    if is_secondary {
-                        builder = builder.position(100.0, 100.0);
-                    } else {
-                        builder = builder.maximized(true);
-                    }
-
-                    match builder.build() {
-                        Ok(win) => {
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                            info!(
-                                "Main window created programmatically (secondary={}, isolated={})",
-                                is_secondary, true
-                            );
-                        }
-                        Err(e) => {
-                            error!("Failed to create main window: {}", e);
-                            return Err(Box::new(e));
-                        }
-                    }
-                } else if let Some(win) = app.get_webview_window("main") {
-                    // Primary: window already created by tauri.conf.json,
-                    // just ensure it's visible and focused.
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                    info!("Main window from tauri.conf.json (primary)");
+                if is_secondary {
+                    builder = builder.position(100.0, 100.0);
                 } else {
-                    error!("No main window found and no data_dir for programmatic creation");
-                    return Err("No main window".into());
+                    builder = builder.maximized(true);
+                }
+
+                match builder.build() {
+                    Ok(win) => {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                        info!(
+                            "Main window created (secondary={}, isolated={})",
+                            is_secondary, data_dir.is_some()
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to create main window: {}", e);
+                        return Err(Box::new(e));
+                    }
                 }
             }
 
