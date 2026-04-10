@@ -1936,8 +1936,26 @@ pub async fn ui_bridge_navigate_and_wait_handler(
             "params": req.params.unwrap_or(serde_json::json!({})),
         }
     });
-    if let Err(e) = ui_bridge_request_sync(&state, "execute_action", action_payload).await {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+    match ui_bridge_request_sync(&state, "execute_action", action_payload).await {
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Ok(ref data) => {
+            // The frontend SDK returns success=false inside the payload when the
+            // element doesn't exist or the action fails. Surface this as an error
+            // instead of silently proceeding to the stability-polling phase.
+            if let Some(false) = data.get("success").and_then(|v| v.as_bool()) {
+                let msg = data
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Action failed on element");
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(api_error(format!(
+                        "navigate-and-wait: action '{}' on '{}' failed: {}",
+                        req.action, req.element_id, msg
+                    ))),
+                ));
+            }
+        }
     }
 
     // 2. Brief initial delay for route transition / React render to start
@@ -6760,9 +6778,23 @@ pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Va
             "control": {
                 "description": "Element discovery, actions, navigation, forms",
                 "endpoints": ["snapshot", "elements", "element/:id", "element/:id/state", "element/:id/action",
-                    "discover", "find", "components", "component/:id/state", "page/navigate", "page/refresh",
+                    "discover", "find", "components", "component/:id/state", "navigate-and-wait",
+                    "page/navigate", "page/refresh",
                     "page/back", "page/forward", "page/evaluate", "forms", "fill", "forms/snapshot", "forms/diff",
-                    "workflows", "specs", "query-selector", "keyboard-shortcuts"]
+                    "workflows", "specs", "query-selector", "keyboard-shortcuts"],
+                "navigateAndWait": {
+                    "method": "POST",
+                    "path": "/ui-bridge/control/navigate-and-wait",
+                    "description": "Click an element, wait for the DOM to stabilize, return a fresh snapshot. Replaces the click → sleep → discover → snapshot pattern.",
+                    "body": {
+                        "elementId": "string (required)",
+                        "action": "string (default: 'click')",
+                        "params": "object (optional, passed to the action)",
+                        "waitForStableMs": "number (default: 800, how long element count must be unchanged)",
+                        "timeoutMs": "number (default: 8000, overall deadline)"
+                    },
+                    "response": "Same shape as GET /control/snapshot. On timeout, includes navigateAndWait.timedOut: true."
+                }
             },
             "ai": {
                 "description": "AI-powered search, assertions, semantic snapshots, NL actions",
