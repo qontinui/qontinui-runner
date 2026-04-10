@@ -198,6 +198,375 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "triggers-editor-form",
+      "name": "Trigger Editor Form",
+      "description": "The trigger editor form allows users to create new triggers or edit existing ones. It includes required fields (name, target workflow dropdown), optional fields (description), a trigger type selector offering webhook, file_watch, workflow_chain, git_event, health_check, and schedule types, type-specific configuration sections that appear based on the selected type, an overrides JSON editor, conditions, and advanced settings for debounce, cooldown, and retry. Inline validation highlights invalid fields with red borders.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-editor-name-field",
+          "description": "Users can enter a trigger name in a required Name field, which validates input and shows a red border when left empty or invalid",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Name *"
+            },
+            "label": "Trigger name input field"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-editor-workflow-dropdown",
+          "description": "Users can select the target workflow that this trigger will execute from a dropdown populated with available workflows",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Target Workflow"
+            },
+            "label": "Target workflow dropdown"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-editor-type-selector",
+          "description": "Users can choose a trigger type (webhook, file_watch, workflow_chain, git_event, health_check, schedule) which dynamically reveals type-specific configuration fields",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Trigger Type"
+            },
+            "label": "Trigger type selector"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-editor-advanced-settings",
+          "description": "Users can configure advanced trigger behavior including debounce interval, cooldown period, and retry settings to control how frequently the trigger fires and how failures are handled",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Debounce"
+            },
+            "label": "Advanced trigger settings"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-editor-save-button",
+          "description": "Users can save the trigger configuration via a Create or Update button that submits the form and returns to the trigger list on success",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Create"
+            },
+            "label": "Save/Create trigger button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "triggers-test-modal",
+      "name": "Test Result Modal",
+      "description": "When a user tests a trigger via dry run, a modal overlay displays the test result showing whether the trigger would or wouldn't execute, the trigger name, the action status, and the target workflow ID. The modal can be dismissed with a Close button.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-test-modal-title",
+          "description": "Users can see a Test Result modal title confirming they are viewing the outcome of a trigger dry-run test",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Test Result"
+            },
+            "label": "Test Result modal title"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-test-modal-execute-status",
+          "description": "Users can see whether the trigger would or wouldn't execute, clearly indicating the dry-run outcome so they can verify their trigger configuration",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "execute"
+            },
+            "label": "Would/wouldn't execute indicator"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-test-modal-target-workflow",
+          "description": "Users can see the target workflow ID in the test result so they can confirm the trigger is wired to the correct workflow",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Workflow"
+            },
+            "label": "Target workflow in test result"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-test-modal-close",
+          "description": "Users can dismiss the test result modal by clicking a Close button, returning focus to the trigger list",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Close"
+            },
+            "label": "Close modal button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "triggers-webhook-details",
+      "name": "Webhook Details and Trigger Type Badges",
+      "description": "Webhook-type triggers display a generated webhook URL that users can copy to their clipboard for use in external integrations. A Copied! feedback message confirms the copy action. Each trigger row also displays a type badge label indicating the trigger type (webhook, file_watch, schedule, etc.).",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-webhook-url-display",
+          "description": "Users can see the generated webhook URL for webhook-type triggers, providing the endpoint they need to configure in external systems",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "webhook"
+            },
+            "label": "Webhook URL display"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-webhook-copy-button",
+          "description": "Users can copy the webhook URL to their clipboard via a copy button, with a Copied! feedback message confirming the action",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button"
+            },
+            "label": "Copy webhook URL button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-type-badge",
+          "description": "Each trigger row displays a type badge label indicating the trigger type, helping users quickly identify the event source for each trigger",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "webhook"
+            },
+            "label": "Trigger type badge"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "triggers-actions-row",
+      "name": "Per-Trigger Actions Row",
+      "description": "Each trigger in the list has an actions row containing an ON/OFF toggle for enabling/disabling the trigger, a Test button for dry-run execution, a History button to view execution history, an Edit button to open the editor, and a Delete button with confirmation. The toggle provides visual feedback reflecting the current enabled state.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-actions-toggle-state",
+          "description": "Users can see the current ON/OFF state of a trigger's toggle, providing immediate visual feedback about whether the trigger is actively listening for events",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "ON"
+            },
+            "label": "Trigger ON/OFF toggle indicator"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-actions-test-button",
+          "description": "Users can initiate a dry-run test of a trigger via a Test button in the actions row, which opens the test result modal",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Test"
+            },
+            "label": "Test trigger button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-actions-edit-button",
+          "description": "Users can open the trigger editor for an existing trigger by clicking an Edit button, which loads the current configuration into the form",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Edit"
+            },
+            "label": "Edit trigger button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-actions-delete-button",
+          "description": "Users can delete a trigger by clicking a Delete button, which prompts for confirmation before permanently removing the trigger configuration",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Delete"
+            },
+            "label": "Delete trigger button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "triggers-notifications",
+      "name": "Toast Notifications",
+      "description": "The Triggers page displays toast notifications in the bottom-right corner to provide feedback on user actions. Success toasts confirm operations like trigger creation, update, deletion, and toggle changes. Error toasts alert users to failures such as network errors or validation issues. Toasts are dismissible and auto-expire after a brief duration.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "triggers-notifications-success",
+          "description": "Users receive a success toast notification confirming when a trigger operation (create, update, delete, toggle) completes successfully",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "success"
+            },
+            "label": "Success toast notification"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-notifications-error",
+          "description": "Users receive an error toast notification when a trigger operation fails, providing information about what went wrong",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "error"
+            },
+            "label": "Error toast notification"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "triggers-notifications-position",
+          "description": "Toast notifications appear in a fixed position at the bottom-right corner of the viewport, ensuring they are visible without obstructing the main content",
+          "category": "visual",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "alert"
+            },
+            "label": "Toast notification container"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {

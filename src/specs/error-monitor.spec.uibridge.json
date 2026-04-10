@@ -293,6 +293,475 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "error-monitor-browser-errors",
+      "name": "Browser Errors Panel",
+      "description": "The Error Monitor page includes a collapsible Browser Errors panel that surfaces UI Bridge SDK browser-level errors. This panel shows a health status badge indicating whether the browser environment is healthy, degraded, or broken, along with a list of recent browser errors. Users can expand or collapse this panel to manage screen real estate while still having quick access to client-side error information that may not appear in server logs.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-browser-panel-heading",
+          "description": "Users can see a clearly labeled Browser Errors panel section that distinguishes browser-level errors from server-side automation errors",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Browser Errors"
+            },
+            "label": "Browser Errors panel heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-browser-health-badge",
+          "description": "Users can see a health status badge on the Browser Errors panel indicating the current state of the browser environment as healthy, degraded, or broken",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataAttributes": { "content-role": "badge" },
+              "textContent": "healthy"
+            },
+            "label": "Browser health status badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-browser-panel-collapsible",
+          "description": "Users can expand and collapse the Browser Errors panel to manage screen space, with the panel retaining its collapsed or expanded state",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Browser Errors"
+            },
+            "label": "Browser Errors collapsible toggle"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-browser-recent-errors",
+          "description": "Users can see a list of recent browser errors within the expanded panel, providing visibility into client-side issues that may affect UI reliability",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "recent"
+            },
+            "label": "Recent browser errors list"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-patterns",
+      "name": "Detected Patterns Display",
+      "description": "The Error Monitor identifies recurring error patterns and clusters them for display. Users can see detected pattern groups with type badges indicating the kind of pattern, frequency counts showing how often each pattern occurs, and the ability to select a pattern to filter the error list to only matching errors. This helps users prioritize systemic issues over one-off errors.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-patterns-section",
+          "description": "Users can see a Detected Patterns section that groups recurring errors into identifiable clusters for easier prioritization",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Detected Patterns"
+            },
+            "label": "Detected Patterns section heading"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-patterns-type-badge",
+          "description": "Each detected pattern displays a type badge indicating the category of the pattern cluster, helping users quickly classify the nature of recurring issues",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataAttributes": { "content-role": "badge" }
+            },
+            "label": "Pattern type badge"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-patterns-frequency",
+          "description": "Each detected pattern shows a frequency count so users can gauge how often the pattern recurs and prioritize high-frequency issues",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "occurrences"
+            },
+            "label": "Pattern frequency count"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-patterns-filter",
+          "description": "Users can select a detected pattern to filter the error list to only show errors matching that pattern, enabling focused investigation of systemic issues",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "pattern"
+            },
+            "label": "Pattern selection for filtering"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-error-details",
+      "name": "Error Item Expanded Details",
+      "description": "When a user expands an error item, they see a detailed view containing the full error message rendered in a code block for readability, the stack trace if available, context lines surrounding the error, resolution notes from previous triage, recurrence history, and action buttons including 'Open in Editor' to jump to the source file and 'Show context' to view surrounding code. This detailed view provides all information needed to diagnose and act on an error without leaving the Error Monitor page.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-details-stack-trace",
+          "description": "Users can see the full stack trace of an expanded error, rendered in a code block format for readability, enabling them to trace the error back to its origin in the codebase",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Stack Trace"
+            },
+            "label": "Stack trace section in expanded error"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-details-context-lines",
+          "description": "Users can see context lines surrounding the error location, providing additional code context without needing to open the file separately",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Context"
+            },
+            "label": "Context lines section"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-details-open-editor",
+          "description": "Users can click an 'Open in Editor' button to jump directly to the source file and line where the error occurred, streamlining the debugging workflow",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Open in Editor"
+            },
+            "label": "Open in Editor action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-details-show-context",
+          "description": "Users can click a 'Show context' button to reveal surrounding code context for the error, providing additional diagnostic information inline",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Show context"
+            },
+            "label": "Show context action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-details-recurrence",
+          "description": "Users can see the recurrence history for an expanded error, showing how many times and when the error has previously occurred, aiding in prioritization of persistent issues",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "recurrence"
+            },
+            "label": "Recurrence history display"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-states",
+      "name": "Loading, Empty, and Error States",
+      "description": "The Error Monitor page handles various data-loading states gracefully. When data is being fetched, a loading spinner is displayed. When no errors exist, an empty state with a success icon communicates that no issues have been detected. When the page itself encounters an error loading data, an error state with an alert icon is shown. An auto-refresh indicator displays the refresh interval (e.g., 'Auto-refresh: 30s') so users know data will update automatically.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-states-loading",
+          "description": "Users see a loading spinner while error data is being fetched, providing feedback that the page is actively retrieving information rather than being stuck or broken",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "status",
+              "textContent": "Loading"
+            },
+            "label": "Loading spinner indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-states-empty-success",
+          "description": "When no errors have been detected, users see a clear empty state with a success icon and message indicating that no issues exist, distinguishing this from a loading or error state",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "No Errors Detected"
+            },
+            "label": "Empty state with success icon"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-states-error-alert",
+          "description": "When the Error Monitor itself fails to load data, users see an error state with an alert icon and message explaining what went wrong, rather than a blank or misleading display",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Failed to load"
+            },
+            "label": "Error state with alert icon"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-states-auto-refresh-interval",
+          "description": "Users can see an auto-refresh indicator showing the refresh interval (e.g., 'Auto-refresh: 30s'), confirming that the error list will update automatically without manual intervention",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Auto-refresh: 30s"
+            },
+            "label": "Auto-refresh interval indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-fix-workflow",
+      "name": "Fix Errors Workflow Generation",
+      "description": "The Error Monitor includes a dedicated Fix Errors button (FixErrorsButton component) that allows users to generate automated fix workflows for selected or visible errors. When activated, this triggers the AI system to analyze the error patterns and propose remediation steps as a workflow that can be executed. This bridges the gap between error detection and resolution, enabling users to take action directly from the monitoring interface.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-fix-button-visible",
+          "description": "Users can see a prominent Fix Errors button that communicates the ability to generate automated remediation workflows from the current error set",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Fix Errors"
+            },
+            "label": "Fix Errors action button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-fix-workflow-generation",
+          "description": "When the Fix Errors button is activated, users receive feedback that a fix workflow is being generated, such as a loading state or progress indicator on the button",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Generating"
+            },
+            "label": "Fix workflow generation feedback"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-fix-error-selection",
+          "description": "Users can see which errors will be included in the fix workflow, either through selection checkboxes or a clear indication that all visible/filtered errors will be addressed",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "selected"
+            },
+            "label": "Error selection indicator for fix workflow"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
+    },
+    {
+      "id": "error-monitor-run-scope",
+      "name": "Per-Run Scope Indicator",
+      "description": "The Error Monitor supports scoping the error view to a specific task run. When scoped, a blue banner appears at the top of the error list showing the name of the task run being viewed, along with a clear button to remove the scope and return to the full error view. This allows users who navigated from a specific workflow run to see only the errors relevant to that run, reducing noise from unrelated errors.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "errmon-scope-banner",
+          "description": "When the error view is scoped to a specific task run, users see a prominent blue banner indicating which run they are viewing errors for",
+          "category": "semantic",
+          "severity": "critical",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Showing errors for"
+            },
+            "label": "Per-run scope banner"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-scope-run-name",
+          "description": "The scope banner displays the name of the specific task run, so users can confirm they are viewing the correct subset of errors",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "dataAttributes": { "content-role": "label" },
+              "textContent": "run"
+            },
+            "label": "Scoped task run name"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-scope-clear-button",
+          "description": "Users can click a clear button on the scope banner to remove the per-run filter and return to viewing all errors across all runs",
+          "category": "semantic",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Clear"
+            },
+            "label": "Clear scope button"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        },
+        {
+          "id": "errmon-scope-visual-distinction",
+          "description": "The scope banner is visually distinct (blue background) from the rest of the page, making it immediately obvious that the error view is currently filtered to a specific run",
+          "category": "semantic",
+          "severity": "info",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Showing errors for"
+            },
+            "label": "Blue scope banner visual indicator"
+          },
+          "source": "manual",
+          "reviewed": true,
+          "enabled": true
+        }
+      ],
+      "source": "manual"
     }
   ],
   "metadata": {
@@ -302,7 +771,7 @@
     "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/tools/error-monitor",
     "elementSource": "sdk",
-    "tags": ["error-monitor", "error-tracking", "triage", "observability"]
+    "tags": ["error-monitor", "error-tracking", "triage", "observability", "browser-errors", "patterns", "fix-workflow", "run-scope"]
   },
   "stateMachine": {
     "states": [

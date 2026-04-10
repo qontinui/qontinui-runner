@@ -333,6 +333,331 @@
         }
       ],
       "source": "manual"
+    },
+    {
+      "id": "settings-claude-auth",
+      "name": "Claude CLI Authentication Status",
+      "description": "The Claude CLI section displays authentication status including subscription type and expiry countdown, with the ability to re-authenticate when needed.",
+      "category": "semantic",
+      "assertions": [
+        {
+          "id": "settings-claude-auth-status-visible",
+          "description": "The Claude CLI section displays current authentication status (authenticated or not) when the AI Providers tab is selected",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Auth"
+            },
+            "label": "Claude CLI auth status display"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-auth-subscription-type",
+          "description": "When authenticated, the subscription type (e.g. Pro, Team, Max) is displayed so users know their plan tier",
+          "category": "semantic",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "subscription"
+            },
+            "label": "Subscription type indicator"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and Claude CLI is authenticated",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-auth-expiry-countdown",
+          "description": "An expiry countdown is shown indicating when the current authentication session expires, helping users plan re-authentication",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "expir"
+            },
+            "label": "Auth expiry countdown"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and Claude CLI is authenticated",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-auth-reauthenticate-button",
+          "description": "A re-authenticate button is available that triggers a new authentication flow when clicked",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "uthenticat"
+            },
+            "label": "Re-authenticate button"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "settings-claude-execution",
+      "name": "Claude CLI Execution Configuration",
+      "description": "Users configure how the Claude CLI is executed: choosing an execution mode (auto, windows_native, wsl, native), optionally setting a custom executable path, and configuring a timeout for CLI operations.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "settings-claude-execution-mode-dropdown",
+          "description": "An execution mode dropdown is present with options: auto, windows_native, wsl, native, allowing users to control how the Claude CLI binary is invoked",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Execution Mode"
+            },
+            "label": "Execution mode dropdown"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-execution-custom-path",
+          "description": "A custom executable path input allows users to override the default Claude CLI binary location",
+          "category": "element-presence",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "executable"
+            },
+            "label": "Custom executable path input"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-execution-timeout",
+          "description": "A timeout configuration field accepts values between 60 and 3600 seconds, controlling how long the runner waits for a CLI operation before timing out",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "timeout"
+            },
+            "label": "Timeout configuration"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-execution-launch-command",
+          "description": "A launch command input is available per account, allowing users to customize the command used to invoke Claude CLI for each account directory",
+          "category": "element-presence",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "launch"
+            },
+            "label": "Launch command input"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and at least one Claude account directory is configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "settings-claude-accounts-mgmt",
+      "name": "Claude CLI Multi-Account Management",
+      "description": "The Claude CLI section provides multi-account management with live state badges (Active, Rate-limited, Auto-selected), color-coded usage bars (green <50%, yellow 50-80%, red >80%), switch buttons per account, and a Check Usage button to refresh usage data.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "settings-claude-accounts-mgmt-usage-bars",
+          "description": "Each configured account displays a usage bar that is color-coded: green when usage is below 50%, yellow between 50-80%, and red above 80%, giving users a visual indication of remaining capacity",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "usage"
+            },
+            "label": "Account usage bars"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and at least one Claude account directory is configured and usage has been checked",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-accounts-mgmt-state-badges",
+          "description": "Each account shows a live state badge reflecting its current status: Active (blue), Rate-limited (red), or Auto-selected, updated from backend state",
+          "category": "state-consistency",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContent": "Active"
+            },
+            "label": "Account state badges"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected and at least one Claude account directory is configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-accounts-mgmt-check-usage",
+          "description": "A Check Usage button fetches current usage data from the Claude CLI for all configured accounts and updates the usage bars",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Check Usage"
+            },
+            "label": "Check Usage button"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected and at least one Claude account directory is configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-accounts-mgmt-tutorial-id",
+          "description": "The Claude CLI section root div has data-tutorial-id='ai-settings-panel' for tutorial targeting",
+          "category": "semantic",
+          "severity": "info",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "attribute": "data-tutorial-id",
+              "value": "ai-settings-panel"
+            },
+            "label": "Tutorial target attribute"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "settings-claude-account-actions",
+      "name": "Claude CLI Account Directory Actions",
+      "description": "Users can manage their Claude account directories: add new directories, remove existing ones, auto-detect available directories, and toggle between Manual and Least Usage account selection modes.",
+      "category": "interaction",
+      "assertions": [
+        {
+          "id": "settings-claude-account-actions-add-dir",
+          "description": "An add directory control allows users to register a new Claude account directory for multi-account management",
+          "category": "element-presence",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Add"
+            },
+            "label": "Add directory control"
+          },
+          "assertionType": "exists",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-account-actions-remove-dir",
+          "description": "Each configured account directory has a remove button that deletes it from the multi-account configuration",
+          "category": "interaction",
+          "severity": "critical",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Remove"
+            },
+            "label": "Remove directory button"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected and at least one Claude account directory is configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-account-actions-auto-detect",
+          "description": "An auto-detect button scans the system for existing Claude configuration directories and offers to add them",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Auto"
+            },
+            "label": "Auto-detect directories button"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "settings-claude-account-actions-selection-mode-toggle",
+          "description": "When two or more accounts are configured, a selection mode toggle switches between Manual (user picks active account) and Least Usage (runner auto-selects the account with lowest usage and fails over on rate-limit)",
+          "category": "interaction",
+          "severity": "warning",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Selection Mode"
+            },
+            "label": "Selection mode toggle"
+          },
+          "assertionType": "behavior",
+          "precondition": "AI Providers tab is selected and at least two Claude account directories are configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
     }
   ],
   "stateMachine": {
@@ -1127,7 +1452,7 @@
     "component": "Settings",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-04-09T00:00:00.000Z",
+    "updatedAt": "2026-04-09T12:00:00.000Z",
     "pageUrl": "/settings",
     "tags": ["settings", "configuration", "ai-providers", "integrations", "system"],
     "specType": "semantic"
