@@ -77,7 +77,6 @@ function TerminalPageInner({
     renameTab,
     updateTab,
     reconnectToExistingSessions,
-    markReconnected,
     createPlanTab,
     pageId,
     zoneLayout,
@@ -128,7 +127,6 @@ function TerminalPageInner({
   const { handleRestartInZone } = transitionEffects;
 
   const {
-    shellIntegration,
     workflowGen,
     analysis,
     findingsActions,
