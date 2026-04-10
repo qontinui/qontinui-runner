@@ -1998,6 +1998,37 @@ impl PgDb {
         Ok(())
     }
 
+    /// Merge JSON into result_data without overwriting existing keys.
+    /// If result_data is NULL or empty, sets it to the provided JSON.
+    /// Otherwise merges via jsonb `||` (new keys win on conflict).
+    pub async fn merge_task_run_result_data(
+        &self,
+        task_run_id: &str,
+        json_str: &str,
+    ) -> Result<(), String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+        conn.execute(
+            r#"UPDATE task_runs
+               SET result_data = CASE
+                   WHEN result_data IS NULL OR result_data = '' THEN $1
+                   ELSE (result_data::jsonb || $1::jsonb)::text
+               END,
+               updated_at = NOW()
+               WHERE id = $2"#,
+            &[
+                &json_str as &(dyn tokio_postgres::types::ToSql + Sync),
+                &task_run_id as &(dyn tokio_postgres::types::ToSql + Sync),
+            ],
+        )
+        .await
+        .map_err(|e| format!("PG merge_task_run_result_data: {}", e))?;
+        Ok(())
+    }
+
     /// Get the parent_task_run_id and blocks_parent flag for a task.
     /// Returns Some((parent_id, blocks_parent)) if the task has a parent, None otherwise.
     /// Uses raw SQL since blocks_parent is not in the Clorinde-generated struct.

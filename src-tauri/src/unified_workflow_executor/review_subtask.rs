@@ -118,7 +118,7 @@ pub async fn spawn_review_subtask(
         if let Some(ref model) = config.review_model {
             meta["model_override"] = serde_json::json!(model);
         }
-        pg.set_task_run_result_data(&review_id, &meta.to_string())
+        pg.merge_task_run_result_data(&review_id, &meta.to_string())
             .await
             .map_err(|e| format!("Failed to set review result_data: {}", e))?;
     }
