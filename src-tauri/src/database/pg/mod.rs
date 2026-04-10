@@ -1259,7 +1259,7 @@ impl PgDb {
             // Observation History table
             "CREATE TABLE IF NOT EXISTS observation_history (
                 id              BIGSERIAL PRIMARY KEY,
-                observation_id  BIGINT NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+                observation_id  BIGINT NOT NULL,  -- soft FK to observations; canonical FK in schema.pg.sql
                 title           TEXT NOT NULL,
                 content         TEXT NOT NULL,
                 content_hash    TEXT NOT NULL,
@@ -2572,20 +2572,7 @@ mod migration_tests {
             .map(|c| c[1].to_lowercase())
             .collect();
 
-        // Remove MIGRATION-only tables (created by migrations, not ensure_tables)
-        // and temp/renamed tables
-        let migration_only: std::collections::HashSet<String> = [
-            "checks_new",
-            "verification_tests_new",
-            "workflow_step_checkpoints_new",
-            "run_details",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-        let diff = &ensure_tables - &schema_tables;
-        let ensure_only = &diff - &migration_only;
+        let ensure_only = &ensure_tables - &schema_tables;
         assert!(
             ensure_only.is_empty(),
             "Tables in ensure_tables/migrations but NOT in schema.pg.sql \

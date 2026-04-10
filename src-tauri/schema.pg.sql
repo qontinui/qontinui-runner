@@ -3607,7 +3607,7 @@ CREATE INDEX IF NOT EXISTS idx_prw_task_run ON pr_watch_state(task_run_id);
 CREATE TABLE IF NOT EXISTS learned_patterns (
     id TEXT PRIMARY KEY,
     problem_hash TEXT NOT NULL UNIQUE,
-    trigger_keywords TEXT NOT NULL,
+    trigger_keywords JSONB NOT NULL,
     problem_description TEXT NOT NULL,
     solution_description TEXT NOT NULL,
     confidence DOUBLE PRECISION NOT NULL DEFAULT 0.0,

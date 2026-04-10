@@ -67,6 +67,10 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
         }
     };
 
+    let created: DateTime<Utc> = row.get(10);
+    let modified: DateTime<Utc> = row.get(11);
+    let next: Option<DateTime<Utc>> = row.get(12);
+
     ScheduledTask {
         id: row.get(0),
         name: row.get(1),
@@ -77,9 +81,9 @@ fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
         skip_if_completed: row.get(7),
         auto_fix_on_failure: row.get(8),
         success_criteria: row.get(9),
-        created_at: row.get(10),
-        modified_at: row.get(11),
-        next_run: row.get(12),
+        created_at: created.to_rfc3339(),
+        modified_at: modified.to_rfc3339(),
+        next_run: next.map(|dt| dt.to_rfc3339()),
         last_run: None,
         conditions: None,
         condition_status: None,
@@ -213,9 +217,9 @@ impl PgDb {
                 &task.skip_if_completed,
                 &task.auto_fix_on_failure,
                 &task.success_criteria,
-                &task.created_at,
-                &task.modified_at,
-                &task.next_run,
+                &task.created_at.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+                &task.modified_at.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+                &task.next_run.as_deref().and_then(|s| s.parse::<DateTime<Utc>>().ok()),
                 &last_run_id,
             ],
         )
@@ -264,8 +268,8 @@ impl PgDb {
                 &task.skip_if_completed,
                 &task.auto_fix_on_failure,
                 &task.success_criteria,
-                &task.modified_at,
-                &task.next_run,
+                &task.modified_at.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+                &task.next_run.as_deref().and_then(|s| s.parse::<DateTime<Utc>>().ok()),
                 &last_run_id,
                 &task.id,
             ],
@@ -304,7 +308,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now();
         conn.execute(
             "UPDATE scheduled_tasks SET last_run_id = $1, modified_at = $2 WHERE id = $3",
             &[
@@ -329,11 +333,12 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let next: Option<DateTime<Utc>> = next_run.and_then(|s| s.parse().ok());
         conn.execute(
             "UPDATE scheduled_tasks SET next_run = $1, modified_at = $2 WHERE id = $3",
             &[
-                &next_run as &(dyn tokio_postgres::types::ToSql + Sync),
+                &next as &(dyn tokio_postgres::types::ToSql + Sync),
                 &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &task_id,
             ],
@@ -354,7 +359,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now();
         let result = conn
             .execute(
                 "UPDATE scheduled_tasks SET condition_status = $1, modified_at = $2 WHERE id = $3",
