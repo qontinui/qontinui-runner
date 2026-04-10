@@ -508,15 +508,7 @@ function TerminalPageInner({
           )}
 
           {zoneLayout.isMultiZone && (
-            <ZoneMinimap
-              layout={zoneLayout.layout}
-              assignments={zoneLayout.assignments}
-              sessionStates={stateTracking.sessionStates}
-              focusedZone={zoneLayout.focusedZone}
-              onFocusZone={zoneLayout.setFocusedZone}
-              zoneTags={labelsAndTags.zoneTags}
-              labelColorMap={labelsAndTags.labelColorMap}
-            />
+            <ZoneMinimap />
           )}
 
           {zoneLayout.isMultiZone && !transitionEffects.batchBarDismissed && (
