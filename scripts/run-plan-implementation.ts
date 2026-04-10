@@ -256,6 +256,20 @@ For each issue found: implement the fix, verify it compiles, move on.
 Some verification steps may have failed. Fix the underlying issues to make all checks pass.`;
 }
 
+/** Build a default compile-check verification step for a stage. */
+function makeCompileCheck(stageLabel: string) {
+  return {
+    id: randomUUID(),
+    type: "command",
+    phase: "verification",
+    name: `${stageLabel}: Compile Check`,
+    mode: "check",
+    check_type: "typecheck",
+    command: "npx tsc --noEmit 2>&1 | tail -5; cargo check --manifest-path src-tauri/Cargo.toml 2>&1 | tail -5",
+    fail_on_error: true,
+  };
+}
+
 function buildWorkflow(phases: PlanPhase[]) {
   const stages: any[] = [];
   const now = new Date().toISOString();
@@ -268,7 +282,7 @@ function buildWorkflow(phases: PlanPhase[]) {
       name: `Phase ${i + 1}: Implement — ${phase.name}`,
       description: `Implement all tasks for phase: ${phase.name}`,
       setup_steps: [],
-      verification_steps: [],
+      verification_steps: [makeCompileCheck(`Phase ${i + 1} Implement`)],
       agentic_steps: [makePromptStep("agentic", `Implement: ${phase.name}`, buildImplementPrompt(phase, i))],
       completion_steps: [],
       max_iterations: 15,
@@ -279,7 +293,7 @@ function buildWorkflow(phases: PlanPhase[]) {
       name: `Phase ${i + 1}: Review — ${phase.name}`,
       description: `Review implementation for phase: ${phase.name}`,
       setup_steps: [],
-      verification_steps: [],
+      verification_steps: [makeCompileCheck(`Phase ${i + 1} Review`)],
       agentic_steps: [makePromptStep("agentic", `Review: ${phase.name}`, buildReviewPrompt(phase, i))],
       completion_steps: [],
       max_iterations: 6,
@@ -290,7 +304,7 @@ function buildWorkflow(phases: PlanPhase[]) {
       name: `Phase ${i + 1}: Next Steps — ${phase.name}`,
       description: `Find and fix remaining issues for phase: ${phase.name}`,
       setup_steps: [],
-      verification_steps: [],
+      verification_steps: [makeCompileCheck(`Phase ${i + 1} Next Steps`)],
       agentic_steps: [makePromptStep("agentic", `Next Steps: ${phase.name}`, buildNextStepsPrompt(phase, i))],
       completion_steps: [],
       max_iterations: 6,
@@ -320,7 +334,10 @@ function buildWorkflow(phases: PlanPhase[]) {
     setup_steps: [],
     verification_steps: [],
     agentic_steps: [],
-    completion_steps: [],
+    completion_steps: [
+      makePromptStep("completion", "Summary",
+        "Summarize what was accomplished across all phases. List files changed, features implemented, and any remaining issues."),
+    ],
     max_iterations: 15,
     stages,
     category: "plan-implementation",
