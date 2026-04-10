@@ -1330,41 +1330,52 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
-                let url = tauri::WebviewUrl::App("index.html".into());
-                let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
-                    .title("Qontinui Runner")
-                    .inner_size(1400.0, 800.0)
-                    .min_inner_size(1200.0, 700.0)
-                    .fullscreen(false)
-                    .resizable(true)
-                    .decorations(true);
+                // Only create the window programmatically when an isolated
+                // WebView2 profile is needed (secondary/test runners). The
+                // primary uses the declarative window from tauri.conf.json.
+                if data_dir.is_some() {
+                    let url = tauri::WebviewUrl::App("index.html".into());
+                    let mut builder = tauri::WebviewWindowBuilder::new(app, "main", url)
+                        .title("Qontinui Runner")
+                        .inner_size(1400.0, 800.0)
+                        .min_inner_size(1200.0, 700.0)
+                        .fullscreen(false)
+                        .resizable(true)
+                        .decorations(true);
 
-                if let Some(ref dir) = data_dir {
-                    builder = builder.data_directory(std::path::PathBuf::from(dir));
-                }
+                    if let Some(ref dir) = data_dir {
+                        builder = builder.data_directory(std::path::PathBuf::from(dir));
+                    }
 
-                if is_secondary {
-                    // Force secondaries on-screen at a known position
-                    builder = builder.position(100.0, 100.0);
+                    if is_secondary {
+                        builder = builder.position(100.0, 100.0);
+                    } else {
+                        builder = builder.maximized(true);
+                    }
+
+                    match builder.build() {
+                        Ok(win) => {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                            info!(
+                                "Main window created programmatically (secondary={}, isolated={})",
+                                is_secondary, true
+                            );
+                        }
+                        Err(e) => {
+                            error!("Failed to create main window: {}", e);
+                            return Err(Box::new(e));
+                        }
+                    }
+                } else if let Some(win) = app.get_webview_window("main") {
+                    // Primary: window already created by tauri.conf.json,
+                    // just ensure it's visible and focused.
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                    info!("Main window from tauri.conf.json (primary)");
                 } else {
-                    // Primary starts maximized (matches old declarative config)
-                    builder = builder.maximized(true);
-                }
-
-                match builder.build() {
-                    Ok(win) => {
-                        let _ = win.show();
-                        let _ = win.set_focus();
-                        info!(
-                            "Main window created programmatically (secondary={}, isolated={})",
-                            is_secondary,
-                            data_dir.is_some()
-                        );
-                    }
-                    Err(e) => {
-                        error!("Failed to create main window: {}", e);
-                        return Err(Box::new(e));
-                    }
+                    error!("No main window found and no data_dir for programmatic creation");
+                    return Err("No main window".into());
                 }
             }
 

@@ -6,7 +6,20 @@ import { version } from "./package.json";
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    // Strip `crossorigin` attribute from script/link tags in built HTML.
+    // Tauri's custom-protocol asset handler doesn't send CORS headers,
+    // causing ES module loads to fail on cold WebView2 profiles.
+    {
+      name: "strip-crossorigin",
+      enforce: "post" as const,
+      transformIndexHtml(html: string) {
+        return html.replace(/ crossorigin/g, "");
+      },
+    },
+  ],
   define: {
     __APP_VERSION__: JSON.stringify(version),
   },
