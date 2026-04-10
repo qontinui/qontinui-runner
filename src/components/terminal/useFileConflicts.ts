@@ -75,11 +75,20 @@ export function useFileConflicts() {
     };
   }, [refreshRegistry]);
 
-  // Poll registry every 30 seconds
+  // Poll registry every 30 seconds — initial fetch deferred to next microtask
+  // to avoid calling setState synchronously within the effect body
   useEffect(() => {
-    refreshRegistry();
-    const interval = setInterval(refreshRegistry, 30000);
-    return () => clearInterval(interval);
+    const interval = setInterval(() => {
+      void refreshRegistry();
+    }, 30000);
+    // Defer initial fetch so setState is not called synchronously in the effect
+    const initialFetch = setTimeout(() => {
+      void refreshRegistry();
+    }, 0);
+    return () => {
+      clearInterval(interval);
+      clearTimeout(initialFetch);
+    };
   }, [refreshRegistry]);
 
   // Derive conflicts: files held by multiple sessions (excluding self from each session's view)

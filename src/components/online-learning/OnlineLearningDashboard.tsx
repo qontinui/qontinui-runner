@@ -117,7 +117,6 @@ export function OnlineLearningDashboard() {
   const [experiences, setExperiences] = useState<ExperienceSummary[]>([]);
 
   const loadData = useCallback(async () => {
-    setLoading(true);
     const [rs, rt, ds, dm, sc, st, ex] = await Promise.all([
       fetchOL<ModelRoutingState>("model-routing"),
       fetchOL<RoutingTableEntry[]>("model-routing/table"),
@@ -138,13 +137,22 @@ export function OnlineLearningDashboard() {
   }, []);
 
   useEffect(() => {
-    loadData();
+    // Defer initial load so setState is called in response to the async subscribe, not synchronously
+    const initialLoad = setTimeout(() => {
+      setLoading(true);
+      void loadData();
+    }, 0);
     let unlisten: UnlistenFn | null = null;
-    listen("drift-detected", () => loadData()).then((fn) => {
+    listen("drift-detected", () => {
+      void loadData();
+    }).then((fn) => {
       unlisten = fn;
     });
-    const interval = setInterval(loadData, 60_000);
+    const interval = setInterval(() => {
+      void loadData();
+    }, 60_000);
     return () => {
+      clearTimeout(initialLoad);
       if (unlisten) unlisten();
       clearInterval(interval);
     };

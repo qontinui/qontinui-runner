@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo, type ReactElement } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo, startTransition, type ReactElement } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { List, useListRef, type RowComponentProps } from "react-window";
@@ -125,7 +125,7 @@ export function ProcessOutputViewer({
 
   // Reset selection when switching processes
   useEffect(() => {
-    setSelectedSessionId(LIVE_SESSION);
+    startTransition(() => setSelectedSessionId(LIVE_SESSION));
   }, [processId]);
 
   // Load historical session list (refreshes when process state changes)
@@ -209,7 +209,7 @@ export function ProcessOutputViewer({
   // Run global search when searchAllSessions is enabled and there's a query
   useEffect(() => {
     if (!searchAllSessions || !searchText.trim()) {
-      setGlobalHits([]);
+      startTransition(() => setGlobalHits([]));
       return;
     }
     let cancelled = false;

@@ -1965,6 +1965,70 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // which is exactly what we want.)
                 instance_manager::clear_active_instances();
 
+                // Deregister this instance from the runner_instances table.
+                // For the primary: mark stopped so secondaries know it's gone.
+                // For secondaries: remove the row entirely and notify the primary.
+                {
+                    let pg = app_state.pg_db.clone();
+                    let own_port = app_state
+                        .api_port
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let is_secondary = instance::is_secondary();
+                    let primary_port = instance::primary_port();
+                    let id = format!(
+                        "{}-{}",
+                        if is_secondary { "ext" } else { "primary" },
+                        own_port
+                    );
+
+                    // Best-effort: spawn a quick runtime to clean up DB + HTTP
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build();
+                        if let Ok(rt) = rt {
+                            rt.block_on(async {
+                                if is_secondary {
+                                    // Remove from DB
+                                    let _ = pg.remove_runner_instance(&id).await;
+                                    // Also try removing by port (covers different ID formats)
+                                    let _ = pg
+                                        .cleanup_dead_runner_instances(0)
+                                        .await;
+                                    info!(
+                                        "Deregistered secondary instance (port={}) from DB",
+                                        own_port
+                                    );
+
+                                    // Notify primary (best-effort)
+                                    if let Some(pp) = primary_port {
+                                        let client = reqwest::Client::builder()
+                                            .timeout(std::time::Duration::from_secs(2))
+                                            .build()
+                                            .ok();
+                                        if let Some(client) = client {
+                                            let url = format!(
+                                                "http://127.0.0.1:{}/instances/{}/stop",
+                                                pp, id
+                                            );
+                                            let _ = client.post(&url).send().await;
+                                        }
+                                    }
+                                } else {
+                                    // Primary: mark as stopped (not delete — secondaries
+                                    // may query it to detect primary is gone)
+                                    let _ = pg
+                                        .update_runner_instance_heartbeat(
+                                            &id, Some(0), "stopped",
+                                        )
+                                        .await;
+                                    info!("Marked primary instance as stopped in DB");
+                                }
+                            });
+                        }
+                    });
+                }
+
                 // ── Explicit shutdown ordering ──
                 // Take PythonBridge (via bridge manager) and ExtractionExecutor out
                 // of AppState and clean them up on a dedicated thread with its own

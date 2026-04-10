@@ -807,7 +807,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
         return next;
       });
     },
-    [zoneCount, assignments, tabs, zoneLabels, zoneNotes, pinnedZones, layoutId],
+    [zoneCount, assignments, tabs, zoneLabels, zoneNotes, pinnedZones, layoutId, pageId],
   );
 
   const handleDeleteWorkspace = useCallback((index: number) => {
@@ -817,7 +817,7 @@ export const ZoneControlPanel = React.memo(function ZoneControlPanel({
       saveWorkspacesToStorage(next, pageId);
       return next;
     });
-  }, []);
+  }, [pageId]);
 
   const handleLoadWorkspace = useCallback(
     (workspace: SavedWorkspace) => {

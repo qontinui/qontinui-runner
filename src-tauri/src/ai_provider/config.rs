@@ -119,7 +119,7 @@ pub fn rotate_account_on_rate_limit() -> bool {
                 .max_by_key(|d| {
                     map.get(*d)
                         .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0) // 0 = never rate-limited means NOT preferred here
+                        .unwrap_or(u64::MAX) // never rate-limited = best candidate
                 });
             best.cloned()
         }

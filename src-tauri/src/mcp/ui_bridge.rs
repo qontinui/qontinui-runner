@@ -610,6 +610,22 @@ async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Valu
         "Frontend was responsive recently but the readiness gate was not notified. Possible race condition."
     };
 
+    // Try to read window.__BOOT_ERRORS from the webview (set by index.html's
+    // error catcher script in <head>). This captures JS errors that occur during
+    // IIFE bundle execution, before the UI Bridge SDK can initialize.
+    let boot_errors: serde_json::Value = if let Some(ref win) = main_window {
+        match win.eval("window.__QONTINUI_DIAG_CALLBACK && window.__QONTINUI_DIAG_CALLBACK(JSON.stringify(window.__BOOT_ERRORS || []))") {
+            _ => {
+                // eval() is fire-and-forget in Tauri v2; we can't get return values.
+                // Instead, the readiness endpoint reads __BOOT_ERRORS via page/evaluate.
+                serde_json::json!(null)
+            }
+        }
+    } else {
+        serde_json::json!(null)
+    };
+    let _ = boot_errors; // reserved for future use when Tauri eval returns values
+
     serde_json::json!({
         "error": "UI Bridge frontend did not become ready within 10000ms",
         "diagnostics": {
@@ -623,7 +639,8 @@ async fn gather_readiness_diagnostics(state: &Arc<ApiState>) -> serde_json::Valu
             "semaphoreAvailablePermits": available_permits,
             "tauriMainWindowExists": window_exists,
             "tauriMainWindowVisible": window_visible,
-            "hint": hint
+            "hint": hint,
+            "bootErrorsNote": "Call GET /ui-bridge/control/page/evaluate with expression 'JSON.stringify(window.__BOOT_ERRORS)' to retrieve boot-time JS errors"
         }
     })
 }
@@ -7748,7 +7765,28 @@ pub async fn ui_bridge_readiness_handler(
             "processUptimeMs": state.started_at.elapsed().as_millis() as u64
         })))
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(diag))
+        // When the frontend is not ready and the process has been up for >30s,
+        // attach a native screenshot + boot errors so agents can diagnose the
+        // webview state without needing a separate call.
+        let uptime_ms = state.started_at.elapsed().as_millis() as u64;
+        let mut result = diag;
+        if uptime_ms >= 30_000 {
+            if let Some((screenshot, width, height)) =
+                capture_runner_window_base64(&state).await
+            {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "diagnosticScreenshot".to_string(),
+                        serde_json::json!({
+                            "screenshot": screenshot,
+                            "width": width,
+                            "height": height,
+                        }),
+                    );
+                }
+            }
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Json(result))
     }
 }
 

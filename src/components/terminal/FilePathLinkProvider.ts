@@ -61,7 +61,7 @@ export class FilePathLinkProvider implements ITerminalLinkProvider {
           start: { x: startX, y: bufferLineNumber },
           end: { x: endX, y: bufferLineNumber },
         },
-        text: fullMatch,
+        text: filePath,
         decorations: {
           pointerCursor: true,
           underline: true,
