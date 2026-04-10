@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "description": "Terminal page -- an integrated multi-page, multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, findings tracking, and concurrent session file conflict detection. Users can create multiple terminal pages (e.g., Development, Testing, Monitoring), each with its own independent zone layout, terminals, and saved configurations. Within each page, users execute shell commands in multiple concurrent terminal sessions organized in configurable zone layouts. The terminal supports session persistence across restarts (Claude Code session IDs are saved and auto-resumed), zone profiles that capture session assignments, shell integration for structured command history, keyboard shortcuts for efficient tab management, and an advisory file registry that auto-detects file conflicts across sessions.",
+  "description": "Terminal page -- an integrated multi-page, multi-tab PTY terminal with workflow generation, session transcript browsing, terminal output analysis, findings tracking, and concurrent session file conflict detection. Users can create multiple terminal pages (e.g., Development, Testing, Monitoring), each with its own independent zone layout, terminals, and saved configurations. Within each page, users execute shell commands in multiple concurrent terminal sessions organized in configurable zone layouts. The terminal supports session persistence across restarts (Claude Code session IDs are saved and auto-resumed), zone profiles that capture session assignments, shell integration for structured command history, keyboard shortcuts for efficient tab management, and an advisory file registry that auto-detects file conflicts across sessions, and plan implementation workflow execution from both the UI (Implement/Verify buttons) and CLI (run-plan-implementation.ts script).",
   "groups": [
     {
       "id": "term-multi-tab",
@@ -459,17 +459,16 @@
         }
       ],
       "source": "manual"
-    }
-    ,
+    },
     {
       "id": "term-file-conflict-banner",
       "name": "File Conflict Detection Banner",
-      "description": "The Terminal page includes an advisory file conflict detection system that tracks which files are under active development by concurrent sessions (workflows and AI terminal sessions). When multiple sessions edit the same file, a warning banner appears below the notification bar showing conflicting files and which sessions hold them. Real-time toast alerts appear when a new conflict is detected (e.g., session B starts editing a file that session A already registered). The banner is collapsible — a summary line shows the count of conflicting files, and expanding reveals the full list with file paths and session names. The system auto-registers files when Claude Code uses Edit or Write tools, polls the runner's file registry API every 30 seconds, and listens for real-time Tauri events. The banner uses warning amber (#e0af68) coloring consistent with the 'needs-input' status style.",
+      "description": "The Terminal page includes an advisory file conflict detection system that tracks which files are under active development by concurrent sessions (workflows and AI terminal sessions). When multiple sessions edit the same file, a warning banner appears below the notification bar showing conflicting files and which sessions hold them. Real-time toast alerts appear when a new conflict is detected (e.g., session B starts editing a file that session A already registered). The banner is collapsible \u00e2\u20ac\u201d a summary line shows the count of conflicting files, and expanding reveals the full list with file paths and session names. The system auto-registers files when Claude Code uses Edit or Write tools, polls the runner's file registry API every 30 seconds, and listens for real-time Tauri events. The banner uses warning amber (#e0af68) coloring consistent with the 'needs-input' status style.",
       "category": "state-consistency",
       "assertions": [
         {
           "id": "term-conflict-banner-hidden-no-conflicts",
-          "description": "When no files are under concurrent development (no file registry conflicts), the FileConflictBanner component renders nothing — no banner, no summary line, no empty state. The banner only appears when there are active conflicts.",
+          "description": "When no files are under concurrent development (no file registry conflicts), the FileConflictBanner component renders nothing \u00e2\u20ac\u201d no banner, no summary line, no empty state. The banner only appears when there are active conflicts.",
           "category": "state-consistency",
           "severity": "critical",
           "assertionType": "semantic",
@@ -684,7 +683,7 @@
         },
         {
           "id": "term-page-switch-isolation",
-          "description": "Switching between pages preserves each page's terminals independently. If page A has 4 terminals and page B has 1, switching from A to B shows 1 terminal, and switching back to A shows 4 terminals. PTY processes stay alive during switches — they are filtered by page_id in the Rust backend.",
+          "description": "Switching between pages preserves each page's terminals independently. If page A has 4 terminals and page B has 1, switching from A to B shows 1 terminal, and switching back to A shows 4 terminals. PTY processes stay alive during switches \u00e2\u20ac\u201d they are filtered by page_id in the Rust backend.",
           "category": "state-consistency",
           "severity": "critical",
           "assertionType": "behavior",
@@ -862,7 +861,7 @@
       "assertions": [
         {
           "id": "term-storage-profiles-isolated",
-          "description": "Zone profiles saved on one page are not visible on another page. If page A has a profile 'Dev Setup' and the user switches to page B and opens the zone profiles dropdown, 'Dev Setup' should not appear — page B has its own independent profile list.",
+          "description": "Zone profiles saved on one page are not visible on another page. If page A has a profile 'Dev Setup' and the user switches to page B and opens the zone profiles dropdown, 'Dev Setup' should not appear \u00e2\u20ac\u201d page B has its own independent profile list.",
           "category": "state-consistency",
           "severity": "critical",
           "assertionType": "semantic",
@@ -910,6 +909,186 @@
             "label": "Page tabs for label isolation check"
           },
           "precondition": "Multiple pages with zone labels configured",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "term-plan-implementation",
+      "name": "Plan Implementation Workflow",
+      "description": "Users can build and execute multi-stage plan implementation workflows directly from the Terminal page. Two entry points exist: (1) from a transcript panel, select messages containing a plan and click Implement to build a workflow with implement/review/next-steps stages per phase, or (2) from the status bar, click Implement next to a detected plan file. The Implement button (amber, Rocket icon) is the primary action; the Verify button (gray, ListChecks icon) builds a lighter verification-only workflow. Both parse the plan markdown into phases and tasks, build a multi-stage UnifiedWorkflow, and show it in the workflow preview panel for execution.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "term-plan-impl-transcript-button",
+          "description": "When viewing a transcript, an Implement button (amber/gold, Rocket icon) appears in the footer alongside Generate and Run. Clicking it extracts plan content from selected messages, parses phases and tasks, builds a plan implementation workflow (3 stages per phase: implement, review, next-steps), and shows it in the workflow preview panel.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Implement"
+            },
+            "label": "Implement plan button in transcript panel"
+          },
+          "precondition": "Transcript panel is open with messages selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-verify-transcript-button",
+          "description": "A secondary Verify button (gray, ListChecks icon) appears next to Implement in the transcript footer. It builds a lighter verification-only plan workflow (1 stage per phase with deterministic checks) instead of the full implement/review/next-steps workflow.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Verify"
+            },
+            "label": "Verify plan button in transcript panel"
+          },
+          "precondition": "Transcript panel is open with messages selected",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-impl-file-button",
+          "description": "When a plan file (PLAN*.md, TODO*.md, NOTES*.md, ROADMAP*.md) is detected in the workspace, the status bar shows the filename in green with an Implement button (amber, Rocket icon) next to it. Clicking Implement parses the file content, builds a plan implementation workflow, and shows the preview panel.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Implement"
+            },
+            "label": "Implement plan from file button in status bar"
+          },
+          "precondition": "A plan file is detected in the workspace (plan filename badge visible in status bar)",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-verify-file-button",
+          "description": "A secondary Verify button (gray, ListChecks icon) appears next to Implement in the status bar plan file area. It builds the lighter verification-only workflow from the plan file.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "exists",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "role": "button",
+              "textContent": "Verify"
+            },
+            "label": "Verify plan from file button in status bar"
+          },
+          "precondition": "A plan file is detected in the workspace",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-impl-workflow-structure",
+          "description": "The plan implementation workflow generated by the Implement button creates 3 stages per plan phase (Implement, Review, Next Steps) plus a final Commit stage. Each stage has its own agentic prompt and compile-check verification step. The workflow preview panel should show all stages with names like 'Phase 1: Implement -- [name]', 'Phase 1: Review -- [name]', 'Phase 1: Next Steps -- [name]'.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Plan Implementation"
+            },
+            "label": "Plan implementation workflow in preview panel"
+          },
+          "precondition": "A plan implementation workflow has been built and is shown in the preview panel",
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-refresh-button",
+          "description": "A refresh button (circular arrow icon) in the status bar plan file area reloads the plan file from disk. When no plan file is found, the status bar shows 'no plan' text instead of a filename. After clicking refresh, if a plan file is now present, the filename appears and the Implement/Verify buttons become visible.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "behavior",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "accessibleName": "Reload plan file from disk"
+            },
+            "label": "Plan file refresh button"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        }
+      ],
+      "source": "ai-generated"
+    },
+    {
+      "id": "term-plan-cli-script",
+      "name": "Plan Implementation CLI Script",
+      "description": "A standalone CLI script (scripts/run-plan-implementation.ts) allows launching plan implementation workflows from any Claude Code session without the runner UI. The script parses markdown plan files, builds the same multi-stage workflow as the UI Implement button, and POSTs it to the runner execute-inline endpoint. It supports --dry-run for inspection and --follow for streaming progress.",
+      "category": "behavior",
+      "assertions": [
+        {
+          "id": "term-plan-cli-parse",
+          "description": "The script correctly parses markdown plans with numbered headings (### 1. Name) as phases and sub-items (numbered lists, bullets) as tasks. Non-actionable sections (Context, Goal, Reference, Validation, Implementation Order) are skipped.",
+          "category": "state-consistency",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "Parsed"
+            },
+            "label": "Script parse output"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-cli-execute",
+          "description": "Running the script with a plan file POSTs the generated workflow to /unified-workflows/execute-inline on the target runner port. The endpoint returns HTTP 200 and the workflow starts executing asynchronously.",
+          "category": "behavior",
+          "severity": "critical",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "execute-inline"
+            },
+            "label": "Execute inline endpoint"
+          },
+          "source": "ai-generated",
+          "reviewed": false,
+          "enabled": true
+        },
+        {
+          "id": "term-plan-cli-follow",
+          "description": "The --follow flag polls /task-runs/{id}/workflow-state every 5 seconds and streams phase transitions, iteration counts, and pass/fail status to stderr until completion.",
+          "category": "behavior",
+          "severity": "warning",
+          "assertionType": "semantic",
+          "target": {
+            "type": "search",
+            "criteria": {
+              "textContains": "follow"
+            },
+            "label": "Follow mode output"
+          },
           "source": "ai-generated",
           "reviewed": false,
           "enabled": true
