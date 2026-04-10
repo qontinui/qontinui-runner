@@ -664,6 +664,7 @@ pub fn check_and_launch_optimizers_with_pg(
 ) -> Result<Vec<String>, String> {
     let mut launched = Vec::new();
     let pg_db = &deps.app_state.pg_db;
+    let mut meta_prompt_pipeline_should_run = false;
 
     for optimizer_type in OptimizerType::all() {
         match should_launch_optimizer(pg_db, *optimizer_type, &source_task_run_id) {
@@ -674,6 +675,9 @@ pub fn check_and_launch_optimizers_with_pg(
                     debug!("Skipping MetaPrompt — additional guards not met");
                     continue;
                 }
+                if *optimizer_type == OptimizerType::MetaPrompt {
+                    meta_prompt_pipeline_should_run = true;
+                }
                 match launch_optimizer(&deps, *optimizer_type) {
                     Ok(id) => launched.push(id),
                     Err(e) => warn!("Failed to launch {}: {}", optimizer_type, e),
@@ -683,6 +687,31 @@ pub fn check_and_launch_optimizers_with_pg(
             Err(e) => warn!("Error checking {}: {}", optimizer_type, e),
         }
     }
+
+    // Launch the optimization pipeline (beam search → duel → canary) alongside
+    // the legacy meta-prompt workflow when guards pass.
+    if meta_prompt_pipeline_should_run {
+        let pg_clone = pg_db.clone();
+        tokio::spawn(async move {
+            use super::optimization_pipeline::{OptimizationPipeline, PipelineConfig};
+            let pipeline = OptimizationPipeline::new(pg_clone, PipelineConfig::default());
+            match pipeline.run_cycle().await {
+                Ok(result) => {
+                    if let Some(reason) = result.skipped_reason {
+                        debug!("OptimizationPipeline (pg) skipped: {}", reason);
+                    } else {
+                        info!(
+                            agent_type = %result.agent_type,
+                            candidates = result.candidates_generated,
+                            "OptimizationPipeline (pg) run_cycle completed"
+                        );
+                    }
+                }
+                Err(e) => warn!("OptimizationPipeline (pg) run_cycle failed: {}", e),
+            }
+        });
+    }
+
     if let Err(e) = super::snapshots::capture_periodic(pg_db, super::types::WorkflowCategory::Main)
     {
         warn!("Failed to capture periodic snapshot: {}", e);

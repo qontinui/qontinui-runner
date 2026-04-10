@@ -16,6 +16,7 @@ import { RobustnessTab } from "../components/meta-optimizer/RobustnessTab";
 import { PromptOptimizationTab } from "../components/meta-optimizer/PromptOptimizationTab";
 import { DuelPoolsTab } from "../components/meta-optimizer/DuelPoolsTab";
 import { BeamRunsTab } from "../components/meta-optimizer/BeamRunsTab";
+import { SpanEventsTab } from "../components/meta-optimizer/SpanEventsTab";
 import { PlaybookPanel } from "../components/adaptive-learning/PlaybookPanel";
 import { LearningDashboard } from "../components/adaptive-learning/LearningDashboard";
 import { PromptEvolutionPanel } from "../components/adaptive-learning/PromptEvolutionPanel";
@@ -31,6 +32,7 @@ type SubTab =
   | "robustness"
   | "duel_pools"
   | "beam_runs"
+  | "span_events"
   | "learning"
   | "playbook"
   | "prompt_evolution";
@@ -46,6 +48,7 @@ const TABS: { id: SubTab; label: string }[] = [
   { id: "robustness", label: "Robustness" },
   { id: "duel_pools", label: "Duel Pools" },
   { id: "beam_runs", label: "Beam Runs" },
+  { id: "span_events", label: "Span Events" },
   { id: "learning", label: "Adaptive Learning" },
   { id: "playbook", label: "Playbook" },
   { id: "prompt_evolution", label: "Prompt Evolution" },
@@ -86,6 +89,7 @@ export function MetaOptimizerPage() {
         {tab === "robustness" && <RobustnessTab />}
         {tab === "duel_pools" && <DuelPoolsTab />}
         {tab === "beam_runs" && <BeamRunsTab />}
+        {tab === "span_events" && <SpanEventsTab />}
         {tab === "learning" && <LearningDashboard />}
         {tab === "playbook" && <PlaybookPanel />}
         {tab === "prompt_evolution" && <PromptEvolutionPanel />}
