@@ -15,7 +15,7 @@ import { BatchOperationsBar } from "./BatchOperationsBar";
 import { ZoneMinimap } from "./ZoneMinimap";
 import { ZoneProfilePicker } from "./ZoneProfilePicker";
 import { useTerminalPageId } from "./TerminalPageContext";
-import { TerminalCoreProvider, useTerminalCore } from "./contexts";
+import { TerminalCoreProvider, useTerminalCore, SessionStateProvider, useSessionState } from "./contexts";
 import { ZoneTimeline } from "./ZoneTimeline";
 import { ZoneControlPanel } from "./ZoneControlPanel";
 import { useSessionPersistence } from "./useSessionPersistence";
@@ -25,18 +25,14 @@ import { TerminalOverlays } from "./TerminalOverlays";
 
 import { useEventHistory } from "./useEventHistory";
 import { useFocusHistory } from "./useFocusHistory";
-import { useUnreadTracking } from "./useUnreadTracking";
-import { useOutputSnapshots } from "./useOutputSnapshots";
 import { useWindowTitle } from "./useWindowTitle";
 import { useZoneLabelsAndTags } from "./useZoneLabelsAndTags";
-import { useSessionStateTracking } from "./useSessionStateTracking";
 import { useStateTransitionEffects } from "./useStateTransitionEffects";
 import { useShellIntegration } from "./useShellIntegration";
 import { useWorkflowGeneration } from "./useWorkflowGeneration";
 import { useAnalysis } from "./useAnalysis";
 import { useFindingsActions } from "./useFindingsActions";
 import { useTranscriptSessions } from "./useTranscriptSessions";
-import { useTerminalFindings } from "./useTerminalFindings";
 import { useUIState } from "./useUIState";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { useTerminalInitialization } from "./useTerminalInitialization";
@@ -53,7 +49,9 @@ export function TerminalPage(props: TerminalPageProps) {
   const pageId = useTerminalPageId();
   return (
     <TerminalCoreProvider pageId={pageId}>
-      <TerminalPageInner {...props} />
+      <SessionStateProvider>
+        <TerminalPageInner {...props} />
+      </SessionStateProvider>
     </TerminalCoreProvider>
   );
 }
@@ -115,29 +113,10 @@ function TerminalPageInner({
   const focusHistory = useFocusHistory(zoneLayout.focusedZone, zoneLayout.setFocusedZone);
   const labelsAndTags = useZoneLabelsAndTags(zoneLayout.layoutId, zoneLayout.assignments, pageId);
 
-  const processOutputRef = useRef<((tabId: string, text: string) => void) | undefined>(undefined);
-
-  const stateTracking = useSessionStateTracking({
-    tabs,
-    processOutput: (tabId, text) => processOutputRef.current?.(tabId, text),
-    getBufferLines: (tabId, maxLines) => {
-      const ref = terminalRefs.current.get(tabId);
-      const scrollback = ref?.current?.getScrollback?.(maxLines) ?? "";
-      if (!scrollback) return [];
-      return scrollback
-        .split("\n")
-        .filter((l) => l.trim().length > 0)
-        .slice(-maxLines);
-    },
-  });
-
-  const { unreadZones: _unreadZones } = useUnreadTracking(
-    zoneLayout.focusedZone,
-    zoneLayout.assignments,
-    stateTracking.lastOutputLines,
-  );
-
-  const snapshots = useOutputSnapshots(stateTracking.lastOutputLines);
+  const sessionState = useSessionState();
+  const { snapshots, activeFindings, allFindings } = sessionState;
+  // Alias for backward compatibility with existing prop-passing code
+  const stateTracking = sessionState;
 
   const handleRestartInZoneRef = useRef<(zoneIdx: number) => void>(() => {});
 
@@ -239,8 +218,6 @@ function TerminalPageInner({
     },
   });
 
-  const { processOutput, activeFindings, allFindings } = useTerminalFindings(activeId ?? null);
-
   const workflowGen = useWorkflowGeneration({
     activeId,
     tabs,
@@ -314,7 +291,6 @@ function TerminalPageInner({
     [],
   );
 
-  processOutputRef.current = processOutput;
   rightPanelModeSetterRef.current = workflowGen.setRightPanelMode;
   selectedSessionSetterRef.current = workflowGen.setSelectedTranscriptSessionId;
 
