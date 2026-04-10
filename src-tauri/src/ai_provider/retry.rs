@@ -11,6 +11,20 @@ pub(super) const MAX_AI_RETRIES: u32 = 3;
 /// Base backoff delay in milliseconds (doubles each retry: 2s, 4s, 8s).
 pub(super) const BASE_BACKOFF_MS: u64 = 2000;
 
+/// Check if an error is specifically a rate-limit / token-exhaustion error.
+///
+/// This is a subset of retryable errors — used to trigger account rotation
+/// before retrying, so the next attempt uses a different account.
+pub(super) fn is_rate_limit_error(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("(429)")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("overloaded")
+        || lower.contains("token limit")
+        || lower.contains("usage limit")
+}
+
 /// Determine whether an AI error response represents a transient/retryable failure.
 ///
 /// Retryable errors include:
@@ -180,6 +194,16 @@ where
             return response;
         }
 
+        // If this is a rate-limit error, try rotating to another account before retrying
+        if is_rate_limit_error(error_msg) {
+            if super::config::rotate_account_on_rate_limit() {
+                warn!(
+                    "{}: rate-limit detected, rotated to next account for retry",
+                    operation_name
+                );
+            }
+        }
+
         // Calculate backoff: BASE_BACKOFF_MS * 2^attempt (2s, 4s, 8s for base=2000)
         let backoff_ms = BASE_BACKOFF_MS * 2u64.pow(attempt);
         let backoff_secs = backoff_ms as f64 / 1000.0;
@@ -265,6 +289,15 @@ where
 
     if let Some(fb) = fallback {
         if is_retryable_error(error_msg) {
+            // Rotate account on rate-limit before trying fallback
+            if is_rate_limit_error(error_msg) {
+                if super::config::rotate_account_on_rate_limit() {
+                    warn!(
+                        "{}: rate-limit on primary, rotated account before fallback",
+                        operation_name
+                    );
+                }
+            }
             warn!(
                 "{}: primary failed with retryable error, trying fallback model",
                 operation_name

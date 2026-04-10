@@ -586,4 +586,305 @@ mod tests {
         assert_eq!(provider_key(&AiProvider::GeminiCli), "gemini_cli");
         assert_eq!(provider_key(&AiProvider::GeminiApi), "gemini_api");
     }
+
+    // ---- Registry tests ----
+
+    #[test]
+    fn test_registry_returns_same_breaker_for_same_key() {
+        // Use a unique key to avoid interference from other tests
+        let key = "registry_same_key_test";
+        // Record a failure through the public API so the breaker exists
+        record_provider_failure(key, "first error");
+
+        // The state should be Closed (only 1 failure, threshold is 4)
+        assert_eq!(provider_state(key), CircuitState::Closed);
+
+        // Record more failures through the same key — they accumulate
+        record_provider_failure(key, "second error");
+        record_provider_failure(key, "third error");
+        record_provider_failure(key, "fourth error");
+
+        // Now it should be Open (4 failures = default threshold)
+        assert_eq!(provider_state(key), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_registry_returns_different_breaker_for_different_keys() {
+        let key_a = "registry_diff_key_a";
+        let key_b = "registry_diff_key_b";
+
+        // Trip breaker A
+        for _ in 0..4 {
+            record_provider_failure(key_a, "error");
+        }
+        assert_eq!(provider_state(key_a), CircuitState::Open);
+
+        // Breaker B should still be Closed
+        assert_eq!(provider_state(key_b), CircuitState::Closed);
+        assert!(is_provider_available(key_b));
+    }
+
+    // ---- Probe mechanics ----
+
+    #[test]
+    fn test_release_probe_handles_underflow() {
+        let cb = make_breaker(2, 1);
+        // active_probes starts at 0 — releasing should not panic or wrap
+        cb.release_probe();
+        assert_eq!(cb.active_probes.load(Ordering::SeqCst), 0);
+
+        // Double release after a single acquire should also be safe
+        cb.active_probes.store(1, Ordering::SeqCst);
+        cb.release_probe();
+        assert_eq!(cb.active_probes.load(Ordering::SeqCst), 0);
+        cb.release_probe();
+        assert_eq!(cb.active_probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_half_open_multiple_successes_required() {
+        // Require 3 successes to close from HalfOpen
+        let cb = CircuitBreaker::new(
+            "test_multi_success".to_string(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 3,
+                open_timeout: Duration::from_millis(50),
+                half_open_max_probes: 1,
+            },
+        );
+
+        // Open the circuit
+        cb.record_failure("boom");
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Wait for timeout
+        std::thread::sleep(Duration::from_millis(60));
+
+        // First probe + success: still HalfOpen (1 of 3)
+        assert!(cb.is_available());
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Second probe + success: still HalfOpen (2 of 3)
+        assert!(cb.is_available());
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        // Third probe + success: now Closed (3 of 3)
+        assert!(cb.is_available());
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    // ---- Failover dedup ----
+
+    #[test]
+    fn test_failover_dedup_independent_providers() {
+        let key_x = "failover_indep_x";
+        let key_y = "failover_indep_y";
+
+        assert!(try_acquire_failover_switch(key_x));
+        // Different provider should still acquire independently
+        assert!(try_acquire_failover_switch(key_y));
+        // Same provider blocked
+        assert!(!try_acquire_failover_switch(key_x));
+        assert!(!try_acquire_failover_switch(key_y));
+
+        release_failover_switch(key_x);
+        release_failover_switch(key_y);
+    }
+
+    #[test]
+    fn test_release_failover_switch_is_idempotent() {
+        let key = "failover_idempotent";
+        assert!(try_acquire_failover_switch(key));
+        release_failover_switch(key);
+        // Double release should not panic
+        release_failover_switch(key);
+        // Should be acquirable again
+        assert!(try_acquire_failover_switch(key));
+        release_failover_switch(key);
+    }
+
+    // ---- Broadcast ----
+
+    #[test]
+    fn test_broadcast_emits_on_state_change() {
+        let mut rx = event_receiver();
+        // Drain stale/lagged messages from other parallel tests
+        while rx.try_recv().is_ok() {}
+
+        let cb = make_breaker(2, 1);
+
+        // Open the circuit (Closed -> Open)
+        cb.record_failure("e1");
+        cb.record_failure("e2");
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Find our Open event (skip events from other tests)
+        let mut found = false;
+        for _ in 0..20 {
+            match rx.try_recv() {
+                Ok(ev) if ev.provider_key == "test_provider" && ev.state == "Open" => {
+                    assert!(!ev.available);
+                    found = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(found, "should receive Open event for test_provider");
+    }
+
+    #[test]
+    fn test_broadcast_emits_on_reset() {
+        let mut rx = event_receiver();
+        // Drain stale/lagged messages from other parallel tests
+        while rx.try_recv().is_ok() {}
+
+        let cb = make_breaker(1, 1);
+
+        // Open then reset
+        cb.record_failure("e1");
+        // Drain all until quiet
+        while rx.try_recv().is_ok() {}
+
+        cb.reset();
+
+        let mut found = false;
+        for _ in 0..20 {
+            match rx.try_recv() {
+                Ok(ev) if ev.provider_key == "test_provider" && ev.state == "Closed" => {
+                    assert!(ev.available);
+                    found = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(found, "should receive Closed event on reset");
+    }
+
+    #[test]
+    fn test_broadcast_emits_half_open_and_closed() {
+        // Subscribe fresh, then drain any lagged/stale messages from other tests
+        let mut rx = event_receiver();
+        while rx.try_recv().is_ok() {}
+
+        let cb = make_breaker(1, 1);
+
+        // Open the circuit
+        cb.record_failure("e1");
+
+        // Drain until we find our Open event (other tests may have emitted too)
+        let mut found_open = false;
+        for _ in 0..20 {
+            match rx.try_recv() {
+                Ok(ev) if ev.provider_key == "test_provider" && ev.state == "Open" => {
+                    found_open = true;
+                    break;
+                }
+                Ok(_) => continue, // event from another test
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(found_open, "should receive Open event for test_provider");
+
+        // Wait for timeout, trigger HalfOpen via is_available
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(cb.is_available());
+
+        let mut found_half_open = false;
+        for _ in 0..20 {
+            match rx.try_recv() {
+                Ok(ev) if ev.provider_key == "test_provider" && ev.state == "HalfOpen" => {
+                    assert!(ev.available);
+                    found_half_open = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(found_half_open, "should receive HalfOpen event for test_provider");
+
+        // Success closes the circuit
+        cb.record_success();
+
+        let mut found_closed = false;
+        for _ in 0..20 {
+            match rx.try_recv() {
+                Ok(ev) if ev.provider_key == "test_provider" && ev.state == "Closed" => {
+                    assert!(ev.available);
+                    found_closed = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(found_closed, "should receive Closed event for test_provider");
+    }
+
+    // ---- Edge cases ----
+
+    #[test]
+    fn test_record_failure_in_open_state_is_noop() {
+        let cb = make_breaker(2, 1);
+        cb.record_failure("e1");
+        cb.record_failure("e2");
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Additional failures in Open state should not panic or change state
+        cb.record_failure("e3");
+        cb.record_failure("e4");
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_record_success_in_open_state_is_noop() {
+        let cb = make_breaker(2, 1);
+        cb.record_failure("e1");
+        cb.record_failure("e2");
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Success in Open state should not close it
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_open_not_available_before_timeout() {
+        let cb = CircuitBreaker::new(
+            "test_no_early_halfopen".to_string(),
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold: 1,
+                open_timeout: Duration::from_secs(60), // very long
+                half_open_max_probes: 1,
+            },
+        );
+
+        cb.record_failure("e1");
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Should still be unavailable — timeout hasn't elapsed
+        assert!(!cb.is_available());
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn test_circuit_state_display() {
+        assert_eq!(CircuitState::Closed.to_string(), "Closed");
+        assert_eq!(CircuitState::Open.to_string(), "Open");
+        assert_eq!(CircuitState::HalfOpen.to_string(), "HalfOpen");
+    }
 }

@@ -20,7 +20,6 @@ pub mod generator;
 pub mod gepa_optimizer;
 pub mod hardener;
 pub mod investigator;
-pub mod learning_orchestrator;
 pub mod meta_workflow;
 pub mod pipeline_artifacts;
 pub mod prm_export;

@@ -5,11 +5,34 @@
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use tracing::warn;
+
+/// Maximum total results to accumulate across paginated GitHub API calls.
+const PAGINATION_CAP: usize = 500;
+
+/// Extract the `rel="next"` URL from a GitHub `Link` header value.
+pub fn extract_next_url(link_header: &str) -> Option<String> {
+    for part in link_header.split(',') {
+        let trimmed = part.trim();
+        if trimmed.ends_with("rel=\"next\"") {
+            if let Some(url) = trimmed.strip_suffix("; rel=\"next\"") {
+                let url = url.trim();
+                if url.starts_with('<') && url.ends_with('>') {
+                    return Some(url[1..url.len() - 1].to_string());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// A minimal GitHub API client.
 pub struct GitHubClient {
     client: reqwest::Client,
     token: String,
+    rate_limit_remaining: AtomicU32,
+    rate_limit_reset: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +97,126 @@ impl GitHubClient {
         Ok(Self {
             client,
             token: token.to_string(),
+            rate_limit_remaining: AtomicU32::new(u32::MAX),
+            rate_limit_reset: AtomicU64::new(0),
         })
+    }
+
+    /// Wait if we are close to the GitHub API rate limit.
+    async fn check_rate_limit(&self) {
+        let remaining = self.rate_limit_remaining.load(Ordering::Relaxed);
+        if remaining < 10 {
+            let reset = self.rate_limit_reset.load(Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now < reset {
+                let wait = reset - now;
+                warn!(
+                    "GitHub API rate limit low ({} remaining), waiting {}s",
+                    remaining, wait
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait.min(300))).await;
+            }
+        }
+    }
+
+    /// Update rate limit tracking from response headers.
+    fn update_rate_limit(&self, headers: &HeaderMap) {
+        if let Some(val) = headers.get("x-ratelimit-remaining") {
+            if let Ok(s) = val.to_str() {
+                if let Ok(n) = s.parse::<u32>() {
+                    self.rate_limit_remaining.store(n, Ordering::Relaxed);
+                }
+            }
+        }
+        if let Some(val) = headers.get("x-ratelimit-reset") {
+            if let Ok(s) = val.to_str() {
+                if let Ok(n) = s.parse::<u64>() {
+                    self.rate_limit_reset.store(n, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Send a request with rate-limit pre-check, header tracking, and 403/429 retry.
+    /// Returns the successful response or an error. Retries at most once.
+    async fn send_with_rate_limit(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, String> {
+        self.check_rate_limit().await;
+
+        let req = request
+            .try_clone()
+            .ok_or("Failed to clone request for potential retry")?;
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("GitHub API request failed: {}", e))?;
+
+        self.update_rate_limit(resp.headers());
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            // Determine wait duration
+            let wait_secs = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // Use Retry-After header if present
+                resp.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(60)
+            } else {
+                // 403 — check if rate-limited (remaining == 0)
+                let remaining = resp
+                    .headers()
+                    .get("x-ratelimit-remaining")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u32>().ok());
+                if remaining == Some(0) {
+                    let reset = self.rate_limit_reset.load(Ordering::Relaxed);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now < reset {
+                        reset - now
+                    } else {
+                        60
+                    }
+                } else {
+                    // Not a rate-limit 403, don't retry
+                    return Err(format!(
+                        "GitHub API returned {}: {}",
+                        status,
+                        resp.text().await.unwrap_or_default()
+                    ));
+                }
+            };
+
+            let capped = wait_secs.min(300);
+            warn!(
+                "GitHub API rate limited ({}), retrying after {}s",
+                status, capped
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(capped)).await;
+
+            // Single retry
+            let retry_resp = request
+                .send()
+                .await
+                .map_err(|e| format!("GitHub API retry request failed: {}", e))?;
+
+            self.update_rate_limit(retry_resp.headers());
+            return Ok(retry_resp);
+        }
+
+        Ok(resp)
     }
 
     fn headers(&self) -> HeaderMap {
@@ -107,12 +249,8 @@ impl GitHubClient {
             owner, repo, number
         );
         let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("GitHub API request failed: {}", e))?;
+            .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
+            .await?;
 
         if !resp.status().is_success() {
             return Err(format!(
@@ -138,74 +276,113 @@ impl GitHubClient {
         })
     }
 
-    /// Fetch check runs for a commit SHA.
+    /// Fetch check runs for a commit SHA (paginated).
     pub async fn get_check_runs(
         &self,
         owner: &str,
         repo: &str,
         sha: &str,
     ) -> Result<Vec<CheckRun>, String> {
-        let url = format!(
+        let mut all_runs = Vec::new();
+        let mut next_url: Option<String> = Some(format!(
             "https://api.github.com/repos/{}/{}/commits/{}/check-runs?per_page=100",
             owner, repo, sha
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("GitHub API request failed: {}", e))?;
+        ));
 
-        if !resp.status().is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
+        while let Some(url) = next_url.take() {
+            let resp = self
+                .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
+                .await?;
+
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "GitHub API returned {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+
+            // Extract next page URL before consuming the response body
+            let link_header = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_next_url);
+
+            let body: CheckRunsResponse = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse check runs: {}", e))?;
+
+            all_runs.extend(body.check_runs);
+
+            if all_runs.len() >= PAGINATION_CAP {
+                warn!(
+                    "get_check_runs: pagination cap ({}) reached for {}/{} sha {}",
+                    PAGINATION_CAP, owner, repo, sha
+                );
+                all_runs.truncate(PAGINATION_CAP);
+                break;
+            }
+
+            next_url = link_header;
         }
 
-        let body: CheckRunsResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse check runs: {}", e))?;
-
-        Ok(body.check_runs)
+        Ok(all_runs)
     }
 
-    /// Fetch reviews for a PR.
+    /// Fetch reviews for a PR (paginated).
     pub async fn get_pr_reviews(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
     ) -> Result<Vec<PrReview>, String> {
-        let url = format!(
+        let mut all_reviews = Vec::new();
+        let mut next_url: Option<String> = Some(format!(
             "https://api.github.com/repos/{}/{}/pulls/{}/reviews?per_page=100",
             owner, repo, number
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("GitHub API request failed: {}", e))?;
+        ));
 
-        if !resp.status().is_success() {
-            return Err(format!(
-                "GitHub API returned {}: {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            ));
+        while let Some(url) = next_url.take() {
+            let resp = self
+                .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
+                .await?;
+
+            if !resp.status().is_success() {
+                return Err(format!(
+                    "GitHub API returned {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ));
+            }
+
+            let link_header = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(extract_next_url);
+
+            let reviews: Vec<PrReview> = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse reviews: {}", e))?;
+
+            all_reviews.extend(reviews);
+
+            if all_reviews.len() >= PAGINATION_CAP {
+                warn!(
+                    "get_pr_reviews: pagination cap ({}) reached for {}/{} PR #{}",
+                    PAGINATION_CAP, owner, repo, number
+                );
+                all_reviews.truncate(PAGINATION_CAP);
+                break;
+            }
+
+            next_url = link_header;
         }
 
-        let reviews: Vec<PrReview> = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse reviews: {}", e))?;
-
-        Ok(reviews)
+        Ok(all_reviews)
     }
 
     /// Fetch truncated log for a check run (last 4KB).
@@ -220,12 +397,8 @@ impl GitHubClient {
             owner, repo, check_run_id
         );
         let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(|e| format!("GitHub API request failed: {}", e))?;
+            .send_with_rate_limit(self.client.get(&url).headers(self.headers()))
+            .await?;
 
         if !resp.status().is_success() {
             return Err(format!(
@@ -267,13 +440,13 @@ impl GitHubClient {
             owner, repo, number
         );
         let resp = self
-            .client
-            .post(&url)
-            .headers(self.headers())
-            .json(&serde_json::json!({ "body": body }))
-            .send()
-            .await
-            .map_err(|e| format!("GitHub API request failed: {}", e))?;
+            .send_with_rate_limit(
+                self.client
+                    .post(&url)
+                    .headers(self.headers())
+                    .json(&serde_json::json!({ "body": body })),
+            )
+            .await?;
 
         if !resp.status().is_success() {
             return Err(format!(

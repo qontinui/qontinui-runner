@@ -104,8 +104,10 @@ export function ZoneProfilePicker({
   const [activeProfileName, setActiveProfileName] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const onLoadProfileRef = useRef(onLoadProfile);
+  onLoadProfileRef.current = onLoadProfile;
 
-  // Load profiles and active profile from database on mount
+  // Load profiles and active profile from database on mount, auto-apply if active
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -117,6 +119,10 @@ export function ZoneProfilePicker({
       setProfiles(profs);
       setActiveProfileName(active);
       setLoaded(true);
+      // Auto-apply the saved active profile on mount
+      if (active && profs[active]) {
+        onLoadProfileRef.current(profs[active]);
+      }
     })();
     return () => {
       cancelled = true;

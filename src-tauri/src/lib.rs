@@ -10,11 +10,10 @@ pub mod schema_export;
 // Main window label abstraction
 // ============================================================================
 
-/// The main window label. On the primary instance this is `"main"` (from
-/// the declarative tauri.conf.json). On secondary instances (test runners
-/// spawned by the supervisor), it may be `"main-isolated"` because we
-/// recreate the window with an isolated WebView2 profile via
-/// `data_directory()`.
+/// The main window label. Always `"main"` — the window is created
+/// programmatically in `.setup()` for both primary and secondary
+/// instances. Secondary instances get an isolated WebView2 profile via
+/// `data_directory()` but share the same label.
 ///
 /// Set once at startup by `main.rs` via [`set_main_window_label`] and read
 /// by all callsites via [`get_main_window_label`].

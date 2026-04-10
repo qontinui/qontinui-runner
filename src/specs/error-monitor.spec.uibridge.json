@@ -299,9 +299,213 @@
     "component": "ErrorMonitorTab",
     "author": "Joshua Spinak",
     "createdAt": "2026-03-05T00:00:00.000Z",
-    "updatedAt": "2026-03-05T00:00:00.000Z",
+    "updatedAt": "2026-04-09T00:00:00.000Z",
     "pageUrl": "/tools/error-monitor",
     "elementSource": "sdk",
     "tags": ["error-monitor", "error-tracking", "triage", "observability"]
+  },
+  "stateMachine": {
+    "states": [
+      {
+        "id": "em-list",
+        "name": "Error List — Default View",
+        "description": "Default state: error list visible with search bar and filter toggle. Filter panel is collapsed. Shows severity badges in header and error count in footer.",
+        "elements": [
+          { "textContent": "Error Monitor" },
+          { "placeholder": "Search errors..." }
+        ],
+        "isInitial": true,
+        "transitions": [
+          {
+            "id": "list-to-filtered",
+            "name": "Open filter panel",
+            "description": "Click the Filters button to expand severity and status filter options",
+            "activateStates": ["em-filtered"],
+            "deactivateStates": ["em-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Filters" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "list-to-expanded",
+            "name": "Expand an error",
+            "description": "Click an error row to expand it and show full message, stack trace, and triage actions",
+            "activateStates": ["em-expanded"],
+            "deactivateStates": ["em-list"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "dataAttributes": { "content-label": "error type" } },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "list-search",
+            "name": "Search errors",
+            "description": "Type in the search input to filter errors by text",
+            "activateStates": ["em-list"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "placeholder": "Search errors..." }
+              },
+              {
+                "action": "type",
+                "target": { "placeholder": "Search errors..." },
+                "params": { "text": "error", "clear": true },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "em-filtered",
+        "name": "Filter Panel Open",
+        "description": "Filter panel expanded showing Severity and Status filter button groups. Users can toggle individual severity levels and statuses to narrow the error list.",
+        "elements": [
+          { "textContent": "Severity" },
+          { "textContent": "Status" },
+          { "textContent": "Filters" }
+        ],
+        "transitions": [
+          {
+            "id": "filtered-to-list",
+            "name": "Close filter panel",
+            "description": "Click the Filters button again to collapse the filter options",
+            "activateStates": ["em-list"],
+            "deactivateStates": ["em-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Filters" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "filtered-clear-all",
+            "name": "Clear all filters",
+            "description": "Click 'Clear all' to reset all filter selections and return to unfiltered list",
+            "activateStates": ["em-list"],
+            "deactivateStates": ["em-filtered"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Clear all" },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "em-expanded",
+        "name": "Error Detail Expanded",
+        "description": "An error row is expanded showing full message, optional stack trace, context lines, triage action buttons (Acknowledge, Mark Resolved, Ignore), and Open in Editor link.",
+        "elements": [
+          { "textContent": "Full Message" },
+          { "textContent": "Mark Resolved" }
+        ],
+        "transitions": [
+          {
+            "id": "expanded-to-list",
+            "name": "Collapse error detail",
+            "description": "Click the expanded error row again to collapse it",
+            "activateStates": ["em-list"],
+            "deactivateStates": ["em-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "role": "button", "dataAttributes": { "content-label": "error type" } },
+                "waitAfter": { "type": "idle", "timeout": 500 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-acknowledge",
+            "name": "Acknowledge error",
+            "description": "Mark a new error as acknowledged to signal awareness",
+            "activateStates": ["em-expanded"],
+            "deactivateStates": [],
+            "staysVisible": true,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Acknowledge" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-resolve",
+            "name": "Resolve error",
+            "description": "Mark the error as resolved to remove it from the active queue",
+            "activateStates": ["em-list"],
+            "deactivateStates": ["em-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Mark Resolved" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          },
+          {
+            "id": "expanded-ignore",
+            "name": "Ignore error",
+            "description": "Dismiss the error as not actionable",
+            "activateStates": ["em-list"],
+            "deactivateStates": ["em-expanded"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "textContent": "Ignore" },
+                "waitAfter": { "type": "idle", "timeout": 1000 }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "em-empty",
+        "name": "Empty State — No Errors",
+        "description": "No errors match current filters or no errors detected. Shows success icon with 'No Errors Detected' message and guidance.",
+        "elements": [
+          { "textContains": "No Errors" }
+        ],
+        "transitions": [
+          {
+            "id": "empty-to-list",
+            "name": "Errors appear after refresh",
+            "description": "Auto-refresh brings in new errors, transitioning from empty to list view",
+            "activateStates": ["em-list"],
+            "deactivateStates": ["em-empty"],
+            "staysVisible": false,
+            "process": [
+              {
+                "action": "click",
+                "target": { "tagName": "button", "textContains": "Refresh" },
+                "waitAfter": { "type": "idle", "timeout": 2000 }
+              }
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

@@ -4,8 +4,12 @@
 //! a child TaskRun that reads the PR diff and either approves or requests changes.
 //! The child task blocks the parent from completing via `blocks_parent: true`.
 
+use std::sync::Arc;
+
+use crate::config_storage::ConfigStorage;
 use crate::database::pg::PgDb;
 use crate::database::CreateTaskRunInput;
+use crate::AppState;
 
 /// Configuration for spawning a review subtask.
 pub struct ReviewSubtaskConfig {
@@ -127,6 +131,130 @@ pub async fn spawn_review_subtask(
     );
 
     Ok(review_id)
+}
+
+/// Dependencies required to execute a review subtask workflow.
+///
+/// Bundles all the Arc-cloned state needed to construct a LoopController
+/// and spawn the workflow. Mirrors `ReflectionDeps` / `FollowUpDeps`.
+pub struct ReviewDeps {
+    pub app_state: Arc<AppState>,
+    pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
+    pub app_handle: tauri::AppHandle,
+    pub pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
+/// Execute a review subtask that was previously created via `spawn_review_subtask`.
+///
+/// Builds a minimal LoopConfig (single iteration, prompt-only, no verification)
+/// and spawns the workflow via `spawn_workflow_with_panic_guard`.
+///
+/// This follows the same pattern as `launch_reflection`, `launch_follow_up`, and
+/// `launch_fixer`: create a LoopController, build a LoopConfig, and fire-and-forget.
+pub fn execute_review_subtask(
+    deps: ReviewDeps,
+    review_id: String,
+    review_name: String,
+    prompt: String,
+    model_override: Option<String>,
+) {
+    use std::collections::HashMap;
+
+    let loop_config = super::types::LoopConfig {
+        max_iterations: 1,
+        base_prompt: prompt,
+        workflow_name: review_name.clone(),
+        workflow_id: review_id.clone(),
+        execution_id: review_id.clone(),
+        targeted_error_ids: Vec::new(),
+        starting_iteration: 0,
+        run_agentic_first: true, // Review is agentic-only (no verification to run first)
+        artifact_dir: None,
+        is_dev_mode: false,
+        enable_sweep: false,
+        max_sweep_iterations: 0,
+        stages: Vec::new(),
+        stop_on_failure: false,
+        constraint_overrides: HashMap::new(),
+        reflection_mode: false,
+        provider_override: None,
+        model_override,
+        model_overrides: HashMap::new(),
+        stage_index: None,
+        max_sessions: Some(1),
+        auto_run_generated: false,
+        approval_gate: false,
+        blocking_approval: false,
+        confidence_threshold: 0.85,
+        max_context_tokens: 100_000,
+        enforce_token_budget: false,
+        cross_workflow_learning: false,
+        verification_history: HashMap::new(),
+        routing_context: Default::default(),
+        project_path: crate::mcp::shared::current_project_path(),
+        acceptance_criteria: None,
+        multi_agent_mode: false,
+        rollback_policy: super::RollbackPolicy::None,
+        escalation_policy: super::blame::EscalationPolicy::default(),
+        iteration_diffs: Vec::new(),
+        strict_cwd: false,
+        tool_tags: Vec::new(),
+        use_worktree: false,
+        worktree_path: None,
+        worktree_branch: None,
+        workflow_architecture: None,
+        agentic_verification_config: None,
+        multi_agent_pipeline_config: None,
+        active_canary: None,
+        is_canary_run: false,
+        phase_timeout_ms: None,
+        max_fix_attempts: 0,
+        max_ci_auto_resumes: 0,
+        ci_failure_context: None,
+    };
+
+    let mut controller = super::LoopController::new(
+        deps.app_state.clone(),
+        deps.config_storage.clone(),
+        deps.app_handle.clone(),
+        deps.pid_tracker.clone(),
+    );
+
+    tracing::info!(
+        "Executing review subtask '{}' (id: {})",
+        review_name,
+        review_id,
+    );
+
+    let exec_id = review_id.clone();
+    let wf_name = review_name;
+    let url_lock = Some(deps.app_state.url_lock_manager.clone());
+    let file_registry = Some(deps.app_state.file_registry_manager.clone());
+    let file_lock = Some(deps.app_state.file_lock_manager.clone());
+
+    super::spawn_workflow_with_panic_guard(
+        exec_id,
+        wf_name,
+        url_lock,
+        file_registry,
+        file_lock,
+        deps.app_state.pg_db.clone(),
+        Box::pin(async move {
+            controller
+                .run(
+                    loop_config,
+                    Vec::new(), // setup automation steps
+                    Vec::new(), // setup prompt steps
+                    Vec::new(), // verification steps (review has none)
+                    Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
+                    Vec::new(), // completion automation steps
+                    Vec::new(), // completion prompt steps
+                )
+                .await
+        }),
+    );
+
+    tracing::info!("Review subtask '{}' spawned", review_id);
 }
 
 /// Parse the review outcome from the AI's response text.

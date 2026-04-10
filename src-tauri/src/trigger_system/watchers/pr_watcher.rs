@@ -8,9 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config_storage::ConfigStorage;
 use crate::database::pg::PgDb;
 use crate::trigger_system::github_api::{CiStatus, GitHubClient, ReviewStatus};
 use crate::unified_workflow_executor::CiFailureContext;
+use crate::AppState;
 
 /// Database row for PR watch state.
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ pub fn determine_pr_action(
     merge_conflict: bool,
     auto_resume_count: u32,
     max_auto_resumes: u32,
+    head_sha_changed: bool,
 ) -> PrAction {
     // PR lifecycle events take priority
     if pr_merged {
@@ -65,6 +68,25 @@ pub fn determine_pr_action(
     }
     if pr_closed {
         return PrAction::Closed;
+    }
+
+    // Head SHA changed: developer pushed new commits.
+    // Handle state transitions that are invalidated by the new code.
+    if head_sha_changed {
+        // Previous CI success is stale -- the new SHA hasn't been validated yet.
+        // Reset to no-action so we wait for CI to run on the new commits.
+        if old_checks == "success" {
+            // The stored state will be updated to the new checks (likely "pending"),
+            // so next poll picks up the fresh CI result for the new SHA.
+            return PrAction::NoAction;
+        }
+
+        // Push-after-failure: old checks were "failure" and new checks are "pending".
+        // The developer likely pushed a fix -- wait for CI to complete on the new code
+        // before deciding whether to auto-resume.
+        if old_checks == "failure" && matches!(new_checks, CiStatus::Pending) {
+            return PrAction::NoAction;
+        }
     }
 
     // CI status change
@@ -96,6 +118,17 @@ pub fn determine_pr_action(
     PrAction::NoAction
 }
 
+/// Dependencies for executing review subtasks from within the PR watcher.
+///
+/// These are cloneable references to the same state used by `TriggerExecutorDeps`.
+#[derive(Clone)]
+pub struct PrWatcherDeps {
+    pub app_state: Arc<AppState>,
+    pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
+    pub app_handle: tauri::AppHandle,
+    pub pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
 /// Start the PR watcher as a background polling task.
 ///
 /// Follows the same pattern as `start_health_check`: spawns a tokio task that
@@ -105,6 +138,7 @@ pub fn start_pr_watcher(
     github_token: String,
     poll_interval_seconds: u64,
     stop_signal: Arc<AtomicBool>,
+    execution_deps: Option<PrWatcherDeps>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = match GitHubClient::new(&github_token) {
@@ -124,7 +158,7 @@ pub fn start_pr_watcher(
                 break;
             }
 
-            if let Err(e) = poll_active_prs(&pg_db, &client).await {
+            if let Err(e) = poll_active_prs(&pg_db, &client, execution_deps.as_ref()).await {
                 tracing::warn!("PR watcher poll error: {}", e);
             }
 
@@ -148,7 +182,11 @@ pub fn start_pr_watcher(
 ///
 /// Groups watches by GitHub token so we create one client per unique token
 /// rather than one per PR (avoids wasteful reqwest client creation).
-async fn poll_active_prs(pg_db: &PgDb, default_client: &GitHubClient) -> Result<(), String> {
+async fn poll_active_prs(
+    pg_db: &PgDb,
+    default_client: &GitHubClient,
+    execution_deps: Option<&PrWatcherDeps>,
+) -> Result<(), String> {
     let watches = pg_db.get_active_pr_watches().await?;
     if watches.is_empty() {
         return Ok(());
@@ -193,7 +231,7 @@ async fn poll_active_prs(pg_db: &PgDb, default_client: &GitHubClient) -> Result<
         };
 
         for watch in token_watches {
-            if let Err(e) = poll_single_pr(pg_db, client_ref, watch).await {
+            if let Err(e) = poll_single_pr(pg_db, client_ref, watch, execution_deps).await {
                 tracing::warn!(
                     "PR watcher: error polling PR #{} for task {}: {}",
                     watch.pr_number,
@@ -212,6 +250,7 @@ async fn poll_single_pr(
     pg_db: &PgDb,
     client: &GitHubClient,
     watch: &PrWatchState,
+    execution_deps: Option<&PrWatcherDeps>,
 ) -> Result<(), String> {
     let parts: Vec<&str> = watch.repo_full_name.splitn(2, '/').collect();
     if parts.len() != 2 {
@@ -230,6 +269,17 @@ async fn poll_single_pr(
     let pr_closed = pr.state == "closed" && !pr.merged;
     let merge_conflict = pr.mergeable == Some(false);
 
+    // Detect head SHA changes (developer pushed new commits)
+    let head_sha_changed = watch.head_sha != pr.head_sha;
+    if head_sha_changed {
+        tracing::warn!(
+            "PR #{} head SHA changed ({} → {}), developer pushed new commits",
+            watch.pr_number,
+            &watch.head_sha[..watch.head_sha.len().min(8)],
+            &pr.head_sha[..pr.head_sha.len().min(8)],
+        );
+    }
+
     // Determine action
     let action = determine_pr_action(
         &watch.last_checks_status,
@@ -241,6 +291,7 @@ async fn poll_single_pr(
         merge_conflict,
         watch.auto_resume_count,
         watch.max_auto_resumes,
+        head_sha_changed,
     );
 
     // Update stored state
@@ -329,11 +380,12 @@ async fn poll_single_pr(
                     spawn_review_subtask, ReviewSubtaskConfig,
                 };
 
+                let review_model = Some("sonnet".to_string());
                 let config = ReviewSubtaskConfig {
                     parent_task_run_id: watch.task_run_id.clone(),
                     pr_number: watch.pr_number,
                     repo_full_name: watch.repo_full_name.clone(),
-                    review_model: Some("sonnet".to_string()),
+                    review_model: review_model.clone(),
                     blocks_parent: true,
                 };
 
@@ -344,6 +396,51 @@ async fn poll_single_pr(
                             review_id,
                             watch.pr_number
                         );
+
+                        // Execute the review subtask (spawn the actual workflow)
+                        if let Some(deps) = execution_deps {
+                            use crate::unified_workflow_executor::review_subtask::{
+                                execute_review_subtask, ReviewDeps,
+                            };
+
+                            let review_name = format!(
+                                "Review PR #{} ({})",
+                                watch.pr_number, watch.repo_full_name
+                            );
+                            // Read the prompt back from the task run we just created
+                            let prompt = match pg_db.get_task_run(&review_id).await {
+                                Ok(Some(tr)) => tr.prompt.unwrap_or_else(|| {
+                                    format!(
+                                        "Review PR #{} in {}",
+                                        watch.pr_number, watch.repo_full_name
+                                    )
+                                }),
+                                _ => format!(
+                                    "Review PR #{} in {}",
+                                    watch.pr_number, watch.repo_full_name
+                                ),
+                            };
+
+                            let review_deps = ReviewDeps {
+                                app_state: deps.app_state.clone(),
+                                config_storage: deps.config_storage.clone(),
+                                app_handle: deps.app_handle.clone(),
+                                pid_tracker: deps.pid_tracker.clone(),
+                            };
+
+                            execute_review_subtask(
+                                review_deps,
+                                review_id,
+                                review_name,
+                                prompt,
+                                review_model,
+                            );
+                        } else {
+                            tracing::warn!(
+                                "PR watcher: no execution deps available, review subtask {} created but not executed",
+                                review_id
+                            );
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(

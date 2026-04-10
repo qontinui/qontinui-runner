@@ -274,6 +274,15 @@ fn passes_quality_gate(problem: &str, solution: &str) -> bool {
 }
 
 /// Extract trigger keywords from a problem description.
+///
+/// Filters to words with `len >= 4` (after stop-word removal) to avoid storing
+/// noisy short words as triggers.  This threshold is deliberately higher than
+/// the `>= 3` used in [`tokenize_for_matching`] — see that function's doc
+/// comment for the rationale behind the asymmetry.
+///
+/// Short domain acronyms like "sql", "api", "jwt" (3 chars) will therefore
+/// never appear as stored keywords.  This is acceptable: those terms are too
+/// common across problem descriptions to serve as reliable trigger keywords.
 fn extract_keywords(description: &str) -> Vec<String> {
     let lower = description.to_lowercase();
     let mut keywords: Vec<String> = lower
@@ -287,6 +296,22 @@ fn extract_keywords(description: &str) -> Vec<String> {
     keywords
 }
 
+/// Tokenize a prompt into a set of lowercase words for keyword matching.
+///
+/// Uses a minimum length of `>= 3`, which is intentionally one character
+/// shorter than the `>= 4` threshold in [`extract_keywords`].  The asymmetry
+/// is deliberate:
+///
+/// * **Stored keywords (`>= 4`)** — stricter filter keeps the keyword index
+///   free of noisy short words that would match too broadly.
+/// * **Prompt tokens (`>= 3`)** — looser filter so prompt words can still
+///   match against the 4+ char keywords.  The extra 3-letter tokens that have
+///   no stored-keyword counterpart are harmless: they simply never hit a
+///   keyword and cost only a hash-set lookup.
+///
+/// This means matching is slightly loose on the prompt side, which is
+/// intentional — we prefer false matches over missed matches, since the
+/// confidence score and the top-3 result limit handle ranking downstream.
 fn tokenize_for_matching(prompt: &str) -> std::collections::HashSet<String> {
     prompt
         .to_lowercase()
@@ -304,6 +329,12 @@ fn compute_confidence(success_rate: f64, sample_count: u32) -> f64 {
     (base * 0.7 + sample_bonus * 0.3).min(1.0)
 }
 
+/// Words excluded from keyword extraction and quality-gate counting.
+///
+/// Besides standard English stop words, this list includes domain terms like
+/// "error", "issue", "problem", "fail", "failed", and "failure".  Those words
+/// appear in virtually every failure context, so keeping them as keywords would
+/// cause all patterns to match nearly every prompt, destroying selectivity.
 const STOP_WORDS: &[&str] = &[
     "the", "a", "an", "and", "or", "but", "if", "then", "else", "for", "with", "to", "of", "in",
     "on", "at", "by", "from", "is", "was", "be", "been", "this", "that", "these", "those", "it",

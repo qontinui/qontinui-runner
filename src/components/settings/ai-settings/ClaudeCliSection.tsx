@@ -10,6 +10,7 @@ import {
   FolderSearch,
   Users,
   X,
+  ArrowRightLeft,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
 import type {
@@ -53,6 +54,54 @@ export function ClaudeCliSection({
 }: ClaudeCliSectionProps) {
   const [checkingUsage, setCheckingUsage] = useState(false);
   const [detectingDirs, setDetectingDirs] = useState(false);
+  const [switching, setSwitching] = useState(false);
+
+  // Live account state from backend (active account, rate-limit status)
+  interface LiveAccountInfo {
+    config_dir: string;
+    label: string;
+    is_active: boolean;
+    is_rate_limited: boolean;
+  }
+  const [liveAccounts, setLiveAccounts] = useState<LiveAccountInfo[]>([]);
+
+  // Fetch live account state on mount and after switching
+  const refreshLiveAccounts = useCallback(async () => {
+    try {
+      const result = await invoke<TauriResult<LiveAccountInfo[]>>("get_claude_accounts");
+      if (result?.success && result.data) {
+        setLiveAccounts(result.data);
+      }
+    } catch {
+      // Silently fail — this is supplementary info
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshLiveAccounts();
+  }, [refreshLiveAccounts]);
+
+  const handleSwitchAccount = useCallback(
+    async (configDir: string) => {
+      setSwitching(true);
+      try {
+        const result = await invoke<TauriResult<null>>("switch_claude_account", {
+          configDir,
+        });
+        if (result?.success) {
+          onLog("success", result.message || "Account switched");
+          await refreshLiveAccounts();
+        } else {
+          onLog("error", result?.message || "Failed to switch account");
+        }
+      } catch (err) {
+        onLog("error", `Failed to switch account: ${err}`);
+      } finally {
+        setSwitching(false);
+      }
+    },
+    [onLog, refreshLiveAccounts],
+  );
 
   // Per-account custom launch commands (e.g. "clg" for gmail)
   const [launchCommands, setLaunchCommands] = useState<Record<string, string>>({});
@@ -328,10 +377,13 @@ export function ClaudeCliSection({
             ) : (
               claudeConfigDirs.map((dir) => {
                 const usage = accountUsages.find((a) => a.config_dir === dir);
+                const live = liveAccounts.find((a) => a.config_dir === dir);
                 const label = dir.split(/[\\/]/).filter(Boolean).pop() || dir;
                 const isSelected =
                   settings.claude_cli.account_selection_mode !== "least_usage" &&
                   settings.claude_cli.config_dir === dir;
+                const isLiveActive = live?.is_active ?? false;
+                const isRateLimited = live?.is_rate_limited ?? false;
                 const isBest =
                   settings.claude_cli.account_selection_mode === "least_usage" &&
                   accountUsages.length > 0 &&
@@ -371,6 +423,20 @@ export function ClaudeCliSection({
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-xs font-medium truncate">{label}</span>
+                          {isLiveActive && (
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("blue").bg} ${getAccentColors("blue").text} font-medium shrink-0`}
+                            >
+                              Active
+                            </span>
+                          )}
+                          {isRateLimited && (
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("red").bg} ${getAccentColors("red").text} font-medium shrink-0`}
+                            >
+                              Rate-limited
+                            </span>
+                          )}
                           {isBest && (
                             <span
                               className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("green").bg} ${getAccentColors("green").text} font-medium shrink-0`}
@@ -420,6 +486,18 @@ export function ClaudeCliSection({
                         <span className={`text-[10px] ${getAccentColors("red").text} shrink-0`}>
                           Error
                         </span>
+                      )}
+
+                      {!isLiveActive && claudeConfigDirs.length > 1 && (
+                        <button
+                          onClick={() => handleSwitchAccount(dir)}
+                          disabled={switching}
+                          className="text-xs px-2 py-0.5 rounded bg-primary/10 hover:bg-primary/20 text-primary transition-colors shrink-0 flex items-center gap-1 disabled:opacity-50"
+                          title="Switch to this account"
+                        >
+                          <ArrowRightLeft className={`w-3 h-3 ${switching ? "animate-spin" : ""}`} />
+                          Switch
+                        </button>
                       )}
 
                       <button
@@ -531,7 +609,7 @@ export function ClaudeCliSection({
                   }`}
                 >
                   <div className="text-xs font-medium">Least Usage</div>
-                  <div className="text-[10px] text-muted-foreground">Auto-select on startup</div>
+                  <div className="text-[10px] text-muted-foreground">Auto-select &amp; failover on rate-limit</div>
                 </button>
               </div>
             </div>

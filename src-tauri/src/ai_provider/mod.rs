@@ -26,7 +26,10 @@ mod types;
 
 // Re-export public API
 pub use cache_aware_builder::StructuredPrompt;
-pub use config::{get_effective_config_dir, set_resolved_config_dir};
+pub use config::{
+    get_account_statuses, get_effective_config_dir, get_resolved_config_dir,
+    rotate_account_on_rate_limit, set_resolved_config_dir, switch_to_account,
+};
 pub use multimodal::{ContentBlock, ImageSource, MultimodalPrompt};
 pub use routing::{
     run_prompt_multimodal, run_prompt_sync, run_prompt_with_middleware,

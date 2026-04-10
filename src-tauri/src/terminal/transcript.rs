@@ -505,13 +505,12 @@ pub fn get_latest_session_id(config_dir: &Path, project_path: &str) -> Option<Tr
 /// Interactive sessions never have either marker.
 fn is_workflow_session(content: &str) -> bool {
     for line in content.lines().take(5) {
-        // queue-operation is the strongest signal — runner-spawned one-shot sessions
-        // always start with this record; interactive sessions never have it.
+        // queue-operation is the only reliable signal — runner-spawned one-shot
+        // sessions always start with this record; interactive sessions never have it.
+        // Do NOT filter on bypassPermissions: users running Claude with
+        // --dangerously-skip-permissions also have that in their permission-mode
+        // record, and excluding them hides every interactive session.
         if line.contains("\"queue-operation\"") {
-            return true;
-        }
-        // bypassPermissions catches supervisor auto-debug sessions
-        if line.contains("\"bypassPermissions\"") {
             return true;
         }
     }

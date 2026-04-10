@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::database::pg::PgDb;
 use crate::database::CreateTaskRunInput;
 use crate::ticket_system::github::GitHubTicketProvider;
+use crate::ticket_system::linear::LinearTicketProvider;
 use crate::ticket_system::types::{
     Ticket, TicketProvider, TicketProviderConfig, TicketSource, TicketState,
 };
@@ -43,7 +44,14 @@ pub fn start_ticket_sync(
                     return;
                 }
             },
-            TicketSource::Linear | TicketSource::Jira => {
+            TicketSource::Linear => match LinearTicketProvider::new() {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    tracing::error!("Ticket sync: failed to create Linear provider: {}", e);
+                    return;
+                }
+            },
+            TicketSource::Jira => {
                 tracing::warn!(
                     "Ticket sync: {:?} provider not yet implemented",
                     config.source
@@ -141,6 +149,20 @@ async fn poll_and_sync(
                     config.source.as_str(),
                     ticket.external_id
                 );
+
+                // Mark ticket as in-progress so the source reflects that work has started.
+                if let Err(e) = provider
+                    .update_state(&ticket.external_id, TicketState::InProgress, config)
+                    .await
+                {
+                    tracing::warn!(
+                        "Ticket sync: failed to mark ticket {}/{} as in-progress: {}",
+                        config.source.as_str(),
+                        ticket.external_id,
+                        e
+                    );
+                }
+
                 // Store mapping for dedup
                 if let Err(e) = pg_db
                     .insert_ticket_task_mapping(
@@ -280,7 +302,11 @@ pub async fn on_task_completed(
             Ok(p) => Box::new(p),
             Err(e) => return Err(e),
         },
-        TicketSource::Linear | TicketSource::Jira => {
+        TicketSource::Linear => match LinearTicketProvider::new() {
+            Ok(p) => Box::new(p),
+            Err(e) => return Err(e),
+        },
+        TicketSource::Jira => {
             tracing::debug!(
                 "Ticket sync: provider {:?} not yet implemented for completion hook",
                 config.source

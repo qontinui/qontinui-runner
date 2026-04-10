@@ -972,6 +972,73 @@ pub async fn resolve_active_config_dir() -> Option<String> {
 }
 
 // ============================================================================
+// Account Switching
+// ============================================================================
+
+/// Info about a configured Claude account for the UI.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccountInfo {
+    pub config_dir: String,
+    pub label: String,
+    pub is_active: bool,
+    pub is_rate_limited: bool,
+}
+
+/// Get the status of all configured Claude accounts.
+///
+/// Returns which account is active, which are rate-limited, etc.
+#[tauri::command]
+pub fn get_claude_accounts() -> Result<CommandResponse, String> {
+    let statuses = crate::ai_provider::get_account_statuses();
+    let accounts: Vec<AccountInfo> = statuses
+        .into_iter()
+        .map(|(dir, label, active, cooled)| AccountInfo {
+            config_dir: dir,
+            label,
+            is_active: active,
+            is_rate_limited: cooled,
+        })
+        .collect();
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("{} accounts configured", accounts.len())),
+        data: Some(
+            serde_json::to_value(&accounts)
+                .map_err(|e| format!("Failed to serialize accounts: {}", e))?,
+        ),
+    })
+}
+
+/// Manually switch to a specific Claude account by its config_dir path.
+#[tauri::command]
+pub fn switch_claude_account(config_dir: String) -> Result<CommandResponse, String> {
+    let switched = crate::ai_provider::switch_to_account(&config_dir);
+    if switched {
+        Ok(CommandResponse {
+            success: true,
+            message: Some(format!(
+                "Switched to account '{}'",
+                std::path::Path::new(&config_dir)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&config_dir)
+            )),
+            data: None,
+        })
+    } else {
+        Ok(CommandResponse {
+            success: false,
+            message: Some(format!(
+                "Account '{}' not found in configured claude_config_dirs",
+                config_dir
+            )),
+            data: None,
+        })
+    }
+}
+
+// ============================================================================
 // Claude CLI Auth Status
 // ============================================================================
 

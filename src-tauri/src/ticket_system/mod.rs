@@ -5,6 +5,7 @@
 //! workflow tasks from new tickets.
 
 pub mod github;
+pub mod linear;
 pub mod service;
 pub mod types;
 

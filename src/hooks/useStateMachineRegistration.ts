@@ -150,7 +150,7 @@ interface StateMachineAPI {
   navigateTo: (id: string) => Promise<unknown>;
 }
 
-function buildEngineAdapter(engine: AutomationEngine): StateMachineAPI {
+function buildEngineAdapter(engine: AutomationEngine, domExecutor?: DefaultDOMExecutor): StateMachineAPI {
   const allDefs = () => engine.stateMachine.getAllStateDefinitions();
   const allTransitions = () => engine.stateMachine.getTransitionDefinitions();
 
@@ -162,7 +162,7 @@ function buildEngineAdapter(engine: AutomationEngine): StateMachineAPI {
     // Exact name match
     const byName = defs.find((d) => d.name === idOrName);
     if (byName) return byName.id;
-    // Prefix match
+    // Prefix match on name
     const lower = idOrName.toLowerCase();
     const byPrefix = defs.find((d) => d.name.toLowerCase().startsWith(lower));
     return byPrefix?.id ?? null;
@@ -242,7 +242,42 @@ function buildEngineAdapter(engine: AutomationEngine): StateMachineAPI {
     },
 
     navigateTo: async (targetStateId) => {
-      const resolved = resolveStateId(targetStateId);
+      let resolved = resolveStateId(targetStateId);
+
+      // page-* alias: execute the sidebar navigation transition's DOM actions
+      // directly (click the sidebar nav item) to navigate to the page.
+      if (!resolved && targetStateId.startsWith("page-")) {
+        const slug = targetStateId.slice(5); // e.g. "error-monitor"
+        const transitionId = `sidebar-to-${slug}`;
+        const transitions = allTransitions();
+        const sidebarT = transitions.find((t) => t.id === transitionId);
+        if (sidebarT && domExecutor) {
+          // Execute each action in the transition (typically a single sidebar click)
+          for (const action of sidebarT.actions) {
+            const found = domExecutor.findElement(action.target);
+            if (found) {
+              await domExecutor.executeAction(found.id, action.action, action.params);
+              // Respect waitAfter if defined
+              if (action.waitAfter?.timeout) {
+                await new Promise((r) => setTimeout(r, Math.min(action.waitAfter!.timeout!, 5000)));
+              }
+            }
+          }
+          // Update state machine state
+          const next = new Set(engine.getActiveStates());
+          for (const s of sidebarT.exitStates) next.delete(s);
+          for (const s of sidebarT.activateStates) next.add(s);
+          engine.stateMachine.setActiveStates(next);
+          return {
+            navigatedTo: targetStateId,
+            path: [transitionId],
+            totalCost: 1,
+            activeStates: Array.from(engine.getActiveStates()),
+            strategy: "sidebar-shortcut",
+          };
+        }
+      }
+
       if (!resolved) throw new Error(`State not found: ${targetStateId}`);
       const result = await engine.navigateToState(resolved);
       return {
@@ -287,7 +322,7 @@ function createAndRegisterEngine(
 
   const bridge = getUIBridgeGlobal();
   if (bridge) {
-    bridge.stateMachine = buildEngineAdapter(engine);
+    bridge.stateMachine = buildEngineAdapter(engine, executor);
     // Expose a simple JSON loading function on the bridge for easy testing.
     // Usage: window.__UI_BRIDGE__.loadStateMachine(jsonString)
     bridge.loadStateMachine = (json: string) => {
